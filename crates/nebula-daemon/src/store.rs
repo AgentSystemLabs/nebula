@@ -53,6 +53,14 @@ const MIGRATIONS: &[&str] = &[
       json  TEXT NOT NULL
     );
     ",
+    // 2: project group dividers
+    "
+    ALTER TABLE projects ADD COLUMN divider_after INTEGER NOT NULL DEFAULT 0;
+    ",
+    // 3: divider labels
+    "
+    ALTER TABLE projects ADD COLUMN divider_label TEXT;
+    ",
 ];
 
 pub struct Store {
@@ -104,8 +112,31 @@ impl Store {
 
     pub fn insert_project(&self, p: &Project) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO projects (id, name, repo_path, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![p.id.as_str(), p.name, p.repo_path.to_string_lossy(), p.sort_order, now_ms()],
+            "INSERT INTO projects (id, name, repo_path, sort_order, divider_after, divider_label, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![p.id.as_str(), p.name, p.repo_path.to_string_lossy(), p.sort_order, p.divider_after as i64, p.divider_label, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Sort slot for a newly added project: after everything else.
+    pub fn next_project_sort_order(&self) -> Result<i64> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM projects",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn set_project_position(
+        &self,
+        id: &ProjectId,
+        sort_order: i64,
+        divider_after: bool,
+        divider_label: Option<&str>,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE projects SET sort_order = ?2, divider_after = ?3, divider_label = ?4 WHERE id = ?1",
+            params![id.as_str(), sort_order, divider_after as i64, divider_label],
         )?;
         Ok(())
     }
@@ -249,14 +280,16 @@ impl Store {
 
     pub fn get_project(&self, id: &ProjectId) -> Result<Option<Project>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id, name, repo_path, sort_order FROM projects WHERE id = ?1")?;
+        let mut stmt = conn
+            .prepare("SELECT id, name, repo_path, sort_order, divider_after, divider_label FROM projects WHERE id = ?1")?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| Project {
             id: ProjectId(r.get::<_, String>(0).unwrap()),
             name: r.get(1).unwrap(),
             repo_path: PathBuf::from(r.get::<_, String>(2).unwrap()),
             sort_order: r.get(3).unwrap(),
+            divider_after: r.get::<_, i64>(4).unwrap() != 0,
+            divider_label: r.get(5).unwrap(),
         }))
     }
 
@@ -322,13 +355,15 @@ impl Store {
         let conn = self.conn.lock().unwrap();
 
         let projects = conn
-            .prepare("SELECT id, name, repo_path, sort_order FROM projects ORDER BY sort_order, created_at")?
+            .prepare("SELECT id, name, repo_path, sort_order, divider_after, divider_label FROM projects ORDER BY sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Project {
                     id: ProjectId(r.get(0)?),
                     name: r.get(1)?,
                     repo_path: PathBuf::from(r.get::<_, String>(2)?),
                     sort_order: r.get(3)?,
+                    divider_after: r.get::<_, i64>(4)? != 0,
+                    divider_label: r.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -410,6 +445,8 @@ mod tests {
             name: "demo".into(),
             repo_path: "/tmp/demo".into(),
             sort_order: 0,
+            divider_after: false,
+            divider_label: None,
         };
         store.insert_project(&project).unwrap();
         let worktree = Worktree {
@@ -449,6 +486,8 @@ mod tests {
             name: "demo".into(),
             repo_path: "/tmp/demo".into(),
             sort_order: 0,
+            divider_after: false,
+            divider_label: None,
         };
         store.insert_project(&project).unwrap();
         let worktree = Worktree {
@@ -480,7 +519,7 @@ mod tests {
     #[test]
     fn sweep_disconnected_only_hits_live_statuses() {
         let store = Store::open_in_memory().unwrap();
-        let project = Project { id: ProjectId::generate(), name: "p".into(), repo_path: "/tmp/p".into(), sort_order: 0 };
+        let project = Project { id: ProjectId::generate(), name: "p".into(), repo_path: "/tmp/p".into(), sort_order: 0, divider_after: false, divider_label: None };
         store.insert_project(&project).unwrap();
         let wt = Worktree { id: WorktreeId::generate(), project_id: project.id.clone(), path: "/tmp/p".into(), branch: "main".into(), is_main: true, sort_order: 0 };
         store.insert_worktree(&wt).unwrap();

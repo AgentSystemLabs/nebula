@@ -18,6 +18,7 @@ pub enum Focus {
 /// What a screen cell maps to; rebuilt on every draw for hit-testing.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HitTarget {
+    /// Row index into `App::project_rows()` (projects and dividers both).
     Project(usize),
     Worktree(usize),
     Session(usize),
@@ -44,6 +45,8 @@ pub enum MenuAction {
     DeleteWorktree(WorktreeId),
     AddProject,
     RemoveProject(ProjectId),
+    SetProjectDivider(ProjectId, bool),
+    LabelDivider(ProjectId),
     ToggleArchived,
 }
 
@@ -87,6 +90,8 @@ pub struct ConfirmDialog {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptKind {
     AddProject,
+    /// Label for the divider hanging below this project.
+    DividerLabel { id: ProjectId },
     NewWorktree { project: ProjectId },
     NewAgent { worktree: WorktreeId },
     NewTerminal { worktree: WorktreeId },
@@ -138,6 +143,24 @@ pub enum ConnState {
 pub enum SessionRow {
     Agent(Agent),
     Terminal(TerminalTab),
+}
+
+/// One selectable row in the Projects panel. The payload indexes
+/// `tree.projects`; a `Divider` is the separator hanging below that project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectRow {
+    Project(usize),
+    Divider(usize),
+}
+
+impl ProjectRow {
+    /// Index of the project this row belongs to (a divider belongs to the
+    /// project it hangs below).
+    pub fn project_index(&self) -> usize {
+        match self {
+            ProjectRow::Project(i) | ProjectRow::Divider(i) => *i,
+        }
+    }
 }
 
 /// Priority-ordered aggregate: needs-feedback > running > finished > fresh.
@@ -282,6 +305,8 @@ impl TermSelection {
 pub struct App {
     pub tree: Tree,
     pub focus: Focus,
+    /// Selected row in the Projects panel — indexes `project_rows()`, which
+    /// interleaves projects and their dividers.
     pub sel_project: usize,
     pub sel_worktree: usize,
     pub sel_session: usize,
@@ -347,8 +372,29 @@ impl App {
         id
     }
 
+    /// Projects panel rows in display order: each project, then its divider
+    /// (when present) directly below it.
+    pub fn project_rows(&self) -> Vec<ProjectRow> {
+        let mut rows = Vec::with_capacity(self.tree.projects.len());
+        for (i, p) in self.tree.projects.iter().enumerate() {
+            rows.push(ProjectRow::Project(i));
+            if p.divider_after {
+                rows.push(ProjectRow::Divider(i));
+            }
+        }
+        rows
+    }
+
+    pub fn selected_project_row(&self) -> Option<ProjectRow> {
+        self.project_rows().get(self.sel_project).copied()
+    }
+
+    /// The project giving the current selection its context. Selecting a
+    /// divider keeps the context of the project it hangs below, so the
+    /// Worktrees/Sessions panels stay put while walking the list.
     pub fn selected_project(&self) -> Option<&Project> {
-        self.tree.projects.get(self.sel_project)
+        let row = self.selected_project_row()?;
+        self.tree.projects.get(row.project_index())
     }
 
     pub fn selected_worktree(&self) -> Option<&Worktree> {
@@ -379,7 +425,7 @@ impl App {
 
     /// Worktrees of the selected project, in tree order.
     pub fn visible_worktrees(&self) -> Vec<&Worktree> {
-        let Some(project) = self.tree.projects.get(self.sel_project) else {
+        let Some(project) = self.selected_project() else {
             return vec![];
         };
         self.tree.worktrees.iter().filter(|w| w.project_id == project.id).collect()

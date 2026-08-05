@@ -50,6 +50,11 @@ pub struct Project {
     pub name: String,
     pub repo_path: PathBuf,
     pub sort_order: i64,
+    /// Draw a group divider under this row. Dividers belong to list
+    /// positions, not projects: reordering keeps them in place.
+    pub divider_after: bool,
+    /// Optional group label rendered inside the divider line.
+    pub divider_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

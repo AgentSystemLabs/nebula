@@ -172,7 +172,9 @@ impl Daemon {
             id: ProjectId::generate(),
             name,
             repo_path: toplevel.clone(),
-            sort_order: 0,
+            sort_order: self.store.next_project_sort_order()?,
+            divider_after: false,
+            divider_label: None,
         };
         self.store.insert_project(&project)?;
         self.broadcast(ServerEvent::EntityUpserted { entity: Entity::Project(project.clone()) });
@@ -214,6 +216,70 @@ impl Daemon {
         // Removing a project only forgets it in nebula — never touches disk.
         self.store.delete_project(id)?;
         self.broadcast(ServerEvent::EntityRemoved { id: EntityId::Project(id.clone()) });
+        Ok(())
+    }
+
+    /// Move a project `delta` slots in the display order (clamped at the
+    /// edges). Sort orders are rewritten to the display index for every row,
+    /// which also normalizes legacy all-zero orders on first use.
+    pub fn move_project(self: &Arc<Self>, id: &ProjectId, delta: i64) -> Result<()> {
+        let (mut projects, _, _, _) = self.store.load_tree()?;
+        let Some(index) = projects.iter().position(|p| &p.id == id) else {
+            bail!("project not found");
+        };
+        let target = (index as i64 + delta).clamp(0, projects.len() as i64 - 1) as usize;
+        if target == index {
+            return Ok(());
+        }
+        let before: HashMap<ProjectId, (i64, bool, Option<String>)> = projects
+            .iter()
+            .map(|p| (p.id.clone(), (p.sort_order, p.divider_after, p.divider_label.clone())))
+            .collect();
+        // Dividers mark the gap below a display slot, not the project in it:
+        // keep them (and their labels) pinned to their slots while the
+        // projects move through.
+        let dividers: Vec<(bool, Option<String>)> =
+            projects.iter().map(|p| (p.divider_after, p.divider_label.clone())).collect();
+        let moved = projects.remove(index);
+        projects.insert(target, moved);
+        for (slot, project) in projects.iter_mut().enumerate() {
+            project.sort_order = slot as i64;
+            (project.divider_after, project.divider_label) = dividers[slot].clone();
+            let now = (project.sort_order, project.divider_after, project.divider_label.clone());
+            if before.get(&project.id) != Some(&now) {
+                self.store.set_project_position(
+                    &project.id,
+                    project.sort_order,
+                    project.divider_after,
+                    project.divider_label.as_deref(),
+                )?;
+                self.broadcast(ServerEvent::EntityUpserted { entity: Entity::Project(project.clone()) });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_project_divider(
+        self: &Arc<Self>,
+        id: &ProjectId,
+        divider_after: bool,
+        label: Option<String>,
+    ) -> Result<()> {
+        let mut project = self.store.get_project(id)?.context("project not found")?;
+        // A removed divider keeps no label.
+        let label = if divider_after { label.filter(|l| !l.trim().is_empty()) } else { None };
+        if (project.divider_after, &project.divider_label) == (divider_after, &label) {
+            return Ok(());
+        }
+        project.divider_after = divider_after;
+        project.divider_label = label;
+        self.store.set_project_position(
+            id,
+            project.sort_order,
+            divider_after,
+            project.divider_label.as_deref(),
+        )?;
+        self.broadcast(ServerEvent::EntityUpserted { entity: Entity::Project(project) });
         Ok(())
     }
 
@@ -598,4 +664,83 @@ pub fn scrubbed_env_names() -> Vec<String> {
         "NEBULA_API_URL".into(),
         "NEBULA_API_TOKEN".into(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_daemon() -> Arc<Daemon> {
+        let store = Store::open_in_memory().unwrap();
+        Daemon::new(store, HookEnv { port: 0, token: String::new() })
+    }
+
+    fn seed_projects(daemon: &Daemon, names: &[&str]) {
+        for (i, name) in names.iter().enumerate() {
+            daemon
+                .store
+                .insert_project(&Project {
+                    id: ProjectId((*name).into()),
+                    name: (*name).into(),
+                    repo_path: format!("/tmp/{name}").into(),
+                    sort_order: i as i64,
+                    divider_after: false,
+                    divider_label: None,
+                })
+                .unwrap();
+        }
+    }
+
+    /// (name, divider_after, divider_label) in display order.
+    fn layout(daemon: &Daemon) -> Vec<(String, bool, Option<String>)> {
+        let (projects, _, _, _) = daemon.store.load_tree().unwrap();
+        projects.into_iter().map(|p| (p.name, p.divider_after, p.divider_label)).collect()
+    }
+
+    fn names(daemon: &Daemon) -> Vec<String> {
+        layout(daemon).into_iter().map(|(n, _, _)| n).collect()
+    }
+
+    #[test]
+    fn move_project_reorders_and_normalizes_sort_orders() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["a", "b", "c", "d"]);
+
+        daemon.move_project(&ProjectId("d".into()), -2).unwrap();
+        assert_eq!(names(&daemon), ["a", "d", "b", "c"]);
+        let (projects, _, _, _) = daemon.store.load_tree().unwrap();
+        assert_eq!(projects.iter().map(|p| p.sort_order).collect::<Vec<_>>(), [0, 1, 2, 3]);
+
+        // Edge moves clamp to no-ops.
+        daemon.move_project(&ProjectId("a".into()), -1).unwrap();
+        daemon.move_project(&ProjectId("c".into()), 5).unwrap();
+        assert_eq!(names(&daemon), ["a", "d", "b", "c"]);
+    }
+
+    #[test]
+    fn dividers_stay_pinned_while_projects_move_through() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["a", "b", "c", "d"]);
+        // Groups: [a b] [c d], labeled "work".
+        daemon.set_project_divider(&ProjectId("b".into()), true, Some("work".into())).unwrap();
+
+        // c crosses the divider into the first group; the divider (and its
+        // label) keeps marking the gap between slots 1 and 2.
+        daemon.move_project(&ProjectId("c".into()), -1).unwrap();
+        assert_eq!(
+            layout(&daemon),
+            [
+                ("a".to_string(), false, None),
+                ("c".to_string(), true, Some("work".to_string())),
+                ("b".to_string(), false, None),
+                ("d".to_string(), false, None),
+            ]
+        );
+
+        // Relabeling keeps the divider; removing it drops the label too.
+        daemon.set_project_divider(&ProjectId("c".into()), true, Some("play".into())).unwrap();
+        assert_eq!(layout(&daemon)[1].2.as_deref(), Some("play"));
+        daemon.set_project_divider(&ProjectId("c".into()), false, Some("ignored".into())).unwrap();
+        assert!(layout(&daemon).iter().all(|(_, divider, label)| !divider && label.is_none()));
+    }
 }

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -49,6 +49,11 @@ pub enum ClientRequest {
     // -- entity CRUD (RPC-style; answered by Ack/Error with matching req_id) --
     AddProject { req_id: u64, path: PathBuf, name: Option<String> },
     RemoveProject { req_id: u64, id: ProjectId },
+    /// Move a project `delta` slots in the list (clamped at the edges).
+    MoveProject { req_id: u64, id: ProjectId, delta: i64 },
+    /// Set the group divider under a project row: presence and label.
+    /// `divider_after: false` removes it (label is dropped too).
+    SetProjectDivider { req_id: u64, id: ProjectId, divider_after: bool, label: Option<String> },
     CreateWorktree { req_id: u64, project: ProjectId, branch: String, base: Option<String> },
     DeleteWorktree { req_id: u64, id: WorktreeId, force: bool },
     CreateAgent { req_id: u64, worktree: WorktreeId, name: String },

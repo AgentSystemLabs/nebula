@@ -2,8 +2,8 @@
 
 use crate::app::{
     App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, Focus, HitTarget, MenuAction,
-    MenuItem, Overlay, PendingAction, PendingIntent, PromptDialog, PromptKind, SessionRow,
-    TermSelection,
+    MenuItem, Overlay, PendingAction, PendingIntent, ProjectRow, PromptDialog, PromptKind,
+    SessionRow, TermSelection,
 };
 use crate::{ipc, keys, ui};
 use anyhow::Result;
@@ -185,7 +185,10 @@ fn restore_ui_state(app: &mut App, json: &str) {
     let Ok(state) = serde_json::from_str::<UiState>(json) else { return };
     app.show_archived = state.show_archived;
     if let Some(pid) = &state.project {
-        if let Some(i) = app.tree.projects.iter().position(|p| p.id.as_str() == pid) {
+        let row = app.project_rows().iter().position(|r| {
+            matches!(r, ProjectRow::Project(i) if app.tree.projects[*i].id.as_str() == pid)
+        });
+        if let Some(i) = row {
             app.sel_project = i;
         }
     }
@@ -344,10 +347,28 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 Focus::Terminal => Focus::Terminal,
             }
         }
+        // Shift+↑/↓ (or Shift+j/k) reorders projects instead of moving the
+        // selection; guarded arms must precede the plain ones.
+        KeyCode::Down | KeyCode::Char('J')
+            if app.focus == Focus::Projects && key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            move_project(app, 1, out)
+        }
+        KeyCode::Up | KeyCode::Char('K')
+            if app.focus == Focus::Projects && key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            move_project(app, -1, out)
+        }
         KeyCode::Char('j') | KeyCode::Down => move_selection(app, 1),
         KeyCode::Char('k') | KeyCode::Up => move_selection(app, -1),
         KeyCode::Enter => match app.focus {
-            Focus::Projects => app.focus = Focus::Worktrees,
+            Focus::Projects => match app.selected_project_row() {
+                Some(ProjectRow::Divider(i)) => {
+                    let id = app.tree.projects[i].id.clone();
+                    open_prompt(app, PromptKind::DividerLabel { id });
+                }
+                _ => app.focus = Focus::Worktrees,
+            },
             Focus::Worktrees => app.focus = Focus::Sessions,
             Focus::Sessions => attach_selected(app, out),
             Focus::Terminal => {
@@ -378,19 +399,24 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 }
             }
         }
-        KeyCode::Char('r') => {
-            if app.focus == Focus::Sessions {
-                match app.selected_session() {
-                    Some(SessionRow::Agent(a)) => {
-                        open_prompt(app, PromptKind::RenameAgent { id: a.id })
-                    }
-                    Some(SessionRow::Terminal(t)) => {
-                        open_prompt(app, PromptKind::RenameTerminal { id: t.id })
-                    }
-                    None => {}
+        KeyCode::Char('r') => match app.focus {
+            Focus::Sessions => match app.selected_session() {
+                Some(SessionRow::Agent(a)) => {
+                    open_prompt(app, PromptKind::RenameAgent { id: a.id })
+                }
+                Some(SessionRow::Terminal(t)) => {
+                    open_prompt(app, PromptKind::RenameTerminal { id: t.id })
+                }
+                None => {}
+            },
+            Focus::Projects => {
+                if let Some(ProjectRow::Divider(i)) = app.selected_project_row() {
+                    let id = app.tree.projects[i].id.clone();
+                    open_prompt(app, PromptKind::DividerLabel { id });
                 }
             }
-        }
+            _ => {}
+        },
         KeyCode::Char('a') => {
             if app.focus == Focus::Sessions {
                 if let Some(SessionRow::Agent(a)) = app.selected_session() {
@@ -415,7 +441,30 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 app.show_archived = !app.show_archived;
             }
         }
-        KeyCode::Char('d') | KeyCode::Delete => open_delete_confirm(app),
+        KeyCode::Char('-') => {
+            if app.focus == Focus::Projects {
+                match app.selected_project_row() {
+                    Some(ProjectRow::Project(i)) => {
+                        let p = &app.tree.projects[i];
+                        let (id, divider_after) = (p.id.clone(), !p.divider_after);
+                        let req_id = app.alloc_req_id(PendingIntent::None);
+                        out.push(ClientRequest::SetProjectDivider {
+                            req_id,
+                            id,
+                            divider_after,
+                            label: None,
+                        });
+                    }
+                    Some(ProjectRow::Divider(i)) => remove_divider(app, i, out),
+                    None => {}
+                }
+            }
+        }
+        KeyCode::Char('d') | KeyCode::Delete => match (app.focus, app.selected_project_row()) {
+            // Dividers are cheap to recreate — no confirmation dance.
+            (Focus::Projects, Some(ProjectRow::Divider(i))) => remove_divider(app, i, out),
+            _ => open_delete_confirm(app),
+        },
         KeyCode::Char('m') => open_context_menu_for_selection(app),
         KeyCode::Char('z') => {
             if app.term.is_some() {
@@ -439,6 +488,16 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
             "path to a git repository".to_string(),
             String::new(),
         ),
+        PromptKind::DividerLabel { id } => {
+            let current = app
+                .tree
+                .projects
+                .iter()
+                .find(|p| &p.id == id)
+                .and_then(|p| p.divider_label.clone())
+                .unwrap_or_default();
+            ("Divider label".to_string(), "label (empty clears it)".to_string(), current)
+        }
         PromptKind::NewWorktree { .. } => {
             ("New worktree".to_string(), "branch name".to_string(), String::new())
         }
@@ -608,6 +667,30 @@ fn menu_items_for_session(row: &SessionRow) -> Vec<MenuItem> {
     }
 }
 
+fn divider_menu_item(p: &nebula_core::Project) -> MenuItem {
+    MenuItem {
+        label: if p.divider_after { "Remove divider below" } else { "Add divider below" }.into(),
+        action: MenuAction::SetProjectDivider(p.id.clone(), !p.divider_after),
+        destructive: false,
+    }
+}
+
+/// Menu for a selected divider row.
+fn divider_row_menu(id: nebula_core::ProjectId) -> Vec<MenuItem> {
+    vec![
+        MenuItem {
+            label: "Edit label".into(),
+            action: MenuAction::LabelDivider(id.clone()),
+            destructive: false,
+        },
+        MenuItem {
+            label: "Remove divider".into(),
+            action: MenuAction::SetProjectDivider(id, false),
+            destructive: false,
+        },
+    ]
+}
+
 fn open_menu(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
     if items.is_empty() {
         return;
@@ -625,6 +708,11 @@ fn open_context_menu_for_selection(app: &mut App) {
     let at = (30, 4);
     match app.focus {
         Focus::Projects => {
+            if let Some(ProjectRow::Divider(i)) = app.selected_project_row() {
+                let id = app.tree.projects[i].id.clone();
+                open_menu(app, divider_row_menu(id), at);
+                return;
+            }
             let mut items = vec![MenuItem {
                 label: "Add project".into(),
                 action: MenuAction::AddProject,
@@ -636,6 +724,7 @@ fn open_context_menu_for_selection(app: &mut App) {
                     action: MenuAction::NewWorktree(p.id.clone()),
                     destructive: false,
                 });
+                items.push(divider_menu_item(p));
                 items.push(MenuItem {
                     label: "Remove from list".into(),
                     action: MenuAction::RemoveProject(p.id.clone()),
@@ -757,11 +846,23 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
 
 fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientRequest>) {
     let value = prompt.input.trim().to_string();
+    // An empty divider label is meaningful: it clears the label.
+    if let PromptKind::DividerLabel { id } = &prompt.kind {
+        let req_id = app.alloc_req_id(PendingIntent::None);
+        out.push(ClientRequest::SetProjectDivider {
+            req_id,
+            id: id.clone(),
+            divider_after: true,
+            label: (!value.is_empty()).then_some(value),
+        });
+        return;
+    }
     if value.is_empty() {
         app.flash = Some("cancelled: empty input".into());
         return;
     }
     match prompt.kind {
+        PromptKind::DividerLabel { .. } => unreachable!("handled above (empty input allowed)"),
         PromptKind::AddProject => {
             let expanded = shellexpand_home(&value);
             let req_id = app.alloc_req_id(PendingIntent::None);
@@ -889,6 +990,11 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 }));
             }
         }
+        MenuAction::SetProjectDivider(id, divider_after) => {
+            let req_id = app.alloc_req_id(PendingIntent::None);
+            out.push(ClientRequest::SetProjectDivider { req_id, id, divider_after, label: None });
+        }
+        MenuAction::LabelDivider(id) => open_prompt(app, PromptKind::DividerLabel { id }),
         MenuAction::ToggleArchived => app.show_archived = !app.show_archived,
     }
 }
@@ -915,28 +1021,67 @@ fn shellexpand_home(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
+/// Ask the daemon to shift the selected project; the selection follows the
+/// project when the reordered rows come back (see `apply_upsert`).
+fn move_project(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
+    let Some(row) = app.selected_project_row() else { return };
+    let ProjectRow::Project(index) = row else {
+        app.flash = Some("dividers stay put — move the projects around them".into());
+        return;
+    };
+    let target = index as i64 + delta;
+    if target < 0 || target >= app.tree.projects.len() as i64 {
+        return; // already at the edge
+    }
+    let id = app.tree.projects[index].id.clone();
+    let req_id = app.alloc_req_id(PendingIntent::None);
+    out.push(ClientRequest::MoveProject { req_id, id, delta });
+}
+
+fn remove_divider(app: &mut App, project_index: usize, out: &mut Vec<ClientRequest>) {
+    let id = app.tree.projects[project_index].id.clone();
+    let req_id = app.alloc_req_id(PendingIntent::None);
+    out.push(ClientRequest::SetProjectDivider { req_id, id, divider_after: false, label: None });
+}
+
 fn move_selection(app: &mut App, delta: i64) {
-    let (len, sel) = match app.focus {
-        Focus::Projects => (app.tree.projects.len(), &mut app.sel_project),
-        Focus::Worktrees => (app.visible_worktrees().len(), &mut app.sel_worktree),
-        Focus::Sessions => (app.visible_sessions().len(), &mut app.sel_session),
+    let len = match app.focus {
+        Focus::Projects => app.project_rows().len(),
+        Focus::Worktrees => app.visible_worktrees().len(),
+        Focus::Sessions => app.visible_sessions().len(),
         Focus::Terminal => return,
     };
     if len == 0 {
         return;
     }
-    let new = (*sel as i64 + delta).clamp(0, len as i64 - 1) as usize;
-    if new != *sel {
-        *sel = new;
-        // Selecting a different parent resets child selections.
-        match app.focus {
-            Focus::Projects => {
+    let sel = match app.focus {
+        Focus::Projects => app.sel_project,
+        Focus::Worktrees => app.sel_worktree,
+        Focus::Sessions => app.sel_session,
+        Focus::Terminal => return,
+    };
+    let new = (sel as i64 + delta).clamp(0, len as i64 - 1) as usize;
+    if new == sel {
+        return;
+    }
+    // Selecting a different parent resets child selections.
+    match app.focus {
+        Focus::Projects => {
+            // Walking onto a divider keeps its project's context, so the
+            // child panels only reset when the actual project changes.
+            let owner_before = app.selected_project().map(|p| p.id.clone());
+            app.sel_project = new;
+            if app.selected_project().map(|p| p.id.clone()) != owner_before {
                 app.sel_worktree = 0;
                 app.sel_session = 0;
             }
-            Focus::Worktrees => app.sel_session = 0,
-            _ => {}
         }
+        Focus::Worktrees => {
+            app.sel_worktree = new;
+            app.sel_session = 0;
+        }
+        Focus::Sessions => app.sel_session = new,
+        Focus::Terminal => {}
     }
 }
 
@@ -1073,9 +1218,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             match app.hit_at(mouse.column, mouse.row) {
                 Some(HitTarget::Project(i)) => {
                     if app.sel_project != i {
+                        let owner_before = app.selected_project().map(|p| p.id.clone());
                         app.sel_project = i;
-                        app.sel_worktree = 0;
-                        app.sel_session = 0;
+                        if app.selected_project().map(|p| p.id.clone()) != owner_before {
+                            app.sel_worktree = 0;
+                            app.sel_session = 0;
+                        }
                     }
                     app.focus = Focus::Projects;
                 }
@@ -1162,7 +1310,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 Some(HitTarget::Project(i)) => {
                     app.sel_project = i;
                     app.focus = Focus::Projects;
-                    if let Some(p) = app.selected_project() {
+                    if let Some(ProjectRow::Divider(pi)) = app.selected_project_row() {
+                        let id = app.tree.projects[pi].id.clone();
+                        open_menu_at(app, divider_row_menu(id), at);
+                    } else if let Some(p) = app.selected_project() {
                         let items = vec![
                             MenuItem {
                                 label: "New worktree".into(),
@@ -1174,6 +1325,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                                 action: MenuAction::AddProject,
                                 destructive: false,
                             },
+                            divider_menu_item(p),
                             MenuItem {
                                 label: "Remove from list".into(),
                                 action: MenuAction::RemoveProject(p.id.clone()),
@@ -1402,6 +1554,8 @@ mod tests {
                     name: "demo".into(),
                     repo_path: "/tmp/demo".into(),
                     sort_order: 0,
+                    divider_after: false,
+                    divider_label: None,
                 }),
             },
         );
@@ -1658,6 +1812,157 @@ mod tests {
         assert!(app.term_selection.is_none(), "click elsewhere clears the selection");
     }
 
+    fn project(
+        id: &str,
+        name: &str,
+        sort_order: i64,
+        divider_after: bool,
+        divider_label: Option<&str>,
+    ) -> nebula_core::Entity {
+        use nebula_core::{Entity, Project, ProjectId};
+        Entity::Project(Project {
+            id: ProjectId(id.into()),
+            name: name.into(),
+            repo_path: format!("/tmp/{name}").into(),
+            sort_order,
+            divider_after,
+            divider_label: divider_label.map(String::from),
+        })
+    }
+
+    #[test]
+    fn shift_arrows_reorder_projects_and_dash_toggles_divider() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        app.focus = Focus::Projects;
+
+        // A single project is already at both edges — nothing to send.
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT), &mut out);
+        assert!(out.is_empty(), "edge move sends nothing");
+
+        hse(&mut app, ServerEvent::EntityUpserted { entity: project("p2", "two", 1, false, None) });
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT), &mut out);
+        assert!(
+            matches!(out.last(), Some(ClientRequest::MoveProject { delta: 1, .. })),
+            "Shift+Down requests a move: {out:?}"
+        );
+
+        // Plain arrows still just move the selection.
+        let sent = out.len();
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut out);
+        assert_eq!(out.len(), sent, "plain Down only moves the selection");
+        assert_eq!(app.sel_project, 1);
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT), &mut out);
+        assert!(
+            matches!(out.last(), Some(ClientRequest::MoveProject { delta: -1, .. })),
+            "Shift+K requests a move up: {out:?}"
+        );
+
+        // '-' toggles the divider below the selected project.
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE), &mut out);
+        assert!(
+            matches!(out.last(), Some(ClientRequest::SetProjectDivider { divider_after: true, .. })),
+            "dash toggles the divider on: {out:?}"
+        );
+    }
+
+    #[test]
+    fn reorder_upserts_resort_projects_and_selection_follows() {
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 "demo" at sort 0, selected
+        hse(&mut app, ServerEvent::EntityUpserted { entity: project("p2", "two", 1, false, None) });
+        app.focus = Focus::Projects;
+        assert_eq!(app.sel_project, 0);
+
+        // The daemon swapped them; upserts arrive one by one.
+        hse(&mut app, ServerEvent::EntityUpserted { entity: project("p1", "demo", 1, false, None) });
+        hse(&mut app, ServerEvent::EntityUpserted { entity: project("p2", "two", 0, false, None) });
+
+        let order: Vec<&str> = app.tree.projects.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(order, ["two", "demo"], "projects re-sort by sort_order");
+        assert_eq!(app.sel_project, 1, "selection follows the project it was on");
+    }
+
+    #[test]
+    fn divider_renders_under_project_row() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(&mut app, ServerEvent::EntityUpserted { entity: project("p1", "demo", 0, true, None) });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        // Projects panel is 20 wide: row 1 is the project, row 2 the divider
+        // spanning the 18 inner columns between the │ borders.
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].starts_with("│○ demo"), "project row first:\n{text}");
+        assert!(
+            lines[2].starts_with(&format!("│{}│", "─".repeat(18))),
+            "divider row under the project:\n{text}"
+        );
+
+        // A labeled divider weaves the label into the line.
+        hse(&mut app, ServerEvent::EntityUpserted { entity: project("p1", "demo", 0, true, Some("work")) });
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.lines().nth(2).unwrap().starts_with("│─ work ──"),
+            "labeled divider row:\n{text}"
+        );
+    }
+
+    #[test]
+    fn divider_rows_select_label_and_delete() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        app.focus = Focus::Projects;
+        hse(&mut app, ServerEvent::EntityUpserted { entity: project("p1", "demo", 0, true, None) });
+
+        // j walks onto the divider; the project's context sticks.
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), &mut out);
+        assert_eq!(app.selected_project_row(), Some(ProjectRow::Divider(0)));
+        assert_eq!(app.selected_project().unwrap().name, "demo");
+        assert!(!app.visible_worktrees().is_empty(), "divider keeps its project's context");
+
+        // Enter opens the label prompt; submitting sends the label.
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Prompt(p)) if p.title == "Divider label"),
+            "Enter on a divider prompts for its label"
+        );
+        for c in "work".chars() {
+            handle_key(&mut app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &mut out);
+        }
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut out);
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::SetProjectDivider { divider_after: true, label: Some(l), .. })
+                    if l == "work"
+            ),
+            "label submit: {out:?}"
+        );
+
+        // Shift moves don't apply to dividers.
+        let sent = out.len();
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT), &mut out);
+        assert_eq!(out.len(), sent, "dividers are not movable");
+
+        // d deletes the divider without a confirm dialog.
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), &mut out);
+        assert!(app.overlay.is_none(), "divider delete needs no confirm");
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::SetProjectDivider { divider_after: false, label: None, .. })
+            ),
+            "divider delete: {out:?}"
+        );
+    }
+
     #[test]
     fn exited_session_does_not_trap_keys() {
         let mut app = App::new();
@@ -1691,9 +1996,31 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
     use nebula_core::Entity;
     match entity {
         Entity::Project(p) => {
+            let selected = app.selected_project_row().map(|row| {
+                let is_divider = matches!(row, ProjectRow::Divider(_));
+                (is_divider, app.tree.projects[row.project_index()].id.clone())
+            });
             match app.tree.projects.iter_mut().find(|x| x.id == p.id) {
                 Some(existing) => *existing = p,
                 None => app.tree.projects.push(p),
+            }
+            // Reorders arrive as plain upserts with new sort_orders; stable
+            // sort keeps snapshot order for legacy all-zero ties. The
+            // selection follows the row it was on, so children stay put; a
+            // selected divider that just vanished falls back to its project.
+            app.tree.projects.sort_by_key(|x| x.sort_order);
+            if let Some((was_divider, id)) = selected {
+                let rows = app.project_rows();
+                let same_kind = rows.iter().position(|row| {
+                    matches!(row, ProjectRow::Divider(_)) == was_divider
+                        && app.tree.projects[row.project_index()].id == id
+                });
+                let found = same_kind.or_else(|| {
+                    rows.iter().position(|row| app.tree.projects[row.project_index()].id == id)
+                });
+                if let Some(i) = found {
+                    app.sel_project = i;
+                }
             }
         }
         Entity::Worktree(w) => {
@@ -1746,8 +2073,9 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
 
 /// Keep selections valid after the tree shrinks.
 fn clamp_selections(app: &mut App) {
-    if app.sel_project >= app.tree.projects.len() {
-        app.sel_project = app.tree.projects.len().saturating_sub(1);
+    let project_rows = app.project_rows().len();
+    if app.sel_project >= project_rows {
+        app.sel_project = project_rows.saturating_sub(1);
     }
     let wt_len = app.visible_worktrees().len();
     if app.sel_worktree >= wt_len {

@@ -73,6 +73,10 @@ Worktree and project rows roll up their children: red beats yellow beats green.
 | Panels | `Tab`/`Shift+Tab`, `h/l`, `j/k` | move focus / selection |
 | Panels | `Enter` | drill in; on a session: attach |
 | Projects | `n` / `d` | add project / remove from list |
+| Projects | `Shift+J/K` | move project up / down the list (`Shift+↑/↓` too, but Terminal.app never sends those) |
+| Projects | `-` | toggle a group divider below the project |
+| Projects | `j/k` onto a divider, then `Enter`/`r` | edit the divider's label |
+| Projects | `d` or `-` on a divider | delete the divider |
 | Worktrees | `n` / `d` | new worktree / delete (typed confirm — deletes files) |
 | Sessions | `n` / `t` | new agent / new terminal |
 | Sessions | `r`, `a`, `u`, `d`, `A` | rename, archive, unarchive, delete, toggle archived |

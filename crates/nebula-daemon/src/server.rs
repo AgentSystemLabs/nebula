@@ -176,6 +176,12 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientRequest::RemoveProject { req_id, id } => {
                     reply(&out_tx, req_id, daemon.remove_project(&id).map(|_| None)).await;
                 }
+                ClientRequest::MoveProject { req_id, id, delta } => {
+                    reply(&out_tx, req_id, daemon.move_project(&id, delta).map(|_| None)).await;
+                }
+                ClientRequest::SetProjectDivider { req_id, id, divider_after, label } => {
+                    reply(&out_tx, req_id, daemon.set_project_divider(&id, divider_after, label).map(|_| None)).await;
+                }
                 ClientRequest::CreateWorktree { req_id, project, branch, base } => {
                     reply(
                         &out_tx,

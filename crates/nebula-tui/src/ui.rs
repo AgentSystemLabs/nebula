@@ -1,7 +1,7 @@
 //! View layer: draws the three panels + terminal pane + footer, and records
 //! hit regions for mouse interaction.
 
-use crate::app::{App, ConnState, Focus, HitTarget, Overlay, SessionRow};
+use crate::app::{App, ConnState, Focus, HitTarget, Overlay, ProjectRow, SessionRow};
 use nebula_core::{AgentStatus, SessionRef};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -164,7 +164,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Paragraph::new(lines), inner);
         }
         Overlay::Help => {
-            let area = centered_rect(f.area(), 60, 20);
+            let area = centered_rect(f.area(), 60, 22);
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -179,6 +179,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 ("j/k or ↓/↑", "move selection"),
                 ("Enter", "drill in / attach; terminal pane: lock input"),
                 ("n", "new project / worktree / agent (per panel)"),
+                ("Shift+J/K", "move project up / down (⇧↑/↓ where supported)"),
+                ("-", "divider below project / remove selected divider"),
+                ("Enter or r", "on a divider: edit its label"),
                 ("t", "new terminal (sessions panel)"),
                 ("r", "rename (sessions panel)"),
                 ("a", "archive agent"),
@@ -294,22 +297,52 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let rows: Vec<(String, Option<AgentStatus>)> = app
-        .tree
-        .projects
-        .iter()
-        .map(|p| (p.name.clone(), app.project_rollup(&p.id)))
+    // Projects and their dividers are one selectable row list; the payload
+    // pre-collects per-row display data to end the tree borrow.
+    let rows: Vec<(ProjectRow, String, Option<AgentStatus>)> = app
+        .project_rows()
+        .into_iter()
+        .map(|row| match row {
+            ProjectRow::Project(i) => {
+                let p = &app.tree.projects[i];
+                (row, p.name.clone(), app.project_rollup(&p.id))
+            }
+            ProjectRow::Divider(i) => {
+                let label = app.tree.projects[i].divider_label.clone().unwrap_or_default();
+                (row, label, None)
+            }
+        })
         .collect();
-    for (i, (name, roll)) in rows.iter().enumerate() {
-        let Some(row_area) = row_rect(inner, i) else { break };
-        let spans = vec![
-            status_dot(*roll),
-            Span::raw(truncate(name, inner.width.saturating_sub(2) as usize)),
-        ];
-        render_row(f, row_area, spans, i == app.sel_project, focused);
-        app.hits.push((row_area, HitTarget::Project(i)));
+    for (row_idx, (row, text, roll)) in rows.iter().enumerate() {
+        let Some(row_area) = row_rect(inner, row_idx) else { break };
+        let spans = match row {
+            ProjectRow::Project(_) => vec![
+                status_dot(*roll),
+                Span::raw(truncate(text, inner.width.saturating_sub(2) as usize)),
+            ],
+            ProjectRow::Divider(_) => divider_spans(text, inner.width),
+        };
+        render_row(f, row_area, spans, row_idx == app.sel_project, focused);
+        app.hits.push((row_area, HitTarget::Project(row_idx)));
     }
     app.hits.push((inner, HitTarget::PanelBg(Focus::Projects)));
+}
+
+/// A divider line, with the group label woven in when present:
+/// `─ label ────────`.
+fn divider_spans(label: &str, width: u16) -> Vec<Span<'static>> {
+    let w = width as usize;
+    let dim = Style::default().fg(Color::DarkGray);
+    if label.is_empty() {
+        return vec![Span::styled("─".repeat(w), dim)];
+    }
+    let label = truncate(label, w.saturating_sub(4));
+    let tail = w.saturating_sub(label.chars().count() + 3);
+    vec![
+        Span::styled("─ ".to_string(), dim),
+        Span::styled(label, Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {}", "─".repeat(tail)), dim),
+    ]
 }
 
 fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
@@ -557,7 +590,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             }
             Focus::Terminal if app.term.is_some() => "Enter: type into terminal  ←: sessions",
             Focus::Terminal => "select a session and press Enter to attach",
-            Focus::Projects => "n: add  d: remove  m: menu  Enter: open  ?: help",
+            Focus::Projects => match app.selected_project_row() {
+                Some(ProjectRow::Divider(_)) => "Enter/r: label  d: delete divider  m: menu  ?: help",
+                _ => "n: add  d: remove  -: divider  ⇧J/K: move  m: menu  ?: help",
+            },
             Focus::Worktrees => "n: new worktree  d: delete  m: menu  ?: help",
             Focus::Sessions => "n: agent  t: term  r: rename  a: archive  d: del  m: menu  ?: help",
         };
