@@ -1,0 +1,80 @@
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "nebula", version, about = "Terminal multiplexer for Claude Code agents")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the daemon process (normally auto-spawned by the TUI).
+    Daemon {
+        /// Stay attached to the terminal instead of logging to file.
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Ask a running daemon to shut down cleanly.
+    KillServer,
+    /// Phase-2 debug client: raw passthrough to a scratch session (Ctrl+\ detaches).
+    #[command(hide = true, name = "_raw-attach")]
+    RawAttach {
+        #[arg(default_value = "0")]
+        name: String,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Some(Command::Daemon { foreground }) => {
+            init_daemon_logging(foreground)?;
+            nebula_daemon::run_daemon()
+        }
+        Some(Command::KillServer) => nebula_tui::run_kill_server(),
+        Some(Command::RawAttach { name }) => nebula_tui::run_raw_attach(&name),
+        None => {
+            init_tui_logging()?;
+            nebula_tui::run_tui()
+        }
+    }
+}
+
+fn init_daemon_logging(foreground: bool) -> Result<()> {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("NEBULA_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    if foreground {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    } else {
+        std::fs::create_dir_all(nebula_core::paths::log_dir())?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(nebula_core::paths::daemon_log_path())?;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(file)
+            .with_ansi(false)
+            .init();
+    }
+    Ok(())
+}
+
+fn init_tui_logging() -> Result<()> {
+    // stdout belongs to the UI — log to file only.
+    std::fs::create_dir_all(nebula_core::paths::log_dir())?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(nebula_core::paths::tui_log_path())?;
+    let filter = tracing_subscriber::EnvFilter::try_from_env("NEBULA_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(file)
+        .with_ansi(false)
+        .init();
+    Ok(())
+}

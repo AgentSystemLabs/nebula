@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "recall": {
+      "command": "node",
+      "args": [
+        "/Applications/MissionControl.app/Contents/Resources/bundled-mcp/recall-mcp.mjs"
+      ],
+      "env": {
+        "MC_API_URL": "${MC_API_URL:-}",
+        "MC_API_TOKEN": "${MC_API_TOKEN:-}",
+        "MC_TASK_ID": "${MC_TASK_ID:-}"
+      }
+    }
+  }
+}

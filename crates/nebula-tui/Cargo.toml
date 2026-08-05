@@ -1,0 +1,23 @@
+[package]
+name = "nebula-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nebula-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tui-term = "0.2"
+vt100 = "0.15"
+futures = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
