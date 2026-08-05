@@ -1,7 +1,7 @@
 #!/bin/sh
 # nebula installer — installs or updates the `nebula` binary.
 #
-#   curl -fsSL https://raw.githubusercontent.com/webdevcody/nebula/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/AgentSystemLabs/nebula/main/install.sh | sh
 #
 # Grabs the prebuilt binary for this platform from the latest GitHub release,
 # falling back to `cargo install --git` when no release (or no matching asset)
@@ -11,7 +11,7 @@
 #   NEBULA_INSTALL_DIR   install destination (default: ~/.local/bin)
 set -eu
 
-REPO="webdevcody/nebula"
+REPO="AgentSystemLabs/nebula"
 INSTALL_DIR="${NEBULA_INSTALL_DIR:-$HOME/.local/bin}"
 
 say() { printf '%s\n' "$*"; }

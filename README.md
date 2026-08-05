@@ -22,7 +22,7 @@ agent manager — entirely inside your terminal.
 macOS or Linux — the same command installs and updates:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/webdevcody/nebula/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/AgentSystemLabs/nebula/main/install.sh | sh
 ```
 
 Downloads the prebuilt binary for your platform from the latest GitHub release
