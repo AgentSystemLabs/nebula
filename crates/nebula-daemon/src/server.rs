@@ -66,7 +66,9 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             daemon_pid: std::process::id(),
                         }
                     } else {
-                        ServerEvent::Incompatible { daemon_protocol_version: PROTOCOL_VERSION }
+                        ServerEvent::Incompatible {
+                            daemon_protocol_version: PROTOCOL_VERSION,
+                        }
                     };
                     let closing = !handshaken;
                     let _ = out_tx.send(reply).await;
@@ -76,7 +78,10 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 _ if !handshaken => {
                     let _ = out_tx
-                        .send(ServerEvent::Error { req_id: None, message: "handshake required".into() })
+                        .send(ServerEvent::Error {
+                            req_id: None,
+                            message: "handshake required".into(),
+                        })
                         .await;
                     break;
                 }
@@ -99,13 +104,20 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                                         break;
                                     }
                                 }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                    continue
+                                }
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             }
                         }
                     });
                 }
-                ClientRequest::Attach { session: sref, from_seq, cols, rows } => {
+                ClientRequest::Attach {
+                    session: sref,
+                    from_seq,
+                    cols,
+                    rows,
+                } => {
                     match daemon.ensure_session(&sref, cols, rows) {
                         Ok(session) => {
                             // Subscribe BEFORE snapshotting so nothing falls in
@@ -115,7 +127,11 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             let (base_seq, data) = session.snapshot(from_seq);
                             let replay_end = base_seq + data.len() as u64;
                             let _ = out_tx
-                                .send(ServerEvent::Scrollback { session: sref.clone(), base_seq, data })
+                                .send(ServerEvent::Scrollback {
+                                    session: sref.clone(),
+                                    base_seq,
+                                    data,
+                                })
                                 .await;
                             let _ = out_tx
                                 .send(ServerEvent::KittyFlags {
@@ -139,7 +155,10 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         }
                         Err(e) => {
                             let _ = out_tx
-                                .send(ServerEvent::Error { req_id: None, message: format!("attach: {e:#}") })
+                                .send(ServerEvent::Error {
+                                    req_id: None,
+                                    message: format!("attach: {e:#}"),
+                                })
                                 .await;
                         }
                     }
@@ -156,7 +175,11 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         }
                     }
                 }
-                ClientRequest::Resize { session, cols, rows } => {
+                ClientRequest::Resize {
+                    session,
+                    cols,
+                    rows,
+                } => {
                     if let Some(s) = daemon.session(&session) {
                         let _ = s.resize(cols, rows);
                     }
@@ -171,33 +194,90 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 // ---- entity CRUD: run the op, reply Ack/Error ----
                 ClientRequest::AddProject { req_id, path, name } => {
-                    reply(&out_tx, req_id, daemon.add_project(&path, name).await.map(Some)).await;
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.add_project(&path, name).await.map(Some),
+                    )
+                    .await;
                 }
                 ClientRequest::RemoveProject { req_id, id } => {
                     reply(&out_tx, req_id, daemon.remove_project(&id).map(|_| None)).await;
                 }
                 ClientRequest::MoveProject { req_id, id, delta } => {
-                    reply(&out_tx, req_id, daemon.move_project(&id, delta).map(|_| None)).await;
-                }
-                ClientRequest::SetProjectDivider { req_id, id, divider_after, label } => {
-                    reply(&out_tx, req_id, daemon.set_project_divider(&id, divider_after, label).map(|_| None)).await;
-                }
-                ClientRequest::CreateWorktree { req_id, project, branch, base } => {
                     reply(
                         &out_tx,
                         req_id,
-                        daemon.create_worktree(&project, &branch, base.as_deref()).await.map(Some),
+                        daemon.move_project(&id, delta).map(|_| None),
+                    )
+                    .await;
+                }
+                ClientRequest::SetProjectDivider {
+                    req_id,
+                    id,
+                    divider_after,
+                    label,
+                } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon
+                            .set_project_divider(&id, divider_after, label)
+                            .map(|_| None),
+                    )
+                    .await;
+                }
+                ClientRequest::MoveDivider { req_id, id, delta } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.move_divider(&id, delta).map(|_| None),
+                    )
+                    .await;
+                }
+                ClientRequest::CreateWorktree {
+                    req_id,
+                    project,
+                    branch,
+                    base,
+                } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon
+                            .create_worktree(&project, &branch, base.as_deref())
+                            .await
+                            .map(Some),
                     )
                     .await;
                 }
                 ClientRequest::DeleteWorktree { req_id, id, force } => {
-                    reply(&out_tx, req_id, daemon.delete_worktree(&id, force).await.map(|_| None)).await;
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.delete_worktree(&id, force).await.map(|_| None),
+                    )
+                    .await;
                 }
-                ClientRequest::CreateAgent { req_id, worktree, name } => {
-                    reply(&out_tx, req_id, daemon.create_agent(&worktree, &name).map(Some)).await;
+                ClientRequest::CreateAgent {
+                    req_id,
+                    worktree,
+                    name,
+                } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.create_agent(&worktree, &name).map(Some),
+                    )
+                    .await;
                 }
                 ClientRequest::RenameAgent { req_id, id, name } => {
-                    reply(&out_tx, req_id, daemon.rename_agent(&id, &name).map(|_| None)).await;
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.rename_agent(&id, &name).map(|_| None),
+                    )
+                    .await;
                 }
                 ClientRequest::ArchiveAgent { req_id, id } => {
                     reply(&out_tx, req_id, daemon.archive_agent(&id).map(|_| None)).await;
@@ -211,11 +291,25 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientRequest::RestartAgent { req_id, id } => {
                     reply(&out_tx, req_id, daemon.restart_agent(&id).map(|_| None)).await;
                 }
-                ClientRequest::CreateTerminal { req_id, worktree, name } => {
-                    reply(&out_tx, req_id, daemon.create_terminal(&worktree, name).map(Some)).await;
+                ClientRequest::CreateTerminal {
+                    req_id,
+                    worktree,
+                    name,
+                } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.create_terminal(&worktree, name).map(Some),
+                    )
+                    .await;
                 }
                 ClientRequest::RenameTerminal { req_id, id, name } => {
-                    reply(&out_tx, req_id, daemon.rename_terminal(&id, &name).map(|_| None)).await;
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.rename_terminal(&id, &name).map(|_| None),
+                    )
+                    .await;
                 }
                 ClientRequest::CloseTerminal { req_id, id } => {
                     reply(&out_tx, req_id, daemon.close_terminal(&id).map(|_| None)).await;
@@ -252,11 +346,19 @@ async fn forward_pty(
                     continue; // fully covered by the replay
                 }
                 let skip = min_seq.saturating_sub(seq) as usize;
-                let payload = if skip > 0 { data[skip..].to_vec() } else { data };
+                let payload = if skip > 0 {
+                    data[skip..].to_vec()
+                } else {
+                    data
+                };
                 let send_seq = seq + skip as u64;
                 min_seq = end;
                 if out_tx
-                    .send(ServerEvent::Output { session: sref.clone(), seq: send_seq, data: payload })
+                    .send(ServerEvent::Output {
+                        session: sref.clone(),
+                        seq: send_seq,
+                        data: payload,
+                    })
                     .await
                     .is_err()
                 {
@@ -264,12 +366,20 @@ async fn forward_pty(
                 }
             }
             Ok(PtyEvent::Exited { exit_code }) => {
-                let _ = out_tx.send(ServerEvent::SessionExited { session: sref.clone(), exit_code }).await;
+                let _ = out_tx
+                    .send(ServerEvent::SessionExited {
+                        session: sref.clone(),
+                        exit_code,
+                    })
+                    .await;
                 break;
             }
             Ok(PtyEvent::KittyFlags { flags }) => {
                 if out_tx
-                    .send(ServerEvent::KittyFlags { session: sref.clone(), flags })
+                    .send(ServerEvent::KittyFlags {
+                        session: sref.clone(),
+                        flags,
+                    })
                     .await
                     .is_err()
                 {
@@ -286,9 +396,17 @@ async fn forward_pty(
                 let (base_seq, data) = session.snapshot(Some(wanted));
                 min_seq = base_seq + data.len() as u64;
                 let ev = if base_seq == wanted {
-                    ServerEvent::Output { session: sref.clone(), seq: base_seq, data }
+                    ServerEvent::Output {
+                        session: sref.clone(),
+                        seq: base_seq,
+                        data,
+                    }
                 } else {
-                    ServerEvent::Scrollback { session: sref.clone(), base_seq, data }
+                    ServerEvent::Scrollback {
+                        session: sref.clone(),
+                        base_seq,
+                        data,
+                    }
                 };
                 if out_tx.send(ev).await.is_err() {
                     break;
@@ -306,7 +424,10 @@ async fn reply(
 ) {
     let ev = match result {
         Ok(created) => ServerEvent::Ack { req_id, created },
-        Err(e) => ServerEvent::Error { req_id: Some(req_id), message: format!("{e:#}") },
+        Err(e) => ServerEvent::Error {
+            req_id: Some(req_id),
+            message: format!("{e:#}"),
+        },
     };
     let _ = out_tx.send(ev).await;
 }

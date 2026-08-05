@@ -1,8 +1,8 @@
 //! TUI state: the Elm-ish Model.
 
 use nebula_core::{
-    Agent, AgentId, AgentStatus, Project, ProjectId, SessionRef, TerminalId, TerminalTab,
-    Worktree, WorktreeId,
+    Agent, AgentId, AgentStatus, Project, ProjectId, SessionRef, TerminalId, TerminalTab, Worktree,
+    WorktreeId,
 };
 use ratatui::layout::Rect;
 use std::collections::HashMap;
@@ -91,12 +91,24 @@ pub struct ConfirmDialog {
 pub enum PromptKind {
     AddProject,
     /// Label for the divider hanging below this project.
-    DividerLabel { id: ProjectId },
-    NewWorktree { project: ProjectId },
-    NewAgent { worktree: WorktreeId },
-    NewTerminal { worktree: WorktreeId },
-    RenameAgent { id: AgentId },
-    RenameTerminal { id: TerminalId },
+    DividerLabel {
+        id: ProjectId,
+    },
+    NewWorktree {
+        project: ProjectId,
+    },
+    NewAgent {
+        worktree: WorktreeId,
+    },
+    NewTerminal {
+        worktree: WorktreeId,
+    },
+    RenameAgent {
+        id: AgentId,
+    },
+    RenameTerminal {
+        id: TerminalId,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +141,8 @@ pub enum Overlay {
 pub enum PendingIntent {
     /// Attach the created session and focus the terminal.
     AttachCreated,
+    /// Select the created worktree in the Worktrees panel.
+    SelectCreatedWorktree,
     None,
 }
 
@@ -329,6 +343,17 @@ pub struct App {
     pub pending: HashMap<u64, PendingIntent>,
     /// Session created by us, awaiting its upsert to fix the selection.
     pub select_when_seen: Option<SessionRef>,
+    /// A divider we asked to move, awaiting the upsert that lands it under
+    /// this project so the selection can follow it there.
+    pub select_divider_when_seen: Option<ProjectId>,
+    /// Worktree created by us, awaiting its upsert to fix the selection.
+    pub select_worktree_when_seen: Option<WorktreeId>,
+    /// Last selected worktree per project — switching back to a project
+    /// returns to the worktree the user left it on.
+    pub last_worktree_for_project: HashMap<ProjectId, WorktreeId>,
+    /// Last selected session per worktree — switching back to a worktree
+    /// re-shows the session the user left it on.
+    pub last_session_for_worktree: HashMap<WorktreeId, SessionRef>,
     /// Mouse drag-selection over the terminal pane, if any.
     pub term_selection: Option<TermSelection>,
 }
@@ -361,6 +386,10 @@ impl App {
             next_req_id: 1,
             pending: HashMap::new(),
             select_when_seen: None,
+            select_divider_when_seen: None,
+            select_worktree_when_seen: None,
+            last_worktree_for_project: HashMap::new(),
+            last_session_for_worktree: HashMap::new(),
             term_selection: None,
         }
     }
@@ -428,7 +457,11 @@ impl App {
         let Some(project) = self.selected_project() else {
             return vec![];
         };
-        self.tree.worktrees.iter().filter(|w| w.project_id == project.id).collect()
+        self.tree
+            .worktrees
+            .iter()
+            .filter(|w| w.project_id == project.id)
+            .collect()
     }
 
     /// Session rows for the selected worktree: active agents, then terminals,
@@ -473,11 +506,24 @@ impl App {
         let Some(wt) = worktrees.get(self.sel_worktree) else {
             return (0, 0, 0);
         };
-        let agents =
-            self.tree.agents.iter().filter(|a| a.worktree_id == wt.id && !a.archived).count();
-        let terminals = self.tree.terminals.iter().filter(|t| t.worktree_id == wt.id).count();
-        let archived =
-            self.tree.agents.iter().filter(|a| a.worktree_id == wt.id && a.archived).count();
+        let agents = self
+            .tree
+            .agents
+            .iter()
+            .filter(|a| a.worktree_id == wt.id && !a.archived)
+            .count();
+        let terminals = self
+            .tree
+            .terminals
+            .iter()
+            .filter(|t| t.worktree_id == wt.id)
+            .count();
+        let archived = self
+            .tree
+            .agents
+            .iter()
+            .filter(|a| a.worktree_id == wt.id && a.archived)
+            .count();
         (agents, terminals, archived)
     }
 

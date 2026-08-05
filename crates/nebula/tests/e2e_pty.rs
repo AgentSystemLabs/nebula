@@ -3,9 +3,7 @@
 //! across a daemon restart.
 
 use nebula_core::codec::{read_frame, write_frame};
-use nebula_core::{
-    ClientRequest, Entity, EntityId, ServerEvent, SessionRef, PROTOCOL_VERSION,
-};
+use nebula_core::{ClientRequest, Entity, EntityId, ServerEvent, SessionRef, PROTOCOL_VERSION};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -33,6 +31,7 @@ impl TestEnv {
             .env("NEBULA_DATA_DIR", self.tmp.path().join("data"))
             .env("SHELL", "/bin/sh")
             .env("NEBULA_AGENT_CMD", "/bin/sh") // no real claude in tests
+            .env("NEBULA_WORKTREE_SYNC_MS", "100") // fast external-worktree pickup
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -79,9 +78,14 @@ async fn connect(sock: &Path) -> UnixStream {
 }
 
 async fn handshake(stream: &mut UnixStream) {
-    write_frame(stream, &ClientRequest::Hello { protocol_version: PROTOCOL_VERSION })
-        .await
-        .unwrap();
+    write_frame(
+        stream,
+        &ClientRequest::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        },
+    )
+    .await
+    .unwrap();
     match read_frame::<ServerEvent, _>(stream).await.unwrap() {
         Some(ServerEvent::HelloOk { .. }) => {}
         other => panic!("bad handshake reply: {other:?}"),
@@ -141,9 +145,12 @@ async fn full_crud_attach_and_restart_persistence() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe).await.unwrap();
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
     let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
     .await;
     match &events[0] {
@@ -152,16 +159,32 @@ async fn full_crud_attach_and_restart_persistence() {
     }
 
     // ---- AddProject: creates project + main worktree row ----
-    write_frame(&mut c, &ClientRequest::AddProject { req_id: 1, path: repo.clone(), name: None })
-        .await
-        .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: repo.clone(),
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
     let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
         find_ack(evs, 1).is_some()
-            && evs.iter().any(|e| matches!(e, ServerEvent::EntityUpserted { entity: Entity::Worktree(_) }))
+            && evs.iter().any(|e| {
+                matches!(
+                    e,
+                    ServerEvent::EntityUpserted {
+                        entity: Entity::Worktree(_)
+                    }
+                )
+            })
     })
     .await;
-    let ServerEvent::Ack { created: Some(EntityId::Project(project_id)), .. } =
-        find_ack(&events, 1).unwrap()
+    let ServerEvent::Ack {
+        created: Some(EntityId::Project(project_id)),
+        ..
+    } = find_ack(&events, 1).unwrap()
     else {
         panic!("AddProject failed: {events:#?}");
     };
@@ -169,36 +192,58 @@ async fn full_crud_attach_and_restart_persistence() {
     let main_worktree = events
         .iter()
         .find_map(|e| match e {
-            ServerEvent::EntityUpserted { entity: Entity::Worktree(w) } if w.is_main => Some(w.clone()),
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } if w.is_main => Some(w.clone()),
             _ => None,
         })
         .expect("main worktree upsert");
     assert_eq!(main_worktree.branch, "main");
 
     // ---- CreateTerminal + attach + echo through the PTY ----
-    write_frame(&mut c, &ClientRequest::CreateTerminal {
-        req_id: 2,
-        worktree: main_worktree.id.clone(),
-        name: None,
-    })
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateTerminal {
+            req_id: 2,
+            worktree: main_worktree.id.clone(),
+            name: None,
+        },
+    )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| find_ack(evs, 2).is_some()).await;
-    let ServerEvent::Ack { created: Some(EntityId::Terminal(term_id)), .. } = find_ack(&events, 2).unwrap()
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Terminal(term_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
     else {
         panic!("CreateTerminal failed: {events:#?}");
     };
     let term_id = term_id.clone();
 
     let sref = SessionRef::Terminal(term_id);
-    write_frame(&mut c, &ClientRequest::Attach { session: sref.clone(), from_seq: None, cols: 80, rows: 24 })
-        .await
-        .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
     let marker = "nebula_e2e_marker_4519";
-    write_frame(&mut c, &ClientRequest::Input {
-        session: sref.clone(),
-        data: format!("echo {marker}; pwd\n").into_bytes(),
-    })
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: format!("echo {marker}; pwd\n").into_bytes(),
+        },
+    )
     .await
     .unwrap();
     let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
@@ -208,29 +253,47 @@ async fn full_crud_attach_and_restart_persistence() {
     .await;
     // The shell runs in the worktree directory.
     let text = String::from_utf8_lossy(&collected_output(&events)).into_owned();
-    assert!(text.contains("repo"), "terminal cwd should be the worktree: {text}");
+    assert!(
+        text.contains("repo"),
+        "terminal cwd should be the worktree: {text}"
+    );
 
     // ---- CreateAgent (NEBULA_AGENT_CMD=/bin/sh stands in for claude) ----
-    write_frame(&mut c, &ClientRequest::CreateAgent {
-        req_id: 3,
-        worktree: main_worktree.id.clone(),
-        name: "agent-1".into(),
-    })
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 3,
+            worktree: main_worktree.id.clone(),
+            name: "agent-1".into(),
+        },
+    )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| find_ack(evs, 3).is_some()).await;
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 3).is_some()
+    })
+    .await;
     assert!(
-        matches!(find_ack(&events, 3), Some(ServerEvent::Ack { created: Some(EntityId::Agent(_)), .. })),
+        matches!(
+            find_ack(&events, 3),
+            Some(ServerEvent::Ack {
+                created: Some(EntityId::Agent(_)),
+                ..
+            })
+        ),
         "CreateAgent failed: {events:#?}"
     );
 
     // ---- CreateWorktree: real `git worktree add` on disk ----
-    write_frame(&mut c, &ClientRequest::CreateWorktree {
-        req_id: 4,
-        project: project_id.clone(),
-        branch: "feature-x".into(),
-        base: None,
-    })
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateWorktree {
+            req_id: 4,
+            project: project_id.clone(),
+            branch: "feature-x".into(),
+            base: None,
+        },
+    )
     .await
     .unwrap();
     let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
@@ -240,8 +303,10 @@ async fn full_crud_attach_and_restart_persistence() {
             })
     })
     .await;
-    let ServerEvent::Ack { created: Some(EntityId::Worktree(feature_wt_id)), .. } =
-        find_ack(&events, 4).unwrap()
+    let ServerEvent::Ack {
+        created: Some(EntityId::Worktree(feature_wt_id)),
+        ..
+    } = find_ack(&events, 4).unwrap()
     else {
         panic!("CreateWorktree failed: {events:#?}");
     };
@@ -249,19 +314,29 @@ async fn full_crud_attach_and_restart_persistence() {
     let feature_wt_path = events
         .iter()
         .find_map(|e| match e {
-            ServerEvent::EntityUpserted { entity: Entity::Worktree(w) } if w.id == feature_wt_id => {
-                Some(w.path.clone())
-            }
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } if w.id == feature_wt_id => Some(w.path.clone()),
             _ => None,
         })
         .expect("worktree upsert carries its path");
     assert!(feature_wt_path.exists(), "worktree dir created on disk");
 
     // ---- DeleteWorktree removes it from disk ----
-    write_frame(&mut c, &ClientRequest::DeleteWorktree { req_id: 5, id: feature_wt_id.clone(), force: true })
-        .await
-        .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| find_ack(evs, 5).is_some()).await;
+    write_frame(
+        &mut c,
+        &ClientRequest::DeleteWorktree {
+            req_id: 5,
+            id: feature_wt_id.clone(),
+            force: true,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        find_ack(evs, 5).is_some()
+    })
+    .await;
     assert!(
         matches!(find_ack(&events, 5), Some(ServerEvent::Ack { .. })),
         "DeleteWorktree failed: {events:#?}"
@@ -275,12 +350,22 @@ async fn full_crud_attach_and_restart_persistence() {
     let mut daemon2 = env.spawn_daemon();
     let mut c2 = connect(&env.sock()).await;
     handshake(&mut c2).await;
-    write_frame(&mut c2, &ClientRequest::Subscribe).await.unwrap();
+    write_frame(&mut c2, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
     let events = read_events_until(&mut c2, Duration::from_secs(5), |evs| {
-        evs.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
     .await;
-    let ServerEvent::Snapshot { projects, worktrees, agents, terminals, .. } = &events[0] else {
+    let ServerEvent::Snapshot {
+        projects,
+        worktrees,
+        agents,
+        terminals,
+        ..
+    } = &events[0]
+    else {
         panic!("expected snapshot");
     };
     assert_eq!(projects.len(), 1, "project persisted");
@@ -292,22 +377,38 @@ async fn full_crud_attach_and_restart_persistence() {
 
     // Reattach the persisted terminal: lazy respawn, cwd still the worktree.
     let sref2 = SessionRef::Terminal(terminals[0].id.clone());
-    write_frame(&mut c2, &ClientRequest::Attach { session: sref2.clone(), from_seq: None, cols: 80, rows: 24 })
-        .await
-        .unwrap();
+    write_frame(
+        &mut c2,
+        &ClientRequest::Attach {
+            session: sref2.clone(),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
     let marker2 = "nebula_e2e_after_restart_8846";
-    write_frame(&mut c2, &ClientRequest::Input {
-        session: sref2,
-        data: format!("echo {marker2}\n").into_bytes(),
-    })
+    write_frame(
+        &mut c2,
+        &ClientRequest::Input {
+            session: sref2,
+            data: format!("echo {marker2}\n").into_bytes(),
+        },
+    )
     .await
     .unwrap();
     read_events_until(&mut c2, Duration::from_secs(5), |evs| {
-        String::from_utf8_lossy(&collected_output(evs)).matches(marker2).count() >= 2
+        String::from_utf8_lossy(&collected_output(evs))
+            .matches(marker2)
+            .count()
+            >= 2
     })
     .await;
 
-    write_frame(&mut c2, &ClientRequest::Shutdown).await.unwrap();
+    write_frame(&mut c2, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
     wait_for_exit(&mut daemon2);
 }
 
@@ -323,20 +424,36 @@ async fn kitty_keyboard_negotiation_passthrough() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::AddProject { req_id: 1, path: repo.clone(), name: None })
-        .await
-        .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| find_ack(evs, 1).is_some()).await;
-    let ServerEvent::Ack { created: Some(EntityId::Project(_)), .. } = find_ack(&events, 1).unwrap()
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: repo.clone(),
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 1).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Project(_)),
+        ..
+    } = find_ack(&events, 1).unwrap()
     else {
         panic!("AddProject failed: {events:#?}");
     };
     // AddProject's worktree upsert goes to subscribers only; fetch it via the DB
     // snapshot path instead: create the terminal against the main worktree id
     // that Subscribe would report. Simplest: subscribe now.
-    write_frame(&mut c, &ClientRequest::Subscribe).await.unwrap();
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
     let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
     .await;
     let worktree_id = events
@@ -347,21 +464,43 @@ async fn kitty_keyboard_negotiation_passthrough() {
         })
         .expect("main worktree in snapshot");
 
-    write_frame(&mut c, &ClientRequest::CreateTerminal { req_id: 2, worktree: worktree_id, name: None })
-        .await
-        .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| find_ack(evs, 2).is_some()).await;
-    let ServerEvent::Ack { created: Some(EntityId::Terminal(term_id)), .. } = find_ack(&events, 2).unwrap()
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateTerminal {
+            req_id: 2,
+            worktree: worktree_id,
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Terminal(term_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
     else {
         panic!("CreateTerminal failed: {events:#?}");
     };
     let sref = SessionRef::Terminal(term_id.clone());
-    write_frame(&mut c, &ClientRequest::Attach { session: sref.clone(), from_seq: None, cols: 100, rows: 30 })
-        .await
-        .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 100,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
     // Attach reports the child's current (legacy) flags right away.
     read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter().any(|e| matches!(e, ServerEvent::KittyFlags { flags: 0, .. }))
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::KittyFlags { flags: 0, .. }))
     })
     .await;
 
@@ -370,48 +509,73 @@ async fn kitty_keyboard_negotiation_passthrough() {
     // reply greppable in plain text.
     let probe = "stty -icanon -echo min 0 time 20; printf '\\033[?u'; sleep 1; \
                  printf 'REPLY:'; dd bs=64 count=1 2>/dev/null | tr '\\033' 'E'; echo; stty sane\n";
-    write_frame(&mut c, &ClientRequest::Input { session: sref.clone(), data: probe.into() })
-        .await
-        .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: probe.into(),
+        },
+    )
+    .await
+    .unwrap();
     read_events_until(&mut c, Duration::from_secs(10), |evs| {
         String::from_utf8_lossy(&collected_output(evs)).contains("REPLY:E[?0u")
     })
     .await;
 
     // Pushing flags reaches the attached client…
-    write_frame(&mut c, &ClientRequest::Input {
-        session: sref.clone(),
-        data: b"printf '\\033[>1u'\n".to_vec(),
-    })
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: b"printf '\\033[>1u'\n".to_vec(),
+        },
+    )
     .await
     .unwrap();
     read_events_until(&mut c, Duration::from_secs(10), |evs| {
-        evs.iter().any(|e| matches!(e, ServerEvent::KittyFlags { flags: 1, .. }))
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::KittyFlags { flags: 1, .. }))
     })
     .await;
 
     // …survives a re-attach (fresh client learns the current mode)…
-    write_frame(&mut c, &ClientRequest::Attach { session: sref.clone(), from_seq: None, cols: 100, rows: 30 })
-        .await
-        .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 100,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
     let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter().any(|e| matches!(e, ServerEvent::KittyFlags { .. }))
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::KittyFlags { .. }))
     })
     .await;
     assert!(
-        events.iter().any(|e| matches!(e, ServerEvent::KittyFlags { flags: 1, .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, ServerEvent::KittyFlags { flags: 1, .. })),
         "re-attach must report the pushed flags: {events:#?}"
     );
 
     // …and popping restores legacy.
-    write_frame(&mut c, &ClientRequest::Input {
-        session: sref.clone(),
-        data: b"printf '\\033[<u'\n".to_vec(),
-    })
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: b"printf '\\033[<u'\n".to_vec(),
+        },
+    )
     .await
     .unwrap();
     read_events_until(&mut c, Duration::from_secs(10), |evs| {
-        evs.iter().any(|e| matches!(e, ServerEvent::KittyFlags { flags: 0, .. }))
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::KittyFlags { flags: 0, .. }))
     })
     .await;
 
@@ -431,36 +595,64 @@ async fn hook_post_from_agent_pty_drives_status() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe).await.unwrap();
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
     read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
     .await;
 
-    write_frame(&mut c, &ClientRequest::AddProject { req_id: 1, path: repo.clone(), name: None })
-        .await
-        .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: repo.clone(),
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
     let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter().any(|e| matches!(e, ServerEvent::EntityUpserted { entity: Entity::Worktree(_) }))
+        evs.iter().any(|e| {
+            matches!(
+                e,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(_)
+                }
+            )
+        })
     })
     .await;
     let worktree = events
         .iter()
         .find_map(|e| match e {
-            ServerEvent::EntityUpserted { entity: Entity::Worktree(w) } => Some(w.clone()),
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } => Some(w.clone()),
             _ => None,
         })
         .unwrap();
 
-    write_frame(&mut c, &ClientRequest::CreateAgent {
-        req_id: 2,
-        worktree: worktree.id.clone(),
-        name: "hooked".into(),
-    })
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: worktree.id.clone(),
+            name: "hooked".into(),
+        },
+    )
     .await
     .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| find_ack(evs, 2).is_some()).await;
-    let ServerEvent::Ack { created: Some(EntityId::Agent(agent_id)), .. } = find_ack(&events, 2).unwrap()
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
     else {
         panic!("CreateAgent failed: {events:#?}");
     };
@@ -471,13 +663,23 @@ async fn hook_post_from_agent_pty_drives_status() {
     assert!(settings_path.exists(), "hooks installed into worktree");
     let settings: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
-    assert!(settings["hooks"]["Stop"][0]["_nebulaManaged"].as_bool().unwrap());
+    assert!(settings["hooks"]["Stop"][0]["_nebulaManaged"]
+        .as_bool()
+        .unwrap());
 
     // Drive the shell inside the agent PTY to POST hooks with its own env.
     let sref = SessionRef::Agent(agent_id.clone());
-    write_frame(&mut c, &ClientRequest::Attach { session: sref.clone(), from_seq: None, cols: 120, rows: 30 })
-        .await
-        .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 120,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
     let curl = |event: &str, body: &str| {
         format!(
             "curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
@@ -487,10 +689,13 @@ async fn hook_post_from_agent_pty_drives_status() {
     };
 
     // UserPromptSubmit → running
-    write_frame(&mut c, &ClientRequest::Input {
-        session: sref.clone(),
-        data: curl("UserPromptSubmit", r#"{"session_id":"sess-1"}"#).into_bytes(),
-    })
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: curl("UserPromptSubmit", r#"{"session_id":"sess-1"}"#).into_bytes(),
+        },
+    )
     .await
     .unwrap();
     read_events_until(&mut c, Duration::from_secs(10), |evs| {
@@ -502,11 +707,17 @@ async fn hook_post_from_agent_pty_drives_status() {
     .await;
 
     // Notification(permission_prompt) → needs_feedback
-    write_frame(&mut c, &ClientRequest::Input {
-        session: sref.clone(),
-        data: curl("Notification", r#"{"session_id":"sess-1","notification_type":"permission_prompt"}"#)
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: curl(
+                "Notification",
+                r#"{"session_id":"sess-1","notification_type":"permission_prompt"}"#,
+            )
             .into_bytes(),
-    })
+        },
+    )
     .await
     .unwrap();
     read_events_until(&mut c, Duration::from_secs(10), |evs| {
@@ -518,17 +729,23 @@ async fn hook_post_from_agent_pty_drives_status() {
     .await;
 
     // A foreign session's Stop is ignored…
-    write_frame(&mut c, &ClientRequest::Input {
-        session: sref.clone(),
-        data: curl("Stop", r#"{"session_id":"someone-elses-claude"}"#).into_bytes(),
-    })
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: curl("Stop", r#"{"session_id":"someone-elses-claude"}"#).into_bytes(),
+        },
+    )
     .await
     .unwrap();
     // …while the owning session's Stop finishes the agent.
-    write_frame(&mut c, &ClientRequest::Input {
-        session: sref.clone(),
-        data: curl("Stop", r#"{"session_id":"sess-1"}"#).into_bytes(),
-    })
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: curl("Stop", r#"{"session_id":"sess-1"}"#).into_bytes(),
+        },
+    )
     .await
     .unwrap();
     let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
@@ -543,7 +760,13 @@ async fn hook_post_from_agent_pty_drives_status() {
     let finished_count = events
         .iter()
         .filter(|e| {
-            matches!(e, ServerEvent::StatusChanged { status: nebula_core::AgentStatus::Finished, .. })
+            matches!(
+                e,
+                ServerEvent::StatusChanged {
+                    status: nebula_core::AgentStatus::Finished,
+                    ..
+                }
+            )
         })
         .count();
     assert_eq!(finished_count, 1, "foreign-session Stop must be ignored");
@@ -554,15 +777,119 @@ async fn hook_post_from_agent_pty_drives_status() {
     let mut daemon2 = env.spawn_daemon();
     let mut c2 = connect(&env.sock()).await;
     handshake(&mut c2).await;
-    write_frame(&mut c2, &ClientRequest::Subscribe).await.unwrap();
+    write_frame(&mut c2, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
     let events = read_events_until(&mut c2, Duration::from_secs(5), |evs| {
-        evs.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
     .await;
-    let ServerEvent::Snapshot { agents, .. } = &events[0] else { panic!() };
-    assert_eq!(agents[0].claude_session_id.as_deref(), Some("sess-1"), "session id persisted");
-    write_frame(&mut c2, &ClientRequest::Shutdown).await.unwrap();
+    let ServerEvent::Snapshot { agents, .. } = &events[0] else {
+        panic!()
+    };
+    assert_eq!(
+        agents[0].claude_session_id.as_deref(),
+        Some("sess-1"),
+        "session id persisted"
+    );
+    write_frame(&mut c2, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
     wait_for_exit(&mut daemon2);
+}
+
+#[tokio::test]
+async fn external_worktrees_are_adopted_and_dropped() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: repo.clone(),
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 1).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&events, 1), Some(ServerEvent::Ack { .. })),
+        "AddProject failed: {events:#?}"
+    );
+
+    // A worktree created behind nebula's back — exactly what an agent (or a
+    // human in another shell) does.
+    let wt_path = env.tmp.path().join("repo-worktrees").join("agent-branch");
+    let git_worktree = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("worktree")
+            .args(args)
+            .arg(&wt_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(
+        git_worktree(&["add", "-b", "agent-branch"]),
+        "external git worktree add failed"
+    );
+
+    // The auto-sync adopts it without any client request.
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| matches!(
+            e,
+            ServerEvent::EntityUpserted { entity: Entity::Worktree(w) } if w.branch == "agent-branch"
+        ))
+    })
+    .await;
+    let adopted = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } if w.branch == "agent-branch" => Some(w.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!adopted.is_main, "adopted checkout is not the main row");
+    assert!(
+        adopted.path.exists(),
+        "adopted row points at the real checkout"
+    );
+
+    // Removing it externally drops the row too (nothing lives there).
+    assert!(
+        git_worktree(&["remove", "--force"]),
+        "external git worktree remove failed"
+    );
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| {
+            matches!(
+                e,
+                ServerEvent::EntityRemoved { id: EntityId::Worktree(id) } if *id == adopted.id
+            )
+        })
+    })
+    .await;
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
 }
 
 fn wait_for_exit(daemon: &mut std::process::Child) {

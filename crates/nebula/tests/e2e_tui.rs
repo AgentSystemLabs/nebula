@@ -49,7 +49,12 @@ impl TuiHarness {
         let repos = tempfile::tempdir().unwrap();
 
         let pty = native_pty_system()
-            .openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows: ROWS,
+                cols: COLS,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .unwrap();
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_nebula"));
         cmd.env("NEBULA_RUNTIME_DIR", &runtime_dir);
@@ -58,6 +63,10 @@ impl TuiHarness {
         cmd.env("NEBULA_LOG", "debug");
         cmd.env("SHELL", "/bin/sh");
         cmd.env("TERM", "xterm-256color");
+        // Agent/CI shells often export NO_COLOR; crossterm then strips the
+        // reverse/bold attrs wait_for_selected relies on.
+        cmd.env_remove("NO_COLOR");
+        cmd.env_remove("FORCE_COLOR");
         cmd.cwd(repos.path());
         let child = pty.slave.spawn_command(cmd).unwrap();
         drop(pty.slave);
@@ -82,7 +91,14 @@ impl TuiHarness {
             });
         }
 
-        Self { writer, parser, child, runtime_dir, data_dir, _repos: repos }
+        Self {
+            writer,
+            parser,
+            child,
+            runtime_dir,
+            data_dir,
+            _repos: repos,
+        }
     }
 
     /// A committed git repo named `name` (fresh `git init` + one commit —
@@ -158,7 +174,9 @@ impl TuiHarness {
     }
 
     fn wait_for_text(&self, needle: &str) {
-        self.wait_for(&format!("text {needle:?}"), |s| screen_to_text(s).contains(needle));
+        self.wait_for(&format!("text {needle:?}"), |s| {
+            screen_to_text(s).contains(needle)
+        });
     }
 
     fn wait_for_gone(&self, needle: &str) {
@@ -209,7 +227,7 @@ fn screen_to_text(screen: &vt100::Screen) -> String {
         for col in 0..cols {
             match screen.cell(row, col) {
                 Some(cell) => {
-                    let contents: String = cell.contents().into();
+                    let contents = cell.contents();
                     if contents.is_empty() {
                         out.push(' ');
                     } else {
@@ -234,8 +252,10 @@ fn sessions_panel_contains(screen: &vt100::Screen, needle: &str) -> bool {
     for row in 0..rows {
         let mut line = String::new();
         for col in SESSIONS_X..right {
-            let contents: String =
-                screen.cell(row, col).map(|c| c.contents().into()).unwrap_or_default();
+            let contents = screen
+                .cell(row, col)
+                .map(|c| c.contents())
+                .unwrap_or_default();
             if contents.is_empty() {
                 line.push(' ');
             } else {
@@ -254,8 +274,10 @@ fn row_is_reversed(screen: &vt100::Screen, needle: &str) -> bool {
     for row in 0..rows {
         let mut line = String::new();
         for col in 0..cols {
-            let contents: String =
-                screen.cell(row, col).map(|c| c.contents().into()).unwrap_or_default();
+            let contents = screen
+                .cell(row, col)
+                .map(|c| c.contents())
+                .unwrap_or_default();
             if contents.is_empty() {
                 line.push(' ');
             } else {
@@ -355,13 +377,15 @@ fn tui_projects_worktrees_agents_navigation() {
     assert!(wt_root.join("feat-a").exists(), "feat-a worktree on disk");
     assert!(wt_root.join("feat-b").exists(), "feat-b worktree on disk");
 
-    // ---- j/k moves the worktree selection: main → feat-a → feat-b → feat-a ----
+    // ---- a fresh worktree is auto-selected: feat-b was created last ----
+    tui.wait_for_selected("feat-b");
+
+    // ---- j/k still walks the selection: feat-b → feat-a → main → feat-a ----
+    tui.send(b"k");
+    tui.wait_for_selected("feat-a");
+    tui.send(b"k");
     tui.wait_for_selected("main (main)");
     tui.send(b"j");
-    tui.wait_for_selected("feat-a");
-    tui.send(b"j");
-    tui.wait_for_selected("feat-b");
-    tui.send(b"k");
     tui.wait_for_selected("feat-a");
 
     // ---- Enter shows the sessions (agents) panel for feat-a ----
@@ -413,14 +437,12 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.wait_for_text("feat-a");
     tui.wait_for_text("feat-b");
 
-    // Switching projects resets the worktree selection to main (by design),
-    // so drill back into feat-a and find the agent again.
+    // Switching back restores the remembered context: feat-a is the
+    // selected worktree again and its agent is back without re-drilling.
+    tui.wait_for_text("agent-1");
     tui.send(b"\r"); // Projects → Worktrees
     tui.wait_for_text(FOOTER_WORKTREES);
-    tui.wait_for_selected("main (main)");
-    tui.send(b"j"); // feat-a
     tui.wait_for_selected("feat-a");
-    tui.wait_for_text("agent-1");
 
     // ---- clean quit ----
     tui.send(b"q");
@@ -428,10 +450,11 @@ fn tui_projects_worktrees_agents_navigation() {
     loop {
         match tui.child.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50))
-            }
-            _ => panic!("TUI did not exit after q\n--- screen ---\n{}", tui.screen_text()),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => panic!(
+                "TUI did not exit after q\n--- screen ---\n{}",
+                tui.screen_text()
+            ),
         }
     }
 }

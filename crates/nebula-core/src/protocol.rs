@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -47,29 +47,95 @@ pub enum ClientRequest {
     },
 
     // -- entity CRUD (RPC-style; answered by Ack/Error with matching req_id) --
-    AddProject { req_id: u64, path: PathBuf, name: Option<String> },
-    RemoveProject { req_id: u64, id: ProjectId },
+    AddProject {
+        req_id: u64,
+        path: PathBuf,
+        name: Option<String>,
+    },
+    RemoveProject {
+        req_id: u64,
+        id: ProjectId,
+    },
     /// Move a project `delta` slots in the list (clamped at the edges).
-    MoveProject { req_id: u64, id: ProjectId, delta: i64 },
+    MoveProject {
+        req_id: u64,
+        id: ProjectId,
+        delta: i64,
+    },
     /// Set the group divider under a project row: presence and label.
     /// `divider_after: false` removes it (label is dropped too).
-    SetProjectDivider { req_id: u64, id: ProjectId, divider_after: bool, label: Option<String> },
-    CreateWorktree { req_id: u64, project: ProjectId, branch: String, base: Option<String> },
-    DeleteWorktree { req_id: u64, id: WorktreeId, force: bool },
-    CreateAgent { req_id: u64, worktree: WorktreeId, name: String },
-    RenameAgent { req_id: u64, id: AgentId, name: String },
+    SetProjectDivider {
+        req_id: u64,
+        id: ProjectId,
+        divider_after: bool,
+        label: Option<String>,
+    },
+    /// Move the divider hanging under project `id` to hang under the
+    /// previous/next project (sign of `delta`). No-op when there is no
+    /// project on that side or it already has a divider.
+    MoveDivider {
+        req_id: u64,
+        id: ProjectId,
+        delta: i64,
+    },
+    CreateWorktree {
+        req_id: u64,
+        project: ProjectId,
+        branch: String,
+        base: Option<String>,
+    },
+    DeleteWorktree {
+        req_id: u64,
+        id: WorktreeId,
+        force: bool,
+    },
+    CreateAgent {
+        req_id: u64,
+        worktree: WorktreeId,
+        name: String,
+    },
+    RenameAgent {
+        req_id: u64,
+        id: AgentId,
+        name: String,
+    },
     /// Kills the PTY, sets archived=1.
-    ArchiveAgent { req_id: u64, id: AgentId },
-    UnarchiveAgent { req_id: u64, id: AgentId },
-    DeleteAgent { req_id: u64, id: AgentId },
+    ArchiveAgent {
+        req_id: u64,
+        id: AgentId,
+    },
+    UnarchiveAgent {
+        req_id: u64,
+        id: AgentId,
+    },
+    DeleteAgent {
+        req_id: u64,
+        id: AgentId,
+    },
     /// Respawn; uses `claude --resume` when a session id is stored.
-    RestartAgent { req_id: u64, id: AgentId },
-    CreateTerminal { req_id: u64, worktree: WorktreeId, name: Option<String> },
-    RenameTerminal { req_id: u64, id: TerminalId, name: String },
-    CloseTerminal { req_id: u64, id: TerminalId },
+    RestartAgent {
+        req_id: u64,
+        id: AgentId,
+    },
+    CreateTerminal {
+        req_id: u64,
+        worktree: WorktreeId,
+        name: Option<String>,
+    },
+    RenameTerminal {
+        req_id: u64,
+        id: TerminalId,
+        name: String,
+    },
+    CloseTerminal {
+        req_id: u64,
+        id: TerminalId,
+    },
 
     /// Fire-and-forget opaque TUI blob (last selection etc.).
-    SaveUiState { json: String },
+    SaveUiState {
+        json: String,
+    },
 
     Shutdown,
 }
@@ -101,9 +167,16 @@ pub enum ServerEvent {
     },
 
     // -- deltas (pushed to all subscribers) --
-    EntityUpserted { entity: Entity },
-    EntityRemoved { id: EntityId },
-    StatusChanged { agent: AgentId, status: AgentStatus },
+    EntityUpserted {
+        entity: Entity,
+    },
+    EntityRemoved {
+        id: EntityId,
+    },
+    StatusChanged {
+        agent: AgentId,
+        status: AgentStatus,
+    },
 
     // -- PTY plane (only to clients attached to that session) --
     /// Ring replay on attach; client resets its parser before applying.

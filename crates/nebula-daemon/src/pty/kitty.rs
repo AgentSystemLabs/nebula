@@ -28,7 +28,9 @@ enum State {
     Esc,
     /// Inside a CSI; params (0x30..=0x3F) collect, intermediates (0x20..=0x2F)
     /// or overflow poison the sequence (we only relay interesting finals).
-    Csi { poisoned: bool },
+    Csi {
+        poisoned: bool,
+    },
 }
 
 pub struct KittyScanner {
@@ -45,7 +47,11 @@ impl Default for KittyScanner {
 
 impl KittyScanner {
     pub fn new() -> Self {
-        Self { state: State::Ground, params: Vec::new(), stack: Vec::new() }
+        Self {
+            state: State::Ground,
+            params: Vec::new(),
+            stack: Vec::new(),
+        }
     }
 
     /// Effective flags: top of the stack, or 0 (legacy) when empty.
@@ -110,8 +116,10 @@ impl KittyScanner {
         match final_byte {
             b'u' => match params.split_first() {
                 // CSI ? u — "do you speak kitty?" Reply with current flags.
-                Some((b'?', rest)) if rest.is_empty() => {
-                    actions.reply.extend_from_slice(format!("\x1b[?{}u", self.flags()).as_bytes());
+                Some((b'?', [])) => {
+                    actions
+                        .reply
+                        .extend_from_slice(format!("\x1b[?{}u", self.flags()).as_bytes());
                 }
                 // CSI > flags u — push (flags default 0).
                 Some((b'>', rest)) => {
