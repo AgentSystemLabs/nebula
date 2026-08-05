@@ -74,11 +74,11 @@ async fn serve() -> Result<()> {
         });
     }
 
-    // Worktrees created or removed outside nebula (an agent running
-    // `git worktree add`, manual CLI use) should show up without a restart.
-    // Git registers every worktree under `<repo>/.git/worktrees`, so a cheap
-    // mtime probe of that dir gates the full `git worktree list` reconcile;
-    // the first tick also runs one boot-time sync per project.
+    // Worktrees created, removed, or re-checked-out outside nebula (an agent
+    // running `git worktree add`, a manual `git checkout` on the root) should
+    // show up without a restart. A cheap mtime probe over the git files those
+    // operations touch gates the full `git worktree list` reconcile; the
+    // first tick also runs one boot-time sync per project.
     {
         let daemon = daemon.clone();
         tokio::spawn(async move {
@@ -102,9 +102,7 @@ async fn serve() -> Result<()> {
                 };
                 seen.retain(|id, _| projects.iter().any(|p| &p.id == id));
                 for project in projects {
-                    let stamp = std::fs::metadata(project.repo_path.join(".git/worktrees"))
-                        .and_then(|m| m.modified())
-                        .ok();
+                    let stamp = worktree_probe_stamp(&project.repo_path);
                     if seen.get(&project.id) == Some(&stamp) {
                         continue;
                     }
@@ -149,4 +147,24 @@ async fn serve() -> Result<()> {
     let _ = std::fs::remove_file(&sock);
     tracing::info!("daemon exited cleanly");
     Ok(())
+}
+
+/// Latest mtime across the git files a worktree change touches: the
+/// `.git/worktrees` registry (add/remove/prune), each linked checkout's
+/// `HEAD` (branch switch inside it), and the root `.git/HEAD` (branch
+/// switch on the main checkout). Any of these moving forward means the
+/// stored rows may be stale.
+fn worktree_probe_stamp(repo_path: &std::path::Path) -> Option<std::time::SystemTime> {
+    let git_dir = repo_path.join(".git");
+    let mtime =
+        |p: std::path::PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut stamps: Vec<std::time::SystemTime> = Vec::new();
+    stamps.extend(mtime(git_dir.join("HEAD")));
+    stamps.extend(mtime(git_dir.join("worktrees")));
+    if let Ok(dir) = std::fs::read_dir(git_dir.join("worktrees")) {
+        for entry in dir.flatten() {
+            stamps.extend(mtime(entry.path().join("HEAD")));
+        }
+    }
+    stamps.into_iter().max()
 }

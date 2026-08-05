@@ -888,6 +888,37 @@ async fn external_worktrees_are_adopted_and_dropped() {
     })
     .await;
 
+    // Switching branches on the root checkout renames the main row in place
+    // (the probe watches .git/HEAD, not just the worktrees registry).
+    assert!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["checkout", "-b", "renamed-root"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success(),
+        "git checkout -b renamed-root failed"
+    );
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| matches!(
+            e,
+            ServerEvent::EntityUpserted { entity: Entity::Worktree(w) }
+                if w.is_main && w.branch == "renamed-root"
+        ))
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            ServerEvent::EntityUpserted { entity: Entity::Worktree(w) }
+                if w.is_main && w.branch == "renamed-root"
+        )),
+        "main row should refresh to the new branch: {events:#?}"
+    );
+
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
 }

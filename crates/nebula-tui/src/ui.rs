@@ -366,15 +366,36 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    // The main checkout renders as `branch ⌂ root` (dim badge — the branch
+    // is live, the badge marks root-ness) with a rule separating it from the
+    // true worktrees below, so rows after it sit one screen line lower.
+    const ROOT_BADGE: &str = " ⌂ root";
+    let mut screen_row = 0usize;
     for (i, (branch, is_main, roll)) in worktrees.iter().enumerate() {
-        let Some(row_area) = row_rect(inner, i) else { break };
-        let label = if *is_main { format!("{branch} (main)") } else { branch.clone() };
-        let spans = vec![
-            status_dot(*roll),
-            Span::raw(truncate(&label, inner.width.saturating_sub(2) as usize)),
-        ];
+        let Some(row_area) = row_rect(inner, screen_row) else { break };
+        let mut spans = vec![status_dot(*roll)];
+        if *is_main {
+            let max = (inner.width as usize).saturating_sub(2 + ROOT_BADGE.chars().count());
+            spans.push(Span::raw(truncate(branch, max)));
+            spans.push(Span::styled(ROOT_BADGE, Style::default().fg(Color::DarkGray)));
+        } else {
+            spans.push(Span::raw(truncate(branch, inner.width.saturating_sub(2) as usize)));
+        }
         render_row(f, row_area, spans, i == app.sel_worktree, focused);
         app.hits.push((row_area, HitTarget::Worktree(i)));
+        screen_row += 1;
+        if *is_main && worktrees.len() > 1 {
+            if let Some(r) = row_rect(inner, screen_row) {
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        "─".repeat(inner.width as usize),
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    r,
+                );
+                screen_row += 1;
+            }
+        }
     }
     app.hits.push((inner, HitTarget::PanelBg(Focus::Worktrees)));
 }

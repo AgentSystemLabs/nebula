@@ -50,28 +50,38 @@ pub async fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeEntry>> {
     let mut entries = Vec::new();
     let mut path: Option<PathBuf> = None;
     let mut branch: Option<String> = None;
+    let mut head: Option<String> = None;
     for line in out.lines() {
         if let Some(p) = line.strip_prefix("worktree ") {
             if let Some(done_path) = path.take() {
                 entries.push(WorktreeEntry {
                     path: done_path,
-                    branch: branch.take().unwrap_or_else(|| "(detached)".into()),
+                    branch: branch.take().unwrap_or_else(|| detached_label(head.as_deref())),
                 });
             }
+            head = None;
             path = Some(PathBuf::from(p));
+        } else if let Some(sha) = line.strip_prefix("HEAD ") {
+            head = Some(sha.to_string());
         } else if let Some(b) = line.strip_prefix("branch ") {
             branch = Some(b.trim_start_matches("refs/heads/").to_string());
-        } else if line == "detached" {
-            branch = Some("(detached)".into());
         }
     }
     if let Some(done_path) = path {
         entries.push(WorktreeEntry {
             path: done_path,
-            branch: branch.unwrap_or_else(|| "(detached)".into()),
+            branch: branch.unwrap_or_else(|| detached_label(head.as_deref())),
         });
     }
     Ok(entries)
+}
+
+/// Display name for a checkout with no branch (detached HEAD).
+fn detached_label(head: Option<&str>) -> String {
+    match head {
+        Some(sha) => format!("detached @ {}", &sha[..sha.len().min(7)]),
+        None => "(detached)".into(),
+    }
 }
 
 /// Directory a new worktree for `branch` should live in:

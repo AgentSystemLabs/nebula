@@ -468,6 +468,7 @@ impl Daemon {
     /// Reconcile a project's worktree rows with `git worktree list` so
     /// checkouts made outside nebula (an agent running `git worktree add`,
     /// manual CLI use) appear without a restart. Adopts unknown checkouts;
+    /// refreshes the branch on known rows after an in-place checkout;
     /// drops rows whose checkout vanished — except the main row and rows
     /// that still have sessions, which the user must delete deliberately.
     pub async fn sync_project_worktrees(self: &Arc<Self>, project: &Project) -> Result<()> {
@@ -479,7 +480,18 @@ impl Daemon {
             .filter(|w| w.project_id == project.id)
             .collect();
         for entry in &entries {
-            if ours.iter().any(|w| w.path == entry.path) {
+            if let Some(known) = ours.iter().find(|w| w.path == entry.path) {
+                // Branch switched in place (checkout on the root or inside a
+                // linked worktree): refresh the stored name so the row tracks
+                // reality instead of the branch at adoption time.
+                if known.branch != entry.branch {
+                    self.store.update_worktree_branch(&known.id, &entry.branch)?;
+                    let mut updated = (*known).clone();
+                    updated.branch = entry.branch.clone();
+                    self.broadcast(ServerEvent::EntityUpserted {
+                        entity: Entity::Worktree(updated),
+                    });
+                }
                 continue;
             }
             let worktree = Worktree {

@@ -60,6 +60,7 @@ impl TuiHarness {
         cmd.env("NEBULA_RUNTIME_DIR", &runtime_dir);
         cmd.env("NEBULA_DATA_DIR", &data_dir);
         cmd.env("NEBULA_AGENT_CMD", "/bin/sh"); // stand-in for claude
+        cmd.env("NEBULA_WORKTREE_SYNC_MS", "100"); // fast external-change pickup
         cmd.env("NEBULA_LOG", "debug");
         cmd.env("SHELL", "/bin/sh");
         cmd.env("TERM", "xterm-256color");
@@ -306,6 +307,19 @@ fn add_project(tui: &mut TuiHarness, path: &Path, expect_name: &str) {
     tui.wait_for_text(expect_name);
 }
 
+fn repo_git(repo: &std::path::Path, args: &[&str]) {
+    let ok = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "git {args:?} failed in {}", repo.display());
+}
+
 fn create_worktree(tui: &mut TuiHarness, branch: &str) {
     tui.send(b"n");
     tui.wait_for_text("New worktree");
@@ -336,7 +350,7 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"\r");
     tui.wait_for_gone("Add project");
     tui.wait_for_text("alpha-proj");
-    tui.wait_for_text("main (main)"); // main checkout appears as a worktree row
+    tui.wait_for_text("main ⌂ root"); // main checkout appears as the root row
 
     // Ambiguous completion lists candidates: "…/T/.tmpX/" + Tab with both
     // repos present shows them side by side, then Esc cancels.
@@ -384,7 +398,7 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"k");
     tui.wait_for_selected("feat-a");
     tui.send(b"k");
-    tui.wait_for_selected("main (main)");
+    tui.wait_for_selected("main ⌂ root");
     tui.send(b"j");
     tui.wait_for_selected("feat-a");
 
@@ -430,8 +444,12 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"j"); // select beta-proj
     tui.wait_for_selected("beta-proj");
     tui.wait_for_gone("feat-a"); // beta has only its main checkout
-    tui.wait_for_text("main (main)");
+    tui.wait_for_text("main ⌂ root");
     tui.wait_for_sessions_row_gone("agent-1");
+
+    // ---- the root row tracks live branch switches, no restart needed ----
+    repo_git(&beta, &["checkout", "-b", "hotfix"]);
+    tui.wait_for_text("hotfix ⌂ root");
     tui.send(b"k"); // back to alpha-proj
     tui.wait_for_selected("alpha-proj");
     tui.wait_for_text("feat-a");

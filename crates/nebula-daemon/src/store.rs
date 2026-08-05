@@ -177,6 +177,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn update_worktree_branch(&self, id: &WorktreeId, branch: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE worktrees SET branch = ?2 WHERE id = ?1",
+            params![id.as_str(), branch],
+        )?;
+        Ok(())
+    }
+
     // ---- agents ----
 
     pub fn insert_agent(&self, a: &Agent) -> Result<()> {
