@@ -27,9 +27,13 @@ curl -fsSL https://raw.githubusercontent.com/AgentSystemLabs/nebula/main/install
 
 Downloads the prebuilt binary for your platform from the latest GitHub release
 into `~/.local/bin` (override with `NEBULA_INSTALL_DIR`), falling back to
-`cargo install --git` when no release matches. Updating while a daemon is
-running is safe: sessions keep running on the old binary until you run
-`nebula kill-server` (which stops all sessions) and relaunch.
+`cargo install --git` when no release matches.
+
+Once installed, `nebula upgrade` runs that same script for you — no need to
+remember the URL. It refuses to clobber a local `cargo build` (pass `--force`
+if you mean it). Upgrading while a daemon is running is safe: sessions keep
+running on the old binary until you run `nebula kill-server` (which stops all
+sessions) and relaunch.
 
 ## How it works
 
@@ -97,11 +101,12 @@ nebula                    # launch the TUI (auto-starts the daemon)
 nebula daemon             # run the daemon (normally auto-spawned)
 nebula daemon --foreground  # daemon with logs to stderr, for debugging
 nebula kill-server        # stop the daemon and all sessions cleanly
+nebula upgrade            # install the latest release (--force on a dev build)
 ```
 
 Logs: `~/.local/state/nebula/daemon.log` and `tui.log` (`NEBULA_LOG=debug` for
 more). Overrides for tests/parallel instances: `NEBULA_RUNTIME_DIR`,
-`NEBULA_DATA_DIR`, `NEBULA_AGENT_CMD`.
+`NEBULA_DATA_DIR`, `NEBULA_AGENT_CMD`, `NEBULA_INSTALL_URL`.
 
 ## Building
 

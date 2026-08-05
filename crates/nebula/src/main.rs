@@ -1,8 +1,14 @@
+mod upgrade;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "nebula", version, about = "Terminal multiplexer for Claude Code agents")]
+#[command(
+    name = "nebula",
+    version,
+    about = "Terminal multiplexer for Claude Code agents"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -18,6 +24,12 @@ enum Command {
     },
     /// Ask a running daemon to shut down cleanly.
     KillServer,
+    /// Install the latest published nebula over this one.
+    Upgrade {
+        /// Upgrade even when running from a local cargo build.
+        #[arg(long)]
+        force: bool,
+    },
     /// Phase-2 debug client: raw passthrough to a scratch session (Ctrl+\ detaches).
     #[command(hide = true, name = "_raw-attach")]
     RawAttach {
@@ -34,6 +46,7 @@ fn main() -> Result<()> {
             nebula_daemon::run_daemon()
         }
         Some(Command::KillServer) => nebula_tui::run_kill_server(),
+        Some(Command::Upgrade { force }) => upgrade::run_upgrade(force),
         Some(Command::RawAttach { name }) => nebula_tui::run_raw_attach(&name),
         None => {
             init_tui_logging()?;
