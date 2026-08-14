@@ -1,6 +1,7 @@
 pub mod app;
 pub mod completion;
 pub mod event_loop;
+pub mod git_diff;
 pub mod ipc;
 pub mod keys;
 pub mod raw_attach;

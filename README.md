@@ -9,11 +9,9 @@ agent manager — entirely inside your terminal.
 │ ● nebula  │ ● main     │ AGENTS       │ $ claude                       │
 │ ○ herdr   │ ● feat/x   │ ● auth-bot   │ …live claude session…          │
 │           │            │ ● refactor   │                                │
-│           │            │ ──────────── │                                │
-│           │            │ TERMINALS    │                                │
-│           │            │ ○ term-1     │                                │
+│           │            │ + new agent… │                                │
 ├───────────┴────────────┴──────────────┴────────────────────────────────┤
-│ ⏻ connected │ n: agent  t: term  r: rename  a: archive  m: menu  ?: help│
+│ ⏻ connected │ n: agent  r: rename  a: archive  m: menu  ?: help        │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -45,17 +43,20 @@ sessions) and relaunch.
 - **Projects → worktrees → sessions.** All work happens in the main checkout
   or a git worktree. Worktrees are real (`git worktree add/remove`), created
   under `<repo>/../<repo-name>-worktrees/<branch>`.
-- **Agents boot `claude`.** Creating an agent spawns a Claude Code session in
-  the worktree. Restored agents resume with `claude --resume <session-id>`
-  (falling back to a fresh session when the old one is gone).
-- **Status via Claude Code hooks, not MCP.** At agent spawn, nebula merges
-  managed hooks into the worktree's `.claude/settings.local.json` (tagged
-  `_nebulaManaged`, user hooks preserved, rebuilt each spawn). Each hook is a
-  fail-soft curl to the daemon's loopback HTTP endpoint, authenticated with a
-  per-boot bearer token injected into the agent's environment only.
+- **Agents boot `claude` or `codex`.** Creating an agent (`n`) first asks
+  which CLI to run, then spawns it in the worktree. Restored agents resume
+  with `claude --resume <session-id>` / `codex resume <session-id>` (falling
+  back to a fresh session when the old one is gone).
+- **Status via agent-CLI hooks, not MCP.** At agent spawn, nebula merges
+  managed hooks into the worktree's `.claude/settings.local.json` (Claude
+  Code) or `.codex/hooks.json` (Codex; loads once the project is trusted and
+  the hooks approved on first run). Groups are tagged `_nebulaManaged`, user
+  hooks preserved, rebuilt each spawn. Each hook is a fail-soft curl to the
+  daemon's loopback HTTP endpoint, authenticated with a per-boot bearer token
+  injected into the agent's environment only.
 - **Everything persists in SQLite** (`~/.local/share/nebula/nebula.db` or the
-  platform equivalent): projects, worktrees, agents (with claude session ids),
-  terminals, and your last selection.
+  platform equivalent): projects, worktrees, agents (with kind + CLI session
+  ids), and your last selection.
 
 ## Status dots
 
@@ -82,7 +83,7 @@ Worktree and project rows roll up their children: red beats yellow beats green.
 | Projects | `j/k` onto a divider, then `Enter`/`r` | edit the divider's label |
 | Projects | `d` or `-` on a divider | delete the divider |
 | Worktrees | `n` / `d` | new worktree / delete (typed confirm — deletes files) |
-| Sessions | `n` / `t` | new agent / new terminal |
+| Sessions | `n` | new agent |
 | Sessions | `r`, `a`, `u`, `d`, `A` | rename, archive, unarchive, delete, toggle archived |
 | Any panel | `m` or right-click | context menu |
 | Any panel | `z` | collapse sidebars (full-width terminal) |

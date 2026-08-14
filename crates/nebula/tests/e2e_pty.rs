@@ -3,7 +3,9 @@
 //! across a daemon restart.
 
 use nebula_core::codec::{read_frame, write_frame};
-use nebula_core::{ClientRequest, Entity, EntityId, ServerEvent, SessionRef, PROTOCOL_VERSION};
+use nebula_core::{
+    AgentKind, ClientRequest, Entity, EntityId, ServerEvent, SessionRef, PROTOCOL_VERSION,
+};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -265,6 +267,7 @@ async fn full_crud_attach_and_restart_persistence() {
             req_id: 3,
             worktree: main_worktree.id.clone(),
             name: "agent-1".into(),
+            kind: AgentKind::Claude,
         },
     )
     .await
@@ -641,6 +644,7 @@ async fn hook_post_from_agent_pty_drives_status() {
             req_id: 2,
             worktree: worktree.id.clone(),
             name: "hooked".into(),
+            kind: AgentKind::Claude,
         },
     )
     .await
@@ -789,9 +793,204 @@ async fn hook_post_from_agent_pty_drives_status() {
         panic!()
     };
     assert_eq!(
-        agents[0].claude_session_id.as_deref(),
+        agents[0].session_id.as_deref(),
         Some("sess-1"),
         "session id persisted"
+    );
+    write_frame(&mut c2, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut daemon2);
+}
+
+/// Codex mirror of the claude hook test: a codex-kind agent gets
+/// `.codex/hooks.json` installed, and posts to `/api/hooks/codex` drive the
+/// same status machine (PermissionRequest is codex's native waiting signal).
+#[tokio::test]
+async fn codex_hooks_install_and_drive_status() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: repo.clone(),
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| {
+            matches!(
+                e,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(_)
+                }
+            )
+        })
+    })
+    .await;
+    let worktree = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } => Some(w.clone()),
+            _ => None,
+        })
+        .unwrap();
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: worktree.id.clone(),
+            name: "codexed".into(),
+            kind: AgentKind::Codex,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+
+    // Codex hooks were installed into the worktree — and only codex-shaped
+    // ones (no claude-specific Notification/AskUserQuestion groups).
+    let hooks_path = repo.join(".codex/hooks.json");
+    assert!(hooks_path.exists(), "codex hooks installed into worktree");
+    let hooks: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+    assert!(hooks["hooks"]["Stop"][0]["_nebulaManaged"]
+        .as_bool()
+        .unwrap());
+    assert!(hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .contains("/api/hooks/codex?"));
+    assert!(hooks["hooks"].get("Notification").is_none());
+    assert!(hooks["hooks"].get("PreToolUse").is_none());
+
+    // Drive the shell inside the agent PTY to POST codex hooks with its env.
+    let sref = SessionRef::Agent(agent_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 120,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    let curl = |event: &str, body: &str| {
+        format!(
+            "curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
+             -H 'Content-Type: application/json' -d '{body}' \
+             \"$NEBULA_API_URL/api/hooks/codex?agentId=$NEBULA_AGENT_ID&hookEvent={event}\"\n"
+        )
+    };
+
+    // UserPromptSubmit → running
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: curl("UserPromptSubmit", r#"{"session_id":"codex-sess-1"}"#).into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Running }
+                if *agent == agent_id)
+        })
+    })
+    .await;
+
+    // PermissionRequest (codex's native waiting signal) → needs_feedback
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: curl("PermissionRequest", r#"{"session_id":"codex-sess-1"}"#).into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::NeedsFeedback }
+                if *agent == agent_id)
+        })
+    })
+    .await;
+
+    // Stop → finished
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: curl("Stop", r#"{"session_id":"codex-sess-1"}"#).into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Finished }
+                if *agent == agent_id)
+        })
+    })
+    .await;
+
+    // Kind and session id survive a daemon restart (feeds `codex resume`).
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+    let mut daemon2 = env.spawn_daemon();
+    let mut c2 = connect(&env.sock()).await;
+    handshake(&mut c2).await;
+    write_frame(&mut c2, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    let events = read_events_until(&mut c2, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+    let ServerEvent::Snapshot { agents, .. } = &events[0] else {
+        panic!()
+    };
+    assert_eq!(agents[0].kind, AgentKind::Codex, "kind persisted");
+    assert_eq!(
+        agents[0].session_id.as_deref(),
+        Some("codex-sess-1"),
+        "codex session id persisted"
     );
     write_frame(&mut c2, &ClientRequest::Shutdown)
         .await
@@ -903,11 +1102,13 @@ async fn external_worktrees_are_adopted_and_dropped() {
         "git checkout -b renamed-root failed"
     );
     let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter().any(|e| matches!(
-            e,
-            ServerEvent::EntityUpserted { entity: Entity::Worktree(w) }
-                if w.is_main && w.branch == "renamed-root"
-        ))
+        evs.iter().any(|e| {
+            matches!(
+                e,
+                ServerEvent::EntityUpserted { entity: Entity::Worktree(w) }
+                    if w.is_main && w.branch == "renamed-root"
+            )
+        })
     })
     .await;
     assert!(

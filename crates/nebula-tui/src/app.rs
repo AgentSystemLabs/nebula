@@ -1,11 +1,12 @@
 //! TUI state: the Elm-ish Model.
 
+use crate::git_diff::DiffFile;
 use nebula_core::{
-    Agent, AgentId, AgentStatus, Project, ProjectId, SessionRef, TerminalId, TerminalTab, Worktree,
-    WorktreeId,
+    Agent, AgentId, AgentKind, AgentStatus, Project, ProjectId, SessionRef, Worktree, WorktreeId,
 };
 use ratatui::layout::Rect;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -25,7 +26,17 @@ pub enum HitTarget {
     /// Panel background (registered after rows, so rows win).
     PanelBg(Focus),
     TerminalPane,
+    /// Draggable vertical boundary between panels, left to right:
+    /// 0 = projects|worktrees, 1 = worktrees|sessions, 2 = sessions|terminal.
+    Splitter(usize),
 }
+
+/// Default widths of the Projects / Worktrees / Sessions panels.
+pub const DEFAULT_PANEL_WIDTHS: [u16; 3] = [20, 22, 26];
+/// A panel can't be dragged narrower than this.
+pub const MIN_PANEL_W: u16 = 10;
+/// The terminal pane always keeps at least this much width.
+pub const MIN_TERM_W: u16 = 20;
 
 // ---- overlays ----
 
@@ -34,13 +45,12 @@ pub enum MenuAction {
     Attach(SessionRef),
     RestartAgent(AgentId),
     RenameAgent(AgentId),
-    RenameTerminal(TerminalId),
     ArchiveAgent(AgentId),
     UnarchiveAgent(AgentId),
     DeleteAgent(AgentId),
-    CloseTerminal(TerminalId),
     NewAgent(WorktreeId),
-    NewTerminal(WorktreeId),
+    /// Picker result: create an agent of this kind (chains into the name prompt).
+    NewAgentOfKind(WorktreeId, AgentKind),
     NewWorktree(ProjectId),
     DeleteWorktree(WorktreeId),
     AddProject,
@@ -59,6 +69,8 @@ pub struct MenuItem {
 
 #[derive(Debug, Clone)]
 pub struct ContextMenu {
+    /// Optional title rendered in the border (used by picker-style menus).
+    pub title: Option<String>,
     pub items: Vec<MenuItem>,
     pub at: (u16, u16),
     pub hover: usize,
@@ -71,7 +83,6 @@ pub struct ContextMenu {
 pub enum PendingAction {
     ArchiveAgent(AgentId),
     DeleteAgent(AgentId),
-    CloseTerminal(TerminalId),
     DeleteWorktree(WorktreeId),
     RemoveProject(ProjectId),
     Quit,
@@ -81,9 +92,6 @@ pub enum PendingAction {
 pub struct ConfirmDialog {
     pub title: String,
     pub message: String,
-    /// When set, the user must type this exact string to enable Yes.
-    pub typed_guard: Option<String>,
-    pub input: String,
     pub action: PendingAction,
 }
 
@@ -99,15 +107,10 @@ pub enum PromptKind {
     },
     NewAgent {
         worktree: WorktreeId,
-    },
-    NewTerminal {
-        worktree: WorktreeId,
+        kind: AgentKind,
     },
     RenameAgent {
         id: AgentId,
-    },
-    RenameTerminal {
-        id: TerminalId,
     },
 }
 
@@ -128,12 +131,57 @@ impl PromptDialog {
     }
 }
 
+/// Full-screen git-diff viewer: file list left, scrollable diff right.
+#[derive(Debug, Clone)]
+pub struct DiffView {
+    /// Checkout dir the diffs are read from.
+    pub root: PathBuf,
+    /// Branch name for the pane title.
+    pub branch: String,
+    pub files: Vec<DiffFile>,
+    /// Index into `files`.
+    pub selected: usize,
+    /// Diff text of the selected file (reloaded on selection change).
+    pub diff: String,
+    /// Cached line count of `diff`, for scroll clamping.
+    pub diff_line_count: usize,
+    /// Top visible diff line.
+    pub scroll: u16,
+    /// Inner height of the diff pane, written back during draw (the
+    /// `ContextMenu::area` pattern) so paging and clamping track resizes.
+    pub view_height: u16,
+    /// Whether the repo has a commit; picks the diff command.
+    pub head_ok: bool,
+}
+
+impl DiffView {
+    pub fn max_scroll(&self) -> u16 {
+        (self.diff_line_count as u16).saturating_sub(self.view_height.max(1))
+    }
+
+    /// Clamped relative scroll.
+    pub fn scroll_by(&mut self, delta: i32) {
+        self.scroll = (self.scroll as i32 + delta).clamp(0, self.max_scroll() as i32) as u16;
+    }
+
+    /// Clamped absolute file selection; true when it changed (the caller
+    /// reloads the diff).
+    pub fn select(&mut self, index: i64) -> bool {
+        let max = self.files.len().saturating_sub(1) as i64;
+        let clamped = index.clamp(0, max) as usize;
+        let changed = clamped != self.selected;
+        self.selected = clamped;
+        changed
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Overlay {
     Menu(ContextMenu),
     Confirm(ConfirmDialog),
     Prompt(PromptDialog),
     Help,
+    Diff(DiffView),
 }
 
 /// What to do when an Ack for this req_id arrives.
@@ -152,11 +200,9 @@ pub enum ConnState {
     Disconnected,
 }
 
-/// One row in the Sessions panel: agents on top, terminals below.
-#[derive(Debug, Clone)]
-pub enum SessionRow {
-    Agent(Agent),
-    Terminal(TerminalTab),
+/// SessionRef for an agent row (the only session kind the panel shows).
+pub fn agent_sref(a: &Agent) -> SessionRef {
+    SessionRef::Agent(a.id.clone())
 }
 
 /// One selectable row in the Projects panel. The payload indexes
@@ -198,40 +244,12 @@ fn rollup(statuses: impl Iterator<Item = AgentStatus>) -> Option<AgentStatus> {
     best
 }
 
-impl SessionRow {
-    pub fn name(&self) -> &str {
-        match self {
-            SessionRow::Agent(a) => &a.name,
-            SessionRow::Terminal(t) => &t.name,
-        }
-    }
-
-    pub fn sref(&self) -> SessionRef {
-        match self {
-            SessionRow::Agent(a) => SessionRef::Agent(a.id.clone()),
-            SessionRow::Terminal(t) => SessionRef::Terminal(t.id.clone()),
-        }
-    }
-
-    pub fn status(&self) -> Option<AgentStatus> {
-        match self {
-            SessionRow::Agent(a) => Some(a.status),
-            SessionRow::Terminal(_) => None,
-        }
-    }
-
-    pub fn is_archived(&self) -> bool {
-        matches!(self, SessionRow::Agent(a) if a.archived)
-    }
-}
-
 /// Client-side mirror of the entity tree.
 #[derive(Debug, Clone, Default)]
 pub struct Tree {
     pub projects: Vec<Project>,
     pub worktrees: Vec<Worktree>,
     pub agents: Vec<Agent>,
-    pub terminals: Vec<TerminalTab>,
 }
 
 pub struct AttachedTerm {
@@ -280,9 +298,11 @@ pub struct UiState {
     pub project: Option<String>,
     pub worktree: Option<String>,
     pub session_agent: Option<String>,
-    pub session_terminal: Option<String>,
     pub show_archived: bool,
     pub collapsed: bool,
+    /// Panel widths (projects, worktrees, sessions); absent in older blobs.
+    #[serde(default)]
+    pub panel_widths: Option<[u16; 3]>,
 }
 
 /// A mouse drag-selection over the terminal pane, in pane-relative cell
@@ -314,6 +334,17 @@ impl TermSelection {
     pub fn is_empty(&self) -> bool {
         self.anchor == self.head
     }
+}
+
+/// An in-progress drag of a panel splitter.
+#[derive(Debug, Clone, Copy)]
+pub struct SplitterDrag {
+    /// Which boundary (see `HitTarget::Splitter`).
+    pub idx: usize,
+    /// `boundary_x - grab column` at mouse-down, so the boundary tracks the
+    /// cursor without jumping a cell depending on which border cell was
+    /// grabbed.
+    pub grab_offset: i32,
 }
 
 pub struct App {
@@ -356,6 +387,14 @@ pub struct App {
     pub last_session_for_worktree: HashMap<WorktreeId, SessionRef>,
     /// Mouse drag-selection over the terminal pane, if any.
     pub term_selection: Option<TermSelection>,
+    /// Widths of the Projects / Worktrees / Sessions panels; the terminal
+    /// pane takes the remainder.
+    pub panel_widths: [u16; 3],
+    /// In-progress splitter drag, if any.
+    pub splitter_drag: Option<SplitterDrag>,
+    /// Body rect (everything above the footer) from the last draw; bounds
+    /// splitter drags.
+    pub body_area: Rect,
 }
 
 impl Default for App {
@@ -391,6 +430,46 @@ impl App {
             last_worktree_for_project: HashMap::new(),
             last_session_for_worktree: HashMap::new(),
             term_selection: None,
+            panel_widths: DEFAULT_PANEL_WIDTHS,
+            splitter_drag: None,
+            body_area: Rect::default(),
+        }
+    }
+
+    /// Screen x of splitter `idx` — the column where the panel to its right
+    /// starts (prefix sum of panel widths).
+    pub fn splitter_x(&self, idx: usize) -> u16 {
+        self.panel_widths[..=idx].iter().sum()
+    }
+
+    /// Move splitter `idx` so its boundary lands at `boundary_x`, clamped so
+    /// the panel keeps `MIN_PANEL_W` and the terminal pane keeps `MIN_TERM_W`.
+    pub fn set_splitter(&mut self, idx: usize, boundary_x: i32, body_w: u16) {
+        let left: u16 = self.panel_widths[..idx].iter().sum();
+        let fixed_right: u16 = self.panel_widths[idx + 1..].iter().sum();
+        let max = body_w.saturating_sub(left + fixed_right + MIN_TERM_W);
+        if max < MIN_PANEL_W {
+            return; // terminal too small to honor the minimums
+        }
+        let want = boundary_x.max(0) as u16;
+        self.panel_widths[idx] = want.saturating_sub(left).clamp(MIN_PANEL_W, max);
+    }
+
+    /// Re-fit panel widths to the current body width, shrinking the rightmost
+    /// panel first, each floored at `MIN_PANEL_W`. Keeps the terminal pane at
+    /// `MIN_TERM_W` whenever the screen allows it at all.
+    pub fn normalize_panel_widths(&mut self, body_w: u16) {
+        let budget = body_w.saturating_sub(MIN_TERM_W);
+        for i in (0..3).rev() {
+            let others: u16 = self
+                .panel_widths
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, w)| *w)
+                .sum();
+            let max = budget.saturating_sub(others);
+            self.panel_widths[i] = self.panel_widths[i].clamp(MIN_PANEL_W, max.max(MIN_PANEL_W));
         }
     }
 
@@ -431,7 +510,7 @@ impl App {
         worktrees.get(self.sel_worktree).copied()
     }
 
-    pub fn selected_session(&self) -> Option<SessionRow> {
+    pub fn selected_session(&self) -> Option<Agent> {
         self.visible_sessions().into_iter().nth(self.sel_session)
     }
 
@@ -440,7 +519,7 @@ impl App {
         let taken: Vec<String> = self
             .visible_sessions()
             .iter()
-            .map(|r| r.name().to_string())
+            .map(|a| a.name.clone())
             .collect();
         let mut n = 1;
         loop {
@@ -464,47 +543,37 @@ impl App {
             .collect()
     }
 
-    /// Session rows for the selected worktree: active agents, then terminals,
-    /// then (when shown) archived agents.
-    pub fn visible_sessions(&self) -> Vec<SessionRow> {
+    /// Session rows for the selected worktree: active agents, then (when
+    /// shown) archived agents.
+    pub fn visible_sessions(&self) -> Vec<Agent> {
         let worktrees = self.visible_worktrees();
         let Some(wt) = worktrees.get(self.sel_worktree) else {
             return vec![];
         };
-        let mut rows: Vec<SessionRow> = self
+        let mut rows: Vec<Agent> = self
             .tree
             .agents
             .iter()
             .filter(|a| a.worktree_id == wt.id && !a.archived)
             .cloned()
-            .map(SessionRow::Agent)
             .collect();
-        rows.extend(
-            self.tree
-                .terminals
-                .iter()
-                .filter(|t| t.worktree_id == wt.id)
-                .cloned()
-                .map(SessionRow::Terminal),
-        );
         if self.show_archived {
             rows.extend(
                 self.tree
                     .agents
                     .iter()
                     .filter(|a| a.worktree_id == wt.id && a.archived)
-                    .cloned()
-                    .map(SessionRow::Agent),
+                    .cloned(),
             );
         }
         rows
     }
 
-    /// (active agents, terminals, archived-total) for the selected worktree.
-    pub fn session_group_counts(&self) -> (usize, usize, usize) {
+    /// (active agents, archived-total) for the selected worktree.
+    pub fn session_group_counts(&self) -> (usize, usize) {
         let worktrees = self.visible_worktrees();
         let Some(wt) = worktrees.get(self.sel_worktree) else {
-            return (0, 0, 0);
+            return (0, 0);
         };
         let agents = self
             .tree
@@ -512,19 +581,13 @@ impl App {
             .iter()
             .filter(|a| a.worktree_id == wt.id && !a.archived)
             .count();
-        let terminals = self
-            .tree
-            .terminals
-            .iter()
-            .filter(|t| t.worktree_id == wt.id)
-            .count();
         let archived = self
             .tree
             .agents
             .iter()
             .filter(|a| a.worktree_id == wt.id && a.archived)
             .count();
-        (agents, terminals, archived)
+        (agents, archived)
     }
 
     /// Aggregate status for a worktree row: red > yellow > green > gray,

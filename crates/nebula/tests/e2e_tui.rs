@@ -40,10 +40,13 @@ struct TuiHarness {
 impl TuiHarness {
     fn spawn() -> Self {
         // Socket paths must stay under SUN_LEN (~104 bytes) — keep the
-        // runtime dir short and per-process.
+        // runtime dir short. Tests share one process, so a per-harness
+        // sequence keeps each test on its own daemon.
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pid = std::process::id();
-        let runtime_dir = PathBuf::from(format!("/tmp/nebtui-rt-{pid}"));
-        let data_dir = PathBuf::from(format!("/tmp/nebtui-data-{pid}"));
+        let runtime_dir = PathBuf::from(format!("/tmp/nebtui-rt-{pid}-{seq}"));
+        let data_dir = PathBuf::from(format!("/tmp/nebtui-data-{pid}-{seq}"));
         let _ = std::fs::remove_dir_all(&runtime_dir);
         let _ = std::fs::remove_dir_all(&data_dir);
         let repos = tempfile::tempdir().unwrap();
@@ -244,7 +247,8 @@ fn screen_to_text(screen: &vt100::Screen) -> String {
 }
 
 /// True when `needle` appears within the Sessions panel's columns
-/// (mirrors PROJECTS_W/WORKTREES_W/SESSIONS_W in nebula-tui/src/ui.rs).
+/// (mirrors DEFAULT_PANEL_WIDTHS in nebula-tui/src/app.rs; the harness
+/// starts with a fresh DB, so the panels are at their default widths).
 fn sessions_panel_contains(screen: &vt100::Screen, needle: &str) -> bool {
     const SESSIONS_X: u16 = 20 + 22;
     const SESSIONS_W: u16 = 26;
@@ -406,10 +410,12 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"\r");
     tui.wait_for_text(FOOTER_SESSIONS);
     tui.wait_for_text("AGENTS");
-    tui.wait_for_text("TERMINALS");
 
-    // ---- create an agent: default name accepted, auto-attaches ----
+    // ---- create an agent: kind picker → name prompt, auto-attaches ----
     tui.send(b"n");
+    tui.wait_for_text("Agent type"); // Claude/Codex picker
+    tui.send(b"\r"); // pick the default (Claude)
+    tui.wait_for_gone("Agent type");
     tui.wait_for_text("New agent");
     tui.send(b"\r"); // accept the pre-filled "agent-1"
     tui.wait_for_gone("New agent");
@@ -475,4 +481,50 @@ fn tui_projects_worktrees_agents_navigation() {
             ),
         }
     }
+}
+
+#[test]
+fn tui_git_diff_modal() {
+    let mut tui = TuiHarness::spawn();
+    let repo = tui.make_repo("diff-proj");
+
+    tui.wait_for_text("No projects yet");
+    add_project(&mut tui, &repo, "diff-proj");
+    // The root worktree row must exist before g has anything to diff.
+    tui.wait_for_text("⌂ root");
+
+    // Dirty the checkout: one tracked modification, one untracked file.
+    std::fs::write(repo.join(".keep"), "tracked change\n").unwrap();
+    std::fs::write(repo.join("hello.txt"), "hello world\n").unwrap();
+
+    // ---- open the modal; the selected file's diff renders ----
+    tui.send(b"g");
+    tui.wait_for_text("Files (2)");
+    // Status is path-ordered, so .keep (modified) is selected first.
+    tui.wait_for_selected(".keep");
+    tui.wait_for_text("+tracked change");
+
+    // ---- toggle to the untracked file ----
+    tui.send(b"j");
+    tui.wait_for_selected("hello.txt");
+    tui.wait_for_text("+hello world");
+
+    // ---- the modal blocks other interaction ----
+    // n would open "Add project" from the Projects panel; inside the modal it
+    // must do nothing (verified after close — stale-frame convention).
+    tui.send(b"n");
+    tui.send(&[0x1b]); // Esc closes
+    tui.wait_for_gone("Files (2)");
+    tui.wait_for_text(FOOTER_PROJECTS);
+    assert!(
+        !tui.screen_text().contains("Add project"),
+        "modal swallowed n\n--- screen ---\n{}",
+        tui.screen_text()
+    );
+
+    // ---- clean tree flashes instead of opening ----
+    repo_git(&repo, &["add", "."]);
+    repo_git(&repo, &["commit", "-m", "wip"]);
+    tui.send(b"g");
+    tui.wait_for_text("no changes in main");
 }
