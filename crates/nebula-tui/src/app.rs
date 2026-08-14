@@ -305,17 +305,25 @@ pub struct UiState {
     pub panel_widths: Option<[u16; 3]>,
 }
 
-/// A mouse drag-selection over the terminal pane, in pane-relative cell
-/// coordinates `(col, row)` with inclusive endpoints. Nebula owns the mouse
-/// (the emulator's native shift+drag never reaches us reliably — Terminal.app
-/// has no such bypass at all), so selection is implemented app-side and
-/// copied to the system clipboard on mouse-up.
+/// A mouse selection over the terminal pane (drag or double-click word), in
+/// pane-relative cell coordinates `(col, row)` with inclusive endpoints.
+/// Nebula owns the mouse (the emulator's native shift+drag never reaches us
+/// reliably — Terminal.app has no such bypass at all), so selection is
+/// implemented app-side and copied to the system clipboard when it completes.
+/// The highlight persists after mouse-up; it's cleared by the next click,
+/// scrolling, typing into the PTY, or a resize/reattach (anything that moves
+/// the content under it — the selection is in screen coordinates).
 #[derive(Debug, Clone, Copy)]
 pub struct TermSelection {
     pub anchor: (u16, u16),
     pub head: (u16, u16),
     /// Still being dragged (button down). Cleared on mouse-up.
     pub dragging: bool,
+    /// A real selection, not just an armed click. Set once a drag leaves its
+    /// starting cell (and kept if it returns), or immediately for a
+    /// double-click word selection — which may be a single cell, so
+    /// `anchor == head` can't be the "just a click" test.
+    pub active: bool,
 }
 
 impl TermSelection {
@@ -328,11 +336,6 @@ impl TermSelection {
         } else {
             (self.head, self.anchor)
         }
-    }
-
-    /// A drag that never left its starting cell — just a click.
-    pub fn is_empty(&self) -> bool {
-        self.anchor == self.head
     }
 }
 
@@ -387,6 +390,12 @@ pub struct App {
     pub last_session_for_worktree: HashMap<WorktreeId, SessionRef>,
     /// Mouse drag-selection over the terminal pane, if any.
     pub term_selection: Option<TermSelection>,
+    /// Last left-click on the terminal pane (time + pane-relative cell), for
+    /// double-click detection.
+    pub last_term_click: Option<(std::time::Instant, (u16, u16))>,
+    /// URLs detected on the visible screen during the last draw; hit-tested
+    /// on ⌥click and underlined by the renderer.
+    pub term_links: Vec<crate::links::TermLink>,
     /// Widths of the Projects / Worktrees / Sessions panels; the terminal
     /// pane takes the remainder.
     pub panel_widths: [u16; 3],
@@ -430,6 +439,8 @@ impl App {
             last_worktree_for_project: HashMap::new(),
             last_session_for_worktree: HashMap::new(),
             term_selection: None,
+            last_term_click: None,
+            term_links: Vec::new(),
             panel_widths: DEFAULT_PANEL_WIDTHS,
             splitter_drag: None,
             body_area: Rect::default(),

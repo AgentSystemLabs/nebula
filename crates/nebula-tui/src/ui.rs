@@ -218,7 +218,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Paragraph::new(lines), inner);
         }
         Overlay::Help => {
-            let area = centered_rect(f.area(), 60, 23);
+            let area = centered_rect(f.area(), 60, 25);
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -245,6 +245,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 ("g", "git diff of the selected worktree"),
                 ("Ctrl+q", "terminal input → back to panels (also Ctrl+])"),
                 ("drag", "select terminal text → copies to clipboard"),
+                ("double-click", "select the word under the cursor"),
+                ("⌥+click", "open the URL under the cursor"),
                 ("Shift+drag", "select text with your terminal"),
                 ("drag border", "resize the panels"),
                 ("q", "quit"),
@@ -684,14 +686,14 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     app.term_area = inner;
     app.hits.push((inner, HitTarget::TerminalPane));
 
-    match &app.term {
+    let links = match &app.term {
         Some(term) => {
             let screen = term.parser.screen();
             let widget = tui_term::widget::PseudoTerminal::new(screen);
             f.render_widget(widget, inner);
-            // Drag-selection highlight: overlay REVERSED on the selected
-            // cells (stream selection — full rows between the endpoints).
-            if let Some(sel) = app.term_selection.filter(|s| !s.is_empty()) {
+            // Selection highlight: overlay REVERSED on the selected cells
+            // (stream selection — full rows between the endpoints).
+            if let Some(sel) = app.term_selection.filter(|s| s.active) {
                 let ((start_col, start_row), (end_col, end_row)) = sel.bounds();
                 let reversed = Style::default().add_modifier(Modifier::REVERSED);
                 let last_col = inner.width.saturating_sub(1);
@@ -711,6 +713,7 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
                     f.buffer_mut().set_style(line, reversed);
                 }
             }
+            crate::links::visible_links(term.parser.screen())
         }
         None => {
             let msg = Paragraph::new(vec![
@@ -729,8 +732,19 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
             ])
             .centered();
             f.render_widget(msg, inner);
+            Vec::new()
+        }
+    };
+    // Underline detected URLs so ⌥click has a visible affordance; kept on
+    // the App for click-time hit-testing against the drawn frame.
+    let underline = Style::default().add_modifier(Modifier::UNDERLINED);
+    for link in &links {
+        for &(row, c0, c1) in &link.segments {
+            let seg = Rect::new(inner.x + c0, inner.y + row, c1 - c0 + 1, 1).intersection(inner);
+            f.buffer_mut().set_style(seg, underline);
         }
     }
+    app.term_links = links;
 }
 
 fn attached_session_name(app: &App) -> Option<String> {
@@ -806,7 +820,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Focus::Terminal if app.term.as_ref().is_some_and(|t| t.exited) => {
                 "session exited — Esc: back to sessions"
             }
-            Focus::Terminal if app.term_locked => "Ctrl+q: panels  drag: select+copy",
+            Focus::Terminal if app.term_locked => {
+                "Ctrl+q: panels  drag: select+copy  ⌥click: open link"
+            }
             Focus::Terminal if app.term.is_some() => "Enter: type into terminal  ←: sessions",
             Focus::Terminal => "select a session and press Enter to attach",
             Focus::Projects => match app.selected_project_row() {

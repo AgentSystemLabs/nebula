@@ -4,6 +4,7 @@ pub mod event_loop;
 pub mod git_diff;
 pub mod ipc;
 pub mod keys;
+pub mod links;
 pub mod raw_attach;
 pub mod ui;
 

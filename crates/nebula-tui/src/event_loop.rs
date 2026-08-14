@@ -229,6 +229,8 @@ fn sync_pty_size(app: &mut App, out: &mut Vec<ClientRequest>) {
     }
     if let Some(term) = &mut app.term {
         if (term.cols, term.rows) != (area.width, area.height) {
+            // The grid reflows; a screen-anchored selection would drift.
+            app.term_selection = None;
             term.cols = area.width;
             term.rows = area.height;
             term.parser.set_size(area.height, area.width);
@@ -303,6 +305,9 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         let exited = app.term.as_ref().is_some_and(|t| t.exited);
         if !exited {
             if let Some(term) = &mut app.term {
+                // Typing changes the content under a persisted selection
+                // highlight — drop it.
+                app.term_selection = None;
                 // Typing exits scroll mode (tmux behavior).
                 if term.scroll > 0 {
                     term.set_scroll(0);
@@ -1300,6 +1305,8 @@ fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     } else {
         (80, 24)
     };
+    // Fresh screen, so any persisted selection would point at stale cells.
+    app.term_selection = None;
     app.term = Some(AttachedTerm::new(sref.clone(), cols, rows));
     out.push(ClientRequest::Attach {
         session: sref,
@@ -1320,11 +1327,11 @@ fn pane_cell(area: ratatui::layout::Rect, col: u16, row: u16) -> (u16, u16) {
     )
 }
 
-/// Text under the current drag-selection, from the screen's visible view
+/// Text under the current selection, from the screen's visible view
 /// (respects scrollback offset and wrapped rows).
 fn selection_text(app: &App) -> Option<String> {
     let sel = app.term_selection.as_ref()?;
-    if sel.is_empty() {
+    if !sel.active {
         return None;
     }
     let screen = app.term.as_ref()?.parser.screen();
@@ -1344,13 +1351,25 @@ fn selection_text(app: &App) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Complete a drag-selection: copy the text to the system clipboard and drop
-/// the highlight. A drag that never left its starting cell is just a click.
+/// Complete a drag-selection: copy the text to the system clipboard and keep
+/// the highlight (it clears on the next click / scroll / keypress). A drag
+/// that never left its starting cell is just a click — drop it.
 fn finish_selection(app: &mut App) {
-    let text = selection_text(app);
-    app.term_selection = None;
     app.dirty = true;
-    if let Some(text) = text {
+    let Some(sel) = &mut app.term_selection else {
+        return;
+    };
+    if !sel.active {
+        app.term_selection = None;
+        return;
+    }
+    sel.dragging = false;
+    copy_selection(app);
+}
+
+/// Copy the current selection's text to the clipboard, flashing the result.
+fn copy_selection(app: &mut App) {
+    if let Some(text) = selection_text(app) {
         app.flash = Some(if copy_to_clipboard(&text) {
             format!("copied {} chars", text.chars().count())
         } else {
@@ -1359,8 +1378,50 @@ fn finish_selection(app: &mut App) {
     }
 }
 
+/// Select the maximal run of non-blank cells around `cell` on its row (a
+/// double-click "word": handles identifiers, paths, and URLs alike).
+fn select_word_at(app: &mut App, cell: (u16, u16)) {
+    let Some(term) = &app.term else {
+        return;
+    };
+    let screen = term.parser.screen();
+    let (rows, cols) = screen.size();
+    let (col, row) = cell;
+    if row >= rows || col >= cols {
+        return;
+    }
+    let is_word = |c: u16| {
+        screen
+            .cell(row, c)
+            .is_some_and(|cell| !cell.contents().trim().is_empty())
+    };
+    if !is_word(col) {
+        return;
+    }
+    let mut start = col;
+    while start > 0 && is_word(start - 1) {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < cols && is_word(end + 1) {
+        end += 1;
+    }
+    app.term_selection = Some(TermSelection {
+        anchor: (start, row),
+        head: (end, row),
+        dragging: false,
+        active: true,
+    });
+    copy_selection(app);
+}
+
 /// Copy to the system clipboard via pbcopy (this tool targets macOS).
 fn copy_to_clipboard(text: &str) -> bool {
+    // Unit tests exercise the selection flow; don't clobber the developer's
+    // real clipboard from `cargo test`.
+    if cfg!(test) {
+        return true;
+    }
     #[cfg(target_os = "macos")]
     {
         use std::io::Write as _;
@@ -1380,6 +1441,35 @@ fn copy_to_clipboard(text: &str) -> bool {
         false
     }
 }
+
+/// Open a URL in the default browser via open(1) (this tool targets macOS).
+/// The scheme allowlist is defense in depth — the link scanner only ever
+/// produces http(s) URLs, but the text originates from untrusted PTY output.
+fn open_url(url: &str) -> bool {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return false;
+    }
+    if cfg!(test) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::{Command, Stdio};
+        Command::new("open")
+            .arg(url)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Two clicks on the same cell within this window make a double-click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) {
     // An open context menu owns the mouse: click inside activates, outside
@@ -1427,6 +1517,32 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            // ⌥click on a detected URL opens it in the browser; the click is
+            // swallowed so it doesn't move focus or disturb the selection.
+            // (Cmd never reaches us — the SGR mouse protocol has no such
+            // bit — so Option is the "open link" modifier.)
+            if mouse.modifiers.contains(KeyModifiers::ALT)
+                && matches!(
+                    app.hit_at(mouse.column, mouse.row),
+                    Some(HitTarget::TerminalPane)
+                )
+            {
+                let cell = pane_cell(app.term_area, mouse.column, mouse.row);
+                if let Some(url) = app
+                    .term_links
+                    .iter()
+                    .find(|link| link.contains(cell))
+                    .map(|link| link.url.clone())
+                {
+                    app.flash = Some(if open_url(&url) {
+                        format!("opened {url}")
+                    } else {
+                        format!("open failed: {url}")
+                    });
+                    app.dirty = true;
+                    return;
+                }
+            }
             // Any fresh click clears a stale selection highlight; a click on
             // the terminal pane below re-arms one.
             app.term_selection = None;
@@ -1484,14 +1600,28 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         if !t.exited {
                             app.term_locked = true;
                         }
-                        // Arm a drag-selection; it becomes visible (and
-                        // copyable) once the drag leaves this cell.
                         let cell = pane_cell(app.term_area, mouse.column, mouse.row);
-                        app.term_selection = Some(TermSelection {
-                            anchor: cell,
-                            head: cell,
-                            dragging: true,
-                        });
+                        let now = std::time::Instant::now();
+                        let double = app
+                            .last_term_click
+                            .take()
+                            .is_some_and(|(at, c)| c == cell && now.duration_since(at) <= DOUBLE_CLICK);
+                        if double {
+                            // Double-click: select (and copy) the word under
+                            // the cursor. `last_term_click` was consumed, so
+                            // a third click starts over.
+                            select_word_at(app, cell);
+                        } else {
+                            app.last_term_click = Some((now, cell));
+                            // Arm a drag-selection; it becomes visible (and
+                            // copyable) once the drag leaves this cell.
+                            app.term_selection = Some(TermSelection {
+                                anchor: cell,
+                                head: cell,
+                                dragging: true,
+                                active: false,
+                            });
+                        }
                     }
                 }
                 None => {}
@@ -1509,6 +1639,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             } else if let Some(sel) = &mut app.term_selection {
                 if sel.dragging {
                     sel.head = pane_cell(app.term_area, mouse.column, mouse.row);
+                    // A real drag; stays active even if it returns to the
+                    // anchor cell (a 1-cell selection is still a selection).
+                    if sel.head != sel.anchor {
+                        sel.active = true;
+                    }
                     app.dirty = true;
                 }
             }
@@ -1528,6 +1663,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             ) || app.collapsed;
             if in_term {
                 if let Some(term) = &mut app.term {
+                    // Scrolling shifts the content under a (screen-anchored)
+                    // selection highlight — drop it.
+                    app.term_selection = None;
                     if term.parser.screen().alternate_screen() {
                         // Full-screen apps (vim, htop, claude) expect arrows.
                         let arrow: &[u8] = if up {
@@ -1682,6 +1820,8 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         ServerEvent::Scrollback { session, data, .. } => {
             if let Some(term) = &mut app.term {
                 if term.sref == session {
+                    // Full replay: the screen is rebuilt from scratch.
+                    app.term_selection = None;
                     term.reset();
                     term.parser.process(&data);
                     app.dirty = true;
@@ -2388,7 +2528,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
 
-        // Mouse-down on the pane arms an (empty) selection and locks input.
+        // Mouse-down on the pane arms an (inactive) selection and locks input.
         handle_mouse(
             &mut app,
             ev(MouseEventKind::Down(MouseButton::Left), 0, 0),
@@ -2396,7 +2536,7 @@ mod tests {
         );
         assert!(app
             .term_selection
-            .is_some_and(|s| s.dragging && s.is_empty()));
+            .is_some_and(|s| s.dragging && !s.active));
         assert!(app.term_locked, "click into the pane still locks input");
 
         // Dragging extends the selection; the text under it is extractable.
@@ -2406,6 +2546,7 @@ mod tests {
             &mut out,
         );
         let sel = app.term_selection.expect("drag keeps the selection");
+        assert!(sel.active, "leaving the anchor cell activates the selection");
         assert_eq!(sel.bounds(), ((0, 0), (10, 0)));
         assert_eq!(selection_text(&app).as_deref(), Some("hello world"));
 
@@ -2416,6 +2557,23 @@ mod tests {
             &mut out,
         );
         assert_eq!(app.term_selection.expect("still selecting").head, (79, 23));
+
+        // Mouse-up copies AND keeps the highlight (dragging over).
+        handle_mouse(
+            &mut app,
+            ev(MouseEventKind::Up(MouseButton::Left), 200, 50),
+            &mut out,
+        );
+        let sel = app.term_selection.expect("highlight persists after release");
+        assert!(!sel.dragging && sel.active);
+        assert!(
+            app.flash.as_deref().is_some_and(|f| f.starts_with("copied")),
+            "release copies the selection"
+        );
+        assert!(
+            selection_text(&app).is_some(),
+            "persisted selection is still extractable"
+        );
 
         // A fresh click outside the pane clears the highlight.
         app.hits.clear();
@@ -2428,6 +2586,198 @@ mod tests {
             app.term_selection.is_none(),
             "click elsewhere clears the selection"
         );
+    }
+
+    #[test]
+    fn plain_click_without_drag_leaves_no_selection() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        let mut term = AttachedTerm::new(sref, 80, 24);
+        term.parser.process(b"hello world");
+        app.term = Some(term);
+        app.term_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        app.hits.push((app.term_area, HitTarget::TerminalPane));
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 3, 0),
+            &mut out,
+        );
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Up(MouseButton::Left), 3, 0),
+            &mut out,
+        );
+        assert!(
+            app.term_selection.is_none(),
+            "a click that never dragged is not a selection"
+        );
+        assert!(app.flash.is_none(), "nothing was copied");
+    }
+
+    #[test]
+    fn double_click_selects_word_and_persists() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        let mut term = AttachedTerm::new(sref, 80, 24);
+        term.parser.process(b"hello world");
+        app.term = Some(term);
+        app.term_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        app.hits.push((app.term_area, HitTarget::TerminalPane));
+
+        // Click, release, click again on the same cell (a fast double-click).
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 2, 0),
+            &mut out,
+        );
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Up(MouseButton::Left), 2, 0),
+            &mut out,
+        );
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 2, 0),
+            &mut out,
+        );
+        let sel = app.term_selection.expect("double-click selects the word");
+        assert!(sel.active && !sel.dragging);
+        assert_eq!(sel.bounds(), ((0, 0), (4, 0)));
+        assert_eq!(selection_text(&app).as_deref(), Some("hello"));
+        assert!(
+            app.flash.as_deref().is_some_and(|f| f.starts_with("copied")),
+            "double-click copies the word"
+        );
+
+        // The release after the second click must not disturb the selection.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Up(MouseButton::Left), 2, 0),
+            &mut out,
+        );
+        assert!(app.term_selection.is_some_and(|s| s.active));
+    }
+
+    #[test]
+    fn double_click_selects_single_char_word() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        let mut term = AttachedTerm::new(sref, 80, 24);
+        term.parser.process(b"a bc");
+        app.term = Some(term);
+        app.term_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        app.hits.push((app.term_area, HitTarget::TerminalPane));
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            &mut out,
+        );
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            &mut out,
+        );
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            &mut out,
+        );
+        // A one-cell word: anchor == head but the selection is real.
+        let sel = app.term_selection.expect("single-char word selected");
+        assert!(sel.active);
+        assert_eq!(sel.bounds(), ((0, 0), (0, 0)));
+        assert_eq!(selection_text(&app).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn slow_second_click_arms_a_plain_drag() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        let mut term = AttachedTerm::new(sref, 80, 24);
+        term.parser.process(b"hello world");
+        app.term = Some(term);
+        app.term_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        app.hits.push((app.term_area, HitTarget::TerminalPane));
+
+        // A stale first click, well outside the double-click window.
+        app.last_term_click = Some((
+            std::time::Instant::now() - Duration::from_millis(500),
+            (2, 0),
+        ));
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 2, 0),
+            &mut out,
+        );
+        assert!(
+            app.term_selection.is_some_and(|s| s.dragging && !s.active),
+            "slow second click starts a fresh drag, not a word selection"
+        );
+    }
+
+    #[test]
+    fn alt_click_opens_link_under_cursor() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        let mut term = AttachedTerm::new(sref, 80, 24);
+        term.parser.process(b"see https://example.com ok");
+        app.term = Some(term);
+        app.term_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        app.hits.push((app.term_area, HitTarget::TerminalPane));
+        app.term_links =
+            crate::links::visible_links(app.term.as_ref().unwrap().parser.screen());
+        assert_eq!(app.term_links.len(), 1);
+
+        let alt = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::ALT,
+        };
+
+        // ⌥click on the link opens it and swallows the click entirely.
+        app.focus = Focus::Projects;
+        handle_mouse(
+            &mut app,
+            alt(MouseEventKind::Down(MouseButton::Left), 6, 0),
+            &mut out,
+        );
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("opened https://example.com"),
+            "the URL under the cursor is opened"
+        );
+        assert_eq!(app.focus, Focus::Projects, "focus is untouched");
+        assert!(!app.term_locked, "input stays unlocked");
+        assert!(app.term_selection.is_none(), "no selection armed");
+
+        // ⌥click on a non-link cell falls through to a normal click.
+        app.flash = None;
+        handle_mouse(
+            &mut app,
+            alt(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            &mut out,
+        );
+        assert!(app.flash.is_none());
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_selection.is_some_and(|s| s.dragging));
     }
 
     /// Mirror ui::draw's splitter registration for a 120x35 body with the
