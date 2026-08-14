@@ -1,11 +1,13 @@
-use crate::entities::{Agent, AgentStatus, Entity, EntityId, Project, TerminalTab, Worktree};
+use crate::entities::{
+    Agent, AgentKind, AgentStatus, Entity, EntityId, Project, TerminalTab, Worktree,
+};
 use crate::ids::{AgentId, ProjectId, TerminalId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -93,6 +95,7 @@ pub enum ClientRequest {
         req_id: u64,
         worktree: WorktreeId,
         name: String,
+        kind: AgentKind,
     },
     RenameAgent {
         req_id: u64,
@@ -112,7 +115,8 @@ pub enum ClientRequest {
         req_id: u64,
         id: AgentId,
     },
-    /// Respawn; uses `claude --resume` when a session id is stored.
+    /// Respawn; resumes the stored session id (`claude --resume` /
+    /// `codex resume`) when one is stored.
     RestartAgent {
         req_id: u64,
         id: AgentId,

@@ -4,7 +4,8 @@
 
 use anyhow::{Context, Result};
 use nebula_core::{
-    Agent, AgentId, AgentStatus, Project, ProjectId, TerminalId, TerminalTab, Worktree, WorktreeId,
+    Agent, AgentId, AgentKind, AgentStatus, Project, ProjectId, TerminalId, TerminalTab, Worktree,
+    WorktreeId,
 };
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
@@ -61,6 +62,11 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE projects ADD COLUMN divider_label TEXT;
     ",
+    // 4: agent kind (claude | codex); claude_session_id doubles as the
+    // resume id for whichever kind the agent runs.
+    "
+    ALTER TABLE agents ADD COLUMN kind TEXT NOT NULL DEFAULT 'claude';
+    ",
 ];
 
 pub struct Store {
@@ -85,7 +91,9 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let store = Self { conn: Mutex::new(conn) };
+        let store = Self {
+            conn: Mutex::new(conn),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -93,7 +101,9 @@ impl Store {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let store = Self { conn: Mutex::new(conn) };
+        let store = Self {
+            conn: Mutex::new(conn),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -102,8 +112,11 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         for (i, migration) in MIGRATIONS.iter().enumerate().skip(version as usize) {
-            conn.execute_batch(&format!("BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;", i + 1))
-                .with_context(|| format!("migration {}", i + 1))?;
+            conn.execute_batch(&format!(
+                "BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;",
+                i + 1
+            ))
+            .with_context(|| format!("migration {}", i + 1))?;
         }
         Ok(())
     }
@@ -142,7 +155,10 @@ impl Store {
     }
 
     pub fn delete_project(&self, id: &ProjectId) -> Result<()> {
-        self.conn.lock().unwrap().execute("DELETE FROM projects WHERE id = ?1", params![id.as_str()])?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM projects WHERE id = ?1", params![id.as_str()])?;
         Ok(())
     }
 
@@ -150,7 +166,9 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id FROM projects WHERE repo_path = ?1")?;
         let mut rows = stmt.query(params![path.to_string_lossy()])?;
-        Ok(rows.next()?.map(|r| ProjectId(r.get::<_, String>(0).unwrap())))
+        Ok(rows
+            .next()?
+            .map(|r| ProjectId(r.get::<_, String>(0).unwrap())))
     }
 
     // ---- worktrees ----
@@ -173,7 +191,10 @@ impl Store {
     }
 
     pub fn delete_worktree(&self, id: &WorktreeId) -> Result<()> {
-        self.conn.lock().unwrap().execute("DELETE FROM worktrees WHERE id = ?1", params![id.as_str()])?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM worktrees WHERE id = ?1", params![id.as_str()])?;
         Ok(())
     }
 
@@ -189,15 +210,16 @@ impl Store {
 
     pub fn insert_agent(&self, a: &Agent) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, claude_session_id, sort_order, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO agents (id, worktree_id, name, status, archived, kind, claude_session_id, sort_order, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 a.id.as_str(),
                 a.worktree_id.as_str(),
                 a.name,
                 a.status.as_str(),
                 a.archived as i64,
-                a.claude_session_id,
+                a.kind.as_str(),
+                a.session_id,
                 a.sort_order,
                 now_ms()
             ],
@@ -238,16 +260,18 @@ impl Store {
     }
 
     pub fn delete_agent(&self, id: &AgentId) -> Result<()> {
-        self.conn.lock().unwrap().execute("DELETE FROM agents WHERE id = ?1", params![id.as_str()])?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM agents WHERE id = ?1", params![id.as_str()])?;
         Ok(())
     }
 
     /// Boot sweep: agents whose PTYs died with the previous daemon.
     pub fn sweep_disconnected(&self) -> Result<Vec<AgentId>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id FROM agents WHERE status IN ('running', 'needs_feedback')",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id FROM agents WHERE status IN ('running', 'needs_feedback')")?;
         let ids: Vec<AgentId> = stmt
             .query_map([], |r| r.get::<_, String>(0))?
             .filter_map(|r| r.ok())
@@ -280,7 +304,10 @@ impl Store {
     }
 
     pub fn delete_terminal(&self, id: &TerminalId) -> Result<()> {
-        self.conn.lock().unwrap().execute("DELETE FROM terminals WHERE id = ?1", params![id.as_str()])?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM terminals WHERE id = ?1", params![id.as_str()])?;
         Ok(())
     }
 
@@ -320,25 +347,27 @@ impl Store {
     pub fn get_agent(&self, id: &AgentId) -> Result<Option<Agent>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, worktree_id, name, status, archived, claude_session_id, sort_order FROM agents WHERE id = ?1",
+            "SELECT id, worktree_id, name, status, archived, kind, claude_session_id, sort_order FROM agents WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| Agent {
             id: AgentId(r.get::<_, String>(0).unwrap()),
             worktree_id: WorktreeId(r.get::<_, String>(1).unwrap()),
             name: r.get(2).unwrap(),
-            status: AgentStatus::parse(&r.get::<_, String>(3).unwrap()).unwrap_or(AgentStatus::Fresh),
+            status: AgentStatus::parse(&r.get::<_, String>(3).unwrap())
+                .unwrap_or(AgentStatus::Fresh),
             archived: r.get::<_, i64>(4).unwrap() != 0,
-            claude_session_id: r.get(5).unwrap(),
-            sort_order: r.get(6).unwrap(),
+            kind: AgentKind::parse(&r.get::<_, String>(5).unwrap()).unwrap_or_default(),
+            session_id: r.get(6).unwrap(),
+            sort_order: r.get(7).unwrap(),
             alive: false,
         }))
     }
 
     pub fn get_terminal(&self, id: &TerminalId) -> Result<Option<TerminalTab>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, worktree_id, name, sort_order FROM terminals WHERE id = ?1")?;
+        let mut stmt =
+            conn.prepare("SELECT id, worktree_id, name, sort_order FROM terminals WHERE id = ?1")?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| TerminalTab {
             id: TerminalId(r.get::<_, String>(0).unwrap()),
@@ -391,7 +420,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let agents = conn
-            .prepare("SELECT id, worktree_id, name, status, archived, claude_session_id, sort_order FROM agents ORDER BY sort_order, created_at")?
+            .prepare("SELECT id, worktree_id, name, status, archived, kind, claude_session_id, sort_order FROM agents ORDER BY sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Agent {
                     id: AgentId(r.get(0)?),
@@ -399,8 +428,9 @@ impl Store {
                     name: r.get(2)?,
                     status: AgentStatus::parse(&r.get::<_, String>(3)?).unwrap_or(AgentStatus::Fresh),
                     archived: r.get::<_, i64>(4)? != 0,
-                    claude_session_id: r.get(5)?,
-                    sort_order: r.get(6)?,
+                    kind: AgentKind::parse(&r.get::<_, String>(5)?).unwrap_or_default(),
+                    session_id: r.get(6)?,
+                    sort_order: r.get(7)?,
                     alive: false,
                 })
             })?
@@ -472,18 +502,33 @@ mod tests {
             name: "agent-1".into(),
             status: AgentStatus::Running,
             archived: false,
-            claude_session_id: Some("sess-123".into()),
+            kind: AgentKind::Claude,
+            session_id: Some("sess-123".into()),
             sort_order: 0,
             alive: false,
         };
         store.insert_agent(&agent).unwrap();
+        let codex_agent = Agent {
+            id: AgentId::generate(),
+            worktree_id: worktree.id.clone(),
+            name: "agent-2".into(),
+            status: AgentStatus::Fresh,
+            archived: false,
+            kind: AgentKind::Codex,
+            session_id: None,
+            sort_order: 1,
+            alive: false,
+        };
+        store.insert_agent(&codex_agent).unwrap();
 
         let (projects, worktrees, agents, _terms) = store.load_tree().unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(worktrees.len(), 1);
-        assert_eq!(agents.len(), 1);
+        assert_eq!(agents.len(), 2);
         assert_eq!(agents[0].status, AgentStatus::Running);
-        assert_eq!(agents[0].claude_session_id.as_deref(), Some("sess-123"));
+        assert_eq!(agents[0].kind, AgentKind::Claude);
+        assert_eq!(agents[0].session_id.as_deref(), Some("sess-123"));
+        assert_eq!(agents[1].kind, AgentKind::Codex);
     }
 
     #[test]
@@ -527,26 +572,59 @@ mod tests {
     #[test]
     fn sweep_disconnected_only_hits_live_statuses() {
         let store = Store::open_in_memory().unwrap();
-        let project = Project { id: ProjectId::generate(), name: "p".into(), repo_path: "/tmp/p".into(), sort_order: 0, divider_after: false, divider_label: None };
+        let project = Project {
+            id: ProjectId::generate(),
+            name: "p".into(),
+            repo_path: "/tmp/p".into(),
+            sort_order: 0,
+            divider_after: false,
+            divider_label: None,
+        };
         store.insert_project(&project).unwrap();
-        let wt = Worktree { id: WorktreeId::generate(), project_id: project.id.clone(), path: "/tmp/p".into(), branch: "main".into(), is_main: true, sort_order: 0 };
+        let wt = Worktree {
+            id: WorktreeId::generate(),
+            project_id: project.id.clone(),
+            path: "/tmp/p".into(),
+            branch: "main".into(),
+            is_main: true,
+            sort_order: 0,
+        };
         store.insert_worktree(&wt).unwrap();
-        for (name, status) in [("a", AgentStatus::Running), ("b", AgentStatus::Finished), ("c", AgentStatus::NeedsFeedback)] {
-            store.insert_agent(&Agent {
-                id: AgentId(format!("agent-{name}")),
-                worktree_id: wt.id.clone(),
-                name: name.into(),
-                status,
-                archived: false,
-                claude_session_id: None,
-                sort_order: 0,
-                alive: false,
-            }).unwrap();
+        for (name, status) in [
+            ("a", AgentStatus::Running),
+            ("b", AgentStatus::Finished),
+            ("c", AgentStatus::NeedsFeedback),
+        ] {
+            store
+                .insert_agent(&Agent {
+                    id: AgentId(format!("agent-{name}")),
+                    worktree_id: wt.id.clone(),
+                    name: name.into(),
+                    status,
+                    archived: false,
+                    kind: AgentKind::Claude,
+                    session_id: None,
+                    sort_order: 0,
+                    alive: false,
+                })
+                .unwrap();
         }
         let swept = store.sweep_disconnected().unwrap();
         assert_eq!(swept.len(), 2);
         let (_, _, agents, _) = store.load_tree().unwrap();
-        assert_eq!(agents.iter().filter(|a| a.status == AgentStatus::Disconnected).count(), 2);
-        assert_eq!(agents.iter().filter(|a| a.status == AgentStatus::Finished).count(), 1);
+        assert_eq!(
+            agents
+                .iter()
+                .filter(|a| a.status == AgentStatus::Disconnected)
+                .count(),
+            2
+        );
+        assert_eq!(
+            agents
+                .iter()
+                .filter(|a| a.status == AgentStatus::Finished)
+                .count(),
+            1
+        );
     }
 }

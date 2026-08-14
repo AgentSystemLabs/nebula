@@ -263,11 +263,12 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     req_id,
                     worktree,
                     name,
+                    kind,
                 } => {
                     reply(
                         &out_tx,
                         req_id,
-                        daemon.create_agent(&worktree, &name).map(Some),
+                        daemon.create_agent(&worktree, &name, kind).map(Some),
                     )
                     .await;
                 }

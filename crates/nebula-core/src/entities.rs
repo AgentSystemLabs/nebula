@@ -44,6 +44,32 @@ impl AgentStatus {
     }
 }
 
+/// Which agent CLI a session runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl AgentKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AgentKind::Claude => "claude",
+            AgentKind::Codex => "codex",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "claude" => AgentKind::Claude,
+            "codex" => AgentKind::Codex,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: ProjectId,
@@ -74,7 +100,10 @@ pub struct Agent {
     pub name: String,
     pub status: AgentStatus,
     pub archived: bool,
-    pub claude_session_id: Option<String>,
+    #[serde(default)]
+    pub kind: AgentKind,
+    /// CLI session id used for resume (claude or codex, per `kind`).
+    pub session_id: Option<String>,
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this agent.
     pub alive: bool,

@@ -1,6 +1,8 @@
-//! Claude Code hook receiver: a loopback-only HTTP endpoint the shell hook
-//! one-liners POST to. Fail-soft on both sides — a malformed payload still
-//! gets a 200 so a broken hook never faults the user's Claude turn.
+//! Agent-CLI hook receiver: a loopback-only HTTP endpoint the shell hook
+//! one-liners POST to (`/api/hooks/claude` and `/api/hooks/codex` — codex
+//! mirrors Claude's hook events and payload shape, so one handler serves
+//! both). Fail-soft on both sides — a malformed payload still gets a 200 so
+//! a broken hook never faults the user's agent turn.
 
 pub mod installer;
 
@@ -53,30 +55,48 @@ pub fn parse_event(hook_event: &str, payload: &HookPayload) -> Option<HookEvent>
     Some(match hook_event {
         "UserPromptSubmit" => HookEvent::UserPromptSubmit,
         "Stop" => HookEvent::Stop,
-        "SessionStart" => HookEvent::SessionStart { source: payload.source.clone() },
+        "SessionStart" => HookEvent::SessionStart {
+            source: payload.source.clone(),
+        },
         "PermissionRequest" => HookEvent::PermissionRequest,
-        "Notification" => {
-            HookEvent::Notification { notification_type: payload.notification_type.clone() }
-        }
-        "PreToolUse" => HookEvent::PreToolUse { tool_name: payload.tool_name.clone() },
-        "PostToolUse" => HookEvent::PostToolUse { tool_name: payload.tool_name.clone() },
-        "SubagentStart" => HookEvent::SubagentStart { subagent_id: payload.agent_id.clone() },
-        "SubagentStop" => HookEvent::SubagentStop { subagent_id: payload.agent_id.clone() },
+        "Notification" => HookEvent::Notification {
+            notification_type: payload.notification_type.clone(),
+        },
+        "PreToolUse" => HookEvent::PreToolUse {
+            tool_name: payload.tool_name.clone(),
+        },
+        "PostToolUse" => HookEvent::PostToolUse {
+            tool_name: payload.tool_name.clone(),
+        },
+        "SubagentStart" => HookEvent::SubagentStart {
+            subagent_id: payload.agent_id.clone(),
+        },
+        "SubagentStop" => HookEvent::SubagentStop {
+            subagent_id: payload.agent_id.clone(),
+        },
         _ => return None,
     })
 }
 
 /// Bind 127.0.0.1:0 and serve the hook route. Returns the env (port + fresh
 /// bearer token) and the receiving end of the event pipe.
-pub async fn start_hook_server(
-) -> anyhow::Result<(HookEnv, mpsc::Receiver<(AgentId, HookEvent, Option<String>)>)> {
+pub async fn start_hook_server() -> anyhow::Result<(
+    HookEnv,
+    mpsc::Receiver<(AgentId, HookEvent, Option<String>)>,
+)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let token = generate_token();
     let (tx, rx) = mpsc::channel(256);
 
-    let state = Arc::new(HookServerState { token: token.clone(), tx });
-    let app = Router::new().route("/api/hooks/claude", post(receive_hook)).with_state(state);
+    let state = Arc::new(HookServerState {
+        token: token.clone(),
+        tx,
+    });
+    let app = Router::new()
+        .route("/api/hooks/claude", post(receive_hook))
+        .route("/api/hooks/codex", post(receive_hook))
+        .with_state(state);
 
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
@@ -107,7 +127,10 @@ async fn receive_hook(
         .map(|presented| presented.as_bytes().ct_eq(state.token.as_bytes()).into())
         .unwrap_or(false);
     if !authorized {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"ok": false})));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"ok": false})),
+        );
     }
 
     // Parse failures still 200 — never fault a hook.

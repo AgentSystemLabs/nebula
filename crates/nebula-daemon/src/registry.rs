@@ -8,8 +8,8 @@ use crate::status::{AgentStatusMachine, Effect, HookEvent};
 use crate::store::Store;
 use anyhow::{bail, Context, Result};
 use nebula_core::{
-    Agent, AgentId, AgentStatus, Entity, EntityId, Project, ProjectId, ServerEvent, SessionRef,
-    TerminalId, TerminalTab, Worktree, WorktreeId,
+    Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Project, ProjectId, ServerEvent,
+    SessionRef, TerminalId, TerminalTab, Worktree, WorktreeId,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -62,10 +62,9 @@ impl Daemon {
                     // Lazily seed from the persisted row; unknown ids (stale
                     // env, deleted agent) are dropped.
                     match self.store.get_agent(agent_id) {
-                        Ok(Some(agent)) => slot.insert(AgentStatusMachine::new(
-                            agent.status,
-                            agent.claude_session_id,
-                        )),
+                        Ok(Some(agent)) => {
+                            slot.insert(AgentStatusMachine::new(agent.status, agent.session_id))
+                        }
                         _ => return,
                     }
                 }
@@ -485,7 +484,8 @@ impl Daemon {
                 // linked worktree): refresh the stored name so the row tracks
                 // reality instead of the branch at adoption time.
                 if known.branch != entry.branch {
-                    self.store.update_worktree_branch(&known.id, &entry.branch)?;
+                    self.store
+                        .update_worktree_branch(&known.id, &entry.branch)?;
                     let mut updated = (*known).clone();
                     updated.branch = entry.branch.clone();
                     self.broadcast(ServerEvent::EntityUpserted {
@@ -530,6 +530,7 @@ impl Daemon {
         self: &Arc<Self>,
         worktree_id: &WorktreeId,
         name: &str,
+        kind: AgentKind,
     ) -> Result<EntityId> {
         let worktree = self
             .store
@@ -545,12 +546,13 @@ impl Daemon {
             },
             status: AgentStatus::Fresh,
             archived: false,
-            claude_session_id: None,
+            kind,
+            session_id: None,
             sort_order: 0,
             alive: false,
         };
         self.store.insert_agent(&agent)?;
-        // Spawn immediately — a new agent should boot claude right away.
+        // Spawn immediately — a new agent should boot its CLI right away.
         self.spawn_agent_session(&agent, &worktree, 80, 24)?;
         let mut broadcast_agent = agent.clone();
         broadcast_agent.alive = true;
@@ -729,30 +731,21 @@ impl Daemon {
     ) -> Result<Arc<PtySession>> {
         // Managed status hooks; a failure here degrades to "no status
         // updates", never blocks the spawn.
-        if let Err(e) = hooks::installer::install_hooks(&worktree.path) {
+        let install_result = match agent.kind {
+            AgentKind::Claude => hooks::installer::install_claude_hooks(&worktree.path),
+            AgentKind::Codex => hooks::installer::install_codex_hooks(&worktree.path),
+        };
+        if let Err(e) = install_result {
             tracing::warn!(error = %e, cwd = %worktree.path.display(), "hook install failed");
         }
 
-        // NEBULA_AGENT_CMD overrides for tests; default is claude.
+        // NEBULA_AGENT_CMD overrides for tests; default is the kind's CLI.
         let cmd_override = std::env::var("NEBULA_AGENT_CMD").ok();
-        let is_default_claude = cmd_override.is_none();
-        let cmd = cmd_override.unwrap_or_else(|| "claude".into());
-        let mut parts = cmd.split_whitespace().map(String::from).collect::<Vec<_>>();
-        if parts.is_empty() {
-            parts.push("claude".into());
-        }
-        let program = parts.remove(0);
-        let mut args = parts;
-        let resumed = if is_default_claude {
-            if let Some(sid) = &agent.claude_session_id {
-                args.extend(["--resume".to_string(), sid.clone()]);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        let (program, args, resumed) = agent_spawn_command(
+            agent.kind,
+            agent.session_id.as_deref(),
+            cmd_override.as_deref(),
+        );
 
         let spec = SpawnSpec {
             program,
@@ -779,8 +772,9 @@ impl Daemon {
         Ok(session)
     }
 
-    /// `claude --resume <id>` dies fast when the session is stale/deleted —
-    /// fall back to a fresh session instead of leaving a dead pane.
+    /// A resumed session (`claude --resume` / `codex resume`) dies fast when
+    /// it is stale/deleted — fall back to a fresh session instead of leaving
+    /// a dead pane.
     fn arm_resume_fallback(
         self: &Arc<Self>,
         agent: Agent,
@@ -809,7 +803,7 @@ impl Daemon {
             tracing::info!(agent = %agent.id, "resume failed fast — respawning fresh");
             let _ = daemon.store.set_agent_session_id(&agent.id, None);
             let mut fresh = agent.clone();
-            fresh.claude_session_id = None;
+            fresh.session_id = None;
             if let Ok(_session) = daemon.spawn_agent_session(&fresh, &worktree, cols, rows) {
                 let mut broadcast_agent = fresh;
                 broadcast_agent.alive = true;
@@ -906,6 +900,32 @@ impl Daemon {
     }
 }
 
+/// Program + args for an agent PTY. An override (tests) is used verbatim —
+/// no resume args. Otherwise the kind picks the CLI and its resume shape:
+/// `claude --resume <sid>` vs `codex resume <sid>` (subcommand, so resume
+/// args must lead).
+fn agent_spawn_command(
+    kind: AgentKind,
+    session_id: Option<&str>,
+    cmd_override: Option<&str>,
+) -> (String, Vec<String>, bool) {
+    if let Some(cmd) = cmd_override {
+        let mut parts = cmd.split_whitespace().map(String::from).collect::<Vec<_>>();
+        if parts.is_empty() {
+            parts.push(kind.as_str().into());
+        }
+        let program = parts.remove(0);
+        return (program, parts, false);
+    }
+    let program = kind.as_str().to_string();
+    let (args, resumed) = match (kind, session_id) {
+        (AgentKind::Claude, Some(sid)) => (vec!["--resume".to_string(), sid.to_string()], true),
+        (AgentKind::Codex, Some(sid)) => (vec!["resume".to_string(), sid.to_string()], true),
+        (_, None) => (Vec::new(), false),
+    };
+    (program, args, resumed)
+}
+
 /// Env vars that must never leak into plain terminals (and are re-set
 /// explicitly for agent PTYs).
 pub fn scrubbed_env_names() -> Vec<String> {
@@ -919,6 +939,45 @@ pub fn scrubbed_env_names() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_command_per_kind_resume_shapes() {
+        // Fresh sessions: bare CLI.
+        assert_eq!(
+            agent_spawn_command(AgentKind::Claude, None, None),
+            ("claude".into(), vec![], false)
+        );
+        assert_eq!(
+            agent_spawn_command(AgentKind::Codex, None, None),
+            ("codex".into(), vec![], false)
+        );
+        // Claude resumes with a flag; codex with a subcommand (order matters).
+        assert_eq!(
+            agent_spawn_command(AgentKind::Claude, Some("sid-1"), None),
+            (
+                "claude".into(),
+                vec!["--resume".to_string(), "sid-1".to_string()],
+                true
+            )
+        );
+        assert_eq!(
+            agent_spawn_command(AgentKind::Codex, Some("sid-2"), None),
+            (
+                "codex".into(),
+                vec!["resume".to_string(), "sid-2".to_string()],
+                true
+            )
+        );
+        // Override wins for both kinds and never gets resume args.
+        assert_eq!(
+            agent_spawn_command(AgentKind::Claude, Some("sid"), Some("/bin/sh -i")),
+            ("/bin/sh".into(), vec!["-i".to_string()], false)
+        );
+        assert_eq!(
+            agent_spawn_command(AgentKind::Codex, Some("sid"), Some("/bin/sh")),
+            ("/bin/sh".into(), vec![], false)
+        );
+    }
 
     fn test_daemon() -> Arc<Daemon> {
         let store = Store::open_in_memory().unwrap();
