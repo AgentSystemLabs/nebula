@@ -28,6 +28,12 @@ pub fn run_raw_attach(name: &str) -> Result<()> {
     runtime()?.block_on(raw_attach::run(name))
 }
 
+/// Post-upgrade daemon handoff: shut the daemon down only when it holds no
+/// live sessions (see `ipc::shutdown_if_idle`).
+pub fn shutdown_daemon_if_idle() -> Result<ipc::IdleShutdown> {
+    runtime()?.block_on(ipc::shutdown_if_idle())
+}
+
 /// `nebula kill-server`.
 pub fn run_kill_server() -> Result<()> {
     runtime()?.block_on(async {

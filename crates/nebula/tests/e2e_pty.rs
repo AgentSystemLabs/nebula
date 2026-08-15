@@ -1124,6 +1124,152 @@ async fn external_worktrees_are_adopted_and_dropped() {
     wait_for_exit(&mut daemon);
 }
 
+/// `nebula upgrade` daemon handoff: with a live session the old daemon is
+/// left running (restart is the user's call); once idle, the upgrade shuts
+/// it down so the next launch spawns the new binary.
+#[tokio::test]
+async fn upgrade_shuts_down_idle_daemon_but_spares_live_sessions() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: repo.clone(),
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 1).is_some()
+            && evs.iter().any(|e| {
+                matches!(
+                    e,
+                    ServerEvent::EntityUpserted {
+                        entity: Entity::Worktree(_)
+                    }
+                )
+            })
+    })
+    .await;
+    let main_worktree = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } if w.is_main => Some(w.clone()),
+            _ => None,
+        })
+        .expect("main worktree upsert");
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateTerminal {
+            req_id: 2,
+            worktree: main_worktree.id.clone(),
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Terminal(term_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateTerminal failed: {events:#?}");
+    };
+    let term_id = term_id.clone();
+
+    // Stub installer: the upgrade command runs it, then handles the daemon.
+    let script = env.tmp.path().join("stub-install.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+    let run_upgrade = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args(["upgrade", "--force"])
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
+            .env("NEBULA_INSTALL_URL", format!("file://{}", script.display()))
+            .output()
+            .unwrap()
+    };
+
+    // A live terminal PTY keeps the daemon alive through the upgrade.
+    let out = run_upgrade();
+    assert!(
+        out.status.success(),
+        "upgrade failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1 live session"),
+        "expected live-session note, got: {stdout}"
+    );
+    assert!(
+        daemon.try_wait().unwrap().is_none(),
+        "daemon must keep running while sessions are live"
+    );
+
+    // Exit the shell; the daemon marks the terminal dead and is now idle.
+    let sref = SessionRef::Terminal(term_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref,
+            data: b"exit\n".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| {
+            matches!(
+                e,
+                ServerEvent::EntityUpserted { entity: Entity::Terminal(t) }
+                    if t.id == term_id && !t.alive
+            )
+        })
+    })
+    .await;
+
+    let out = run_upgrade();
+    assert!(
+        out.status.success(),
+        "idle upgrade failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no live sessions"),
+        "expected idle-shutdown note, got: {stdout}"
+    );
+    wait_for_exit(&mut daemon);
+}
+
 fn wait_for_exit(daemon: &mut std::process::Child) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {

@@ -64,10 +64,18 @@ fn spawn_daemon() -> Result<()> {
 }
 
 async fn handshake(mut stream: UnixStream) -> Result<Connection> {
-    write_frame(&mut stream, &ClientRequest::Hello { protocol_version: PROTOCOL_VERSION }).await?;
+    write_frame(
+        &mut stream,
+        &ClientRequest::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        },
+    )
+    .await?;
     match read_frame::<ServerEvent, _>(&mut stream).await? {
         Some(ServerEvent::HelloOk { daemon_pid, .. }) => Ok(Connection { stream, daemon_pid }),
-        Some(ServerEvent::Incompatible { daemon_protocol_version }) => bail!(
+        Some(ServerEvent::Incompatible {
+            daemon_protocol_version,
+        }) => bail!(
             "daemon speaks protocol v{daemon_protocol_version}, this client v{PROTOCOL_VERSION} — \
              run `nebula kill-server` and relaunch"
         ),
@@ -106,7 +114,10 @@ pub fn split_connection(conn: Connection) -> IpcChannels {
         }
     });
 
-    IpcChannels { tx: req_tx, rx: event_rx }
+    IpcChannels {
+        tx: req_tx,
+        rx: event_rx,
+    }
 }
 
 /// Ask a running daemon to shut down. Ok(false) when none is running.
@@ -128,6 +139,53 @@ pub async fn kill_server() -> Result<bool> {
     // Nothing listening — but a wedged or mid-boot daemon may still hold the
     // pidfile lock; fall through to the same check.
     kill_by_pidfile().await
+}
+
+/// Outcome of `shutdown_if_idle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleShutdown {
+    /// Nothing listening on the socket.
+    NoDaemon,
+    /// The daemon held no live PTYs and was shut down cleanly.
+    ShutDown,
+    /// Live sessions exist; the daemon was left running.
+    SessionsLive { count: usize },
+    /// A daemon is listening but its protocol version differs, so its
+    /// session state can't be inspected.
+    Skewed,
+}
+
+/// Shut the daemon down only when it holds no live PTYs — the post-upgrade
+/// handoff. An idle daemon can die safely (the next client launch spawns one
+/// from the new binary on disk); live sessions would be killed with it, so
+/// their daemon is left alone and the restart stays the user's call.
+pub async fn shutdown_if_idle() -> Result<IdleShutdown> {
+    let sock = paths::socket_path();
+    let Ok(stream) = try_connect(&sock).await else {
+        return Ok(IdleShutdown::NoDaemon);
+    };
+    let Ok(mut conn) = handshake(stream).await else {
+        return Ok(IdleShutdown::Skewed);
+    };
+    write_frame(&mut conn.stream, &ClientRequest::Subscribe).await?;
+    loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::Snapshot {
+                agents, terminals, ..
+            }) => {
+                let live = agents.iter().filter(|a| a.alive).count()
+                    + terminals.iter().filter(|t| t.alive).count();
+                if live > 0 {
+                    return Ok(IdleShutdown::SessionsLive { count: live });
+                }
+                write_frame(&mut conn.stream, &ClientRequest::Shutdown).await?;
+                wait_for_daemon_exit().await;
+                return Ok(IdleShutdown::ShutDown);
+            }
+            Some(_) => continue,
+            None => bail!("daemon closed the connection before sending a snapshot"),
+        }
+    }
 }
 
 /// SIGTERM the daemon recorded in the pidfile (its SIGTERM handler runs the
@@ -153,7 +211,11 @@ async fn kill_by_pidfile() -> Result<bool> {
 /// take the lock ourselves, nobody holds it. Released on drop.
 fn daemon_holds_pidfile_lock(path: &std::path::Path) -> bool {
     use std::os::fd::AsRawFd;
-    let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(path) else {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    else {
         return false;
     };
     flock_try_exclusive(file.as_raw_fd()) != 0

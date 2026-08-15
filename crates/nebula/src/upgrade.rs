@@ -19,7 +19,36 @@ pub fn run_upgrade(force: bool) -> Result<()> {
     // The runtime dir is already the 0700 auth boundary; staging the script
     // there keeps it out of a world-writable /tmp before we execute it.
     nebula_daemon::lifecycle::ensure_runtime_dir()?;
-    upgrade_with(&url, &nebula_core::paths::runtime_dir(), force)
+    upgrade_with(&url, &nebula_core::paths::runtime_dir(), force)?;
+    finish_daemon_handoff();
+    Ok(())
+}
+
+/// Swapping the binary on disk doesn't touch the running daemon — it keeps
+/// executing the old code. An idle daemon (no live PTYs) is shut down here so
+/// the next launch spawns the new binary; live sessions would die with the
+/// daemon, so that restart stays the user's call. Never fails the upgrade:
+/// the install already succeeded.
+fn finish_daemon_handoff() {
+    use nebula_tui::ipc::IdleShutdown;
+    match nebula_tui::shutdown_daemon_if_idle() {
+        Ok(IdleShutdown::NoDaemon) => {}
+        Ok(IdleShutdown::ShutDown) => {
+            println!(
+                "old daemon had no live sessions — shut it down; \
+                 the new binary starts on the next launch"
+            );
+        }
+        Ok(IdleShutdown::SessionsLive { count }) => {
+            let plural = if count == 1 { "" } else { "s" };
+            println!("note: the old daemon is still running with {count} live session{plural}.");
+            println!("      run 'nebula kill-server' to restart onto the new binary (stops all sessions).");
+        }
+        Ok(IdleShutdown::Skewed) | Err(_) => {
+            println!("note: a daemon from a previous version may still be running.");
+            println!("      run 'nebula kill-server' to restart onto the new binary (stops all sessions).");
+        }
+    }
 }
 
 fn upgrade_with(url: &str, staging_dir: &Path, force: bool) -> Result<()> {
@@ -38,8 +67,11 @@ fn upgrade_with(url: &str, staging_dir: &Path, force: bool) -> Result<()> {
 
     let script = stage_script(url, staging_dir)?;
     // Inherited stdio: the script's own progress lines are the UI here.
+    // NEBULA_UPGRADE_HANDOFF tells install.sh to skip its "daemon still
+    // running" note — finish_daemon_handoff owns that messaging here.
     let result = Command::new("sh")
         .arg(&script)
+        .env("NEBULA_UPGRADE_HANDOFF", "1")
         .status()
         .with_context(|| format!("run {}", script.display()));
     let _ = std::fs::remove_file(&script);
