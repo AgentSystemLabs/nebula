@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
 members = ["crates/nebula-core", "crates/nebula-daemon", "crates/nebula-tui", "crates/nebula"]
+exclude = ["vendor/vt100"]
+
+# Vendored vt100 with one patch: rows scrolled out of a top-anchored DECSTBM
+# region on the primary screen go into scrollback (upstream discards them).
+# Without it, codex's ratatui inline viewport leaves the TUI scrollback empty
+# — wheel-up over a codex agent did nothing. See vendor/vt100/Cargo.toml.
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }
 
 [workspace.package]
 version = "0.1.0"

@@ -639,3 +639,61 @@ impl App {
             .map(|(_, t)| t.clone())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Codex (ratatui inline viewport) inserts chat history by scrolling a
+    /// TOP-ANCHORED DECSTBM region, which stock vt100 discards instead of
+    /// saving — leaving nothing to scroll back to. This exercises the
+    /// vendored vt100 patch through the real dependency, so it also fails if
+    /// the `[patch.crates-io]` wiring is ever dropped.
+    #[test]
+    fn top_anchored_region_scroll_lands_in_scrollback() {
+        let sref = SessionRef::Agent(AgentId::from("test-agent".to_string()));
+        let mut term = AttachedTerm::new(sref, 80, 24);
+
+        // Codex-style history insert: region rows 1..=10 (viewport below),
+        // cursor at region bottom, newlines scroll history off the top.
+        term.parser.process(b"\x1b[1;10r\x1b[10;1H");
+        for i in 0..20 {
+            term.parser
+                .process(format!("history line {i}\r\n").as_bytes());
+        }
+        term.parser.process(b"\x1b[r");
+
+        term.set_scroll(5);
+        assert_eq!(
+            term.parser.screen().scrollback(),
+            5,
+            "rows scrolled out of a top-anchored region must be recallable"
+        );
+        let top_row = term.parser.screen().contents();
+        let top_row = top_row.lines().next().unwrap_or("");
+        assert!(
+            top_row.starts_with("history line"),
+            "scrolled-back view should show an evicted history line, got {top_row:?}"
+        );
+    }
+
+    /// The alternate screen (vim, htop) has no scrollback buffer, so region
+    /// scrolls there must stay discarded even with the vendored patch.
+    #[test]
+    fn alternate_screen_region_scroll_stays_unscrollable() {
+        let sref = SessionRef::Agent(AgentId::from("test-agent".to_string()));
+        let mut term = AttachedTerm::new(sref, 80, 24);
+
+        term.parser.process(b"\x1b[?1049h\x1b[1;10r\x1b[10;1H");
+        for i in 0..20 {
+            term.parser.process(format!("alt line {i}\r\n").as_bytes());
+        }
+
+        term.set_scroll(5);
+        assert_eq!(
+            term.parser.screen().scrollback(),
+            0,
+            "alternate screen must not accumulate scrollback"
+        );
+    }
+}
