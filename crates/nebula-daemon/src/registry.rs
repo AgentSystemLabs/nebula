@@ -915,7 +915,9 @@ impl Daemon {
 /// Program + args for an agent PTY. An override (tests) is used verbatim —
 /// no resume args. Otherwise the kind picks the CLI and its resume shape:
 /// `claude --resume <sid>` and `cursor-agent --resume <sid>` (flag) vs
-/// `codex resume <sid>` (subcommand, so resume args must lead).
+/// `codex resume <sid>` (subcommand, so resume args must lead). Codex and
+/// cursor always get their skip-permissions flag (`--yolo` / `--force`),
+/// appended after the resume args — same convention as Mission Control.
 fn agent_spawn_command(
     kind: AgentKind,
     session_id: Option<&str>,
@@ -930,12 +932,17 @@ fn agent_spawn_command(
         return (program, parts, false);
     }
     let program = kind.cli_program().to_string();
-    let (args, resumed) = match (kind, session_id) {
+    let (mut args, resumed) = match (kind, session_id) {
         (AgentKind::Claude, Some(sid)) => (vec!["--resume".to_string(), sid.to_string()], true),
         (AgentKind::Codex, Some(sid)) => (vec!["resume".to_string(), sid.to_string()], true),
         (AgentKind::Cursor, Some(sid)) => (vec!["--resume".to_string(), sid.to_string()], true),
         (_, None) => (Vec::new(), false),
     };
+    match kind {
+        AgentKind::Codex => args.push("--yolo".to_string()),
+        AgentKind::Cursor => args.push("--force".to_string()),
+        AgentKind::Claude => {}
+    }
     (program, args, resumed)
 }
 
@@ -978,14 +985,15 @@ mod tests {
             agent_spawn_command(AgentKind::Claude, None, None),
             ("claude".into(), vec![], false)
         );
+        // Codex/cursor always run in skip-permissions mode.
         assert_eq!(
             agent_spawn_command(AgentKind::Codex, None, None),
-            ("codex".into(), vec![], false)
+            ("codex".into(), vec!["--yolo".to_string()], false)
         );
         // Cursor's agent CLI is `cursor-agent`, not `cursor` (the editor).
         assert_eq!(
             agent_spawn_command(AgentKind::Cursor, None, None),
-            ("cursor-agent".into(), vec![], false)
+            ("cursor-agent".into(), vec!["--force".to_string()], false)
         );
         // Claude resumes with a flag; codex with a subcommand (order matters).
         assert_eq!(
@@ -996,11 +1004,16 @@ mod tests {
                 true
             )
         );
+        // Skip-permissions flags trail the resume args.
         assert_eq!(
             agent_spawn_command(AgentKind::Codex, Some("sid-2"), None),
             (
                 "codex".into(),
-                vec!["resume".to_string(), "sid-2".to_string()],
+                vec![
+                    "resume".to_string(),
+                    "sid-2".to_string(),
+                    "--yolo".to_string()
+                ],
                 true
             )
         );
@@ -1008,7 +1021,11 @@ mod tests {
             agent_spawn_command(AgentKind::Cursor, Some("sid-3"), None),
             (
                 "cursor-agent".into(),
-                vec!["--resume".to_string(), "sid-3".to_string()],
+                vec![
+                    "--resume".to_string(),
+                    "sid-3".to_string(),
+                    "--force".to_string()
+                ],
                 true
             )
         );
