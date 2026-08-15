@@ -746,6 +746,15 @@ impl Daemon {
             agent.session_id.as_deref(),
             cmd_override.as_deref(),
         );
+        // Run the agent through the user's login+interactive shell so it sees
+        // the same env as a Terminal.app tab (~/.zprofile, ~/.zshrc,
+        // path_helper) instead of the daemon's inherited-at-boot env.
+        // Overrides (tests) stay verbatim.
+        let (program, args) = if cmd_override.is_some() {
+            (program, args)
+        } else {
+            login_shell_wrap(&user_shell(), &program, &args)
+        };
 
         let spec = SpawnSpec {
             program,
@@ -821,10 +830,11 @@ impl Daemon {
         cols: u16,
         rows: u16,
     ) -> Result<Arc<PtySession>> {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        // `-l` makes it a login shell, matching Terminal.app: zsh then sources
+        // /etc/zprofile (path_helper), ~/.zprofile, and ~/.zshrc.
         let spec = SpawnSpec {
-            program: shell,
-            args: vec![],
+            program: user_shell(),
+            args: vec!["-l".into()],
             cwd: worktree.path.clone(),
             env: vec![],
             scrub_env: scrubbed_env_names(),
@@ -926,6 +936,24 @@ fn agent_spawn_command(
     (program, args, resumed)
 }
 
+fn user_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+}
+
+/// Wrap `program args…` in a login + interactive shell (`$SHELL -l -i -c
+/// 'exec …'`) so the child gets the user's real environment — ~/.zprofile
+/// and ~/.zshrc on zsh — rather than the daemon's. `exec` keeps the child
+/// as the PTY's direct process (exit codes and signals pass through).
+fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec<String>) {
+    let mut cmdline = String::from("exec");
+    for part in std::iter::once(program).chain(args.iter().map(String::as_str)) {
+        cmdline.push_str(" '");
+        cmdline.push_str(&part.replace('\'', "'\\''"));
+        cmdline.push('\'');
+    }
+    (shell.to_string(), vec!["-l".into(), "-i".into(), "-c".into(), cmdline])
+}
+
 /// Env vars that must never leak into plain terminals (and are re-set
 /// explicitly for agent PTYs).
 pub fn scrubbed_env_names() -> Vec<String> {
@@ -977,6 +1005,23 @@ mod tests {
             agent_spawn_command(AgentKind::Codex, Some("sid"), Some("/bin/sh")),
             ("/bin/sh".into(), vec![], false)
         );
+    }
+
+    #[test]
+    fn login_shell_wrap_quotes_and_execs() {
+        let (program, args) = login_shell_wrap(
+            "/bin/zsh",
+            "claude",
+            &["--resume".to_string(), "sid-1".to_string()],
+        );
+        assert_eq!(program, "/bin/zsh");
+        assert_eq!(
+            args,
+            vec!["-l", "-i", "-c", "exec 'claude' '--resume' 'sid-1'"]
+        );
+        // Single quotes in an arg survive the wrapping.
+        let (_, args) = login_shell_wrap("/bin/zsh", "echo", &["it's".to_string()]);
+        assert_eq!(args[3], r"exec 'echo' 'it'\''s'");
     }
 
     fn test_daemon() -> Arc<Daemon> {
