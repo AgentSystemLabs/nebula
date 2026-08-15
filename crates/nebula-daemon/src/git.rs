@@ -123,12 +123,89 @@ pub async fn add_worktree(repo: &Path, branch: &str, base: Option<&str>) -> Resu
 }
 
 pub async fn remove_worktree(repo: &Path, worktree_path: &Path, force: bool) -> Result<()> {
+    // Checkout already gone (manual rm -rf): `git worktree remove` would fail,
+    // but the user's intent is already satisfied — just drop git's stale
+    // bookkeeping so the entry leaves `git worktree list`.
+    if !worktree_path.exists() {
+        let _ = git(repo, &["worktree", "prune"]).await;
+        return Ok(());
+    }
     let path_str = worktree_path.to_string_lossy().into_owned();
     let mut args = vec!["worktree", "remove"];
     if force {
         args.push("--force");
     }
     args.push(&path_str);
-    git(repo, &args).await?;
-    Ok(())
+    match git(repo, &args).await {
+        Ok(_) => Ok(()),
+        // Directory exists but git no longer tracks it as a worktree (already
+        // pruned, or its .git link was destroyed). Nothing for git to remove;
+        // prune any leftover metadata and let the caller drop its row. The
+        // directory itself is left alone — deleting an untracked dir is not
+        // ours to do.
+        Err(e)
+            if e.to_string().contains("is not a working tree")
+                || e.to_string().contains("does not exist") =>
+        {
+            let _ = git(repo, &["worktree", "prune"]).await;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn init_repo(dir: &Path) {
+        git(dir, &["init", "-b", "main"]).await.unwrap();
+        git(dir, &["config", "user.email", "t@t"]).await.unwrap();
+        git(dir, &["config", "user.name", "t"]).await.unwrap();
+        git(dir, &["commit", "--allow-empty", "-m", "init"]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_worktree_survives_manual_rm_rf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let wt = add_worktree(&repo, "feature", None).await.unwrap();
+
+        // Simulate the user deleting the checkout by hand.
+        std::fs::remove_dir_all(&wt).unwrap();
+
+        remove_worktree(&repo, &wt, false).await.unwrap();
+        // The stale registration should be pruned from git's list too.
+        let entries = list_worktrees(&repo).await.unwrap();
+        assert!(entries.iter().all(|e| e.path != wt));
+    }
+
+    #[tokio::test]
+    async fn remove_worktree_ok_when_already_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let wt = add_worktree(&repo, "feature", None).await.unwrap();
+        std::fs::remove_dir_all(&wt).unwrap();
+        git(&repo, &["worktree", "prune"]).await.unwrap();
+
+        // Path gone AND git no longer knows it — still not an error.
+        remove_worktree(&repo, &wt, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_worktree_still_fails_on_dirty_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let wt = add_worktree(&repo, "feature", None).await.unwrap();
+        std::fs::write(wt.join("untracked.txt"), "dirty").unwrap();
+
+        assert!(remove_worktree(&repo, &wt, false).await.is_err());
+        remove_worktree(&repo, &wt, true).await.unwrap();
+    }
 }
