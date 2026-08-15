@@ -520,15 +520,28 @@ mod tests {
             alive: false,
         };
         store.insert_agent(&codex_agent).unwrap();
+        let cursor_agent = Agent {
+            id: AgentId::generate(),
+            worktree_id: worktree.id.clone(),
+            name: "agent-3".into(),
+            status: AgentStatus::Fresh,
+            archived: false,
+            kind: AgentKind::Cursor,
+            session_id: None,
+            sort_order: 2,
+            alive: false,
+        };
+        store.insert_agent(&cursor_agent).unwrap();
 
         let (projects, worktrees, agents, _terms) = store.load_tree().unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(worktrees.len(), 1);
-        assert_eq!(agents.len(), 2);
+        assert_eq!(agents.len(), 3);
         assert_eq!(agents[0].status, AgentStatus::Running);
         assert_eq!(agents[0].kind, AgentKind::Claude);
         assert_eq!(agents[0].session_id.as_deref(), Some("sess-123"));
         assert_eq!(agents[1].kind, AgentKind::Codex);
+        assert_eq!(agents[2].kind, AgentKind::Cursor);
     }
 
     #[test]

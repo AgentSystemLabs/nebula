@@ -655,8 +655,11 @@ fn draw_session_row(
         Style::default()
     };
     // Non-default CLIs get a dim badge (same idiom as the worktree root row).
-    const CODEX_BADGE: &str = " codex";
-    let badge = (row.kind == nebula_core::AgentKind::Codex).then_some(CODEX_BADGE);
+    let badge = match row.kind {
+        nebula_core::AgentKind::Claude => None,
+        nebula_core::AgentKind::Codex => Some(" codex"),
+        nebula_core::AgentKind::Cursor => Some(" cursor"),
+    };
     let name_max = (width.saturating_sub(2) as usize).saturating_sub(badge.map_or(0, str::len));
     let mut spans = vec![dot, Span::styled(truncate(&row.name, name_max), name_style)];
     if let Some(badge) = badge {

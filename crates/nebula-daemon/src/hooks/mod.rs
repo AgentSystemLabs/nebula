@@ -1,8 +1,9 @@
 //! Agent-CLI hook receiver: a loopback-only HTTP endpoint the shell hook
-//! one-liners POST to (`/api/hooks/claude` and `/api/hooks/codex` — codex
-//! mirrors Claude's hook events and payload shape, so one handler serves
-//! both). Fail-soft on both sides — a malformed payload still gets a 200 so
-//! a broken hook never faults the user's agent turn.
+//! one-liners POST to (`/api/hooks/claude`, `/api/hooks/codex`, and
+//! `/api/hooks/cursor` — codex and cursor mirror Claude's hook events and
+//! payload shape, so one handler serves all three). Fail-soft on both sides
+//! — a malformed payload still gets a 200 so a broken hook never faults the
+//! user's agent turn.
 
 pub mod installer;
 
@@ -96,6 +97,7 @@ pub async fn start_hook_server() -> anyhow::Result<(
     let app = Router::new()
         .route("/api/hooks/claude", post(receive_hook))
         .route("/api/hooks/codex", post(receive_hook))
+        .route("/api/hooks/cursor", post(receive_hook))
         .with_state(state);
 
     tokio::spawn(async move {

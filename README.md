@@ -43,14 +43,16 @@ sessions) and relaunch.
 - **Projects → worktrees → sessions.** All work happens in the main checkout
   or a git worktree. Worktrees are real (`git worktree add/remove`), created
   under `<repo>/../<repo-name>-worktrees/<branch>`.
-- **Agents boot `claude` or `codex`.** Creating an agent (`n`) first asks
-  which CLI to run, then spawns it in the worktree. Restored agents resume
-  with `claude --resume <session-id>` / `codex resume <session-id>` (falling
-  back to a fresh session when the old one is gone).
+- **Agents boot `claude`, `codex`, or `cursor-agent`.** Creating an agent
+  (`n`) first asks which CLI to run, then spawns it in the worktree. Restored
+  agents resume with `claude --resume <session-id>` / `codex resume
+  <session-id>` / `cursor-agent --resume <session-id>` (falling back to a
+  fresh session when the old one is gone).
 - **Status via agent-CLI hooks, not MCP.** At agent spawn, nebula merges
   managed hooks into the worktree's `.claude/settings.local.json` (Claude
-  Code) or `.codex/hooks.json` (Codex; loads once the project is trusted and
-  the hooks approved on first run). Groups are tagged `_nebulaManaged`, user
+  Code), `.codex/hooks.json` (Codex; loads once the project is trusted and
+  the hooks approved on first run), or `.cursor/hooks.json` (Cursor CLI).
+  Groups are tagged `_nebulaManaged`, user
   hooks preserved, rebuilt each spawn. Each hook is a fail-soft curl to the
   daemon's loopback HTTP endpoint, authenticated with a per-boot bearer token
   injected into the agent's environment only.

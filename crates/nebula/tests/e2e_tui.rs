@@ -413,7 +413,7 @@ fn tui_projects_worktrees_agents_navigation() {
 
     // ---- create an agent: kind picker → name prompt, auto-attaches ----
     tui.send(b"n");
-    tui.wait_for_text("Agent type"); // Claude/Codex picker
+    tui.wait_for_text("Agent type"); // Claude/Codex/Cursor picker
     tui.send(b"\r"); // pick the default (Claude)
     tui.wait_for_gone("Agent type");
     tui.wait_for_text("New agent");

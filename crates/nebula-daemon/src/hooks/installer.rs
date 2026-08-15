@@ -1,6 +1,7 @@
 //! Managed-hook installation into a worktree's agent-CLI config:
-//! `.claude/settings.local.json` (Claude Code) or `.codex/hooks.json`
-//! (Codex CLI — same hooks JSON shape).
+//! `.claude/settings.local.json` (Claude Code), `.codex/hooks.json`
+//! (Codex CLI), or `.cursor/hooks.json` (Cursor CLI) — same hooks JSON
+//! shape across all three.
 //!
 //! Rules (learned the hard way in mission-control):
 //! - MERGE, never replace: user hooks are preserved untouched.
@@ -43,6 +44,10 @@ const CODEX_EVENTS: &[(&str, Option<&str>)] = &[
     ("SubagentStart", None),
     ("SubagentStop", None),
 ];
+
+/// Cursor mirrors codex's hook surface: no Notification hook and no
+/// AskUserQuestion tool, so PermissionRequest is the waiting-on-user signal.
+const CURSOR_EVENTS: &[(&str, Option<&str>)] = CODEX_EVENTS;
 
 fn hook_command(endpoint: &str, event: &str) -> String {
     format!(
@@ -101,6 +106,11 @@ pub fn install_claude_hooks(cwd: &Path) -> Result<()> {
 /// Merge nebula's managed hooks for Codex into `<cwd>/.codex/hooks.json`.
 pub fn install_codex_hooks(cwd: &Path) -> Result<()> {
     install_managed_hooks(cwd, ".codex", "hooks.json", "codex", CODEX_EVENTS)
+}
+
+/// Merge nebula's managed hooks for Cursor into `<cwd>/.cursor/hooks.json`.
+pub fn install_cursor_hooks(cwd: &Path) -> Result<()> {
+    install_managed_hooks(cwd, ".cursor", "hooks.json", "cursor", CURSOR_EVENTS)
 }
 
 fn install_managed_hooks(
@@ -345,12 +355,38 @@ mod tests {
     }
 
     #[test]
-    fn claude_and_codex_installs_do_not_interfere() {
+    fn cursor_installs_into_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_cursor_hooks(tmp.path()).unwrap();
+        let hooks = read_json(tmp.path(), ".cursor/hooks.json");
+        let stop = &hooks["hooks"]["Stop"];
+        assert_eq!(stop.as_array().unwrap().len(), 1);
+        assert_eq!(stop[0]["_nebulaManaged"], json!(true));
+        let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("/api/hooks/cursor?"), "cursor endpoint: {cmd}");
+        assert!(cmd.contains("hookEvent=Stop"));
+        // Claude-only events must not leak into the cursor file.
+        assert!(hooks["hooks"].get("Notification").is_none());
+        assert!(hooks["hooks"].get("PreToolUse").is_none());
+        assert!(hooks["hooks"].get("PostToolUse").is_none());
+        assert_eq!(
+            hooks["hooks"]["PermissionRequest"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn per_kind_installs_do_not_interfere() {
         let tmp = tempfile::tempdir().unwrap();
         install_claude_hooks(tmp.path()).unwrap();
         install_codex_hooks(tmp.path()).unwrap();
+        install_cursor_hooks(tmp.path()).unwrap();
         let claude = read_settings(tmp.path());
         let codex = read_json(tmp.path(), ".codex/hooks.json");
+        let cursor = read_json(tmp.path(), ".cursor/hooks.json");
         assert!(claude["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap()
@@ -359,5 +395,9 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("/api/hooks/codex?"));
+        assert!(cursor["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("/api/hooks/cursor?"));
     }
 }

@@ -51,6 +51,7 @@ pub enum AgentKind {
     #[default]
     Claude,
     Codex,
+    Cursor,
 }
 
 impl AgentKind {
@@ -58,6 +59,7 @@ impl AgentKind {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
+            AgentKind::Cursor => "cursor",
         }
     }
 
@@ -65,8 +67,19 @@ impl AgentKind {
         Some(match s {
             "claude" => AgentKind::Claude,
             "codex" => AgentKind::Codex,
+            "cursor" => AgentKind::Cursor,
             _ => return None,
         })
+    }
+
+    /// Binary the kind launches. Differs from `as_str` only for Cursor,
+    /// whose agent CLI ships as `cursor-agent` (`cursor` opens the editor).
+    pub fn cli_program(&self) -> &'static str {
+        match self {
+            AgentKind::Claude => "claude",
+            AgentKind::Codex => "codex",
+            AgentKind::Cursor => "cursor-agent",
+        }
     }
 }
 
@@ -102,7 +115,7 @@ pub struct Agent {
     pub archived: bool,
     #[serde(default)]
     pub kind: AgentKind,
-    /// CLI session id used for resume (claude or codex, per `kind`).
+    /// CLI session id used for resume (claude, codex, or cursor, per `kind`).
     pub session_id: Option<String>,
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this agent.

@@ -734,6 +734,7 @@ impl Daemon {
         let install_result = match agent.kind {
             AgentKind::Claude => hooks::installer::install_claude_hooks(&worktree.path),
             AgentKind::Codex => hooks::installer::install_codex_hooks(&worktree.path),
+            AgentKind::Cursor => hooks::installer::install_cursor_hooks(&worktree.path),
         };
         if let Err(e) = install_result {
             tracing::warn!(error = %e, cwd = %worktree.path.display(), "hook install failed");
@@ -781,7 +782,8 @@ impl Daemon {
         Ok(session)
     }
 
-    /// A resumed session (`claude --resume` / `codex resume`) dies fast when
+    /// A resumed session (`claude --resume` / `codex resume` /
+    /// `cursor-agent --resume`) dies fast when
     /// it is stale/deleted — fall back to a fresh session instead of leaving
     /// a dead pane.
     fn arm_resume_fallback(
@@ -912,8 +914,8 @@ impl Daemon {
 
 /// Program + args for an agent PTY. An override (tests) is used verbatim —
 /// no resume args. Otherwise the kind picks the CLI and its resume shape:
-/// `claude --resume <sid>` vs `codex resume <sid>` (subcommand, so resume
-/// args must lead).
+/// `claude --resume <sid>` and `cursor-agent --resume <sid>` (flag) vs
+/// `codex resume <sid>` (subcommand, so resume args must lead).
 fn agent_spawn_command(
     kind: AgentKind,
     session_id: Option<&str>,
@@ -922,15 +924,16 @@ fn agent_spawn_command(
     if let Some(cmd) = cmd_override {
         let mut parts = cmd.split_whitespace().map(String::from).collect::<Vec<_>>();
         if parts.is_empty() {
-            parts.push(kind.as_str().into());
+            parts.push(kind.cli_program().into());
         }
         let program = parts.remove(0);
         return (program, parts, false);
     }
-    let program = kind.as_str().to_string();
+    let program = kind.cli_program().to_string();
     let (args, resumed) = match (kind, session_id) {
         (AgentKind::Claude, Some(sid)) => (vec!["--resume".to_string(), sid.to_string()], true),
         (AgentKind::Codex, Some(sid)) => (vec!["resume".to_string(), sid.to_string()], true),
+        (AgentKind::Cursor, Some(sid)) => (vec!["--resume".to_string(), sid.to_string()], true),
         (_, None) => (Vec::new(), false),
     };
     (program, args, resumed)
@@ -979,6 +982,11 @@ mod tests {
             agent_spawn_command(AgentKind::Codex, None, None),
             ("codex".into(), vec![], false)
         );
+        // Cursor's agent CLI is `cursor-agent`, not `cursor` (the editor).
+        assert_eq!(
+            agent_spawn_command(AgentKind::Cursor, None, None),
+            ("cursor-agent".into(), vec![], false)
+        );
         // Claude resumes with a flag; codex with a subcommand (order matters).
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, Some("sid-1"), None),
@@ -993,6 +1001,14 @@ mod tests {
             (
                 "codex".into(),
                 vec!["resume".to_string(), "sid-2".to_string()],
+                true
+            )
+        );
+        assert_eq!(
+            agent_spawn_command(AgentKind::Cursor, Some("sid-3"), None),
+            (
+                "cursor-agent".into(),
+                vec!["--resume".to_string(), "sid-3".to_string()],
                 true
             )
         );

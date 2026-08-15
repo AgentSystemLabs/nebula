@@ -754,7 +754,12 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
             },
             MenuItem {
                 label: "Codex".into(),
-                action: MenuAction::NewAgentOfKind(worktree, AgentKind::Codex),
+                action: MenuAction::NewAgentOfKind(worktree.clone(), AgentKind::Codex),
+                destructive: false,
+            },
+            MenuItem {
+                label: "Cursor".into(),
+                action: MenuAction::NewAgentOfKind(worktree, AgentKind::Cursor),
                 destructive: false,
             },
         ],
@@ -2276,9 +2281,10 @@ mod tests {
             panic!("expected agent-type picker, got {:?}", app.overlay);
         };
         assert_eq!(menu.title.as_deref(), Some("Agent type"));
-        assert_eq!(menu.items.len(), 2);
+        assert_eq!(menu.items.len(), 3);
         assert_eq!(menu.items[0].label, "Claude");
         assert_eq!(menu.items[1].label, "Codex");
+        assert_eq!(menu.items[2].label, "Cursor");
         assert_eq!(menu.hover, 0, "Claude is the default");
 
         // Enter on the default chains into the name prompt with kind=Claude.
@@ -2336,6 +2342,39 @@ mod tests {
             out.last(),
             Some(ClientRequest::CreateAgent {
                 kind: AgentKind::Codex,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn picker_third_row_creates_cursor_agent() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+
+        for code in [
+            KeyCode::Char('n'),
+            KeyCode::Char('j'),
+            KeyCode::Char('j'),
+            KeyCode::Enter,
+        ] {
+            handle_key(&mut app, KeyEvent::new(code, KeyModifiers::NONE), &mut out);
+        }
+        assert!(matches!(
+            &app.overlay,
+            Some(Overlay::Prompt(p)) if matches!(&p.kind, PromptKind::NewAgent { kind: AgentKind::Cursor, .. })
+        ));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut out,
+        );
+        assert!(matches!(
+            out.last(),
+            Some(ClientRequest::CreateAgent {
+                kind: AgentKind::Cursor,
                 ..
             })
         ));

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -116,7 +116,7 @@ pub enum ClientRequest {
         id: AgentId,
     },
     /// Respawn; resumes the stored session id (`claude --resume` /
-    /// `codex resume`) when one is stored.
+    /// `codex resume` / `cursor-agent --resume`) when one is stored.
     RestartAgent {
         req_id: u64,
         id: AgentId,
