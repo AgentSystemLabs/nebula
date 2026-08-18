@@ -56,7 +56,9 @@ pub async fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeEntry>> {
             if let Some(done_path) = path.take() {
                 entries.push(WorktreeEntry {
                     path: done_path,
-                    branch: branch.take().unwrap_or_else(|| detached_label(head.as_deref())),
+                    branch: branch
+                        .take()
+                        .unwrap_or_else(|| detached_label(head.as_deref())),
                 });
             }
             head = None;
@@ -87,7 +89,10 @@ fn detached_label(head: Option<&str>) -> String {
 /// Directory a new worktree for `branch` should live in:
 /// `<repo>/../<repo-name>-worktrees/<branch>` (slashes in branch → dashes).
 pub fn worktree_dir(repo: &Path, branch: &str) -> PathBuf {
-    let repo_name = repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "repo".into());
+    let repo_name = repo
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "repo".into());
     let safe_branch = branch.replace('/', "-");
     repo.parent()
         .map(|p| p.to_path_buf())
@@ -150,6 +155,15 @@ pub async fn remove_worktree(repo: &Path, worktree_path: &Path, force: bool) -> 
             let _ = git(repo, &["worktree", "prune"]).await;
             Ok(())
         }
+        // Locked by a session that ran `git worktree lock` (Claude Code locks
+        // its worktree and a killed session never unlocks). The caller has
+        // already killed this worktree's sessions, so the lock is stale —
+        // unlock and retry rather than surfacing git's refusal.
+        Err(e) if e.to_string().contains("locked working tree") => {
+            git(repo, &["worktree", "unlock", &path_str]).await?;
+            git(repo, &args).await?;
+            Ok(())
+        }
         Err(e) => Err(e),
     }
 }
@@ -162,7 +176,9 @@ mod tests {
         git(dir, &["init", "-b", "main"]).await.unwrap();
         git(dir, &["config", "user.email", "t@t"]).await.unwrap();
         git(dir, &["config", "user.name", "t"]).await.unwrap();
-        git(dir, &["commit", "--allow-empty", "-m", "init"]).await.unwrap();
+        git(dir, &["commit", "--allow-empty", "-m", "init"])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -194,6 +210,32 @@ mod tests {
 
         // Path gone AND git no longer knows it — still not an error.
         remove_worktree(&repo, &wt, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_worktree_unlocks_session_locked_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let wt = add_worktree(&repo, "feature", None).await.unwrap();
+        let wt_str = wt.to_string_lossy().into_owned();
+        git(
+            &repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "claude session menu-enable-level",
+                &wt_str,
+            ],
+        )
+        .await
+        .unwrap();
+
+        remove_worktree(&repo, &wt, false).await.unwrap();
+        let entries = list_worktrees(&repo).await.unwrap();
+        assert!(entries.iter().all(|e| e.path != wt));
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 use crate::app::{
     agent_sref, App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, Focus,
     HitTarget, MenuAction, MenuItem, Overlay, PendingAction, PendingIntent, ProjectRow,
-    PromptDialog, PromptKind, SplitterDrag, TermSelection,
+    PromptDialog, PromptKind, SplitterDrag, TermSelection, WorktreeRollback,
 };
 use crate::{ipc, keys, ui};
 use anyhow::Result;
@@ -479,11 +479,14 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 }
             }
         }
-        KeyCode::Char('d') | KeyCode::Delete => match (app.focus, app.selected_project_row()) {
-            // Dividers are cheap to recreate — no confirmation dance.
-            (Focus::Projects, Some(ProjectRow::Divider(i))) => remove_divider(app, i, out),
-            _ => open_delete_confirm(app),
-        },
+        // Backspace is what a Mac "delete" key actually sends.
+        KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+            match (app.focus, app.selected_project_row()) {
+                // Dividers are cheap to recreate — no confirmation dance.
+                (Focus::Projects, Some(ProjectRow::Divider(i))) => remove_divider(app, i, out),
+                _ => open_delete_confirm(app),
+            }
+        }
         KeyCode::Char('m') => open_context_menu_for_selection(app),
         KeyCode::Char('g') => open_diff_view(app),
         KeyCode::Char('z') => {
@@ -529,8 +532,8 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
         ),
         PromptKind::NewAgent { .. } => (
             "New agent".to_string(),
-            "name".to_string(),
-            app.default_session_name("agent"),
+            format!("name (empty = {})", app.default_session_name("agent")),
+            String::new(),
         ),
         PromptKind::RenameAgent { id } => {
             let current = app
@@ -935,7 +938,8 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
         });
         return;
     }
-    if value.is_empty() {
+    // An empty agent name falls back to the next free default (agent-1, …).
+    if value.is_empty() && !matches!(prompt.kind, PromptKind::NewAgent { .. }) {
         app.flash = Some("cancelled: empty input".into());
         return;
     }
@@ -960,11 +964,16 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             });
         }
         PromptKind::NewAgent { worktree, kind } => {
+            let name = if value.is_empty() {
+                app.default_session_name("agent")
+            } else {
+                value
+            };
             let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
             out.push(ClientRequest::CreateAgent {
                 req_id,
                 worktree,
-                name: value,
+                name,
                 kind,
             });
         }
@@ -992,7 +1001,15 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
             out.push(ClientRequest::DeleteAgent { req_id, id });
         }
         PendingAction::DeleteWorktree(id) => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
+            // Optimistic: drop the rows now (the daemon deletes in the
+            // background — `git worktree remove` can take seconds). The
+            // eventual EntityRemoved is a no-op; an Error for this req_id
+            // restores the rows via the rollback stashed in the intent.
+            let intent = match remove_worktree_rows(app, &id) {
+                Some(rollback) => PendingIntent::DeleteWorktree(rollback),
+                None => PendingIntent::None,
+            };
+            let req_id = app.alloc_req_id(intent);
             out.push(ClientRequest::DeleteWorktree {
                 req_id,
                 id,
@@ -1235,7 +1252,8 @@ fn select_worktree_by_id(
         app.sel_worktree = index;
         restore_session(app, out);
     }
-    app.focus = Focus::Worktrees;
+    // Land on the sessions panel so `n` immediately creates a session here.
+    app.focus = Focus::Sessions;
     true
 }
 
@@ -1607,10 +1625,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         }
                         let cell = pane_cell(app.term_area, mouse.column, mouse.row);
                         let now = std::time::Instant::now();
-                        let double = app
-                            .last_term_click
-                            .take()
-                            .is_some_and(|(at, c)| c == cell && now.duration_since(at) <= DOUBLE_CLICK);
+                        let double = app.last_term_click.take().is_some_and(|(at, c)| {
+                            c == cell && now.duration_since(at) <= DOUBLE_CLICK
+                        });
                         if double {
                             // Double-click: select (and copy) the word under
                             // the cursor. `last_term_click` was consumed, so
@@ -1913,7 +1930,14 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             clamp_selections(app);
             app.dirty = true;
         }
-        ServerEvent::Error { message, .. } => {
+        ServerEvent::Error { req_id, message } => {
+            // A failed request's intent never gets an Ack; clear it — and if
+            // it was an optimistic worktree delete, put the rows back.
+            if let Some(PendingIntent::DeleteWorktree(rollback)) =
+                req_id.and_then(|id| app.pending.remove(&id))
+            {
+                restore_worktree_rows(app, rollback);
+            }
             app.flash = Some(message);
             app.dirty = true;
         }
@@ -2005,6 +2029,52 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
         EntityId::Agent(id) => app.tree.agents.retain(|a| &a.id != id),
         EntityId::Terminal(_) => {}
     }
+}
+
+/// Optimistically remove a worktree row and its agent rows, returning a
+/// snapshot that `restore_worktree_rows` can reinsert if the daemon-side
+/// delete fails. None when the worktree isn't in the tree.
+fn remove_worktree_rows(app: &mut App, id: &WorktreeId) -> Option<WorktreeRollback> {
+    let index = app.tree.worktrees.iter().position(|w| &w.id == id)?;
+    let worktree = app.tree.worktrees.remove(index);
+    let mut agents = Vec::new();
+    let mut kept = Vec::with_capacity(app.tree.agents.len());
+    for (i, a) in std::mem::take(&mut app.tree.agents).into_iter().enumerate() {
+        if &a.worktree_id == id {
+            agents.push((i, a));
+        } else {
+            kept.push(a);
+        }
+    }
+    app.tree.agents = kept;
+    clamp_selections(app);
+    Some(WorktreeRollback {
+        index,
+        worktree,
+        agents,
+    })
+}
+
+/// Rollback of `remove_worktree_rows`: reinsert the rows at (or near) their
+/// old positions. Skips anything the daemon re-upserted in the meantime.
+fn restore_worktree_rows(app: &mut App, rollback: WorktreeRollback) {
+    let WorktreeRollback {
+        index,
+        worktree,
+        agents,
+    } = rollback;
+    if !app.tree.worktrees.iter().any(|w| w.id == worktree.id) {
+        let at = index.min(app.tree.worktrees.len());
+        app.tree.worktrees.insert(at, worktree);
+    }
+    for (i, a) in agents {
+        if !app.tree.agents.iter().any(|x| x.id == a.id) {
+            let at = i.min(app.tree.agents.len());
+            app.tree.agents.insert(at, a);
+        }
+    }
+    clamp_selections(app);
+    app.dirty = true;
 }
 
 /// Keep selections valid after the tree shrinks.
@@ -2136,6 +2206,80 @@ mod tests {
         assert!(
             !text.contains("TERMINALS"),
             "terminals section is gone:\n{text}"
+        );
+    }
+
+    /// Confirming a worktree delete drops the row (and its agents)
+    /// immediately — the daemon deletes in the background — and an Error
+    /// reply for that request restores them where they were.
+    #[test]
+    fn worktree_delete_is_optimistic_and_rolls_back_on_error() {
+        use nebula_core::{Agent, AgentStatus, Entity, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let wt_id = WorktreeId("w2".into());
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: wt_id.clone(),
+                    project_id: nebula_core::ProjectId("p1".into()),
+                    path: "/tmp/demo-feature".into(),
+                    branch: "feature".into(),
+                    is_main: false,
+                    sort_order: 0,
+                }),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a2".into()),
+                    worktree_id: wt_id.clone(),
+                    name: "agent-2".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    kind: nebula_core::AgentKind::Claude,
+                    session_id: None,
+                    sort_order: 0,
+                    alive: true,
+                }),
+            },
+        );
+
+        // Confirmed delete: rows vanish before any daemon reply.
+        let mut out = Vec::new();
+        run_pending_action(
+            &mut app,
+            PendingAction::DeleteWorktree(wt_id.clone()),
+            &mut out,
+        );
+        let req_id = match out.as_slice() {
+            [ClientRequest::DeleteWorktree { req_id, id, .. }] if *id == wt_id => *req_id,
+            other => panic!("expected DeleteWorktree request, got {other:?}"),
+        };
+        assert!(!app.tree.worktrees.iter().any(|w| w.id == wt_id));
+        assert!(!app.tree.agents.iter().any(|a| a.worktree_id == wt_id));
+
+        // Daemon says the delete failed: rows come back, error flashes.
+        hse(
+            &mut app,
+            ServerEvent::Error {
+                req_id: Some(req_id),
+                message: "worktree dirty".into(),
+            },
+        );
+        assert_eq!(
+            app.tree.worktrees.iter().position(|w| w.id == wt_id),
+            Some(1),
+            "worktree restored at its old index"
+        );
+        assert!(app.tree.agents.iter().any(|a| a.worktree_id == wt_id));
+        assert_eq!(app.flash.as_deref(), Some("worktree dirty"));
+        assert!(
+            app.pending.is_empty(),
+            "failed request leaves no pending intent"
         );
     }
 
@@ -2297,7 +2441,8 @@ mod tests {
             panic!("expected name prompt, got {:?}", app.overlay);
         };
         assert_eq!(p.title, "New agent");
-        assert_eq!(p.input, "agent-2", "prefilled with the next free name");
+        assert_eq!(p.input, "", "name starts blank; the default is only a hint");
+        assert_eq!(p.label, "name (empty = agent-2)");
         assert!(matches!(
             &p.kind,
             PromptKind::NewAgent {
@@ -2306,7 +2451,7 @@ mod tests {
             }
         ));
 
-        // Accepting the prompt emits CreateAgent with the picked kind.
+        // Accepting the empty prompt falls back to the next free default name.
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -2573,9 +2718,7 @@ mod tests {
             ev(MouseEventKind::Down(MouseButton::Left), 0, 0),
             &mut out,
         );
-        assert!(app
-            .term_selection
-            .is_some_and(|s| s.dragging && !s.active));
+        assert!(app.term_selection.is_some_and(|s| s.dragging && !s.active));
         assert!(app.term_locked, "click into the pane still locks input");
 
         // Dragging extends the selection; the text under it is extractable.
@@ -2585,7 +2728,10 @@ mod tests {
             &mut out,
         );
         let sel = app.term_selection.expect("drag keeps the selection");
-        assert!(sel.active, "leaving the anchor cell activates the selection");
+        assert!(
+            sel.active,
+            "leaving the anchor cell activates the selection"
+        );
         assert_eq!(sel.bounds(), ((0, 0), (10, 0)));
         assert_eq!(selection_text(&app).as_deref(), Some("hello world"));
 
@@ -2603,10 +2749,14 @@ mod tests {
             ev(MouseEventKind::Up(MouseButton::Left), 200, 50),
             &mut out,
         );
-        let sel = app.term_selection.expect("highlight persists after release");
+        let sel = app
+            .term_selection
+            .expect("highlight persists after release");
         assert!(!sel.dragging && sel.active);
         assert!(
-            app.flash.as_deref().is_some_and(|f| f.starts_with("copied")),
+            app.flash
+                .as_deref()
+                .is_some_and(|f| f.starts_with("copied")),
             "release copies the selection"
         );
         assert!(
@@ -2691,7 +2841,9 @@ mod tests {
         assert_eq!(sel.bounds(), ((0, 0), (4, 0)));
         assert_eq!(selection_text(&app).as_deref(), Some("hello"));
         assert!(
-            app.flash.as_deref().is_some_and(|f| f.starts_with("copied")),
+            app.flash
+                .as_deref()
+                .is_some_and(|f| f.starts_with("copied")),
             "double-click copies the word"
         );
 
@@ -2780,8 +2932,7 @@ mod tests {
         app.term = Some(term);
         app.term_area = ratatui::layout::Rect::new(0, 0, 80, 24);
         app.hits.push((app.term_area, HitTarget::TerminalPane));
-        app.term_links =
-            crate::links::visible_links(app.term.as_ref().unwrap().parser.screen());
+        app.term_links = crate::links::visible_links(app.term.as_ref().unwrap().parser.screen());
         assert_eq!(app.term_links.len(), 1);
 
         let alt = |kind, column, row| MouseEvent {
@@ -3228,7 +3379,8 @@ mod tests {
         let req_id = *req_id;
 
         // The daemon broadcasts the upsert, then acks — selection lands on
-        // the new worktree, children reset, panel focused.
+        // the new worktree, children reset, sessions panel focused so `n`
+        // creates a session right away.
         let w2 = Worktree {
             id: WorktreeId("w2".into()),
             project_id: nebula_core::ProjectId("p1".into()),
@@ -3250,7 +3402,7 @@ mod tests {
                 created: Some(EntityId::Worktree(w2.id.clone())),
             },
         );
-        assert_eq!(app.focus, Focus::Worktrees);
+        assert_eq!(app.focus, Focus::Sessions);
         assert_eq!(app.selected_worktree().map(|w| w.id.clone()), Some(w2.id));
         assert_eq!(app.sel_session, 0);
     }
@@ -3477,6 +3629,42 @@ mod tests {
                 })
             ),
             "divider delete: {out:?}"
+        );
+    }
+
+    #[test]
+    fn backspace_opens_delete_confirm_per_panel() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+
+        app.focus = Focus::Projects;
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(
+                &app.overlay,
+                Some(Overlay::Confirm(c)) if matches!(c.action, PendingAction::RemoveProject(_))
+            ),
+            "backspace on a project confirms removal: {:?}",
+            app.overlay
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+        // The seeded worktree is the main checkout — deletion is refused.
+        app.focus = Focus::Worktrees;
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "main checkout never gets a confirm");
+        assert!(app.flash.is_some(), "main checkout delete flashes instead");
+
+        app.focus = Focus::Sessions;
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(
+                &app.overlay,
+                Some(Overlay::Confirm(c)) if matches!(c.action, PendingAction::DeleteAgent(_))
+            ),
+            "backspace on a session confirms agent delete: {:?}",
+            app.overlay
         );
     }
 

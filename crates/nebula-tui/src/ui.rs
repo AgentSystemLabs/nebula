@@ -239,7 +239,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 ("r", "rename (sessions panel)"),
                 ("a", "archive agent"),
                 ("u", "unarchive agent"),
-                ("d", "delete (confirms first)"),
+                ("d / ⌫", "delete (confirms first)"),
                 ("A", "toggle archived agents"),
                 ("m / right-click", "context menu"),
                 ("g", "git diff of the selected worktree"),

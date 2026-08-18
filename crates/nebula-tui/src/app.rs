@@ -184,13 +184,26 @@ pub enum Overlay {
     Diff(DiffView),
 }
 
-/// What to do when an Ack for this req_id arrives.
-#[derive(Debug, Clone, PartialEq)]
+/// Rows optimistically removed for an in-flight DeleteWorktree, kept so an
+/// Error reply can put them back exactly where they were.
+#[derive(Debug, Clone)]
+pub struct WorktreeRollback {
+    /// Index the worktree held in `tree.worktrees`.
+    pub index: usize,
+    pub worktree: Worktree,
+    /// Its agents, each with the index it held in `tree.agents`.
+    pub agents: Vec<(usize, Agent)>,
+}
+
+/// What to do when an Ack (or Error) for this req_id arrives.
+#[derive(Debug, Clone)]
 pub enum PendingIntent {
     /// Attach the created session and focus the terminal.
     AttachCreated,
     /// Select the created worktree in the Worktrees panel.
     SelectCreatedWorktree,
+    /// Worktree removed optimistically; restore these rows on Error.
+    DeleteWorktree(WorktreeRollback),
     None,
 }
 

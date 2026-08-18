@@ -331,6 +331,11 @@ fn create_worktree(tui: &mut TuiHarness, branch: &str) {
     tui.send(b"\r");
     tui.wait_for_gone("New worktree");
     tui.wait_for_text(branch);
+    // A fresh worktree auto-focuses the sessions panel (so `n` starts an
+    // agent); hop back to Worktrees so callers stay panel-stable.
+    tui.wait_for_text(FOOTER_SESSIONS);
+    tui.send(b"h");
+    tui.wait_for_text(FOOTER_WORKTREES);
 }
 
 #[test]
@@ -417,7 +422,7 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"\r"); // pick the default (Claude)
     tui.wait_for_gone("Agent type");
     tui.wait_for_text("New agent");
-    tui.send(b"\r"); // accept the pre-filled "agent-1"
+    tui.send(b"\r"); // empty input falls back to "agent-1"
     tui.wait_for_gone("New agent");
     tui.wait_for_text("agent-1"); // now provably the sessions-panel row
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED); // auto-attach locks input

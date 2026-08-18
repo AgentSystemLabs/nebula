@@ -252,12 +252,20 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     .await;
                 }
                 ClientRequest::DeleteWorktree { req_id, id, force } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.delete_worktree(&id, force).await.map(|_| None),
-                    )
-                    .await;
+                    // `git worktree remove` can take seconds on a large
+                    // checkout; run it off the request loop so Input/Attach
+                    // frames keep flowing while it grinds. `worktree_ops`
+                    // still serializes it against create/sync.
+                    let daemon = daemon.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        reply(
+                            &out_tx,
+                            req_id,
+                            daemon.delete_worktree(&id, force).await.map(|_| None),
+                        )
+                        .await;
+                    });
                 }
                 ClientRequest::CreateAgent {
                     req_id,
