@@ -67,6 +67,10 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE agents ADD COLUMN kind TEXT NOT NULL DEFAULT 'claude';
     ",
+    // 5: pinned agents (their own group in the sessions list)
+    "
+    ALTER TABLE agents ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 pub struct Store {
@@ -210,18 +214,20 @@ impl Store {
 
     pub fn insert_agent(&self, a: &Agent) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, kind, claude_session_id, sort_order, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO agents (id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 a.id.as_str(),
                 a.worktree_id.as_str(),
                 a.name,
                 a.status.as_str(),
                 a.archived as i64,
+                a.pinned as i64,
                 a.kind.as_str(),
                 a.session_id,
                 a.sort_order,
-                now_ms()
+                now_ms(),
+                a.status_changed_at
             ],
         )?;
         Ok(())
@@ -235,6 +241,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_agent_worktree(&self, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE agents SET worktree_id = ?2 WHERE id = ?1",
+            params![id.as_str(), worktree_id.as_str()],
+        )?;
+        Ok(())
+    }
+
     pub fn set_agent_archived(&self, id: &AgentId, archived: bool) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE agents SET archived = ?2 WHERE id = ?1",
@@ -243,12 +257,23 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_agent_status(&self, id: &AgentId, status: AgentStatus) -> Result<()> {
+    pub fn set_agent_pinned(&self, id: &AgentId, pinned: bool) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "UPDATE agents SET status = ?2, status_changed_at = ?3 WHERE id = ?1",
-            params![id.as_str(), status.as_str(), now_ms()],
+            "UPDATE agents SET pinned = ?2 WHERE id = ?1",
+            params![id.as_str(), pinned as i64],
         )?;
         Ok(())
+    }
+
+    /// Returns the epoch-ms stamp written to `status_changed_at`, so the
+    /// caller can broadcast the exact same timestamp it persisted.
+    pub fn set_agent_status(&self, id: &AgentId, status: AgentStatus) -> Result<i64> {
+        let stamp = now_ms();
+        self.conn.lock().unwrap().execute(
+            "UPDATE agents SET status = ?2, status_changed_at = ?3 WHERE id = ?1",
+            params![id.as_str(), status.as_str(), stamp],
+        )?;
+        Ok(stamp)
     }
 
     pub fn set_agent_session_id(&self, id: &AgentId, session_id: Option<&str>) -> Result<()> {
@@ -279,8 +304,8 @@ impl Store {
             .collect();
         drop(stmt);
         conn.execute(
-            "UPDATE agents SET status = 'disconnected' WHERE status IN ('running', 'needs_feedback')",
-            [],
+            "UPDATE agents SET status = 'disconnected', status_changed_at = ?1 WHERE status IN ('running', 'needs_feedback')",
+            params![now_ms()],
         )?;
         Ok(ids)
     }
@@ -347,7 +372,7 @@ impl Store {
     pub fn get_agent(&self, id: &AgentId) -> Result<Option<Agent>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, worktree_id, name, status, archived, kind, claude_session_id, sort_order FROM agents WHERE id = ?1",
+            "SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at FROM agents WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| Agent {
@@ -357,9 +382,11 @@ impl Store {
             status: AgentStatus::parse(&r.get::<_, String>(3).unwrap())
                 .unwrap_or(AgentStatus::Fresh),
             archived: r.get::<_, i64>(4).unwrap() != 0,
-            kind: AgentKind::parse(&r.get::<_, String>(5).unwrap()).unwrap_or_default(),
-            session_id: r.get(6).unwrap(),
-            sort_order: r.get(7).unwrap(),
+            pinned: r.get::<_, i64>(5).unwrap() != 0,
+            kind: AgentKind::parse(&r.get::<_, String>(6).unwrap()).unwrap_or_default(),
+            session_id: r.get(7).unwrap(),
+            sort_order: r.get(8).unwrap(),
+            status_changed_at: r.get(9).unwrap(),
             alive: false,
         }))
     }
@@ -420,7 +447,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let agents = conn
-            .prepare("SELECT id, worktree_id, name, status, archived, kind, claude_session_id, sort_order FROM agents ORDER BY sort_order, created_at")?
+            .prepare("SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at FROM agents ORDER BY sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Agent {
                     id: AgentId(r.get(0)?),
@@ -428,9 +455,11 @@ impl Store {
                     name: r.get(2)?,
                     status: AgentStatus::parse(&r.get::<_, String>(3)?).unwrap_or(AgentStatus::Fresh),
                     archived: r.get::<_, i64>(4)? != 0,
-                    kind: AgentKind::parse(&r.get::<_, String>(5)?).unwrap_or_default(),
-                    session_id: r.get(6)?,
-                    sort_order: r.get(7)?,
+                    pinned: r.get::<_, i64>(5)? != 0,
+                    kind: AgentKind::parse(&r.get::<_, String>(6)?).unwrap_or_default(),
+                    session_id: r.get(7)?,
+                    sort_order: r.get(8)?,
+                    status_changed_at: r.get(9)?,
                     alive: false,
                 })
             })?
@@ -502,9 +531,11 @@ mod tests {
             name: "agent-1".into(),
             status: AgentStatus::Running,
             archived: false,
+            pinned: false,
             kind: AgentKind::Claude,
             session_id: Some("sess-123".into()),
             sort_order: 0,
+            status_changed_at: 0,
             alive: false,
         };
         store.insert_agent(&agent).unwrap();
@@ -514,9 +545,11 @@ mod tests {
             name: "agent-2".into(),
             status: AgentStatus::Fresh,
             archived: false,
+            pinned: false,
             kind: AgentKind::Codex,
             session_id: None,
             sort_order: 1,
+            status_changed_at: 0,
             alive: false,
         };
         store.insert_agent(&codex_agent).unwrap();
@@ -526,9 +559,11 @@ mod tests {
             name: "agent-3".into(),
             status: AgentStatus::Fresh,
             archived: false,
+            pinned: false,
             kind: AgentKind::Cursor,
             session_id: None,
             sort_order: 2,
+            status_changed_at: 0,
             alive: false,
         };
         store.insert_agent(&cursor_agent).unwrap();
@@ -615,9 +650,11 @@ mod tests {
                     name: name.into(),
                     status,
                     archived: false,
+                    pinned: false,
                     kind: AgentKind::Claude,
                     session_id: None,
                     sort_order: 0,
+                    status_changed_at: 0,
                     alive: false,
                 })
                 .unwrap();

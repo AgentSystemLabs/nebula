@@ -20,7 +20,12 @@ pub async fn run(name: &str) -> Result<()> {
     let (cols, rows) = crossterm::terminal::size()?;
     write_frame(
         &mut write_half,
-        &ClientRequest::Attach { session: sref.clone(), from_seq: None, cols, rows },
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols,
+            rows,
+        },
     )
     .await?;
 

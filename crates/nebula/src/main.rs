@@ -1,3 +1,4 @@
+mod ssh;
 mod upgrade;
 
 use anyhow::Result;
@@ -24,6 +25,13 @@ enum Command {
     },
     /// Ask a running daemon to shut down cleanly.
     KillServer,
+    /// Open nebula on a remote host over ssh (installs it there if missing).
+    Ssh {
+        /// ssh destination, passed verbatim (e.g. user@server).
+        host: String,
+        /// Remote directory to start in (default: remote $HOME).
+        path: Option<String>,
+    },
     /// Install the latest published nebula over this one.
     Upgrade {
         /// Upgrade even when running from a local cargo build.
@@ -46,6 +54,7 @@ fn main() -> Result<()> {
             nebula_daemon::run_daemon()
         }
         Some(Command::KillServer) => nebula_tui::run_kill_server(),
+        Some(Command::Ssh { host, path }) => ssh::run_ssh(&host, path.as_deref()),
         Some(Command::Upgrade { force }) => upgrade::run_upgrade(force),
         Some(Command::RawAttach { name }) => nebula_tui::run_raw_attach(&name),
         None => {

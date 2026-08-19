@@ -22,7 +22,10 @@ pub struct PathCompletion {
 pub fn complete_path(input: &str, home: Option<&Path>) -> PathCompletion {
     // Bare "~" → "~/" so the next Tab lists the home directory.
     if input == "~" {
-        return PathCompletion { completed: Some("~/".into()), candidates: vec![] };
+        return PathCompletion {
+            completed: Some("~/".into()),
+            candidates: vec![],
+        };
     }
 
     // Split into the part the user typed up to the last '/' (kept verbatim,
@@ -85,7 +88,9 @@ fn expand_parent(typed_parent: &str, home: Option<&Path>) -> PathBuf {
 }
 
 fn longest_common_prefix(names: &[String]) -> String {
-    let Some(first) = names.first() else { return String::new() };
+    let Some(first) = names.first() else {
+        return String::new();
+    };
     let mut lcp = first.as_str();
     for name in &names[1..] {
         let common_bytes = lcp
@@ -110,7 +115,12 @@ mod tests {
     /// projects/{alpha,alps,beta,.hidden}/ + a file notes.txt
     fn fixture() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
-        for dir in ["projects/alpha", "projects/alps", "projects/beta", "projects/.hidden"] {
+        for dir in [
+            "projects/alpha",
+            "projects/alps",
+            "projects/beta",
+            "projects/.hidden",
+        ] {
             std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
         }
         std::fs::write(tmp.path().join("projects/notes.txt"), "").unwrap();
@@ -140,7 +150,11 @@ mod tests {
     fn ambiguous_extends_to_longest_common_prefix_and_lists() {
         let tmp = fixture();
         let got = complete_path(&p(&tmp, "projects/a"), None);
-        assert_eq!(got.completed, Some(p(&tmp, "projects/alp")), "extends a → alp");
+        assert_eq!(
+            got.completed,
+            Some(p(&tmp, "projects/alp")),
+            "extends a → alp"
+        );
         assert_eq!(got.candidates, vec!["alpha/", "alps/"]);
     }
 
@@ -156,7 +170,11 @@ mod tests {
     fn files_are_not_offered() {
         let tmp = fixture();
         let got = complete_path(&p(&tmp, "projects/no"), None);
-        assert_eq!(got, PathCompletion::default(), "notes.txt is a file, not a project dir");
+        assert_eq!(
+            got,
+            PathCompletion::default(),
+            "notes.txt is a file, not a project dir"
+        );
     }
 
     #[test]

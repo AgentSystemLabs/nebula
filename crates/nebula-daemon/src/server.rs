@@ -193,11 +193,16 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     let _ = daemon.store.save_ui_state(&json);
                 }
                 // ---- entity CRUD: run the op, reply Ack/Error ----
-                ClientRequest::AddProject { req_id, path, name } => {
+                ClientRequest::AddProject {
+                    req_id,
+                    path,
+                    name,
+                    create_missing,
+                } => {
                     reply(
                         &out_tx,
                         req_id,
-                        daemon.add_project(&path, name).await.map(Some),
+                        daemon.add_project(&path, name, create_missing).await.map(Some),
                     )
                     .await;
                 }
@@ -280,6 +285,17 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     )
                     .await;
                 }
+                ClientRequest::PrewarmAgent { worktree, kind } => {
+                    // Fire-and-forget: boot the CLI while the user is still
+                    // typing the session name; CreateAgent adopts it. Runs
+                    // off the request loop (the CLI probe can take a bit).
+                    let daemon = daemon.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = daemon.prewarm_agent(&worktree, kind).await {
+                            tracing::debug!(error = %e, "prewarm failed");
+                        }
+                    });
+                }
                 ClientRequest::RenameAgent { req_id, id, name } => {
                     reply(
                         &out_tx,
@@ -288,11 +304,31 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     )
                     .await;
                 }
+                ClientRequest::MoveAgent {
+                    req_id,
+                    id,
+                    worktree,
+                } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.move_agent(&id, &worktree).map(|_| None),
+                    )
+                    .await;
+                }
                 ClientRequest::ArchiveAgent { req_id, id } => {
                     reply(&out_tx, req_id, daemon.archive_agent(&id).map(|_| None)).await;
                 }
                 ClientRequest::UnarchiveAgent { req_id, id } => {
                     reply(&out_tx, req_id, daemon.unarchive_agent(&id).map(|_| None)).await;
+                }
+                ClientRequest::SetAgentPinned { req_id, id, pinned } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.set_agent_pinned(&id, pinned).map(|_| None),
+                    )
+                    .await;
                 }
                 ClientRequest::DeleteAgent { req_id, id } => {
                     reply(&out_tx, req_id, daemon.delete_agent(&id).map(|_| None)).await;

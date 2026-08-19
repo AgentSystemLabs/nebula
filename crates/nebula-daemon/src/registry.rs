@@ -14,8 +14,35 @@ use nebula_core::{
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
+
+/// A warm agent CLI older than this is reaped — it holds memory and its
+/// conversation context grows stale.
+const PREWARM_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+/// Hook events buffered on a warm session before its row exists (oldest
+/// dropped beyond this).
+const PREWARM_HOOK_BUFFER_CAP: usize = 64;
+
+/// A pre-spawned agent CLI waiting to be adopted by the next CreateAgent for
+/// the same (worktree, kind). The PTY lives in the normal sessions map under
+/// a pre-generated agent id, so its NEBULA_AGENT_ID env is already the id
+/// the adopted row will use. Hook events that arrive before the row exists
+/// (SessionStart carries the resume session id) are buffered here and
+/// replayed at adoption.
+struct PrewarmEntry {
+    agent_id: AgentId,
+    spawned_at: Instant,
+    buffered_hooks: Vec<(HookEvent, Option<String>)>,
+}
+
+/// Wall-clock epoch ms, matching the store's `status_changed_at` stamps.
+fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 pub struct Daemon {
     sessions: Mutex<HashMap<SessionRef, Arc<PtySession>>>,
@@ -28,6 +55,11 @@ pub struct Daemon {
     /// Serializes worktree create/delete with the background auto-sync so
     /// a checkout is never adopted twice while its row is mid-insert.
     worktree_ops: tokio::sync::Mutex<()>,
+    /// Warm agent CLIs awaiting adoption, at most one per (worktree, kind).
+    prewarmed: Mutex<HashMap<(WorktreeId, AgentKind), PrewarmEntry>>,
+    /// Cached `command -v` results per CLI so a missing binary doesn't get
+    /// re-probed (login shell spawn) on every prewarm request.
+    cli_probes: Mutex<HashMap<AgentKind, (bool, Instant)>>,
 }
 
 impl Daemon {
@@ -41,6 +73,8 @@ impl Daemon {
             events,
             shutdown: tokio_util::sync::CancellationToken::new(),
             worktree_ops: tokio::sync::Mutex::new(()),
+            prewarmed: Mutex::new(HashMap::new()),
+            cli_probes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -54,24 +88,47 @@ impl Daemon {
         event: HookEvent,
         session_id: Option<String>,
     ) {
-        let effects = {
+        enum Outcome {
+            Effects(Vec<Effect>),
+            UnknownAgent(HookEvent, Option<String>),
+        }
+        let outcome = {
             let mut machines = self.status_machines.lock().unwrap();
-            let machine = match machines.entry(agent_id.clone()) {
-                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            match machines.entry(agent_id.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => Outcome::Effects(
+                    e.into_mut()
+                        .handle(event, session_id.as_deref(), Instant::now()),
+                ),
                 std::collections::hash_map::Entry::Vacant(slot) => {
-                    // Lazily seed from the persisted row; unknown ids (stale
-                    // env, deleted agent) are dropped.
+                    // Lazily seed from the persisted row.
                     match self.store.get_agent(agent_id) {
-                        Ok(Some(agent)) => {
+                        Ok(Some(agent)) => Outcome::Effects(
                             slot.insert(AgentStatusMachine::new(agent.status, agent.session_id))
-                        }
-                        _ => return,
+                                .handle(event, session_id.as_deref(), Instant::now()),
+                        ),
+                        _ => Outcome::UnknownAgent(event, session_id),
                     }
                 }
-            };
-            machine.handle(event, session_id.as_deref(), Instant::now())
+            }
         };
-        self.apply_status_effects(agent_id, effects);
+        match outcome {
+            Outcome::Effects(effects) => self.apply_status_effects(agent_id, effects),
+            // Ids with no row are prewarmed sessions (buffer for replay at
+            // adoption) or stale env / deleted agents (dropped, as before).
+            Outcome::UnknownAgent(event, session_id) => {
+                self.buffer_prewarm_hook(agent_id, event, session_id)
+            }
+        }
+    }
+
+    fn buffer_prewarm_hook(&self, agent_id: &AgentId, event: HookEvent, session_id: Option<String>) {
+        let mut pool = self.prewarmed.lock().unwrap();
+        if let Some(entry) = pool.values_mut().find(|e| &e.agent_id == agent_id) {
+            if entry.buffered_hooks.len() >= PREWARM_HOOK_BUFFER_CAP {
+                entry.buffered_hooks.remove(0);
+            }
+            entry.buffered_hooks.push((event, session_id));
+        }
     }
 
     /// Deferred-finish recheck across all machines (runs on a timer).
@@ -93,12 +150,17 @@ impl Daemon {
         for effect in effects {
             match effect {
                 Effect::SetStatus(status) => {
-                    if let Err(e) = self.store.set_agent_status(agent_id, status) {
-                        tracing::warn!(error = %e, "persist status failed");
-                    }
+                    let changed_at = match self.store.set_agent_status(agent_id, status) {
+                        Ok(stamp) => stamp,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "persist status failed");
+                            epoch_ms()
+                        }
+                    };
                     self.broadcast(ServerEvent::StatusChanged {
                         agent: agent_id.clone(),
                         status,
+                        changed_at,
                     });
                 }
                 Effect::SaveSessionId(sid) => {
@@ -178,7 +240,16 @@ impl Daemon {
         self: &Arc<Self>,
         path: &Path,
         name: Option<String>,
+        create_missing: bool,
     ) -> Result<EntityId> {
+        if create_missing && !path.exists() {
+            tokio::fs::create_dir_all(path)
+                .await
+                .with_context(|| format!("create {}", path.display()))?;
+            if crate::config::Config::load().git_init_on_create {
+                git::init(path).await?;
+            }
+        }
         let toplevel = git::repo_toplevel(path)
             .await
             .with_context(|| format!("{} is not a git repository", path.display()))?;
@@ -240,6 +311,7 @@ impl Daemon {
         for t in terminals.iter().filter(|t| wt_ids.contains(&t.worktree_id)) {
             self.kill_session(&SessionRef::Terminal(t.id.clone()));
         }
+        self.kill_prewarmed_in(&wt_ids);
         // Removing a project only forgets it in nebula — never touches disk.
         self.store.delete_project(id)?;
         self.broadcast(ServerEvent::EntityRemoved {
@@ -455,6 +527,7 @@ impl Daemon {
         for t in terminals.iter().filter(|t| &t.worktree_id == id) {
             self.kill_session(&SessionRef::Terminal(t.id.clone()));
         }
+        self.kill_prewarmed_in(std::slice::from_ref(id));
 
         git::remove_worktree(&project.repo_path, &worktree.path, force).await?;
         self.store.delete_worktree(id)?;
@@ -536,8 +609,15 @@ impl Daemon {
             .store
             .get_worktree(worktree_id)?
             .context("worktree not found")?;
+        // A warm session for this (worktree, kind) hands over its PTY and
+        // its pre-generated id — the CLI booted while the user typed the
+        // name, so the create feels instant.
+        let adopted = self.take_prewarmed(worktree_id, kind);
         let agent = Agent {
-            id: AgentId::generate(),
+            id: adopted
+                .as_ref()
+                .map(|e| e.agent_id.clone())
+                .unwrap_or_else(AgentId::generate),
             worktree_id: worktree_id.clone(),
             name: if name.trim().is_empty() {
                 "agent".into()
@@ -546,20 +626,192 @@ impl Daemon {
             },
             status: AgentStatus::Fresh,
             archived: false,
+            pinned: false,
             kind,
             session_id: None,
             sort_order: 0,
+            status_changed_at: epoch_ms(),
             alive: false,
         };
         self.store.insert_agent(&agent)?;
-        // Spawn immediately — a new agent should boot its CLI right away.
-        self.spawn_agent_session(&agent, &worktree, 80, 24)?;
+        if adopted.is_none() {
+            // Cold path: boot the CLI right away.
+            self.spawn_agent_session(&agent, &worktree, 80, 24)?;
+        }
         let mut broadcast_agent = agent.clone();
         broadcast_agent.alive = true;
         self.broadcast(ServerEvent::EntityUpserted {
             entity: Entity::Agent(broadcast_agent),
         });
+        if let Some(entry) = adopted {
+            // Now that the row exists, replay the hooks the warm CLI fired
+            // before adoption (SessionStart stores the resume session id).
+            for (event, sid) in entry.buffered_hooks {
+                self.apply_hook_event(&agent.id, event, sid);
+            }
+        }
         Ok(EntityId::Agent(agent.id))
+    }
+
+    // ---- prewarm pool ----
+
+    /// Pre-spawn an agent CLI for (worktree, kind) so the next create adopts
+    /// an already-booted session. Fail-soft by design: a disabled config,
+    /// missing CLI, or spawn error just means the create stays cold.
+    pub async fn prewarm_agent(
+        self: &Arc<Self>,
+        worktree_id: &WorktreeId,
+        kind: AgentKind,
+    ) -> Result<()> {
+        if !crate::config::Config::load().prewarm_agents {
+            return Ok(());
+        }
+        let Some(worktree) = self.store.get_worktree(worktree_id)? else {
+            return Ok(());
+        };
+        {
+            // One warm slot per key; keep a live one, replace a dead one.
+            let mut pool = self.prewarmed.lock().unwrap();
+            if let Some(entry) = pool.get(&(worktree_id.clone(), kind)) {
+                if self.is_alive(&SessionRef::Agent(entry.agent_id.clone())) {
+                    return Ok(());
+                }
+                pool.remove(&(worktree_id.clone(), kind));
+            }
+        }
+        if !self.cli_available(kind).await {
+            tracing::debug!(kind = kind.as_str(), "prewarm skipped: CLI not installed");
+            return Ok(());
+        }
+        let agent = Agent {
+            id: AgentId::generate(),
+            worktree_id: worktree_id.clone(),
+            name: "prewarm".into(),
+            status: AgentStatus::Fresh,
+            archived: false,
+            pinned: false,
+            kind,
+            session_id: None,
+            sort_order: 0,
+            status_changed_at: 0,
+            alive: false,
+        };
+        self.spawn_agent_session(&agent, &worktree, 80, 24)?;
+        tracing::info!(agent = %agent.id, kind = kind.as_str(), worktree = %worktree.branch, "prewarmed agent session");
+        let replaced = self.prewarmed.lock().unwrap().insert(
+            (worktree_id.clone(), kind),
+            PrewarmEntry {
+                agent_id: agent.id,
+                spawned_at: Instant::now(),
+                buffered_hooks: Vec::new(),
+            },
+        );
+        // Two racing prewarms for the same key: the loser's session would
+        // otherwise leak as an orphan CLI process.
+        if let Some(old) = replaced {
+            self.kill_session(&SessionRef::Agent(old.agent_id));
+        }
+        Ok(())
+    }
+
+    /// Pop the warm entry for (worktree, kind) if its PTY is still running.
+    /// A dead entry (CLI missing/crashed while warm) is dropped so the
+    /// caller falls back to a cold spawn.
+    fn take_prewarmed(&self, worktree_id: &WorktreeId, kind: AgentKind) -> Option<PrewarmEntry> {
+        let entry = self
+            .prewarmed
+            .lock()
+            .unwrap()
+            .remove(&(worktree_id.clone(), kind))?;
+        self.is_alive(&SessionRef::Agent(entry.agent_id.clone()))
+            .then_some(entry)
+    }
+
+    /// Drop warm sessions that died or sat unclaimed past the max age
+    /// (runs on the daemon's periodic tick).
+    pub fn reap_prewarmed(&self) {
+        let doomed: Vec<AgentId> = {
+            let mut pool = self.prewarmed.lock().unwrap();
+            let expired: Vec<_> = pool
+                .iter()
+                .filter(|(_, e)| {
+                    e.spawned_at.elapsed() > PREWARM_MAX_AGE
+                        || !self.is_alive(&SessionRef::Agent(e.agent_id.clone()))
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+            expired
+                .into_iter()
+                .filter_map(|k| pool.remove(&k))
+                .map(|e| e.agent_id)
+                .collect()
+        };
+        for id in doomed {
+            tracing::debug!(agent = %id, "reaping prewarmed session");
+            self.kill_session(&SessionRef::Agent(id));
+        }
+    }
+
+    /// Kill warm sessions homed in any of these worktrees (worktree delete,
+    /// project remove — their store rows are gone or going).
+    fn kill_prewarmed_in(&self, worktree_ids: &[WorktreeId]) {
+        let doomed: Vec<AgentId> = {
+            let mut pool = self.prewarmed.lock().unwrap();
+            let keys: Vec<_> = pool
+                .keys()
+                .filter(|(w, _)| worktree_ids.contains(w))
+                .cloned()
+                .collect();
+            keys.into_iter()
+                .filter_map(|k| pool.remove(&k))
+                .map(|e| e.agent_id)
+                .collect()
+        };
+        for id in doomed {
+            self.kill_session(&SessionRef::Agent(id));
+        }
+    }
+
+    /// Is the kind's CLI on the user's PATH (as their login shell sees it)?
+    /// Cached: hits for an hour, misses for a minute so a just-installed CLI
+    /// gets picked up quickly. Probe trouble (timeout, spawn error) fails
+    /// open — a doomed warm spawn is still graceful.
+    async fn cli_available(&self, kind: AgentKind) -> bool {
+        if std::env::var("NEBULA_AGENT_CMD").is_ok() {
+            return true; // test override is spawned verbatim
+        }
+        const OK_TTL: Duration = Duration::from_secs(3600);
+        const FAIL_TTL: Duration = Duration::from_secs(60);
+        {
+            let probes = self.cli_probes.lock().unwrap();
+            if let Some((ok, at)) = probes.get(&kind) {
+                if at.elapsed() < if *ok { OK_TTL } else { FAIL_TTL } {
+                    return *ok;
+                }
+            }
+        }
+        let check = format!("command -v '{}' >/dev/null 2>&1", kind.cli_program());
+        let status = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::process::Command::new(user_shell())
+                .args(["-l", "-i", "-c", &check])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status(),
+        )
+        .await;
+        match status {
+            Ok(Ok(status)) => {
+                let ok = status.success();
+                self.cli_probes
+                    .lock()
+                    .unwrap()
+                    .insert(kind, (ok, Instant::now()));
+                ok
+            }
+            _ => true,
+        }
     }
 
     pub fn rename_agent(self: &Arc<Self>, id: &AgentId, name: &str) -> Result<()> {
@@ -571,6 +823,108 @@ impl Daemon {
         self.broadcast(ServerEvent::EntityUpserted {
             entity: Entity::Agent(agent),
         });
+        Ok(())
+    }
+
+    /// Re-home an agent row under another worktree of the same project. The
+    /// live PTY (if any) is untouched — this moves where the row lives in
+    /// the tree, not where the process runs; the next respawn uses the new
+    /// worktree's path.
+    pub fn move_agent(self: &Arc<Self>, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
+        let agent = self.store.get_agent(id)?.context("agent not found")?;
+        if &agent.worktree_id == worktree_id {
+            return Ok(());
+        }
+        let target = self
+            .store
+            .get_worktree(worktree_id)?
+            .context("worktree not found")?;
+        let current = self
+            .store
+            .get_worktree(&agent.worktree_id)?
+            .context("worktree not found")?;
+        if target.project_id != current.project_id {
+            bail!("target worktree belongs to a different project");
+        }
+        self.store.set_agent_worktree(id, worktree_id)?;
+        let agent = self.agent_entity(id)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Agent(agent),
+        });
+        Ok(())
+    }
+
+    /// A hook payload reported the agent CLI's working directory. When that
+    /// directory sits inside a *different* worktree of the same project (the
+    /// session entered a worktree it created mid-conversation), re-home the
+    /// agent row so the tree reflects where the work actually happens.
+    /// Fail-soft: any error leaves the row where it is.
+    pub fn reparent_agent_by_cwd(
+        self: &Arc<Self>,
+        agent_id: &AgentId,
+        cwd: &str,
+        payload_session_id: Option<&str>,
+        captures_session: bool,
+    ) {
+        if let Err(e) =
+            self.try_reparent_agent_by_cwd(agent_id, cwd, payload_session_id, captures_session)
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "cwd reparent failed");
+        }
+    }
+
+    fn try_reparent_agent_by_cwd(
+        self: &Arc<Self>,
+        agent_id: &AgentId,
+        cwd: &str,
+        payload_session_id: Option<&str>,
+        captures_session: bool,
+    ) -> Result<()> {
+        let Some(agent) = self.store.get_agent(agent_id)? else {
+            return Ok(());
+        };
+        if agent.archived {
+            return Ok(());
+        }
+        // Same foreign-session rule as the status machine: a payload from a
+        // different CLI session only counts when the event (re)establishes
+        // session ownership (UserPromptSubmit / SessionStart).
+        if !captures_session {
+            if let (Some(mine), Some(theirs)) = (agent.session_id.as_deref(), payload_session_id)
+            {
+                if mine != theirs {
+                    return Ok(());
+                }
+            }
+        }
+        let Some(current) = self.store.get_worktree(&agent.worktree_id)? else {
+            return Ok(());
+        };
+        let cwd = canonical_or_raw(Path::new(cwd));
+        let (_, worktrees, _, _) = self.store.load_tree()?;
+        // Deepest worktree of the same project containing cwd — nested
+        // layouts (checkouts under the repo root) must not resolve to the
+        // root row just because the root path is also a prefix.
+        let target = worktrees
+            .into_iter()
+            .filter(|w| w.project_id == current.project_id)
+            .map(|w| {
+                let canonical = canonical_or_raw(&w.path);
+                (w, canonical)
+            })
+            .filter(|(_, canonical)| cwd.starts_with(canonical))
+            .max_by_key(|(_, canonical)| canonical.components().count());
+        if let Some((worktree, _)) = target {
+            if worktree.id != agent.worktree_id {
+                tracing::info!(
+                    agent = %agent_id,
+                    from = %current.branch,
+                    to = %worktree.branch,
+                    "agent re-homed by hook cwd"
+                );
+                self.move_agent(agent_id, &worktree.id)?;
+            }
+        }
         Ok(())
     }
 
@@ -586,6 +940,15 @@ impl Daemon {
 
     pub fn unarchive_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
         self.store.set_agent_archived(id, false)?;
+        let agent = self.agent_entity(id)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Agent(agent),
+        });
+        Ok(())
+    }
+
+    pub fn set_agent_pinned(self: &Arc<Self>, id: &AgentId, pinned: bool) -> Result<()> {
+        self.store.set_agent_pinned(id, pinned)?;
         let agent = self.agent_entity(id)?;
         self.broadcast(ServerEvent::EntityUpserted {
             entity: Entity::Agent(agent),
@@ -946,6 +1309,13 @@ fn agent_spawn_command(
     (program, args, resumed)
 }
 
+/// Canonicalize for path containment tests, falling back to the raw path
+/// when it doesn't resolve (deleted checkout, not-yet-created dir). macOS
+/// symlinks (`/tmp` → `/private/tmp`) otherwise break `starts_with`.
+fn canonical_or_raw(path: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn user_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
 }
@@ -1263,5 +1633,257 @@ mod tests {
         assert!(layout(&daemon)
             .iter()
             .all(|(_, divider, label)| !divider && label.is_none()));
+    }
+
+    fn seed_worktree(daemon: &Daemon, project: &str, id: &str, path: &str, is_main: bool) {
+        daemon
+            .store
+            .insert_worktree(&Worktree {
+                id: WorktreeId(id.into()),
+                project_id: ProjectId(project.into()),
+                path: path.into(),
+                branch: id.into(),
+                is_main,
+                sort_order: 0,
+            })
+            .unwrap();
+    }
+
+    fn seed_agent(daemon: &Daemon, id: &str, worktree: &str, session_id: Option<&str>) {
+        daemon
+            .store
+            .insert_agent(&Agent {
+                id: AgentId(id.into()),
+                worktree_id: WorktreeId(worktree.into()),
+                name: id.into(),
+                status: AgentStatus::Running,
+                archived: false,
+                pinned: false,
+                kind: AgentKind::Claude,
+                session_id: session_id.map(str::to_string),
+                sort_order: 0,
+                status_changed_at: 0,
+                alive: false,
+            })
+            .unwrap();
+    }
+
+    fn agent_worktree(daemon: &Daemon, id: &str) -> String {
+        daemon
+            .store
+            .get_agent(&AgentId(id.into()))
+            .unwrap()
+            .unwrap()
+            .worktree_id
+            .to_string()
+    }
+
+    #[test]
+    fn move_agent_rehomes_row_and_broadcasts() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
+        seed_agent(&daemon, "a1", "root", None);
+        let mut rx = daemon.events.subscribe();
+
+        daemon
+            .move_agent(&AgentId("a1".into()), &WorktreeId("feat".into()))
+            .unwrap();
+        assert_eq!(agent_worktree(&daemon, "a1"), "feat");
+        match rx.try_recv().unwrap() {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            } => assert_eq!(a.worktree_id.to_string(), "feat"),
+            other => panic!("expected agent upsert, got {other:?}"),
+        }
+
+        // Moving to the worktree it already lives in is a silent no-op.
+        daemon
+            .move_agent(&AgentId("a1".into()), &WorktreeId("feat".into()))
+            .unwrap();
+        assert!(rx.try_recv().is_err(), "no broadcast for a no-op move");
+    }
+
+    #[test]
+    fn move_agent_rejects_cross_project_targets() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p", "q"]);
+        seed_worktree(&daemon, "p", "p-root", "/nebula-test/p", true);
+        seed_worktree(&daemon, "q", "q-root", "/nebula-test/q", true);
+        seed_agent(&daemon, "a1", "p-root", None);
+
+        let err = daemon
+            .move_agent(&AgentId("a1".into()), &WorktreeId("q-root".into()))
+            .unwrap_err();
+        assert!(err.to_string().contains("different project"));
+        assert_eq!(agent_worktree(&daemon, "a1"), "p-root");
+    }
+
+    #[test]
+    fn reparent_by_cwd_picks_deepest_matching_worktree() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        // Nested layout: the linked checkout lives under the repo root, so
+        // both paths are prefixes of a cwd inside it — deepest must win.
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_worktree(&daemon, "p", "feat", "/nebula-test/p/.wt/feat", false);
+        seed_agent(&daemon, "a1", "root", None);
+
+        // cwd inside the root checkout (but outside the nested worktree)
+        // keeps the agent where it is.
+        daemon.reparent_agent_by_cwd(&AgentId("a1".into()), "/nebula-test/p/src", None, false);
+        assert_eq!(agent_worktree(&daemon, "a1"), "root");
+
+        // cwd inside the nested worktree re-homes it there.
+        daemon.reparent_agent_by_cwd(
+            &AgentId("a1".into()),
+            "/nebula-test/p/.wt/feat/src",
+            None,
+            false,
+        );
+        assert_eq!(agent_worktree(&daemon, "a1"), "feat");
+
+        // cwd outside every worktree is ignored.
+        daemon.reparent_agent_by_cwd(&AgentId("a1".into()), "/elsewhere", None, false);
+        assert_eq!(agent_worktree(&daemon, "a1"), "feat");
+    }
+
+    #[test]
+    fn reparent_by_cwd_ignores_foreign_sessions_unless_capturing() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
+        seed_agent(&daemon, "a1", "root", Some("s1"));
+
+        // A different session id on a non-capturing event (a nested claude
+        // launched inside the agent's PTY) must not move the row.
+        daemon.reparent_agent_by_cwd(
+            &AgentId("a1".into()),
+            "/nebula-test/p-feat",
+            Some("s2"),
+            false,
+        );
+        assert_eq!(agent_worktree(&daemon, "a1"), "root");
+
+        // A capturing event (re)establishes ownership, so it may move it.
+        daemon.reparent_agent_by_cwd(
+            &AgentId("a1".into()),
+            "/nebula-test/p-feat",
+            Some("s2"),
+            true,
+        );
+        assert_eq!(agent_worktree(&daemon, "a1"), "feat");
+    }
+
+    #[test]
+    fn prewarm_pool_buffers_hooks_and_drops_dead_entries() {
+        let daemon = test_daemon();
+        let key = (WorktreeId("w1".into()), AgentKind::Claude);
+        daemon.prewarmed.lock().unwrap().insert(
+            key.clone(),
+            PrewarmEntry {
+                agent_id: AgentId("warm-1".into()),
+                spawned_at: Instant::now(),
+                buffered_hooks: Vec::new(),
+            },
+        );
+
+        // Hooks for the warm (row-less) id are buffered on the entry, not
+        // dropped; hooks for unrelated unknown ids still vanish quietly.
+        daemon.apply_hook_event(
+            &AgentId("warm-1".into()),
+            HookEvent::SessionStart { source: None },
+            Some("sid-9".into()),
+        );
+        daemon.apply_hook_event(&AgentId("stranger".into()), HookEvent::Stop, None);
+        {
+            let pool = daemon.prewarmed.lock().unwrap();
+            let entry = pool.get(&key).unwrap();
+            assert_eq!(entry.buffered_hooks.len(), 1);
+            assert_eq!(
+                entry.buffered_hooks[0],
+                (
+                    HookEvent::SessionStart { source: None },
+                    Some("sid-9".to_string())
+                )
+            );
+        }
+
+        // The buffer is bounded: overflow drops the oldest.
+        for i in 0..(PREWARM_HOOK_BUFFER_CAP + 5) {
+            daemon.apply_hook_event(
+                &AgentId("warm-1".into()),
+                HookEvent::Notification {
+                    notification_type: Some(format!("n{i}")),
+                },
+                None,
+            );
+        }
+        assert_eq!(
+            daemon
+                .prewarmed
+                .lock()
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .buffered_hooks
+                .len(),
+            PREWARM_HOOK_BUFFER_CAP
+        );
+
+        // No live PTY backs the entry, so take() refuses it (create falls
+        // back to a cold spawn) and reap clears it out.
+        assert!(daemon
+            .take_prewarmed(&WorktreeId("w1".into()), AgentKind::Claude)
+            .is_none());
+        assert!(daemon.prewarmed.lock().unwrap().is_empty());
+
+        daemon.prewarmed.lock().unwrap().insert(
+            key.clone(),
+            PrewarmEntry {
+                agent_id: AgentId("warm-2".into()),
+                spawned_at: Instant::now(),
+                buffered_hooks: Vec::new(),
+            },
+        );
+        daemon.reap_prewarmed();
+        assert!(daemon.prewarmed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn kill_prewarmed_in_scopes_to_worktrees() {
+        let daemon = test_daemon();
+        for (wt, id) in [("w1", "a"), ("w2", "b")] {
+            daemon.prewarmed.lock().unwrap().insert(
+                (WorktreeId(wt.into()), AgentKind::Codex),
+                PrewarmEntry {
+                    agent_id: AgentId(id.into()),
+                    spawned_at: Instant::now(),
+                    buffered_hooks: Vec::new(),
+                },
+            );
+        }
+        daemon.kill_prewarmed_in(&[WorktreeId("w1".into())]);
+        let pool = daemon.prewarmed.lock().unwrap();
+        assert_eq!(pool.len(), 1);
+        assert!(pool.contains_key(&(WorktreeId("w2".into()), AgentKind::Codex)));
+    }
+
+    #[test]
+    fn reparent_by_cwd_skips_archived_agents() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
+        seed_agent(&daemon, "a1", "root", None);
+        daemon
+            .store
+            .set_agent_archived(&AgentId("a1".into()), true)
+            .unwrap();
+
+        daemon.reparent_agent_by_cwd(&AgentId("a1".into()), "/nebula-test/p-feat", None, false);
+        assert_eq!(agent_worktree(&daemon, "a1"), "root");
     }
 }

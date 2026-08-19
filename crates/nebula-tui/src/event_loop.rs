@@ -2,8 +2,9 @@
 
 use crate::app::{
     agent_sref, App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, Focus,
-    HitTarget, MenuAction, MenuItem, Overlay, PendingAction, PendingIntent, ProjectRow,
-    PromptDialog, PromptKind, SplitterDrag, TermSelection, WorktreeRollback,
+    HitTarget, MenuAction, MenuItem, Overlay, Palette, PaletteTarget, PendingAction, PendingIntent,
+    ProjectRow, PromptDialog, PromptKind, SettingsView, SplitterDrag, TermSelection,
+    WorktreeRollback,
 };
 use crate::{ipc, keys, ui};
 use anyhow::Result;
@@ -11,7 +12,9 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use futures::StreamExt;
-use nebula_core::{AgentKind, ClientRequest, EntityId, ServerEvent, SessionRef, WorktreeId};
+use nebula_core::{
+    AgentId, AgentKind, ClientRequest, EntityId, ServerEvent, SessionRef, WorktreeId,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{BufWriter, Stdout};
@@ -95,6 +98,7 @@ async fn main_loop(
 ) -> Result<()> {
     let mut app = App::new();
     app.conn = ConnState::Connected;
+    app.recent_window_ms = crate::config::Config::load().recent_window_ms();
     let mut input = crossterm::event::EventStream::new();
     let mut out: Vec<ClientRequest> = Vec::new();
     let mut next_draw = tokio::time::Instant::now();
@@ -105,13 +109,33 @@ async fn main_loop(
             app.dirty = false;
             next_draw = tokio::time::Instant::now() + FRAME_INTERVAL;
             sync_pty_size(&mut app, &mut out);
+            // What the user sees selected, for RECENT-expiry re-anchoring.
+            app.drawn_session = app.selected_session().map(|a| a.id.clone());
         }
+
+        // Wake when the next RECENT session ages out so the list regroups
+        // (slack so the wakeup lands past the boundary).
+        let recent_expiry = app.next_recent_expiry();
 
         let focus_before = app.focus;
         tokio::select! {
             // Pending redraw: wake at the frame boundary even if no new
             // events arrive.
             _ = tokio::time::sleep_until(next_draw), if app.dirty => {}
+            _ = tokio::time::sleep(recent_expiry.unwrap_or_default() + Duration::from_millis(250)),
+                if recent_expiry.is_some() =>
+            {
+                // Re-read the config so window edits apply without restart.
+                app.recent_window_ms = crate::config::Config::load().recent_window_ms();
+                // The expired session dropped down the list; keep the
+                // selection on whatever row the user had selected.
+                if let Some(keep) = app.drawn_session.clone() {
+                    if let Some(i) = app.visible_sessions().iter().position(|a| a.id == keep) {
+                        app.sel_session = i;
+                    }
+                }
+                app.dirty = true;
+            }
             ev = input.next() => match ev {
                 Some(Ok(event)) => {
                     tracing::debug!(?event, "terminal event");
@@ -178,6 +202,7 @@ fn ui_state_json(app: &App) -> String {
         show_archived: app.show_archived,
         collapsed: app.collapsed,
         panel_widths: Some(app.panel_widths),
+        diff_files_width: Some(app.diff_files_width),
     };
     serde_json::to_string(&state).unwrap_or_else(|_| "{}".into())
 }
@@ -192,6 +217,10 @@ fn restore_ui_state(app: &mut App, json: &str) {
         // Coarse sanity clamp; normalize_panel_widths re-fits to the actual
         // screen on the next draw.
         app.panel_widths = w.map(|v| v.clamp(crate::app::MIN_PANEL_W, 300));
+    }
+    if let Some(w) = state.diff_files_width {
+        // Coarse sanity clamp; the draw re-caps it to the actual modal width.
+        app.diff_files_width = w.clamp(crate::app::MIN_DIFF_FILES_W, 300);
     }
     if let Some(pid) = &state.project {
         let row = app.project_rows().iter().position(
@@ -339,6 +368,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             app.should_quit = true
         }
         KeyCode::Char('?') => app.overlay = Some(Overlay::Help),
+        KeyCode::Char('s') => app.overlay = Some(Overlay::Settings(SettingsView::new())),
         KeyCode::Tab => {
             app.focus = match app.focus {
                 Focus::Projects => Focus::Worktrees,
@@ -445,6 +475,25 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 }
             }
         }
+        KeyCode::Char('p') => {
+            if app.focus == Focus::Sessions {
+                if let Some(a) = app.selected_session() {
+                    if a.archived {
+                        app.flash = Some("agent is archived — unarchive first (u)".into());
+                    } else {
+                        // Keep the selection on this agent after it jumps
+                        // between the PINNED/UNPINNED groups.
+                        app.select_when_seen = Some(SessionRef::Agent(a.id.clone()));
+                        let req_id = app.alloc_req_id(PendingIntent::None);
+                        out.push(ClientRequest::SetAgentPinned {
+                            req_id,
+                            id: a.id,
+                            pinned: !a.pinned,
+                        });
+                    }
+                }
+            }
+        }
         KeyCode::Char('u') => {
             if app.focus == Focus::Sessions {
                 if let Some(a) = app.selected_session() {
@@ -458,6 +507,17 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         KeyCode::Char('A') => {
             if app.focus == Focus::Sessions {
                 app.show_archived = !app.show_archived;
+            }
+        }
+        // Fuzzy-search palette over every project / worktree / session.
+        // The config read is per-open so edits apply without restarting.
+        KeyCode::Char('/') => {
+            if app.focus != Focus::Terminal {
+                app.overlay = Some(Overlay::Palette(Palette::new(
+                    &app.tree,
+                    app.show_archived,
+                    crate::config::Config::load().palette_enter_attaches,
+                )));
             }
         }
         KeyCode::Char('-') => {
@@ -580,17 +640,8 @@ fn open_diff_view(app: &mut App) {
         return;
     }
     let head_ok = crate::git_diff::has_head(&path);
-    let mut view = DiffView {
-        root: path,
-        branch,
-        files,
-        selected: 0,
-        diff: String::new(),
-        diff_line_count: 0,
-        scroll: 0,
-        view_height: 0,
-        head_ok,
-    };
+    let mut view = DiffView::new(path, branch, files, head_ok);
+    view.files_width = app.diff_files_width;
     crate::git_diff::load_selected_diff(&mut view);
     app.overlay = Some(Overlay::Diff(view));
 }
@@ -684,8 +735,18 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
                 destructive: false,
             },
             MenuItem {
+                label: if a.pinned { "Unpin" } else { "Pin" }.into(),
+                action: MenuAction::SetAgentPinned(a.id.clone(), !a.pinned),
+                destructive: false,
+            },
+            MenuItem {
                 label: "Rename".into(),
                 action: MenuAction::RenameAgent(a.id.clone()),
+                destructive: false,
+            },
+            MenuItem {
+                label: "Move to worktree".into(),
+                action: MenuAction::MoveAgent(a.id.clone()),
                 destructive: false,
             },
             MenuItem {
@@ -738,7 +799,7 @@ fn open_menu(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
     app.overlay = Some(Overlay::Menu(ContextMenu {
         title: None,
         items,
-        at,
+        at: Some(at),
         hover: 0,
         area: ratatui::layout::Rect::default(),
     }));
@@ -766,7 +827,43 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
                 destructive: false,
             },
         ],
-        at: (30, 4),
+        at: None,
+        hover: 0,
+        area: ratatui::layout::Rect::default(),
+    }));
+}
+
+/// Step 1 of moving an agent: pick the destination — any other worktree of
+/// the selected project. Chains into `MenuAction::MoveAgentToWorktree`.
+fn open_move_agent_picker(app: &mut App, agent: AgentId) {
+    let current = app
+        .tree
+        .agents
+        .iter()
+        .find(|a| a.id == agent)
+        .map(|a| a.worktree_id.clone());
+    let items: Vec<MenuItem> = app
+        .visible_worktrees()
+        .iter()
+        .filter(|w| Some(&w.id) != current.as_ref())
+        .map(|w| MenuItem {
+            label: if w.is_main {
+                format!("{} ⌂ root", w.branch)
+            } else {
+                w.branch.clone()
+            },
+            action: MenuAction::MoveAgentToWorktree(agent.clone(), w.id.clone()),
+            destructive: false,
+        })
+        .collect();
+    if items.is_empty() {
+        app.flash = Some("no other worktree to move to".into());
+        return;
+    }
+    app.overlay = Some(Overlay::Menu(ContextMenu {
+        title: Some("Move to worktree".into()),
+        items,
+        at: None,
         hover: 0,
         area: ratatui::layout::Rect::default(),
     }));
@@ -832,10 +929,15 @@ fn open_context_menu_for_selection(app: &mut App) {
 }
 
 fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
+    if matches!(&app.overlay, Some(Overlay::Settings(_))) {
+        handle_settings_key(app, key);
+        return;
+    }
     let Some(overlay) = &mut app.overlay else {
         return;
     };
     match overlay {
+        Overlay::Settings(_) => {}
         Overlay::Help => {
             if matches!(
                 key.code,
@@ -897,32 +999,146 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
         },
         Overlay::Diff(view) => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             let half = (view.view_height / 2).max(1) as i32;
             let page = view.view_height.max(1) as i32;
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => app.overlay = None,
+                // Two-stage escape: an active filter is cleared before the
+                // second Esc closes the modal.
+                KeyCode::Esc if !view.filter.is_empty() => {
+                    view.filter.clear();
+                    if view.apply_filter() {
+                        crate::git_diff::load_selected_diff(view);
+                    }
+                }
+                KeyCode::Esc => app.overlay = None,
                 KeyCode::Char('d') if ctrl => view.scroll_by(half),
                 KeyCode::Char('u') if ctrl => view.scroll_by(-half),
-                KeyCode::Char('j') | KeyCode::Down => {
+                KeyCode::Down if shift => view.scroll_by(1),
+                KeyCode::Up if shift => view.scroll_by(-1),
+                KeyCode::Down => {
                     if view.select(view.selected as i64 + 1) {
                         crate::git_diff::load_selected_diff(view);
                     }
                 }
-                KeyCode::Char('k') | KeyCode::Up => {
+                KeyCode::Up => {
                     if view.select(view.selected as i64 - 1) {
                         crate::git_diff::load_selected_diff(view);
                     }
                 }
-                KeyCode::Char('J') => view.scroll_by(1),
-                KeyCode::Char('K') => view.scroll_by(-1),
                 KeyCode::PageDown => view.scroll_by(page),
                 KeyCode::PageUp => view.scroll_by(-page),
-                KeyCode::Char('g') => view.scroll = 0,
-                KeyCode::Char('G') => view.scroll = view.max_scroll(),
+                KeyCode::Home => view.scroll = 0,
+                KeyCode::End => view.scroll = view.max_scroll(),
+                KeyCode::Backspace => {
+                    if view.filter.pop().is_some() && view.apply_filter() {
+                        crate::git_diff::load_selected_diff(view);
+                    }
+                }
+                // Everything printable feeds the always-on fuzzy filter.
+                KeyCode::Char(c) if !ctrl => {
+                    view.filter.push(c);
+                    if view.apply_filter() {
+                        crate::git_diff::load_selected_diff(view);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Overlay::Palette(palette) => {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                // Two-stage escape: an active query is cleared before the
+                // second Esc closes the palette.
+                KeyCode::Esc if !palette.query.is_empty() => {
+                    palette.query.clear();
+                    palette.apply_filter();
+                }
+                KeyCode::Esc => app.overlay = None,
+                // j/k stay typeable in the query; Ctrl+n/p mirror ↑/↓.
+                KeyCode::Down => palette.select(palette.selected as i64 + 1),
+                KeyCode::Up => palette.select(palette.selected as i64 - 1),
+                KeyCode::Char('n') if ctrl => palette.select(palette.selected as i64 + 1),
+                KeyCode::Char('p') if ctrl => palette.select(palette.selected as i64 - 1),
+                // Enter picks per the config setting; Ctrl+O always opens
+                // (attach + terminal focus), Ctrl+F only focuses the row.
+                KeyCode::Enter => {
+                    let attach = palette.enter_attaches;
+                    if let Some(target) = palette.selected_target().cloned() {
+                        app.overlay = None;
+                        jump_to_target(app, target, attach, out);
+                    }
+                }
+                KeyCode::Char('o') if ctrl => {
+                    if let Some(target) = palette.selected_target().cloned() {
+                        app.overlay = None;
+                        jump_to_target(app, target, true, out);
+                    }
+                }
+                KeyCode::Char('f') if ctrl => {
+                    if let Some(target) = palette.selected_target().cloned() {
+                        app.overlay = None;
+                        jump_to_target(app, target, false, out);
+                    }
+                }
+                KeyCode::Backspace => {
+                    if palette.query.pop().is_some() {
+                        palette.apply_filter();
+                    }
+                }
+                KeyCode::Char('u') if ctrl => {
+                    palette.query.clear();
+                    palette.apply_filter();
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    palette.query.push(c);
+                    palette.apply_filter();
+                }
                 _ => {}
             }
         }
     }
+}
+
+fn handle_settings_key(app: &mut App, key: KeyEvent) {
+    let Some(Overlay::Settings(view)) = &app.overlay else {
+        return;
+    };
+    let last = crate::config::SETTINGS.len().saturating_sub(1);
+    let cmd = match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => SettingsCmd::Close,
+        KeyCode::Char('j') | KeyCode::Down => SettingsCmd::Move((view.selected + 1).min(last)),
+        KeyCode::Char('k') | KeyCode::Up => SettingsCmd::Move(view.selected.saturating_sub(1)),
+        KeyCode::Enter | KeyCode::Char(' ') => SettingsCmd::Apply(view.selected, 0),
+        KeyCode::Char('l') | KeyCode::Right => SettingsCmd::Apply(view.selected, 1),
+        KeyCode::Char('h') | KeyCode::Left => SettingsCmd::Apply(view.selected, -1),
+        _ => return,
+    };
+    match cmd {
+        SettingsCmd::Close => app.overlay = None,
+        SettingsCmd::Move(i) => {
+            if let Some(Overlay::Settings(view)) = &mut app.overlay {
+                view.selected = i;
+            }
+        }
+        SettingsCmd::Apply(i, delta) => apply_setting_at(app, i, delta),
+    }
+}
+
+enum SettingsCmd {
+    Close,
+    Move(usize),
+    Apply(usize, i32),
+}
+
+fn apply_setting_at(app: &mut App, index: usize, delta: i32) {
+    let mut cfg = crate::config::Config::load();
+    cfg.cycle(index, delta);
+    if let Err(err) = cfg.save() {
+        app.flash = Some(format!("couldn't save settings: {err}"));
+        return;
+    }
+    app.recent_window_ms = cfg.recent_window_ms();
 }
 
 fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientRequest>) {
@@ -947,11 +1163,23 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
         PromptKind::DividerLabel { .. } => unreachable!("handled above (empty input allowed)"),
         PromptKind::AddProject => {
             let expanded = shellexpand_home(&value);
+            if !expanded.exists() {
+                app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+                    title: "Create directory".into(),
+                    message: format!(
+                        "{} doesn't exist, would you like to create it?",
+                        expanded.display()
+                    ),
+                    action: PendingAction::CreateProjectDir(expanded),
+                }));
+                return;
+            }
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::AddProject {
                 req_id,
                 path: expanded,
                 name: None,
+                create_missing: false,
             });
         }
         PromptKind::NewWorktree { project } => {
@@ -990,6 +1218,15 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
 
 fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<ClientRequest>) {
     match action {
+        PendingAction::CreateProjectDir(path) => {
+            let req_id = app.alloc_req_id(PendingIntent::None);
+            out.push(ClientRequest::AddProject {
+                req_id,
+                path,
+                name: None,
+                create_missing: true,
+            });
+        }
         PendingAction::ArchiveAgent(id) => {
             detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
             let req_id = app.alloc_req_id(PendingIntent::None);
@@ -1036,6 +1273,17 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             out.push(ClientRequest::RestartAgent { req_id, id });
         }
         MenuAction::RenameAgent(id) => open_prompt(app, PromptKind::RenameAgent { id }),
+        MenuAction::MoveAgent(id) => open_move_agent_picker(app, id),
+        MenuAction::MoveAgentToWorktree(id, worktree) => {
+            // Follow the agent to its new home when the upsert lands.
+            app.select_when_seen = Some(SessionRef::Agent(id.clone()));
+            let req_id = app.alloc_req_id(PendingIntent::None);
+            out.push(ClientRequest::MoveAgent {
+                req_id,
+                id,
+                worktree,
+            });
+        }
         MenuAction::ArchiveAgent(id) => {
             if let Some(a) = app.tree.agents.iter().find(|a| a.id == id).cloned() {
                 open_confirm_archive(app, &a);
@@ -1044,6 +1292,11 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::UnarchiveAgent(id) => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::UnarchiveAgent { req_id, id });
+        }
+        MenuAction::SetAgentPinned(id, pinned) => {
+            app.select_when_seen = Some(SessionRef::Agent(id.clone()));
+            let req_id = app.alloc_req_id(PendingIntent::None);
+            out.push(ClientRequest::SetAgentPinned { req_id, id, pinned });
         }
         MenuAction::DeleteAgent(id) => {
             if let Some(a) = app.tree.agents.iter().find(|a| a.id == id).cloned() {
@@ -1059,6 +1312,13 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         }
         MenuAction::NewAgent(worktree) => open_new_agent_picker(app, worktree),
         MenuAction::NewAgentOfKind(worktree, kind) => {
+            // Warm the CLI while the user types the name: the daemon
+            // pre-spawns the session so CreateAgent adopts an already-booted
+            // PTY. Fail-soft — a missing CLI just means a cold spawn later.
+            out.push(ClientRequest::PrewarmAgent {
+                worktree: worktree.clone(),
+                kind,
+            });
             open_prompt(app, PromptKind::NewAgent { worktree, kind })
         }
         MenuAction::NewWorktree(project) => open_prompt(app, PromptKind::NewWorktree { project }),
@@ -1257,6 +1517,119 @@ fn select_worktree_by_id(
     true
 }
 
+/// Select the Projects-panel row for project `id`, with the manual-move
+/// bookkeeping (drop pending selection-follows, remember the context being
+/// left). Does NOT restore the target's remembered worktree/session — the
+/// caller decides. False when the project is gone from the tree.
+fn select_project_row_by_id(app: &mut App, id: &nebula_core::ProjectId) -> bool {
+    let rows = app.project_rows();
+    let Some(row) = rows
+        .iter()
+        .position(|r| matches!(r, ProjectRow::Project(i) if &app.tree.projects[*i].id == id))
+    else {
+        return false;
+    };
+    app.select_divider_when_seen = None;
+    app.select_worktree_when_seen = None;
+    remember_context(app);
+    app.sel_project = row;
+    true
+}
+
+/// Land the panel selections on a `/` palette pick. A project or worktree
+/// pick moves the selection (restoring remembered child rows, like a manual
+/// switch). A session pick with `attach` opens it immediately, exactly like
+/// Enter on its row; without, it only lands on the row in the Sessions
+/// panel, previewing like ↑/↓ there. Targets are re-validated against the
+/// tree — a pick can race a removal, in which case it flashes instead of
+/// jumping.
+fn jump_to_target(
+    app: &mut App,
+    target: PaletteTarget,
+    attach: bool,
+    out: &mut Vec<ClientRequest>,
+) {
+    match target {
+        PaletteTarget::Project(id) => {
+            let changed = app.selected_project().map(|p| p.id != id).unwrap_or(true);
+            if !select_project_row_by_id(app, &id) {
+                app.flash = Some("project no longer exists".into());
+                return;
+            }
+            if changed {
+                restore_context(app, out);
+            }
+            app.focus = Focus::Projects;
+        }
+        PaletteTarget::Worktree(id) => {
+            if app.selected_worktree().is_some_and(|w| w.id == id) {
+                app.focus = Focus::Worktrees;
+                return;
+            }
+            let found = app
+                .tree
+                .worktrees
+                .iter()
+                .find(|w| w.id == id)
+                .map(|w| w.project_id.clone())
+                .is_some_and(|pid| select_project_row_by_id(app, &pid));
+            let index = found
+                .then(|| app.visible_worktrees().iter().position(|w| w.id == id))
+                .flatten();
+            let Some(index) = index else {
+                app.flash = Some("worktree no longer exists".into());
+                return;
+            };
+            app.sel_worktree = index;
+            restore_session(app, out);
+            app.focus = Focus::Worktrees;
+        }
+        PaletteTarget::Session(id) => {
+            let worktree = app
+                .tree
+                .agents
+                .iter()
+                .find(|a| a.id == id)
+                .map(|a| a.worktree_id.clone());
+            let found = worktree.as_ref().is_some_and(|wid| {
+                app.tree
+                    .worktrees
+                    .iter()
+                    .find(|w| &w.id == wid)
+                    .map(|w| w.project_id.clone())
+                    .is_some_and(|pid| select_project_row_by_id(app, &pid))
+            });
+            let wt_index = found
+                .then(|| {
+                    app.visible_worktrees()
+                        .iter()
+                        .position(|w| Some(&w.id) == worktree.as_ref())
+                })
+                .flatten();
+            let Some(wt_index) = wt_index else {
+                app.flash = Some("session no longer exists".into());
+                return;
+            };
+            app.sel_worktree = wt_index;
+            let Some(index) = app.visible_sessions().iter().position(|a| a.id == id) else {
+                // Vanished (or got archived out of view) mid-pick: land on
+                // its worktree instead of attaching.
+                restore_session(app, out);
+                app.focus = Focus::Sessions;
+                app.flash = Some("session no longer exists".into());
+                return;
+            };
+            app.sel_session = index;
+            if attach {
+                attach_selected(app, out);
+            } else {
+                app.focus = Focus::Sessions;
+                preview_selected(app, out);
+            }
+        }
+    }
+}
+
 fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
     let len = match app.focus {
         Focus::Projects => app.project_rows().len(),
@@ -1298,9 +1671,26 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
             app.sel_worktree = new;
             restore_session(app, out);
         }
-        Focus::Sessions => app.sel_session = new,
+        Focus::Sessions => {
+            app.sel_session = new;
+            preview_selected(app, out);
+        }
         Focus::Terminal => {}
     }
+}
+
+/// Show the selected session in the terminal pane WITHOUT taking focus or
+/// the input lock — walking the list with ↑/↓ previews each session so it
+/// can be read; Enter (or a click) is what commits: focus + lock. Archived
+/// rows don't preview (same rule as clicking one).
+fn preview_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let Some(row) = app.selected_session() else {
+        return;
+    };
+    if row.archived {
+        return;
+    }
+    attach(app, agent_sref(&row), out);
 }
 
 fn attach_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
@@ -1518,7 +1908,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         }
         return;
     }
-    // Diff modal: the wheel scrolls the diff; clicks are swallowed.
+    // Diff modal: the wheel scrolls the diff, a click on a file-list row
+    // selects that file, a drag on the files/diff border resizes the file
+    // list; everything else is swallowed.
     if let Some(Overlay::Diff(view)) = &mut app.overlay {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -1529,7 +1921,126 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 view.scroll_by(3);
                 app.dirty = true;
             }
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Border grab zone: the two touching border cells at the
+                // files/diff boundary (the panel `Splitter` pattern).
+                let bx = view.splitter_x();
+                let on_border = view.area.width > 0
+                    && mouse.row >= view.area.y
+                    && mouse.row < view.area.y + view.area.height
+                    && mouse.column.saturating_add(1) >= bx
+                    && mouse.column <= bx;
+                if on_border {
+                    view.files_drag = Some(bx as i32 - mouse.column as i32);
+                    return;
+                }
+                let area = view.list_area;
+                if area.width > 0
+                    && mouse.column >= area.x
+                    && mouse.column < area.x + area.width
+                    && mouse.row >= area.y
+                    && mouse.row < area.y + area.height
+                {
+                    let start = view.window_start(area.height as usize);
+                    let index = start + (mouse.row - area.y) as usize;
+                    if index < view.matches.len() && view.select(index as i64) {
+                        crate::git_diff::load_selected_diff(view);
+                        app.dirty = true;
+                    }
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(offset) = view.files_drag {
+                    view.set_files_width(mouse.column as i32 + offset);
+                    app.diff_files_width = view.files_width;
+                    app.dirty = true;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if view.files_drag.take().is_some() {
+                    app.dirty = true;
+                }
+            }
             _ => {}
+        }
+        return;
+    }
+    // Palette: the wheel moves the selection, a click on a result row jumps
+    // there, a click outside the modal closes; everything else is swallowed.
+    if let Some(Overlay::Palette(palette)) = &mut app.overlay {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                palette.select(palette.selected as i64 - 1);
+                app.dirty = true;
+            }
+            MouseEventKind::ScrollDown => {
+                palette.select(palette.selected as i64 + 1);
+                app.dirty = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let list = palette.list_area;
+                let inside_list = list.width > 0
+                    && mouse.column >= list.x
+                    && mouse.column < list.x + list.width
+                    && mouse.row >= list.y
+                    && mouse.row < list.y + list.height;
+                let area = palette.area;
+                let inside_modal = mouse.column >= area.x
+                    && mouse.column < area.x + area.width
+                    && mouse.row >= area.y
+                    && mouse.row < area.y + area.height;
+                if inside_list {
+                    let start = palette.window_start(list.height as usize);
+                    let index = start + (mouse.row - list.y) as usize;
+                    if index < palette.matches.len() {
+                        palette.select(index as i64);
+                        let attach = palette.enter_attaches;
+                        if let Some(target) = palette.selected_target().cloned() {
+                            app.overlay = None;
+                            jump_to_target(app, target, attach, out);
+                        }
+                    }
+                } else if !inside_modal {
+                    app.overlay = None;
+                }
+                app.dirty = true;
+            }
+            _ => {}
+        }
+        return;
+    }
+    // Settings: click a row to select (or toggle if already selected),
+    // click outside to close; everything else is swallowed.
+    if matches!(&app.overlay, Some(Overlay::Settings(_))) {
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            let (area, selected) = match &app.overlay {
+                Some(Overlay::Settings(view)) => (view.area, view.selected),
+                _ => return,
+            };
+            let inside = area.width > 0
+                && mouse.column >= area.x
+                && mouse.column < area.x + area.width
+                && mouse.row >= area.y
+                && mouse.row < area.y + area.height;
+            if inside {
+                let inner_y = area.y.saturating_add(1);
+                if mouse.row >= inner_y {
+                    let row = (mouse.row - inner_y) as usize;
+                    let n = crate::config::SETTINGS.len();
+                    let index = row / 2;
+                    if index < n && row < n * 2 {
+                        if let Some(Overlay::Settings(view)) = &mut app.overlay {
+                            view.selected = index;
+                        }
+                        if selected == index {
+                            apply_setting_at(app, index, 0);
+                        }
+                    }
+                }
+            } else {
+                app.overlay = None;
+            }
+            app.dirty = true;
         }
         return;
     }
@@ -1604,8 +2115,27 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     if app.selected_session().is_some_and(|a| a.archived) {
                         app.focus = Focus::Sessions;
                         app.flash = Some("agent is archived — unarchive first (u)".into());
-                    } else {
-                        attach_selected(app, out);
+                    } else if let Some(a) = app.selected_session() {
+                        let now = std::time::Instant::now();
+                        // Double-click toggles pin; `last_session_click` was
+                        // consumed, so a third click starts over.
+                        let double = app.last_session_click.take().is_some_and(|(at, id)| {
+                            id == a.id && now.duration_since(at) <= DOUBLE_CLICK
+                        });
+                        if double {
+                            // Keep the selection on this agent after it jumps
+                            // between the PINNED/UNPINNED groups.
+                            app.select_when_seen = Some(SessionRef::Agent(a.id.clone()));
+                            let req_id = app.alloc_req_id(PendingIntent::None);
+                            out.push(ClientRequest::SetAgentPinned {
+                                req_id,
+                                id: a.id,
+                                pinned: !a.pinned,
+                            });
+                        } else {
+                            app.last_session_click = Some((now, a.id));
+                            attach_selected(app, out);
+                        }
                     }
                 }
                 Some(HitTarget::PanelBg(focus)) => {
@@ -1837,6 +2367,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 restore_ui_state(app, &json);
             }
             clamp_selections(app);
+            refresh_palette(app);
             app.dirty = true;
         }
         ServerEvent::Scrollback { session, data, .. } => {
@@ -1873,10 +2404,23 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 }
             }
         }
-        ServerEvent::StatusChanged { agent, status } => {
+        ServerEvent::StatusChanged {
+            agent,
+            status,
+            changed_at,
+        } => {
+            // A status flip can pull the agent into the RECENT group and
+            // reorder the list; keep the selection on the same session.
+            let keep = app.selected_session().map(|a| a.id.clone());
             if let Some(a) = app.tree.agents.iter_mut().find(|a| a.id == agent) {
                 a.status = status;
+                a.status_changed_at = changed_at;
                 app.dirty = true;
+            }
+            if let Some(keep) = keep {
+                if let Some(i) = app.visible_sessions().iter().position(|a| a.id == keep) {
+                    app.sel_session = i;
+                }
             }
         }
         ServerEvent::Ack { req_id, created } => {
@@ -1906,7 +2450,8 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         }
         ServerEvent::EntityUpserted { entity } => {
             apply_upsert(app, entity);
-            // Fix the selection onto a session we just created.
+            // Fix the selection onto a session we just created — or follow
+            // one we just moved into another worktree of this project.
             if let Some(pending_sref) = app.select_when_seen.clone() {
                 if let Some(index) = app
                     .visible_sessions()
@@ -1915,6 +2460,25 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 {
                     app.sel_session = index;
                     app.select_when_seen = None;
+                } else if let SessionRef::Agent(id) = &pending_sref {
+                    let landed_worktree = app
+                        .tree
+                        .agents
+                        .iter()
+                        .find(|a| &a.id == id)
+                        .map(|a| a.worktree_id.clone());
+                    if let Some(wt_id) = landed_worktree {
+                        if select_worktree_by_id(app, &wt_id, out) {
+                            if let Some(index) = app
+                                .visible_sessions()
+                                .iter()
+                                .position(|a| agent_sref(a) == pending_sref)
+                            {
+                                app.sel_session = index;
+                            }
+                            app.select_when_seen = None;
+                        }
+                    }
                 }
             }
             // ...and onto a worktree we just created.
@@ -1923,11 +2487,17 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     app.select_worktree_when_seen = None;
                 }
             }
+            // An agent upsert can shrink the visible session list (the
+            // daemon re-homed it to another worktree) — keep selections in
+            // bounds.
+            clamp_selections(app);
+            refresh_palette(app);
             app.dirty = true;
         }
         ServerEvent::EntityRemoved { id } => {
             apply_removal(app, &id);
             clamp_selections(app);
+            refresh_palette(app);
             app.dirty = true;
         }
         ServerEvent::Error { req_id, message } => {
@@ -2077,6 +2647,14 @@ fn restore_worktree_rows(app: &mut App, rollback: WorktreeRollback) {
     app.dirty = true;
 }
 
+/// Keep an open `/` palette in sync with tree changes (renames, removals,
+/// new entities) so its rows never go stale under the user's cursor.
+fn refresh_palette(app: &mut App) {
+    if let Some(Overlay::Palette(palette)) = &mut app.overlay {
+        palette.rebuild(&app.tree, app.show_archived);
+    }
+}
+
 /// Keep selections valid after the tree shrinks.
 fn clamp_selections(app: &mut App) {
     let project_rows = app.project_rows().len();
@@ -2156,9 +2734,11 @@ mod tests {
                     name: "agent-1".into(),
                     status: AgentStatus::Fresh,
                     archived: false,
+                    pinned: false,
                     kind: nebula_core::AgentKind::Claude,
                     session_id: None,
                     sort_order: 0,
+                    status_changed_at: 0,
                     alive: true,
                 }),
             },
@@ -2200,13 +2780,155 @@ mod tests {
         assert!(text.contains("line2"), "second line rendered:\n{text}");
         assert!(text.contains("agent-1"), "session row rendered:\n{text}");
         assert!(
-            text.contains("AGENTS"),
-            "agents group header rendered:\n{text}"
+            !text.contains("PINNED"),
+            "no group headers with nothing pinned:\n{text}"
         );
         assert!(
             !text.contains("TERMINALS"),
             "terminals section is gone:\n{text}"
         );
+    }
+
+    /// Pinning an agent splits the sessions panel into PINNED and UNPINNED
+    /// groups; pinned rows sort first.
+    #[test]
+    fn pinned_agents_render_in_their_own_group() {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a2".into()),
+                    worktree_id: WorktreeId("w1".into()),
+                    name: "agent-2".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    pinned: true,
+                    kind: nebula_core::AgentKind::Claude,
+                    session_id: None,
+                    sort_order: 1,
+                    status_changed_at: 0,
+                    alive: true,
+                }),
+            },
+        );
+
+        let rows = app.visible_sessions();
+        assert_eq!(rows[0].name, "agent-2", "pinned agent sorts first");
+        assert_eq!(app.session_group_counts(), (1, 0, 1, 0));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("PINNED"), "pinned header rendered:\n{text}");
+        assert!(
+            text.contains("UNPINNED"),
+            "unpinned header rendered:\n{text}"
+        );
+    }
+
+    /// Agents whose status changed within the window sort into a RECENT
+    /// group: below PINNED (always), above the remaining unpinned rows.
+    /// Pinned agents stay in PINNED even with a fresh status change, and an
+    /// expired timestamp lands back in UNPINNED.
+    #[test]
+    fn recent_status_changes_group_below_pinned() {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let now = crate::app::now_ms();
+        let mk = |id: &str, pinned: bool, changed_at: i64, sort: i64| ServerEvent::EntityUpserted {
+            entity: Entity::Agent(Agent {
+                id: AgentId(id.into()),
+                worktree_id: WorktreeId("w1".into()),
+                name: id.into(),
+                status: AgentStatus::Finished,
+                archived: false,
+                pinned,
+                kind: nebula_core::AgentKind::Claude,
+                session_id: None,
+                sort_order: sort,
+                status_changed_at: changed_at,
+                alive: true,
+            }),
+        };
+        // Pinned with a fresh change: must stay in PINNED, not RECENT.
+        hse(&mut app, mk("pinned-fresh", true, now, 1));
+        // Unpinned, changed just now: RECENT.
+        hse(&mut app, mk("recent-1", false, now - 1_000, 2));
+        // Unpinned, changed outside the window: plain UNPINNED.
+        let stale = now - app.recent_window_ms - 60_000;
+        hse(&mut app, mk("stale-1", false, stale, 3));
+
+        let rows = app.visible_sessions();
+        let names: Vec<&str> = rows.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["pinned-fresh", "recent-1", "agent-1", "stale-1"],
+            "pinned, then recent, then the rest"
+        );
+        assert_eq!(app.session_group_counts(), (1, 1, 2, 0));
+        assert!(app.next_recent_expiry().is_some());
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("PINNED"), "pinned header rendered:\n{text}");
+        assert!(text.contains("RECENT"), "recent header rendered:\n{text}");
+        assert!(
+            text.contains("UNPINNED"),
+            "unpinned header rendered:\n{text}"
+        );
+    }
+
+    /// A StatusChanged delta stamps the agent's timestamp, pulls it into
+    /// RECENT, and the selection follows the session it was on.
+    #[test]
+    fn status_change_regroups_and_selection_follows() {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a2".into()),
+                    worktree_id: WorktreeId("w1".into()),
+                    name: "agent-2".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    pinned: false,
+                    kind: nebula_core::AgentKind::Claude,
+                    session_id: None,
+                    sort_order: 1,
+                    status_changed_at: 0,
+                    alive: true,
+                }),
+            },
+        );
+        app.focus = Focus::Sessions;
+        app.sel_session = 1; // agent-2
+
+        hse(
+            &mut app,
+            ServerEvent::StatusChanged {
+                agent: AgentId("a2".into()),
+                status: AgentStatus::Finished,
+                changed_at: crate::app::now_ms(),
+            },
+        );
+        let rows = app.visible_sessions();
+        assert_eq!(rows[0].name, "agent-2", "recent agent bubbled to the top");
+        assert_eq!(app.session_group_counts(), (0, 1, 1, 0));
+        assert_eq!(app.sel_session, 0, "selection followed agent-2");
+
+        // recent_window "off" collapses the group back to a flat list.
+        app.recent_window_ms = 0;
+        assert_eq!(app.session_group_counts(), (0, 0, 2, 0));
+        assert_eq!(app.visible_sessions()[0].name, "agent-1");
+        assert!(app.next_recent_expiry().is_none());
     }
 
     /// Confirming a worktree delete drops the row (and its agents)
@@ -2240,9 +2962,11 @@ mod tests {
                     name: "agent-2".into(),
                     status: AgentStatus::Fresh,
                     archived: false,
+                    pinned: false,
                     kind: nebula_core::AgentKind::Claude,
                     session_id: None,
                     sort_order: 0,
+                    status_changed_at: 0,
                     alive: true,
                 }),
             },
@@ -2431,12 +3155,20 @@ mod tests {
         assert_eq!(menu.items[2].label, "Cursor");
         assert_eq!(menu.hover, 0, "Claude is the default");
 
-        // Enter on the default chains into the name prompt with kind=Claude.
+        // Enter on the default chains into the name prompt with kind=Claude,
+        // and fires the prewarm so the CLI boots while the user types.
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &mut out,
         );
+        assert!(matches!(
+            out.last(),
+            Some(ClientRequest::PrewarmAgent {
+                kind: AgentKind::Claude,
+                ..
+            })
+        ));
         let Some(Overlay::Prompt(p)) = &app.overlay else {
             panic!("expected name prompt, got {:?}", app.overlay);
         };
@@ -2692,6 +3424,80 @@ mod tests {
         assert!(app.term_locked, "Enter on the focused pane locks input");
     }
 
+    /// ↑/↓ in the Sessions panel previews the selected session in the
+    /// terminal pane (attach, so it can be read) but does NOT move focus or
+    /// lock input — that's Enter's job. Archived rows are skipped.
+    #[test]
+    fn session_arrows_preview_without_focusing() {
+        use nebula_core::{Agent, AgentStatus, Entity, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let agent = |id: &str, name: &str, archived: bool, sort: i64| {
+            Entity::Agent(Agent {
+                id: AgentId(id.into()),
+                worktree_id: WorktreeId("w1".into()),
+                name: name.into(),
+                status: AgentStatus::Fresh,
+                archived,
+                pinned: false,
+                kind: nebula_core::AgentKind::Claude,
+                session_id: None,
+                sort_order: sort,
+                status_changed_at: 0,
+                alive: true,
+            })
+        };
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: agent("a2", "agent-2", false, 1),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: agent("a3", "agent-3", true, 2),
+            },
+        );
+        app.show_archived = true;
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.sel_session, 1);
+        assert_eq!(app.focus, Focus::Sessions, "preview must not steal focus");
+        assert!(!app.term_locked, "preview must not lock input");
+        let a2 = SessionRef::Agent(AgentId("a2".into()));
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(a2.clone()),
+            "the walked-to session shows in the pane"
+        );
+        assert!(
+            matches!(out.last(), Some(ClientRequest::Attach { session, .. }) if *session == a2),
+            "preview attaches so scrollback streams in"
+        );
+
+        // Walking onto an archived row keeps the previous preview.
+        out.clear();
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.sel_session, 2);
+        assert_eq!(app.term.as_ref().map(|t| t.sref.clone()), Some(a2.clone()));
+        assert!(out.is_empty(), "archived rows don't attach");
+
+        // Enter on a previewed live row commits: focus + lock, no re-attach.
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked, "Enter locks input into the preview");
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { .. })),
+            "already-previewed session isn't re-attached"
+        );
+    }
+
     #[test]
     fn drag_selection_selects_and_extracts_text() {
         let mut app = App::new();
@@ -2917,6 +3723,81 @@ mod tests {
         assert!(
             app.term_selection.is_some_and(|s| s.dragging && !s.active),
             "slow second click starts a fresh drag, not a word selection"
+        );
+    }
+
+    #[test]
+    fn double_click_on_session_row_toggles_pin() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        app.hits.push((
+            ratatui::layout::Rect::new(0, 0, 20, 1),
+            HitTarget::Session(0),
+        ));
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 1, 0),
+            &mut out,
+        );
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::SetAgentPinned { .. })),
+            "single click attaches, never pins"
+        );
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Up(MouseButton::Left), 1, 0),
+            &mut out,
+        );
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 1, 0),
+            &mut out,
+        );
+        assert!(
+            out.iter().any(|r| matches!(
+                r,
+                ClientRequest::SetAgentPinned { id, pinned: true, .. } if id.0 == "a1"
+            )),
+            "fast second click pins the agent"
+        );
+        assert_eq!(
+            app.select_when_seen,
+            Some(SessionRef::Agent(AgentId("a1".into()))),
+            "selection follows the agent across the pin regroup"
+        );
+        assert!(
+            app.last_session_click.is_none(),
+            "double-click consumed the click state, a third click starts over"
+        );
+    }
+
+    #[test]
+    fn slow_second_click_on_session_row_does_not_pin() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        app.hits.push((
+            ratatui::layout::Rect::new(0, 0, 20, 1),
+            HitTarget::Session(0),
+        ));
+
+        // A stale first click, well outside the double-click window.
+        app.last_session_click = Some((
+            std::time::Instant::now() - Duration::from_millis(500),
+            AgentId("a1".into()),
+        ));
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 1, 0),
+            &mut out,
+        );
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::SetAgentPinned { .. })),
+            "slow second click is a plain attach, not a pin toggle"
         );
     }
 
@@ -3152,6 +4033,74 @@ mod tests {
             divider_after,
             divider_label: divider_label.map(String::from),
         })
+    }
+
+    #[test]
+    fn move_agent_menu_requests_move_and_selection_follows_the_upsert() {
+        use nebula_core::{Agent, AgentStatus, Entity, Worktree};
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 / w1(main) / a1
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w2".into()),
+                    project_id: nebula_core::ProjectId("p1".into()),
+                    path: "/tmp/demo-feat".into(),
+                    branch: "feat".into(),
+                    is_main: false,
+                    sort_order: 0,
+                }),
+            },
+        );
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+
+        // The picker offers only the OTHER worktree.
+        open_move_agent_picker(&mut app, AgentId("a1".into()));
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("picker did not open");
+        };
+        assert_eq!(menu.items.len(), 1);
+        assert_eq!(menu.items[0].label, "feat");
+
+        run_menu_action(
+            &mut app,
+            MenuAction::MoveAgentToWorktree(AgentId("a1".into()), WorktreeId("w2".into())),
+            &mut out,
+        );
+        assert!(
+            matches!(out.last(), Some(ClientRequest::MoveAgent { .. })),
+            "menu action sends MoveAgent: {out:?}"
+        );
+
+        // The daemon's upsert lands with the new worktree_id — the selection
+        // follows the agent into its new worktree.
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a1".into()),
+                    worktree_id: WorktreeId("w2".into()),
+                    name: "agent-1".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    pinned: false,
+                    kind: nebula_core::AgentKind::Claude,
+                    session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    alive: true,
+                }),
+            },
+        );
+        assert_eq!(
+            app.selected_worktree().map(|w| w.branch.clone()),
+            Some("feat".into()),
+            "worktree selection followed the moved agent"
+        );
+        assert_eq!(app.sel_session, 0);
+        assert!(app.select_when_seen.is_none(), "follow intent consumed");
     }
 
     #[test]
@@ -3519,14 +4468,15 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         // Projects panel is 20 wide: row 1 is the project, row 2 the divider
-        // spanning the 18 inner columns between the │ borders.
+        // spanning the 18 inner columns between the borders (thick ┃ — the
+        // Projects panel starts focused).
         let lines: Vec<&str> = text.lines().collect();
         assert!(
-            lines[1].starts_with("│● demo"),
+            lines[1].starts_with("┃● demo"),
             "project row first:\n{text}"
         );
         assert!(
-            lines[2].starts_with(&format!("│{}│", "─".repeat(18))),
+            lines[2].starts_with(&format!("┃{}┃", "─".repeat(18))),
             "divider row under the project:\n{text}"
         );
 
@@ -3540,7 +4490,7 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(
-            text.lines().nth(2).unwrap().starts_with("│─ work ──"),
+            text.lines().nth(2).unwrap().starts_with("┃─ work ──"),
             "labeled divider row:\n{text}"
         );
     }
@@ -3779,31 +4729,30 @@ mod tests {
     /// Hand-built modal state — no git involved.
     fn fake_diff_view(lines: usize) -> crate::app::DiffView {
         use crate::git_diff::DiffFile;
-        DiffView {
-            root: "/nonexistent-nebula-diff-test".into(),
-            branch: "main".into(),
-            files: vec![
+        let mut view = DiffView::new(
+            "/nonexistent-nebula-diff-test".into(),
+            "main".into(),
+            vec![
                 DiffFile {
-                    path: "a.rs".into(),
+                    path: "alpha.rs".into(),
                     orig_path: None,
                     xy: ['M', ' '],
                 },
                 DiffFile {
-                    path: "b.rs".into(),
+                    path: "beta.rs".into(),
                     orig_path: None,
                     xy: ['?', '?'],
                 },
             ],
-            selected: 0,
-            diff: (0..lines)
-                .map(|i| format!("line {i}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            diff_line_count: lines,
-            scroll: 0,
-            view_height: 20,
-            head_ok: true,
-        }
+            true,
+        );
+        view.diff = (0..lines)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        view.diff_line_count = lines;
+        view.view_height = 20;
+        view
     }
 
     #[test]
@@ -3878,11 +4827,11 @@ mod tests {
             _ => panic!("diff overlay gone"),
         };
 
-        press(&mut app, KeyCode::Char('J'), KeyModifiers::SHIFT, &mut out);
-        assert_eq!(scroll(&app), (0, 1), "J scrolls down one line");
-        press(&mut app, KeyCode::Char('K'), KeyModifiers::SHIFT, &mut out);
-        press(&mut app, KeyCode::Char('K'), KeyModifiers::SHIFT, &mut out);
-        assert_eq!(scroll(&app), (0, 0), "K clamps at the top");
+        press(&mut app, KeyCode::Down, KeyModifiers::SHIFT, &mut out);
+        assert_eq!(scroll(&app), (0, 1), "Shift+Down scrolls down one line");
+        press(&mut app, KeyCode::Up, KeyModifiers::SHIFT, &mut out);
+        press(&mut app, KeyCode::Up, KeyModifiers::SHIFT, &mut out);
+        assert_eq!(scroll(&app), (0, 0), "Shift+Up clamps at the top");
         press(
             &mut app,
             KeyCode::Char('d'),
@@ -3890,28 +4839,97 @@ mod tests {
             &mut out,
         );
         assert_eq!(scroll(&app), (0, 10), "Ctrl+d scrolls half a page");
-        press(&mut app, KeyCode::Char('G'), KeyModifiers::SHIFT, &mut out);
-        assert_eq!(scroll(&app), (0, 80), "G jumps to max scroll");
+        press(&mut app, KeyCode::End, KeyModifiers::NONE, &mut out);
+        assert_eq!(scroll(&app), (0, 80), "End jumps to max scroll");
         press(&mut app, KeyCode::PageDown, KeyModifiers::NONE, &mut out);
         assert_eq!(scroll(&app), (0, 80), "paging clamps at the bottom");
-        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
-        assert_eq!(scroll(&app), (0, 0), "g jumps back to the top");
+        press(&mut app, KeyCode::Home, KeyModifiers::NONE, &mut out);
+        assert_eq!(scroll(&app), (0, 0), "Home jumps back to the top");
 
         // File switch resets the scroll; the fake root makes the reload an
         // error body, which must not panic.
-        press(&mut app, KeyCode::Char('G'), KeyModifiers::SHIFT, &mut out);
-        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-        assert_eq!(scroll(&app).0, 1, "j selects the next file");
+        press(&mut app, KeyCode::End, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert_eq!(scroll(&app).0, 1, "Down selects the next file");
         assert_eq!(scroll(&app).1, 0, "file switch resets scroll");
-        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         assert_eq!(scroll(&app).0, 1, "selection clamps at the last file");
-        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
-        assert_eq!(scroll(&app).0, 0, "k selects the previous file");
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        assert_eq!(scroll(&app).0, 0, "Up selects the previous file");
 
-        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE, &mut out);
-        assert!(app.overlay.is_none(), "q closes the modal");
-        assert!(!app.should_quit, "q inside the modal does not quit the app");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "Esc closes the modal");
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn diff_modal_type_to_filter() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.overlay = Some(Overlay::Diff(fake_diff_view(10)));
+        let mut out = Vec::new();
+        let view = |app: &App| match &app.overlay {
+            Some(Overlay::Diff(v)) => v.clone(),
+            _ => panic!("diff overlay gone"),
+        };
+
+        // Typing narrows to the fuzzy matches; the diff reload against the
+        // fake root yields an error body, which must not panic.
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
+        let v = view(&app);
+        assert_eq!(v.filter, "b");
+        assert_eq!(v.matches.len(), 1, "only beta.rs matches");
+        assert_eq!(v.selected_file().unwrap().path, "beta.rs");
+
+        // Uppercase (SHIFT-modified) chars land in the filter too, and the
+        // match is case-insensitive.
+        press(&mut app, KeyCode::Char('T'), KeyModifiers::SHIFT, &mut out);
+        let v = view(&app);
+        assert_eq!(v.filter, "bT");
+        assert_eq!(v.matches.len(), 1, "bT still fuzzy-matches beta.rs");
+
+        // A dead-end query empties the list without panicking.
+        press(&mut app, KeyCode::Char('z'), KeyModifiers::NONE, &mut out);
+        let v = view(&app);
+        assert!(v.matches.is_empty(), "no file matches bTz");
+        assert!(v.selected_file().is_none());
+        assert_eq!(v.diff, "", "no selection clears the diff pane");
+
+        // Backspace restores the previous narrowing.
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
+        assert_eq!(view(&app).matches.len(), 1);
+
+        // First Esc clears the filter, second closes.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        let v = view(&app);
+        assert_eq!(v.filter, "", "Esc clears the filter first");
+        assert_eq!(v.matches.len(), 2, "full list restored in git order");
+        assert_eq!(v.selected_file().unwrap().path, "alpha.rs");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "second Esc closes the modal");
+        assert!(out.is_empty(), "filtering never talks to the daemon");
+    }
+
+    #[test]
+    fn diff_filter_sorts_best_match_first() {
+        use crate::git_diff::DiffFile;
+        let file = |path: &str| DiffFile {
+            path: path.into(),
+            orig_path: None,
+            xy: ['M', ' '],
+        };
+        let mut view = DiffView::new(
+            "/nonexistent-nebula-diff-test".into(),
+            "main".into(),
+            vec![file("build.rs"), file("src/ui.rs")],
+            true,
+        );
+        view.filter = "ui".into();
+        view.apply_filter();
+        assert_eq!(view.matches.len(), 2);
+        // Segment-start match on src/ui.rs outranks the mid-word one in
+        // build.rs despite git order listing build.rs first.
+        assert_eq!(view.selected_file().unwrap().path, "src/ui.rs");
     }
 
     #[test]
@@ -3927,9 +4945,10 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("Files (2)"), "file pane title:\n{text}");
-        assert!(text.contains("a.rs"), "file row:\n{text}");
+        assert!(text.contains("alpha.rs"), "file row:\n{text}");
+        assert!(text.contains("type to filter"), "filter row:\n{text}");
         assert!(text.contains("+new line"), "diff body:\n{text}");
-        assert!(text.contains("j/k: file"), "footer hint:\n{text}");
+        assert!(text.contains("type: filter"), "footer hint:\n{text}");
         match &app.overlay {
             Some(Overlay::Diff(v)) => {
                 assert!(v.view_height > 0, "view_height written back during draw")
@@ -3973,5 +4992,616 @@ mod tests {
         assert_eq!(app.focus, focus_before, "clicks do not change focus");
         assert_eq!(app.sel_project, sel_before);
         assert!(out.is_empty(), "mouse in the modal sends nothing");
+    }
+
+    #[test]
+    fn diff_modal_click_selects_file_row() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.overlay = Some(Overlay::Diff(fake_diff_view(4)));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let area = match &app.overlay {
+            Some(Overlay::Diff(v)) => v.list_area,
+            _ => panic!("diff overlay gone"),
+        };
+        assert!(
+            area.height >= 2,
+            "list area written back during draw: {area:?}"
+        );
+
+        let mut out = Vec::new();
+        // Click the second row: beta.rs becomes the selection and its diff
+        // loads (the fake root makes that an error string, still a reload).
+        handle_mouse(
+            &mut app,
+            mev(
+                MouseEventKind::Down(MouseButton::Left),
+                area.x + 2,
+                area.y + 1,
+            ),
+            &mut out,
+        );
+        match &app.overlay {
+            Some(Overlay::Diff(v)) => {
+                assert_eq!(v.selected, 1);
+                assert_eq!(v.selected_file().unwrap().path, "beta.rs");
+                assert_eq!(v.scroll, 0, "reload resets the scroll");
+            }
+            _ => panic!("diff overlay gone"),
+        }
+
+        // A click below the last populated row is a no-op.
+        handle_mouse(
+            &mut app,
+            mev(
+                MouseEventKind::Down(MouseButton::Left),
+                area.x + 2,
+                area.y + area.height - 1,
+            ),
+            &mut out,
+        );
+        match &app.overlay {
+            Some(Overlay::Diff(v)) => assert_eq!(v.selected, 1, "empty-row click ignored"),
+            _ => panic!("diff overlay gone"),
+        }
+        assert!(out.is_empty(), "clicks in the modal send nothing");
+    }
+
+    #[test]
+    fn diff_modal_border_drag_resizes_file_list() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.overlay = Some(Overlay::Diff(fake_diff_view(4)));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let (area, width_before) = match &app.overlay {
+            Some(Overlay::Diff(v)) => (v.area, v.files_width),
+            _ => panic!("diff overlay gone"),
+        };
+        assert!(area.width > 0, "modal area written back during draw");
+        assert_eq!(width_before, crate::app::DEFAULT_DIFF_FILES_W);
+
+        let bx = area.x + width_before;
+        let mut out = Vec::new();
+        // Grab the boundary's left border cell and drag 10 columns right.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), bx - 1, area.y + 5),
+            &mut out,
+        );
+        match &app.overlay {
+            Some(Overlay::Diff(v)) => {
+                assert!(v.files_drag.is_some(), "border click arms the drag");
+                assert_eq!(v.selected, 0, "border click selects no row");
+            }
+            _ => panic!("diff overlay gone"),
+        }
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), bx + 9, area.y + 5),
+            &mut out,
+        );
+        match &app.overlay {
+            Some(Overlay::Diff(v)) => assert_eq!(v.files_width, width_before + 10),
+            _ => panic!("diff overlay gone"),
+        }
+        assert_eq!(
+            app.diff_files_width,
+            width_before + 10,
+            "width remembered for the next open"
+        );
+
+        // A drag far past the right edge clamps so the diff pane keeps its
+        // minimum; far left clamps to the file-list minimum.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), area.x + 200, 5),
+            &mut out,
+        );
+        match &app.overlay {
+            Some(Overlay::Diff(v)) => {
+                assert_eq!(v.files_width, area.width - crate::app::MIN_DIFF_PANE_W)
+            }
+            _ => panic!("diff overlay gone"),
+        }
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), area.x, 5),
+            &mut out,
+        );
+        match &app.overlay {
+            Some(Overlay::Diff(v)) => {
+                assert_eq!(v.files_width, crate::app::MIN_DIFF_FILES_W)
+            }
+            _ => panic!("diff overlay gone"),
+        }
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Up(MouseButton::Left), area.x, 5),
+            &mut out,
+        );
+        match &app.overlay {
+            Some(Overlay::Diff(v)) => assert!(v.files_drag.is_none(), "mouse-up ends the drag"),
+            _ => panic!("diff overlay gone"),
+        }
+        assert!(out.is_empty(), "resizing never talks to the daemon");
+    }
+
+    // ---- `/` fuzzy-search palette ----
+
+    /// A second project ("nebula", branch feat-x, session codex-1) next to
+    /// `seed_tree`'s demo/main/agent-1, plus an archived session on demo.
+    fn seed_second_project(app: &mut App) {
+        use nebula_core::{Agent, AgentStatus, Entity, Project, ProjectId, Worktree, WorktreeId};
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(Project {
+                    id: ProjectId("p2".into()),
+                    name: "nebula".into(),
+                    repo_path: "/tmp/nebula".into(),
+                    sort_order: 1,
+                    divider_after: false,
+                    divider_label: None,
+                }),
+            },
+        );
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w2".into()),
+                    project_id: ProjectId("p2".into()),
+                    path: "/tmp/nebula".into(),
+                    branch: "feat-x".into(),
+                    is_main: true,
+                    sort_order: 0,
+                }),
+            },
+        );
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a2".into()),
+                    worktree_id: WorktreeId("w2".into()),
+                    name: "codex-1".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    pinned: false,
+                    kind: nebula_core::AgentKind::Codex,
+                    session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    alive: true,
+                }),
+            },
+        );
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a3".into()),
+                    worktree_id: WorktreeId("w1".into()),
+                    name: "old-1".into(),
+                    status: AgentStatus::Terminated,
+                    archived: true,
+                    pinned: false,
+                    kind: nebula_core::AgentKind::Claude,
+                    session_id: None,
+                    sort_order: 1,
+                    status_changed_at: 0,
+                    alive: false,
+                }),
+            },
+        );
+    }
+
+    fn palette(app: &App) -> &crate::app::Palette {
+        match &app.overlay {
+            Some(Overlay::Palette(p)) => p,
+            other => panic!("expected palette overlay, got {other:?}"),
+        }
+    }
+
+    /// Pin the open palette's Enter behavior: `/` snapshots it from the
+    /// machine's real config.json, which tests must not depend on.
+    fn set_enter_attaches(app: &mut App, v: bool) {
+        match &mut app.overlay {
+            Some(Overlay::Palette(p)) => p.enter_attaches = v,
+            other => panic!("expected palette overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_opens_palette_listing_projects_then_worktrees_then_sessions() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        let texts: Vec<&str> = palette(&app)
+            .items
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "demo",
+                "nebula",
+                "demo/main",
+                "nebula/feat-x",
+                "demo/main/agent-1",
+                "nebula/feat-x/codex-1",
+            ],
+            "grouped build order, archived hidden by default"
+        );
+        // The empty query shows everything.
+        assert_eq!(palette(&app).matches.len(), texts.len());
+        assert!(out.is_empty(), "opening the palette sends nothing");
+    }
+
+    #[test]
+    fn palette_follows_the_archived_toggle() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        app.show_archived = true;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        let archived: Vec<&str> = palette(&app)
+            .items
+            .iter()
+            .filter(|i| i.archived)
+            .map(|i| i.text.as_str())
+            .collect();
+        assert_eq!(archived, vec!["demo/main/old-1"]);
+    }
+
+    #[test]
+    fn palette_typing_filters_best_match_first_and_esc_is_two_stage() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        for c in "main".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        {
+            let p = palette(&app);
+            assert_eq!(p.query, "main");
+            let top = &p.items[p.matches[0].item];
+            // Same boundary match, but the worktree text is shorter than its
+            // session's — the tighter candidate wins the tie.
+            assert_eq!(top.text, "demo/main");
+            assert!(p
+                .matches
+                .iter()
+                .all(|m| p.items[m.item].text.contains("main")));
+        }
+        // First Esc clears the query, second closes.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert_eq!(palette(&app).query, "");
+        assert!(!palette(&app).matches.is_empty());
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none());
+        assert!(out.is_empty(), "browsing the palette sends nothing");
+    }
+
+    #[test]
+    fn palette_enter_on_session_selects_the_chain_and_attaches() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        set_enter_attaches(&mut app, true);
+        for c in "codex".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+
+        assert!(app.overlay.is_none());
+        assert_eq!(app.selected_project().unwrap().name, "nebula");
+        assert_eq!(app.selected_worktree().unwrap().branch, "feat-x");
+        assert_eq!(app.selected_session().unwrap().name, "codex-1");
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked, "a session pick locks input immediately");
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. }
+                    if *session == SessionRef::Agent(AgentId("a2".into())))),
+            "a session pick attaches: {out:?}"
+        );
+    }
+
+    #[test]
+    fn palette_enter_only_focuses_the_row_when_auto_attach_is_off() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        set_enter_attaches(&mut app, false);
+        for c in "codex".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+
+        assert!(app.overlay.is_none());
+        assert_eq!(app.selected_session().unwrap().name, "codex-1");
+        assert_eq!(
+            app.focus,
+            Focus::Sessions,
+            "lands on the list, not the terminal"
+        );
+        assert!(!app.term_locked, "no input lock — Enter on the row commits");
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. }
+                    if *session == SessionRef::Agent(AgentId("a2".into())))),
+            "the pane still previews the picked session: {out:?}"
+        );
+    }
+
+    #[test]
+    fn palette_ctrl_o_opens_the_session_regardless_of_the_setting() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        set_enter_attaches(&mut app, false);
+        for c in "codex".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(
+            &mut app,
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+
+        assert!(app.overlay.is_none());
+        assert_eq!(app.selected_session().unwrap().name, "codex-1");
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked);
+    }
+
+    #[test]
+    fn palette_ctrl_f_focuses_the_row_regardless_of_the_setting() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        set_enter_attaches(&mut app, true);
+        for c in "codex".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(
+            &mut app,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+
+        assert!(app.overlay.is_none());
+        assert_eq!(app.selected_session().unwrap().name, "codex-1");
+        assert_eq!(app.focus, Focus::Sessions);
+        assert!(!app.term_locked);
+    }
+
+    #[test]
+    fn palette_enter_on_worktree_navigates_without_attaching() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        for c in "featx".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+
+        assert!(app.overlay.is_none());
+        assert_eq!(app.selected_project().unwrap().name, "nebula");
+        assert_eq!(app.selected_worktree().unwrap().branch, "feat-x");
+        assert_eq!(app.focus, Focus::Worktrees);
+        assert!(!app.term_locked);
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { .. })),
+            "no remembered session on the target worktree, so nothing attaches: {out:?}"
+        );
+    }
+
+    #[test]
+    fn palette_rebuilds_when_the_tree_changes_under_it() {
+        use nebula_core::{Entity, EntityId, Project, ProjectId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        assert_eq!(palette(&app).items.len(), 3);
+        // Park the cursor on the session row before the tree churns.
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(Project {
+                    id: ProjectId("p9".into()),
+                    name: "fresh".into(),
+                    repo_path: "/tmp/fresh".into(),
+                    sort_order: 9,
+                    divider_after: false,
+                    divider_label: None,
+                }),
+            },
+        );
+        assert!(
+            palette(&app).items.iter().any(|i| i.text == "fresh"),
+            "an upsert lands in the open palette"
+        );
+        assert_eq!(
+            palette(&app).selected_target(),
+            Some(&crate::app::PaletteTarget::Session(AgentId("a1".into()))),
+            "a rebuild keeps the cursor on its target"
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityRemoved {
+                id: EntityId::Project(ProjectId("p9".into())),
+            },
+        );
+        assert!(
+            !palette(&app).items.iter().any(|i| i.text == "fresh"),
+            "a removal drops out of the open palette"
+        );
+    }
+
+    #[test]
+    fn palette_renders_with_kind_badges_and_emoji_panel_titles() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Jump to"), "palette title rendered:\n{text}");
+        assert!(
+            text.contains("type to search"),
+            "query placeholder rendered:\n{text}"
+        );
+        // The TestBackend pads a double-width emoji with a placeholder
+        // cell, so match badge and label separately rather than adjacent.
+        assert!(text.contains("📁") && text.contains("Projects"), "{text}");
+        assert!(text.contains("🌳") && text.contains("Worktrees"), "{text}");
+        assert!(text.contains("🤖") && text.contains("Sessions"), "{text}");
+        assert!(
+            text.contains("demo/main/agent-1"),
+            "session row rendered in the palette:\n{text}"
+        );
+        // Rects for mouse hit-testing were written back during the draw.
+        assert!(palette(&app).list_area.width > 0);
+    }
+
+    #[test]
+    fn s_opens_settings_and_esc_closes() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        assert!(matches!(app.overlay, Some(Overlay::Settings(_))));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn s_toggles_settings_closed_like_help() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn settings_j_k_move_selection() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Settings(view)) = &app.overlay else {
+            panic!("settings closed");
+        };
+        assert_eq!(view.selected, 1);
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Settings(view)) = &app.overlay else {
+            panic!("settings closed");
+        };
+        assert_eq!(view.selected, 0);
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Settings(view)) = &app.overlay else {
+            panic!("settings closed");
+        };
+        assert_eq!(view.selected, 0, "selection does not wrap");
+    }
+
+    #[test]
+    fn settings_enter_persists_toggle_to_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        crate::config::with_config_path(path.clone(), || {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let cfg = crate::config::Config::load();
+            assert!(
+                !cfg.palette_enter_attaches,
+                "Enter toggles the first setting off"
+            );
+            let saved: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(saved["palette_enter_attaches"], false);
+            assert!(
+                matches!(app.overlay, Some(Overlay::Settings(_))),
+                "toggle keeps the overlay open"
+            );
+        });
+    }
+
+    #[test]
+    fn settings_hl_cycles_recent_window_and_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        crate::config::with_config_path(path, || {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
+            let cfg = crate::config::Config::load();
+            assert_eq!(cfg.recent_window, "1h");
+            assert_eq!(app.recent_window_ms, 3_600_000);
+            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+            let cfg = crate::config::Config::load();
+            assert_eq!(cfg.recent_window, "30m");
+            assert_eq!(
+                app.recent_window_ms,
+                crate::config::DEFAULT_RECENT_WINDOW_MS
+            );
+        });
+    }
+
+    #[test]
+    fn settings_overlay_renders_labels() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Settings"), "title rendered:\n{text}");
+        assert!(
+            text.contains("Search Enter attaches"),
+            "bool setting rendered:\n{text}"
+        );
+        assert!(
+            text.contains("Recent window"),
+            "cycle setting rendered:\n{text}"
+        );
+        let Some(Overlay::Settings(view)) = &app.overlay else {
+            panic!("settings closed");
+        };
+        assert!(view.area.width > 0, "draw writes hit-test area");
     }
 }

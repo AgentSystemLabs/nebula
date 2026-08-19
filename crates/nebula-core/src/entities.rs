@@ -45,7 +45,7 @@ impl AgentStatus {
 }
 
 /// Which agent CLI a session runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentKind {
     #[default]
@@ -113,6 +113,13 @@ pub struct Agent {
     pub name: String,
     pub status: AgentStatus,
     pub archived: bool,
+    /// Pinned agents sort into their own PINNED group in the sessions list.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Epoch ms of the last status change; 0 = unknown (pre-upgrade rows or
+    /// never-run agents). Drives the TUI's RECENT session group.
+    #[serde(default)]
+    pub status_changed_at: i64,
     #[serde(default)]
     pub kind: AgentKind,
     /// CLI session id used for resume (claude, codex, or cursor, per `kind`).

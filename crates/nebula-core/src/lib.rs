@@ -1,5 +1,6 @@
 pub mod codec;
 pub mod entities;
+pub mod host;
 pub mod ids;
 pub mod paths;
 pub mod protocol;

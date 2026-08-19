@@ -193,7 +193,11 @@ fn arrow(dir: u8, mods: KeyModifiers) -> &'static [u8] {
     // Static tables keep this allocation-free for the common cases.
     macro_rules! seq {
         ($d:literal) => {
-            match (mods.contains(KeyModifiers::SHIFT), mods.contains(KeyModifiers::ALT), mods.contains(KeyModifiers::CONTROL)) {
+            match (
+                mods.contains(KeyModifiers::SHIFT),
+                mods.contains(KeyModifiers::ALT),
+                mods.contains(KeyModifiers::CONTROL),
+            ) {
                 (false, false, false) => concat!("\x1b[", $d).as_bytes(),
                 (true, false, false) => concat!("\x1b[1;2", $d).as_bytes(),
                 (false, true, false) => concat!("\x1b[1;3", $d).as_bytes(),
@@ -248,22 +252,34 @@ mod tests {
 
     #[test]
     fn plain_char() {
-        assert_eq!(encode_key(&key(KeyCode::Char('a'), KeyModifiers::NONE), 0), Some(b"a".to_vec()));
+        assert_eq!(
+            encode_key(&key(KeyCode::Char('a'), KeyModifiers::NONE), 0),
+            Some(b"a".to_vec())
+        );
     }
 
     #[test]
     fn ctrl_c() {
-        assert_eq!(encode_key(&key(KeyCode::Char('c'), KeyModifiers::CONTROL), 0), Some(vec![0x03]));
+        assert_eq!(
+            encode_key(&key(KeyCode::Char('c'), KeyModifiers::CONTROL), 0),
+            Some(vec![0x03])
+        );
     }
 
     #[test]
     fn alt_char_prefixes_esc() {
-        assert_eq!(encode_key(&key(KeyCode::Char('f'), KeyModifiers::ALT), 0), Some(vec![0x1b, b'f']));
+        assert_eq!(
+            encode_key(&key(KeyCode::Char('f'), KeyModifiers::ALT), 0),
+            Some(vec![0x1b, b'f'])
+        );
     }
 
     #[test]
     fn arrows() {
-        assert_eq!(encode_key(&key(KeyCode::Up, KeyModifiers::NONE), 0), Some(b"\x1b[A".to_vec()));
+        assert_eq!(
+            encode_key(&key(KeyCode::Up, KeyModifiers::NONE), 0),
+            Some(b"\x1b[A".to_vec())
+        );
         assert_eq!(
             encode_key(&key(KeyCode::Left, KeyModifiers::CONTROL), 0),
             Some(b"\x1b[1;5D".to_vec())
@@ -272,25 +288,40 @@ mod tests {
 
     #[test]
     fn utf8_char() {
-        assert_eq!(encode_key(&key(KeyCode::Char('é'), KeyModifiers::NONE), 0), Some("é".as_bytes().to_vec()));
+        assert_eq!(
+            encode_key(&key(KeyCode::Char('é'), KeyModifiers::NONE), 0),
+            Some("é".as_bytes().to_vec())
+        );
     }
 
     #[test]
     fn legacy_swallows_super_combos() {
-        assert_eq!(encode_key(&key(KeyCode::Char('c'), KeyModifiers::SUPER), 0), None);
-        assert_eq!(encode_key(&key(KeyCode::Backspace, KeyModifiers::SUPER), 0), None);
+        assert_eq!(
+            encode_key(&key(KeyCode::Char('c'), KeyModifiers::SUPER), 0),
+            None
+        );
+        assert_eq!(
+            encode_key(&key(KeyCode::Backspace, KeyModifiers::SUPER), 0),
+            None
+        );
     }
 
     // ---- kitty dialect (flags=1: disambiguate) ----
 
     #[test]
     fn kitty_plain_text_stays_text() {
-        assert_eq!(encode_key(&key(KeyCode::Char('a'), KeyModifiers::NONE), 1), Some(b"a".to_vec()));
+        assert_eq!(
+            encode_key(&key(KeyCode::Char('a'), KeyModifiers::NONE), 1),
+            Some(b"a".to_vec())
+        );
         assert_eq!(
             encode_key(&key(KeyCode::Char('A'), KeyModifiers::SHIFT), 1),
             Some(b"A".to_vec())
         );
-        assert_eq!(encode_key(&key(KeyCode::Enter, KeyModifiers::NONE), 1), Some(b"\r".to_vec()));
+        assert_eq!(
+            encode_key(&key(KeyCode::Enter, KeyModifiers::NONE), 1),
+            Some(b"\r".to_vec())
+        );
     }
 
     #[test]
@@ -315,7 +346,10 @@ mod tests {
             encode_key(&key(KeyCode::Enter, KeyModifiers::SHIFT), 1),
             Some(b"\x1b[13;2u".to_vec())
         );
-        assert_eq!(encode_key(&key(KeyCode::Esc, KeyModifiers::NONE), 1), Some(b"\x1b[27u".to_vec()));
+        assert_eq!(
+            encode_key(&key(KeyCode::Esc, KeyModifiers::NONE), 1),
+            Some(b"\x1b[27u".to_vec())
+        );
     }
 
     #[test]
@@ -329,14 +363,23 @@ mod tests {
     #[test]
     fn kitty_uppercase_sets_shift_bit() {
         assert_eq!(
-            encode_key(&key(KeyCode::Char('P'), KeyModifiers::CONTROL | KeyModifiers::SHIFT), 1),
+            encode_key(
+                &key(
+                    KeyCode::Char('P'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                ),
+                1
+            ),
             Some(b"\x1b[112;6u".to_vec())
         );
     }
 
     #[test]
     fn kitty_arrows_keep_legacy_form() {
-        assert_eq!(encode_key(&key(KeyCode::Up, KeyModifiers::NONE), 1), Some(b"\x1b[A".to_vec()));
+        assert_eq!(
+            encode_key(&key(KeyCode::Up, KeyModifiers::NONE), 1),
+            Some(b"\x1b[A".to_vec())
+        );
         assert_eq!(
             encode_key(&key(KeyCode::Up, KeyModifiers::SUPER), 1),
             Some(b"\x1b[1;9A".to_vec())
@@ -350,6 +393,9 @@ mod tests {
             encode_key(&key(KeyCode::Char('a'), KeyModifiers::NONE), 0x9),
             Some(b"\x1b[97u".to_vec())
         );
-        assert_eq!(encode_key(&key(KeyCode::Enter, KeyModifiers::NONE), 0x9), Some(b"\x1b[13u".to_vec()));
+        assert_eq!(
+            encode_key(&key(KeyCode::Enter, KeyModifiers::NONE), 0x9),
+            Some(b"\x1b[13u".to_vec())
+        );
     }
 }

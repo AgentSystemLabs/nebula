@@ -20,6 +20,12 @@ async fn git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// `git init` an existing directory.
+pub async fn init(path: &Path) -> Result<()> {
+    git(path, &["init"]).await?;
+    Ok(())
+}
+
 /// Verify `path` is inside a git repo and return its toplevel.
 pub async fn repo_toplevel(path: &Path) -> Result<PathBuf> {
     let out = git(path, &["rev-parse", "--show-toplevel"]).await?;

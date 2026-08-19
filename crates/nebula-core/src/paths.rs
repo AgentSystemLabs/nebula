@@ -49,6 +49,12 @@ pub fn db_path() -> PathBuf {
     data_dir().join("nebula.db")
 }
 
+/// User settings file (JSON). Lives beside the DB so `NEBULA_DATA_DIR`
+/// isolates it for tests and parallel instances too.
+pub fn config_path() -> PathBuf {
+    data_dir().join("config.json")
+}
+
 pub fn log_dir() -> PathBuf {
     // Tests and parallel instances override the data dir; keep their logs
     // beside their data instead of the real user's state dir.

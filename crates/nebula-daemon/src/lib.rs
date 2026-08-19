@@ -1,3 +1,4 @@
+pub mod config;
 pub mod git;
 pub mod hooks;
 pub mod lifecycle;
@@ -50,12 +51,28 @@ async fn serve() -> Result<()> {
 
     let daemon = registry::Daemon::new(store, hook_env);
 
-    // Drain hook events into the status machines.
+    // Drain hook events into the status machines; a payload that reports a
+    // cwd inside another worktree of the same project re-homes the agent row.
     {
         let daemon = daemon.clone();
         tokio::spawn(async move {
-            while let Some((agent_id, event, session_id)) = hook_rx.recv().await {
-                daemon.apply_hook_event(&agent_id, event, session_id);
+            while let Some(hooks::HookDelivery {
+                agent_id,
+                event,
+                session_id,
+                cwd,
+            }) = hook_rx.recv().await
+            {
+                let captures_session = event.captures_session();
+                daemon.apply_hook_event(&agent_id, event, session_id.clone());
+                if let Some(cwd) = &cwd {
+                    daemon.reparent_agent_by_cwd(
+                        &agent_id,
+                        cwd,
+                        session_id.as_deref(),
+                        captures_session,
+                    );
+                }
             }
         });
     }
@@ -68,7 +85,10 @@ async fn serve() -> Result<()> {
             loop {
                 tokio::select! {
                     _ = daemon.shutdown.cancelled() => break,
-                    _ = interval.tick() => daemon.tick_status_machines(),
+                    _ = interval.tick() => {
+                        daemon.tick_status_machines();
+                        daemon.reap_prewarmed();
+                    }
                 }
             }
         });

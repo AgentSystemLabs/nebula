@@ -414,7 +414,6 @@ fn tui_projects_worktrees_agents_navigation() {
     // ---- Enter shows the sessions (agents) panel for feat-a ----
     tui.send(b"\r");
     tui.wait_for_text(FOOTER_SESSIONS);
-    tui.wait_for_text("AGENTS");
 
     // ---- create an agent: kind picker → name prompt, auto-attaches ----
     tui.send(b"n");
@@ -509,16 +508,27 @@ fn tui_git_diff_modal() {
     tui.wait_for_selected(".keep");
     tui.wait_for_text("+tracked change");
 
-    // ---- toggle to the untracked file ----
-    tui.send(b"j");
+    // ---- arrow to the untracked file ----
+    tui.send(b"\x1b[B"); // Down
     tui.wait_for_selected("hello.txt");
     tui.wait_for_text("+hello world");
 
+    // ---- type-to-filter narrows the list and reselects the top match ----
+    tui.type_str("kee");
+    tui.wait_for_text("Files (1/2)");
+    tui.wait_for_selected(".keep");
+    tui.wait_for_text("+tracked change");
+    tui.send(&[0x1b]); // first Esc clears the filter, not the modal
+    tui.wait_for_text("Files (2)");
+
     // ---- the modal blocks other interaction ----
     // n would open "Add project" from the Projects panel; inside the modal it
-    // must do nothing (verified after close — stale-frame convention).
+    // feeds the filter instead (verified after close — stale-frame convention).
     tui.send(b"n");
-    tui.send(&[0x1b]); // Esc closes
+    tui.wait_for_text("no matches");
+    tui.send(&[0x1b]); // Esc clears the filter…
+    tui.wait_for_text("Files (2)"); // (also keeps the two Escs from coalescing)
+    tui.send(&[0x1b]); // …and the second closes the modal
     tui.wait_for_gone("Files (2)");
     tui.wait_for_text(FOOTER_PROJECTS);
     assert!(

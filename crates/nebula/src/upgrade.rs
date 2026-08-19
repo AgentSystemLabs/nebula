@@ -11,11 +11,17 @@ use std::process::Command;
 const INSTALL_URL: &str =
     "https://raw.githubusercontent.com/AgentSystemLabs/nebula/main/install.sh";
 
-pub fn run_upgrade(force: bool) -> Result<()> {
-    let url = std::env::var("NEBULA_INSTALL_URL")
+/// The published install script, with `NEBULA_INSTALL_URL` as the override
+/// hook (tests point it at a file:// URL). Shared with `nebula ssh`.
+pub(crate) fn install_url() -> String {
+    std::env::var("NEBULA_INSTALL_URL")
         .ok()
         .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| INSTALL_URL.to_string());
+        .unwrap_or_else(|| INSTALL_URL.to_string())
+}
+
+pub fn run_upgrade(force: bool) -> Result<()> {
+    let url = install_url();
     // The runtime dir is already the 0700 auth boundary; staging the script
     // there keeps it out of a world-writable /tmp before we execute it.
     nebula_daemon::lifecycle::ensure_runtime_dir()?;

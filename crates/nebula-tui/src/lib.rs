@@ -1,6 +1,8 @@
 pub mod app;
 pub mod completion;
+pub mod config;
 pub mod event_loop;
+pub mod fuzzy;
 pub mod git_diff;
 pub mod ipc;
 pub mod keys;

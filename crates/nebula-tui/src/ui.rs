@@ -1,13 +1,13 @@
 //! View layer: draws the three panels + terminal pane + footer, and records
 //! hit regions for mouse interaction.
 
-use crate::app::{App, ConnState, Focus, HitTarget, Overlay, ProjectRow};
+use crate::app::{App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, ProjectRow};
 use crate::git_diff::{classify_diff_line, DiffLineKind};
 use nebula_core::{Agent, AgentStatus, SessionRef};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -77,17 +77,22 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             .max(title_width + 2)
             .min(f.area().width as usize) as u16;
             let height = menu.items.len() as u16 + 2;
-            let x = menu.at.0.min(f.area().width.saturating_sub(width));
-            let y = if menu.at.1 + height > f.area().height {
-                menu.at.1.saturating_sub(height)
-            } else {
-                menu.at.1
-            };
-            let area = Rect {
-                x,
-                y,
-                width,
-                height: height.min(f.area().height),
+            let area = match menu.at {
+                Some((ax, ay)) => {
+                    let x = ax.min(f.area().width.saturating_sub(width));
+                    let y = if ay + height > f.area().height {
+                        ay.saturating_sub(height)
+                    } else {
+                        ay
+                    };
+                    Rect {
+                        x,
+                        y,
+                        width,
+                        height: height.min(f.area().height),
+                    }
+                }
+                None => centered_rect(f.area(), width, height),
             };
             f.render_widget(Clear, area);
             let mut block = Block::default()
@@ -218,7 +223,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Paragraph::new(lines), inner);
         }
         Overlay::Help => {
-            let area = centered_rect(f.area(), 60, 25);
+            let area = centered_rect(f.area(), 60, 28);
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -230,19 +235,29 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             let lines: Vec<Line> = [
                 ("Tab / Shift+Tab", "cycle focus between panels"),
                 ("h/l or ←/→", "move focus left / right (Ctrl+←/→ too)"),
-                ("j/k or ↓/↑", "move selection"),
-                ("Enter", "drill in / attach; terminal pane: lock input"),
+                (
+                    "j/k or ↓/↑",
+                    "move selection (session rows preview in the pane)",
+                ),
+                ("Enter", "drill in; sessions/terminal pane: lock input"),
                 ("n", "new project / worktree / agent (per panel)"),
                 ("Shift+J/K", "move project up / down (⇧↑/↓ where supported)"),
                 ("-", "divider below project / remove selected divider"),
                 ("Enter or r", "on a divider: edit its label"),
                 ("r", "rename (sessions panel)"),
+                ("p", "pin / unpin agent (or double-click its row)"),
                 ("a", "archive agent"),
                 ("u", "unarchive agent"),
                 ("d / ⌫", "delete (confirms first)"),
                 ("A", "toggle archived agents"),
                 ("m / right-click", "context menu"),
                 ("g", "git diff of the selected worktree"),
+                ("/", "fuzzy search projects / worktrees / sessions"),
+                ("s", "settings (toggles write to config.json)"),
+                (
+                    "Ctrl+o / Ctrl+f",
+                    "search pick: open session / focus its row",
+                ),
                 ("Ctrl+q", "terminal input → back to panels (also Ctrl+])"),
                 ("drag", "select terminal text → copies to clipboard"),
                 ("double-click", "select the word under the cursor"),
@@ -261,37 +276,131 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             .collect();
             f.render_widget(Paragraph::new(lines), inner);
         }
+        Overlay::Settings(view) => {
+            let cfg = crate::config::Config::load();
+            let n = crate::config::SETTINGS.len();
+            // 2 rows per setting (label + hint), then blank + hints + path.
+            let height = (n * 2 + 5) as u16;
+            let area = centered_rect(f.area(), 64, height);
+            f.render_widget(Clear, area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(Span::styled(
+                    " Settings ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            let dim = Style::default().fg(Color::DarkGray);
+            let mut lines: Vec<Line> = Vec::new();
+            for (i, spec) in crate::config::SETTINGS.iter().enumerate() {
+                let value = cfg.value_label(spec.kind);
+                let mut label_style = Style::default();
+                let mut value_style = Style::default().fg(Color::Cyan);
+                if i == view.selected {
+                    label_style = label_style.add_modifier(Modifier::REVERSED);
+                    value_style = value_style.add_modifier(Modifier::REVERSED);
+                }
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {:<28}", spec.label), label_style),
+                    Span::styled(format!("[{value}]"), value_style),
+                ]));
+                lines.push(Line::from(Span::styled(format!("   {}", spec.hint), dim)));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Enter/Space: toggle   h/l: cycle   Esc: close",
+                dim,
+            )));
+            let path = nebula_core::paths::config_path();
+            lines.push(Line::from(Span::styled(
+                truncate(&path.display().to_string(), inner.width as usize),
+                dim,
+            )));
+            f.render_widget(Paragraph::new(lines), inner);
+            if let Some(Overlay::Settings(v)) = &mut app.overlay {
+                v.area = area;
+            }
+        }
         Overlay::Diff(view) => {
             let area = centered_rect_pct(f.area(), 92, 90);
             f.render_widget(Clear, area);
+            // Cap first, floor second: on a tiny screen the file list keeps
+            // its minimum and Min(20) squeezes the diff pane instead.
+            let files_w = view
+                .files_width
+                .min(area.width.saturating_sub(crate::app::MIN_DIFF_PANE_W))
+                .max(crate::app::MIN_DIFF_FILES_W);
             let [files_a, diff_a] =
-                Layout::horizontal([Constraint::Length(34), Constraint::Min(20)]).areas(area);
+                Layout::horizontal([Constraint::Length(files_w), Constraint::Min(20)]).areas(area);
 
             // Left: changed-file list; a stateless follow-window keeps the
             // selected row visible.
-            let files_title = format!("Files ({})", view.files.len());
+            let files_title = if view.filter.is_empty() {
+                format!("Files ({})", view.files.len())
+            } else {
+                format!("Files ({}/{})", view.matches.len(), view.files.len())
+            };
             let block = panel_block(&files_title, true);
             let files_inner = block.inner(files_a);
             f.render_widget(block, files_a);
-            let start = (view.selected + 1).saturating_sub(files_inner.height as usize);
-            for (row, (i, file)) in view.files.iter().enumerate().skip(start).enumerate() {
-                let Some(row_area) = row_rect(files_inner, row) else {
+
+            // First row: the always-on fuzzy filter input.
+            if let Some(filter_area) = row_rect(files_inner, 0) {
+                let line = if view.filter.is_empty() {
+                    Line::from(Span::styled(
+                        "type to filter…",
+                        Style::default().fg(Color::DarkGray),
+                    ))
+                } else {
+                    Line::from(vec![
+                        Span::raw(view.filter.clone()),
+                        Span::styled("█", Style::default().fg(Color::Cyan)),
+                    ])
+                };
+                f.render_widget(Paragraph::new(line), filter_area);
+            }
+            let list_inner = Rect {
+                y: files_inner.y + 1,
+                height: files_inner.height.saturating_sub(1),
+                ..files_inner
+            };
+
+            if view.matches.is_empty() {
+                if let Some(row_area) = row_rect(list_inner, 0) {
+                    f.render_widget(
+                        Paragraph::new(Span::styled(
+                            "no matches",
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                        row_area,
+                    );
+                }
+            }
+            let start = view.window_start(list_inner.height as usize);
+            for (row, (i, m)) in view.matches.iter().enumerate().skip(start).enumerate() {
+                let Some(row_area) = row_rect(list_inner, row) else {
                     break;
                 };
+                let file = &view.files[m.file];
                 let status_color = match (file.xy[0], file.xy[1]) {
                     ('?', '?') | ('A', _) => Color::Green,
                     ('D', _) | (_, 'D') => Color::Red,
                     ('R', _) | ('C', _) => Color::Cyan,
                     _ => Color::Yellow,
                 };
-                let budget = (files_inner.width as usize).saturating_sub(3);
+                let budget = (list_inner.width as usize).saturating_sub(3);
                 let mut spans = vec![Span::styled(
                     format!("{} ", file.status_str()),
                     Style::default().fg(status_color),
                 )];
                 let shown = truncate(&file.path, budget);
                 let used = shown.chars().count();
-                spans.push(Span::raw(shown));
+                spans.extend(fuzzy_highlight_spans(&shown, &m.positions));
                 if let Some(orig) = &file.orig_path {
                     let rest = budget.saturating_sub(used);
                     if rest > 3 {
@@ -305,11 +414,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
 
             // Right: the selected file's diff, scrolled.
-            let sel_path = view
-                .files
-                .get(view.selected)
-                .map(|d| d.path.as_str())
-                .unwrap_or("");
+            let sel_path = view.selected_file().map(|d| d.path.as_str()).unwrap_or("");
             let title = truncate(
                 &format!("{}: {}", view.branch, sel_path),
                 (diff_a.width as usize).saturating_sub(4),
@@ -349,6 +454,119 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if let Some(Overlay::Diff(v)) = &mut app.overlay {
                 v.view_height = diff_inner.height;
                 v.scroll = scroll;
+                v.list_area = list_inner;
+                v.area = area;
+                v.files_width = files_w;
+            }
+        }
+        Overlay::Palette(palette) => {
+            let area = centered_rect(f.area(), 64, 18);
+            f.render_widget(Clear, area);
+            let title = if palette.query.is_empty() {
+                " Jump to ".to_string()
+            } else {
+                format!(
+                    " Jump to ({}/{}) ",
+                    palette.matches.len(),
+                    palette.items.len()
+                )
+            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            // First row: the always-on fuzzy query input.
+            if let Some(query_area) = row_rect(inner, 0) {
+                let line = if palette.query.is_empty() {
+                    Line::from(Span::styled(
+                        "type to search…",
+                        Style::default().fg(Color::DarkGray),
+                    ))
+                } else {
+                    Line::from(vec![
+                        Span::raw(palette.query.clone()),
+                        Span::styled("█", Style::default().fg(Color::Cyan)),
+                    ])
+                };
+                f.render_widget(Paragraph::new(line), query_area);
+            }
+            let list_inner = Rect {
+                y: inner.y + 1,
+                height: inner.height.saturating_sub(1),
+                ..inner
+            };
+
+            if palette.matches.is_empty() {
+                if let Some(row_area) = row_rect(list_inner, 0) {
+                    f.render_widget(
+                        Paragraph::new(Span::styled(
+                            "no matches",
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                        row_area,
+                    );
+                }
+            }
+            let start = palette.window_start(list_inner.height as usize);
+            for (row, (i, m)) in palette.matches.iter().enumerate().skip(start).enumerate() {
+                let Some(row_area) = row_rect(list_inner, row) else {
+                    break;
+                };
+                let item = &palette.items[m.item];
+                // Kind indicator: badge emoji + a per-kind text color, so
+                // rows read at a glance; the cyan-bold match highlight
+                // stands out against all three.
+                let (badge, kind_color) = match &item.target {
+                    PaletteTarget::Project(_) => ("📁 ", None),
+                    PaletteTarget::Worktree(_) => ("🌳 ", Some(Color::Green)),
+                    PaletteTarget::Session(_) => ("🤖 ", Some(Color::Magenta)),
+                };
+                let base_fg = if item.archived {
+                    Some(Color::DarkGray)
+                } else {
+                    kind_color
+                };
+                let budget = (list_inner.width as usize).saturating_sub(4);
+                let shown = truncate(&item.text, budget);
+                // Truncation puts `…` at the last char of `shown`; a match
+                // landing on that index must not light the ellipsis.
+                let shown_len = shown.chars().count();
+                let positions = if shown_len < item.text.chars().count() {
+                    let keep = m
+                        .positions
+                        .iter()
+                        .take_while(|&&p| p + 1 < shown_len)
+                        .count();
+                    &m.positions[..keep]
+                } else {
+                    &m.positions[..]
+                };
+                let mut spans = vec![Span::raw(badge)];
+                let mut text_spans = fuzzy_highlight_spans(&shown, positions);
+                if let Some(fg) = base_fg {
+                    for s in &mut text_spans {
+                        if s.style.fg.is_none() {
+                            s.style.fg = Some(fg);
+                        }
+                    }
+                }
+                spans.extend(text_spans);
+                render_row(f, row_area, spans, i == palette.selected, true);
+            }
+
+            // Write-back (draw works on a clone): rects for mouse
+            // hit-testing.
+            if let Some(Overlay::Palette(p)) = &mut app.overlay {
+                p.area = area;
+                p.list_area = list_inner;
             }
         }
     }
@@ -370,25 +588,31 @@ fn centered_rect_pct(frame: Rect, pct_w: u16, pct_h: u16) -> Rect {
     centered_rect(frame, frame.width * pct_w / 100, frame.height * pct_h / 100)
 }
 
+/// Bordered panel frame. Focus has to be unmissable, so the focused panel
+/// differs in shape as well as color: a THICK border and a solid
+/// cyan-background title chip, versus a thin dim border and plain title.
 fn panel_block(title: &str, focused: bool) -> Block<'_> {
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(Span::styled(
-            format!(" {title} "),
-            if focused {
+    if focused {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Thick)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(Span::styled(
+                format!(" {title} "),
                 Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            },
-        ))
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                format!(" {title} "),
+                Style::default().fg(Color::Gray),
+            ))
+    }
 }
 
 fn status_dot(status: Option<AgentStatus>) -> Span<'static> {
@@ -438,7 +662,7 @@ fn render_row(f: &mut Frame, area: Rect, mut spans: Vec<Span>, selected: bool, f
 
 fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Projects;
-    let block = panel_block("Projects", focused);
+    let block = panel_block("📁 Projects", focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -520,7 +744,7 @@ fn divider_spans(label: &str, width: u16) -> Vec<Span<'static>> {
 
 fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Worktrees;
-    let block = panel_block("Worktrees", focused);
+    let block = panel_block("🌳 Worktrees", focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -587,12 +811,13 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Sessions;
-    let block = panel_block("Sessions", focused);
+    let block = panel_block("🤖 Sessions", focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let sessions = app.visible_sessions();
-    let (agent_count, archived_count) = app.session_group_counts();
+    let (pinned_count, recent_count, unpinned_count, archived_count) = app.session_group_counts();
+    let active_count = pinned_count + recent_count + unpinned_count;
     let dim = Style::default().fg(Color::DarkGray);
 
     let mut screen_row: usize = 0;
@@ -603,8 +828,43 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         }
     };
 
-    header(f, "AGENTS".into(), &mut screen_row);
-    for (i, row) in sessions.iter().enumerate().take(agent_count) {
+    // Group headers only appear once something is pinned or recent;
+    // otherwise the list stays flat with no group header.
+    let grouped = pinned_count > 0 || recent_count > 0;
+    if pinned_count > 0 {
+        header(f, "PINNED".into(), &mut screen_row);
+        for (i, row) in sessions.iter().enumerate().take(pinned_count) {
+            let Some(r) = row_rect(inner, screen_row) else {
+                break;
+            };
+            draw_session_row(f, app, r, i, row, focused, inner.width);
+            screen_row += 1;
+        }
+    }
+    if recent_count > 0 {
+        header(f, "RECENT".into(), &mut screen_row);
+        for (i, row) in sessions
+            .iter()
+            .enumerate()
+            .skip(pinned_count)
+            .take(recent_count)
+        {
+            let Some(r) = row_rect(inner, screen_row) else {
+                break;
+            };
+            draw_session_row(f, app, r, i, row, focused, inner.width);
+            screen_row += 1;
+        }
+    }
+    if grouped && unpinned_count > 0 {
+        header(f, "UNPINNED".into(), &mut screen_row);
+    }
+    for (i, row) in sessions
+        .iter()
+        .enumerate()
+        .skip(pinned_count + recent_count)
+        .take(unpinned_count)
+    {
         let Some(r) = row_rect(inner, screen_row) else {
             break;
         };
@@ -615,7 +875,7 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         header(f, "─".repeat(inner.width as usize), &mut screen_row);
         if app.show_archived {
             header(f, format!("ARCHIVED ({archived_count})"), &mut screen_row);
-            for (i, row) in sessions.iter().enumerate().skip(agent_count) {
+            for (i, row) in sessions.iter().enumerate().skip(active_count) {
                 let Some(r) = row_rect(inner, screen_row) else {
                     break;
                 };
@@ -810,7 +1070,17 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(flash.clone(), Style::default().fg(Color::Yellow))
     } else if matches!(&app.overlay, Some(Overlay::Diff(_))) {
         Span::styled(
-            "j/k: file  J/K: scroll  Ctrl+d/u: page  g/G: top/end  Esc: close",
+            "type: filter  ↑/↓: file  ⇧↑/↓: scroll  Ctrl+d/u: page  Home/End: top/end  Esc: clear/close",
+            Style::default().fg(Color::DarkGray),
+        )
+    } else if matches!(&app.overlay, Some(Overlay::Palette(_))) {
+        Span::styled(
+            "type: search  ↑/↓: move  Enter: open  Esc: clear/close",
+            Style::default().fg(Color::DarkGray),
+        )
+    } else if matches!(&app.overlay, Some(Overlay::Settings(_))) {
+        Span::styled(
+            "↑/↓: move  Enter/Space: toggle  h/l: cycle  Esc: close",
             Style::default().fg(Color::DarkGray),
         )
     } else if app.overlay.is_some() {
@@ -832,14 +1102,28 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 Some(ProjectRow::Divider(_)) => {
                     "Enter/r: label  d: delete divider  m: menu  ?: help"
                 }
-                _ => "n: add  d: remove  -: divider  ⇧J/K: move  m: menu  ?: help",
+                _ => "n: add  d: remove  -: divider  ⇧J/K: move  /: search  m: menu  ?: help",
             },
-            Focus::Worktrees => "n: new worktree  d: delete  m: menu  ?: help",
-            Focus::Sessions => "n: agent  r: rename  a: archive  d: del  m: menu  ?: help",
+            Focus::Worktrees => "n: new worktree  d: delete  /: search  m: menu  ?: help",
+            Focus::Sessions => {
+                "↵: focus  n: agent  r: rename  p: pin  a: archive  d: del  /: search  m: menu  ?: help"
+            }
         };
         Span::styled(text, Style::default().fg(Color::DarkGray))
     };
-    let mut spans = vec![conn, Span::raw("  │  ")];
+    let host_style = if app.is_remote {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let mut spans = vec![
+        Span::styled(truncate(&app.hostname, 24), host_style),
+        Span::raw("  │  "),
+        conn,
+        Span::raw("  │  "),
+    ];
     let crumbs = breadcrumb(app);
     if !crumbs.is_empty() {
         spans.extend(crumbs);
@@ -847,6 +1131,40 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     }
     spans.push(hints);
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Split a (possibly truncated) path into spans, lighting the chars the
+/// fuzzy filter matched. `positions` are ascending char indices into the
+/// untruncated path; anything cut off by truncation simply isn't lit.
+fn fuzzy_highlight_spans(shown: &str, positions: &[usize]) -> Vec<Span<'static>> {
+    if positions.is_empty() {
+        return vec![Span::raw(shown.to_string())];
+    }
+    let hl = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    let mut run = String::new();
+    let mut run_hl = false;
+    let push = |text: String, lit: bool, spans: &mut Vec<Span<'static>>| {
+        if !text.is_empty() {
+            spans.push(if lit {
+                Span::styled(text, hl)
+            } else {
+                Span::raw(text)
+            });
+        }
+    };
+    for (i, c) in shown.chars().enumerate() {
+        let lit = positions.binary_search(&i).is_ok();
+        if lit != run_hl {
+            push(std::mem::take(&mut run), run_hl, &mut spans);
+            run_hl = lit;
+        }
+        run.push(c);
+    }
+    push(run, run_hl, &mut spans);
+    spans
 }
 
 /// The i-th single-height row inside `inner`, or None when it overflows.

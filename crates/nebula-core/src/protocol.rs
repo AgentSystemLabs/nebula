@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -53,6 +53,9 @@ pub enum ClientRequest {
         req_id: u64,
         path: PathBuf,
         name: Option<String>,
+        /// Create `path` (and `git init` it, per config) when it doesn't
+        /// exist on disk. Set only after the user confirmed in the client.
+        create_missing: bool,
     },
     RemoveProject {
         req_id: u64,
@@ -97,10 +100,25 @@ pub enum ClientRequest {
         name: String,
         kind: AgentKind,
     },
+    /// Fire-and-forget: pre-spawn an agent CLI for this (worktree, kind) so
+    /// the next CreateAgent adopts an already-booted session. Sent the
+    /// moment the user picks the kind, before they type the name. No reply;
+    /// a missing CLI or failed spawn silently degrades to a cold spawn.
+    PrewarmAgent {
+        worktree: WorktreeId,
+        kind: AgentKind,
+    },
     RenameAgent {
         req_id: u64,
         id: AgentId,
         name: String,
+    },
+    /// Re-home the agent row under another worktree of the same project.
+    /// The live PTY is untouched; the next respawn uses the new path.
+    MoveAgent {
+        req_id: u64,
+        id: AgentId,
+        worktree: WorktreeId,
     },
     /// Kills the PTY, sets archived=1.
     ArchiveAgent {
@@ -110,6 +128,12 @@ pub enum ClientRequest {
     UnarchiveAgent {
         req_id: u64,
         id: AgentId,
+    },
+    /// Pin/unpin the agent in the sessions list (pure metadata; PTY untouched).
+    SetAgentPinned {
+        req_id: u64,
+        id: AgentId,
+        pinned: bool,
     },
     DeleteAgent {
         req_id: u64,
@@ -180,6 +204,9 @@ pub enum ServerEvent {
     StatusChanged {
         agent: AgentId,
         status: AgentStatus,
+        /// Epoch ms the change was stamped with (matches the persisted
+        /// `status_changed_at`, so clients regroup consistently).
+        changed_at: i64,
     },
 
     // -- PTY plane (only to clients attached to that session) --

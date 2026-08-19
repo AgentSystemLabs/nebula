@@ -27,12 +27,16 @@ impl TestEnv {
     }
 
     fn spawn_daemon(&self) -> std::process::Child {
+        self.spawn_daemon_with_agent_cmd("/bin/sh") // no real claude in tests
+    }
+
+    fn spawn_daemon_with_agent_cmd(&self, agent_cmd: &str) -> std::process::Child {
         std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
             .args(["daemon", "--foreground"])
             .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
             .env("NEBULA_DATA_DIR", self.tmp.path().join("data"))
             .env("SHELL", "/bin/sh")
-            .env("NEBULA_AGENT_CMD", "/bin/sh") // no real claude in tests
+            .env("NEBULA_AGENT_CMD", agent_cmd)
             .env("NEBULA_WORKTREE_SYNC_MS", "100") // fast external-worktree pickup
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -167,6 +171,7 @@ async fn full_crud_attach_and_restart_persistence() {
             req_id: 1,
             path: repo.clone(),
             name: None,
+            create_missing: false,
         },
     )
     .await
@@ -433,6 +438,7 @@ async fn kitty_keyboard_negotiation_passthrough() {
             req_id: 1,
             path: repo.clone(),
             name: None,
+            create_missing: false,
         },
     )
     .await
@@ -613,6 +619,7 @@ async fn hook_post_from_agent_pty_drives_status() {
             req_id: 1,
             path: repo.clone(),
             name: None,
+            create_missing: false,
         },
     )
     .await
@@ -704,7 +711,7 @@ async fn hook_post_from_agent_pty_drives_status() {
     .unwrap();
     read_events_until(&mut c, Duration::from_secs(10), |evs| {
         evs.iter().any(|e| {
-            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Running }
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Running, .. }
                 if *agent == agent_id)
         })
     })
@@ -726,7 +733,7 @@ async fn hook_post_from_agent_pty_drives_status() {
     .unwrap();
     read_events_until(&mut c, Duration::from_secs(10), |evs| {
         evs.iter().any(|e| {
-            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::NeedsFeedback }
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::NeedsFeedback, .. }
                 if *agent == agent_id)
         })
     })
@@ -754,7 +761,7 @@ async fn hook_post_from_agent_pty_drives_status() {
     .unwrap();
     let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
         evs.iter().any(|e| {
-            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Finished }
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Finished, .. }
                 if *agent == agent_id)
         })
     })
@@ -803,6 +810,167 @@ async fn hook_post_from_agent_pty_drives_status() {
     wait_for_exit(&mut daemon2);
 }
 
+/// cwd-based re-homing end to end: an agent created in the main checkout
+/// posts a hook whose payload reports a cwd inside another worktree of the
+/// same project (claude entered a worktree it created mid-conversation) —
+/// the daemon re-homes the agent row there and broadcasts the upsert.
+#[tokio::test]
+async fn hook_cwd_rehomes_agent_to_other_worktree() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: repo.clone(),
+            name: None,
+            create_missing: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| {
+            matches!(
+                e,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(_)
+                }
+            )
+        })
+    })
+    .await;
+    let main_worktree = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } => Some(w.clone()),
+            _ => None,
+        })
+        .unwrap();
+
+    // A second worktree — the one the agent will "enter".
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateWorktree {
+            req_id: 2,
+            project: main_worktree.project_id.clone(),
+            branch: "feat".into(),
+            base: None,
+        },
+    )
+    .await
+    .unwrap();
+    // The upsert broadcast and the Ack ride different channels — wait for
+    // the upsert itself.
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Worktree(w) }
+                if w.branch == "feat")
+        })
+    })
+    .await;
+    let feat_worktree = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } if w.branch == "feat" => Some(w.clone()),
+            _ => None,
+        })
+        .expect("feat worktree upsert");
+
+    // Agent lives in the main checkout.
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 3,
+            worktree: main_worktree.id.clone(),
+            name: "mover".into(),
+            kind: AgentKind::Claude,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 3).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 3).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+
+    // POST a hook from inside the agent PTY whose payload reports the feat
+    // worktree as cwd — exactly what claude sends after entering it.
+    let sref = SessionRef::Agent(agent_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 120,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    let body = format!(
+        r#"{{"session_id":"sess-1","cwd":"{}"}}"#,
+        feat_worktree.path.display()
+    );
+    let curl = format!(
+        "curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
+         -H 'Content-Type: application/json' -d '{body}' \
+         \"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=UserPromptSubmit\"\n"
+    );
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: curl.into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.worktree_id == feat_worktree.id)
+        })
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.worktree_id == feat_worktree.id)
+        }),
+        "agent re-homed to the worktree its hook cwd reported: {events:#?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// Codex mirror of the claude hook test: a codex-kind agent gets
 /// `.codex/hooks.json` installed, and posts to `/api/hooks/codex` drive the
 /// same status machine (PermissionRequest is codex's native waiting signal).
@@ -829,6 +997,7 @@ async fn codex_hooks_install_and_drive_status() {
             req_id: 1,
             path: repo.clone(),
             name: None,
+            create_missing: false,
         },
     )
     .await
@@ -927,7 +1096,7 @@ async fn codex_hooks_install_and_drive_status() {
     .unwrap();
     read_events_until(&mut c, Duration::from_secs(10), |evs| {
         evs.iter().any(|e| {
-            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Running }
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Running, .. }
                 if *agent == agent_id)
         })
     })
@@ -945,7 +1114,7 @@ async fn codex_hooks_install_and_drive_status() {
     .unwrap();
     read_events_until(&mut c, Duration::from_secs(10), |evs| {
         evs.iter().any(|e| {
-            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::NeedsFeedback }
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::NeedsFeedback, .. }
                 if *agent == agent_id)
         })
     })
@@ -963,7 +1132,7 @@ async fn codex_hooks_install_and_drive_status() {
     .unwrap();
     read_events_until(&mut c, Duration::from_secs(10), |evs| {
         evs.iter().any(|e| {
-            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Finished }
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Finished, .. }
                 if *agent == agent_id)
         })
     })
@@ -1015,6 +1184,7 @@ async fn external_worktrees_are_adopted_and_dropped() {
             req_id: 1,
             path: repo.clone(),
             name: None,
+            create_missing: false,
         },
     )
     .await
@@ -1144,6 +1314,7 @@ async fn upgrade_shuts_down_idle_daemon_but_spares_live_sessions() {
             req_id: 1,
             path: repo.clone(),
             name: None,
+            create_missing: false,
         },
     )
     .await
@@ -1267,6 +1438,326 @@ async fn upgrade_shuts_down_idle_daemon_but_spares_live_sessions() {
         stdout.contains("no live sessions"),
         "expected idle-shutdown note, got: {stdout}"
     );
+    wait_for_exit(&mut daemon);
+}
+
+/// AddProject with `create_missing` makes the directory and `git init`s it;
+/// with `git_init_on_create: false` in config.json the directory is still
+/// created but adding fails (not a git repository).
+#[tokio::test]
+async fn add_project_creates_missing_dir_and_inits() {
+    let env = TestEnv::new();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+
+    let new_dir = env.tmp.path().join("brand-new-project");
+    assert!(!new_dir.exists());
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: new_dir.clone(),
+            name: None,
+            create_missing: true,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 1).is_some()
+    })
+    .await;
+    assert!(
+        matches!(
+            find_ack(&events, 1),
+            Some(ServerEvent::Ack {
+                created: Some(EntityId::Project(_)),
+                ..
+            })
+        ),
+        "AddProject with create_missing failed: {events:#?}"
+    );
+    assert!(new_dir.join(".git").is_dir(), "git init ran in the new dir");
+
+    // Opt out of git init via config: the dir is created, the add errors.
+    std::fs::write(
+        env.tmp.path().join("data").join("config.json"),
+        r#"{"git_init_on_create": false}"#,
+    )
+    .unwrap();
+    let bare_dir = env.tmp.path().join("bare-new-project");
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 2,
+            path: bare_dir.clone(),
+            name: None,
+            create_missing: true,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&events, 2), Some(ServerEvent::Error { .. })),
+        "expected not-a-git-repo error: {events:#?}"
+    );
+    assert!(bare_dir.is_dir(), "dir created even without git init");
+    assert!(!bare_dir.join(".git").exists(), "git init skipped");
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// Subscribe + AddProject boilerplate; returns the main worktree row.
+async fn add_project_get_main_worktree(
+    c: &mut UnixStream,
+    repo: &Path,
+) -> nebula_core::Worktree {
+    write_frame(c, &ClientRequest::Subscribe).await.unwrap();
+    read_events_until(c, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+    write_frame(
+        c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: repo.to_path_buf(),
+            name: None,
+            create_missing: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 1).is_some()
+            && evs.iter().any(|e| {
+                matches!(
+                    e,
+                    ServerEvent::EntityUpserted {
+                        entity: Entity::Worktree(w)
+                    } if w.is_main
+                )
+            })
+    })
+    .await;
+    events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } if w.is_main => Some(w.clone()),
+            _ => None,
+        })
+        .expect("main worktree upsert")
+}
+
+/// PrewarmAgent boots the CLI while the user is "typing the name"; the
+/// following CreateAgent must adopt that already-running PTY (its slow boot
+/// output is already in scrollback) and replay the hooks it fired before the
+/// row existed (SessionStart → stored resume session id).
+#[tokio::test]
+async fn prewarmed_session_is_adopted_by_create_agent() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    // Stand-in agent CLI with a deliberately slow boot: posts SessionStart
+    // (like claude does), sleeps, prints a marker, then becomes a shell. If
+    // adoption works, the marker is in scrollback the moment we attach; a
+    // cold spawn at CreateAgent time couldn't print it for another 3s.
+    let script = env.tmp.path().join("slow-agent.sh");
+    std::fs::write(
+        &script,
+        concat!(
+            "#!/bin/sh\n",
+            "curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \\\n",
+            "  -H 'Content-Type: application/json' -d '{\"session_id\":\"warm-sid-99\"}' \\\n",
+            "  \"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=SessionStart\" \\\n",
+            "  >/dev/null 2>&1\n",
+            "sleep 3\n",
+            "echo PREWARM_READY\n",
+            "exec /bin/sh\n",
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    // Kind picked — warm the CLI. No reply expected.
+    write_frame(
+        &mut c,
+        &ClientRequest::PrewarmAgent {
+            worktree: worktree.id.clone(),
+            kind: AgentKind::Claude,
+        },
+    )
+    .await
+    .unwrap();
+    // "User types the name": long enough for the warm boot to finish.
+    tokio::time::sleep(Duration::from_millis(4500)).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: worktree.id.clone(),
+            name: "warm-agent".into(),
+            kind: AgentKind::Claude,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+
+    // Attach: the boot marker must already be there (window far shorter
+    // than the script's 3s boot, so a cold spawn cannot pass).
+    let sref = SessionRef::Agent(agent_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 100,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(2), |evs| {
+        String::from_utf8_lossy(&collected_output(evs)).contains("PREWARM_READY")
+    })
+    .await;
+    drop(events);
+
+    // The adopted PTY is interactive.
+    let marker = "adopted_marker_7731";
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: format!("echo {marker}\n").into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        String::from_utf8_lossy(&collected_output(evs))
+            .matches(marker)
+            .count()
+            >= 2
+    })
+    .await;
+
+    // The SessionStart the warm CLI posted before the row existed was
+    // buffered and replayed: the agent row carries the resume session id.
+    let mut c2 = connect(&env.sock()).await;
+    handshake(&mut c2).await;
+    write_frame(&mut c2, &ClientRequest::Subscribe).await.unwrap();
+    let events = read_events_until(&mut c2, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+    let ServerEvent::Snapshot { agents, .. } = &events[0] else {
+        panic!("expected snapshot");
+    };
+    let agent = agents.iter().find(|a| a.id == agent_id).expect("agent row");
+    assert_eq!(agent.name, "warm-agent");
+    assert!(agent.alive, "adopted session is live");
+    assert_eq!(
+        agent.session_id.as_deref(),
+        Some("warm-sid-99"),
+        "buffered SessionStart replayed at adoption"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// A prewarmed CLI that dies immediately (the "claude/codex not installed"
+/// shape) must not poison creation: CreateAgent quietly falls back to a
+/// fresh spawn and still succeeds.
+#[tokio::test]
+async fn dead_prewarm_falls_back_to_cold_spawn() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let script = env.tmp.path().join("dying-agent.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 127\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::PrewarmAgent {
+            worktree: worktree.id.clone(),
+            kind: AgentKind::Claude,
+        },
+    )
+    .await
+    .unwrap();
+    // Give the warm spawn time to die.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: worktree.id.clone(),
+            name: "fallback-agent".into(),
+            kind: AgentKind::Claude,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    assert!(
+        matches!(
+            find_ack(&events, 2),
+            Some(ServerEvent::Ack {
+                created: Some(EntityId::Agent(_)),
+                ..
+            })
+        ),
+        "CreateAgent must survive a dead prewarm: {events:#?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
 }
 

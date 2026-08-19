@@ -187,7 +187,7 @@ pub fn diff_for(root: &Path, file: &DiffFile, head_ok: bool) -> String {
 
 /// Reload `view.diff` for the currently selected file and reset the scroll.
 pub fn load_selected_diff(view: &mut DiffView) {
-    let diff = match view.files.get(view.selected) {
+    let diff = match view.selected_file() {
         Some(file) => diff_for(&view.root, file, view.head_ok),
         None => String::new(),
     };

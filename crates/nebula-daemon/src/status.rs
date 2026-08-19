@@ -38,7 +38,7 @@ pub enum HookEvent {
 
 impl HookEvent {
     /// Events that (re)establish which Claude session id owns this agent.
-    fn captures_session(&self) -> bool {
+    pub fn captures_session(&self) -> bool {
         matches!(self, HookEvent::UserPromptSubmit | HookEvent::SessionStart { .. })
     }
 }

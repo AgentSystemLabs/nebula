@@ -26,7 +26,19 @@ pub struct HookEnv {
 
 pub struct HookServerState {
     token: String,
-    tx: mpsc::Sender<(AgentId, HookEvent, Option<String>)>,
+    tx: mpsc::Sender<HookDelivery>,
+}
+
+/// One accepted hook POST, decoded for the daemon's drain loop.
+#[derive(Debug)]
+pub struct HookDelivery {
+    pub agent_id: AgentId,
+    pub event: HookEvent,
+    pub session_id: Option<String>,
+    /// The CLI's working directory as reported in the payload (Claude Code
+    /// sends it on every event); drives cwd-based agent re-homing. Absent
+    /// when the CLI doesn't report it — re-homing simply never triggers.
+    pub cwd: Option<String>,
 }
 
 /// Permissive payload: every field optional, unknown fields ignored. Hook
@@ -42,6 +54,7 @@ pub struct HookPayload {
     pub agent_id: Option<String>,
     pub source: Option<String>,
     pub exit_code: Option<i32>,
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,10 +94,7 @@ pub fn parse_event(hook_event: &str, payload: &HookPayload) -> Option<HookEvent>
 
 /// Bind 127.0.0.1:0 and serve the hook route. Returns the env (port + fresh
 /// bearer token) and the receiving end of the event pipe.
-pub async fn start_hook_server() -> anyhow::Result<(
-    HookEnv,
-    mpsc::Receiver<(AgentId, HookEvent, Option<String>)>,
-)> {
+pub async fn start_hook_server() -> anyhow::Result<(HookEnv, mpsc::Receiver<HookDelivery>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let token = generate_token();
@@ -116,6 +126,24 @@ fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_parses_cwd_and_tolerates_unknown_fields() {
+        let payload: HookPayload = serde_json::from_str(
+            r#"{"session_id":"s1","cwd":"/w/feat","transcript_path":"/x.jsonl","novel":1}"#,
+        )
+        .unwrap();
+        assert_eq!(payload.cwd.as_deref(), Some("/w/feat"));
+        assert_eq!(payload.session_id.as_deref(), Some("s1"));
+        // Absent cwd stays None (codex/cursor payloads may not send it).
+        let payload: HookPayload = serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
+        assert!(payload.cwd.is_none());
+    }
+}
+
 async fn receive_hook(
     State(state): State<Arc<HookServerState>>,
     Query(query): Query<HookQuery>,
@@ -142,6 +170,14 @@ async fn receive_hook(
     };
     let agent_id = AgentId(query.agent_id);
     tracing::debug!(agent = %agent_id, event = ?event, "hook received");
-    let _ = state.tx.send((agent_id, event, payload.session_id)).await;
+    let _ = state
+        .tx
+        .send(HookDelivery {
+            agent_id,
+            event,
+            session_id: payload.session_id,
+            cwd: payload.cwd,
+        })
+        .await;
     (StatusCode::OK, Json(serde_json::json!({"ok": true})))
 }

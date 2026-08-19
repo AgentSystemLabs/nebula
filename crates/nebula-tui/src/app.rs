@@ -8,6 +8,14 @@ use ratatui::layout::Rect;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Wall-clock epoch ms, comparable to the daemon's `status_changed_at`.
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Projects,
@@ -38,6 +46,13 @@ pub const MIN_PANEL_W: u16 = 10;
 /// The terminal pane always keeps at least this much width.
 pub const MIN_TERM_W: u16 = 20;
 
+/// Default outer width of the diff modal's file-list panel.
+pub const DEFAULT_DIFF_FILES_W: u16 = 34;
+/// The diff modal's file list can't be dragged narrower than this.
+pub const MIN_DIFF_FILES_W: u16 = 16;
+/// The diff pane always keeps at least this much width.
+pub const MIN_DIFF_PANE_W: u16 = 24;
+
 // ---- overlays ----
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,8 +60,13 @@ pub enum MenuAction {
     Attach(SessionRef),
     RestartAgent(AgentId),
     RenameAgent(AgentId),
+    /// Opens the destination-worktree picker for this agent.
+    MoveAgent(AgentId),
+    /// Picker result: re-home the agent under this worktree.
+    MoveAgentToWorktree(AgentId, WorktreeId),
     ArchiveAgent(AgentId),
     UnarchiveAgent(AgentId),
+    SetAgentPinned(AgentId, bool),
     DeleteAgent(AgentId),
     NewAgent(WorktreeId),
     /// Picker result: create an agent of this kind (chains into the name prompt).
@@ -72,7 +92,9 @@ pub struct ContextMenu {
     /// Optional title rendered in the border (used by picker-style menus).
     pub title: Option<String>,
     pub items: Vec<MenuItem>,
-    pub at: (u16, u16),
+    /// Anchor position for context menus; `None` centers the menu in the
+    /// frame (used by picker-style menus opened from the keyboard).
+    pub at: Option<(u16, u16)>,
     pub hover: usize,
     /// Set during draw for click hit-testing.
     pub area: Rect,
@@ -81,6 +103,9 @@ pub struct ContextMenu {
 /// Destructive action waiting behind a confirmation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PendingAction {
+    /// AddProject aimed at a path that doesn't exist yet: create the
+    /// directory (daemon-side, `git init` per its config) and add it.
+    CreateProjectDir(std::path::PathBuf),
     ArchiveAgent(AgentId),
     DeleteAgent(AgentId),
     DeleteWorktree(WorktreeId),
@@ -131,6 +156,14 @@ impl PromptDialog {
     }
 }
 
+/// One visible row of the diff-view file list: an index into `files` plus
+/// the char positions of `path` the filter matched, for highlighting.
+#[derive(Debug, Clone)]
+pub struct DiffMatch {
+    pub file: usize,
+    pub positions: Vec<usize>,
+}
+
 /// Full-screen git-diff viewer: file list left, scrollable diff right.
 #[derive(Debug, Clone)]
 pub struct DiffView {
@@ -139,7 +172,12 @@ pub struct DiffView {
     /// Branch name for the pane title.
     pub branch: String,
     pub files: Vec<DiffFile>,
-    /// Index into `files`.
+    /// Type-to-filter query over `files` paths; always live.
+    pub filter: String,
+    /// Visible rows: `files` narrowed by `filter`, best matches first
+    /// (git order when the filter is empty).
+    pub matches: Vec<DiffMatch>,
+    /// Index into `matches` (not `files`).
     pub selected: usize,
     /// Diff text of the selected file (reloaded on selection change).
     pub diff: String,
@@ -150,13 +188,63 @@ pub struct DiffView {
     /// Inner height of the diff pane, written back during draw (the
     /// `ContextMenu::area` pattern) so paging and clamping track resizes.
     pub view_height: u16,
+    /// Screen rect of the file-list rows (filter row excluded), written back
+    /// during draw so clicks can hit-test rows.
+    pub list_area: Rect,
+    /// Full modal rect, written back during draw; bounds the file-panel
+    /// splitter drag and hit-tests its border.
+    pub area: Rect,
+    /// Outer width of the file-list panel; drag the panel border to resize.
+    pub files_width: u16,
+    /// In-progress drag of the files/diff border: `boundary_x - grab column`
+    /// at mouse-down (the `SplitterDrag::grab_offset` pattern).
+    pub files_drag: Option<i32>,
     /// Whether the repo has a commit; picks the diff command.
     pub head_ok: bool,
 }
 
 impl DiffView {
+    pub fn new(root: PathBuf, branch: String, files: Vec<DiffFile>, head_ok: bool) -> Self {
+        let mut view = Self {
+            root,
+            branch,
+            files,
+            filter: String::new(),
+            matches: Vec::new(),
+            selected: 0,
+            diff: String::new(),
+            diff_line_count: 0,
+            scroll: 0,
+            view_height: 0,
+            list_area: Rect::default(),
+            area: Rect::default(),
+            files_width: DEFAULT_DIFF_FILES_W,
+            files_drag: None,
+            head_ok,
+        };
+        view.apply_filter();
+        view
+    }
+
     pub fn max_scroll(&self) -> u16 {
         (self.diff_line_count as u16).saturating_sub(self.view_height.max(1))
+    }
+
+    /// Screen x of the files/diff boundary — the column where the diff panel
+    /// starts.
+    pub fn splitter_x(&self) -> u16 {
+        self.area.x + self.files_width
+    }
+
+    /// Move the files/diff boundary to `boundary_x`, clamped so the file list
+    /// keeps `MIN_DIFF_FILES_W` and the diff pane keeps `MIN_DIFF_PANE_W`.
+    pub fn set_files_width(&mut self, boundary_x: i32) {
+        let max = self.area.width.saturating_sub(MIN_DIFF_PANE_W);
+        if max < MIN_DIFF_FILES_W {
+            return; // modal too small to honor the minimums
+        }
+        let want = (boundary_x - self.area.x as i32).max(0) as u16;
+        self.files_width = want.clamp(MIN_DIFF_FILES_W, max);
     }
 
     /// Clamped relative scroll.
@@ -164,14 +252,207 @@ impl DiffView {
         self.scroll = (self.scroll as i32 + delta).clamp(0, self.max_scroll() as i32) as u16;
     }
 
-    /// Clamped absolute file selection; true when it changed (the caller
-    /// reloads the diff).
+    /// Clamped absolute selection in the filtered list; true when it changed
+    /// (the caller reloads the diff).
     pub fn select(&mut self, index: i64) -> bool {
-        let max = self.files.len().saturating_sub(1) as i64;
+        let max = self.matches.len().saturating_sub(1) as i64;
         let clamped = index.clamp(0, max) as usize;
         let changed = clamped != self.selected;
         self.selected = clamped;
         changed
+    }
+
+    /// The file behind the current selection, if any row is visible.
+    pub fn selected_file(&self) -> Option<&DiffFile> {
+        self.files.get(self.matches.get(self.selected)?.file)
+    }
+
+    /// First visible row of the file list's stateless follow-window for a
+    /// list of `height` rows.
+    pub fn window_start(&self, height: usize) -> usize {
+        (self.selected + 1).saturating_sub(height)
+    }
+
+    /// Recompute `matches` from `filter` and reset the selection to the top
+    /// row; true when the selected file changed (the caller reloads the
+    /// diff). Best matches first, git order when the filter is empty.
+    pub fn apply_filter(&mut self) -> bool {
+        let before = self.matches.get(self.selected).map(|m| m.file);
+        self.matches = crate::fuzzy::rank(&self.filter, self.files.iter().map(|f| f.path.as_str()))
+            .into_iter()
+            .map(|(file, positions)| DiffMatch { file, positions })
+            .collect();
+        self.selected = 0;
+        before != self.matches.first().map(|m| m.file)
+    }
+}
+
+/// What a `/` palette row jumps to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaletteTarget {
+    Project(ProjectId),
+    Worktree(WorktreeId),
+    Session(AgentId),
+}
+
+/// One searchable row of the `/` palette. `text` is both the string the
+/// fuzzy filter runs over and the string rendered after the kind badge, so
+/// match highlighting always lines up: `name` for projects,
+/// `project/branch` for worktrees, `project/branch/name` for sessions —
+/// letting a query narrow by parent context.
+#[derive(Debug, Clone)]
+pub struct PaletteItem {
+    pub target: PaletteTarget,
+    pub text: String,
+    pub archived: bool,
+}
+
+/// One visible palette row: an index into `items` plus the char positions of
+/// `text` the query matched, for highlighting.
+#[derive(Debug, Clone)]
+pub struct PaletteMatch {
+    pub item: usize,
+    pub positions: Vec<usize>,
+}
+
+/// Fuzzy-search palette over every project, worktree, and session (`/`).
+#[derive(Debug, Clone)]
+pub struct Palette {
+    pub items: Vec<PaletteItem>,
+    /// Type-to-filter query over `items` texts; always live.
+    pub query: String,
+    /// Visible rows: `items` narrowed by `query`, best matches first (build
+    /// order when the query is empty).
+    pub matches: Vec<PaletteMatch>,
+    /// Index into `matches` (not `items`).
+    pub selected: usize,
+    /// Whether Enter (and a click) on a session row attaches to it, or only
+    /// lands on its Sessions-panel row. Snapshot of the config setting at
+    /// open time; Ctrl+O / Ctrl+F pick explicitly either way.
+    pub enter_attaches: bool,
+    /// Whole modal rect, written back during draw so clicks outside close.
+    pub area: Rect,
+    /// Screen rect of the result rows (query row excluded), written back
+    /// during draw so clicks can hit-test rows.
+    pub list_area: Rect,
+}
+
+impl Palette {
+    pub fn new(tree: &Tree, show_archived: bool, enter_attaches: bool) -> Self {
+        let mut palette = Self {
+            items: build_palette_items(tree, show_archived),
+            query: String::new(),
+            matches: Vec::new(),
+            selected: 0,
+            enter_attaches,
+            area: Rect::default(),
+            list_area: Rect::default(),
+        };
+        palette.apply_filter();
+        palette
+    }
+
+    /// Re-derive `items` after the tree changed under an open palette,
+    /// keeping the query — and the cursor: agent status flips arrive as
+    /// upserts every few seconds, and a rebuild must not yank the user's
+    /// ↑/↓ position to the top. The selection follows its target's row;
+    /// only a vanished target falls back to the best match.
+    pub fn rebuild(&mut self, tree: &Tree, show_archived: bool) {
+        let keep = self.selected_target().cloned();
+        self.items = build_palette_items(tree, show_archived);
+        self.apply_filter();
+        if let Some(target) = keep {
+            if let Some(row) = self
+                .matches
+                .iter()
+                .position(|m| self.items[m.item].target == target)
+            {
+                self.selected = row;
+            }
+        }
+    }
+
+    /// First visible row of the result list's stateless follow-window for a
+    /// list of `height` rows.
+    pub fn window_start(&self, height: usize) -> usize {
+        (self.selected + 1).saturating_sub(height)
+    }
+
+    /// Clamped absolute selection in the filtered list.
+    pub fn select(&mut self, index: i64) {
+        let max = self.matches.len().saturating_sub(1) as i64;
+        self.selected = index.clamp(0, max) as usize;
+    }
+
+    /// The jump target behind the current selection, if any row is visible.
+    pub fn selected_target(&self) -> Option<&PaletteTarget> {
+        Some(
+            &self
+                .items
+                .get(self.matches.get(self.selected)?.item)?
+                .target,
+        )
+    }
+
+    /// Recompute `matches` from `query` and reset the selection to the top
+    /// row. Best matches first, build order when the query is empty.
+    pub fn apply_filter(&mut self) {
+        self.matches = crate::fuzzy::rank(&self.query, self.items.iter().map(|i| i.text.as_str()))
+            .into_iter()
+            .map(|(item, positions)| PaletteMatch { item, positions })
+            .collect();
+        self.selected = 0;
+    }
+}
+
+/// Every jumpable entity: projects in tree order, then each project's
+/// worktrees, then each worktree's sessions. Archived sessions appear only
+/// when the archived toggle is on (the Sessions panel rule).
+fn build_palette_items(tree: &Tree, show_archived: bool) -> Vec<PaletteItem> {
+    let mut items = Vec::new();
+    for p in &tree.projects {
+        items.push(PaletteItem {
+            target: PaletteTarget::Project(p.id.clone()),
+            text: p.name.clone(),
+            archived: false,
+        });
+    }
+    for p in &tree.projects {
+        for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
+            items.push(PaletteItem {
+                target: PaletteTarget::Worktree(w.id.clone()),
+                text: format!("{}/{}", p.name, w.branch),
+                archived: false,
+            });
+        }
+    }
+    for p in &tree.projects {
+        for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
+            for a in tree.agents.iter().filter(|a| a.worktree_id == w.id) {
+                if a.archived && !show_archived {
+                    continue;
+                }
+                items.push(PaletteItem {
+                    target: PaletteTarget::Session(a.id.clone()),
+                    text: format!("{}/{}/{}", p.name, w.branch, a.name),
+                    archived: a.archived,
+                });
+            }
+        }
+    }
+    items
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SettingsView {
+    pub selected: usize,
+    /// Set during draw for click hit-testing.
+    pub area: Rect,
+}
+
+impl SettingsView {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -181,7 +462,9 @@ pub enum Overlay {
     Confirm(ConfirmDialog),
     Prompt(PromptDialog),
     Help,
+    Settings(SettingsView),
     Diff(DiffView),
+    Palette(Palette),
 }
 
 /// Rows optimistically removed for an in-flight DeleteWorktree, kept so an
@@ -316,6 +599,9 @@ pub struct UiState {
     /// Panel widths (projects, worktrees, sessions); absent in older blobs.
     #[serde(default)]
     pub panel_widths: Option<[u16; 3]>,
+    /// Diff modal file-list width; absent in older blobs.
+    #[serde(default)]
+    pub diff_files_width: Option<u16>,
 }
 
 /// A mouse selection over the terminal pane (drag or double-click word), in
@@ -406,17 +692,34 @@ pub struct App {
     /// Last left-click on the terminal pane (time + pane-relative cell), for
     /// double-click detection.
     pub last_term_click: Option<(std::time::Instant, (u16, u16))>,
+    /// Last left-click on a session row (time + agent), for double-click
+    /// pin/unpin detection.
+    pub last_session_click: Option<(std::time::Instant, AgentId)>,
     /// URLs detected on the visible screen during the last draw; hit-tested
     /// on ⌥click and underlined by the renderer.
     pub term_links: Vec<crate::links::TermLink>,
     /// Widths of the Projects / Worktrees / Sessions panels; the terminal
     /// pane takes the remainder.
     pub panel_widths: [u16; 3],
+    /// File-list width of the diff modal, remembered across opens.
+    pub diff_files_width: u16,
     /// In-progress splitter drag, if any.
     pub splitter_drag: Option<SplitterDrag>,
     /// Body rect (everything above the footer) from the last draw; bounds
     /// splitter drags.
     pub body_area: Rect,
+    /// Short machine hostname, shown at the far left of the footer.
+    pub hostname: String,
+    /// Running inside an ssh session (SSH_CONNECTION/SSH_TTY) — the footer
+    /// colors the hostname as a remote warning.
+    pub is_remote: bool,
+    /// Unpinned sessions whose status changed within this window sort into
+    /// a RECENT group (below PINNED). 0 disables the group. From config
+    /// (`recent_window`); the event loop refreshes it.
+    pub recent_window_ms: i64,
+    /// Session under the cursor as of the last draw, so the RECENT-expiry
+    /// tick can re-anchor `sel_session` after rows regroup underneath it.
+    pub drawn_session: Option<AgentId>,
 }
 
 impl Default for App {
@@ -453,10 +756,16 @@ impl App {
             last_session_for_worktree: HashMap::new(),
             term_selection: None,
             last_term_click: None,
+            last_session_click: None,
             term_links: Vec::new(),
             panel_widths: DEFAULT_PANEL_WIDTHS,
+            diff_files_width: DEFAULT_DIFF_FILES_W,
             splitter_drag: None,
             body_area: Rect::default(),
+            hostname: nebula_core::host::hostname(),
+            is_remote: nebula_core::host::is_remote_session(),
+            recent_window_ms: crate::config::DEFAULT_RECENT_WINDOW_MS,
+            drawn_session: None,
         }
     }
 
@@ -567,8 +876,20 @@ impl App {
             .collect()
     }
 
-    /// Session rows for the selected worktree: active agents, then (when
-    /// shown) archived agents.
+    /// An unpinned, unarchived agent whose status changed within the
+    /// configured window sorts into the RECENT group. Pinned agents never
+    /// join it — PINNED always stays on top.
+    pub fn is_recent(&self, a: &Agent) -> bool {
+        !a.pinned
+            && !a.archived
+            && self.recent_window_ms > 0
+            && a.status_changed_at > 0
+            && now_ms().saturating_sub(a.status_changed_at) < self.recent_window_ms
+    }
+
+    /// Session rows for the selected worktree: pinned agents, then RECENT
+    /// (status changed within the window), then the remaining unpinned,
+    /// then (when shown) archived agents.
     pub fn visible_sessions(&self) -> Vec<Agent> {
         let worktrees = self.visible_worktrees();
         let Some(wt) = worktrees.get(self.sel_worktree) else {
@@ -578,9 +899,25 @@ impl App {
             .tree
             .agents
             .iter()
-            .filter(|a| a.worktree_id == wt.id && !a.archived)
+            .filter(|a| a.worktree_id == wt.id && !a.archived && a.pinned)
             .cloned()
             .collect();
+        rows.extend(
+            self.tree
+                .agents
+                .iter()
+                .filter(|a| a.worktree_id == wt.id && self.is_recent(a))
+                .cloned(),
+        );
+        rows.extend(
+            self.tree
+                .agents
+                .iter()
+                .filter(|a| {
+                    a.worktree_id == wt.id && !a.archived && !a.pinned && !self.is_recent(a)
+                })
+                .cloned(),
+        );
         if self.show_archived {
             rows.extend(
                 self.tree
@@ -593,17 +930,29 @@ impl App {
         rows
     }
 
-    /// (active agents, archived-total) for the selected worktree.
-    pub fn session_group_counts(&self) -> (usize, usize) {
+    /// (pinned, recent, unpinned, archived-total) for the selected worktree.
+    pub fn session_group_counts(&self) -> (usize, usize, usize, usize) {
         let worktrees = self.visible_worktrees();
         let Some(wt) = worktrees.get(self.sel_worktree) else {
-            return (0, 0);
+            return (0, 0, 0, 0);
         };
-        let agents = self
+        let pinned = self
             .tree
             .agents
             .iter()
-            .filter(|a| a.worktree_id == wt.id && !a.archived)
+            .filter(|a| a.worktree_id == wt.id && !a.archived && a.pinned)
+            .count();
+        let recent = self
+            .tree
+            .agents
+            .iter()
+            .filter(|a| a.worktree_id == wt.id && self.is_recent(a))
+            .count();
+        let unpinned = self
+            .tree
+            .agents
+            .iter()
+            .filter(|a| a.worktree_id == wt.id && !a.archived && !a.pinned && !self.is_recent(a))
             .count();
         let archived = self
             .tree
@@ -611,7 +960,23 @@ impl App {
             .iter()
             .filter(|a| a.worktree_id == wt.id && a.archived)
             .count();
-        (agents, archived)
+        (pinned, recent, unpinned, archived)
+    }
+
+    /// Delay until the next visible RECENT session ages out of the window,
+    /// so the event loop can wake up and regroup. None when nothing is
+    /// pending expiry.
+    pub fn next_recent_expiry(&self) -> Option<std::time::Duration> {
+        let worktrees = self.visible_worktrees();
+        let wt = worktrees.get(self.sel_worktree)?;
+        let now = now_ms();
+        self.tree
+            .agents
+            .iter()
+            .filter(|a| a.worktree_id == wt.id && self.is_recent(a))
+            .map(|a| (a.status_changed_at + self.recent_window_ms - now).max(0) as u64)
+            .min()
+            .map(std::time::Duration::from_millis)
     }
 
     /// Aggregate status for a worktree row: red > yellow > green > gray,
