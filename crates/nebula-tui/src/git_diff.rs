@@ -122,6 +122,26 @@ pub fn parse_status_z(bytes: &[u8]) -> Vec<DiffFile> {
     files
 }
 
+/// Every file in the checkout (tracked + untracked, gitignore respected) in
+/// git listing order, for the fuzzy file finder. `Err` is a user-facing
+/// flash message.
+pub fn list_files(root: &Path) -> Result<Vec<String>, String> {
+    let output = run_git(
+        root,
+        &["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git ls-files failed: {}", stderr.trim()));
+    }
+    Ok(output
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect())
+}
+
 /// Does this checkout have any commit? Unborn HEAD changes the diff command.
 pub fn has_head(root: &Path) -> bool {
     run_git(root, &["rev-parse", "--verify", "--quiet", "HEAD"])
@@ -286,6 +306,27 @@ mod tests {
         // Untracked goes through the --no-index exit-1 path.
         let diff = diff_for(&repo, fresh, true);
         assert!(diff.contains("+hello"), "{diff}");
+    }
+
+    #[test]
+    fn list_files_includes_untracked_and_respects_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = make_repo(&dir);
+        std::fs::write(repo.join("fresh.txt"), "hello\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(repo.join("ignored.txt"), "nope\n").unwrap();
+
+        let files = list_files(&repo).unwrap();
+        assert!(files.contains(&"tracked.txt".to_string()), "{files:?}");
+        assert!(files.contains(&"fresh.txt".to_string()), "{files:?}");
+        assert!(!files.contains(&"ignored.txt".to_string()), "{files:?}");
+    }
+
+    #[test]
+    fn list_files_errors_outside_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = list_files(dir.path()).unwrap_err();
+        assert!(err.contains("git ls-files failed"), "{err}");
     }
 
     #[test]

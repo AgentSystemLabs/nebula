@@ -443,6 +443,167 @@ fn build_palette_items(tree: &Tree, show_archived: bool) -> Vec<PaletteItem> {
     items
 }
 
+/// One visible row of the file finder: an index into `files` plus the char
+/// positions of the path the query matched, for highlighting.
+#[derive(Debug, Clone)]
+pub struct FinderMatch {
+    pub file: usize,
+    pub positions: Vec<usize>,
+}
+
+/// Fuzzy file finder over every file of the selected worktree (`f`).
+#[derive(Debug, Clone)]
+pub struct FileFinder {
+    /// Checkout dir the listing was read from.
+    pub root: PathBuf,
+    /// Branch name for the modal title.
+    pub branch: String,
+    /// Paths relative to `root`, in git listing order.
+    pub files: Vec<String>,
+    /// Type-to-filter query over `files`; always live.
+    pub query: String,
+    /// Visible rows: `files` narrowed by `query`, best matches first
+    /// (listing order when the query is empty).
+    pub matches: Vec<FinderMatch>,
+    /// Index into `matches` (not `files`).
+    pub selected: usize,
+    /// Whole modal rect, written back during draw so clicks outside close.
+    pub area: Rect,
+    /// Screen rect of the result rows (query row excluded), written back
+    /// during draw so clicks can hit-test rows.
+    pub list_area: Rect,
+}
+
+impl FileFinder {
+    pub fn new(root: PathBuf, branch: String, files: Vec<String>) -> Self {
+        let mut finder = Self {
+            root,
+            branch,
+            files,
+            query: String::new(),
+            matches: Vec::new(),
+            selected: 0,
+            area: Rect::default(),
+            list_area: Rect::default(),
+        };
+        finder.apply_filter();
+        finder
+    }
+
+    /// First visible row of the result list's stateless follow-window for a
+    /// list of `height` rows.
+    pub fn window_start(&self, height: usize) -> usize {
+        (self.selected + 1).saturating_sub(height)
+    }
+
+    /// Clamped absolute selection in the filtered list.
+    pub fn select(&mut self, index: i64) {
+        let max = self.matches.len().saturating_sub(1) as i64;
+        self.selected = index.clamp(0, max) as usize;
+    }
+
+    /// The path behind the current selection, if any row is visible.
+    pub fn selected_path(&self) -> Option<&str> {
+        self.files
+            .get(self.matches.get(self.selected)?.file)
+            .map(String::as_str)
+    }
+
+    /// Recompute `matches` from `query` and reset the selection to the top
+    /// row. Best matches first, listing order when the query is empty.
+    pub fn apply_filter(&mut self) {
+        self.matches = crate::fuzzy::rank(&self.query, self.files.iter().map(String::as_str))
+            .into_iter()
+            .map(|(file, positions)| FinderMatch { file, positions })
+            .collect();
+        self.selected = 0;
+    }
+}
+
+/// Find-in-files overlay (`F`): live `git grep` over the selected worktree.
+#[derive(Debug, Clone)]
+pub struct GrepView {
+    /// Checkout dir the search runs in.
+    pub root: PathBuf,
+    /// Branch name for the modal title.
+    pub branch: String,
+    /// Editor command Enter launches (NEBULA_EDITOR, default vim), captured
+    /// at open time.
+    pub editor: String,
+    /// The search text; every edit re-runs the grep.
+    pub query: String,
+    /// Current results, best-first in git grep order (path, then line).
+    pub hits: Vec<crate::grep_search::GrepHit>,
+    /// The search stopped at the result cap — the title says so.
+    pub truncated: bool,
+    /// A failed grep's message, shown in the list area until the next edit.
+    pub error: Option<String>,
+    /// Index into `hits`.
+    pub selected: usize,
+    /// Whole modal rect, written back during draw so clicks outside close.
+    pub area: Rect,
+    /// Screen rect of the result rows (query row excluded), written back
+    /// during draw so clicks can hit-test rows.
+    pub list_area: Rect,
+}
+
+impl GrepView {
+    pub fn new(root: PathBuf, branch: String, editor: String) -> Self {
+        Self {
+            root,
+            branch,
+            editor,
+            query: String::new(),
+            hits: Vec::new(),
+            truncated: false,
+            error: None,
+            selected: 0,
+            area: Rect::default(),
+            list_area: Rect::default(),
+        }
+    }
+
+    /// Re-run the grep for the current query and reset the selection to the
+    /// top row. Queries under `MIN_QUERY_LEN` just clear the results.
+    pub fn run_search(&mut self) {
+        self.selected = 0;
+        self.error = None;
+        if self.query.chars().count() < crate::grep_search::MIN_QUERY_LEN {
+            self.hits.clear();
+            self.truncated = false;
+            return;
+        }
+        match crate::grep_search::search(&self.root, &self.query) {
+            Ok((hits, truncated)) => {
+                self.hits = hits;
+                self.truncated = truncated;
+            }
+            Err(msg) => {
+                self.hits.clear();
+                self.truncated = false;
+                self.error = Some(msg);
+            }
+        }
+    }
+
+    /// First visible row of the result list's stateless follow-window for a
+    /// list of `height` rows.
+    pub fn window_start(&self, height: usize) -> usize {
+        (self.selected + 1).saturating_sub(height)
+    }
+
+    /// Clamped absolute selection.
+    pub fn select(&mut self, index: i64) {
+        let max = self.hits.len().saturating_sub(1) as i64;
+        self.selected = index.clamp(0, max) as usize;
+    }
+
+    /// The hit behind the current selection, if any row is visible.
+    pub fn selected_hit(&self) -> Option<&crate::grep_search::GrepHit> {
+        self.hits.get(self.selected)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SettingsView {
     pub selected: usize,
@@ -465,6 +626,8 @@ pub enum Overlay {
     Settings(SettingsView),
     Diff(DiffView),
     Palette(Palette),
+    Files(FileFinder),
+    Grep(GrepView),
 }
 
 /// Rows optimistically removed for an in-flight DeleteWorktree, kept so an
@@ -693,11 +856,14 @@ pub struct App {
     /// double-click detection.
     pub last_term_click: Option<(std::time::Instant, (u16, u16))>,
     /// Last left-click on a session row (time + agent), for double-click
-    /// pin/unpin detection.
+    /// attach detection (a single click only selects the row).
     pub last_session_click: Option<(std::time::Instant, AgentId)>,
     /// URLs detected on the visible screen during the last draw; hit-tested
     /// on ⌥click and underlined by the renderer.
     pub term_links: Vec<crate::links::TermLink>,
+    /// File paths detected on the visible screen during the last draw;
+    /// ⌥click opens them in the editor modal.
+    pub term_file_links: Vec<crate::links::FileLink>,
     /// Widths of the Projects / Worktrees / Sessions panels; the terminal
     /// pane takes the remainder.
     pub panel_widths: [u16; 3],
@@ -723,6 +889,13 @@ pub struct App {
     /// Active color theme. From config (`theme`); the event loop refreshes
     /// it when the setting changes.
     pub theme: crate::theme::Theme,
+    /// Embedded editor modal (find-in-files Enter), above every overlay.
+    pub vim: Option<crate::vim_term::VimTerm>,
+    /// Where editor reader threads send output; the main loop installs it.
+    pub vim_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::vim_term::VimEvent>>,
+    /// Stamp for the current editor spawn, so a closed editor's buffered
+    /// events can't touch its successor.
+    pub vim_generation: u64,
 }
 
 impl Default for App {
@@ -761,6 +934,7 @@ impl App {
             last_term_click: None,
             last_session_click: None,
             term_links: Vec::new(),
+            term_file_links: Vec::new(),
             panel_widths: DEFAULT_PANEL_WIDTHS,
             diff_files_width: DEFAULT_DIFF_FILES_W,
             splitter_drag: None,
@@ -770,6 +944,9 @@ impl App {
             recent_window_ms: crate::config::DEFAULT_RECENT_WINDOW_MS,
             drawn_session: None,
             theme: crate::theme::Theme::default(),
+            vim: None,
+            vim_tx: None,
+            vim_generation: 0,
         }
     }
 

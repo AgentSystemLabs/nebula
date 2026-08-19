@@ -4,12 +4,14 @@ pub mod config;
 pub mod event_loop;
 pub mod fuzzy;
 pub mod git_diff;
+pub mod grep_search;
 pub mod ipc;
 pub mod keys;
 pub mod links;
 pub mod raw_attach;
 pub mod theme;
 pub mod ui;
+pub mod vim_term;
 
 use anyhow::Result;
 

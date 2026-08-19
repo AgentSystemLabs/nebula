@@ -11,6 +11,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
+/// Outer size of the editor modal, as (width, height) percent of the frame.
+/// Shared with the event loop's pre-draw PTY size guess.
+pub const VIM_MODAL_PCT: (u16, u16) = (94, 92);
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits.clear();
 
@@ -21,6 +25,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_terminal(f, app, body);
         draw_footer(f, app, footer);
         draw_overlay(f, app);
+        draw_vim(f, app);
         return;
     }
 
@@ -55,6 +60,42 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_terminal(f, app, term_a);
     draw_footer(f, app, footer);
     draw_overlay(f, app);
+    draw_vim(f, app);
+}
+
+/// The embedded editor modal, above every overlay.
+fn draw_vim(f: &mut Frame, app: &mut App) {
+    let th = app.theme;
+    let Some(vim) = &app.vim else {
+        return;
+    };
+    let area = centered_rect_pct(f.area(), VIM_MODAL_PCT.0, VIM_MODAL_PCT.1);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(th.accent))
+        .title(Span::styled(
+            format!(" {} ", vim.title),
+            Style::default()
+                .fg(th.on_accent)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(Span::styled(
+            " Ctrl+Q: force close ",
+            Style::default().fg(th.dim),
+        )));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(
+        tui_term::widget::PseudoTerminal::new(vim.parser.screen()),
+        inner,
+    );
+    // Write-back: the post-draw sync resizes the PTY to the drawn rect.
+    if let Some(vim) = &mut app.vim {
+        vim.area = inner;
+    }
 }
 
 fn draw_overlay(f: &mut Frame, app: &mut App) {
@@ -254,6 +295,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 ("A", "toggle archived agents"),
                 ("m / right-click", "context menu"),
                 ("g", "git diff of the selected worktree"),
+                ("f", "fuzzy find a file in the selected worktree"),
+                ("F", "find in files (git grep), Enter edits the hit in vim"),
                 ("/", "fuzzy search projects / worktrees / sessions"),
                 ("s", "settings (toggles write to config.json)"),
                 (
@@ -569,6 +612,196 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if let Some(Overlay::Palette(p)) = &mut app.overlay {
                 p.area = area;
                 p.list_area = list_inner;
+            }
+        }
+        Overlay::Files(finder) => {
+            let area = centered_rect(f.area(), 72, 20);
+            f.render_widget(Clear, area);
+            let title = if finder.query.is_empty() {
+                format!(" Find file — {} ({}) ", finder.branch, finder.files.len())
+            } else {
+                format!(
+                    " Find file — {} ({}/{}) ",
+                    finder.branch,
+                    finder.matches.len(),
+                    finder.files.len()
+                )
+            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(th.accent))
+                .title(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(th.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            // First row: the always-on fuzzy query input.
+            if let Some(query_area) = row_rect(inner, 0) {
+                let line = if finder.query.is_empty() {
+                    Line::from(Span::styled(
+                        "type to filter…",
+                        Style::default().fg(th.dim),
+                    ))
+                } else {
+                    Line::from(vec![
+                        Span::raw(finder.query.clone()),
+                        Span::styled("█", Style::default().fg(th.accent)),
+                    ])
+                };
+                f.render_widget(Paragraph::new(line), query_area);
+            }
+            let list_inner = Rect {
+                y: inner.y + 1,
+                height: inner.height.saturating_sub(1),
+                ..inner
+            };
+
+            if finder.matches.is_empty() {
+                if let Some(row_area) = row_rect(list_inner, 0) {
+                    f.render_widget(
+                        Paragraph::new(Span::styled(
+                            "no matches",
+                            Style::default().fg(th.dim),
+                        )),
+                        row_area,
+                    );
+                }
+            }
+            let start = finder.window_start(list_inner.height as usize);
+            for (row, (i, m)) in finder.matches.iter().enumerate().skip(start).enumerate() {
+                let Some(row_area) = row_rect(list_inner, row) else {
+                    break;
+                };
+                let path = &finder.files[m.file];
+                let budget = (list_inner.width as usize).saturating_sub(2);
+                let shown = truncate(path, budget);
+                // Truncation puts `…` at the last char of `shown`; a match
+                // landing on that index must not light the ellipsis.
+                let shown_len = shown.chars().count();
+                let positions = if shown_len < path.chars().count() {
+                    let keep = m
+                        .positions
+                        .iter()
+                        .take_while(|&&p| p + 1 < shown_len)
+                        .count();
+                    &m.positions[..keep]
+                } else {
+                    &m.positions[..]
+                };
+                let mut spans = vec![Span::raw(" ")];
+                spans.extend(fuzzy_highlight_spans(&shown, positions, th));
+                render_row(f, row_area, spans, i == finder.selected, true, th);
+            }
+
+            // Write-back (draw works on a clone): rects for mouse
+            // hit-testing.
+            if let Some(Overlay::Files(fin)) = &mut app.overlay {
+                fin.area = area;
+                fin.list_area = list_inner;
+            }
+        }
+        Overlay::Grep(view) => {
+            let area = centered_rect_pct(f.area(), 88, 76);
+            f.render_widget(Clear, area);
+            let title = if view.query.chars().count() < crate::grep_search::MIN_QUERY_LEN {
+                format!(" Find in files — {} ", view.branch)
+            } else if view.truncated {
+                format!(
+                    " Find in files — {} ({}+ hits) ",
+                    view.branch,
+                    view.hits.len()
+                )
+            } else {
+                format!(
+                    " Find in files — {} ({} hits) ",
+                    view.branch,
+                    view.hits.len()
+                )
+            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(th.accent))
+                .title(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(th.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            // First row: the always-live grep query.
+            if let Some(query_area) = row_rect(inner, 0) {
+                let line = if view.query.is_empty() {
+                    Line::from(Span::styled(
+                        "type to search…",
+                        Style::default().fg(th.dim),
+                    ))
+                } else {
+                    Line::from(vec![
+                        Span::raw(view.query.clone()),
+                        Span::styled("█", Style::default().fg(th.accent)),
+                    ])
+                };
+                f.render_widget(Paragraph::new(line), query_area);
+            }
+            let list_inner = Rect {
+                y: inner.y + 1,
+                height: inner.height.saturating_sub(1),
+                ..inner
+            };
+
+            // Placeholder row: error, too-short query, or an empty result.
+            let placeholder = if let Some(err) = &view.error {
+                Some(Span::styled(err.clone(), Style::default().fg(th.err)))
+            } else if view.query.chars().count() < crate::grep_search::MIN_QUERY_LEN {
+                Some(Span::styled(
+                    format!(
+                        "type at least {} characters to search",
+                        crate::grep_search::MIN_QUERY_LEN
+                    ),
+                    Style::default().fg(th.dim),
+                ))
+            } else if view.hits.is_empty() {
+                Some(Span::styled("no matches", Style::default().fg(th.dim)))
+            } else {
+                None
+            };
+            if let (Some(span), Some(row_area)) = (placeholder, row_rect(list_inner, 0)) {
+                f.render_widget(Paragraph::new(span), row_area);
+            }
+
+            let start = view.window_start(list_inner.height as usize);
+            for (row, (i, hit)) in view.hits.iter().enumerate().skip(start).enumerate() {
+                let Some(row_area) = row_rect(list_inner, row) else {
+                    break;
+                };
+                let budget = (list_inner.width as usize).saturating_sub(2);
+                let loc = format!("{}:{}", hit.path, hit.line);
+                let loc_len = loc.chars().count();
+                let mut spans = vec![Span::raw(" ")];
+                if loc_len + 2 >= budget {
+                    spans.push(Span::styled(
+                        truncate(&loc, budget),
+                        Style::default().fg(th.accent),
+                    ));
+                } else {
+                    spans.push(Span::styled(loc, Style::default().fg(th.accent)));
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::raw(truncate(&hit.text, budget - loc_len - 2)));
+                }
+                render_row(f, row_area, spans, i == view.selected, true, th);
+            }
+
+            // Write-back (draw works on a clone): rects for mouse
+            // hit-testing.
+            if let Some(Overlay::Grep(v)) = &mut app.overlay {
+                v.area = area;
+                v.list_area = list_inner;
             }
         }
     }
@@ -990,7 +1223,10 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
                     f.buffer_mut().set_style(line, reversed);
                 }
             }
-            crate::links::visible_links(term.parser.screen())
+            (
+                crate::links::visible_links(term.parser.screen()),
+                crate::links::visible_file_links(term.parser.screen()),
+            )
         }
         None => {
             let msg = Paragraph::new(vec![
@@ -1009,19 +1245,24 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
             ])
             .centered();
             f.render_widget(msg, inner);
-            Vec::new()
+            (Vec::new(), Vec::new())
         }
     };
-    // Underline detected URLs so ⌥click has a visible affordance; kept on
-    // the App for click-time hit-testing against the drawn frame.
+    let (links, file_links) = links;
+    // Underline detected URLs and file paths so ⌥click has a visible
+    // affordance; kept on the App for click-time hit-testing against the
+    // drawn frame.
     let underline = Style::default().add_modifier(Modifier::UNDERLINED);
-    for link in &links {
-        for &(row, c0, c1) in &link.segments {
-            let seg = Rect::new(inner.x + c0, inner.y + row, c1 - c0 + 1, 1).intersection(inner);
-            f.buffer_mut().set_style(seg, underline);
-        }
+    let segments = links
+        .iter()
+        .flat_map(|l| l.segments.iter())
+        .chain(file_links.iter().flat_map(|l| l.segments.iter()));
+    for &(row, c0, c1) in segments {
+        let seg = Rect::new(inner.x + c0, inner.y + row, c1 - c0 + 1, 1).intersection(inner);
+        f.buffer_mut().set_style(seg, underline);
     }
     app.term_links = links;
+    app.term_file_links = file_links;
 }
 
 fn attached_session_name(app: &App) -> Option<String> {
@@ -1084,6 +1325,16 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     };
     let hints = if let Some(flash) = &app.flash {
         Span::styled(flash.clone(), Style::default().fg(th.warn))
+    } else if app.vim.is_some() {
+        Span::styled(
+            ":wq / :q to finish  Ctrl+Q: force close",
+            Style::default().fg(th.dim),
+        )
+    } else if matches!(&app.overlay, Some(Overlay::Grep(_))) {
+        Span::styled(
+            "type: search  ↑/↓: move  Enter: edit in vim  Esc: clear/close",
+            Style::default().fg(th.dim),
+        )
     } else if matches!(&app.overlay, Some(Overlay::Diff(_))) {
         Span::styled(
             "type: filter  ↑/↓: file  ⇧↑/↓: scroll  Ctrl+d/u: page  Home/End: top/end  Esc: clear/close",

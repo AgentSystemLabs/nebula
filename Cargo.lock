@@ -908,6 +908,7 @@ dependencies = [
  "crossterm",
  "futures",
  "nebula-core",
+ "portable-pty",
  "ratatui",
  "rmp-serde",
  "serde",

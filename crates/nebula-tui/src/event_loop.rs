@@ -1,11 +1,13 @@
 //! The main TUI loop: terminal setup/teardown, message routing, update logic.
 
 use crate::app::{
-    agent_sref, App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, Focus,
+    agent_sref, App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder,
+    Focus, GrepView,
     HitTarget, MenuAction, MenuItem, Overlay, Palette, PaletteTarget, PendingAction, PendingIntent,
     ProjectRow, PromptDialog, PromptKind, SettingsView, SplitterDrag, TermSelection,
     WorktreeRollback,
 };
+use crate::vim_term::{VimEvent, VimTerm};
 use crate::{ipc, keys, ui};
 use anyhow::Result;
 use crossterm::event::{
@@ -104,6 +106,10 @@ async fn main_loop(
     let mut input = crossterm::event::EventStream::new();
     let mut out: Vec<ClientRequest> = Vec::new();
     let mut next_draw = tokio::time::Instant::now();
+    // Editor-modal PTY output; the channel outlives individual editor
+    // spawns (VimEvent generations keep them apart).
+    let (vim_tx, mut vim_rx) = tokio::sync::mpsc::unbounded_channel::<VimEvent>();
+    app.vim_tx = Some(vim_tx);
 
     loop {
         if app.dirty && tokio::time::Instant::now() >= next_draw {
@@ -111,6 +117,7 @@ async fn main_loop(
             app.dirty = false;
             next_draw = tokio::time::Instant::now() + FRAME_INTERVAL;
             sync_pty_size(&mut app, &mut out);
+            sync_vim_size(&mut app);
             // What the user sees selected, for RECENT-expiry re-anchoring.
             app.drawn_session = app.selected_session().map(|a| a.id.clone());
         }
@@ -156,6 +163,12 @@ async fn main_loop(
                     app.dirty = true;
                 }
             },
+            ev = vim_rx.recv() => {
+                // Never None: app.vim_tx keeps a sender alive.
+                if let Some(ev) = ev {
+                    handle_vim_event(&mut app, ev);
+                }
+            }
         }
         if app.focus != focus_before {
             tracing::debug!(from = ?focus_before, to = ?app.focus, "focus changed");
@@ -166,6 +179,9 @@ async fn main_loop(
         while let Ok(ev) = channels.rx.try_recv() {
             log_server_event(&ev);
             handle_server_event(&mut app, ev, &mut out);
+        }
+        while let Ok(ev) = vim_rx.try_recv() {
+            handle_vim_event(&mut app, ev);
         }
 
         for req in out.drain(..) {
@@ -274,6 +290,37 @@ fn sync_pty_size(app: &mut App, out: &mut Vec<ClientRequest>) {
     }
 }
 
+/// Keep the editor modal's PTY and parser sized to the drawn inner rect
+/// (the `sync_pty_size` pattern, minus the daemon round-trip).
+fn sync_vim_size(app: &mut App) {
+    if let Some(vim) = &mut app.vim {
+        if vim.area.width >= 2 && vim.area.height >= 2 {
+            vim.resize(vim.area.width, vim.area.height);
+        }
+    }
+}
+
+/// Editor reader-thread events. A stale generation (bytes buffered from an
+/// editor that was already closed) is dropped on the floor.
+fn handle_vim_event(app: &mut App, ev: VimEvent) {
+    match ev {
+        VimEvent::Output { generation, data } => {
+            if let Some(vim) = &mut app.vim {
+                if vim.generation == generation {
+                    vim.process(&data);
+                    app.dirty = true;
+                }
+            }
+        }
+        VimEvent::Exited { generation } => {
+            if app.vim.as_ref().is_some_and(|v| v.generation == generation) {
+                app.vim = None;
+                app.dirty = true;
+            }
+        }
+    }
+}
+
 fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientRequest>) {
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -282,6 +329,15 @@ fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientReques
             app.dirty = true;
         }
         Event::Mouse(mouse) => handle_mouse(app, mouse, out),
+        Event::Paste(text) if app.vim.is_some() => {
+            if let Some(vim) = &mut app.vim {
+                // Bracketed paste so vim doesn't auto-indent it to mush.
+                let mut data = b"\x1b[200~".to_vec();
+                data.extend_from_slice(text.as_bytes());
+                data.extend_from_slice(b"\x1b[201~");
+                vim.input(&data);
+            }
+        }
         Event::Paste(text) => {
             if app.focus == Focus::Terminal && app.term_locked {
                 if let Some(term) = &app.term {
@@ -302,6 +358,13 @@ fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientReques
 }
 
 fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
+    // The editor modal sits above every overlay: all keys forward to it —
+    // vim needs Esc — except Ctrl+Q, the same hatch the terminal lock uses.
+    if app.vim.is_some() {
+        handle_vim_key(app, key);
+        return;
+    }
+
     // Modal overlays swallow all keys.
     if app.overlay.is_some() {
         handle_overlay_key(app, key, out);
@@ -551,6 +614,8 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         }
         KeyCode::Char('m') => open_context_menu_for_selection(app),
         KeyCode::Char('g') => open_diff_view(app),
+        KeyCode::Char('f') => open_file_finder(app),
+        KeyCode::Char('F') => open_grep_view(app),
         KeyCode::Char('z') => {
             if app.term.is_some() {
                 app.collapsed = true;
@@ -646,6 +711,199 @@ fn open_diff_view(app: &mut App) {
     view.files_width = app.diff_files_width;
     crate::git_diff::load_selected_diff(&mut view);
     app.overlay = Some(Overlay::Diff(view));
+}
+
+/// Fuzzy file finder over every tracked + untracked file of the selected
+/// worktree (`f`). Same shell as `open_diff_view`: flash instead of opening
+/// when there's no worktree, the path is gone, or git fails.
+fn open_file_finder(app: &mut App) {
+    // Clone before touching app.overlay — selected_worktree borrows app.
+    let Some((path, branch)) = app
+        .selected_worktree()
+        .map(|w| (w.path.clone(), w.branch.clone()))
+    else {
+        app.flash = Some("no worktree selected".into());
+        return;
+    };
+    if !path.is_dir() {
+        app.flash = Some(format!("worktree path missing on disk: {}", path.display()));
+        return;
+    }
+    let files = match crate::git_diff::list_files(&path) {
+        Ok(files) => files,
+        Err(msg) => {
+            app.flash = Some(msg);
+            return;
+        }
+    };
+    if files.is_empty() {
+        app.flash = Some(format!("no files in {branch}"));
+        return;
+    }
+    app.overlay = Some(Overlay::Files(FileFinder::new(path, branch, files)));
+}
+
+/// Find-in-files (`F`): live `git grep` over the selected worktree; Enter
+/// on a hit opens it in the editor modal. Same shell as `open_diff_view`.
+fn open_grep_view(app: &mut App) {
+    // Clone before touching app.overlay — selected_worktree borrows app.
+    let Some((path, branch)) = app
+        .selected_worktree()
+        .map(|w| (w.path.clone(), w.branch.clone()))
+    else {
+        app.flash = Some("no worktree selected".into());
+        return;
+    };
+    if !path.is_dir() {
+        app.flash = Some(format!("worktree path missing on disk: {}", path.display()));
+        return;
+    }
+    let editor = std::env::var("NEBULA_EDITOR").unwrap_or_else(|_| "vim".into());
+    app.overlay = Some(Overlay::Grep(GrepView::new(path, branch, editor)));
+}
+
+/// Enter on a grep hit: spawn the editor at `path:line` inside the modal
+/// terminal. The grep overlay stays open underneath, so quitting the editor
+/// lands back on the results.
+fn open_selected_hit_in_editor(app: &mut App) {
+    let Some(Overlay::Grep(view)) = &app.overlay else {
+        return;
+    };
+    let Some(hit) = view.selected_hit() else {
+        return;
+    };
+    let (root, editor) = (view.root.clone(), view.editor.clone());
+    let (path, line) = (hit.path.clone(), hit.line);
+    let Some(tx) = app.vim_tx.clone() else {
+        return; // main loop not running (unit tests without a channel)
+    };
+    // Size guess from the last-drawn body; the post-draw sync corrects it.
+    let (cols, rows) = vim_size_guess(app);
+    app.vim_generation += 1;
+    match VimTerm::spawn_editor(
+        &editor,
+        &root,
+        &path,
+        line,
+        cols,
+        rows,
+        app.vim_generation,
+        tx,
+    ) {
+        Ok(vim) => app.vim = Some(vim),
+        Err(msg) => app.flash = Some(msg),
+    }
+}
+
+/// Expected inner size of the editor modal before its first draw, derived
+/// from the last-drawn body rect (`VIM_MODAL_PCT` of the frame, minus the
+/// border). `sync_vim_size` trues it up after the real draw.
+fn vim_size_guess(app: &App) -> (u16, u16) {
+    let frame_w = app.body_area.width;
+    let frame_h = app.body_area.height + 1; // + footer row
+    let cols = (frame_w * ui::VIM_MODAL_PCT.0 / 100).saturating_sub(2).max(2);
+    let rows = (frame_h * ui::VIM_MODAL_PCT.1 / 100).saturating_sub(2).max(2);
+    (cols, rows)
+}
+
+/// ⌥click on a file path in the terminal pane: resolve it against the
+/// attached session's worktree and open it in the editor modal at the
+/// referenced line.
+fn open_file_link(app: &mut App, path: &str, line: Option<u64>) {
+    let Some(root) = attached_worktree_root(app) else {
+        app.flash = Some("no worktree for this session".into());
+        return;
+    };
+    let Some(file) = resolve_file_link(&root, path) else {
+        app.flash = Some(format!("file not found: {path}"));
+        return;
+    };
+    let editor = std::env::var("NEBULA_EDITOR").unwrap_or_else(|_| "vim".into());
+    let Some(tx) = app.vim_tx.clone() else {
+        return; // main loop not running (unit tests without a channel)
+    };
+    let (cols, rows) = vim_size_guess(app);
+    app.vim_generation += 1;
+    match VimTerm::spawn_editor(
+        &editor,
+        &root,
+        &file,
+        line.unwrap_or(1),
+        cols,
+        rows,
+        app.vim_generation,
+        tx,
+    ) {
+        Ok(vim) => app.vim = Some(vim),
+        Err(msg) => app.flash = Some(msg),
+    }
+}
+
+/// Worktree root of the attached session; falls back to the selected
+/// worktree when the attachment isn't an agent (or isn't in the tree yet).
+fn attached_worktree_root(app: &App) -> Option<std::path::PathBuf> {
+    if let Some(SessionRef::Agent(id)) = app.term.as_ref().map(|t| &t.sref) {
+        let root = app
+            .tree
+            .agents
+            .iter()
+            .find(|a| &a.id == id)
+            .and_then(|a| app.tree.worktrees.iter().find(|w| w.id == a.worktree_id))
+            .map(|w| w.path.clone());
+        if root.is_some() {
+            return root;
+        }
+    }
+    app.selected_worktree().map(|w| w.path.clone())
+}
+
+/// Resolve a clicked path against the worktree: expand `~/`, try it as
+/// printed, then with the git-diff `a/`/`b/` prefix stripped. Returns the
+/// argument to hand the editor — relative paths stay relative, since the
+/// editor runs with the worktree as cwd.
+fn resolve_file_link(root: &std::path::Path, path: &str) -> Option<String> {
+    let mut candidates = vec![path.to_string()];
+    for prefix in ["a/", "b/"] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            candidates.push(rest.to_string());
+        }
+    }
+    for cand in candidates {
+        let full = if let Some(rest) = cand.strip_prefix("~/") {
+            let home = std::env::var_os("HOME")?;
+            std::path::PathBuf::from(home).join(rest)
+        } else {
+            // join() with an absolute candidate yields the candidate.
+            root.join(&cand)
+        };
+        if full.is_file() {
+            return Some(if cand.starts_with("~/") {
+                full.to_string_lossy().into_owned()
+            } else {
+                cand
+            });
+        }
+    }
+    None
+}
+
+/// Keys while the editor modal is open: Ctrl+Q force-closes (the terminal
+/// lock's hatch — vim owns Esc), everything else forwards in the legacy
+/// dialect (vim never pushes kitty flags).
+fn handle_vim_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if ctrl && key.code == KeyCode::Char('q') {
+        if let Some(vim) = &mut app.vim {
+            vim.kill();
+        }
+        app.vim = None;
+        return;
+    }
+    if let Some(vim) = &mut app.vim {
+        if let Some(data) = keys::encode_key(&key, 0) {
+            vim.input(&data);
+        }
+    }
 }
 
 fn open_confirm_archive(app: &mut App, agent: &nebula_core::Agent) {
@@ -1095,6 +1353,83 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 KeyCode::Char(c) if !ctrl => {
                     palette.query.push(c);
                     palette.apply_filter();
+                }
+                _ => {}
+            }
+        }
+        Overlay::Files(finder) => {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                // Two-stage escape: an active query is cleared before the
+                // second Esc closes the finder.
+                KeyCode::Esc if !finder.query.is_empty() => {
+                    finder.query.clear();
+                    finder.apply_filter();
+                }
+                KeyCode::Esc => app.overlay = None,
+                // j/k stay typeable in the query; Ctrl+n/p mirror ↑/↓.
+                KeyCode::Down => finder.select(finder.selected as i64 + 1),
+                KeyCode::Up => finder.select(finder.selected as i64 - 1),
+                KeyCode::Char('n') if ctrl => finder.select(finder.selected as i64 + 1),
+                KeyCode::Char('p') if ctrl => finder.select(finder.selected as i64 - 1),
+                // Enter copies the selected path (relative to the worktree
+                // root) to the clipboard — ready to paste into an agent.
+                KeyCode::Enter => {
+                    if let Some(path) = finder.selected_path().map(str::to_string) {
+                        app.overlay = None;
+                        app.flash = Some(if copy_to_clipboard(&path) {
+                            format!("copied {path}")
+                        } else {
+                            "copy failed (clipboard unavailable)".into()
+                        });
+                    }
+                }
+                KeyCode::Backspace => {
+                    if finder.query.pop().is_some() {
+                        finder.apply_filter();
+                    }
+                }
+                KeyCode::Char('u') if ctrl => {
+                    finder.query.clear();
+                    finder.apply_filter();
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    finder.query.push(c);
+                    finder.apply_filter();
+                }
+                _ => {}
+            }
+        }
+        Overlay::Grep(view) => {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                // Two-stage escape: an active query is cleared before the
+                // second Esc closes the overlay.
+                KeyCode::Esc if !view.query.is_empty() => {
+                    view.query.clear();
+                    view.run_search();
+                }
+                KeyCode::Esc => app.overlay = None,
+                // j/k stay typeable in the query; Ctrl+n/p mirror ↑/↓.
+                KeyCode::Down => view.select(view.selected as i64 + 1),
+                KeyCode::Up => view.select(view.selected as i64 - 1),
+                KeyCode::Char('n') if ctrl => view.select(view.selected as i64 + 1),
+                KeyCode::Char('p') if ctrl => view.select(view.selected as i64 - 1),
+                // Enter opens the hit in the editor modal; the overlay stays
+                // open underneath so quitting the editor returns here.
+                KeyCode::Enter => open_selected_hit_in_editor(app),
+                KeyCode::Backspace => {
+                    if view.query.pop().is_some() {
+                        view.run_search();
+                    }
+                }
+                KeyCode::Char('u') if ctrl => {
+                    view.query.clear();
+                    view.run_search();
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    view.query.push(c);
+                    view.run_search();
                 }
                 _ => {}
             }
@@ -1683,9 +2018,9 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
 }
 
 /// Show the selected session in the terminal pane WITHOUT taking focus or
-/// the input lock — walking the list with ↑/↓ previews each session so it
-/// can be read; Enter (or a click) is what commits: focus + lock. Archived
-/// rows don't preview (same rule as clicking one).
+/// the input lock — walking the list with ↑/↓ (or single-clicking a row)
+/// previews each session so it can be read; Enter (or a double-click) is
+/// what commits: focus + lock. Archived rows don't preview.
 fn preview_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
     let Some(row) = app.selected_session() else {
         return;
@@ -1888,6 +2223,11 @@ fn open_url(url: &str) -> bool {
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) {
+    // The editor modal swallows the mouse entirely — its selection/scroll
+    // story is vim's, not ours.
+    if app.vim.is_some() {
+        return;
+    }
     // An open context menu owns the mouse: click inside activates, outside
     // closes (and swallows the click).
     if let Some(Overlay::Menu(menu)) = &app.overlay {
@@ -2012,6 +2352,95 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         }
         return;
     }
+    // File finder: the wheel moves the selection, a click on a result row
+    // copies that path, a click outside the modal closes; everything else is
+    // swallowed.
+    if let Some(Overlay::Files(finder)) = &mut app.overlay {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                finder.select(finder.selected as i64 - 1);
+                app.dirty = true;
+            }
+            MouseEventKind::ScrollDown => {
+                finder.select(finder.selected as i64 + 1);
+                app.dirty = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let list = finder.list_area;
+                let inside_list = list.width > 0
+                    && mouse.column >= list.x
+                    && mouse.column < list.x + list.width
+                    && mouse.row >= list.y
+                    && mouse.row < list.y + list.height;
+                let area = finder.area;
+                let inside_modal = mouse.column >= area.x
+                    && mouse.column < area.x + area.width
+                    && mouse.row >= area.y
+                    && mouse.row < area.y + area.height;
+                if inside_list {
+                    let start = finder.window_start(list.height as usize);
+                    let index = start + (mouse.row - list.y) as usize;
+                    if index < finder.matches.len() {
+                        finder.select(index as i64);
+                        if let Some(path) = finder.selected_path().map(str::to_string) {
+                            app.overlay = None;
+                            app.flash = Some(if copy_to_clipboard(&path) {
+                                format!("copied {path}")
+                            } else {
+                                "copy failed (clipboard unavailable)".into()
+                            });
+                        }
+                    }
+                } else if !inside_modal {
+                    app.overlay = None;
+                }
+                app.dirty = true;
+            }
+            _ => {}
+        }
+        return;
+    }
+    // Find-in-files: the wheel moves the selection, a click on a result row
+    // opens it in the editor, a click outside the modal closes; everything
+    // else is swallowed.
+    if let Some(Overlay::Grep(view)) = &mut app.overlay {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                view.select(view.selected as i64 - 1);
+                app.dirty = true;
+            }
+            MouseEventKind::ScrollDown => {
+                view.select(view.selected as i64 + 1);
+                app.dirty = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let list = view.list_area;
+                let inside_list = list.width > 0
+                    && mouse.column >= list.x
+                    && mouse.column < list.x + list.width
+                    && mouse.row >= list.y
+                    && mouse.row < list.y + list.height;
+                let area = view.area;
+                let inside_modal = mouse.column >= area.x
+                    && mouse.column < area.x + area.width
+                    && mouse.row >= area.y
+                    && mouse.row < area.y + area.height;
+                if inside_list {
+                    let start = view.window_start(list.height as usize);
+                    let index = start + (mouse.row - list.y) as usize;
+                    if index < view.hits.len() {
+                        view.select(index as i64);
+                        open_selected_hit_in_editor(app);
+                    }
+                } else if !inside_modal {
+                    app.overlay = None;
+                }
+                app.dirty = true;
+            }
+            _ => {}
+        }
+        return;
+    }
     // Settings: click a row to select (or toggle if already selected),
     // click outside to close; everything else is swallowed.
     if matches!(&app.overlay, Some(Overlay::Settings(_))) {
@@ -2079,6 +2508,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     app.dirty = true;
                     return;
                 }
+                // Not a URL — a detected file path opens in the editor
+                // modal instead (claude/cursor/codex print `path:line`).
+                if let Some((path, line)) = app
+                    .term_file_links
+                    .iter()
+                    .find(|link| link.contains(cell))
+                    .map(|link| (link.path.clone(), link.line))
+                {
+                    open_file_link(app, &path, line);
+                    app.dirty = true;
+                    return;
+                }
             }
             // Any fresh click clears a stale selection highlight; a click on
             // the terminal pane below re-arms one.
@@ -2120,24 +2561,20 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         app.flash = Some("agent is archived — unarchive first (u)".into());
                     } else if let Some(a) = app.selected_session() {
                         let now = std::time::Instant::now();
-                        // Double-click toggles pin; `last_session_click` was
+                        // Double-click attaches; `last_session_click` was
                         // consumed, so a third click starts over.
                         let double = app.last_session_click.take().is_some_and(|(at, id)| {
                             id == a.id && now.duration_since(at) <= DOUBLE_CLICK
                         });
                         if double {
-                            // Keep the selection on this agent after it jumps
-                            // between the PINNED/UNPINNED groups.
-                            app.select_when_seen = Some(SessionRef::Agent(a.id.clone()));
-                            let req_id = app.alloc_req_id(PendingIntent::None);
-                            out.push(ClientRequest::SetAgentPinned {
-                                req_id,
-                                id: a.id,
-                                pinned: !a.pinned,
-                            });
-                        } else {
-                            app.last_session_click = Some((now, a.id));
                             attach_selected(app, out);
+                        } else {
+                            // Single click selects the row and previews its
+                            // terminal (no focus/lock); Enter or a second
+                            // click commits.
+                            app.last_session_click = Some((now, a.id));
+                            app.focus = Focus::Sessions;
+                            preview_selected(app, out);
                         }
                     }
                 }
@@ -3730,7 +4167,7 @@ mod tests {
     }
 
     #[test]
-    fn double_click_on_session_row_toggles_pin() {
+    fn single_click_previews_double_click_focuses() {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
@@ -3745,10 +4182,11 @@ mod tests {
             &mut out,
         );
         assert!(
-            !out.iter()
-                .any(|r| matches!(r, ClientRequest::SetAgentPinned { .. })),
-            "single click attaches, never pins"
+            out.iter().any(|r| matches!(r, ClientRequest::Attach { .. })),
+            "single click previews the session's terminal"
         );
+        assert_eq!(app.focus, Focus::Sessions, "single click keeps list focus");
+        assert!(!app.term_locked, "preview never takes the input lock");
         handle_mouse(
             &mut app,
             mev(MouseEventKind::Up(MouseButton::Left), 1, 0),
@@ -3759,18 +4197,8 @@ mod tests {
             mev(MouseEventKind::Down(MouseButton::Left), 1, 0),
             &mut out,
         );
-        assert!(
-            out.iter().any(|r| matches!(
-                r,
-                ClientRequest::SetAgentPinned { id, pinned: true, .. } if id.0 == "a1"
-            )),
-            "fast second click pins the agent"
-        );
-        assert_eq!(
-            app.select_when_seen,
-            Some(SessionRef::Agent(AgentId("a1".into()))),
-            "selection follows the agent across the pin regroup"
-        );
+        assert_eq!(app.focus, Focus::Terminal, "double-click focuses terminal");
+        assert!(app.term_locked, "double-click locks input");
         assert!(
             app.last_session_click.is_none(),
             "double-click consumed the click state, a third click starts over"
@@ -3778,7 +4206,7 @@ mod tests {
     }
 
     #[test]
-    fn slow_second_click_on_session_row_does_not_pin() {
+    fn slow_second_click_on_session_row_previews_without_focusing() {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
@@ -3797,11 +4225,8 @@ mod tests {
             mev(MouseEventKind::Down(MouseButton::Left), 1, 0),
             &mut out,
         );
-        assert!(
-            !out.iter()
-                .any(|r| matches!(r, ClientRequest::SetAgentPinned { .. })),
-            "slow second click is a plain attach, not a pin toggle"
-        );
+        assert_eq!(app.focus, Focus::Sessions, "slow click keeps list focus");
+        assert!(!app.term_locked, "slow click never takes the input lock");
     }
 
     #[test]
@@ -3852,6 +4277,66 @@ mod tests {
         assert!(app.flash.is_none());
         assert_eq!(app.focus, Focus::Terminal);
         assert!(app.term_selection.is_some_and(|s| s.dragging));
+    }
+
+    #[test]
+    fn alt_click_on_file_path_resolves_against_attached_worktree() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+
+        // Attach a1 (worktree /tmp/demo); the printed path doesn't exist
+        // there, so the click reports it instead of spawning an editor.
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        let mut term = AttachedTerm::new(sref, 80, 24);
+        term.parser.process(b"edited src/nope.rs:12 just now");
+        app.term = Some(term);
+        app.term_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        app.hits.push((app.term_area, HitTarget::TerminalPane));
+        app.term_file_links =
+            crate::links::visible_file_links(app.term.as_ref().unwrap().parser.screen());
+        assert_eq!(app.term_file_links.len(), 1);
+
+        let alt = |column| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: 0,
+            modifiers: KeyModifiers::ALT,
+        };
+
+        app.focus = Focus::Projects;
+        handle_mouse(&mut app, alt(9), &mut out);
+        assert_eq!(app.flash.as_deref(), Some("file not found: src/nope.rs"));
+        assert!(app.vim.is_none());
+        assert_eq!(app.focus, Focus::Projects, "the click is swallowed");
+        assert!(app.term_selection.is_none(), "no selection armed");
+    }
+
+    #[test]
+    fn resolve_file_link_handles_diff_prefixes_and_absolutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.rs"), "").unwrap();
+
+        assert_eq!(
+            resolve_file_link(root, "src/app.rs").as_deref(),
+            Some("src/app.rs"),
+            "relative paths stay relative (editor cwd is the worktree)"
+        );
+        assert_eq!(
+            resolve_file_link(root, "a/src/app.rs").as_deref(),
+            Some("src/app.rs"),
+            "git-diff a/ prefix is stripped when the raw path is missing"
+        );
+        let abs = root.join("src/app.rs");
+        assert_eq!(
+            resolve_file_link(root, abs.to_str().unwrap()).as_deref(),
+            abs.to_str(),
+            "absolute paths pass through"
+        );
+        assert_eq!(resolve_file_link(root, "src/nope.rs"), None);
+        assert_eq!(resolve_file_link(root, "src"), None, "directories don't open");
     }
 
     /// Mirror ui::draw's splitter registration for a 120x35 body with the
@@ -5606,5 +6091,291 @@ mod tests {
             panic!("settings closed");
         };
         assert!(view.area.width > 0, "draw writes hit-test area");
+    }
+
+    // ---- `f` fuzzy file finder ----
+
+    fn finder(app: &App) -> &crate::app::FileFinder {
+        match &app.overlay {
+            Some(Overlay::Files(f)) => f,
+            other => panic!("expected file finder overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn f_opens_file_finder_listing_tracked_and_untracked() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        std::fs::write(repo.join("fresh.txt"), "hello\n").unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE, &mut out);
+        let files = &finder(&app).files;
+        assert!(files.contains(&"a.txt".to_string()), "{files:?}");
+        assert!(files.contains(&"fresh.txt".to_string()), "{files:?}");
+        // The empty query shows everything.
+        assert_eq!(finder(&app).matches.len(), files.len());
+        assert!(out.is_empty(), "opening the finder sends nothing");
+
+        // Typing narrows to the fuzzy matches.
+        for c in ['f', 'r'] {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(finder(&app).matches.len(), 1, "fr matches only fresh.txt");
+        assert_eq!(finder(&app).selected_path(), Some("fresh.txt"));
+
+        // Enter copies the selected path and closes.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "enter closes the finder");
+        assert_eq!(app.flash.as_deref(), Some("copied fresh.txt"));
+    }
+
+    #[test]
+    fn file_finder_escape_clears_query_then_closes() {
+        let mut app = App::new();
+        app.overlay = Some(Overlay::Files(FileFinder::new(
+            "/nonexistent-nebula-finder-test".into(),
+            "main".into(),
+            vec!["src/alpha.rs".into(), "src/beta.rs".into()],
+        )));
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
+        assert_eq!(finder(&app).matches.len(), 1, "b matches only beta.rs");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert_eq!(finder(&app).query, "", "first Esc clears the query");
+        assert_eq!(finder(&app).matches.len(), 2, "cleared query shows all");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "second Esc closes the finder");
+    }
+
+    #[test]
+    fn f_without_worktree_flashes() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.flash.as_deref(), Some("no worktree selected"));
+    }
+
+    #[test]
+    fn file_finder_renders_query_row_and_matches() {
+        let mut app = App::new();
+        app.overlay = Some(Overlay::Files(FileFinder::new(
+            "/nonexistent-nebula-finder-test".into(),
+            "main".into(),
+            vec!["src/alpha.rs".into(), "src/beta.rs".into()],
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Find file — main (2)"), "title:\n{text}");
+        assert!(text.contains("type to filter…"), "query hint:\n{text}");
+        assert!(text.contains("src/alpha.rs"), "rows rendered:\n{text}");
+        let fin = finder(&app);
+        assert!(fin.area.width > 0, "draw writes hit-test area");
+        assert!(fin.list_area.height > 0, "draw writes list area");
+    }
+
+    // ---- `F` find in files + editor modal ----
+
+    fn grep_view(app: &App) -> &crate::app::GrepView {
+        match &app.overlay {
+            Some(Overlay::Grep(v)) => v,
+            other => panic!("expected grep overlay, got {other:?}"),
+        }
+    }
+
+    fn fake_grep_view(hits: Vec<crate::grep_search::GrepHit>) -> GrepView {
+        let mut view = GrepView::new(
+            "/nonexistent-nebula-grep-test".into(),
+            "main".into(),
+            "vim".into(),
+        );
+        view.query = "zz".into();
+        view.hits = hits;
+        view
+    }
+
+    #[test]
+    fn shift_f_opens_grep_and_typing_searches() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        std::fs::write(repo.join("hay.txt"), "one\nneedle here\n").unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('F'), KeyModifiers::SHIFT, &mut out);
+        assert!(grep_view(&app).hits.is_empty(), "opens with no results");
+        assert!(out.is_empty(), "opening the overlay sends nothing");
+
+        for c in "needle".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        let view = grep_view(&app);
+        assert_eq!(view.hits.len(), 1, "{:?}", view.hits);
+        assert_eq!(view.hits[0].path, "hay.txt");
+        assert_eq!(view.hits[0].line, 2);
+        assert_eq!(view.hits[0].text, "needle here");
+
+        // Two-stage escape: clear the query, then close.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert_eq!(grep_view(&app).query, "", "first Esc clears the query");
+        assert!(
+            grep_view(&app).hits.is_empty(),
+            "cleared query shows no hits"
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "second Esc closes the overlay");
+    }
+
+    #[test]
+    fn shift_f_without_worktree_flashes() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('F'), KeyModifiers::SHIFT, &mut out);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.flash.as_deref(), Some("no worktree selected"));
+    }
+
+    #[test]
+    fn grep_enter_spawns_editor_and_ctrl_q_closes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.vim_tx = Some(tx);
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('F'), KeyModifiers::SHIFT, &mut out);
+        for c in "orig".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(grep_view(&app).selected_hit().unwrap().path, "a.txt");
+        // A shell stands in for vim (`sh +1 a.txt` still spawns fine).
+        if let Some(Overlay::Grep(v)) = &mut app.overlay {
+            v.editor = "/bin/sh".into();
+        }
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let vim = app.vim.as_ref().expect("enter spawns the editor modal");
+        assert_eq!(vim.title, "a.txt:1");
+        assert_eq!(vim.generation, 1);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Grep(_))),
+            "the grep overlay stays open under the editor"
+        );
+
+        // With the modal open, keys forward to the editor — q must not quit.
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE, &mut out);
+        assert!(!app.should_quit, "q goes to the editor, not the app");
+        assert!(app.vim.is_some());
+
+        // Ctrl+Q is the hatch.
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL, &mut out);
+        assert!(app.vim.is_none(), "Ctrl+Q force-closes the editor");
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Grep(_))),
+            "closing the editor lands back on the results"
+        );
+    }
+
+    #[test]
+    fn stale_generation_editor_events_are_dropped() {
+        let mut app = App::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let mut vim = crate::vim_term::VimTerm::spawn_cmd(
+            "/bin/sh",
+            &["-c".into(), "sleep 30".into()],
+            dir.path(),
+            "a.txt:1".into(),
+            80,
+            24,
+            2,
+            tx,
+        )
+        .unwrap();
+        vim.kill();
+        app.vim = Some(vim);
+
+        // Output and exit stamped with a previous spawn's generation: ignored.
+        handle_vim_event(
+            &mut app,
+            VimEvent::Output {
+                generation: 1,
+                data: b"stale".to_vec(),
+            },
+        );
+        handle_vim_event(&mut app, VimEvent::Exited { generation: 1 });
+        assert!(app.vim.is_some(), "stale exit must not close a new editor");
+        assert!(
+            !app.vim.as_ref().unwrap().parser.screen().contents().contains("stale"),
+            "stale output must not reach the new editor's screen"
+        );
+
+        // The current generation's exit closes the modal.
+        handle_vim_event(&mut app, VimEvent::Exited { generation: 2 });
+        assert!(app.vim.is_none());
+    }
+
+    #[test]
+    fn grep_overlay_renders_hits_and_editor_modal_renders_on_top() {
+        let mut app = App::new();
+        app.overlay = Some(Overlay::Grep(fake_grep_view(vec![
+            crate::grep_search::GrepHit {
+                path: "src/alpha.rs".into(),
+                line: 3,
+                text: "let zz = 1;".into(),
+            },
+            crate::grep_search::GrepHit {
+                path: "src/beta.rs".into(),
+                line: 14,
+                text: "zz += 1;".into(),
+            },
+        ])));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Find in files — main (2 hits)"), "title:\n{text}");
+        assert!(text.contains("src/alpha.rs:3"), "hit location:\n{text}");
+        assert!(text.contains("let zz = 1;"), "hit text:\n{text}");
+        let view = grep_view(&app);
+        assert!(view.area.width > 0, "draw writes hit-test area");
+        assert!(view.list_area.height > 0, "draw writes list area");
+
+        // Spawn an editor modal: it draws on top and gets its rect written
+        // back for the PTY resize sync.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let mut vim = crate::vim_term::VimTerm::spawn_cmd(
+            "/bin/sh",
+            &["-c".into(), "sleep 30".into()],
+            dir.path(),
+            "src/alpha.rs:3".into(),
+            80,
+            24,
+            1,
+            tx,
+        )
+        .unwrap();
+        vim.kill();
+        app.vim = Some(vim);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("src/alpha.rs:3"), "modal title:\n{text}");
+        assert!(text.contains("Ctrl+Q: force close"), "hatch hint:\n{text}");
+        let vim = app.vim.as_ref().unwrap();
+        assert!(vim.area.width > 0, "draw writes the editor rect");
+        sync_vim_size(&mut app);
+        let vim = app.vim.as_ref().unwrap();
+        assert_eq!(
+            (vim.cols, vim.rows),
+            (vim.area.width, vim.area.height),
+            "sync resizes the PTY to the drawn rect"
+        );
     }
 }

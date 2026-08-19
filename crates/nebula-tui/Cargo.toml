@@ -17,6 +17,7 @@ ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tui-term = "0.2"
 vt100 = "0.15"
+portable-pty = "0.9"
 futures = "0.3"
 
 [dev-dependencies]
