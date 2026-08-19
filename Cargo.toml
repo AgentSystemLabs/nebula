@@ -34,6 +34,8 @@ directories = "5"
 
 [profile.release]
 lto = "thin"
-strip = true
+# Keep the symbol table (drop only debug info) so the crash-log panic
+# backtraces show function names instead of bare addresses.
+strip = "debuginfo"
 opt-level = "z"
 codegen-units = 1
