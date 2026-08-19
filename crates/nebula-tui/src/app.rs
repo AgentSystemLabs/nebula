@@ -720,6 +720,9 @@ pub struct App {
     /// Session under the cursor as of the last draw, so the RECENT-expiry
     /// tick can re-anchor `sel_session` after rows regroup underneath it.
     pub drawn_session: Option<AgentId>,
+    /// Active color theme. From config (`theme`); the event loop refreshes
+    /// it when the setting changes.
+    pub theme: crate::theme::Theme,
 }
 
 impl Default for App {
@@ -766,6 +769,7 @@ impl App {
             is_remote: nebula_core::host::is_remote_session(),
             recent_window_ms: crate::config::DEFAULT_RECENT_WINDOW_MS,
             drawn_session: None,
+            theme: crate::theme::Theme::default(),
         }
     }
 

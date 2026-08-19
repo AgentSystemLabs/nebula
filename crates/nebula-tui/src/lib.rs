@@ -8,6 +8,7 @@ pub mod ipc;
 pub mod keys;
 pub mod links;
 pub mod raw_attach;
+pub mod theme;
 pub mod ui;
 
 use anyhow::Result;

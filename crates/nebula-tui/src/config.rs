@@ -29,6 +29,7 @@ pub enum SettingKind {
     PaletteEnterAttaches,
     GitInitOnCreate,
     RecentWindow,
+    Theme,
 }
 
 pub const SETTINGS: &[SettingSpec] = &[
@@ -46,6 +47,11 @@ pub const SETTINGS: &[SettingSpec] = &[
         kind: SettingKind::RecentWindow,
         label: "Recent window",
         hint: "How long unpinned sessions stay in the RECENT group",
+    },
+    SettingSpec {
+        kind: SettingKind::Theme,
+        label: "Color theme",
+        hint: "Accent colors used across the panels and overlays",
     },
 ];
 
@@ -65,6 +71,9 @@ pub struct Config {
     /// changed: "5m", "10m", "30m", "1h", "24h" (any `<n>m`/`<n>h` works).
     /// "off" disables the group. Malformed values fall back to 30m.
     pub recent_window: String,
+    /// Color theme name (see `theme::THEMES`). Unknown names fall back to
+    /// the default theme.
+    pub theme: String,
 }
 
 impl Default for Config {
@@ -73,6 +82,7 @@ impl Default for Config {
             palette_enter_attaches: true,
             git_init_on_create: true,
             recent_window: "30m".into(),
+            theme: "default".into(),
         }
     }
 }
@@ -115,6 +125,7 @@ impl Config {
             "recent_window".into(),
             serde_json::json!(self.recent_window),
         );
+        obj.insert("theme".into(), serde_json::json!(self.theme));
         let mut bytes = serde_json::to_vec_pretty(&root)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
         if !bytes.ends_with(b"\n") {
@@ -131,11 +142,17 @@ impl Config {
         parse_window_ms(&self.recent_window).unwrap_or(DEFAULT_RECENT_WINDOW_MS)
     }
 
+    /// `theme` resolved to the palette the UI draws with.
+    pub fn theme(&self) -> crate::theme::Theme {
+        crate::theme::Theme::by_name(&self.theme)
+    }
+
     pub fn value_label(&self, kind: SettingKind) -> String {
         match kind {
             SettingKind::PaletteEnterAttaches => on_off(self.palette_enter_attaches).into(),
             SettingKind::GitInitOnCreate => on_off(self.git_init_on_create).into(),
             SettingKind::RecentWindow => self.recent_window.clone(),
+            SettingKind::Theme => self.theme.clone(),
         }
     }
 
@@ -155,6 +172,10 @@ impl Config {
             SettingKind::RecentWindow => {
                 let step = if delta == 0 { 1 } else { delta };
                 self.recent_window = cycle_choice(&self.recent_window, RECENT_WINDOWS, step).into();
+            }
+            SettingKind::Theme => {
+                let step = if delta == 0 { 1 } else { delta };
+                self.theme = cycle_choice(&self.theme, crate::theme::THEMES, step).into();
             }
         }
     }
@@ -285,6 +306,26 @@ mod tests {
         assert_eq!(cfg.recent_window, "30m");
         cfg.cycle(2, -1);
         assert_eq!(cfg.recent_window, "10m");
+    }
+
+    #[test]
+    fn theme_cycles_through_presets_and_resolves() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.theme, "default");
+        assert_eq!(cfg.theme(), crate::theme::Theme::default());
+        let theme_row = SETTINGS
+            .iter()
+            .position(|s| s.kind == SettingKind::Theme)
+            .unwrap();
+        cfg.cycle(theme_row, 1);
+        assert_eq!(cfg.theme, "ocean");
+        assert_ne!(cfg.theme(), crate::theme::Theme::default());
+        cfg.cycle(theme_row, -1);
+        assert_eq!(cfg.theme, "default");
+        // Unknown names (hand-edited config) cycle from the start and
+        // resolve to the default palette rather than erroring.
+        cfg.theme = "sparkle".into();
+        assert_eq!(cfg.theme(), crate::theme::Theme::default());
     }
 
     #[test]

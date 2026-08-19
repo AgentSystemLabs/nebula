@@ -98,7 +98,9 @@ async fn main_loop(
 ) -> Result<()> {
     let mut app = App::new();
     app.conn = ConnState::Connected;
-    app.recent_window_ms = crate::config::Config::load().recent_window_ms();
+    let cfg = crate::config::Config::load();
+    app.recent_window_ms = cfg.recent_window_ms();
+    app.theme = cfg.theme();
     let mut input = crossterm::event::EventStream::new();
     let mut out: Vec<ClientRequest> = Vec::new();
     let mut next_draw = tokio::time::Instant::now();
@@ -1139,6 +1141,7 @@ fn apply_setting_at(app: &mut App, index: usize, delta: i32) {
         return;
     }
     app.recent_window_ms = cfg.recent_window_ms();
+    app.theme = cfg.theme();
 }
 
 fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientRequest>) {

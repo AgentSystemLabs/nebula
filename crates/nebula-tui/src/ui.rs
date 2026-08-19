@@ -3,9 +3,10 @@
 
 use crate::app::{App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, ProjectRow};
 use crate::git_diff::{classify_diff_line, DiffLineKind};
+use crate::theme::Theme;
 use nebula_core::{Agent, AgentStatus, SessionRef};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
@@ -57,6 +58,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_overlay(f: &mut Frame, app: &mut App) {
+    let th = app.theme;
     let Some(overlay) = app.overlay.clone() else {
         return;
     };
@@ -97,12 +99,12 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Clear, area);
             let mut block = Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan));
+                .border_style(Style::default().fg(th.accent));
             if let Some(title) = &menu.title {
                 block = block.title(Span::styled(
                     format!(" {title} "),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(th.accent)
                         .add_modifier(Modifier::BOLD),
                 ));
             }
@@ -111,7 +113,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             for (i, item) in menu.items.iter().enumerate() {
                 let Some(row) = row_rect(inner, i) else { break };
                 let mut style = if item.destructive {
-                    Style::default().fg(Color::Red)
+                    Style::default().fg(th.err)
                 } else {
                     Style::default()
                 };
@@ -133,10 +135,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red))
+                .border_style(Style::default().fg(th.err))
                 .title(Span::styled(
                     format!(" {} ", confirm.title),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(th.err),
                 ));
             let inner = block.inner(area);
             f.render_widget(block, area);
@@ -144,9 +146,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 Line::from(confirm.message.clone()),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("[Enter/y] confirm", Style::default().fg(Color::Red)),
+                    Span::styled("[Enter/y] confirm", Style::default().fg(th.err)),
                     Span::raw("   "),
-                    Span::styled("[Esc/n] cancel", Style::default().fg(Color::DarkGray)),
+                    Span::styled("[Esc/n] cancel", Style::default().fg(th.dim)),
                 ]),
             ];
             f.render_widget(Paragraph::new(lines), inner);
@@ -159,10 +161,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
+                .border_style(Style::default().fg(th.accent))
                 .title(Span::styled(
                     format!(" {} ", prompt.title),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(th.accent),
                 ));
             let inner = block.inner(area);
             f.render_widget(block, area);
@@ -182,12 +184,12 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             let mut lines = vec![
                 Line::from(Span::styled(
                     prompt.label.clone(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(th.dim),
                 )),
                 Line::from(vec![
                     Span::raw("> "),
-                    Span::styled(shown_input, Style::default().fg(Color::White)),
-                    Span::styled("█", Style::default().fg(Color::White)),
+                    Span::styled(shown_input, Style::default().fg(th.text)),
+                    Span::styled("█", Style::default().fg(th.text)),
                 ]),
             ];
             if !prompt.candidates.is_empty() {
@@ -207,7 +209,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 }
                 lines.push(Line::from(Span::styled(
                     truncate(&list, inner.width as usize),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(th.warn),
                 )));
             }
             lines.push(Line::from(""));
@@ -218,7 +220,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             };
             lines.push(Line::from(Span::styled(
                 hint,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(th.dim),
             )));
             f.render_widget(Paragraph::new(lines), inner);
         }
@@ -227,11 +229,11 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
+                .border_style(Style::default().fg(th.accent))
                 .title(" Help ");
             let inner = block.inner(area);
             f.render_widget(block, area);
-            let dim = Style::default().fg(Color::DarkGray);
+            let dim = Style::default().fg(th.dim);
             let lines: Vec<Line> = [
                 ("Tab / Shift+Tab", "cycle focus between panels"),
                 ("h/l or ←/→", "move focus left / right (Ctrl+←/→ too)"),
@@ -269,7 +271,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             .iter()
             .map(|(k, v)| {
                 Line::from(vec![
-                    Span::styled(format!(" {k:<16}"), Style::default().fg(Color::Cyan)),
+                    Span::styled(format!(" {k:<16}"), Style::default().fg(th.accent)),
                     Span::styled((*v).to_string(), dim),
                 ])
             })
@@ -285,22 +287,22 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
+                .border_style(Style::default().fg(th.accent))
                 .title(Span::styled(
                     " Settings ",
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(th.accent)
                         .add_modifier(Modifier::BOLD),
                 ));
             let inner = block.inner(area);
             f.render_widget(block, area);
 
-            let dim = Style::default().fg(Color::DarkGray);
+            let dim = Style::default().fg(th.dim);
             let mut lines: Vec<Line> = Vec::new();
             for (i, spec) in crate::config::SETTINGS.iter().enumerate() {
                 let value = cfg.value_label(spec.kind);
                 let mut label_style = Style::default();
-                let mut value_style = Style::default().fg(Color::Cyan);
+                let mut value_style = Style::default().fg(th.accent);
                 if i == view.selected {
                     label_style = label_style.add_modifier(Modifier::REVERSED);
                     value_style = value_style.add_modifier(Modifier::REVERSED);
@@ -345,7 +347,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             } else {
                 format!("Files ({}/{})", view.matches.len(), view.files.len())
             };
-            let block = panel_block(&files_title, true);
+            let block = panel_block(&files_title, true, th);
             let files_inner = block.inner(files_a);
             f.render_widget(block, files_a);
 
@@ -354,12 +356,12 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 let line = if view.filter.is_empty() {
                     Line::from(Span::styled(
                         "type to filter…",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(th.dim),
                     ))
                 } else {
                     Line::from(vec![
                         Span::raw(view.filter.clone()),
-                        Span::styled("█", Style::default().fg(Color::Cyan)),
+                        Span::styled("█", Style::default().fg(th.accent)),
                     ])
                 };
                 f.render_widget(Paragraph::new(line), filter_area);
@@ -375,7 +377,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     f.render_widget(
                         Paragraph::new(Span::styled(
                             "no matches",
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(th.dim),
                         )),
                         row_area,
                     );
@@ -388,10 +390,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 };
                 let file = &view.files[m.file];
                 let status_color = match (file.xy[0], file.xy[1]) {
-                    ('?', '?') | ('A', _) => Color::Green,
-                    ('D', _) | (_, 'D') => Color::Red,
-                    ('R', _) | ('C', _) => Color::Cyan,
-                    _ => Color::Yellow,
+                    ('?', '?') | ('A', _) => th.ok,
+                    ('D', _) | (_, 'D') => th.err,
+                    ('R', _) | ('C', _) => th.accent,
+                    _ => th.warn,
                 };
                 let budget = (list_inner.width as usize).saturating_sub(3);
                 let mut spans = vec![Span::styled(
@@ -400,17 +402,17 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 )];
                 let shown = truncate(&file.path, budget);
                 let used = shown.chars().count();
-                spans.extend(fuzzy_highlight_spans(&shown, &m.positions));
+                spans.extend(fuzzy_highlight_spans(&shown, &m.positions, th));
                 if let Some(orig) = &file.orig_path {
                     let rest = budget.saturating_sub(used);
                     if rest > 3 {
                         spans.push(Span::styled(
                             truncate(&format!(" ← {orig}"), rest),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(th.dim),
                         ));
                     }
                 }
-                render_row(f, row_area, spans, i == view.selected, true);
+                render_row(f, row_area, spans, i == view.selected, true, th);
             }
 
             // Right: the selected file's diff, scrolled.
@@ -419,7 +421,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 &format!("{}: {}", view.branch, sel_path),
                 (diff_a.width as usize).saturating_sub(4),
             );
-            let mut block = panel_block(&title, true);
+            let mut block = panel_block(&title, true, th);
             let diff_inner = block.inner(diff_a);
             let max_scroll = (view.diff_line_count as u16).saturating_sub(diff_inner.height.max(1));
             let scroll = view.scroll.min(max_scroll);
@@ -427,7 +429,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 block = block.title_bottom(
                     Line::from(Span::styled(
                         format!(" {}/{} ", scroll + 1, view.diff_line_count),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(th.dim),
                     ))
                     .right_aligned(),
                 );
@@ -438,10 +440,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 .lines()
                 .map(|l| {
                     let style = match classify_diff_line(l) {
-                        DiffLineKind::Add => Style::default().fg(Color::Green),
-                        DiffLineKind::Remove => Style::default().fg(Color::Red),
-                        DiffLineKind::Hunk => Style::default().fg(Color::Cyan),
-                        DiffLineKind::Header => Style::default().fg(Color::DarkGray),
+                        DiffLineKind::Add => Style::default().fg(th.ok),
+                        DiffLineKind::Remove => Style::default().fg(th.err),
+                        DiffLineKind::Hunk => Style::default().fg(th.accent),
+                        DiffLineKind::Header => Style::default().fg(th.dim),
                         DiffLineKind::Context => Style::default(),
                     };
                     Line::from(Span::styled(l.to_string(), style))
@@ -473,11 +475,11 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             };
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
+                .border_style(Style::default().fg(th.accent))
                 .title(Span::styled(
                     title,
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(th.accent)
                         .add_modifier(Modifier::BOLD),
                 ));
             let inner = block.inner(area);
@@ -488,12 +490,12 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 let line = if palette.query.is_empty() {
                     Line::from(Span::styled(
                         "type to search…",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(th.dim),
                     ))
                 } else {
                     Line::from(vec![
                         Span::raw(palette.query.clone()),
-                        Span::styled("█", Style::default().fg(Color::Cyan)),
+                        Span::styled("█", Style::default().fg(th.accent)),
                     ])
                 };
                 f.render_widget(Paragraph::new(line), query_area);
@@ -509,7 +511,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     f.render_widget(
                         Paragraph::new(Span::styled(
                             "no matches",
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(th.dim),
                         )),
                         row_area,
                     );
@@ -526,11 +528,11 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 // stands out against all three.
                 let (badge, kind_color) = match &item.target {
                     PaletteTarget::Project(_) => ("📁 ", None),
-                    PaletteTarget::Worktree(_) => ("🌳 ", Some(Color::Green)),
-                    PaletteTarget::Session(_) => ("🤖 ", Some(Color::Magenta)),
+                    PaletteTarget::Worktree(_) => ("🌳 ", Some(th.ok)),
+                    PaletteTarget::Session(_) => ("🤖 ", Some(th.special)),
                 };
                 let base_fg = if item.archived {
-                    Some(Color::DarkGray)
+                    Some(th.dim)
                 } else {
                     kind_color
                 };
@@ -550,7 +552,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     &m.positions[..]
                 };
                 let mut spans = vec![Span::raw(badge)];
-                let mut text_spans = fuzzy_highlight_spans(&shown, positions);
+                let mut text_spans = fuzzy_highlight_spans(&shown, positions, th);
                 if let Some(fg) = base_fg {
                     for s in &mut text_spans {
                         if s.style.fg.is_none() {
@@ -559,7 +561,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     }
                 }
                 spans.extend(text_spans);
-                render_row(f, row_area, spans, i == palette.selected, true);
+                render_row(f, row_area, spans, i == palette.selected, true, th);
             }
 
             // Write-back (draw works on a clone): rects for mouse
@@ -590,79 +592,87 @@ fn centered_rect_pct(frame: Rect, pct_w: u16, pct_h: u16) -> Rect {
 
 /// Bordered panel frame. Focus has to be unmissable, so the focused panel
 /// differs in shape as well as color: a THICK border and a solid
-/// cyan-background title chip, versus a thin dim border and plain title.
-fn panel_block(title: &str, focused: bool) -> Block<'_> {
+/// accent-background title chip, versus a thin dim border and plain title.
+fn panel_block(title: &str, focused: bool, th: Theme) -> Block<'_> {
     if focused {
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Thick)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(th.accent))
             .title(Span::styled(
                 format!(" {title} "),
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .fg(th.on_accent)
+                    .bg(th.accent)
                     .add_modifier(Modifier::BOLD),
             ))
     } else {
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
+            .border_style(Style::default().fg(th.dim))
             .title(Span::styled(
                 format!(" {title} "),
-                Style::default().fg(Color::Gray),
+                Style::default().fg(th.muted),
             ))
     }
 }
 
-fn status_dot(status: Option<AgentStatus>) -> Span<'static> {
+fn status_dot(status: Option<AgentStatus>, th: Theme) -> Span<'static> {
     match status {
-        Some(AgentStatus::Fresh) => Span::styled("● ", Style::default().fg(Color::DarkGray)),
-        Some(AgentStatus::Running) => Span::styled("● ", Style::default().fg(Color::Yellow)),
-        Some(AgentStatus::Finished) => Span::styled("● ", Style::default().fg(Color::Green)),
-        Some(AgentStatus::NeedsFeedback) => Span::styled("● ", Style::default().fg(Color::Red)),
-        Some(AgentStatus::Terminated) => Span::styled("● ", Style::default().fg(Color::Magenta)),
-        Some(AgentStatus::Disconnected) => Span::styled("○ ", Style::default().fg(Color::DarkGray)),
-        None => Span::styled("○ ", Style::default().fg(Color::DarkGray)),
+        Some(AgentStatus::Fresh) => Span::styled("● ", Style::default().fg(th.dim)),
+        Some(AgentStatus::Running) => Span::styled("● ", Style::default().fg(th.warn)),
+        Some(AgentStatus::Finished) => Span::styled("● ", Style::default().fg(th.ok)),
+        Some(AgentStatus::NeedsFeedback) => Span::styled("● ", Style::default().fg(th.err)),
+        Some(AgentStatus::Terminated) => Span::styled("● ", Style::default().fg(th.special)),
+        Some(AgentStatus::Disconnected) => Span::styled("○ ", Style::default().fg(th.dim)),
+        None => Span::styled("○ ", Style::default().fg(th.dim)),
     }
 }
 
 /// Base style for a whole list row. Selection reads as a full-width bar so
 /// the active project → worktree → session path stays visible at a glance:
 /// bright (reversed) in the focused panel, dim gray in unfocused panels.
-fn row_bar(selected: bool, focused: bool) -> Style {
+fn row_bar(selected: bool, focused: bool, th: Theme) -> Style {
     if selected && focused {
         Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
     } else if selected {
         Style::default()
-            .bg(Color::DarkGray)
-            .fg(Color::White)
+            .bg(th.dim)
+            .fg(th.text)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     }
 }
 
-/// Render one list row as a full-width bar. DarkGray spans (idle dots,
+/// Render one list row as a full-width bar. Dim spans (idle dots,
 /// archived names) would vanish against the unfocused-selection bar, so
-/// they get lifted to Gray there.
-fn render_row(f: &mut Frame, area: Rect, mut spans: Vec<Span>, selected: bool, focused: bool) {
+/// they get lifted to muted there.
+fn render_row(
+    f: &mut Frame,
+    area: Rect,
+    mut spans: Vec<Span>,
+    selected: bool,
+    focused: bool,
+    th: Theme,
+) {
     if selected && !focused {
         for s in &mut spans {
-            if s.style.fg == Some(Color::DarkGray) {
-                s.style.fg = Some(Color::Gray);
+            if s.style.fg == Some(th.dim) {
+                s.style.fg = Some(th.muted);
             }
         }
     }
     f.render_widget(
-        Paragraph::new(Line::from(spans)).style(row_bar(selected, focused)),
+        Paragraph::new(Line::from(spans)).style(row_bar(selected, focused, th)),
         area,
     );
 }
 
 fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
+    let th = app.theme;
     let focused = app.focus == Focus::Projects;
-    let block = panel_block("📁 Projects", focused);
+    let block = panel_block("📁 Projects", focused, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -671,11 +681,11 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
             Paragraph::new(vec![
                 Line::from(Span::styled(
                     "No projects yet",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(th.dim),
                 )),
                 Line::from(Span::styled(
                     "n: add project",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(th.dim),
                 )),
             ]),
             inner,
@@ -709,12 +719,12 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
         };
         let spans = match row {
             ProjectRow::Project(_) => vec![
-                status_dot(*roll),
+                status_dot(*roll, th),
                 Span::raw(truncate(text, inner.width.saturating_sub(2) as usize)),
             ],
-            ProjectRow::Divider(_) => divider_spans(text, inner.width),
+            ProjectRow::Divider(_) => divider_spans(text, inner.width, th),
         };
-        render_row(f, row_area, spans, row_idx == app.sel_project, focused);
+        render_row(f, row_area, spans, row_idx == app.sel_project, focused, th);
         app.hits.push((row_area, HitTarget::Project(row_idx)));
     }
     app.hits.push((inner, HitTarget::PanelBg(Focus::Projects)));
@@ -722,9 +732,9 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
 
 /// A divider line, with the group label woven in when present:
 /// `─ label ────────`.
-fn divider_spans(label: &str, width: u16) -> Vec<Span<'static>> {
+fn divider_spans(label: &str, width: u16, th: Theme) -> Vec<Span<'static>> {
     let w = width as usize;
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(th.dim);
     if label.is_empty() {
         return vec![Span::styled("─".repeat(w), dim)];
     }
@@ -735,7 +745,7 @@ fn divider_spans(label: &str, width: u16) -> Vec<Span<'static>> {
         Span::styled(
             label,
             Style::default()
-                .fg(Color::Gray)
+                .fg(th.muted)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!(" {}", "─".repeat(tail)), dim),
@@ -743,8 +753,9 @@ fn divider_spans(label: &str, width: u16) -> Vec<Span<'static>> {
 }
 
 fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
+    let th = app.theme;
     let focused = app.focus == Focus::Worktrees;
-    let block = panel_block("🌳 Worktrees", focused);
+    let block = panel_block("🌳 Worktrees", focused, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -760,7 +771,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             "n: new worktree"
         };
         f.render_widget(
-            Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(hint).style(Style::default().fg(th.dim)),
             inner,
         );
         app.hits.push((inner, HitTarget::PanelBg(Focus::Worktrees)));
@@ -776,13 +787,13 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         let Some(row_area) = row_rect(inner, screen_row) else {
             break;
         };
-        let mut spans = vec![status_dot(*roll)];
+        let mut spans = vec![status_dot(*roll, th)];
         if *is_main {
             let max = (inner.width as usize).saturating_sub(2 + ROOT_BADGE.chars().count());
             spans.push(Span::raw(truncate(branch, max)));
             spans.push(Span::styled(
                 ROOT_BADGE,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(th.dim),
             ));
         } else {
             spans.push(Span::raw(truncate(
@@ -790,7 +801,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 inner.width.saturating_sub(2) as usize,
             )));
         }
-        render_row(f, row_area, spans, i == app.sel_worktree, focused);
+        render_row(f, row_area, spans, i == app.sel_worktree, focused, th);
         app.hits.push((row_area, HitTarget::Worktree(i)));
         screen_row += 1;
         if *is_main && worktrees.len() > 1 {
@@ -798,7 +809,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 f.render_widget(
                     Paragraph::new(Span::styled(
                         "─".repeat(inner.width as usize),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(th.dim),
                     )),
                     r,
                 );
@@ -810,15 +821,16 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
+    let th = app.theme;
     let focused = app.focus == Focus::Sessions;
-    let block = panel_block("🤖 Sessions", focused);
+    let block = panel_block("🤖 Sessions", focused, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let sessions = app.visible_sessions();
     let (pinned_count, recent_count, unpinned_count, archived_count) = app.session_group_counts();
     let active_count = pinned_count + recent_count + unpinned_count;
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(th.dim);
 
     let mut screen_row: usize = 0;
     let header = |f: &mut Frame, text: String, screen_row: &mut usize| {
@@ -904,13 +916,14 @@ fn draw_session_row(
     focused: bool,
     width: u16,
 ) {
+    let th = app.theme;
     let dot = if row.archived {
-        Span::styled("⊘ ", Style::default().fg(Color::DarkGray))
+        Span::styled("⊘ ", Style::default().fg(th.dim))
     } else {
-        status_dot(Some(row.status))
+        status_dot(Some(row.status), th)
     };
     let name_style = if row.archived {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(th.dim)
     } else {
         Style::default()
     };
@@ -923,13 +936,14 @@ fn draw_session_row(
     let name_max = (width.saturating_sub(2) as usize).saturating_sub(badge.map_or(0, str::len));
     let mut spans = vec![dot, Span::styled(truncate(&row.name, name_max), name_style)];
     if let Some(badge) = badge {
-        spans.push(Span::styled(badge, Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(badge, Style::default().fg(th.dim)));
     }
-    render_row(f, area, spans, index == app.sel_session, focused);
+    render_row(f, area, spans, index == app.sel_session, focused, th);
     app.hits.push((area, HitTarget::Session(index)));
 }
 
 fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
+    let th = app.theme;
     let focused = app.focus == Focus::Terminal;
     // Name the attached session in the title so it's clear what you're
     // looking at (and typing into) even with the sidebars collapsed.
@@ -943,7 +957,7 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         Some(_) => format!("Terminal{who}"),
         None => "Terminal".to_string(),
     };
-    let block = panel_block(&title, focused);
+    let block = panel_block(&title, focused, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.term_area = inner;
@@ -984,13 +998,13 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
                 Line::from(Span::styled(
                     "nebula",
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(th.accent)
                         .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
                     "select a session and press Enter to attach",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(th.dim),
                 )),
             ])
             .centered();
@@ -1028,19 +1042,20 @@ fn attached_session_name(app: &App) -> Option<String> {
 /// segment matching the focused panel is highlighted. Sessions/Terminal
 /// focus both highlight the session segment.
 fn breadcrumb(app: &App) -> Vec<Span<'static>> {
+    let th = app.theme;
     let seg = |name: &str, active: bool| {
         Span::styled(
             truncate(name, 20),
             if active {
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(th.accent)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(th.muted)
             },
         )
     };
-    let sep = || Span::styled(" ▸ ", Style::default().fg(Color::DarkGray));
+    let sep = || Span::styled(" ▸ ", Style::default().fg(th.dim));
 
     let mut spans = Vec::new();
     let Some(project) = app.selected_project() else {
@@ -1062,31 +1077,32 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    let th = app.theme;
     let conn = match app.conn {
-        ConnState::Connected => Span::styled("⏻ connected", Style::default().fg(Color::Green)),
-        ConnState::Disconnected => Span::styled("✗ disconnected", Style::default().fg(Color::Red)),
+        ConnState::Connected => Span::styled("⏻ connected", Style::default().fg(th.ok)),
+        ConnState::Disconnected => Span::styled("✗ disconnected", Style::default().fg(th.err)),
     };
     let hints = if let Some(flash) = &app.flash {
-        Span::styled(flash.clone(), Style::default().fg(Color::Yellow))
+        Span::styled(flash.clone(), Style::default().fg(th.warn))
     } else if matches!(&app.overlay, Some(Overlay::Diff(_))) {
         Span::styled(
             "type: filter  ↑/↓: file  ⇧↑/↓: scroll  Ctrl+d/u: page  Home/End: top/end  Esc: clear/close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(th.dim),
         )
     } else if matches!(&app.overlay, Some(Overlay::Palette(_))) {
         Span::styled(
             "type: search  ↑/↓: move  Enter: open  Esc: clear/close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(th.dim),
         )
     } else if matches!(&app.overlay, Some(Overlay::Settings(_))) {
         Span::styled(
             "↑/↓: move  Enter/Space: toggle  h/l: cycle  Esc: close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(th.dim),
         )
     } else if app.overlay.is_some() {
         Span::styled(
             "Esc: close  Enter: confirm",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(th.dim),
         )
     } else {
         let text = match app.focus {
@@ -1109,14 +1125,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 "↵: focus  n: agent  r: rename  p: pin  a: archive  d: del  /: search  m: menu  ?: help"
             }
         };
-        Span::styled(text, Style::default().fg(Color::DarkGray))
+        Span::styled(text, Style::default().fg(th.dim))
     };
     let host_style = if app.is_remote {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(th.warn)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(th.dim)
     };
     let mut spans = vec![
         Span::styled(truncate(&app.hostname, 24), host_style),
@@ -1136,12 +1152,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 /// Split a (possibly truncated) path into spans, lighting the chars the
 /// fuzzy filter matched. `positions` are ascending char indices into the
 /// untruncated path; anything cut off by truncation simply isn't lit.
-fn fuzzy_highlight_spans(shown: &str, positions: &[usize]) -> Vec<Span<'static>> {
+fn fuzzy_highlight_spans(shown: &str, positions: &[usize], th: Theme) -> Vec<Span<'static>> {
     if positions.is_empty() {
         return vec![Span::raw(shown.to_string())];
     }
     let hl = Style::default()
-        .fg(Color::Cyan)
+        .fg(th.accent)
         .add_modifier(Modifier::BOLD);
     let mut spans = Vec::new();
     let mut run = String::new();
