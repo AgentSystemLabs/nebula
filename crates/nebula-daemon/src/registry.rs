@@ -269,6 +269,8 @@ impl Daemon {
             sort_order: self.store.next_project_sort_order()?,
             divider_after: false,
             divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
         };
         self.store.insert_project(&project)?;
         self.broadcast(ServerEvent::EntityUpserted {
@@ -286,6 +288,7 @@ impl Daemon {
                 path: entry.path.clone(),
                 branch: entry.branch,
                 is_main: first,
+                pinned: false,
                 sort_order: 0,
             };
             first = false;
@@ -299,7 +302,20 @@ impl Daemon {
 
     pub fn remove_project(self: &Arc<Self>, id: &ProjectId) -> Result<()> {
         // Kill any live sessions under this project first.
-        let (_, worktrees, agents, terminals) = self.store.load_tree()?;
+        let (projects, worktrees, agents, terminals) = self.store.load_tree()?;
+        // The leading divider belongs to the list, not the top project:
+        // removing that project hands it down to the next one.
+        if let (Some(first), Some(second)) = (projects.first(), projects.get(1)) {
+            if &first.id == id && first.divider_before {
+                let mut heir = second.clone();
+                heir.divider_before = true;
+                heir.divider_before_label = first.divider_before_label.clone();
+                self.store.set_project_position(&heir)?;
+                self.broadcast(ServerEvent::EntityUpserted {
+                    entity: Entity::Project(heir),
+                });
+            }
+        }
         let wt_ids: Vec<WorktreeId> = worktrees
             .into_iter()
             .filter(|w| &w.project_id == id)
@@ -324,8 +340,10 @@ impl Daemon {
     /// occupy rows of their own (clamped at the edges). A project steps into
     /// the gap beside a divider before it swaps with the next project, so
     /// repeated single-row moves can park it directly above or below a
-    /// divider. Sort orders are rewritten to the display index for every
-    /// project, which also normalizes legacy all-zero orders on first use.
+    /// divider — including below a divider that ends up above the whole
+    /// list (the leading divider). Sort orders are rewritten to the display
+    /// index for every project, which also normalizes legacy all-zero
+    /// orders on first use.
     pub fn move_project(self: &Arc<Self>, id: &ProjectId, delta: i64) -> Result<()> {
         let (projects, _, _, _) = self.store.load_tree()?;
         #[derive(Clone, PartialEq)]
@@ -334,6 +352,11 @@ impl Daemon {
             Divider(Option<String>),
         }
         let mut rows: Vec<Row> = Vec::new();
+        if let Some(first) = projects.first() {
+            if first.divider_before {
+                rows.push(Row::Divider(first.divider_before_label.clone()));
+            }
+        }
         for p in &projects {
             rows.push(Row::Project(p.id.clone()));
             if p.divider_after {
@@ -351,15 +374,14 @@ impl Daemon {
             let mut moved = rows.clone();
             let row = moved.remove(pos);
             moved.insert(target, row);
-            // A divider can't hang above every project, so a leading divider
-            // slides back under the first one. When that cancels the whole
-            // move (the top project stepping below its own divider), push one
-            // row further so the keystroke still lands the project across.
-            if let Some(divider @ Row::Divider(_)) = moved.first().cloned() {
-                moved.remove(0);
-                moved.insert(1, divider);
-            }
-            if moved != rows {
+            // Two dividers can't share a gap: a move that would leave them
+            // stacked (no project left between) pushes one row further so
+            // the keystroke still lands the project across, or no-ops at
+            // the edge.
+            let stacked = moved
+                .windows(2)
+                .any(|w| matches!(w, [Row::Divider(_), Row::Divider(_)]));
+            if !stacked && moved != rows {
                 break moved;
             }
             let next = (target as i64 + delta.signum()).clamp(0, rows.len() as i64 - 1) as usize;
@@ -368,18 +390,22 @@ impl Daemon {
             }
             target = next;
         };
-        let before: HashMap<ProjectId, (i64, bool, Option<String>)> = projects
-            .iter()
-            .map(|p| {
-                (
-                    p.id.clone(),
-                    (p.sort_order, p.divider_after, p.divider_label.clone()),
-                )
-            })
-            .collect();
+        type Position = (i64, bool, Option<String>, bool, Option<String>);
+        fn position(p: &Project) -> Position {
+            (
+                p.sort_order,
+                p.divider_after,
+                p.divider_label.clone(),
+                p.divider_before,
+                p.divider_before_label.clone(),
+            )
+        }
+        let before: HashMap<ProjectId, Position> =
+            projects.iter().map(|p| (p.id.clone(), position(p))).collect();
         let mut by_id: HashMap<ProjectId, Project> =
             projects.into_iter().map(|p| (p.id.clone(), p)).collect();
         let mut ordered: Vec<Project> = Vec::new();
+        let mut leading: Option<Option<String>> = None;
         for row in rows {
             match row {
                 Row::Project(pid) => {
@@ -387,28 +413,29 @@ impl Daemon {
                     project.sort_order = ordered.len() as i64;
                     project.divider_after = false;
                     project.divider_label = None;
+                    project.divider_before = false;
+                    project.divider_before_label = None;
                     ordered.push(project);
                 }
-                Row::Divider(label) => {
-                    let owner = ordered.last_mut().expect("a project always leads the rows");
-                    owner.divider_after = true;
-                    owner.divider_label = label;
-                }
+                Row::Divider(label) => match ordered.last_mut() {
+                    Some(owner) => {
+                        owner.divider_after = true;
+                        owner.divider_label = label;
+                    }
+                    // Ahead of every project: the leading divider, re-owned
+                    // by whichever project ends up on top.
+                    None => leading = Some(label),
+                },
             }
         }
+        if let Some(label) = leading {
+            let first = ordered.first_mut().expect("rows contain every project");
+            first.divider_before = true;
+            first.divider_before_label = label;
+        }
         for project in &ordered {
-            let now = (
-                project.sort_order,
-                project.divider_after,
-                project.divider_label.clone(),
-            );
-            if before.get(&project.id) != Some(&now) {
-                self.store.set_project_position(
-                    &project.id,
-                    project.sort_order,
-                    project.divider_after,
-                    project.divider_label.as_deref(),
-                )?;
+            if before.get(&project.id) != Some(&position(project)) {
+                self.store.set_project_position(project)?;
                 self.broadcast(ServerEvent::EntityUpserted {
                     entity: Entity::Project(project.clone()),
                 });
@@ -417,41 +444,52 @@ impl Daemon {
         Ok(())
     }
 
+    /// Set or clear one of a project's dividers. `before` addresses the
+    /// leading divider (drawn above the whole list) — only the first
+    /// project can carry that one.
     pub fn set_project_divider(
         self: &Arc<Self>,
         id: &ProjectId,
-        divider_after: bool,
+        before: bool,
+        present: bool,
         label: Option<String>,
     ) -> Result<()> {
         let mut project = self.store.get_project(id)?.context("project not found")?;
+        if before && present {
+            let (projects, _, _, _) = self.store.load_tree()?;
+            if projects.first().map(|p| &p.id) != Some(id) {
+                bail!("only the first project can hold the leading divider");
+            }
+        }
         // A removed divider keeps no label.
-        let label = if divider_after {
+        let label = if present {
             label.filter(|l| !l.trim().is_empty())
         } else {
             None
         };
-        if (project.divider_after, &project.divider_label) == (divider_after, &label) {
+        let slot = if before {
+            (&mut project.divider_before, &mut project.divider_before_label)
+        } else {
+            (&mut project.divider_after, &mut project.divider_label)
+        };
+        if (*slot.0, &*slot.1) == (present, &label) {
             return Ok(());
         }
-        project.divider_after = divider_after;
-        project.divider_label = label;
-        self.store.set_project_position(
-            id,
-            project.sort_order,
-            divider_after,
-            project.divider_label.as_deref(),
-        )?;
+        *slot.0 = present;
+        *slot.1 = label;
+        self.store.set_project_position(&project)?;
         self.broadcast(ServerEvent::EntityUpserted {
             entity: Entity::Project(project),
         });
         Ok(())
     }
 
-    /// Move the divider hanging under project `id` to hang under the
-    /// previous/next project (sign of `delta`; one step per call). No-op
-    /// when there is no project on that side or it already has a divider —
-    /// two dividers can't share a gap, so a neighbor's divider blocks.
-    pub fn move_divider(self: &Arc<Self>, id: &ProjectId, delta: i64) -> Result<()> {
+    /// Move project `id`'s divider (`before` picks which one) to the
+    /// neighboring gap (sign of `delta`; one step per call). The divider
+    /// under the first project can hop above it — the leading divider —
+    /// and back down. No-op past the list's edges or when the destination
+    /// gap already has a divider — two dividers can't share a gap.
+    pub fn move_divider(self: &Arc<Self>, id: &ProjectId, before: bool, delta: i64) -> Result<()> {
         if delta == 0 {
             return Ok(());
         }
@@ -459,8 +497,35 @@ impl Daemon {
         let Some(index) = projects.iter().position(|p| &p.id == id) else {
             bail!("project not found");
         };
+        let down = delta.signum() > 0;
+        if before {
+            if index != 0 || !projects[0].divider_before {
+                bail!("project has no leading divider");
+            }
+            if !down {
+                return Ok(()); // already above everything
+            }
+            // Hop from above the first project to below it.
+            if projects[0].divider_after {
+                return Ok(());
+            }
+            let label = projects[0].divider_before_label.clone();
+            self.set_project_divider(id, true, false, None)?;
+            self.set_project_divider(id, false, true, label)?;
+            return Ok(());
+        }
         if !projects[index].divider_after {
             bail!("project has no divider");
+        }
+        let label = projects[index].divider_label.clone();
+        if index == 0 && !down {
+            // Hop from below the first project to above it.
+            if projects[0].divider_before {
+                return Ok(());
+            }
+            self.set_project_divider(id, false, false, None)?;
+            self.set_project_divider(id, true, true, label)?;
+            return Ok(());
         }
         let neighbor = index as i64 + delta.signum();
         let Some(neighbor) = usize::try_from(neighbor).ok().and_then(|i| projects.get(i)) else {
@@ -469,10 +534,9 @@ impl Daemon {
         if neighbor.divider_after {
             return Ok(());
         }
-        let label = projects[index].divider_label.clone();
         let neighbor_id = neighbor.id.clone();
-        self.set_project_divider(id, false, None)?;
-        self.set_project_divider(&neighbor_id, true, label)?;
+        self.set_project_divider(id, false, false, None)?;
+        self.set_project_divider(&neighbor_id, false, true, label)?;
         Ok(())
     }
 
@@ -499,6 +563,7 @@ impl Daemon {
             path,
             branch: branch.to_string(),
             is_main: false,
+            pinned: false,
             sort_order: 0,
         };
         self.store.insert_worktree(&worktree)?;
@@ -533,6 +598,15 @@ impl Daemon {
         self.store.delete_worktree(id)?;
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Worktree(id.clone()),
+        });
+        Ok(())
+    }
+
+    pub fn set_worktree_pinned(self: &Arc<Self>, id: &WorktreeId, pinned: bool) -> Result<()> {
+        self.store.set_worktree_pinned(id, pinned)?;
+        let worktree = self.store.get_worktree(id)?.context("worktree not found")?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Worktree(worktree),
         });
         Ok(())
     }
@@ -573,6 +647,7 @@ impl Daemon {
                 path: entry.path.clone(),
                 branch: entry.branch.clone(),
                 is_main: false,
+                pinned: false,
                 sort_order: 0,
             };
             self.store.insert_worktree(&worktree)?;
@@ -1449,6 +1524,8 @@ mod tests {
                     sort_order: i as i64,
                     divider_after: false,
                     divider_label: None,
+                    divider_before: false,
+                    divider_before_label: None,
                 })
                 .unwrap();
         }
@@ -1461,6 +1538,22 @@ mod tests {
             .into_iter()
             .map(|p| (p.name, p.divider_after, p.divider_label))
             .collect()
+    }
+
+    /// The leading divider: `Some(label)` when the list has one. Also
+    /// asserts the invariant that only the first project ever carries it.
+    fn leading(daemon: &Daemon) -> Option<Option<String>> {
+        let (projects, _, _, _) = daemon.store.load_tree().unwrap();
+        for p in projects.iter().skip(1) {
+            assert!(
+                !p.divider_before,
+                "leading divider drifted off the first project"
+            );
+        }
+        let first = projects.first()?;
+        first
+            .divider_before
+            .then(|| first.divider_before_label.clone())
     }
 
     fn names(daemon: &Daemon) -> Vec<String> {
@@ -1492,7 +1585,7 @@ mod tests {
         seed_projects(&daemon, &["a", "b", "c", "d"]);
         // Groups: [a b] [c d], labeled "work".
         daemon
-            .set_project_divider(&ProjectId("b".into()), true, Some("work".into()))
+            .set_project_divider(&ProjectId("b".into()), false, true, Some("work".into()))
             .unwrap();
 
         // First press: c crosses the divider into the first group without
@@ -1536,23 +1629,103 @@ mod tests {
     }
 
     #[test]
-    fn top_project_crossing_its_divider_keeps_a_project_above_it() {
+    fn top_project_crossing_its_divider_leaves_it_leading() {
         let daemon = test_daemon();
         seed_projects(&daemon, &["a", "b"]);
         daemon
-            .set_project_divider(&ProjectId("a".into()), true, Some("work".into()))
+            .set_project_divider(&ProjectId("a".into()), false, true, Some("work".into()))
             .unwrap();
 
-        // A divider can't sit above every project, so the crossing also
-        // carries a past b — b takes the top group, a lands below the line.
+        // a steps below its own divider, which stays put above the whole
+        // list — the leading divider, label intact.
         daemon.move_project(&ProjectId("a".into()), 1).unwrap();
+        assert_eq!(names(&daemon), ["a", "b"]);
+        assert_eq!(leading(&daemon), Some(Some("work".to_string())));
+        assert!(layout(&daemon).iter().all(|(_, divider, _)| !divider));
+
+        // The next press swaps a past b like any project move; the leading
+        // divider stays on top, now owned by b.
+        daemon.move_project(&ProjectId("a".into()), 1).unwrap();
+        assert_eq!(names(&daemon), ["b", "a"]);
+        assert_eq!(leading(&daemon), Some(Some("work".to_string())));
+
+        // Moving a back up retraces both steps.
+        daemon.move_project(&ProjectId("a".into()), -1).unwrap();
+        assert_eq!(names(&daemon), ["a", "b"]);
+        assert_eq!(leading(&daemon), Some(Some("work".to_string())));
+        daemon.move_project(&ProjectId("a".into()), -1).unwrap();
+        assert_eq!(leading(&daemon), None);
         assert_eq!(
-            layout(&daemon),
-            [
-                ("b".to_string(), true, Some("work".to_string())),
-                ("a".to_string(), false, None),
-            ]
+            layout(&daemon)[0],
+            ("a".to_string(), true, Some("work".to_string()))
         );
+    }
+
+    #[test]
+    fn move_divider_hops_above_the_first_project_and_back() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["a", "b"]);
+        daemon
+            .set_project_divider(&ProjectId("a".into()), false, true, Some("work".into()))
+            .unwrap();
+
+        // Up from under a: the divider crosses onto the top slot.
+        daemon.move_divider(&ProjectId("a".into()), false, -1).unwrap();
+        assert_eq!(leading(&daemon), Some(Some("work".to_string())));
+        assert!(layout(&daemon).iter().all(|(_, divider, _)| !divider));
+
+        // Up again clamps — it is already above everything.
+        daemon.move_divider(&ProjectId("a".into()), true, -1).unwrap();
+        assert_eq!(leading(&daemon), Some(Some("work".to_string())));
+
+        // Down: back under a.
+        daemon.move_divider(&ProjectId("a".into()), true, 1).unwrap();
+        assert_eq!(leading(&daemon), None);
+        assert_eq!(
+            layout(&daemon)[0],
+            ("a".to_string(), true, Some("work".to_string()))
+        );
+    }
+
+    #[test]
+    fn leading_divider_blocks_on_a_stacked_gap() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["a", "b"]);
+        daemon
+            .set_project_divider(&ProjectId("a".into()), true, true, Some("top".into()))
+            .unwrap();
+        daemon
+            .set_project_divider(&ProjectId("a".into()), false, true, Some("mid".into()))
+            .unwrap();
+
+        // Neither divider can move onto the other's gap.
+        daemon.move_divider(&ProjectId("a".into()), true, 1).unwrap();
+        daemon.move_divider(&ProjectId("a".into()), false, -1).unwrap();
+        assert_eq!(leading(&daemon), Some(Some("top".to_string())));
+        assert_eq!(
+            layout(&daemon)[0],
+            ("a".to_string(), true, Some("mid".to_string()))
+        );
+
+        // And the project pinched between them can't move either — that
+        // would stack the dividers into one gap.
+        daemon.move_project(&ProjectId("a".into()), 1).unwrap();
+        daemon.move_project(&ProjectId("a".into()), -1).unwrap();
+        assert_eq!(names(&daemon), ["a", "b"]);
+        assert_eq!(leading(&daemon), Some(Some("top".to_string())));
+    }
+
+    #[test]
+    fn removing_the_top_project_hands_the_leading_divider_down() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["a", "b"]);
+        daemon
+            .set_project_divider(&ProjectId("a".into()), true, true, Some("work".into()))
+            .unwrap();
+
+        daemon.remove_project(&ProjectId("a".into())).unwrap();
+        assert_eq!(names(&daemon), ["b"]);
+        assert_eq!(leading(&daemon), Some(Some("work".to_string())));
     }
 
     #[test]
@@ -1560,11 +1733,11 @@ mod tests {
         let daemon = test_daemon();
         seed_projects(&daemon, &["a", "b", "c"]);
         daemon
-            .set_project_divider(&ProjectId("a".into()), true, Some("work".into()))
+            .set_project_divider(&ProjectId("a".into()), false, true, Some("work".into()))
             .unwrap();
 
         // Down: the divider hops from under a to under b, label intact.
-        daemon.move_divider(&ProjectId("a".into()), 1).unwrap();
+        daemon.move_divider(&ProjectId("a".into()), false, 1).unwrap();
         assert_eq!(
             layout(&daemon),
             [
@@ -1574,18 +1747,17 @@ mod tests {
             ]
         );
 
-        // Back up, then up again clamps at the top (a is the first project).
-        daemon.move_divider(&ProjectId("b".into()), -1).unwrap();
-        daemon.move_divider(&ProjectId("a".into()), -1).unwrap();
+        // Back up under a (the top hop has its own test).
+        daemon.move_divider(&ProjectId("b".into()), false, -1).unwrap();
         assert_eq!(
             layout(&daemon)[0],
             ("a".to_string(), true, Some("work".to_string()))
         );
 
-        // Down past the last project clamps too.
-        daemon.move_divider(&ProjectId("a".into()), 1).unwrap();
-        daemon.move_divider(&ProjectId("b".into()), 1).unwrap();
-        daemon.move_divider(&ProjectId("c".into()), 1).unwrap();
+        // Down past the last project clamps.
+        daemon.move_divider(&ProjectId("a".into()), false, 1).unwrap();
+        daemon.move_divider(&ProjectId("b".into()), false, 1).unwrap();
+        daemon.move_divider(&ProjectId("c".into()), false, 1).unwrap();
         assert_eq!(
             layout(&daemon)[2],
             ("c".to_string(), true, Some("work".to_string()))
@@ -1597,15 +1769,15 @@ mod tests {
         let daemon = test_daemon();
         seed_projects(&daemon, &["a", "b"]);
         daemon
-            .set_project_divider(&ProjectId("a".into()), true, Some("one".into()))
+            .set_project_divider(&ProjectId("a".into()), false, true, Some("one".into()))
             .unwrap();
         daemon
-            .set_project_divider(&ProjectId("b".into()), true, Some("two".into()))
+            .set_project_divider(&ProjectId("b".into()), false, true, Some("two".into()))
             .unwrap();
 
         // Neither divider can move onto the other's gap.
-        daemon.move_divider(&ProjectId("a".into()), 1).unwrap();
-        daemon.move_divider(&ProjectId("b".into()), -1).unwrap();
+        daemon.move_divider(&ProjectId("a".into()), false, 1).unwrap();
+        daemon.move_divider(&ProjectId("b".into()), false, -1).unwrap();
         assert_eq!(
             layout(&daemon),
             [
@@ -1620,15 +1792,15 @@ mod tests {
         let daemon = test_daemon();
         seed_projects(&daemon, &["a", "b"]);
         daemon
-            .set_project_divider(&ProjectId("a".into()), true, Some("work".into()))
+            .set_project_divider(&ProjectId("a".into()), false, true, Some("work".into()))
             .unwrap();
 
         daemon
-            .set_project_divider(&ProjectId("a".into()), true, Some("play".into()))
+            .set_project_divider(&ProjectId("a".into()), false, true, Some("play".into()))
             .unwrap();
         assert_eq!(layout(&daemon)[0].2.as_deref(), Some("play"));
         daemon
-            .set_project_divider(&ProjectId("a".into()), false, Some("ignored".into()))
+            .set_project_divider(&ProjectId("a".into()), false, false, Some("ignored".into()))
             .unwrap();
         assert!(layout(&daemon)
             .iter()
@@ -1644,6 +1816,7 @@ mod tests {
                 path: path.into(),
                 branch: id.into(),
                 is_main,
+                pinned: false,
                 sort_order: 0,
             })
             .unwrap();

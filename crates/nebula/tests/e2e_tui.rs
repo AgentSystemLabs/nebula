@@ -417,9 +417,9 @@ fn tui_projects_worktrees_agents_navigation() {
 
     // ---- create an agent: kind picker → name prompt, auto-attaches ----
     tui.send(b"n");
-    tui.wait_for_text("Agent type"); // Claude/Codex/Cursor picker
+    tui.wait_for_text("New session"); // Claude/Codex/Cursor/Terminal picker
     tui.send(b"\r"); // pick the default (Claude)
-    tui.wait_for_gone("Agent type");
+    tui.wait_for_gone("New session");
     tui.wait_for_text("New agent");
     tui.send(b"\r"); // empty input falls back to "agent-1"
     tui.wait_for_gone("New agent");
@@ -436,6 +436,14 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"\r");
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
     tui.send(&[0x1d]); // Ctrl+] fallback (legacy byte, what Terminal.app sends)
+    tui.wait_for_text(FOOTER_SESSIONS);
+
+    // ---- Shift+T: a shell terminal in the worktree dir, auto-attached ----
+    tui.send(b"T");
+    tui.wait_for_text("TERMINALS");
+    tui.wait_for_text("term-1");
+    tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
+    tui.send(&[0x11]); // Ctrl+q back to panels
     tui.wait_for_text(FOOTER_SESSIONS);
 
     // ---- sessions are per-worktree: feat-b has no agent-1 ----
@@ -501,12 +509,31 @@ fn tui_git_diff_modal() {
     std::fs::write(repo.join(".keep"), "tracked change\n").unwrap();
     std::fs::write(repo.join("hello.txt"), "hello world\n").unwrap();
 
+    // The worktree panel's bottom badge picks the changes up on its own
+    // poll — no keypress in between.
+    tui.wait_for_text("2 changed files");
+
     // ---- open the modal; the selected file's diff renders ----
     tui.send(b"g");
     tui.wait_for_text("Files (2)");
     // Status is path-ordered, so .keep (modified) is selected first.
     tui.wait_for_selected(".keep");
     tui.wait_for_text("+tracked change");
+
+    // ---- Ctrl+r marks .keep reviewed: it sinks below hello.txt and the
+    // selection auto-advances to the next file, loading its diff ----
+    tui.send(&[0x12]);
+    tui.wait_for_text("· 1✓"); // files-panel title counts the mark
+    tui.wait_for_selected("hello.txt");
+    tui.wait_for_text("+hello world");
+
+    // ---- Down reaches the reviewed zone; Ctrl+r unmarks .keep, which
+    // pops back to the top of the list and stays selected ----
+    tui.send(b"\x1b[B"); // Down
+    tui.wait_for_selected(".keep");
+    tui.wait_for_text("+tracked change");
+    tui.send(&[0x12]);
+    tui.wait_for_gone("· 1✓");
 
     // ---- arrow to the untracked file ----
     tui.send(b"\x1b[B"); // Down
@@ -540,6 +567,8 @@ fn tui_git_diff_modal() {
     // ---- clean tree flashes instead of opening ----
     repo_git(&repo, &["add", "."]);
     repo_git(&repo, &["commit", "-m", "wip"]);
+    // The commit empties the badge on the next poll.
+    tui.wait_for_gone("2 changed files");
     tui.send(b"g");
     tui.wait_for_text("no changes in main");
 }

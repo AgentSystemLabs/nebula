@@ -1,10 +1,10 @@
 //! View layer: draws the three panels + terminal pane + footer, and records
 //! hit regions for mouse interaction.
 
-use crate::app::{App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, ProjectRow};
+use crate::app::{App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, ProjectRow, SessionRow};
 use crate::git_diff::{classify_diff_line, DiffLineKind};
 use crate::theme::Theme;
-use nebula_core::{Agent, AgentStatus, SessionRef};
+use nebula_core::{AgentStatus, SessionRef};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -193,7 +193,13 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
         }
         Overlay::Confirm(confirm) => {
-            let area = centered_rect(f.area(), 52, 7);
+            // Bulk deletes itemize their casualties across several message
+            // lines — size the dialog to fit them.
+            let msg_lines: Vec<&str> = confirm.message.lines().collect();
+            let longest = msg_lines.iter().map(|l| l.chars().count()).max();
+            let width = (longest.unwrap_or(0) as u16 + 4).max(52);
+            let height = msg_lines.len() as u16 + 4;
+            let area = centered_rect(f.area(), width, height);
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -204,15 +210,16 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 ));
             let inner = block.inner(area);
             f.render_widget(block, area);
-            let lines = vec![
-                Line::from(confirm.message.clone()),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("[Enter/y] confirm", Style::default().fg(th.err)),
-                    Span::raw("   "),
-                    Span::styled("[Esc/n] cancel", Style::default().fg(th.dim)),
-                ]),
-            ];
+            let mut lines: Vec<Line> = msg_lines
+                .into_iter()
+                .map(|l| Line::from(l.to_string()))
+                .collect();
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("[Enter/y] confirm", Style::default().fg(th.err)),
+                Span::raw("   "),
+                Span::styled("[Esc/n] cancel", Style::default().fg(th.dim)),
+            ]));
             f.render_widget(Paragraph::new(lines), inner);
         }
         Overlay::Prompt(prompt) => {
@@ -287,7 +294,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Paragraph::new(lines), inner);
         }
         Overlay::Help => {
-            let area = centered_rect(f.area(), 60, 32);
+            let area = centered_rect(f.area(), 60, 35);
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -305,17 +312,20 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 ),
                 ("Enter", "drill in; sessions/terminal pane: lock input"),
                 ("n", "new project / worktree / agent (per panel)"),
+                ("T", "new terminal in the worktree (projects panel: its root)"),
                 ("Shift+J/K", "move project up / down (⇧↑/↓ where supported)"),
                 ("-", "divider below project / remove selected divider"),
                 ("Enter or r", "on a divider: edit its label"),
                 ("r", "rename (sessions panel)"),
-                ("p", "pin / unpin agent (or double-click its row)"),
+                ("p", "pin / unpin worktree or agent (per panel)"),
                 ("a", "archive agent"),
                 ("u", "unarchive agent"),
                 ("d / ⌫", "delete (confirms first)"),
+                ("D", "delete ALL worktrees / sessions in the panel"),
                 ("A", "toggle archived agents"),
                 ("m / right-click", "context menu"),
                 ("g", "git diff of the selected worktree"),
+                ("Ctrl+r", "diff view: toggle reviewed ✓ on the file"),
                 ("f", "fuzzy find a file, Enter edits it in vim, Ctrl+y copies"),
                 ("F", "find in files (git grep), Enter edits the hit in vim"),
                 ("t", "file tree browser; Enter edits in the preview pane"),
@@ -408,11 +418,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             // Left: changed-file list; a stateless follow-window keeps the
             // selected row visible.
-            let files_title = if view.filter.is_empty() {
+            let mut files_title = if view.filter.is_empty() {
                 format!("Files ({})", view.files.len())
             } else {
                 format!("Files ({}/{})", view.matches.len(), view.files.len())
             };
+            if !view.reviewed.is_empty() {
+                files_title.push_str(&format!(" · {}✓", view.reviewed.len()));
+            }
             let block = panel_block(&files_title, true, th);
             let files_inner = block.inner(files_a);
             f.render_widget(block, files_a);
@@ -461,11 +474,18 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     ('R', _) | ('C', _) => th.accent,
                     _ => th.warn,
                 };
-                let budget = (list_inner.width as usize).saturating_sub(3);
-                let mut spans = vec![Span::styled(
-                    format!("{} ", file.status_str()),
-                    Style::default().fg(status_color),
-                )];
+                let budget = (list_inner.width as usize).saturating_sub(5);
+                let mut spans = vec![
+                    Span::styled(
+                        format!("{} ", file.status_str()),
+                        Style::default().fg(status_color),
+                    ),
+                    if view.reviewed.contains_key(&file.path) {
+                        Span::styled("✓ ", Style::default().fg(th.ok))
+                    } else {
+                        Span::raw("  ")
+                    },
+                ];
                 let shown = truncate(&file.path, budget);
                 let used = shown.chars().count();
                 spans.extend(fuzzy_highlight_spans(&shown, &m.positions, th));
@@ -483,11 +503,20 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             // Right: the selected file's diff, scrolled.
             let sel_path = view.selected_file().map(|d| d.path.as_str()).unwrap_or("");
+            let sel_reviewed = view.reviewed.contains_key(sel_path);
             let title = truncate(
-                &format!("{}: {}", view.branch, sel_path),
+                &format!(
+                    "{}: {}{}",
+                    view.branch,
+                    sel_path,
+                    if sel_reviewed { " ✓" } else { "" }
+                ),
                 (diff_a.width as usize).saturating_sub(4),
             );
-            let mut block = panel_block(&title, true, th);
+            let mut block = panel_block(&title, true, th).title_bottom(Line::from(Span::styled(
+                " ^r: toggle reviewed ",
+                Style::default().fg(th.dim),
+            )));
             let diff_inner = block.inner(diff_a);
             let max_scroll = (view.diff_line_count as u16).saturating_sub(diff_inner.height.max(1));
             let scroll = view.scroll.min(max_scroll);
@@ -1120,11 +1149,14 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                 let p = &app.tree.projects[i];
                 (row, p.name.clone(), app.project_rollup(&p.id))
             }
-            ProjectRow::Divider(i) => {
-                let label = app.tree.projects[i]
-                    .divider_label
-                    .clone()
-                    .unwrap_or_default();
+            ProjectRow::Divider { project, before } => {
+                let p = &app.tree.projects[project];
+                let label = if before {
+                    p.divider_before_label.clone()
+                } else {
+                    p.divider_label.clone()
+                }
+                .unwrap_or_default();
                 (row, label, None)
             }
         })
@@ -1138,7 +1170,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                 status_dot(*roll, th),
                 Span::raw(truncate(text, inner.width.saturating_sub(2) as usize)),
             ],
-            ProjectRow::Divider(_) => divider_spans(text, inner.width, th),
+            ProjectRow::Divider { .. } => divider_spans(text, inner.width, th),
         };
         render_row(f, row_area, spans, row_idx == app.sel_project, focused, th);
         app.hits.push((row_area, HitTarget::Project(row_idx)));
@@ -1171,9 +1203,26 @@ fn divider_spans(label: &str, width: u16, th: Theme) -> Vec<Span<'static>> {
 fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Worktrees;
-    let block = panel_block("🌳 Worktrees", focused, th);
+    let mut block = panel_block("🌳 Worktrees", focused, th);
+    // Bottom badge: the selected checkout's changed-file count, so a dirty
+    // worktree (or root) is obvious at a glance. Clean stays quiet.
+    if !app.divider_focused() {
+        if let Some(n) = app.selected_worktree_changes().filter(|n| *n > 0) {
+            block = block.title_bottom(Line::from(Span::styled(
+                format!(" {n} changed file{} ", if n == 1 { "" } else { "s" }),
+                Style::default().fg(th.warn),
+            )));
+        }
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    // A selected separator has nothing underneath it: keep the panel, hide
+    // the rows (the terminal pane carries the hint).
+    if app.divider_focused() {
+        app.hits.push((inner, HitTarget::PanelBg(Focus::Worktrees)));
+        return;
+    }
 
     let worktrees: Vec<(String, bool, Option<AgentStatus>)> = app
         .visible_worktrees()
@@ -1198,8 +1247,25 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     // is live, the badge marks root-ness) with a rule separating it from the
     // true worktrees below, so rows after it sit one screen line lower.
     const ROOT_BADGE: &str = " ⌂ root";
+    // Group headers only appear once something is pinned; otherwise the
+    // list stays flat (same idiom as the sessions panel).
+    let (pinned_count, _) = app.worktree_group_counts();
+    let grouped = pinned_count > 0;
+    let dim = Style::default().fg(th.dim);
     let mut screen_row = 0usize;
+    let header = |f: &mut Frame, text: String, screen_row: &mut usize| {
+        if let Some(r) = row_rect(inner, *screen_row) {
+            f.render_widget(Paragraph::new(Span::styled(text, dim)), r);
+            *screen_row += 1;
+        }
+    };
+    if grouped {
+        header(f, "PINNED".into(), &mut screen_row);
+    }
     for (i, (branch, is_main, roll)) in worktrees.iter().enumerate() {
+        if grouped && i == pinned_count {
+            header(f, "UNPINNED".into(), &mut screen_row);
+        }
         let Some(row_area) = row_rect(inner, screen_row) else {
             break;
         };
@@ -1220,7 +1286,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         render_row(f, row_area, spans, i == app.sel_worktree, focused, th);
         app.hits.push((row_area, HitTarget::Worktree(i)));
         screen_row += 1;
-        if *is_main && worktrees.len() > 1 {
+        // The root rule belongs to the flat list; group headers already
+        // separate the rows once something is pinned.
+        if !grouped && *is_main && worktrees.len() > 1 {
             if let Some(r) = row_rect(inner, screen_row) {
                 f.render_widget(
                     Paragraph::new(Span::styled(
@@ -1243,9 +1311,20 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let sessions = app.visible_sessions();
+    // A selected separator has nothing underneath it: keep the panel, hide
+    // the rows (the terminal pane carries the hint).
+    if app.divider_focused() {
+        app.hits.push((inner, HitTarget::PanelBg(Focus::Sessions)));
+        return;
+    }
+
+    let rows = app.visible_session_rows();
     let (pinned_count, recent_count, unpinned_count, archived_count) = app.session_group_counts();
     let active_count = pinned_count + recent_count + unpinned_count;
+    let terminal_count = rows
+        .iter()
+        .filter(|r| matches!(r, SessionRow::Terminal(_)))
+        .count();
     let dim = Style::default().fg(th.dim);
 
     let mut screen_row: usize = 0;
@@ -1261,7 +1340,7 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     let grouped = pinned_count > 0 || recent_count > 0;
     if pinned_count > 0 {
         header(f, "PINNED".into(), &mut screen_row);
-        for (i, row) in sessions.iter().enumerate().take(pinned_count) {
+        for (i, row) in rows.iter().enumerate().take(pinned_count) {
             let Some(r) = row_rect(inner, screen_row) else {
                 break;
             };
@@ -1271,7 +1350,7 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     }
     if recent_count > 0 {
         header(f, "RECENT".into(), &mut screen_row);
-        for (i, row) in sessions
+        for (i, row) in rows
             .iter()
             .enumerate()
             .skip(pinned_count)
@@ -1287,7 +1366,7 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     if grouped && unpinned_count > 0 {
         header(f, "UNPINNED".into(), &mut screen_row);
     }
-    for (i, row) in sessions
+    for (i, row) in rows
         .iter()
         .enumerate()
         .skip(pinned_count + recent_count)
@@ -1299,11 +1378,30 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         draw_session_row(f, app, r, i, row, focused, inner.width);
         screen_row += 1;
     }
+    if terminal_count > 0 {
+        header(f, "TERMINALS".into(), &mut screen_row);
+        for (i, row) in rows
+            .iter()
+            .enumerate()
+            .skip(active_count)
+            .take(terminal_count)
+        {
+            let Some(r) = row_rect(inner, screen_row) else {
+                break;
+            };
+            draw_session_row(f, app, r, i, row, focused, inner.width);
+            screen_row += 1;
+        }
+    }
     if archived_count > 0 {
         header(f, "─".repeat(inner.width as usize), &mut screen_row);
         if app.show_archived {
             header(f, format!("ARCHIVED ({archived_count})"), &mut screen_row);
-            for (i, row) in sessions.iter().enumerate().skip(active_count) {
+            for (i, row) in rows
+                .iter()
+                .enumerate()
+                .skip(active_count + terminal_count)
+            {
                 let Some(r) = row_rect(inner, screen_row) else {
                     break;
                 };
@@ -1328,32 +1426,48 @@ fn draw_session_row(
     app: &mut App,
     area: Rect,
     index: usize,
-    row: &Agent,
+    row: &SessionRow,
     focused: bool,
     width: u16,
 ) {
     let th = app.theme;
-    let dot = if row.archived {
-        Span::styled("⊘ ", Style::default().fg(th.dim))
-    } else {
-        status_dot(Some(row.status), th)
+    let spans = match row {
+        SessionRow::Agent(a) => {
+            let dot = if a.archived {
+                Span::styled("⊘ ", Style::default().fg(th.dim))
+            } else {
+                status_dot(Some(a.status), th)
+            };
+            let name_style = if a.archived {
+                Style::default().fg(th.dim)
+            } else {
+                Style::default()
+            };
+            // Non-default CLIs get a dim badge (same idiom as the worktree
+            // root row).
+            let badge = match a.kind {
+                nebula_core::AgentKind::Claude => None,
+                nebula_core::AgentKind::Codex => Some(" codex"),
+                nebula_core::AgentKind::Cursor => Some(" cursor"),
+            };
+            let name_max =
+                (width.saturating_sub(2) as usize).saturating_sub(badge.map_or(0, str::len));
+            let mut spans = vec![dot, Span::styled(truncate(&a.name, name_max), name_style)];
+            if let Some(badge) = badge {
+                spans.push(Span::styled(badge, Style::default().fg(th.dim)));
+            }
+            spans
+        }
+        SessionRow::Terminal(t) => {
+            // Shell prompt glyph instead of a status dot; dim once the
+            // shell has exited (re-attach respawns it).
+            let glyph_color = if t.alive { th.ok } else { th.dim };
+            vec![
+                Span::styled("❯ ", Style::default().fg(glyph_color)),
+                Span::raw(truncate(&t.name, width.saturating_sub(2) as usize)),
+            ]
+        }
     };
-    let name_style = if row.archived {
-        Style::default().fg(th.dim)
-    } else {
-        Style::default()
-    };
-    // Non-default CLIs get a dim badge (same idiom as the worktree root row).
-    let badge = match row.kind {
-        nebula_core::AgentKind::Claude => None,
-        nebula_core::AgentKind::Codex => Some(" codex"),
-        nebula_core::AgentKind::Cursor => Some(" cursor"),
-    };
-    let name_max = (width.saturating_sub(2) as usize).saturating_sub(badge.map_or(0, str::len));
-    let mut spans = vec![dot, Span::styled(truncate(&row.name, name_max), name_style)];
-    if let Some(badge) = badge {
-        spans.push(Span::styled(badge, Style::default().fg(th.dim)));
-    }
     render_row(f, area, spans, index == app.sel_session, focused, th);
     app.hits.push((area, HitTarget::Session(index)));
 }
@@ -1361,6 +1475,32 @@ fn draw_session_row(
 fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Terminal;
+    // A selected separator has no session behind it: keep the pane, swap
+    // the content for a hint. The attachment itself stays live so walking
+    // the list across a divider doesn't churn detach/attach.
+    if app.divider_focused() {
+        let block = panel_block("Terminal", focused, th);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        app.term_area = inner;
+        let msg = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "you're focused on a separator",
+                Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "select a project to see its worktrees and sessions",
+                Style::default().fg(th.dim),
+            )),
+        ])
+        .centered();
+        f.render_widget(msg, inner);
+        app.term_links = Vec::new();
+        app.term_file_links = Vec::new();
+        return;
+    }
     // Name the attached session in the title so it's clear what you're
     // looking at (and typing into) even with the sidebars collapsed.
     let who = attached_session_name(app)
@@ -1456,9 +1596,12 @@ fn attached_session_name(app: &App) -> Option<String> {
             .iter()
             .find(|a| &a.id == id)
             .map(|a| a.name.clone()),
-        // The TUI only attaches agents; scratch terminals belong to
-        // `nebula raw-attach`.
-        SessionRef::Terminal(_) => None,
+        SessionRef::Terminal(id) => app
+            .tree
+            .terminals
+            .iter()
+            .find(|t| &t.id == id)
+            .map(|t| t.name.clone()),
     }
 }
 
@@ -1482,6 +1625,21 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
     let sep = || Span::styled(" ▸ ", Style::default().fg(th.dim));
 
     let mut spans = Vec::new();
+    // A focused separator has no worktree/session context to spell out —
+    // the crumb is the separator itself.
+    if let Some(ProjectRow::Divider { project, before }) = app.selected_project_row() {
+        let p = &app.tree.projects[project];
+        let label = if before {
+            p.divider_before_label.as_deref()
+        } else {
+            p.divider_label.as_deref()
+        };
+        spans.push(seg(
+            &format!("─ {} ─", label.unwrap_or("separator")),
+            app.focus == Focus::Projects,
+        ));
+        return spans;
+    }
     let Some(project) = app.selected_project() else {
         return spans;
     };
@@ -1489,10 +1647,10 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
     if let Some(worktree) = app.selected_worktree() {
         spans.push(sep());
         spans.push(seg(&worktree.branch, app.focus == Focus::Worktrees));
-        if let Some(session) = app.selected_session() {
+        if let Some(session) = app.selected_session_row() {
             spans.push(sep());
             spans.push(seg(
-                &session.name,
+                session.name(),
                 matches!(app.focus, Focus::Sessions | Focus::Terminal),
             ));
         }
@@ -1559,14 +1717,16 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Focus::Terminal if app.term.is_some() => "Enter: type into terminal  ←: sessions",
             Focus::Terminal => "select a session and press Enter to attach",
             Focus::Projects => match app.selected_project_row() {
-                Some(ProjectRow::Divider(_)) => {
-                    "Enter/r: label  d: delete divider  m: menu  ?: help"
+                Some(ProjectRow::Divider { .. }) => {
+                    "Enter/r: label  d: delete divider  ⇧J/K: move  m: menu  ?: help"
                 }
                 _ => "n: add  d: remove  -: divider  ⇧J/K: move  /: search  m: menu  ?: help",
             },
-            Focus::Worktrees => "n: new worktree  d: delete  /: search  m: menu  ?: help",
+            Focus::Worktrees => {
+                "n: new worktree  T: terminal  p: pin  d: delete  /: search  m: menu  ?: help"
+            }
             Focus::Sessions => {
-                "↵: focus  n: agent  r: rename  p: pin  a: archive  d: del  /: search  m: menu  ?: help"
+                "↵: focus  n: agent  T: terminal  r: rename  p: pin  a: archive  d: del  m: menu  ?: help"
             }
         };
         Span::styled(text, Style::default().fg(th.dim))

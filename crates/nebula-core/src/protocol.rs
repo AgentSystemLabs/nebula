@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -67,20 +67,24 @@ pub enum ClientRequest {
         id: ProjectId,
         delta: i64,
     },
-    /// Set the group divider under a project row: presence and label.
-    /// `divider_after: false` removes it (label is dropped too).
+    /// Set a group divider on a project row: presence and label.
+    /// `before` targets the leading divider drawn above the row (only
+    /// valid on the first project) instead of the one hanging below it.
+    /// `present: false` removes it (label is dropped too).
     SetProjectDivider {
         req_id: u64,
         id: ProjectId,
-        divider_after: bool,
+        before: bool,
+        present: bool,
         label: Option<String>,
     },
-    /// Move the divider hanging under project `id` to hang under the
-    /// previous/next project (sign of `delta`). No-op when there is no
-    /// project on that side or it already has a divider.
+    /// Move the divider on project `id` (`before` picks which one) to the
+    /// neighboring gap (sign of `delta`). No-op past the list's edges or
+    /// when the destination gap already has a divider.
     MoveDivider {
         req_id: u64,
         id: ProjectId,
+        before: bool,
         delta: i64,
     },
     CreateWorktree {
@@ -93,6 +97,12 @@ pub enum ClientRequest {
         req_id: u64,
         id: WorktreeId,
         force: bool,
+    },
+    /// Pin/unpin the worktree in the worktrees list (pure metadata).
+    SetWorktreePinned {
+        req_id: u64,
+        id: WorktreeId,
+        pinned: bool,
     },
     CreateAgent {
         req_id: u64,

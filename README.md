@@ -85,8 +85,9 @@ Worktree and project rows roll up their children: red beats yellow beats green.
 | Projects | `j/k` onto a divider, then `Enter`/`r` | edit the divider's label |
 | Projects | `d` or `-` on a divider | delete the divider |
 | Worktrees | `n` / `d` | new worktree / delete (typed confirm — deletes files) |
-| Sessions | `n` | new agent |
+| Sessions | `n` | new session (agent or shell terminal) |
 | Sessions | `r`, `a`, `u`, `d`, `A` | rename, archive, unarchive, delete, toggle archived |
+| Any panel | `Shift+T` | new shell terminal in the selected worktree's directory (Projects panel: the repo root) |
 | Any panel | `m` or right-click | context menu |
 | Any panel | `z` | collapse sidebars (full-width terminal) |
 | Any panel | `?` | help overlay |

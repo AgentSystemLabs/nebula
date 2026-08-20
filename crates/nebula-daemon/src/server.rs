@@ -220,23 +220,29 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientRequest::SetProjectDivider {
                     req_id,
                     id,
-                    divider_after,
+                    before,
+                    present,
                     label,
                 } => {
                     reply(
                         &out_tx,
                         req_id,
                         daemon
-                            .set_project_divider(&id, divider_after, label)
+                            .set_project_divider(&id, before, present, label)
                             .map(|_| None),
                     )
                     .await;
                 }
-                ClientRequest::MoveDivider { req_id, id, delta } => {
+                ClientRequest::MoveDivider {
+                    req_id,
+                    id,
+                    before,
+                    delta,
+                } => {
                     reply(
                         &out_tx,
                         req_id,
-                        daemon.move_divider(&id, delta).map(|_| None),
+                        daemon.move_divider(&id, before, delta).map(|_| None),
                     )
                     .await;
                 }
@@ -271,6 +277,14 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         )
                         .await;
                     });
+                }
+                ClientRequest::SetWorktreePinned { req_id, id, pinned } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.set_worktree_pinned(&id, pinned).map(|_| None),
+                    )
+                    .await;
                 }
                 ClientRequest::CreateAgent {
                     req_id,

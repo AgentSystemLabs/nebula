@@ -94,6 +94,12 @@ pub struct Project {
     pub divider_after: bool,
     /// Optional group label rendered inside the divider line.
     pub divider_label: Option<String>,
+    /// Draw a group divider above this row. Only ever set on the first
+    /// project — it is the list's leading divider, re-owned by whichever
+    /// project is on top after a reorder.
+    pub divider_before: bool,
+    /// Optional group label for the leading divider.
+    pub divider_before_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +109,9 @@ pub struct Worktree {
     pub path: PathBuf,
     pub branch: String,
     pub is_main: bool,
+    /// Pinned worktrees sort into their own PINNED group in the worktrees list.
+    #[serde(default)]
+    pub pinned: bool,
     pub sort_order: i64,
 }
 

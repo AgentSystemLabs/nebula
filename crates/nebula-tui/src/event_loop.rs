@@ -1,10 +1,10 @@
 //! The main TUI loop: terminal setup/teardown, message routing, update logic.
 
 use crate::app::{
-    agent_sref, App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder,
+    App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder,
     Focus, GrepView,
     HitTarget, MenuAction, MenuItem, Overlay, Palette, PaletteTarget, PendingAction, PendingIntent,
-    ProjectRow, PromptDialog, PromptKind, SettingsView, SplitterDrag, TermSelection,
+    ProjectRow, PromptDialog, PromptKind, SessionRow, SettingsView, SplitterDrag, TermSelection,
     WorktreeRollback,
 };
 use crate::tree_browser::TreeBrowser;
@@ -26,6 +26,10 @@ use std::time::Duration;
 /// Redraw cap (~60fps). Output bursts coalesce into one frame; input events
 /// are still handled immediately between frames.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// How often the worktree panel's changed-file badge re-reads `git status`
+/// for the selected checkout, so agent edits surface without a keypress.
+const GIT_POLL: Duration = Duration::from_secs(2);
 
 pub async fn run_app() -> Result<()> {
     let conn = ipc::connect_or_spawn().await?;
@@ -107,6 +111,7 @@ async fn main_loop(
     let mut input = crossterm::event::EventStream::new();
     let mut out: Vec<ClientRequest> = Vec::new();
     let mut next_draw = tokio::time::Instant::now();
+    let mut next_git_poll = tokio::time::Instant::now();
     // Editor-modal PTY output; the channel outlives individual editor
     // spawns (VimEvent generations keep them apart).
     let (vim_tx, mut vim_rx) = tokio::sync::mpsc::unbounded_channel::<VimEvent>();
@@ -114,13 +119,18 @@ async fn main_loop(
 
     loop {
         if app.dirty && tokio::time::Instant::now() >= next_draw {
+            // A selection change must never paint another checkout's badge;
+            // between selections the slow poll keeps the count fresh.
+            if app.git_changes_stale() {
+                refresh_git_changes(&mut app);
+            }
             terminal.draw(|f| ui::draw(f, &mut app))?;
             app.dirty = false;
             next_draw = tokio::time::Instant::now() + FRAME_INTERVAL;
             sync_pty_size(&mut app, &mut out);
             sync_vim_size(&mut app);
             // What the user sees selected, for RECENT-expiry re-anchoring.
-            app.drawn_session = app.selected_session().map(|a| a.id.clone());
+            app.drawn_session = app.selected_session_row().map(|r| r.sref());
         }
 
         // Wake when the next RECENT session ages out so the list regroups
@@ -132,6 +142,12 @@ async fn main_loop(
             // Pending redraw: wake at the frame boundary even if no new
             // events arrive.
             _ = tokio::time::sleep_until(next_draw), if app.dirty => {}
+            // Fixed deadline (not a fresh sleep per iteration) so heavy PTY
+            // traffic can't starve the badge refresh.
+            _ = tokio::time::sleep_until(next_git_poll) => {
+                refresh_git_changes(&mut app);
+                next_git_poll = tokio::time::Instant::now() + GIT_POLL;
+            }
             _ = tokio::time::sleep(recent_expiry.unwrap_or_default() + Duration::from_millis(250)),
                 if recent_expiry.is_some() =>
             {
@@ -140,7 +156,11 @@ async fn main_loop(
                 // The expired session dropped down the list; keep the
                 // selection on whatever row the user had selected.
                 if let Some(keep) = app.drawn_session.clone() {
-                    if let Some(i) = app.visible_sessions().iter().position(|a| a.id == keep) {
+                    if let Some(i) = app
+                        .visible_session_rows()
+                        .iter()
+                        .position(|r| r.sref() == keep)
+                    {
                         app.sel_session = i;
                     }
                 }
@@ -205,6 +225,23 @@ async fn main_loop(
     }
 }
 
+/// Recompute the changed-file count behind the worktree panel's badge.
+/// Synchronous `git status` on purpose (the git_diff.rs precedent): it runs
+/// once per `GIT_POLL` plus on selection changes, off the input hot path.
+fn refresh_git_changes(app: &mut App) {
+    let next = app
+        .selected_worktree()
+        .map(|w| (w.id.clone(), w.path.clone()))
+        .map(|(id, path)| {
+            let count = crate::git_diff::changed_files(&path).ok().map(|f| f.len());
+            (id, count)
+        });
+    if app.git_changes != next {
+        app.git_changes = next;
+        app.dirty = true;
+    }
+}
+
 fn log_server_event(ev: &ServerEvent) {
     match ev {
         ServerEvent::Output { .. } | ServerEvent::Scrollback { .. } => {}
@@ -260,9 +297,9 @@ fn restore_ui_state(app: &mut App, json: &str) {
     }
     if let Some(sid) = state.session_agent {
         if let Some(i) = app
-            .visible_sessions()
+            .visible_session_rows()
             .iter()
-            .position(|a| a.id.as_str() == sid)
+            .position(|r| matches!(r, SessionRow::Agent(a) if a.id.as_str() == sid))
         {
             app.sel_session = i;
         }
@@ -495,9 +532,9 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         KeyCode::Char('k') | KeyCode::Up => move_selection(app, -1, out),
         KeyCode::Enter => match app.focus {
             Focus::Projects => match app.selected_project_row() {
-                Some(ProjectRow::Divider(i)) => {
-                    let id = app.tree.projects[i].id.clone();
-                    open_prompt(app, PromptKind::DividerLabel { id });
+                Some(ProjectRow::Divider { project, before }) => {
+                    let id = app.tree.projects[project].id.clone();
+                    open_prompt(app, PromptKind::DividerLabel { id, before });
                 }
                 _ => app.focus = Focus::Worktrees,
             },
@@ -531,31 +568,41 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             Focus::Terminal => {}
         },
         KeyCode::Char('r') => match app.focus {
-            Focus::Sessions => {
-                if let Some(a) = app.selected_session() {
+            Focus::Sessions => match app.selected_session_row() {
+                Some(SessionRow::Agent(a)) => {
                     open_prompt(app, PromptKind::RenameAgent { id: a.id })
                 }
-            }
+                Some(SessionRow::Terminal(t)) => {
+                    open_prompt(app, PromptKind::RenameTerminal { id: t.id })
+                }
+                None => {}
+            },
             Focus::Projects => {
-                if let Some(ProjectRow::Divider(i)) = app.selected_project_row() {
-                    let id = app.tree.projects[i].id.clone();
-                    open_prompt(app, PromptKind::DividerLabel { id });
+                if let Some(ProjectRow::Divider { project, before }) = app.selected_project_row() {
+                    let id = app.tree.projects[project].id.clone();
+                    open_prompt(app, PromptKind::DividerLabel { id, before });
                 }
             }
             _ => {}
         },
         KeyCode::Char('a') => {
             if app.focus == Focus::Sessions {
-                if let Some(a) = app.selected_session() {
-                    if !a.archived {
+                match app.selected_session_row() {
+                    Some(SessionRow::Agent(a)) if !a.archived => {
                         archive_agent(app, a.id, out);
                     }
+                    Some(SessionRow::Terminal(_)) => {
+                        app.flash = Some("terminals can't be archived — d closes them".into());
+                    }
+                    _ => {}
                 }
             }
         }
-        KeyCode::Char('p') => {
-            if app.focus == Focus::Sessions {
-                if let Some(a) = app.selected_session() {
+        KeyCode::Char('p') => match app.focus {
+            Focus::Sessions => {
+                if let Some(SessionRow::Terminal(_)) = app.selected_session_row() {
+                    app.flash = Some("terminals can't be pinned".into());
+                } else if let Some(a) = app.selected_session() {
                     if a.archived {
                         app.flash = Some("agent is archived — unarchive first (u)".into());
                     } else {
@@ -571,7 +618,17 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     }
                 }
             }
-        }
+            Focus::Worktrees => {
+                // Selection follow across the regroup happens on the upsert
+                // (the handler re-finds the selected worktree by id).
+                if let Some(w) = app.selected_worktree() {
+                    let (id, pinned) = (w.id.clone(), !w.pinned);
+                    let req_id = app.alloc_req_id(PendingIntent::None);
+                    out.push(ClientRequest::SetWorktreePinned { req_id, id, pinned });
+                }
+            }
+            _ => {}
+        },
         KeyCode::Char('u') => {
             if app.focus == Focus::Sessions {
                 if let Some(a) = app.selected_session() {
@@ -603,16 +660,19 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 match app.selected_project_row() {
                     Some(ProjectRow::Project(i)) => {
                         let p = &app.tree.projects[i];
-                        let (id, divider_after) = (p.id.clone(), !p.divider_after);
+                        let (id, present) = (p.id.clone(), !p.divider_after);
                         let req_id = app.alloc_req_id(PendingIntent::None);
                         out.push(ClientRequest::SetProjectDivider {
                             req_id,
                             id,
-                            divider_after,
+                            before: false,
+                            present,
                             label: None,
                         });
                     }
-                    Some(ProjectRow::Divider(i)) => remove_divider(app, i, out),
+                    Some(ProjectRow::Divider { project, before }) => {
+                        remove_divider(app, project, before, out)
+                    }
                     None => {}
                 }
             }
@@ -621,15 +681,23 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
             match (app.focus, app.selected_project_row()) {
                 // Dividers are cheap to recreate — no confirmation dance.
-                (Focus::Projects, Some(ProjectRow::Divider(i))) => remove_divider(app, i, out),
+                (Focus::Projects, Some(ProjectRow::Divider { project, before })) => {
+                    remove_divider(app, project, before, out)
+                }
                 _ => open_delete_confirm(app),
             }
         }
+        // Shift+D: delete EVERY row of the focused panel (behind a confirm
+        // that lists the casualties).
+        KeyCode::Char('D') => open_delete_all_confirm(app),
         KeyCode::Char('m') => open_context_menu_for_selection(app),
         KeyCode::Char('g') => open_diff_view(app),
         KeyCode::Char('f') => open_file_finder(app),
         KeyCode::Char('F') => open_grep_view(app),
         KeyCode::Char('t') => open_tree_browser(app),
+        // Shift+T: new shell terminal, spawned in the worktree's directory.
+        // (Cmd+T never reaches a TUI — the emulator opens its own tab.)
+        KeyCode::Char('T') => create_terminal_for_context(app, out),
         KeyCode::Char('z') => {
             if app.term.is_some() {
                 app.collapsed = true;
@@ -652,13 +720,19 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
             "path to a git repository".to_string(),
             String::new(),
         ),
-        PromptKind::DividerLabel { id } => {
+        PromptKind::DividerLabel { id, before } => {
             let current = app
                 .tree
                 .projects
                 .iter()
                 .find(|p| &p.id == id)
-                .and_then(|p| p.divider_label.clone())
+                .and_then(|p| {
+                    if *before {
+                        p.divider_before_label.clone()
+                    } else {
+                        p.divider_label.clone()
+                    }
+                })
                 .unwrap_or_default();
             (
                 "Divider label".to_string(),
@@ -685,6 +759,16 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
                 .map(|a| a.name.clone())
                 .unwrap_or_default();
             ("Rename agent".to_string(), "name".to_string(), current)
+        }
+        PromptKind::RenameTerminal { id } => {
+            let current = app
+                .tree
+                .terminals
+                .iter()
+                .find(|t| &t.id == id)
+                .map(|t| t.name.clone())
+                .unwrap_or_default();
+            ("Rename terminal".to_string(), "name".to_string(), current)
         }
     };
     app.overlay = Some(Overlay::Prompt(PromptDialog {
@@ -720,11 +804,40 @@ fn open_diff_view(app: &mut App) {
         app.flash = Some(format!("no changes in {branch}"));
         return;
     }
-    let head_ok = crate::git_diff::has_head(&path);
+    let head = crate::git_diff::head_oid(&path);
+    let head_ok = head.is_some();
     let mut view = DiffView::new(path, branch, files, head_ok);
+    view.head_key = head.unwrap_or_default();
     view.files_width = app.diff_files_width;
+    restore_reviewed_marks(&mut view);
     crate::git_diff::load_selected_diff(&mut view);
     app.overlay = Some(Overlay::Diff(view));
+}
+
+/// Restore the worktree's reviewed ✓ marks into `view.reviewed`, dropping
+/// any that no longer apply: `load_marks` already returns nothing when HEAD
+/// moved (a commit resets the whole worktree), and a mark whose file left
+/// the change list or whose diff text changed since it was approved is
+/// pruned here — then the pruned set is written back. Restored marks sink
+/// to the bottom, so the modal opens on the first unreviewed file.
+fn restore_reviewed_marks(view: &mut DiffView) {
+    let stored = crate::review::load_marks(&view.root, &view.head_key);
+    if stored.is_empty() {
+        return;
+    }
+    view.reviewed = view
+        .files
+        .iter()
+        .filter_map(|file| {
+            let mark = *stored.get(&file.path)?;
+            let diff = crate::git_diff::diff_for(&view.root, file, view.head_ok);
+            (crate::review::fingerprint(&diff) == mark).then(|| (file.path.clone(), mark))
+        })
+        .collect();
+    if view.reviewed.len() != stored.len() {
+        crate::review::store_marks(&view.root, &view.head_key, &view.reviewed);
+    }
+    view.recompute_matches();
 }
 
 /// Fuzzy file finder over every tracked + untracked file of the selected
@@ -1036,6 +1149,33 @@ fn archive_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
     out.push(ClientRequest::ArchiveAgent { req_id, id });
 }
 
+/// Shift+T: create a shell terminal whose pwd is the selection's checkout —
+/// the selected worktree, or the project's main checkout (root) when the
+/// Projects panel has focus. The daemon names it (`term-N`) and the Ack
+/// attaches it, so one keypress lands in a ready shell.
+fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let worktree = match app.focus {
+        Focus::Projects => app.selected_project().and_then(|p| {
+            app.tree
+                .worktrees
+                .iter()
+                .find(|w| w.project_id == p.id && w.is_main)
+                .map(|w| w.id.clone())
+        }),
+        _ => app.selected_worktree().map(|w| w.id.clone()),
+    };
+    let Some(worktree) = worktree else {
+        app.flash = Some("select a project or worktree first".into());
+        return;
+    };
+    let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
+    out.push(ClientRequest::CreateTerminal {
+        req_id,
+        worktree,
+        name: None,
+    });
+}
+
 fn open_delete_confirm(app: &mut App) {
     match app.focus {
         Focus::Projects => {
@@ -1060,7 +1200,8 @@ fn open_delete_confirm(app: &mut App) {
                     .visible_sessions()
                     .iter()
                     .filter(|a| !a.archived)
-                    .count();
+                    .count()
+                    + app.visible_terminals().len();
                 app.overlay = Some(Overlay::Confirm(ConfirmDialog {
                     title: "Delete worktree".into(),
                     message: format!(
@@ -1071,8 +1212,8 @@ fn open_delete_confirm(app: &mut App) {
                 }));
             }
         }
-        Focus::Sessions => {
-            if let Some(a) = app.selected_session() {
+        Focus::Sessions => match app.selected_session_row() {
+            Some(SessionRow::Agent(a)) => {
                 app.overlay = Some(Overlay::Confirm(ConfirmDialog {
                     title: "Delete agent".into(),
                     message: format!(
@@ -1082,8 +1223,106 @@ fn open_delete_confirm(app: &mut App) {
                     action: PendingAction::DeleteAgent(a.id),
                 }));
             }
-        }
+            Some(SessionRow::Terminal(t)) => {
+                app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+                    title: "Close terminal".into(),
+                    message: format!("Close terminal '{}'? Its shell is killed.", t.name),
+                    action: PendingAction::CloseTerminal(t.id),
+                }));
+            }
+            None => {}
+        },
         Focus::Terminal => {}
+    }
+}
+
+/// Cap on itemized rows in the bulk-delete confirm; the rest collapse into
+/// an "and N more" line so the dialog always fits on screen.
+const BULK_CONFIRM_MAX_LISTED: usize = 8;
+
+/// The itemized body of a bulk-delete confirm: one bullet per doomed row.
+fn bulk_confirm_listing(names: &[String]) -> String {
+    let mut lines: Vec<String> = names
+        .iter()
+        .take(BULK_CONFIRM_MAX_LISTED)
+        .map(|n| format!("  • {n}"))
+        .collect();
+    if names.len() > BULK_CONFIRM_MAX_LISTED {
+        lines.push(format!(
+            "  … and {} more",
+            names.len() - BULK_CONFIRM_MAX_LISTED
+        ));
+    }
+    lines.join("\n")
+}
+
+/// Shift+D: confirm deleting EVERY row of the focused panel — all worktrees
+/// of the selected project, or all sessions the panel shows. The dialog
+/// itemizes the casualties so the blast radius is unmistakable.
+fn open_delete_all_confirm(app: &mut App) {
+    match app.focus {
+        Focus::Worktrees => {
+            let doomed: Vec<&nebula_core::Worktree> = app
+                .visible_worktrees()
+                .into_iter()
+                .filter(|w| !w.is_main)
+                .collect();
+            if doomed.is_empty() {
+                app.flash = Some("no deletable worktrees (the main checkout stays)".into());
+                return;
+            }
+            let killed = app
+                .tree
+                .agents
+                .iter()
+                .filter(|a| !a.archived && doomed.iter().any(|w| w.id == a.worktree_id))
+                .count()
+                + app
+                    .tree
+                    .terminals
+                    .iter()
+                    .filter(|t| doomed.iter().any(|w| w.id == t.worktree_id))
+                    .count();
+            let names: Vec<String> = doomed.iter().map(|w| w.branch.clone()).collect();
+            let ids: Vec<WorktreeId> = doomed.iter().map(|w| w.id.clone()).collect();
+            app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+                title: format!("Delete ALL {} worktree(s)", ids.len()),
+                message: format!(
+                    "Delete these {} worktree(s) from disk? {killed} session(s) will be killed.\n{}\nThe main checkout stays.",
+                    ids.len(),
+                    bulk_confirm_listing(&names),
+                ),
+                action: PendingAction::DeleteAllWorktrees(ids),
+            }));
+        }
+        Focus::Sessions => {
+            // What the panel shows is what dies — terminals too, archived
+            // rows only when the archived toggle has them visible.
+            let doomed = app.visible_session_rows();
+            if doomed.is_empty() {
+                app.flash = Some("no sessions to delete".into());
+                return;
+            }
+            let names: Vec<String> = doomed.iter().map(|r| r.name().to_string()).collect();
+            let mut agents = Vec::new();
+            let mut terminals = Vec::new();
+            for row in doomed {
+                match row {
+                    SessionRow::Agent(a) => agents.push(a.id),
+                    SessionRow::Terminal(t) => terminals.push(t.id),
+                }
+            }
+            app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+                title: format!("Delete ALL {} session(s)", names.len()),
+                message: format!(
+                    "Delete these {} session(s)? Their history goes away.\n{}",
+                    names.len(),
+                    bulk_confirm_listing(&names),
+                ),
+                action: PendingAction::DeleteAllSessions { agents, terminals },
+            }));
+        }
+        Focus::Projects | Focus::Terminal => {}
     }
 }
 
@@ -1142,6 +1381,26 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
     }
 }
 
+fn menu_items_for_terminal(t: &nebula_core::TerminalTab) -> Vec<MenuItem> {
+    vec![
+        MenuItem {
+            label: "Attach".into(),
+            action: MenuAction::Attach(SessionRef::Terminal(t.id.clone())),
+            destructive: false,
+        },
+        MenuItem {
+            label: "Rename".into(),
+            action: MenuAction::RenameTerminal(t.id.clone()),
+            destructive: false,
+        },
+        MenuItem {
+            label: "Close".into(),
+            action: MenuAction::CloseTerminal(t.id.clone()),
+            destructive: true,
+        },
+    ]
+}
+
 fn divider_menu_item(p: &nebula_core::Project) -> MenuItem {
     MenuItem {
         label: if p.divider_after {
@@ -1150,22 +1409,30 @@ fn divider_menu_item(p: &nebula_core::Project) -> MenuItem {
             "Add divider below"
         }
         .into(),
-        action: MenuAction::SetProjectDivider(p.id.clone(), !p.divider_after),
+        action: MenuAction::SetProjectDivider {
+            id: p.id.clone(),
+            before: false,
+            present: !p.divider_after,
+        },
         destructive: false,
     }
 }
 
 /// Menu for a selected divider row.
-fn divider_row_menu(id: nebula_core::ProjectId) -> Vec<MenuItem> {
+fn divider_row_menu(id: nebula_core::ProjectId, before: bool) -> Vec<MenuItem> {
     vec![
         MenuItem {
             label: "Edit label".into(),
-            action: MenuAction::LabelDivider(id.clone()),
+            action: MenuAction::LabelDivider(id.clone(), before),
             destructive: false,
         },
         MenuItem {
             label: "Remove divider".into(),
-            action: MenuAction::SetProjectDivider(id, false),
+            action: MenuAction::SetProjectDivider {
+                id,
+                before,
+                present: false,
+            },
             destructive: false,
         },
     ]
@@ -1184,11 +1451,12 @@ fn open_menu(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
     }));
 }
 
-/// Step 1 of new-agent creation: pick which CLI the session runs. The
-/// chosen kind chains into the name prompt via `MenuAction::NewAgentOfKind`.
+/// Step 1 of new-session creation: pick which CLI the session runs — or a
+/// plain shell terminal. An agent kind chains into the name prompt via
+/// `MenuAction::NewAgentOfKind`; the terminal is created immediately.
 fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
     app.overlay = Some(Overlay::Menu(ContextMenu {
-        title: Some("Agent type".into()),
+        title: Some("New session".into()),
         items: vec![
             MenuItem {
                 label: "Claude".into(),
@@ -1202,7 +1470,12 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
             },
             MenuItem {
                 label: "Cursor".into(),
-                action: MenuAction::NewAgentOfKind(worktree, AgentKind::Cursor),
+                action: MenuAction::NewAgentOfKind(worktree.clone(), AgentKind::Cursor),
+                destructive: false,
+            },
+            MenuItem {
+                label: "Terminal (shell)".into(),
+                action: MenuAction::NewTerminal(worktree),
                 destructive: false,
             },
         ],
@@ -1253,9 +1526,9 @@ fn open_context_menu_for_selection(app: &mut App) {
     let at = (30, 4);
     match app.focus {
         Focus::Projects => {
-            if let Some(ProjectRow::Divider(i)) = app.selected_project_row() {
-                let id = app.tree.projects[i].id.clone();
-                open_menu(app, divider_row_menu(id), at);
+            if let Some(ProjectRow::Divider { project, before }) = app.selected_project_row() {
+                let id = app.tree.projects[project].id.clone();
+                open_menu(app, divider_row_menu(id, before), at);
                 return;
             }
             let mut items = vec![MenuItem {
@@ -1283,11 +1556,23 @@ fn open_context_menu_for_selection(app: &mut App) {
         }
         Focus::Worktrees => {
             if let Some(w) = app.selected_worktree() {
-                let mut items = vec![MenuItem {
-                    label: "New agent".into(),
-                    action: MenuAction::NewAgent(w.id.clone()),
-                    destructive: false,
-                }];
+                let mut items = vec![
+                    MenuItem {
+                        label: "New agent".into(),
+                        action: MenuAction::NewAgent(w.id.clone()),
+                        destructive: false,
+                    },
+                    MenuItem {
+                        label: "New terminal".into(),
+                        action: MenuAction::NewTerminal(w.id.clone()),
+                        destructive: false,
+                    },
+                    MenuItem {
+                        label: if w.pinned { "Unpin" } else { "Pin" }.into(),
+                        action: MenuAction::SetWorktreePinned(w.id.clone(), !w.pinned),
+                        destructive: false,
+                    },
+                ];
                 if !w.is_main {
                     items.push(MenuItem {
                         label: "Delete worktree".into(),
@@ -1298,11 +1583,11 @@ fn open_context_menu_for_selection(app: &mut App) {
                 open_menu(app, items, at);
             }
         }
-        Focus::Sessions => {
-            if let Some(row) = app.selected_session() {
-                open_menu(app, menu_items_for_session(&row), at);
-            }
-        }
+        Focus::Sessions => match app.selected_session_row() {
+            Some(SessionRow::Agent(a)) => open_menu(app, menu_items_for_session(&a), at),
+            Some(SessionRow::Terminal(t)) => open_menu(app, menu_items_for_terminal(&t), at),
+            None => {}
+        },
         Focus::Terminal => {}
     }
 }
@@ -1401,6 +1686,18 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                     }
                 }
                 KeyCode::Char('u') if ctrl => view.scroll_by(-half),
+                // Ctrl+r toggles the reviewed ✓ on the selected file —
+                // nebula-side bookkeeping only, no git state is touched.
+                // Reviewed files sink to the bottom and marking advances to
+                // the next file (see `DiffView::toggle_reviewed`).
+                KeyCode::Char('r') if ctrl => {
+                    if let Some(changed) = view.toggle_reviewed() {
+                        crate::review::store_marks(&view.root, &view.head_key, &view.reviewed);
+                        if changed {
+                            crate::git_diff::load_selected_diff(view);
+                        }
+                    }
+                }
                 KeyCode::Down if shift => view.scroll_by(1),
                 KeyCode::Up if shift => view.scroll_by(-1),
                 KeyCode::Down => {
@@ -1683,12 +1980,13 @@ fn apply_setting_at(app: &mut App, index: usize, delta: i32) {
 fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientRequest>) {
     let value = prompt.input.trim().to_string();
     // An empty divider label is meaningful: it clears the label.
-    if let PromptKind::DividerLabel { id } = &prompt.kind {
+    if let PromptKind::DividerLabel { id, before } = &prompt.kind {
         let req_id = app.alloc_req_id(PendingIntent::None);
         out.push(ClientRequest::SetProjectDivider {
             req_id,
             id: id.clone(),
-            divider_after: true,
+            before: *before,
+            present: true,
             label: (!value.is_empty()).then_some(value),
         });
         return;
@@ -1752,6 +2050,14 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 name: value,
             });
         }
+        PromptKind::RenameTerminal { id } => {
+            let req_id = app.alloc_req_id(PendingIntent::None);
+            out.push(ClientRequest::RenameTerminal {
+                req_id,
+                id,
+                name: value,
+            });
+        }
     }
 }
 
@@ -1771,6 +2077,11 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::DeleteAgent { req_id, id });
         }
+        PendingAction::CloseTerminal(id) => {
+            detach_if_attached(app, &SessionRef::Terminal(id.clone()), out);
+            let req_id = app.alloc_req_id(PendingIntent::None);
+            out.push(ClientRequest::CloseTerminal { req_id, id });
+        }
         PendingAction::DeleteWorktree(id) => {
             // Optimistic: drop the rows now (the daemon deletes in the
             // background — `git worktree remove` can take seconds). The
@@ -1786,6 +2097,34 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
                 id,
                 force: true,
             });
+        }
+        PendingAction::DeleteAllWorktrees(ids) => {
+            // Each delete is its own request with its own optimistic
+            // removal + rollback, so one failure restores only its rows.
+            for id in ids {
+                let intent = match remove_worktree_rows(app, &id) {
+                    Some(rollback) => PendingIntent::DeleteWorktree(rollback),
+                    None => PendingIntent::None,
+                };
+                let req_id = app.alloc_req_id(intent);
+                out.push(ClientRequest::DeleteWorktree {
+                    req_id,
+                    id,
+                    force: true,
+                });
+            }
+        }
+        PendingAction::DeleteAllSessions { agents, terminals } => {
+            for id in agents {
+                detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
+                let req_id = app.alloc_req_id(PendingIntent::None);
+                out.push(ClientRequest::DeleteAgent { req_id, id });
+            }
+            for id in terminals {
+                detach_if_attached(app, &SessionRef::Terminal(id.clone()), out);
+                let req_id = app.alloc_req_id(PendingIntent::None);
+                out.push(ClientRequest::CloseTerminal { req_id, id });
+            }
         }
         PendingAction::RemoveProject(id) => {
             let req_id = app.alloc_req_id(PendingIntent::None);
@@ -1843,6 +2182,24 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             }
         }
         MenuAction::NewAgent(worktree) => open_new_agent_picker(app, worktree),
+        MenuAction::NewTerminal(worktree) => {
+            let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
+            out.push(ClientRequest::CreateTerminal {
+                req_id,
+                worktree,
+                name: None,
+            });
+        }
+        MenuAction::RenameTerminal(id) => open_prompt(app, PromptKind::RenameTerminal { id }),
+        MenuAction::CloseTerminal(id) => {
+            if let Some(t) = app.tree.terminals.iter().find(|t| t.id == id).cloned() {
+                app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+                    title: "Close terminal".into(),
+                    message: format!("Close terminal '{}'? Its shell is killed.", t.name),
+                    action: PendingAction::CloseTerminal(id),
+                }));
+            }
+        }
         MenuAction::NewAgentOfKind(worktree, kind) => {
             // Warm the CLI while the user types the name: the daemon
             // pre-spawns the session so CreateAgent adopts an already-booted
@@ -1854,6 +2211,10 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             open_prompt(app, PromptKind::NewAgent { worktree, kind })
         }
         MenuAction::NewWorktree(project) => open_prompt(app, PromptKind::NewWorktree { project }),
+        MenuAction::SetWorktreePinned(id, pinned) => {
+            let req_id = app.alloc_req_id(PendingIntent::None);
+            out.push(ClientRequest::SetWorktreePinned { req_id, id, pinned });
+        }
         MenuAction::DeleteWorktree(id) => {
             if let Some(w) = app.tree.worktrees.iter().find(|w| w.id == id).cloned() {
                 app.overlay = Some(Overlay::Confirm(ConfirmDialog {
@@ -1876,16 +2237,23 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 }));
             }
         }
-        MenuAction::SetProjectDivider(id, divider_after) => {
+        MenuAction::SetProjectDivider {
+            id,
+            before,
+            present,
+        } => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::SetProjectDivider {
                 req_id,
                 id,
-                divider_after,
+                before,
+                present,
                 label: None,
             });
         }
-        MenuAction::LabelDivider(id) => open_prompt(app, PromptKind::DividerLabel { id }),
+        MenuAction::LabelDivider(id, before) => {
+            open_prompt(app, PromptKind::DividerLabel { id, before })
+        }
         MenuAction::ToggleArchived => app.show_archived = !app.show_archived,
     }
 }
@@ -1920,47 +2288,84 @@ fn shellexpand_home(path: &str) -> std::path::PathBuf {
 fn move_project(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
     match app.selected_project_row() {
         Some(ProjectRow::Project(index)) => {
-            let target = index as i64 + delta;
-            if target < 0 || target >= app.tree.projects.len() as i64 {
-                return; // already at the edge
+            // Edge check in row terms: crossing a divider at the edge is
+            // still a real move (the divider ends up leading / trailing).
+            let last = app.project_rows().len() - 1;
+            let at_edge = match delta.signum() {
+                -1 => app.sel_project == 0,
+                1 => app.sel_project == last,
+                _ => true,
+            };
+            if at_edge {
+                return;
             }
             let id = app.tree.projects[index].id.clone();
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::MoveProject { req_id, id, delta });
         }
-        Some(ProjectRow::Divider(index)) => move_divider(app, index, delta, out),
+        Some(ProjectRow::Divider { project, before }) => {
+            move_divider(app, project, before, delta, out)
+        }
         None => {}
     }
 }
 
-/// Ask the daemon to hop the selected divider under the previous/next
-/// project. Mirrors the daemon's own rules so a blocked move flashes
-/// immediately instead of arming a selection-follow that never fires.
-fn move_divider(app: &mut App, index: usize, delta: i64, out: &mut Vec<ClientRequest>) {
-    let neighbor = index as i64 + delta.signum();
-    let Some(neighbor) = usize::try_from(neighbor)
-        .ok()
-        .and_then(|i| app.tree.projects.get(i))
-    else {
-        return; // no project on that side: the divider is at an edge
-    };
-    if neighbor.divider_after {
-        app.flash = Some("that gap already has a divider".into());
-        return;
+/// Ask the daemon to hop the selected divider into the previous/next gap —
+/// including the slot above the whole list (the leading divider). Mirrors
+/// the daemon's own rules so a blocked move flashes immediately instead of
+/// arming a selection-follow that never fires.
+fn move_divider(app: &mut App, project: usize, before: bool, delta: i64, out: &mut Vec<ClientRequest>) {
+    let down = delta.signum() > 0;
+    if before {
+        // The leading divider: up is already the top; down hops below the
+        // first project when that gap is free.
+        if !down {
+            return;
+        }
+        if app.tree.projects[project].divider_after {
+            app.flash = Some("that gap already has a divider".into());
+            return;
+        }
+        app.select_divider_when_seen = Some((app.tree.projects[project].id.clone(), false));
+    } else if project == 0 && !down {
+        // The divider under the first project hops above the whole list.
+        if app.tree.projects[0].divider_before {
+            app.flash = Some("that gap already has a divider".into());
+            return;
+        }
+        app.select_divider_when_seen = Some((app.tree.projects[0].id.clone(), true));
+    } else {
+        let neighbor = project as i64 + delta.signum();
+        let Some(neighbor) = usize::try_from(neighbor)
+            .ok()
+            .and_then(|i| app.tree.projects.get(i))
+        else {
+            return; // no project below: the divider is at the bottom edge
+        };
+        if neighbor.divider_after {
+            app.flash = Some("that gap already has a divider".into());
+            return;
+        }
+        app.select_divider_when_seen = Some((neighbor.id.clone(), false));
     }
-    app.select_divider_when_seen = Some(neighbor.id.clone());
-    let id = app.tree.projects[index].id.clone();
+    let id = app.tree.projects[project].id.clone();
     let req_id = app.alloc_req_id(PendingIntent::None);
-    out.push(ClientRequest::MoveDivider { req_id, id, delta });
+    out.push(ClientRequest::MoveDivider {
+        req_id,
+        id,
+        before,
+        delta,
+    });
 }
 
-fn remove_divider(app: &mut App, project_index: usize, out: &mut Vec<ClientRequest>) {
+fn remove_divider(app: &mut App, project_index: usize, before: bool, out: &mut Vec<ClientRequest>) {
     let id = app.tree.projects[project_index].id.clone();
     let req_id = app.alloc_req_id(PendingIntent::None);
     out.push(ClientRequest::SetProjectDivider {
         req_id,
         id,
-        divider_after: false,
+        before,
+        present: false,
         label: None,
     });
 }
@@ -1975,7 +2380,7 @@ fn remember_context(app: &mut App) {
     if let Some(pid) = app.selected_project().map(|p| p.id.clone()) {
         app.last_worktree_for_project.insert(pid, wid.clone());
     }
-    match app.selected_session().map(|a| agent_sref(&a)) {
+    match app.selected_session_row().map(|r| r.sref()) {
         Some(sref) => {
             app.last_session_for_worktree.insert(wid, sref);
         }
@@ -2008,9 +2413,9 @@ fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
         .selected_worktree()
         .and_then(|w| app.last_session_for_worktree.get(&w.id).cloned());
     let target = remembered.and_then(|sref| {
-        app.visible_sessions()
+        app.visible_session_rows()
             .iter()
-            .position(|a| agent_sref(a) == sref && !a.archived)
+            .position(|r| r.sref() == sref && !r.is_archived_agent())
             .map(|i| (i, sref))
     });
     match target {
@@ -2025,6 +2430,52 @@ fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
                 app.term = None;
                 app.term_locked = false;
             }
+        }
+    }
+}
+
+/// Land the selection on `select_when_seen` — a session just created, or
+/// moved into another worktree of this project: directly when its row is
+/// visible under the selected worktree, else by switching to the worktree it
+/// landed under first. Clears the pending follow once it lands; a no-op
+/// until the session's upsert has arrived.
+fn land_pending_selection(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let Some(pending_sref) = app.select_when_seen.clone() else {
+        return;
+    };
+    if let Some(index) = app
+        .visible_session_rows()
+        .iter()
+        .position(|r| r.sref() == pending_sref)
+    {
+        app.sel_session = index;
+        app.select_when_seen = None;
+        return;
+    }
+    let landed_worktree = match &pending_sref {
+        SessionRef::Agent(id) => app
+            .tree
+            .agents
+            .iter()
+            .find(|a| &a.id == id)
+            .map(|a| a.worktree_id.clone()),
+        SessionRef::Terminal(id) => app
+            .tree
+            .terminals
+            .iter()
+            .find(|t| &t.id == id)
+            .map(|t| t.worktree_id.clone()),
+    };
+    if let Some(wt_id) = landed_worktree {
+        if select_worktree_by_id(app, &wt_id, out) {
+            if let Some(index) = app
+                .visible_session_rows()
+                .iter()
+                .position(|r| r.sref() == pending_sref)
+            {
+                app.sel_session = index;
+            }
+            app.select_when_seen = None;
         }
     }
 }
@@ -2143,7 +2594,11 @@ fn jump_to_target(
                 return;
             };
             app.sel_worktree = wt_index;
-            let Some(index) = app.visible_sessions().iter().position(|a| a.id == id) else {
+            let Some(index) = app
+                .visible_session_rows()
+                .iter()
+                .position(|r| matches!(r, SessionRow::Agent(a) if a.id == id))
+            else {
                 // Vanished (or got archived out of view) mid-pick: land on
                 // its worktree instead of attaching.
                 restore_session(app, out);
@@ -2166,7 +2621,7 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
     let len = match app.focus {
         Focus::Projects => app.project_rows().len(),
         Focus::Worktrees => app.visible_worktrees().len(),
-        Focus::Sessions => app.visible_sessions().len(),
+        Focus::Sessions => app.visible_session_rows().len(),
         Focus::Terminal => return,
     };
     if len == 0 {
@@ -2216,21 +2671,21 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
 /// previews each session so it can be read; Enter (or a double-click) is
 /// what commits: focus + lock. Archived rows don't preview.
 fn preview_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let Some(row) = app.selected_session() else {
+    let Some(row) = app.selected_session_row() else {
         return;
     };
-    if row.archived {
+    if row.is_archived_agent() {
         return;
     }
-    attach(app, agent_sref(&row), out);
+    attach(app, row.sref(), out);
 }
 
 fn attach_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let sessions = app.visible_sessions();
-    let Some(row) = sessions.get(app.sel_session) else {
+    let rows = app.visible_session_rows();
+    let Some(row) = rows.get(app.sel_session) else {
         return;
     };
-    attach(app, agent_sref(row), out);
+    attach(app, row.sref(), out);
     app.focus = Focus::Terminal;
     app.term_locked = true;
 }
@@ -2808,26 +3263,32 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 }
                 Some(HitTarget::Session(i)) => {
                     app.sel_session = i;
-                    if app.selected_session().is_some_and(|a| a.archived) {
-                        app.focus = Focus::Sessions;
-                        app.flash = Some("agent is archived — unarchive first (u)".into());
-                    } else if let Some(a) = app.selected_session() {
-                        let now = std::time::Instant::now();
-                        // Double-click attaches; `last_session_click` was
-                        // consumed, so a third click starts over.
-                        let double = app.last_session_click.take().is_some_and(|(at, id)| {
-                            id == a.id && now.duration_since(at) <= DOUBLE_CLICK
-                        });
-                        if double {
-                            attach_selected(app, out);
-                        } else {
-                            // Single click selects the row and previews its
-                            // terminal (no focus/lock); Enter or a second
-                            // click commits.
-                            app.last_session_click = Some((now, a.id));
+                    match app.selected_session_row() {
+                        Some(row) if row.is_archived_agent() => {
                             app.focus = Focus::Sessions;
-                            preview_selected(app, out);
+                            app.flash = Some("agent is archived — unarchive first (u)".into());
                         }
+                        Some(row) => {
+                            let sref = row.sref();
+                            let now = std::time::Instant::now();
+                            // Double-click attaches; `last_session_click` was
+                            // consumed, so a third click starts over.
+                            let double =
+                                app.last_session_click.take().is_some_and(|(at, id)| {
+                                    id == sref && now.duration_since(at) <= DOUBLE_CLICK
+                                });
+                            if double {
+                                attach_selected(app, out);
+                            } else {
+                                // Single click selects the row and previews its
+                                // terminal (no focus/lock); Enter or a second
+                                // click commits.
+                                app.last_session_click = Some((now, sref));
+                                app.focus = Focus::Sessions;
+                                preview_selected(app, out);
+                            }
+                        }
+                        None => {}
                     }
                 }
                 Some(HitTarget::PanelBg(focus)) => {
@@ -2939,9 +3400,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 Some(HitTarget::Project(i)) => {
                     app.sel_project = i;
                     app.focus = Focus::Projects;
-                    if let Some(ProjectRow::Divider(pi)) = app.selected_project_row() {
-                        let id = app.tree.projects[pi].id.clone();
-                        open_menu_at(app, divider_row_menu(id), at);
+                    if let Some(ProjectRow::Divider { project, before }) = app.selected_project_row()
+                    {
+                        let id = app.tree.projects[project].id.clone();
+                        open_menu_at(app, divider_row_menu(id, before), at);
                     } else if let Some(p) = app.selected_project() {
                         let items = vec![
                             MenuItem {
@@ -2969,11 +3431,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     app.sel_session = 0;
                     app.focus = Focus::Worktrees;
                     if let Some(w) = app.selected_worktree() {
-                        let mut items = vec![MenuItem {
-                            label: "New agent".into(),
-                            action: MenuAction::NewAgent(w.id.clone()),
-                            destructive: false,
-                        }];
+                        let mut items = vec![
+                            MenuItem {
+                                label: "New agent".into(),
+                                action: MenuAction::NewAgent(w.id.clone()),
+                                destructive: false,
+                            },
+                            MenuItem {
+                                label: "New terminal".into(),
+                                action: MenuAction::NewTerminal(w.id.clone()),
+                                destructive: false,
+                            },
+                        ];
                         if !w.is_main {
                             items.push(MenuItem {
                                 label: "Delete worktree".into(),
@@ -2987,8 +3456,14 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 Some(HitTarget::Session(i)) => {
                     app.sel_session = i;
                     app.focus = Focus::Sessions;
-                    if let Some(row) = app.selected_session() {
-                        open_menu_at(app, menu_items_for_session(&row), at);
+                    match app.selected_session_row() {
+                        Some(SessionRow::Agent(a)) => {
+                            open_menu_at(app, menu_items_for_session(&a), at)
+                        }
+                        Some(SessionRow::Terminal(t)) => {
+                            open_menu_at(app, menu_items_for_terminal(&t), at)
+                        }
+                        None => {}
                     }
                 }
                 Some(HitTarget::PanelBg(focus)) => {
@@ -3048,13 +3523,13 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             projects,
             worktrees,
             agents,
-            // Scratch terminals (`nebula raw-attach`) aren't shown in the TUI.
-            terminals: _,
+            terminals,
             ui_state,
         } => {
             app.tree.projects = projects;
             app.tree.worktrees = worktrees;
             app.tree.agents = agents;
+            app.tree.terminals = terminals;
             if let Some(json) = ui_state {
                 restore_ui_state(app, &json);
             }
@@ -3103,14 +3578,18 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         } => {
             // A status flip can pull the agent into the RECENT group and
             // reorder the list; keep the selection on the same session.
-            let keep = app.selected_session().map(|a| a.id.clone());
+            let keep = app.selected_session_row().map(|r| r.sref());
             if let Some(a) = app.tree.agents.iter_mut().find(|a| a.id == agent) {
                 a.status = status;
                 a.status_changed_at = changed_at;
                 app.dirty = true;
             }
             if let Some(keep) = keep {
-                if let Some(i) = app.visible_sessions().iter().position(|a| a.id == keep) {
+                if let Some(i) = app
+                    .visible_session_rows()
+                    .iter()
+                    .position(|r| r.sref() == keep)
+                {
                     app.sel_session = i;
                 }
             }
@@ -3120,10 +3599,14 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 (Some(PendingIntent::AttachCreated), Some(id)) => {
                     let sref = match id {
                         EntityId::Agent(id) => Some(SessionRef::Agent(id)),
+                        EntityId::Terminal(id) => Some(SessionRef::Terminal(id)),
                         _ => None,
                     };
                     if let Some(sref) = sref {
                         app.select_when_seen = Some(sref.clone());
+                        // Its upsert usually lands just before this Ack; land
+                        // the selection now, or on the upsert otherwise.
+                        land_pending_selection(app, out);
                         attach(app, sref, out);
                         app.focus = Focus::Terminal;
                         app.term_locked = true;
@@ -3141,38 +3624,20 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.dirty = true;
         }
         ServerEvent::EntityUpserted { entity } => {
+            // A pin toggle regroups the worktree list; keep the selection
+            // on the same worktree row across the reorder.
+            let keep_worktree = matches!(entity, nebula_core::Entity::Worktree(_))
+                .then(|| app.selected_worktree().map(|w| w.id.clone()))
+                .flatten();
             apply_upsert(app, entity);
-            // Fix the selection onto a session we just created — or follow
-            // one we just moved into another worktree of this project.
-            if let Some(pending_sref) = app.select_when_seen.clone() {
-                if let Some(index) = app
-                    .visible_sessions()
-                    .iter()
-                    .position(|a| agent_sref(a) == pending_sref)
-                {
-                    app.sel_session = index;
-                    app.select_when_seen = None;
-                } else if let SessionRef::Agent(id) = &pending_sref {
-                    let landed_worktree = app
-                        .tree
-                        .agents
-                        .iter()
-                        .find(|a| &a.id == id)
-                        .map(|a| a.worktree_id.clone());
-                    if let Some(wt_id) = landed_worktree {
-                        if select_worktree_by_id(app, &wt_id, out) {
-                            if let Some(index) = app
-                                .visible_sessions()
-                                .iter()
-                                .position(|a| agent_sref(a) == pending_sref)
-                            {
-                                app.sel_session = index;
-                            }
-                            app.select_when_seen = None;
-                        }
-                    }
+            if let Some(id) = keep_worktree {
+                if let Some(i) = app.visible_worktrees().iter().position(|w| w.id == id) {
+                    app.sel_worktree = i;
                 }
             }
+            // Fix the selection onto a session we just created — or follow
+            // one we just moved into another worktree of this project.
+            land_pending_selection(app, out);
             // ...and onto a worktree we just created.
             if let Some(wt_id) = app.select_worktree_when_seen.clone() {
                 if select_worktree_by_id(app, &wt_id, out) {
@@ -3211,10 +3676,15 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
     use nebula_core::Entity;
     match entity {
         Entity::Project(p) => {
+            // A row's kind: None = the project itself, Some(before) = one
+            // of its dividers.
+            let kind = |row: &ProjectRow| match row {
+                ProjectRow::Divider { before, .. } => Some(*before),
+                ProjectRow::Project(_) => None,
+            };
             let selected = app.selected_project_row().map(|row| {
-                let is_divider = matches!(row, ProjectRow::Divider(_));
                 (
-                    is_divider,
+                    kind(&row),
                     app.tree.projects[row.project_index()].id.clone(),
                 )
             });
@@ -3227,11 +3697,10 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             // selection follows the row it was on, so children stay put; a
             // selected divider that just vanished falls back to its project.
             app.tree.projects.sort_by_key(|x| x.sort_order);
-            if let Some((was_divider, id)) = selected {
+            if let Some((was_kind, id)) = selected {
                 let rows = app.project_rows();
                 let same_kind = rows.iter().position(|row| {
-                    matches!(row, ProjectRow::Divider(_)) == was_divider
-                        && app.tree.projects[row.project_index()].id == id
+                    kind(row) == was_kind && app.tree.projects[row.project_index()].id == id
                 });
                 let found = same_kind.or_else(|| {
                     rows.iter()
@@ -3241,12 +3710,12 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
                     app.sel_project = i;
                 }
             }
-            // A divider we moved re-homes under another project; chase it
+            // A divider we moved re-homes onto another slot; chase it
             // there once the destination's upsert lands.
-            if let Some(target) = app.select_divider_when_seen.clone() {
+            if let Some((target, before)) = app.select_divider_when_seen.clone() {
                 let rows = app.project_rows();
                 let landed = rows.iter().position(|row| {
-                    matches!(row, ProjectRow::Divider(_))
+                    kind(row) == Some(before)
                         && app.tree.projects[row.project_index()].id == target
                 });
                 if let Some(i) = landed {
@@ -3263,8 +3732,10 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             Some(existing) => *existing = a,
             None => app.tree.agents.push(a),
         },
-        // Scratch terminals (`nebula raw-attach`) aren't shown in the TUI.
-        Entity::Terminal(_) => {}
+        Entity::Terminal(t) => match app.tree.terminals.iter_mut().find(|x| x.id == t.id) {
+            Some(existing) => *existing = t,
+            None => app.tree.terminals.push(t),
+        },
     }
 }
 
@@ -3281,15 +3752,19 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
                 .map(|w| w.id.clone())
                 .collect();
             app.tree.agents.retain(|a| !wt_ids.contains(&a.worktree_id));
+            app.tree
+                .terminals
+                .retain(|t| !wt_ids.contains(&t.worktree_id));
             app.tree.worktrees.retain(|w| &w.project_id != id);
             app.tree.projects.retain(|p| &p.id != id);
         }
         EntityId::Worktree(id) => {
             app.tree.agents.retain(|a| &a.worktree_id != id);
+            app.tree.terminals.retain(|t| &t.worktree_id != id);
             app.tree.worktrees.retain(|w| &w.id != id);
         }
         EntityId::Agent(id) => app.tree.agents.retain(|a| &a.id != id),
-        EntityId::Terminal(_) => {}
+        EntityId::Terminal(id) => app.tree.terminals.retain(|t| &t.id != id),
     }
 }
 
@@ -3357,7 +3832,7 @@ fn clamp_selections(app: &mut App) {
     if app.sel_worktree >= wt_len {
         app.sel_worktree = wt_len.saturating_sub(1);
     }
-    let sess_len = app.visible_sessions().len();
+    let sess_len = app.visible_session_rows().len();
     if app.sel_session >= sess_len {
         app.sel_session = sess_len.saturating_sub(1);
     }
@@ -3401,6 +3876,8 @@ mod tests {
                     sort_order: 0,
                     divider_after: false,
                     divider_label: None,
+                    divider_before: false,
+                    divider_before_label: None,
                 }),
             },
         );
@@ -3413,6 +3890,7 @@ mod tests {
                     path: "/tmp/demo".into(),
                     branch: "main".into(),
                     is_main: true,
+                    pinned: false,
                     sort_order: 0,
                 }),
             },
@@ -3510,6 +3988,61 @@ mod tests {
         let rows = app.visible_sessions();
         assert_eq!(rows[0].name, "agent-2", "pinned agent sorts first");
         assert_eq!(app.session_group_counts(), (1, 0, 1, 0));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("PINNED"), "pinned header rendered:\n{text}");
+        assert!(
+            text.contains("UNPINNED"),
+            "unpinned header rendered:\n{text}"
+        );
+    }
+
+    /// `p` on a worktree row asks the daemon to pin it; the upsert splits
+    /// the worktrees panel into PINNED and UNPINNED groups with pinned rows
+    /// first, and the selection follows the row across the regroup.
+    #[test]
+    fn pinned_worktrees_render_in_their_own_group() {
+        use nebula_core::{Entity, Worktree, WorktreeId};
+        let mk_feat = |pinned: bool| ServerEvent::EntityUpserted {
+            entity: Entity::Worktree(Worktree {
+                id: WorktreeId("w2".into()),
+                project_id: nebula_core::ProjectId("p1".into()),
+                path: "/tmp/demo-worktrees/feat".into(),
+                branch: "feat".into(),
+                is_main: false,
+                pinned,
+                sort_order: 0,
+            }),
+        };
+        let mut app = App::new();
+        seed_tree(&mut app); // p1/w1(main) + agent-1
+        hse(&mut app, mk_feat(false));
+
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 1; // "feat"
+        let mut out = Vec::new();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+            &mut out,
+        );
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::SetWorktreePinned { id, pinned: true, .. })
+                    if id.as_str() == "w2"
+            ),
+            "p requests the pin: {out:?}"
+        );
+
+        hse(&mut app, mk_feat(true));
+        let rows = app.visible_worktrees();
+        assert_eq!(rows[0].branch, "feat", "pinned worktree sorts first");
+        assert_eq!(app.worktree_group_counts(), (1, 1));
+        assert_eq!(app.sel_worktree, 0, "selection follows the pinned row");
+        assert_eq!(app.focus, Focus::Worktrees, "focus stays on the panel");
 
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
@@ -3641,6 +4174,7 @@ mod tests {
                     path: "/tmp/demo-feature".into(),
                     branch: "feature".into(),
                     is_main: false,
+                    pinned: false,
                     sort_order: 0,
                 }),
             },
@@ -3840,11 +4374,12 @@ mod tests {
         let Some(Overlay::Menu(menu)) = &app.overlay else {
             panic!("expected agent-type picker, got {:?}", app.overlay);
         };
-        assert_eq!(menu.title.as_deref(), Some("Agent type"));
-        assert_eq!(menu.items.len(), 3);
+        assert_eq!(menu.title.as_deref(), Some("New session"));
+        assert_eq!(menu.items.len(), 4);
         assert_eq!(menu.items[0].label, "Claude");
         assert_eq!(menu.items[1].label, "Codex");
         assert_eq!(menu.items[2].label, "Cursor");
+        assert_eq!(menu.items[3].label, "Terminal (shell)");
         assert_eq!(menu.hover, 0, "Claude is the default");
 
         // Enter on the default chains into the name prompt with kind=Claude,
@@ -3989,7 +4524,219 @@ mod tests {
         );
         assert!(matches!(
             &app.overlay,
-            Some(Overlay::Menu(m)) if m.title.as_deref() == Some("Agent type")
+            Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New session")
+        ));
+    }
+
+    fn seed_terminal(app: &mut App, id: &str, name: &str) {
+        use nebula_core::{Entity, TerminalId, TerminalTab, WorktreeId};
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Terminal(TerminalTab {
+                    id: TerminalId(id.into()),
+                    worktree_id: WorktreeId("w1".into()),
+                    name: name.into(),
+                    sort_order: 0,
+                    alive: true,
+                }),
+            },
+        );
+    }
+
+    #[test]
+    fn shift_t_creates_terminal_in_selected_worktree() {
+        use nebula_core::WorktreeId;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            &mut out,
+        );
+        assert!(matches!(
+            out.last(),
+            Some(ClientRequest::CreateTerminal { worktree, name: None, .. })
+                if worktree == &WorktreeId("w1".into())
+        ));
+    }
+
+    /// From the Projects panel, Shift+T targets the project's main checkout
+    /// (root), not whatever worktree row happens to be selected.
+    #[test]
+    fn shift_t_from_projects_targets_the_root_checkout() {
+        use nebula_core::{Entity, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w2".into()),
+                    project_id: nebula_core::ProjectId("p1".into()),
+                    path: "/tmp/demo-worktrees/feat".into(),
+                    branch: "feat".into(),
+                    is_main: false,
+                    pinned: false,
+                    sort_order: 1,
+                }),
+            },
+        );
+        app.sel_worktree = 1; // the feat worktree
+        app.focus = Focus::Projects;
+        let mut out = Vec::new();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            &mut out,
+        );
+        assert!(matches!(
+            out.last(),
+            Some(ClientRequest::CreateTerminal { worktree, .. })
+                if worktree == &WorktreeId("w1".into())
+        ));
+    }
+
+    /// The CreateTerminal Ack attaches the new terminal, and its upsert
+    /// lands the selection on the new row.
+    #[test]
+    fn create_terminal_ack_attaches_and_selects_it() {
+        use nebula_core::TerminalId;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            &mut out,
+        );
+        let Some(ClientRequest::CreateTerminal { req_id, .. }) = out.last() else {
+            panic!("expected CreateTerminal, got {:?}", out.last());
+        };
+        let req_id = *req_id;
+
+        // The daemon broadcasts the upsert before it replies with the Ack.
+        seed_terminal(&mut app, "t1", "term-1");
+        hse(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(EntityId::Terminal(TerminalId("t1".into()))),
+            },
+        );
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(SessionRef::Terminal(TerminalId("t1".into())))
+        );
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked, "a created terminal takes the input lock");
+        assert_eq!(app.sel_session, 1, "selection follows the new terminal row");
+    }
+
+    #[test]
+    fn terminal_rows_render_under_terminals_header() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_terminal(&mut app, "t1", "term-1");
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("TERMINALS"), "terminals header:\n{text}");
+        assert!(text.contains("term-1"), "terminal row rendered:\n{text}");
+    }
+
+    #[test]
+    fn enter_on_terminal_row_attaches_it() {
+        use nebula_core::TerminalId;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_terminal(&mut app, "t1", "term-1");
+        app.focus = Focus::Sessions;
+        app.sel_session = 1; // agent-1 first, then the terminal
+        let mut out = Vec::new();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut out,
+        );
+        assert!(out.iter().any(|r| matches!(
+            r,
+            ClientRequest::Attach { session: SessionRef::Terminal(id), .. }
+                if id == &TerminalId("t1".into())
+        )));
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked);
+    }
+
+    #[test]
+    fn d_on_terminal_row_confirms_then_closes() {
+        use nebula_core::TerminalId;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_terminal(&mut app, "t1", "term-1");
+        app.focus = Focus::Sessions;
+        app.sel_session = 1;
+        let mut out = Vec::new();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &mut out,
+        );
+        assert!(matches!(
+            &app.overlay,
+            Some(Overlay::Confirm(c)) if matches!(c.action, PendingAction::CloseTerminal(_))
+        ));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut out,
+        );
+        assert!(matches!(
+            out.last(),
+            Some(ClientRequest::CloseTerminal { id, .. }) if id == &TerminalId("t1".into())
+        ));
+    }
+
+    #[test]
+    fn r_on_terminal_row_renames_it() {
+        use nebula_core::TerminalId;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_terminal(&mut app, "t1", "term-1");
+        app.focus = Focus::Sessions;
+        app.sel_session = 1;
+        let mut out = Vec::new();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut out,
+        );
+        let Some(Overlay::Prompt(p)) = &app.overlay else {
+            panic!("expected rename prompt, got {:?}", app.overlay);
+        };
+        assert_eq!(p.title, "Rename terminal");
+        assert_eq!(p.input, "term-1", "prompt starts from the current name");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut out,
+        );
+        assert!(matches!(
+            out.last(),
+            Some(ClientRequest::RenameTerminal { id, name, .. })
+                if id == &TerminalId("t1".into()) && name == "term-1"
         ));
     }
 
@@ -4470,7 +5217,7 @@ mod tests {
         // A stale first click, well outside the double-click window.
         app.last_session_click = Some((
             std::time::Instant::now() - Duration::from_millis(500),
-            AgentId("a1".into()),
+            SessionRef::Agent(AgentId("a1".into())),
         ));
         handle_mouse(
             &mut app,
@@ -4772,6 +5519,8 @@ mod tests {
             sort_order,
             divider_after,
             divider_label: divider_label.map(String::from),
+            divider_before: false,
+            divider_before_label: None,
         })
     }
 
@@ -4789,6 +5538,7 @@ mod tests {
                     path: "/tmp/demo-feat".into(),
                     branch: "feat".into(),
                     is_main: false,
+                    pinned: false,
                     sort_order: 0,
                 }),
             },
@@ -4910,7 +5660,8 @@ mod tests {
             matches!(
                 out.last(),
                 Some(ClientRequest::SetProjectDivider {
-                    divider_after: true,
+                    before: false,
+                    present: true,
                     ..
                 })
             ),
@@ -4979,7 +5730,13 @@ mod tests {
             KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
             &mut out,
         );
-        assert_eq!(app.selected_project_row(), Some(ProjectRow::Divider(0)));
+        assert_eq!(
+            app.selected_project_row(),
+            Some(ProjectRow::Divider {
+                project: 0,
+                before: false
+            })
+        );
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT),
@@ -4988,7 +5745,11 @@ mod tests {
         assert!(
             matches!(
                 out.last(),
-                Some(ClientRequest::MoveDivider { delta: 1, .. })
+                Some(ClientRequest::MoveDivider {
+                    before: false,
+                    delta: 1,
+                    ..
+                })
             ),
             "Shift+J on a divider requests a divider move: {out:?}"
         );
@@ -5007,7 +5768,13 @@ mod tests {
                 entity: project("p2", "two", 1, true, Some("work")),
             },
         );
-        assert_eq!(app.selected_project_row(), Some(ProjectRow::Divider(1)));
+        assert_eq!(
+            app.selected_project_row(),
+            Some(ProjectRow::Divider {
+                project: 1,
+                before: false
+            })
+        );
         assert_eq!(app.selected_project().unwrap().name, "two");
 
         // Under the last project it sits at the bottom edge: nothing to send.
@@ -5076,6 +5843,7 @@ mod tests {
             path: "/tmp/demo-worktrees/feat".into(),
             branch: "feat".into(),
             is_main: false,
+            pinned: false,
             sort_order: 0,
         };
         hse(
@@ -5125,6 +5893,7 @@ mod tests {
                     path: "/tmp/demo-worktrees/other".into(),
                     branch: "other".into(),
                     is_main: false,
+                    pinned: false,
                     sort_order: 1,
                 }),
             },
@@ -5235,6 +6004,139 @@ mod tests {
         );
     }
 
+    /// A project with the leading divider (divider above the whole list).
+    fn leading_project(
+        id: &str,
+        name: &str,
+        sort_order: i64,
+        label: Option<&str>,
+    ) -> nebula_core::Entity {
+        use nebula_core::{Entity, Project, ProjectId};
+        Entity::Project(Project {
+            id: ProjectId(id.into()),
+            name: name.into(),
+            repo_path: format!("/tmp/{name}").into(),
+            sort_order,
+            divider_after: false,
+            divider_label: None,
+            divider_before: true,
+            divider_before_label: label.map(String::from),
+        })
+    }
+
+    #[test]
+    fn divider_under_the_top_project_hops_above_the_list() {
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 "demo" at sort 0, selected
+        let mut out = Vec::new();
+        app.focus = Focus::Projects;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: project("p1", "demo", 0, true, Some("work")),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: project("p2", "two", 1, false, None),
+            },
+        );
+
+        // j onto the divider under p1; Shift+K asks for the hop above the
+        // whole list.
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut out,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
+            &mut out,
+        );
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::MoveDivider {
+                    before: false,
+                    delta: -1,
+                    ..
+                })
+            ),
+            "Shift+K under the first project requests the top hop: {out:?}"
+        );
+
+        // The daemon answers with the re-owned divider; the selection
+        // chases it onto the leading row, drawn above its project.
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: leading_project("p1", "demo", 0, Some("work")),
+            },
+        );
+        assert_eq!(
+            app.selected_project_row(),
+            Some(ProjectRow::Divider {
+                project: 0,
+                before: true
+            })
+        );
+        assert_eq!(app.sel_project, 0, "the leading divider is the first row");
+
+        // Shift+K again clamps — it is already above everything.
+        let sent = out.len();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
+            &mut out,
+        );
+        assert_eq!(out.len(), sent, "top divider move up sends nothing");
+    }
+
+    #[test]
+    fn selected_divider_blanks_the_panes_with_a_hint() {
+        let mut app = App::new();
+        seed_tree(&mut app); // p1/w1(main) + agent-1
+        let mut out = Vec::new();
+        app.focus = Focus::Projects;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: project("p1", "demo", 0, true, Some("work")),
+            },
+        );
+
+        // On the project row the side panels show its content.
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("⌂ root"), "project shows worktrees:\n{text}");
+        assert!(text.contains("agent-1"), "project shows sessions:\n{text}");
+
+        // On the divider row the panels stay but their content blanks, and
+        // the terminal pane explains why.
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut out,
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            !text.contains("⌂ root"),
+            "divider hides worktree rows:\n{text}"
+        );
+        assert!(
+            !text.contains("agent-1"),
+            "divider hides session rows:\n{text}"
+        );
+        assert!(
+            text.contains("you're focused on a separator"),
+            "the pane hints at what to do:\n{text}"
+        );
+    }
+
     #[test]
     fn divider_rows_select_label_and_delete() {
         let mut app = App::new();
@@ -5254,7 +6156,13 @@ mod tests {
             KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
             &mut out,
         );
-        assert_eq!(app.selected_project_row(), Some(ProjectRow::Divider(0)));
+        assert_eq!(
+            app.selected_project_row(),
+            Some(ProjectRow::Divider {
+                project: 0,
+                before: false
+            })
+        );
         assert_eq!(app.selected_project().unwrap().name, "demo");
         assert!(
             !app.visible_worktrees().is_empty(),
@@ -5286,7 +6194,7 @@ mod tests {
         assert!(
             matches!(
                 out.last(),
-                Some(ClientRequest::SetProjectDivider { divider_after: true, label: Some(l), .. })
+                Some(ClientRequest::SetProjectDivider { present: true, label: Some(l), .. })
                     if l == "work"
             ),
             "label submit: {out:?}"
@@ -5313,7 +6221,7 @@ mod tests {
             matches!(
                 out.last(),
                 Some(ClientRequest::SetProjectDivider {
-                    divider_after: false,
+                    present: false,
                     label: None,
                     ..
                 })
@@ -5448,6 +6356,8 @@ mod tests {
                     sort_order: 0,
                     divider_after: false,
                     divider_label: None,
+                    divider_before: false,
+                    divider_before_label: None,
                 }),
             },
         );
@@ -5460,6 +6370,7 @@ mod tests {
                     path: path.to_path_buf(),
                     branch: "main".into(),
                     is_main: true,
+                    pinned: false,
                     sort_order: 0,
                 }),
             },
@@ -5538,6 +6449,89 @@ mod tests {
                 .contains("no changes in main"),
             "{:?}",
             app.flash
+        );
+    }
+
+    /// The badge cache follows the checkout: dirty counts (staged, unstaged
+    /// and untracked alike), clean clears, an unreadable path shows nothing,
+    /// and every value change marks the app dirty so a frame gets drawn.
+    #[test]
+    fn refresh_git_changes_tracks_the_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+
+        app.dirty = false;
+        refresh_git_changes(&mut app);
+        assert_eq!(app.selected_worktree_changes(), Some(0), "clean tree");
+        assert!(app.dirty, "first computation redraws");
+        assert!(!app.git_changes_stale(), "cache matches the selection");
+
+        std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+        std::fs::write(repo.join("z.txt"), "fresh\n").unwrap();
+        app.dirty = false;
+        refresh_git_changes(&mut app);
+        assert_eq!(app.selected_worktree_changes(), Some(2), "dirty tree");
+        assert!(app.dirty, "count change redraws");
+
+        app.dirty = false;
+        refresh_git_changes(&mut app);
+        assert!(!app.dirty, "an unchanged count skips the redraw");
+
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "wip"]);
+        refresh_git_changes(&mut app);
+        assert_eq!(app.selected_worktree_changes(), Some(0), "commit clears");
+    }
+
+    #[test]
+    fn refresh_git_changes_survives_a_missing_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &dir.path().join("nope"));
+        refresh_git_changes(&mut app);
+        assert_eq!(app.selected_worktree_changes(), None);
+        assert!(!app.git_changes_stale(), "the failed read is still cached");
+    }
+
+    /// The worktree panel badge renders only for a dirty selected checkout.
+    #[test]
+    fn worktree_panel_badge_shows_change_count() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            !buffer_text(&terminal).contains("changed file"),
+            "no badge before a count exists"
+        );
+
+        app.git_changes = Some((WorktreeId("w1".into()), Some(2)));
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("2 changed files"), "badge rendered:\n{text}");
+
+        app.git_changes = Some((WorktreeId("w1".into()), Some(1)));
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("1 changed file "), "singular form:\n{text}");
+
+        app.git_changes = Some((WorktreeId("w1".into()), Some(0)));
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            !buffer_text(&terminal).contains("changed file"),
+            "clean checkout stays quiet"
+        );
+
+        // A count cached for some other worktree must not leak onto the
+        // selected row's panel.
+        app.git_changes = Some((WorktreeId("w2".into()), Some(5)));
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            !buffer_text(&terminal).contains("changed file"),
+            "stale cache renders nothing"
         );
     }
 
@@ -5648,6 +6642,123 @@ mod tests {
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
         assert!(app.overlay.is_none(), "second Esc closes the modal");
         assert!(out.is_empty(), "filtering never talks to the daemon");
+    }
+
+    /// The current diff view, or panic.
+    fn diff_view(app: &App) -> &crate::app::DiffView {
+        match &app.overlay {
+            Some(Overlay::Diff(v)) => v,
+            other => panic!("expected diff overlay, got {other:?}"),
+        }
+    }
+
+    /// The visible file list in display order.
+    fn diff_order(app: &App) -> Vec<String> {
+        let v = diff_view(app);
+        v.matches
+            .iter()
+            .map(|m| v.files[m.file].path.clone())
+            .collect()
+    }
+
+    #[test]
+    fn ctrl_r_toggles_reviewed_and_marks_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::review::with_store_path(dir.path().join("reviewed.json"), || {
+            let repo = test_repo(&dir);
+            std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+            std::fs::write(repo.join("z.txt"), "fresh\n").unwrap();
+
+            let mut app = App::new();
+            seed_repo_tree(&mut app, &repo);
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+            // Status is path-ordered, so a.txt is the selected file. Marking
+            // sinks it below z.txt and advances to the next file.
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL, &mut out);
+            let v = diff_view(&app);
+            assert!(v.reviewed.contains_key("a.txt"), "{:?}", v.reviewed);
+            assert!(!v.head_key.is_empty(), "head OID captured for scoping");
+            assert_eq!(diff_order(&app), ["z.txt", "a.txt"], "reviewed sinks");
+            let v = diff_view(&app);
+            assert_eq!(v.selected_file().unwrap().path, "z.txt", "auto-advance");
+            assert!(v.diff.contains("+fresh"), "next file's diff loaded: {}", v.diff);
+
+            // Reopen: the mark comes back from the store, already sunk, and
+            // the first unreviewed file starts selected.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+            assert_eq!(diff_order(&app), ["z.txt", "a.txt"], "restored + sunk");
+            assert_eq!(diff_view(&app).selected_file().unwrap().path, "z.txt");
+
+            // Ctrl+r on the reviewed row unmarks it; the file pops back up
+            // to git order, stays selected, and the store forgets the mark.
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL, &mut out);
+            let v = diff_view(&app);
+            assert!(v.reviewed.is_empty());
+            assert_eq!(diff_order(&app), ["a.txt", "z.txt"], "git order back");
+            let v = diff_view(&app);
+            assert_eq!(
+                v.selected_file().unwrap().path,
+                "a.txt",
+                "selection follows the unmarked file"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+            assert!(diff_view(&app).reviewed.is_empty(), "unmark persisted");
+            assert!(out.is_empty(), "reviewed marks never talk to the daemon");
+        });
+    }
+
+    #[test]
+    fn editing_a_reviewed_file_drops_its_mark_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::review::with_store_path(dir.path().join("reviewed.json"), || {
+            let repo = test_repo(&dir);
+            std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+
+            let mut app = App::new();
+            seed_repo_tree(&mut app, &repo);
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL, &mut out);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+            // The approved diff no longer matches what's on disk.
+            std::fs::write(repo.join("a.txt"), "changed again\n").unwrap();
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+            assert!(
+                diff_view(&app).reviewed.is_empty(),
+                "an edited file comes back unreviewed"
+            );
+        });
+    }
+
+    #[test]
+    fn a_commit_resets_reviewed_marks() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::review::with_store_path(dir.path().join("reviewed.json"), || {
+            let repo = test_repo(&dir);
+            std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+
+            let mut app = App::new();
+            seed_repo_tree(&mut app, &repo);
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL, &mut out);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+            // Commit moves HEAD; the next round of changes starts unreviewed.
+            run_git(&repo, &["add", "."]);
+            run_git(&repo, &["commit", "-m", "wip"]);
+            std::fs::write(repo.join("a.txt"), "post-commit\n").unwrap();
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+            assert!(
+                diff_view(&app).reviewed.is_empty(),
+                "a commit resets the worktree's marks"
+            );
+        });
     }
 
     #[test]
@@ -5931,6 +7042,8 @@ mod tests {
                     sort_order: 1,
                     divider_after: false,
                     divider_label: None,
+                    divider_before: false,
+                    divider_before_label: None,
                 }),
             },
         );
@@ -5943,6 +7056,7 @@ mod tests {
                     path: "/tmp/nebula".into(),
                     branch: "feat-x".into(),
                     is_main: true,
+                    pinned: false,
                     sort_order: 0,
                 }),
             },
@@ -6228,6 +7342,8 @@ mod tests {
                     sort_order: 9,
                     divider_after: false,
                     divider_label: None,
+                    divider_before: false,
+                    divider_before_label: None,
                 }),
             },
         );
@@ -6895,5 +8011,153 @@ mod tests {
             (vim.area.width, vim.area.height),
             "sync resizes the PTY to the drawn rect"
         );
+    }
+
+    // ---- Shift+D bulk delete ----
+
+    /// Shift+D in the worktrees panel confirms deleting EVERY non-main
+    /// worktree of the project — itemized in the dialog — and confirming
+    /// fires one delete per worktree, dropping the rows optimistically.
+    #[test]
+    fn shift_d_bulk_deletes_worktrees_behind_an_itemized_confirm() {
+        use nebula_core::{Entity, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app); // p1/w1(main) + agent-1
+        let mut out = Vec::new();
+        for (id, branch) in [("w2", "feat"), ("w3", "fix")] {
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(Worktree {
+                        id: WorktreeId(id.into()),
+                        project_id: nebula_core::ProjectId("p1".into()),
+                        path: format!("/tmp/demo-worktrees/{branch}").into(),
+                        branch: branch.into(),
+                        is_main: false,
+                        pinned: false,
+                        sort_order: 0,
+                    }),
+                },
+            );
+        }
+        app.focus = Focus::Worktrees;
+
+        press(&mut app, KeyCode::Char('D'), KeyModifiers::SHIFT, &mut out);
+        let Some(Overlay::Confirm(c)) = &app.overlay else {
+            panic!("Shift+D confirms first: {:?}", app.overlay);
+        };
+        assert!(
+            c.message.contains("• feat") && c.message.contains("• fix"),
+            "casualties are itemized: {}",
+            c.message
+        );
+        assert!(
+            !c.message.contains("• main"),
+            "main checkout is not on the kill list: {}",
+            c.message
+        );
+        assert!(
+            matches!(&c.action, PendingAction::DeleteAllWorktrees(ids) if ids.len() == 2),
+            "main checkout excluded from the action: {:?}",
+            c.action
+        );
+
+        // The dialog really shows the list (multi-line confirm rendering).
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("• feat"), "dialog lists feat:\n{text}");
+        assert!(text.contains("• fix"), "dialog lists fix:\n{text}");
+
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        let deleted: Vec<&str> = out
+            .iter()
+            .filter_map(|r| match r {
+                ClientRequest::DeleteWorktree { id, .. } => Some(id.0.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deleted, ["w2", "w3"], "one request per worktree: {out:?}");
+        assert!(app.overlay.is_none());
+        let left: Vec<&str> = app.tree.worktrees.iter().map(|w| w.id.0.as_str()).collect();
+        assert_eq!(left, ["w1"], "only the main checkout survives");
+    }
+
+    /// With only the main checkout, Shift+D has nothing to offer — flash,
+    /// no dialog.
+    #[test]
+    fn shift_d_with_only_the_main_checkout_flashes() {
+        let mut app = App::new();
+        seed_tree(&mut app); // p1/w1(main) + agent-1
+        let mut out = Vec::new();
+        app.focus = Focus::Worktrees;
+        press(&mut app, KeyCode::Char('D'), KeyModifiers::SHIFT, &mut out);
+        assert!(app.overlay.is_none(), "nothing to confirm");
+        assert!(app.flash.is_some(), "the refusal explains itself");
+        assert!(out.is_empty(), "nothing is requested");
+    }
+
+    /// Shift+D in the sessions panel confirms deleting every LISTED session
+    /// — hidden archived rows are spared — and an attached doomed session
+    /// detaches before its delete.
+    #[test]
+    fn shift_d_bulk_deletes_the_visible_sessions() {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app); // p1/w1(main) + agent-1
+        for (id, name, archived) in [("a2", "agent-2", false), ("a3", "agent-3", true)] {
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(Agent {
+                        id: AgentId(id.into()),
+                        worktree_id: WorktreeId("w1".into()),
+                        name: name.into(),
+                        status: AgentStatus::Fresh,
+                        archived,
+                        pinned: false,
+                        kind: nebula_core::AgentKind::Claude,
+                        session_id: None,
+                        sort_order: 1,
+                        status_changed_at: 0,
+                        alive: true,
+                    }),
+                },
+            );
+        }
+        app.focus = Focus::Sessions;
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        app.term = Some(AttachedTerm::new(sref.clone(), 40, 10));
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('D'), KeyModifiers::SHIFT, &mut out);
+        let Some(Overlay::Confirm(c)) = &app.overlay else {
+            panic!("Shift+D confirms first: {:?}", app.overlay);
+        };
+        assert!(
+            c.message.contains("• agent-1") && c.message.contains("• agent-2"),
+            "listed sessions are itemized: {}",
+            c.message
+        );
+        assert!(
+            !c.message.contains("agent-3"),
+            "hidden archived rows are spared: {}",
+            c.message
+        );
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(out.first(), Some(ClientRequest::Detach { session }) if *session == sref),
+            "attached doomed session detaches first: {out:?}"
+        );
+        assert!(app.term.is_none(), "the pane blanks with the detach");
+        let deleted: Vec<&str> = out
+            .iter()
+            .filter_map(|r| match r {
+                ClientRequest::DeleteAgent { id, .. } => Some(id.0.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deleted, ["a1", "a2"], "one request per session: {out:?}");
     }
 }

@@ -2,7 +2,8 @@
 
 use crate::git_diff::DiffFile;
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Project, ProjectId, SessionRef, Worktree, WorktreeId,
+    Agent, AgentId, AgentKind, AgentStatus, Project, ProjectId, SessionRef, TerminalId,
+    TerminalTab, Worktree, WorktreeId,
 };
 use ratatui::layout::Rect;
 use std::collections::HashMap;
@@ -71,12 +72,22 @@ pub enum MenuAction {
     NewAgent(WorktreeId),
     /// Picker result: create an agent of this kind (chains into the name prompt).
     NewAgentOfKind(WorktreeId, AgentKind),
+    /// Shell terminal in the worktree's directory; created immediately with
+    /// a default name (no prompt), renameable later.
+    NewTerminal(WorktreeId),
+    RenameTerminal(TerminalId),
+    CloseTerminal(TerminalId),
     NewWorktree(ProjectId),
+    SetWorktreePinned(WorktreeId, bool),
     DeleteWorktree(WorktreeId),
     AddProject,
     RemoveProject(ProjectId),
-    SetProjectDivider(ProjectId, bool),
-    LabelDivider(ProjectId),
+    SetProjectDivider {
+        id: ProjectId,
+        before: bool,
+        present: bool,
+    },
+    LabelDivider(ProjectId, bool),
     ToggleArchived,
 }
 
@@ -107,7 +118,16 @@ pub enum PendingAction {
     /// directory (daemon-side, `git init` per its config) and add it.
     CreateProjectDir(std::path::PathBuf),
     DeleteAgent(AgentId),
+    CloseTerminal(TerminalId),
     DeleteWorktree(WorktreeId),
+    /// Shift+D: every deletable worktree of the selected project.
+    DeleteAllWorktrees(Vec<WorktreeId>),
+    /// Shift+D: every session row the panel currently shows — agents and
+    /// terminals both.
+    DeleteAllSessions {
+        agents: Vec<AgentId>,
+        terminals: Vec<TerminalId>,
+    },
     RemoveProject(ProjectId),
     Quit,
 }
@@ -122,9 +142,11 @@ pub struct ConfirmDialog {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptKind {
     AddProject,
-    /// Label for the divider hanging below this project.
+    /// Label for one of this project's dividers (`before` = the leading
+    /// divider above the list).
     DividerLabel {
         id: ProjectId,
+        before: bool,
     },
     NewWorktree {
         project: ProjectId,
@@ -135,6 +157,9 @@ pub enum PromptKind {
     },
     RenameAgent {
         id: AgentId,
+    },
+    RenameTerminal {
+        id: TerminalId,
     },
 }
 
@@ -174,7 +199,8 @@ pub struct DiffView {
     /// Type-to-filter query over `files` paths; always live.
     pub filter: String,
     /// Visible rows: `files` narrowed by `filter`, best matches first
-    /// (git order when the filter is empty).
+    /// (git order when the filter is empty); reviewed ✓ files always sink
+    /// to the bottom.
     pub matches: Vec<DiffMatch>,
     /// Index into `matches` (not `files`).
     pub selected: usize,
@@ -200,6 +226,13 @@ pub struct DiffView {
     pub files_drag: Option<i32>,
     /// Whether the repo has a commit; picks the diff command.
     pub head_ok: bool,
+    /// Reviewed ✓ marks: file path → fingerprint of the approved diff text.
+    /// Nebula-side bookkeeping only (persisted via `review::store_marks`);
+    /// never stages or otherwise touches git state.
+    pub reviewed: HashMap<String, u64>,
+    /// HEAD OID the marks are scoped to (empty on an unborn HEAD). A moved
+    /// HEAD — commit, checkout — resets the worktree's marks on next open.
+    pub head_key: String,
 }
 
 impl DiffView {
@@ -220,6 +253,8 @@ impl DiffView {
             files_width: DEFAULT_DIFF_FILES_W,
             files_drag: None,
             head_ok,
+            reviewed: HashMap::new(),
+            head_key: String::new(),
         };
         view.apply_filter();
         view
@@ -274,15 +309,56 @@ impl DiffView {
 
     /// Recompute `matches` from `filter` and reset the selection to the top
     /// row; true when the selected file changed (the caller reloads the
-    /// diff). Best matches first, git order when the filter is empty.
+    /// diff).
     pub fn apply_filter(&mut self) -> bool {
         let before = self.matches.get(self.selected).map(|m| m.file);
+        self.recompute_matches();
+        self.selected = 0;
+        before != self.matches.first().map(|m| m.file)
+    }
+
+    /// Rebuild the visible rows from `filter` and the reviewed marks: best
+    /// matches first (git order when the filter is empty), reviewed ✓ files
+    /// stably sunk to the bottom. The selection index is left alone —
+    /// callers reset or fix it up.
+    pub fn recompute_matches(&mut self) {
         self.matches = crate::fuzzy::rank(&self.filter, self.files.iter().map(|f| f.path.as_str()))
             .into_iter()
             .map(|(file, positions)| DiffMatch { file, positions })
             .collect();
-        self.selected = 0;
-        before != self.matches.first().map(|m| m.file)
+        let files = &self.files;
+        let reviewed = &self.reviewed;
+        self.matches
+            .sort_by_key(|m| reviewed.contains_key(&files[m.file].path));
+    }
+
+    /// Toggle the reviewed ✓ on the selected file and re-sink reviewed
+    /// files. Marking keeps the selection row — with the marked file sunk,
+    /// that lands on the next file in the list; unmarking follows the file
+    /// back to its natural spot. `None` when no row is selected, otherwise
+    /// whether the selected file changed (the caller reloads the diff; it
+    /// persists `reviewed` either way).
+    pub fn toggle_reviewed(&mut self) -> Option<bool> {
+        let path = self.selected_file()?.path.clone();
+        let before = self.matches.get(self.selected).map(|m| m.file);
+        let unmarked = self.reviewed.remove(&path).is_some();
+        if !unmarked {
+            let mark = crate::review::fingerprint(&self.diff);
+            self.reviewed.insert(path.clone(), mark);
+        }
+        self.recompute_matches();
+        if unmarked {
+            if let Some(pos) = self
+                .matches
+                .iter()
+                .position(|m| self.files[m.file].path == path)
+            {
+                self.selected = pos;
+            }
+        } else {
+            self.selected = self.selected.min(self.matches.len().saturating_sub(1));
+        }
+        Some(before != self.matches.get(self.selected).map(|m| m.file))
     }
 }
 
@@ -663,25 +739,50 @@ pub enum ConnState {
     Disconnected,
 }
 
-/// SessionRef for an agent row (the only session kind the panel shows).
-pub fn agent_sref(a: &Agent) -> SessionRef {
-    SessionRef::Agent(a.id.clone())
+/// One row in the Sessions panel: agents (pinned / recent / unpinned), then
+/// shell terminals, then archived agents.
+#[derive(Debug, Clone)]
+pub enum SessionRow {
+    Agent(Agent),
+    Terminal(TerminalTab),
+}
+
+impl SessionRow {
+    pub fn name(&self) -> &str {
+        match self {
+            SessionRow::Agent(a) => &a.name,
+            SessionRow::Terminal(t) => &t.name,
+        }
+    }
+
+    pub fn sref(&self) -> SessionRef {
+        match self {
+            SessionRow::Agent(a) => SessionRef::Agent(a.id.clone()),
+            SessionRow::Terminal(t) => SessionRef::Terminal(t.id.clone()),
+        }
+    }
+
+    pub fn is_archived_agent(&self) -> bool {
+        matches!(self, SessionRow::Agent(a) if a.archived)
+    }
 }
 
 /// One selectable row in the Projects panel. The payload indexes
-/// `tree.projects`; a `Divider` is the separator hanging below that project.
+/// `tree.projects`; a `Divider` is the separator hanging below that project
+/// — or, with `before`, the leading divider drawn above the whole list
+/// (always owned by project 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectRow {
     Project(usize),
-    Divider(usize),
+    Divider { project: usize, before: bool },
 }
 
 impl ProjectRow {
     /// Index of the project this row belongs to (a divider belongs to the
-    /// project it hangs below).
+    /// project that owns it).
     pub fn project_index(&self) -> usize {
         match self {
-            ProjectRow::Project(i) | ProjectRow::Divider(i) => *i,
+            ProjectRow::Project(i) | ProjectRow::Divider { project: i, .. } => *i,
         }
     }
 }
@@ -713,6 +814,7 @@ pub struct Tree {
     pub projects: Vec<Project>,
     pub worktrees: Vec<Worktree>,
     pub agents: Vec<Agent>,
+    pub terminals: Vec<TerminalTab>,
 }
 
 pub struct AttachedTerm {
@@ -843,9 +945,10 @@ pub struct App {
     pub pending: HashMap<u64, PendingIntent>,
     /// Session created by us, awaiting its upsert to fix the selection.
     pub select_when_seen: Option<SessionRef>,
-    /// A divider we asked to move, awaiting the upsert that lands it under
-    /// this project so the selection can follow it there.
-    pub select_divider_when_seen: Option<ProjectId>,
+    /// A divider we asked to move, awaiting the upsert that lands it on
+    /// this project (`true` = its leading divider) so the selection can
+    /// follow it there.
+    pub select_divider_when_seen: Option<(ProjectId, bool)>,
     /// Worktree created by us, awaiting its upsert to fix the selection.
     pub select_worktree_when_seen: Option<WorktreeId>,
     /// Last selected worktree per project — switching back to a project
@@ -859,9 +962,9 @@ pub struct App {
     /// Last left-click on the terminal pane (time + pane-relative cell), for
     /// double-click detection.
     pub last_term_click: Option<(std::time::Instant, (u16, u16))>,
-    /// Last left-click on a session row (time + agent), for double-click
+    /// Last left-click on a session row (time + session), for double-click
     /// attach detection (a single click only selects the row).
-    pub last_session_click: Option<(std::time::Instant, AgentId)>,
+    pub last_session_click: Option<(std::time::Instant, SessionRef)>,
     /// URLs detected on the visible screen during the last draw; hit-tested
     /// on ⌥click and underlined by the renderer.
     pub term_links: Vec<crate::links::TermLink>,
@@ -889,7 +992,7 @@ pub struct App {
     pub recent_window_ms: i64,
     /// Session under the cursor as of the last draw, so the RECENT-expiry
     /// tick can re-anchor `sel_session` after rows regroup underneath it.
-    pub drawn_session: Option<AgentId>,
+    pub drawn_session: Option<SessionRef>,
     /// Active color theme. From config (`theme`); the event loop refreshes
     /// it when the setting changes.
     pub theme: crate::theme::Theme,
@@ -900,6 +1003,12 @@ pub struct App {
     /// Stamp for the current editor spawn, so a closed editor's buffered
     /// events can't touch its successor.
     pub vim_generation: u64,
+    /// Changed-file count of the selected worktree's checkout (staged +
+    /// unstaged + untracked), the worktree panel's bottom badge. Keyed by
+    /// worktree so a selection change can't show another checkout's count;
+    /// the inner `None` means the checkout wasn't readable. The event loop
+    /// refreshes it on a slow poll and before drawing a changed selection.
+    pub git_changes: Option<(WorktreeId, Option<usize>)>,
 }
 
 impl Default for App {
@@ -951,6 +1060,7 @@ impl App {
             vim: None,
             vim_tx: None,
             vim_generation: 0,
+            git_changes: None,
         }
     }
 
@@ -998,17 +1108,33 @@ impl App {
         id
     }
 
-    /// Projects panel rows in display order: each project, then its divider
-    /// (when present) directly below it.
+    /// Projects panel rows in display order: the leading divider (when
+    /// present), then each project with its divider directly below it.
     pub fn project_rows(&self) -> Vec<ProjectRow> {
-        let mut rows = Vec::with_capacity(self.tree.projects.len());
+        let mut rows = Vec::with_capacity(self.tree.projects.len() + 1);
+        if self.tree.projects.first().is_some_and(|p| p.divider_before) {
+            rows.push(ProjectRow::Divider {
+                project: 0,
+                before: true,
+            });
+        }
         for (i, p) in self.tree.projects.iter().enumerate() {
             rows.push(ProjectRow::Project(i));
             if p.divider_after {
-                rows.push(ProjectRow::Divider(i));
+                rows.push(ProjectRow::Divider {
+                    project: i,
+                    before: false,
+                });
             }
         }
         rows
+    }
+
+    /// Is the Projects-panel selection sitting on a divider row? The
+    /// Worktrees/Sessions panels and the terminal pane blank their content
+    /// while it is — a separator has nothing underneath it to show.
+    pub fn divider_focused(&self) -> bool {
+        matches!(self.selected_project_row(), Some(ProjectRow::Divider { .. }))
     }
 
     pub fn selected_project_row(&self) -> Option<ProjectRow> {
@@ -1028,8 +1154,68 @@ impl App {
         worktrees.get(self.sel_worktree).copied()
     }
 
+    /// The cached changed-file count when it belongs to the selected
+    /// worktree; `None` while unknown or the checkout is unreadable.
+    pub fn selected_worktree_changes(&self) -> Option<usize> {
+        let wt = self.selected_worktree()?;
+        match &self.git_changes {
+            Some((id, count)) if *id == wt.id => *count,
+            _ => None,
+        }
+    }
+
+    /// Does the cache describe a different worktree than the selection?
+    /// The event loop refreshes before drawing when it does, so the badge
+    /// never lags a j/k by a poll interval.
+    pub fn git_changes_stale(&self) -> bool {
+        self.git_changes.as_ref().map(|(id, _)| id) != self.selected_worktree().map(|w| &w.id)
+    }
+
+    /// The full row list the panel shows — `sel_session` indexes this.
+    pub fn visible_session_rows(&self) -> Vec<SessionRow> {
+        let agents = self.visible_sessions();
+        let (pinned, recent, unpinned, _) = self.session_group_counts();
+        let active = (pinned + recent + unpinned).min(agents.len());
+        let mut rows: Vec<SessionRow> = agents[..active]
+            .iter()
+            .cloned()
+            .map(SessionRow::Agent)
+            .collect();
+        rows.extend(
+            self.visible_terminals()
+                .into_iter()
+                .map(SessionRow::Terminal),
+        );
+        rows.extend(agents[active..].iter().cloned().map(SessionRow::Agent));
+        rows
+    }
+
+    pub fn selected_session_row(&self) -> Option<SessionRow> {
+        self.visible_session_rows()
+            .into_iter()
+            .nth(self.sel_session)
+    }
+
+    /// The selected row's agent, when it is one (terminal rows return None).
     pub fn selected_session(&self) -> Option<Agent> {
-        self.visible_sessions().into_iter().nth(self.sel_session)
+        match self.selected_session_row() {
+            Some(SessionRow::Agent(a)) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// Shell terminals of the selected worktree, in tree order.
+    pub fn visible_terminals(&self) -> Vec<TerminalTab> {
+        let worktrees = self.visible_worktrees();
+        let Some(wt) = worktrees.get(self.sel_worktree) else {
+            return vec![];
+        };
+        self.tree
+            .terminals
+            .iter()
+            .filter(|t| t.worktree_id == wt.id)
+            .cloned()
+            .collect()
     }
 
     /// First free `prefix-N` name within the selected worktree.
@@ -1049,16 +1235,45 @@ impl App {
         }
     }
 
-    /// Worktrees of the selected project, in tree order.
+    /// Worktrees of the selected project: pinned first, then the rest,
+    /// each group in tree order (mirrors the sessions list).
     pub fn visible_worktrees(&self) -> Vec<&Worktree> {
         let Some(project) = self.selected_project() else {
             return vec![];
         };
-        self.tree
+        let mut rows: Vec<&Worktree> = self
+            .tree
             .worktrees
             .iter()
-            .filter(|w| w.project_id == project.id)
-            .collect()
+            .filter(|w| w.project_id == project.id && w.pinned)
+            .collect();
+        rows.extend(
+            self.tree
+                .worktrees
+                .iter()
+                .filter(|w| w.project_id == project.id && !w.pinned),
+        );
+        rows
+    }
+
+    /// (pinned, unpinned) worktree counts for the selected project.
+    pub fn worktree_group_counts(&self) -> (usize, usize) {
+        let Some(project) = self.selected_project() else {
+            return (0, 0);
+        };
+        let pinned = self
+            .tree
+            .worktrees
+            .iter()
+            .filter(|w| w.project_id == project.id && w.pinned)
+            .count();
+        let unpinned = self
+            .tree
+            .worktrees
+            .iter()
+            .filter(|w| w.project_id == project.id && !w.pinned)
+            .count();
+        (pinned, unpinned)
     }
 
     /// An unpinned, unarchived agent whose status changed within the
@@ -1258,5 +1473,55 @@ mod tests {
             0,
             "alternate screen must not accumulate scrollback"
         );
+    }
+
+    #[test]
+    fn toggle_reviewed_sinks_marks_and_moves_the_selection() {
+        let files = ["a", "b", "c"]
+            .map(|p| DiffFile {
+                path: p.into(),
+                orig_path: None,
+                xy: ['M', ' '],
+            })
+            .to_vec();
+        let mut v = DiffView::new("/nonexistent-review".into(), "main".into(), files, true);
+        let order = |v: &DiffView| -> Vec<String> {
+            v.matches
+                .iter()
+                .map(|m| v.files[m.file].path.clone())
+                .collect()
+        };
+
+        // Mark the middle file: it sinks and the next file takes its row.
+        v.select(1);
+        assert_eq!(v.toggle_reviewed(), Some(true), "moved on to c");
+        assert_eq!(order(&v), ["a", "c", "b"]);
+        assert_eq!(v.selected_file().unwrap().path, "c");
+
+        // Mark c too: the reviewed zone keeps git order and the selection
+        // row lands in it (nothing unreviewed is left below c).
+        assert_eq!(v.toggle_reviewed(), Some(true));
+        assert_eq!(order(&v), ["a", "b", "c"]);
+        assert_eq!(v.selected_file().unwrap().path, "b");
+
+        // Unmark b: it pops back to its natural spot and stays selected —
+        // same file, so no diff reload.
+        assert_eq!(v.toggle_reviewed(), Some(false));
+        assert_eq!(order(&v), ["a", "b", "c"]);
+        assert_eq!(v.selected_file().unwrap().path, "b");
+        assert_eq!(v.reviewed.len(), 1, "only c is still marked");
+
+        // With every other file reviewed, marking keeps the file selected —
+        // there is nowhere further to advance.
+        assert_eq!(v.toggle_reviewed(), Some(false), "b stays selected");
+        v.select(0);
+        assert_eq!(v.toggle_reviewed(), Some(false), "a stays selected");
+        assert_eq!(order(&v), ["a", "b", "c"]);
+        assert_eq!(v.reviewed.len(), 3);
+
+        // No visible row (dead-end filter): toggling is a no-op.
+        v.filter = "zzz".into();
+        v.apply_filter();
+        assert_eq!(v.toggle_reviewed(), None);
     }
 }

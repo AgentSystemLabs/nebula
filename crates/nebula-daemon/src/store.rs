@@ -71,6 +71,16 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE agents ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
     ",
+    // 6: pinned worktrees (their own group in the worktrees list)
+    "
+    ALTER TABLE worktrees ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+    ",
+    // 7: the leading divider — drawn above the whole list, owned by the
+    // first project
+    "
+    ALTER TABLE projects ADD COLUMN divider_before INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE projects ADD COLUMN divider_before_label TEXT;
+    ",
 ];
 
 pub struct Store {
@@ -129,8 +139,8 @@ impl Store {
 
     pub fn insert_project(&self, p: &Project) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO projects (id, name, repo_path, sort_order, divider_after, divider_label, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![p.id.as_str(), p.name, p.repo_path.to_string_lossy(), p.sort_order, p.divider_after as i64, p.divider_label, now_ms()],
+            "INSERT INTO projects (id, name, repo_path, sort_order, divider_after, divider_label, divider_before, divider_before_label, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![p.id.as_str(), p.name, p.repo_path.to_string_lossy(), p.sort_order, p.divider_after as i64, p.divider_label, p.divider_before as i64, p.divider_before_label, now_ms()],
         )?;
         Ok(())
     }
@@ -144,16 +154,18 @@ impl Store {
         )?)
     }
 
-    pub fn set_project_position(
-        &self,
-        id: &ProjectId,
-        sort_order: i64,
-        divider_after: bool,
-        divider_label: Option<&str>,
-    ) -> Result<()> {
+    /// Persist a project's list position: sort order plus both dividers.
+    pub fn set_project_position(&self, p: &Project) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "UPDATE projects SET sort_order = ?2, divider_after = ?3, divider_label = ?4 WHERE id = ?1",
-            params![id.as_str(), sort_order, divider_after as i64, divider_label],
+            "UPDATE projects SET sort_order = ?2, divider_after = ?3, divider_label = ?4, divider_before = ?5, divider_before_label = ?6 WHERE id = ?1",
+            params![
+                p.id.as_str(),
+                p.sort_order,
+                p.divider_after as i64,
+                p.divider_label,
+                p.divider_before as i64,
+                p.divider_before_label
+            ],
         )?;
         Ok(())
     }
@@ -179,14 +191,15 @@ impl Store {
 
     pub fn insert_worktree(&self, w: &Worktree) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO worktrees (id, project_id, path, branch, is_main, sort_order, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO worktrees (id, project_id, path, branch, is_main, pinned, sort_order, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 w.id.as_str(),
                 w.project_id.as_str(),
                 w.path.to_string_lossy(),
                 w.branch,
                 w.is_main as i64,
+                w.pinned as i64,
                 w.sort_order,
                 now_ms()
             ],
@@ -206,6 +219,14 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "UPDATE worktrees SET branch = ?2 WHERE id = ?1",
             params![id.as_str(), branch],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_worktree_pinned(&self, id: &WorktreeId, pinned: bool) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE worktrees SET pinned = ?2 WHERE id = ?1",
+            params![id.as_str(), pinned as i64],
         )?;
         Ok(())
     }
@@ -341,7 +362,7 @@ impl Store {
     pub fn get_project(&self, id: &ProjectId) -> Result<Option<Project>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, repo_path, sort_order, divider_after, divider_label FROM projects WHERE id = ?1")?;
+            .prepare("SELECT id, name, repo_path, sort_order, divider_after, divider_label, divider_before, divider_before_label FROM projects WHERE id = ?1")?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| Project {
             id: ProjectId(r.get::<_, String>(0).unwrap()),
@@ -350,13 +371,15 @@ impl Store {
             sort_order: r.get(3).unwrap(),
             divider_after: r.get::<_, i64>(4).unwrap() != 0,
             divider_label: r.get(5).unwrap(),
+            divider_before: r.get::<_, i64>(6).unwrap() != 0,
+            divider_before_label: r.get(7).unwrap(),
         }))
     }
 
     pub fn get_worktree(&self, id: &WorktreeId) -> Result<Option<Worktree>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, path, branch, is_main, sort_order FROM worktrees WHERE id = ?1",
+            "SELECT id, project_id, path, branch, is_main, pinned, sort_order FROM worktrees WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| Worktree {
@@ -365,7 +388,8 @@ impl Store {
             path: PathBuf::from(r.get::<_, String>(2).unwrap()),
             branch: r.get(3).unwrap(),
             is_main: r.get::<_, i64>(4).unwrap() != 0,
-            sort_order: r.get(5).unwrap(),
+            pinned: r.get::<_, i64>(5).unwrap() != 0,
+            sort_order: r.get(6).unwrap(),
         }))
     }
 
@@ -419,7 +443,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
 
         let projects = conn
-            .prepare("SELECT id, name, repo_path, sort_order, divider_after, divider_label FROM projects ORDER BY sort_order, created_at")?
+            .prepare("SELECT id, name, repo_path, sort_order, divider_after, divider_label, divider_before, divider_before_label FROM projects ORDER BY sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Project {
                     id: ProjectId(r.get(0)?),
@@ -428,12 +452,14 @@ impl Store {
                     sort_order: r.get(3)?,
                     divider_after: r.get::<_, i64>(4)? != 0,
                     divider_label: r.get(5)?,
+                    divider_before: r.get::<_, i64>(6)? != 0,
+                    divider_before_label: r.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let worktrees = conn
-            .prepare("SELECT id, project_id, path, branch, is_main, sort_order FROM worktrees ORDER BY is_main DESC, sort_order, created_at")?
+            .prepare("SELECT id, project_id, path, branch, is_main, pinned, sort_order FROM worktrees ORDER BY is_main DESC, sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Worktree {
                     id: WorktreeId(r.get(0)?),
@@ -441,7 +467,8 @@ impl Store {
                     path: PathBuf::from(r.get::<_, String>(2)?),
                     branch: r.get(3)?,
                     is_main: r.get::<_, i64>(4)? != 0,
-                    sort_order: r.get(5)?,
+                    pinned: r.get::<_, i64>(5)? != 0,
+                    sort_order: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -514,6 +541,8 @@ mod tests {
             sort_order: 0,
             divider_after: false,
             divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
         };
         store.insert_project(&project).unwrap();
         let worktree = Worktree {
@@ -522,6 +551,7 @@ mod tests {
             path: "/tmp/demo".into(),
             branch: "main".into(),
             is_main: true,
+            pinned: false,
             sort_order: 0,
         };
         store.insert_worktree(&worktree).unwrap();
@@ -589,6 +619,8 @@ mod tests {
             sort_order: 0,
             divider_after: false,
             divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
         };
         store.insert_project(&project).unwrap();
         let worktree = Worktree {
@@ -597,6 +629,7 @@ mod tests {
             path: "/tmp/demo".into(),
             branch: "main".into(),
             is_main: true,
+            pinned: false,
             sort_order: 0,
         };
         store.insert_worktree(&worktree).unwrap();
@@ -627,6 +660,8 @@ mod tests {
             sort_order: 0,
             divider_after: false,
             divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
         };
         store.insert_project(&project).unwrap();
         let wt = Worktree {
@@ -635,6 +670,7 @@ mod tests {
             path: "/tmp/p".into(),
             branch: "main".into(),
             is_main: true,
+            pinned: false,
             sort_order: 0,
         };
         store.insert_worktree(&wt).unwrap();

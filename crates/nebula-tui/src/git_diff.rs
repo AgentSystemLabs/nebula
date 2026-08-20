@@ -144,9 +144,17 @@ pub fn list_files(root: &Path) -> Result<Vec<String>, String> {
 
 /// Does this checkout have any commit? Unborn HEAD changes the diff command.
 pub fn has_head(root: &Path) -> bool {
-    run_git(root, &["rev-parse", "--verify", "--quiet", "HEAD"])
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    head_oid(root).is_some()
+}
+
+/// HEAD's commit OID, `None` on an unborn HEAD (or outside a repo). The
+/// review marks are scoped to this: any HEAD move invalidates them.
+pub fn head_oid(root: &Path) -> Option<String> {
+    let output = run_git(root, &["rev-parse", "--verify", "--quiet", "HEAD"]).ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// Diff text for one file. Never fails: errors become the displayed text so
@@ -327,6 +335,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = list_files(dir.path()).unwrap_err();
         assert!(err.contains("git ls-files failed"), "{err}");
+    }
+
+    #[test]
+    fn head_oid_moves_with_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = make_repo(&dir);
+        let first = head_oid(&repo).expect("committed repo has a HEAD");
+        std::fs::write(repo.join("tracked.txt"), "new line\n").unwrap();
+        git(&repo, &["commit", "-am", "second"]);
+        let second = head_oid(&repo).expect("still has a HEAD");
+        assert_ne!(first, second, "a commit moves the OID");
+        assert!(head_oid(dir.path()).is_none(), "no repo, no OID");
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub mod ipc;
 pub mod keys;
 pub mod links;
 pub mod raw_attach;
+pub mod review;
 pub mod syntax;
 pub mod theme;
 pub mod tree_browser;
