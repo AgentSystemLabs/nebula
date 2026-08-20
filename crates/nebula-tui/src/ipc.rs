@@ -50,17 +50,35 @@ async fn try_connect(sock: &std::path::Path) -> Result<UnixStream> {
 fn spawn_daemon() -> Result<()> {
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().context("resolve current_exe")?;
-    std::process::Command::new(exe)
-        .arg("daemon")
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        // New process group so the daemon outlives this client and never
-        // receives the TUI's terminal signals (Ctrl+C etc.).
-        .process_group(0)
-        .spawn()
-        .context("spawn nebula daemon")?;
+        .stderr(std::process::Stdio::null());
+    // New *session*, not just a new process group: besides outliving this
+    // client and skipping its terminal signals (Ctrl+C etc.), the daemon must
+    // hold no controlling terminal. It shells out to the user's interactive
+    // shell (CLI probes, login-shell agent wrap), and an interactive zsh that
+    // can reach a tty via /dev/tty grabs its foreground process group —
+    // SIGTTIN-stopping the TUI running on this terminal mid-frame.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc_setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn().context("spawn nebula daemon")?;
     Ok(())
+}
+
+// Avoid a libc dependency for one call (same pattern as nebula-core's geteuid).
+fn libc_setsid() -> i32 {
+    extern "C" {
+        fn setsid() -> i32;
+    }
+    unsafe { setsid() }
 }
 
 async fn handshake(mut stream: UnixStream) -> Result<Connection> {

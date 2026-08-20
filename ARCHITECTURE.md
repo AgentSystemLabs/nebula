@@ -9,7 +9,7 @@ There are two processes, same binary:
 1. **Daemon** (`nebula daemon`) — owns every PTY, SQLite, git worktrees, and agent status. Lives in the background.
 2. **TUI** (`nebula`) — a ratatui client. Quit it and nothing dies; relaunch and scrollback is replayed.
 
-On launch the TUI connects to a unix socket (`$XDG_RUNTIME_DIR/nebula/daemon.sock`, mode `0700`). If nothing is listening, it spawns `nebula daemon` in a new process group so the daemon outlives the client and does not get Ctrl+C.
+On launch the TUI connects to a unix socket (`$XDG_RUNTIME_DIR/nebula/daemon.sock`, mode `0700`). If nothing is listening, it spawns `nebula daemon` in its own session (`setsid`) so the daemon outlives the client, does not get Ctrl+C, and holds no controlling terminal — daemon subprocesses that run the user's interactive shell must not be able to reach the TUI's tty via `/dev/tty`.
 
 IPC is length-prefixed MessagePack: the client sends `ClientRequest`s (CRUD, attach, keystrokes, resize); the daemon pushes `ServerEvent`s (entity deltas, status, PTY output).
 

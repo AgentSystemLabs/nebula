@@ -866,16 +866,25 @@ impl Daemon {
             }
         }
         let check = format!("command -v '{}' >/dev/null 2>&1", kind.cli_program());
-        let status = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::process::Command::new(user_shell())
-                .args(["-l", "-i", "-c", &check])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status(),
-        )
-        .await;
+        let mut probe = tokio::process::Command::new(user_shell());
+        probe
+            .args(["-l", "-i", "-c", &check])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            // A timed-out probe must die with the dropped future, not linger.
+            .kill_on_drop(true);
+        // Own session: the interactive shell must not reach the daemon's
+        // controlling terminal (--foreground runs have one). zsh's job-control
+        // init opens /dev/tty and makes itself the foreground process group,
+        // SIGTTIN-stopping whatever TUI owns that terminal.
+        unsafe {
+            probe.pre_exec(|| match nix::unistd::setsid() {
+                Ok(_) => Ok(()),
+                Err(errno) => Err(std::io::Error::from_raw_os_error(errno as i32)),
+            });
+        }
+        let status = tokio::time::timeout(Duration::from_secs(5), probe.status()).await;
         match status {
             Ok(Ok(status)) => {
                 let ok = status.success();
