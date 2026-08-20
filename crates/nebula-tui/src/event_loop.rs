@@ -2087,6 +2087,7 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
             // background — `git worktree remove` can take seconds). The
             // eventual EntityRemoved is a no-op; an Error for this req_id
             // restores the rows via the rollback stashed in the intent.
+            let before = selection_snapshot(app);
             let intent = match remove_worktree_rows(app, &id) {
                 Some(rollback) => PendingIntent::DeleteWorktree(rollback),
                 None => PendingIntent::None,
@@ -2097,10 +2098,15 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
                 id,
                 force: true,
             });
+            // Deleting the selected worktree lands the cursor on a neighbor
+            // — bring up that neighbor's session like a manual switch would.
+            reconcile_selection(app, before, out);
         }
         PendingAction::DeleteAllWorktrees(ids) => {
             // Each delete is its own request with its own optimistic
             // removal + rollback, so one failure restores only its rows.
+            // One reconcile at the end: the cursor settles on a survivor.
+            let before = selection_snapshot(app);
             for id in ids {
                 let intent = match remove_worktree_rows(app, &id) {
                     Some(rollback) => PendingIntent::DeleteWorktree(rollback),
@@ -2113,6 +2119,7 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
                     force: true,
                 });
             }
+            reconcile_selection(app, before, out);
         }
         PendingAction::DeleteAllSessions { agents, terminals } => {
             for id in agents {
@@ -2450,6 +2457,9 @@ fn land_pending_selection(app: &mut App, out: &mut Vec<ClientRequest>) {
     {
         app.sel_session = index;
         app.select_when_seen = None;
+        // The pane follows the cursor; a session about to be attached
+        // outright (the create flow's Ack) dedupes in attach().
+        preview_selected(app, out);
         return;
     }
     let landed_worktree = match &pending_sref {
@@ -2474,6 +2484,7 @@ fn land_pending_selection(app: &mut App, out: &mut Vec<ClientRequest>) {
                 .position(|r| r.sref() == pending_sref)
             {
                 app.sel_session = index;
+                preview_selected(app, out);
             }
             app.select_when_seen = None;
         }
@@ -3624,17 +3635,13 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.dirty = true;
         }
         ServerEvent::EntityUpserted { entity } => {
-            // A pin toggle regroups the worktree list; keep the selection
-            // on the same worktree row across the reorder.
-            let keep_worktree = matches!(entity, nebula_core::Entity::Worktree(_))
-                .then(|| app.selected_worktree().map(|w| w.id.clone()))
-                .flatten();
+            let before = selection_snapshot(app);
             apply_upsert(app, entity);
-            if let Some(id) = keep_worktree {
-                if let Some(i) = app.visible_worktrees().iter().position(|w| w.id == id) {
-                    app.sel_worktree = i;
-                }
-            }
+            // Cursors follow the row they were on across regroups (pin
+            // toggles, re-homes); a row that left its list (archived away,
+            // moved elsewhere) hands the cursor — and the terminal pane —
+            // to its neighbor.
+            reconcile_selection(app, before, out);
             // Fix the selection onto a session we just created — or follow
             // one we just moved into another worktree of this project.
             land_pending_selection(app, out);
@@ -3644,16 +3651,15 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     app.select_worktree_when_seen = None;
                 }
             }
-            // An agent upsert can shrink the visible session list (the
-            // daemon re-homed it to another worktree) — keep selections in
-            // bounds.
-            clamp_selections(app);
             refresh_palette(app);
             app.dirty = true;
         }
         ServerEvent::EntityRemoved { id } => {
+            let before = selection_snapshot(app);
             apply_removal(app, &id);
-            clamp_selections(app);
+            // The cursor that was on the removed row now sits on its
+            // neighbor — show that neighbor's session/context.
+            reconcile_selection(app, before, out);
             refresh_palette(app);
             app.dirty = true;
         }
@@ -3819,6 +3825,117 @@ fn restore_worktree_rows(app: &mut App, rollback: WorktreeRollback) {
 fn refresh_palette(app: &mut App) {
     if let Some(Overlay::Palette(palette)) = &mut app.overlay {
         palette.rebuild(&app.tree, app.show_archived);
+    }
+}
+
+/// What each panel cursor pointed at, captured with `selection_snapshot`
+/// before a tree mutation so `reconcile_selection` can compare afterwards.
+struct SelectionSnapshot {
+    project: Option<nebula_core::ProjectId>,
+    /// The selected Projects-panel row's kind: None = the project itself,
+    /// Some(before) = one of its dividers (apply_upsert's convention).
+    project_kind: Option<bool>,
+    /// A divider move was in flight — its landing is apply_upsert's to
+    /// chase, so the project cursor is left alone.
+    divider_chase: bool,
+    worktree: Option<WorktreeId>,
+    session: Option<SessionRef>,
+    /// Whether the selected session row was already in the archived group —
+    /// following onto an archived row is only right when it was.
+    session_archived: bool,
+}
+
+fn project_row_kind(row: &ProjectRow) -> Option<bool> {
+    match row {
+        ProjectRow::Divider { before, .. } => Some(*before),
+        ProjectRow::Project(_) => None,
+    }
+}
+
+fn selection_snapshot(app: &App) -> SelectionSnapshot {
+    let row = app.selected_session_row();
+    SelectionSnapshot {
+        project: app.selected_project().map(|p| p.id.clone()),
+        project_kind: app.selected_project_row().as_ref().and_then(project_row_kind),
+        divider_chase: app.select_divider_when_seen.is_some(),
+        worktree: app.selected_worktree().map(|w| w.id.clone()),
+        session_archived: row.as_ref().is_some_and(|r| r.is_archived_agent()),
+        session: row.map(|r| r.sref()),
+    }
+}
+
+/// Re-point the panel cursors after the tree changed. Each cursor follows
+/// the entity it was on when rows merely shifted; when that entity left its
+/// list — deleted, archived away, re-homed — the cursor has landed on a
+/// neighbor, and that neighbor gets shown exactly as if the user had moved
+/// there (restore_context / restore_session / preview). The invariant: the
+/// terminal pane always shows the highlighted session, never a stale or
+/// blank one.
+fn reconcile_selection(app: &mut App, before: SelectionSnapshot, out: &mut Vec<ClientRequest>) {
+    clamp_selections(app);
+    if let Some(pid) = &before.project {
+        if !app.tree.projects.iter().any(|p| &p.id == pid) {
+            // The selected row's project is gone; the cursor landed on a
+            // neighbor — bring up its remembered worktree + session.
+            restore_context(app, out);
+            return;
+        }
+        // A divider move lands via apply_upsert's own chase; don't fight it.
+        if !before.divider_chase
+            && app.selected_project().map(|p| p.id.clone()).as_ref() != Some(pid)
+        {
+            let rows = app.project_rows();
+            let same_kind = rows.iter().position(|r| {
+                project_row_kind(r) == before.project_kind
+                    && &app.tree.projects[r.project_index()].id == pid
+            });
+            let found = same_kind.or_else(|| {
+                rows.iter().position(
+                    |r| matches!(r, ProjectRow::Project(i) if &app.tree.projects[*i].id == pid),
+                )
+            });
+            if let Some(i) = found {
+                app.sel_project = i;
+            }
+        }
+    }
+    if let Some(wid) = &before.worktree {
+        if app.selected_worktree().map(|w| w.id.clone()).as_ref() != Some(wid) {
+            match app.visible_worktrees().iter().position(|w| &w.id == wid) {
+                Some(i) => app.sel_worktree = i,
+                None => {
+                    restore_session(app, out);
+                    return;
+                }
+            }
+        }
+    }
+    if let Some(sref) = &before.session {
+        let rows = app.visible_session_rows();
+        if rows.get(app.sel_session).map(|r| r.sref()).as_ref() != Some(sref) {
+            let found = rows.iter().position(|r| {
+                r.sref() == *sref && (before.session_archived || !r.is_archived_agent())
+            });
+            match found {
+                Some(i) => app.sel_session = i,
+                None => {
+                    preview_selected(app, out);
+                    // Nothing previewable left (empty list, or only archived
+                    // rows): don't keep showing a session that's gone.
+                    if let Some(tref) = app.term.as_ref().map(|t| t.sref.clone()) {
+                        let alive = match &tref {
+                            SessionRef::Agent(id) => app.tree.agents.iter().any(|a| &a.id == id),
+                            SessionRef::Terminal(id) => {
+                                app.tree.terminals.iter().any(|t| &t.id == id)
+                            }
+                        };
+                        if !alive {
+                            detach_if_attached(app, &tref, out);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -8159,5 +8276,316 @@ mod tests {
             })
             .collect();
         assert_eq!(deleted, ["a1", "a2"], "one request per session: {out:?}");
+    }
+
+    fn wt_entity(id: &str, project: &str, branch: &str, is_main: bool) -> nebula_core::Entity {
+        use nebula_core::{Entity, Worktree};
+        Entity::Worktree(Worktree {
+            id: WorktreeId(id.into()),
+            project_id: nebula_core::ProjectId(project.into()),
+            path: format!("/tmp/{branch}").into(),
+            branch: branch.into(),
+            is_main,
+            pinned: false,
+            sort_order: 0,
+        })
+    }
+
+    fn agent_entity(id: &str, wt: &str, name: &str, archived: bool) -> nebula_core::Entity {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        Entity::Agent(Agent {
+            id: AgentId(id.into()),
+            worktree_id: WorktreeId(wt.into()),
+            name: name.into(),
+            status: AgentStatus::Fresh,
+            archived,
+            pinned: false,
+            kind: nebula_core::AgentKind::Claude,
+            session_id: None,
+            sort_order: 1,
+            status_changed_at: 0,
+            alive: true,
+        })
+    }
+
+    /// Archiving the selected session lands the cursor on the next row AND
+    /// attaches it — the pane must show the newly highlighted session, not
+    /// stay blank after the archive's detach.
+    #[test]
+    fn archiving_selected_agent_previews_the_next_row() {
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 / w1(main) / a1
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: agent_entity("a2", "w1", "agent-2", false),
+            },
+        );
+        app.focus = Focus::Sessions;
+        app.sel_session = 0; // a1
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        app.term = Some(AttachedTerm::new(a1.clone(), 40, 10));
+
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::ArchiveAgent { .. })),
+            "a requests the archive: {out:?}"
+        );
+
+        // The daemon's upsert flips the archived flag; the row leaves the
+        // list, the cursor lands on agent-2, and agent-2 gets shown.
+        out.clear();
+        handle_server_event(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: agent_entity("a1", "w1", "agent-1", true),
+            },
+            &mut out,
+        );
+        let a2 = SessionRef::Agent(AgentId("a2".into()));
+        assert_eq!(
+            app.selected_session().map(|a| a.name),
+            Some("agent-2".into()),
+            "cursor landed on the next row"
+        );
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == a2)),
+            "the next row's session attaches: {out:?}"
+        );
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(a2),
+            "the pane shows the newly highlighted session"
+        );
+    }
+
+    /// Archiving a row ABOVE the cursor must not drag the highlight onto a
+    /// different session — the cursor follows the session it was on.
+    #[test]
+    fn archiving_a_row_above_keeps_the_cursor_on_its_session() {
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 / w1(main) / a1
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: agent_entity("a2", "w1", "agent-2", false),
+            },
+        );
+        app.focus = Focus::Sessions;
+        app.sel_session = 1; // a2
+        let a2 = SessionRef::Agent(AgentId("a2".into()));
+        app.term = Some(AttachedTerm::new(a2.clone(), 40, 10));
+
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: agent_entity("a1", "w1", "agent-1", true),
+            },
+            &mut out,
+        );
+        assert_eq!(
+            app.selected_session().map(|a| a.name),
+            Some("agent-2".into()),
+            "cursor followed its session up the list"
+        );
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(a2),
+            "the attached pane is untouched"
+        );
+        assert!(
+            !out.iter().any(|r| matches!(r, ClientRequest::Attach { .. })),
+            "no re-attach when the highlighted session didn't change: {out:?}"
+        );
+    }
+
+    /// Deleting the selected session lands the cursor on the next row and
+    /// shows it in the pane.
+    #[test]
+    fn deleting_selected_agent_previews_the_next_row() {
+        use nebula_core::EntityId;
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 / w1(main) / a1
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: agent_entity("a2", "w1", "agent-2", false),
+            },
+        );
+        app.focus = Focus::Sessions;
+        app.sel_session = 0; // a1
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        app.term = Some(AttachedTerm::new(a1.clone(), 40, 10));
+
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut app,
+            ServerEvent::EntityRemoved {
+                id: EntityId::Agent(AgentId("a1".into())),
+            },
+            &mut out,
+        );
+        let a2 = SessionRef::Agent(AgentId("a2".into()));
+        assert_eq!(
+            app.selected_session().map(|a| a.name),
+            Some("agent-2".into()),
+            "cursor landed on the next row"
+        );
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == a2)),
+            "the next row's session attaches: {out:?}"
+        );
+        assert_eq!(app.term.as_ref().map(|t| t.sref.clone()), Some(a2));
+    }
+
+    /// Removing the only session leaves nothing to preview: the pane blanks
+    /// instead of keeping the dead session's screen.
+    #[test]
+    fn deleting_the_last_session_blanks_the_pane() {
+        use nebula_core::EntityId;
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 / w1(main) / a1
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        app.term = Some(AttachedTerm::new(a1.clone(), 40, 10));
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut app,
+            ServerEvent::EntityRemoved {
+                id: EntityId::Agent(AgentId("a1".into())),
+            },
+            &mut out,
+        );
+        assert!(app.term.is_none(), "the pane blanks");
+        assert_eq!(app.focus, Focus::Sessions, "focus hands back to the list");
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Detach { session } if *session == a1)),
+            "the dead session detaches: {out:?}"
+        );
+    }
+
+    /// Deleting the selected worktree lands the cursor on a neighbor and
+    /// brings up that neighbor's remembered session, like a manual switch.
+    #[test]
+    fn deleting_selected_worktree_shows_the_neighbor_worktrees_session() {
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 / w1(main) / a1
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: wt_entity("w2", "p1", "feat", false),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: agent_entity("a2", "w2", "agent-2", false),
+            },
+        );
+        let w2_index = app
+            .visible_worktrees()
+            .iter()
+            .position(|w| w.id.0 == "w2")
+            .unwrap();
+        app.sel_worktree = w2_index;
+        app.sel_session = 0; // a2
+        app.focus = Focus::Worktrees;
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        let a2 = SessionRef::Agent(AgentId("a2".into()));
+        app.term = Some(AttachedTerm::new(a2.clone(), 40, 10));
+        app.last_session_for_worktree
+            .insert(WorktreeId("w1".into()), a1.clone());
+
+        let mut out = Vec::new();
+        run_pending_action(
+            &mut app,
+            PendingAction::DeleteWorktree(WorktreeId("w2".into())),
+            &mut out,
+        );
+        assert_eq!(
+            app.selected_worktree().map(|w| w.id.0.clone()),
+            Some("w1".into()),
+            "cursor landed on the surviving worktree"
+        );
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == a1)),
+            "the survivor's remembered session attaches: {out:?}"
+        );
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(a1),
+            "the pane shows the survivor's session, not the deleted one"
+        );
+    }
+
+    /// Removing the selected project restores the neighbor project's
+    /// remembered worktree + session, like switching to it manually.
+    #[test]
+    fn removing_selected_project_restores_the_neighbor_projects_context() {
+        use nebula_core::EntityId;
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 / w1(main) / a1
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: project("p2", "two", 1, false, None),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: wt_entity("w2", "p2", "main2", true),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: agent_entity("a2", "w2", "agent-2", false),
+            },
+        );
+        app.sel_project = 1; // p2
+        app.sel_worktree = 0; // w2
+        app.sel_session = 0; // a2
+        app.focus = Focus::Projects;
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        let a2 = SessionRef::Agent(AgentId("a2".into()));
+        app.term = Some(AttachedTerm::new(a2.clone(), 40, 10));
+        app.last_worktree_for_project
+            .insert(nebula_core::ProjectId("p1".into()), WorktreeId("w1".into()));
+        app.last_session_for_worktree
+            .insert(WorktreeId("w1".into()), a1.clone());
+
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut app,
+            ServerEvent::EntityRemoved {
+                id: EntityId::Project(nebula_core::ProjectId("p2".into())),
+            },
+            &mut out,
+        );
+        assert_eq!(
+            app.selected_project().map(|p| p.name.clone()),
+            Some("demo".into()),
+            "cursor landed on the surviving project"
+        );
+        assert_eq!(
+            app.selected_worktree().map(|w| w.id.0.clone()),
+            Some("w1".into()),
+            "its remembered worktree is selected"
+        );
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(a1),
+            "the pane shows the survivor's remembered session"
+        );
     }
 }
