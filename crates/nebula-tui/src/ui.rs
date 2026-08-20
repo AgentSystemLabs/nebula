@@ -63,12 +63,33 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_vim(f, app);
 }
 
-/// The embedded editor modal, above every overlay.
+/// The editor, above every overlay: a centered modal, or — spawned from the
+/// tree browser — embedded in its preview pane (whose block the tree arm
+/// already drew).
 fn draw_vim(f: &mut Frame, app: &mut App) {
     let th = app.theme;
     let Some(vim) = &app.vim else {
         return;
     };
+    if vim.embedded {
+        if let Some(Overlay::Tree(view)) = &app.overlay {
+            let inner = view.preview_area;
+            if inner.width < 2 || inner.height < 2 {
+                return; // pane not drawn yet
+            }
+            f.render_widget(
+                tui_term::widget::PseudoTerminal::new(vim.parser.screen()),
+                inner,
+            );
+            // Write-back: the post-draw sync resizes the PTY to the pane.
+            if let Some(vim) = &mut app.vim {
+                vim.area = inner;
+            }
+            return;
+        }
+        // Tree overlay gone under an embedded editor — fall through to the
+        // modal so the session is never invisible.
+    }
     let area = centered_rect_pct(f.area(), VIM_MODAL_PCT.0, VIM_MODAL_PCT.1);
     f.render_widget(Clear, area);
     let block = Block::default()
@@ -255,9 +276,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
             lines.push(Line::from(""));
             let hint = if prompt.completes_paths() {
-                "[Enter] ok   [Tab] complete   [Esc] cancel"
+                "[Enter] ok   [Tab] complete   [Ctrl+u] clear   [Esc] cancel"
             } else {
-                "[Enter] ok   [Esc] cancel"
+                "[Enter] ok   [Ctrl+u] clear   [Esc] cancel"
             };
             lines.push(Line::from(Span::styled(
                 hint,
@@ -266,7 +287,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Paragraph::new(lines), inner);
         }
         Overlay::Help => {
-            let area = centered_rect(f.area(), 60, 28);
+            let area = centered_rect(f.area(), 60, 32);
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -295,14 +316,16 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 ("A", "toggle archived agents"),
                 ("m / right-click", "context menu"),
                 ("g", "git diff of the selected worktree"),
-                ("f", "fuzzy find a file in the selected worktree"),
+                ("f", "fuzzy find a file, Enter edits it in vim, Ctrl+y copies"),
                 ("F", "find in files (git grep), Enter edits the hit in vim"),
+                ("t", "file tree browser; Enter edits in the preview pane"),
                 ("/", "fuzzy search projects / worktrees / sessions"),
                 ("s", "settings (toggles write to config.json)"),
                 (
                     "Ctrl+o / Ctrl+f",
                     "search pick: open session / focus its row",
                 ),
+                ("Ctrl+u", "clear the typed input / filter in any overlay"),
                 ("Ctrl+q", "terminal input → back to panels (also Ctrl+])"),
                 ("drag", "select terminal text → copies to clipboard"),
                 ("double-click", "select the word under the cursor"),
@@ -802,6 +825,166 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if let Some(Overlay::Grep(v)) = &mut app.overlay {
                 v.area = area;
                 v.list_area = list_inner;
+            }
+        }
+        Overlay::Tree(view) => {
+            let area = centered_rect_pct(f.area(), 92, 90);
+            f.render_widget(Clear, area);
+            // Cap first, floor second: on a tiny screen the tree keeps its
+            // minimum and Min(20) squeezes the preview pane instead.
+            let files_w = view
+                .files_width
+                .min(area.width.saturating_sub(crate::app::MIN_DIFF_PANE_W))
+                .max(crate::app::MIN_DIFF_FILES_W);
+            let [tree_a, preview_a] =
+                Layout::horizontal([Constraint::Length(files_w), Constraint::Min(20)]).areas(area);
+
+            // Left: the file tree; a stateless follow-window keeps the
+            // selected row visible.
+            let tree_title = if view.filter.is_empty() {
+                format!("Tree — {} ({})", view.branch, view.file_count)
+            } else {
+                format!(
+                    "Tree — {} ({}/{})",
+                    view.branch, view.match_count, view.file_count
+                )
+            };
+            let block = panel_block(&tree_title, true, th);
+            let tree_inner = block.inner(tree_a);
+            f.render_widget(block, tree_a);
+
+            // First row: the always-on fuzzy filter input.
+            if let Some(filter_area) = row_rect(tree_inner, 0) {
+                let line = if view.filter.is_empty() {
+                    Line::from(Span::styled(
+                        "type to filter…",
+                        Style::default().fg(th.dim),
+                    ))
+                } else {
+                    Line::from(vec![
+                        Span::raw(view.filter.clone()),
+                        Span::styled("█", Style::default().fg(th.accent)),
+                    ])
+                };
+                f.render_widget(Paragraph::new(line), filter_area);
+            }
+            let list_inner = Rect {
+                y: tree_inner.y + 1,
+                height: tree_inner.height.saturating_sub(1),
+                ..tree_inner
+            };
+
+            if view.rows.is_empty() {
+                if let Some(row_area) = row_rect(list_inner, 0) {
+                    f.render_widget(
+                        Paragraph::new(Span::styled(
+                            "no matches",
+                            Style::default().fg(th.dim),
+                        )),
+                        row_area,
+                    );
+                }
+            }
+            let start = view.window_start(list_inner.height as usize);
+            for (row, (i, r)) in view.rows.iter().enumerate().skip(start).enumerate() {
+                let Some(row_area) = row_rect(list_inner, row) else {
+                    break;
+                };
+                let node = &view.nodes[r.node];
+                let indent = "  ".repeat(node.depth);
+                // Directories fold; a live filter forces them all open.
+                let marker = if !node.is_dir {
+                    "  "
+                } else if !view.filter.is_empty() || view.expanded[r.node] {
+                    "▾ "
+                } else {
+                    "▸ "
+                };
+                let budget = (list_inner.width as usize)
+                    .saturating_sub(indent.chars().count() + 3);
+                let shown = truncate(&node.name, budget);
+                // Truncation puts `…` at the last char of `shown`; a match
+                // landing on that index must not light the ellipsis.
+                let shown_len = shown.chars().count();
+                let positions = if shown_len < node.name.chars().count() {
+                    let keep = r
+                        .positions
+                        .iter()
+                        .take_while(|&&p| p + 1 < shown_len)
+                        .count();
+                    &r.positions[..keep]
+                } else {
+                    &r.positions[..]
+                };
+                let mut spans = vec![
+                    Span::raw(format!(" {indent}")),
+                    Span::styled(marker, Style::default().fg(th.accent)),
+                ];
+                if node.is_dir {
+                    spans.push(Span::styled(shown, Style::default().fg(th.accent)));
+                } else {
+                    spans.extend(fuzzy_highlight_spans(&shown, positions, th));
+                }
+                render_row(f, row_area, spans, i == view.selected, true, th);
+            }
+
+            // Right: the selected node's preview, syntax-highlighted and
+            // scrolled — or the embedded editor, which draw_vim paints into
+            // this pane after us.
+            let editing = app.vim.as_ref().is_some_and(|v| v.embedded);
+            let sel_path = view.selected_node().map(|n| n.path.as_str()).unwrap_or("");
+            let title = if editing {
+                format!(
+                    "{} — editing",
+                    truncate(sel_path, (preview_a.width as usize).saturating_sub(14))
+                )
+            } else {
+                truncate(sel_path, (preview_a.width as usize).saturating_sub(4))
+            };
+            let mut block = panel_block(&title, true, th);
+            let preview_inner = block.inner(preview_a);
+            let max_scroll =
+                (view.preview_line_count as u16).saturating_sub(preview_inner.height.max(1));
+            let scroll = view.scroll.min(max_scroll);
+            if !editing && max_scroll > 0 {
+                block = block.title_bottom(
+                    Line::from(Span::styled(
+                        format!(" {}/{} ", scroll + 1, view.preview_line_count),
+                        Style::default().fg(th.dim),
+                    ))
+                    .right_aligned(),
+                );
+            }
+            f.render_widget(block, preview_a);
+            if !editing {
+                let lines: Vec<Line> = view
+                    .preview_lines
+                    .iter()
+                    .skip(scroll as usize)
+                    .take(preview_inner.height as usize)
+                    .map(|runs| {
+                        Line::from(
+                            runs.iter()
+                                .map(|(kind, text)| {
+                                    Span::styled(text.clone(), token_style(*kind, th))
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect();
+                f.render_widget(Paragraph::new(lines), preview_inner);
+            }
+
+            // Write-back (draw works on a clone): page size for key paging,
+            // scroll re-clamped so resizes never strand the view, preview
+            // rect for the embedded editor.
+            if let Some(Overlay::Tree(v)) = &mut app.overlay {
+                v.view_height = preview_inner.height;
+                v.scroll = scroll;
+                v.list_area = list_inner;
+                v.preview_area = preview_inner;
+                v.area = area;
+                v.files_width = files_w;
             }
         }
     }
@@ -1332,17 +1515,27 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         )
     } else if matches!(&app.overlay, Some(Overlay::Grep(_))) {
         Span::styled(
-            "type: search  ↑/↓: move  Enter: edit in vim  Esc: clear/close",
+            "type: search  ↑/↓: move  Enter: edit in vim  Ctrl+u: clear  Esc: clear/close",
             Style::default().fg(th.dim),
         )
     } else if matches!(&app.overlay, Some(Overlay::Diff(_))) {
         Span::styled(
-            "type: filter  ↑/↓: file  ⇧↑/↓: scroll  Ctrl+d/u: page  Home/End: top/end  Esc: clear/close",
+            "type: filter  ↑/↓: file  ⇧↑/↓: scroll  Ctrl+d/u: page  Ctrl+u: clear filter  Esc: clear/close",
+            Style::default().fg(th.dim),
+        )
+    } else if matches!(&app.overlay, Some(Overlay::Tree(_))) {
+        Span::styled(
+            "type: filter  ↑/↓: move  ←/→: fold  Enter: open/edit  ⇧↑/↓: scroll  Ctrl+u: clear filter  Esc: clear/close",
+            Style::default().fg(th.dim),
+        )
+    } else if matches!(&app.overlay, Some(Overlay::Files(_))) {
+        Span::styled(
+            "type: search  ↑/↓: move  Enter: edit in vim  Ctrl+y: copy path  Ctrl+u: clear  Esc: clear/close",
             Style::default().fg(th.dim),
         )
     } else if matches!(&app.overlay, Some(Overlay::Palette(_))) {
         Span::styled(
-            "type: search  ↑/↓: move  Enter: open  Esc: clear/close",
+            "type: search  ↑/↓: move  Enter: open  Ctrl+u: clear  Esc: clear/close",
             Style::default().fg(th.dim),
         )
     } else if matches!(&app.overlay, Some(Overlay::Settings(_))) {
@@ -1398,6 +1591,19 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     }
     spans.push(hints);
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Style for one syntax-highlight token kind of the tree-browser preview
+/// (classification lives in syntax.rs, the `classify_diff_line` split).
+fn token_style(kind: crate::syntax::TokenKind, th: Theme) -> Style {
+    use crate::syntax::TokenKind;
+    match kind {
+        TokenKind::Keyword => Style::default().fg(th.special),
+        TokenKind::String => Style::default().fg(th.ok),
+        TokenKind::Comment => Style::default().fg(th.dim),
+        TokenKind::Number => Style::default().fg(th.warn),
+        TokenKind::Text => Style::default(),
+    }
 }
 
 /// Split a (possibly truncated) path into spans, lighting the chars the

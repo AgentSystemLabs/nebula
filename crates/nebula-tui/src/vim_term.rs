@@ -29,6 +29,9 @@ pub struct VimTerm {
     pub rows: u16,
     /// "path:line" for the modal title.
     pub title: String,
+    /// Rendered inside the tree browser's preview pane instead of the
+    /// centered modal (set by the tree browser's Enter).
+    pub embedded: bool,
     /// Inner rect from the last draw; `sync_vim_size` resizes to it.
     pub area: Rect,
     master: Box<dyn MasterPty + Send>,
@@ -130,6 +133,7 @@ impl VimTerm {
             cols,
             rows,
             title,
+            embedded: false,
             area: Rect::default(),
             master: pair.master,
             writer,

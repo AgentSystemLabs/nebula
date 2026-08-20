@@ -9,7 +9,9 @@ pub mod ipc;
 pub mod keys;
 pub mod links;
 pub mod raw_attach;
+pub mod syntax;
 pub mod theme;
+pub mod tree_browser;
 pub mod ui;
 pub mod vim_term;
 

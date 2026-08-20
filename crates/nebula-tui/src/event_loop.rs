@@ -7,6 +7,7 @@ use crate::app::{
     ProjectRow, PromptDialog, PromptKind, SettingsView, SplitterDrag, TermSelection,
     WorktreeRollback,
 };
+use crate::tree_browser::TreeBrowser;
 use crate::vim_term::{VimEvent, VimTerm};
 use crate::{ipc, keys, ui};
 use anyhow::Result;
@@ -314,9 +315,21 @@ fn handle_vim_event(app: &mut App, ev: VimEvent) {
         }
         VimEvent::Exited { generation } => {
             if app.vim.as_ref().is_some_and(|v| v.generation == generation) {
-                app.vim = None;
+                close_vim(app);
                 app.dirty = true;
             }
+        }
+    }
+}
+
+/// Drop the editor; an embedded one hands its preview pane back to the tree
+/// browser with the (possibly just-edited) file reloaded.
+fn close_vim(app: &mut App) {
+    let embedded = app.vim.as_ref().is_some_and(|v| v.embedded);
+    app.vim = None;
+    if embedded {
+        if let Some(Overlay::Tree(view)) = &mut app.overlay {
+            view.load_preview();
         }
     }
 }
@@ -535,7 +548,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             if app.focus == Focus::Sessions {
                 if let Some(a) = app.selected_session() {
                     if !a.archived {
-                        open_confirm_archive(app, &a);
+                        archive_agent(app, a.id, out);
                     }
                 }
             }
@@ -616,6 +629,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         KeyCode::Char('g') => open_diff_view(app),
         KeyCode::Char('f') => open_file_finder(app),
         KeyCode::Char('F') => open_grep_view(app),
+        KeyCode::Char('t') => open_tree_browser(app),
         KeyCode::Char('z') => {
             if app.term.is_some() {
                 app.collapsed = true;
@@ -740,7 +754,40 @@ fn open_file_finder(app: &mut App) {
         app.flash = Some(format!("no files in {branch}"));
         return;
     }
-    app.overlay = Some(Overlay::Files(FileFinder::new(path, branch, files)));
+    let editor = std::env::var("NEBULA_EDITOR").unwrap_or_else(|_| "vim".into());
+    app.overlay = Some(Overlay::Files(FileFinder::new(path, branch, editor, files)));
+}
+
+/// Tree browser (`t`): full file tree of the selected worktree with a
+/// content preview, filterable by file name. Same shell as `open_diff_view`:
+/// flash instead of opening when there's no worktree, the path is gone, or
+/// git fails.
+fn open_tree_browser(app: &mut App) {
+    // Clone before touching app.overlay — selected_worktree borrows app.
+    let Some((path, branch)) = app
+        .selected_worktree()
+        .map(|w| (w.path.clone(), w.branch.clone()))
+    else {
+        app.flash = Some("no worktree selected".into());
+        return;
+    };
+    if !path.is_dir() {
+        app.flash = Some(format!("worktree path missing on disk: {}", path.display()));
+        return;
+    }
+    let files = match crate::git_diff::list_files(&path) {
+        Ok(files) => files,
+        Err(msg) => {
+            app.flash = Some(msg);
+            return;
+        }
+    };
+    if files.is_empty() {
+        app.flash = Some(format!("no files in {branch}"));
+        return;
+    }
+    let editor = std::env::var("NEBULA_EDITOR").unwrap_or_else(|_| "vim".into());
+    app.overlay = Some(Overlay::Tree(TreeBrowser::new(path, branch, editor, files)));
 }
 
 /// Find-in-files (`F`): live `git grep` over the selected worktree; Enter
@@ -791,6 +838,82 @@ fn open_selected_hit_in_editor(app: &mut App) {
         tx,
     ) {
         Ok(vim) => app.vim = Some(vim),
+        Err(msg) => app.flash = Some(msg),
+    }
+}
+
+/// Enter on a file-finder row: spawn the editor at the file's first line
+/// inside the modal terminal. The finder stays open underneath, so quitting
+/// the editor lands back on the results.
+fn open_selected_file_in_editor(app: &mut App) {
+    let Some(Overlay::Files(finder)) = &app.overlay else {
+        return;
+    };
+    let Some(path) = finder.selected_path().map(str::to_string) else {
+        return;
+    };
+    let (root, editor) = (finder.root.clone(), finder.editor.clone());
+    let Some(tx) = app.vim_tx.clone() else {
+        return; // main loop not running (unit tests without a channel)
+    };
+    // Size guess from the last-drawn body; the post-draw sync corrects it.
+    let (cols, rows) = vim_size_guess(app);
+    app.vim_generation += 1;
+    match VimTerm::spawn_editor(
+        &editor,
+        &root,
+        &path,
+        1,
+        cols,
+        rows,
+        app.vim_generation,
+        tx,
+    ) {
+        Ok(vim) => app.vim = Some(vim),
+        Err(msg) => app.flash = Some(msg),
+    }
+}
+
+/// Enter on a tree-browser file row: spawn the editor embedded in the
+/// preview pane — the pane becomes vim, keys flow to it, and quitting lands
+/// back on the tree with the preview reloaded.
+fn open_selected_tree_file_in_editor(app: &mut App) {
+    let Some(Overlay::Tree(view)) = &app.overlay else {
+        return;
+    };
+    let Some(path) = view
+        .selected_node()
+        .filter(|n| !n.is_dir)
+        .map(|n| n.path.clone())
+    else {
+        return;
+    };
+    let (root, editor) = (view.root.clone(), view.editor.clone());
+    // Size from the last-drawn preview pane; the post-draw sync corrects it.
+    let preview = view.preview_area;
+    let Some(tx) = app.vim_tx.clone() else {
+        return; // main loop not running (unit tests without a channel)
+    };
+    let (cols, rows) = if preview.width >= 2 && preview.height >= 2 {
+        (preview.width, preview.height)
+    } else {
+        vim_size_guess(app) // never drawn yet
+    };
+    app.vim_generation += 1;
+    match VimTerm::spawn_editor(
+        &editor,
+        &root,
+        &path,
+        1,
+        cols,
+        rows,
+        app.vim_generation,
+        tx,
+    ) {
+        Ok(mut vim) => {
+            vim.embedded = true;
+            app.vim = Some(vim);
+        }
         Err(msg) => app.flash = Some(msg),
     }
 }
@@ -896,7 +1019,7 @@ fn handle_vim_key(app: &mut App, key: KeyEvent) {
         if let Some(vim) = &mut app.vim {
             vim.kill();
         }
-        app.vim = None;
+        close_vim(app);
         return;
     }
     if let Some(vim) = &mut app.vim {
@@ -906,15 +1029,11 @@ fn handle_vim_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn open_confirm_archive(app: &mut App, agent: &nebula_core::Agent) {
-    app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-        title: "Archive agent".into(),
-        message: format!(
-            "Archive '{}'? Its running session will be stopped.",
-            agent.name
-        ),
-        action: PendingAction::ArchiveAgent(agent.id.clone()),
-    }));
+/// Archive is cheap to undo (u), so it skips the confirm dialog.
+fn archive_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
+    detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
+    let req_id = app.alloc_req_id(PendingIntent::None);
+    out.push(ClientRequest::ArchiveAgent { req_id, id });
 }
 
 fn open_delete_confirm(app: &mut App) {
@@ -1273,6 +1392,14 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 }
                 KeyCode::Esc => app.overlay = None,
                 KeyCode::Char('d') if ctrl => view.scroll_by(half),
+                // Ctrl+u clears an active filter (the app-wide clear-input
+                // key); only with nothing typed does it keep its scroll role.
+                KeyCode::Char('u') if ctrl && !view.filter.is_empty() => {
+                    view.filter.clear();
+                    if view.apply_filter() {
+                        crate::git_diff::load_selected_diff(view);
+                    }
+                }
                 KeyCode::Char('u') if ctrl => view.scroll_by(-half),
                 KeyCode::Down if shift => view.scroll_by(1),
                 KeyCode::Up if shift => view.scroll_by(-1),
@@ -1372,9 +1499,13 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 KeyCode::Up => finder.select(finder.selected as i64 - 1),
                 KeyCode::Char('n') if ctrl => finder.select(finder.selected as i64 + 1),
                 KeyCode::Char('p') if ctrl => finder.select(finder.selected as i64 - 1),
-                // Enter copies the selected path (relative to the worktree
+                // Enter opens the selected file in the editor modal; the
+                // finder stays open underneath so quitting the editor
+                // returns here.
+                KeyCode::Enter => open_selected_file_in_editor(app),
+                // Ctrl+y copies the selected path (relative to the worktree
                 // root) to the clipboard — ready to paste into an agent.
-                KeyCode::Enter => {
+                KeyCode::Char('y') if ctrl => {
                     if let Some(path) = finder.selected_path().map(str::to_string) {
                         app.overlay = None;
                         app.flash = Some(if copy_to_clipboard(&path) {
@@ -1430,6 +1561,76 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 KeyCode::Char(c) if !ctrl => {
                     view.query.push(c);
                     view.run_search();
+                }
+                _ => {}
+            }
+        }
+        Overlay::Tree(view) => {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            let half = (view.view_height / 2).max(1) as i32;
+            let page = view.view_height.max(1) as i32;
+            match key.code {
+                // Two-stage escape: an active filter is cleared before the
+                // second Esc closes the modal.
+                KeyCode::Esc if !view.filter.is_empty() => {
+                    view.filter.clear();
+                    view.apply_filter();
+                }
+                KeyCode::Esc => app.overlay = None,
+                // The preview scrolls on the diff-modal keys: ⇧↑/↓ lines,
+                // Ctrl+d/u half pages, PageUp/Down, Home/End.
+                KeyCode::Char('d') if ctrl => view.scroll_by(half),
+                // Ctrl+u clears an active filter (the app-wide clear-input
+                // key); only with nothing typed does it keep its scroll role.
+                KeyCode::Char('u') if ctrl && !view.filter.is_empty() => {
+                    view.filter.clear();
+                    view.apply_filter();
+                }
+                KeyCode::Char('u') if ctrl => view.scroll_by(-half),
+                KeyCode::Down if shift => view.scroll_by(1),
+                KeyCode::Up if shift => view.scroll_by(-1),
+                KeyCode::PageDown => view.scroll_by(page),
+                KeyCode::PageUp => view.scroll_by(-page),
+                KeyCode::Home => view.scroll = 0,
+                KeyCode::End => view.scroll = view.max_scroll(),
+                // j/k stay typeable in the filter; Ctrl+n/p mirror ↑/↓.
+                KeyCode::Down => view.select(view.selected as i64 + 1),
+                KeyCode::Up => view.select(view.selected as i64 - 1),
+                KeyCode::Char('n') if ctrl => view.select(view.selected as i64 + 1),
+                KeyCode::Char('p') if ctrl => view.select(view.selected as i64 - 1),
+                KeyCode::Right => view.expand_selected(),
+                KeyCode::Left => view.collapse_selected(),
+                // Enter folds/unfolds a directory; on a file it opens the
+                // editor modal, with the browser staying open underneath.
+                KeyCode::Enter => {
+                    if view.selected_is_dir() {
+                        view.toggle_row(view.selected);
+                    } else {
+                        open_selected_tree_file_in_editor(app);
+                    }
+                }
+                // Ctrl+y copies the selected path (relative to the worktree
+                // root) to the clipboard — ready to paste into an agent.
+                KeyCode::Char('y') if ctrl => {
+                    if let Some(path) = view.selected_node().map(|n| n.path.clone()) {
+                        app.overlay = None;
+                        app.flash = Some(if copy_to_clipboard(&path) {
+                            format!("copied {path}")
+                        } else {
+                            "copy failed (clipboard unavailable)".into()
+                        });
+                    }
+                }
+                KeyCode::Backspace => {
+                    if view.filter.pop().is_some() {
+                        view.apply_filter();
+                    }
+                }
+                // Everything printable feeds the always-on fuzzy filter.
+                KeyCode::Char(c) if !ctrl => {
+                    view.filter.push(c);
+                    view.apply_filter();
                 }
                 _ => {}
             }
@@ -1565,11 +1766,6 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
                 create_missing: true,
             });
         }
-        PendingAction::ArchiveAgent(id) => {
-            detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::ArchiveAgent { req_id, id });
-        }
         PendingAction::DeleteAgent(id) => {
             detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
             let req_id = app.alloc_req_id(PendingIntent::None);
@@ -1623,9 +1819,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             });
         }
         MenuAction::ArchiveAgent(id) => {
-            if let Some(a) = app.tree.agents.iter().find(|a| a.id == id).cloned() {
-                open_confirm_archive(app, &a);
-            }
+            archive_agent(app, id, out);
         }
         MenuAction::UnarchiveAgent(id) => {
             let req_id = app.alloc_req_id(PendingIntent::None);
@@ -2353,8 +2547,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         return;
     }
     // File finder: the wheel moves the selection, a click on a result row
-    // copies that path, a click outside the modal closes; everything else is
-    // swallowed.
+    // opens it in the editor, a click outside the modal closes; everything
+    // else is swallowed.
     if let Some(Overlay::Files(finder)) = &mut app.overlay {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -2382,14 +2576,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     let index = start + (mouse.row - list.y) as usize;
                     if index < finder.matches.len() {
                         finder.select(index as i64);
-                        if let Some(path) = finder.selected_path().map(str::to_string) {
-                            app.overlay = None;
-                            app.flash = Some(if copy_to_clipboard(&path) {
-                                format!("copied {path}")
-                            } else {
-                                "copy failed (clipboard unavailable)".into()
-                            });
-                        }
+                        open_selected_file_in_editor(app);
                     }
                 } else if !inside_modal {
                     app.overlay = None;
@@ -2436,6 +2623,71 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     app.overlay = None;
                 }
                 app.dirty = true;
+            }
+            _ => {}
+        }
+        return;
+    }
+    // Tree browser: the wheel scrolls the preview, a click selects a row
+    // (folding/unfolding directories), a drag on the tree/preview border
+    // resizes the tree panel, a click outside the modal closes; everything
+    // else is swallowed.
+    if let Some(Overlay::Tree(view)) = &mut app.overlay {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                view.scroll_by(-3);
+                app.dirty = true;
+            }
+            MouseEventKind::ScrollDown => {
+                view.scroll_by(3);
+                app.dirty = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Border grab zone: the two touching border cells at the
+                // tree/preview boundary (the panel `Splitter` pattern).
+                let bx = view.splitter_x();
+                let on_border = view.area.width > 0
+                    && mouse.row >= view.area.y
+                    && mouse.row < view.area.y + view.area.height
+                    && mouse.column.saturating_add(1) >= bx
+                    && mouse.column <= bx;
+                if on_border {
+                    view.files_drag = Some(bx as i32 - mouse.column as i32);
+                    return;
+                }
+                let list = view.list_area;
+                let inside_list = list.width > 0
+                    && mouse.column >= list.x
+                    && mouse.column < list.x + list.width
+                    && mouse.row >= list.y
+                    && mouse.row < list.y + list.height;
+                let area = view.area;
+                let inside_modal = mouse.column >= area.x
+                    && mouse.column < area.x + area.width
+                    && mouse.row >= area.y
+                    && mouse.row < area.y + area.height;
+                if inside_list {
+                    let start = view.window_start(list.height as usize);
+                    let index = start + (mouse.row - list.y) as usize;
+                    if index < view.rows.len() {
+                        view.select(index as i64);
+                        view.toggle_row(index); // no-op on files / under a filter
+                    }
+                } else if !inside_modal {
+                    app.overlay = None;
+                }
+                app.dirty = true;
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(offset) = view.files_drag {
+                    view.set_files_width(mouse.column as i32 + offset);
+                    app.dirty = true;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if view.files_drag.take().is_some() {
+                    app.dirty = true;
+                }
             }
             _ => {}
         }
@@ -5399,6 +5651,52 @@ mod tests {
     }
 
     #[test]
+    fn diff_modal_ctrl_u_clears_filter_before_scrolling() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.overlay = Some(Overlay::Diff(fake_diff_view(100)));
+        let mut out = Vec::new();
+        let view = |app: &App| match &app.overlay {
+            Some(Overlay::Diff(v)) => v.clone(),
+            _ => panic!("diff overlay gone"),
+        };
+
+        // With nothing typed, Ctrl+u keeps its half-page-up scroll role.
+        press(
+            &mut app,
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        assert_eq!(view(&app).scroll, 10, "Ctrl+d scrolls half a page down");
+        press(
+            &mut app,
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        assert_eq!(view(&app).scroll, 0, "empty filter: Ctrl+u scrolls up");
+
+        // With a filter typed, Ctrl+u clears it instead of scrolling.
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
+        assert_eq!(view(&app).matches.len(), 1, "filter narrows to beta.rs");
+        press(
+            &mut app,
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        let v = view(&app);
+        assert_eq!(v.filter, "", "Ctrl+u clears the filter");
+        assert_eq!(v.matches.len(), 2, "full list restored");
+        assert!(
+            matches!(app.overlay, Some(Overlay::Diff(_))),
+            "the modal stays open"
+        );
+        assert!(out.is_empty(), "filtering never talks to the daemon");
+    }
+
+    #[test]
     fn diff_filter_sorts_best_match_first() {
         use crate::git_diff::DiffFile;
         let file = |path: &str| DiffFile {
@@ -6109,6 +6407,8 @@ mod tests {
         std::fs::write(repo.join("fresh.txt"), "hello\n").unwrap();
         let mut app = App::new();
         seed_repo_tree(&mut app, &repo);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.vim_tx = Some(tx);
         let mut out = Vec::new();
 
         press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE, &mut out);
@@ -6126,9 +6426,26 @@ mod tests {
         assert_eq!(finder(&app).matches.len(), 1, "fr matches only fresh.txt");
         assert_eq!(finder(&app).selected_path(), Some("fresh.txt"));
 
-        // Enter copies the selected path and closes.
+        // Enter opens the selection in the editor modal; the finder stays
+        // open underneath. A shell stands in for vim (`sh +1 fresh.txt`
+        // still spawns fine).
+        if let Some(Overlay::Files(f)) = &mut app.overlay {
+            f.editor = "/bin/sh".into();
+        }
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        assert!(app.overlay.is_none(), "enter closes the finder");
+        let vim = app.vim.as_ref().expect("enter spawns the editor modal");
+        assert_eq!(vim.title, "fresh.txt:1");
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Files(_))),
+            "the finder stays open under the editor"
+        );
+
+        // Ctrl+Q closes the editor, landing back on the finder; Ctrl+y
+        // copies the selected path and closes.
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL, &mut out);
+        assert!(app.vim.is_none(), "Ctrl+Q force-closes the editor");
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::CONTROL, &mut out);
+        assert!(app.overlay.is_none(), "ctrl+y closes the finder");
         assert_eq!(app.flash.as_deref(), Some("copied fresh.txt"));
     }
 
@@ -6138,6 +6455,7 @@ mod tests {
         app.overlay = Some(Overlay::Files(FileFinder::new(
             "/nonexistent-nebula-finder-test".into(),
             "main".into(),
+            "vim".into(),
             vec!["src/alpha.rs".into(), "src/beta.rs".into()],
         )));
         let mut out = Vec::new();
@@ -6165,6 +6483,7 @@ mod tests {
         app.overlay = Some(Overlay::Files(FileFinder::new(
             "/nonexistent-nebula-finder-test".into(),
             "main".into(),
+            "vim".into(),
             vec!["src/alpha.rs".into(), "src/beta.rs".into()],
         )));
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -6176,6 +6495,205 @@ mod tests {
         let fin = finder(&app);
         assert!(fin.area.width > 0, "draw writes hit-test area");
         assert!(fin.list_area.height > 0, "draw writes list area");
+    }
+
+    // ---- `t` tree browser ----
+
+    fn tree_view(app: &App) -> &crate::tree_browser::TreeBrowser {
+        match &app.overlay {
+            Some(Overlay::Tree(v)) => v,
+            other => panic!("expected tree overlay, got {other:?}"),
+        }
+    }
+
+    fn tree_rows(app: &App) -> Vec<String> {
+        let v = tree_view(app);
+        v.rows
+            .iter()
+            .map(|r| v.nodes[r.node].path.clone())
+            .collect()
+    }
+
+    #[test]
+    fn t_opens_tree_browser_folds_dirs_and_filters_hierarchies() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        std::fs::create_dir_all(repo.join("src/sub")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "hello tree\n").unwrap();
+        std::fs::write(repo.join("src/sub/deep.rs"), "deep\n").unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.vim_tx = Some(tx);
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
+        assert_eq!(tree_view(&app).file_count, 3);
+        // Collapsed by default: dirs first, then top-level files; the
+        // selected dir previews its children.
+        assert_eq!(tree_rows(&app), vec!["src", "a.txt"]);
+        assert_eq!(tree_view(&app).preview, "sub/\nlib.rs");
+        assert!(out.is_empty(), "opening the browser sends nothing");
+
+        // Enter on a directory unfolds it, and folds it again.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            tree_rows(&app),
+            vec!["src", "src/sub", "src/lib.rs", "a.txt"]
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(tree_rows(&app), vec!["src", "a.txt"]);
+
+        // Typing narrows the tree to matching files plus the hierarchies
+        // containing them, forced open, with the selection on the match.
+        for c in ['d', 'e', 'e', 'p'] {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(tree_rows(&app), vec!["src", "src/sub", "src/sub/deep.rs"]);
+        assert_eq!(tree_view(&app).match_count, 1);
+        assert_eq!(
+            tree_view(&app).selected_node().unwrap().path,
+            "src/sub/deep.rs"
+        );
+        assert_eq!(tree_view(&app).preview, "deep");
+
+        // Enter opens the selected file in an editor embedded in the
+        // preview pane; the browser stays open. A shell stands in for vim.
+        if let Some(Overlay::Tree(v)) = &mut app.overlay {
+            v.editor = "/bin/sh".into();
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let vim = app.vim.as_ref().expect("enter spawns the editor");
+        assert_eq!(vim.title, "src/sub/deep.rs:1");
+        assert!(vim.embedded, "tree editor renders in the preview pane");
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Tree(_))),
+            "the browser stays open around the editor"
+        );
+
+        // Closing the editor reloads the preview — the file may have been
+        // edited under it.
+        std::fs::write(repo.join("src/sub/deep.rs"), "deeper\n").unwrap();
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL, &mut out);
+        assert!(app.vim.is_none(), "Ctrl+Q force-closes the editor");
+        assert_eq!(tree_view(&app).preview, "deeper");
+
+        // Two-stage escape: clear the filter (restoring the folded tree),
+        // then close.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert_eq!(tree_view(&app).filter, "", "first Esc clears the filter");
+        assert_eq!(tree_rows(&app), vec!["src", "a.txt"]);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "second Esc closes the browser");
+    }
+
+    #[test]
+    fn tree_browser_ctrl_u_clears_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "hello tree\n").unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
+        for c in ['l', 'i', 'b'] {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(tree_rows(&app), vec!["src", "src/lib.rs"]);
+
+        press(
+            &mut app,
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        assert_eq!(tree_view(&app).filter, "", "Ctrl+u clears the filter");
+        assert_eq!(tree_rows(&app), vec!["src", "a.txt"], "folded tree restored");
+
+        // With nothing typed, Ctrl+u falls back to scrolling: the browser
+        // stays open and the filter stays empty.
+        press(
+            &mut app,
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        assert_eq!(tree_view(&app).filter, "");
+        assert!(
+            matches!(app.overlay, Some(Overlay::Tree(_))),
+            "the browser stays open"
+        );
+    }
+
+    #[test]
+    fn t_without_worktree_flashes() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.flash.as_deref(), Some("no worktree selected"));
+    }
+
+    #[test]
+    fn tree_browser_renders_tree_and_preview_panes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir); // commits a.txt containing "orig"
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Tree — main (1)"), "tree title:\n{text}");
+        assert!(text.contains("type to filter…"), "filter hint:\n{text}");
+        assert!(text.contains("a.txt"), "tree rows rendered:\n{text}");
+        assert!(text.contains("orig"), "preview rendered:\n{text}");
+        let v = tree_view(&app);
+        assert!(v.area.width > 0, "draw writes hit-test area");
+        assert!(v.list_area.height > 0, "draw writes list area");
+        assert!(v.view_height > 0, "draw writes preview page size");
+    }
+
+    #[test]
+    fn embedded_editor_takes_over_the_preview_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.vim_tx = Some(tx);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
+
+        // A draw teaches the browser its preview rect, so the editor can
+        // spawn at the pane's size. Row 0 is a.txt (the only file).
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        if let Some(Overlay::Tree(v)) = &mut app.overlay {
+            v.editor = "/bin/sh".into();
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let pane = tree_view(&app).preview_area;
+        let vim = app.vim.as_ref().expect("enter spawns the editor");
+        assert!(vim.embedded);
+        assert_eq!(
+            (vim.cols, vim.rows),
+            (pane.width, pane.height),
+            "editor spawns at the pane size"
+        );
+
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("— editing"), "title shows edit state:\n{text}");
+        assert_eq!(
+            app.vim.as_ref().unwrap().area,
+            tree_view(&app).preview_area,
+            "editor renders into the preview pane, not the modal"
+        );
     }
 
     // ---- `F` find in files + editor modal ----

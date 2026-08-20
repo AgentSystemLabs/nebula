@@ -106,7 +106,6 @@ pub enum PendingAction {
     /// AddProject aimed at a path that doesn't exist yet: create the
     /// directory (daemon-side, `git init` per its config) and add it.
     CreateProjectDir(std::path::PathBuf),
-    ArchiveAgent(AgentId),
     DeleteAgent(AgentId),
     DeleteWorktree(WorktreeId),
     RemoveProject(ProjectId),
@@ -458,6 +457,9 @@ pub struct FileFinder {
     pub root: PathBuf,
     /// Branch name for the modal title.
     pub branch: String,
+    /// Editor command Enter launches (NEBULA_EDITOR, default vim), captured
+    /// at open time.
+    pub editor: String,
     /// Paths relative to `root`, in git listing order.
     pub files: Vec<String>,
     /// Type-to-filter query over `files`; always live.
@@ -475,10 +477,11 @@ pub struct FileFinder {
 }
 
 impl FileFinder {
-    pub fn new(root: PathBuf, branch: String, files: Vec<String>) -> Self {
+    pub fn new(root: PathBuf, branch: String, editor: String, files: Vec<String>) -> Self {
         let mut finder = Self {
             root,
             branch,
+            editor,
             files,
             query: String::new(),
             matches: Vec::new(),
@@ -628,6 +631,7 @@ pub enum Overlay {
     Palette(Palette),
     Files(FileFinder),
     Grep(GrepView),
+    Tree(crate::tree_browser::TreeBrowser),
 }
 
 /// Rows optimistically removed for an in-flight DeleteWorktree, kept so an
