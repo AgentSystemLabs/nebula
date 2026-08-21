@@ -54,6 +54,10 @@ enum Command {
         #[arg(default_value = "0")]
         name: String,
     },
+    /// Installer hook: print the cutover note only when a live daemon is on
+    /// a different build than this binary (see `make install` / install.sh).
+    #[command(hide = true, name = "_stale-daemon-note")]
+    StaleDaemonNote,
 }
 
 fn main() -> Result<()> {
@@ -67,6 +71,15 @@ fn main() -> Result<()> {
         Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),
         Some(Command::Ssh { host, path }) => ssh::run_ssh(&host, path.as_deref()),
         Some(Command::Upgrade { force }) => upgrade::run_upgrade(force),
+        Some(Command::StaleDaemonNote) => {
+            if nebula_daemon::lifecycle::daemon_is_stale() {
+                println!("note: the running daemon was built from older code.");
+                println!(
+                    "      run 'nebula kill' to restart onto the new binary (stops ALL sessions)."
+                );
+            }
+            Ok(())
+        }
         Some(Command::RawAttach { name }) => nebula_tui::run_raw_attach(&name),
         None => {
             init_tui_logging()?;

@@ -26,6 +26,9 @@ async fn serve() -> Result<()> {
     let Some(_lock) = lifecycle::PidfileLock::try_acquire()? else {
         bail!("another nebula daemon is already running");
     };
+    // Record which build this daemon runs so installers can tell an
+    // up-to-date daemon from a stale one (`nebula _stale-daemon-note`).
+    lifecycle::write_buildstamp();
 
     let sock = paths::socket_path();
     lifecycle::unlink_stale_socket(&sock);

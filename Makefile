@@ -17,10 +17,7 @@ install: build
 	cp $(BIN) $(PREFIX)/nebula.new
 	mv $(PREFIX)/nebula.new $(PREFIX)/nebula
 	@$(PREFIX)/nebula --version
-	@if pgrep -f 'nebula daemon' >/dev/null; then \
-		echo "note: a daemon from the previous version is still running."; \
-		echo "      'make kill' restarts onto the new binary (stops ALL sessions)."; \
-	fi
+	@$(PREFIX)/nebula _stale-daemon-note
 
 # Stops every active session — run only when you're ready to cut over.
 kill:

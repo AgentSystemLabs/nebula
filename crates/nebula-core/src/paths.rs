@@ -34,6 +34,13 @@ pub fn pidfile_path() -> PathBuf {
     runtime_dir().join("daemon.pid")
 }
 
+/// Fingerprint of the binary the running daemon was launched from, written
+/// by the daemon at startup. Installers compare it against the binary they
+/// just installed to tell an up-to-date daemon from a stale one.
+pub fn buildstamp_path() -> PathBuf {
+    runtime_dir().join("daemon.build")
+}
+
 pub fn data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("NEBULA_DATA_DIR") {
         if !dir.is_empty() {
