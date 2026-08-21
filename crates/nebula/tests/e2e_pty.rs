@@ -2599,3 +2599,102 @@ async fn auto_title_instruction_and_rename_flow() {
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
 }
+
+/// `nebula add <dir>` and the bare `nebula <dir>` shorthand: the one-shot CLI
+/// resolves the path against its own cwd (the daemon's differs), registers
+/// the repo over IPC, and surfaces daemon rejections as nonzero exits.
+#[tokio::test]
+async fn cli_add_project() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    write_frame(&mut c, &ClientRequest::Subscribe).await.unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+
+    let run_cli = |args: &[&str], cwd: &Path| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args(args)
+            .current_dir(cwd)
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
+            .output()
+            .unwrap()
+    };
+
+    // `nebula add .` from inside the repo: cwd-relative resolution, project
+    // named after the directory.
+    let out = run_cli(&["add", "."], &repo);
+    assert!(out.status.success(), "add . failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("added project"), "stdout: {stdout}");
+    let canon = repo.canonicalize().unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Project(p) }
+                if p.repo_path == canon && p.name == "repo")
+        })
+    })
+    .await;
+
+    // The same repo again: the daemon's dedupe comes back as a failure.
+    let out = run_cli(&["add", repo.to_str().unwrap()], env.tmp.path());
+    assert!(!out.status.success(), "duplicate add must fail: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("already added"), "stderr: {stderr}");
+
+    // Bare `nebula <dir>` shorthand on a second repo.
+    let repo2 = env.tmp.path().join("repo2");
+    std::fs::create_dir_all(&repo2).unwrap();
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["commit", "--allow-empty", "-m", "init"],
+    ] {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo2)
+            .args(&args)
+            .env("GIT_AUTHOR_NAME", "nebula-test")
+            .env("GIT_AUTHOR_EMAIL", "test@nebula.dev")
+            .env("GIT_COMMITTER_NAME", "nebula-test")
+            .env("GIT_COMMITTER_EMAIL", "test@nebula.dev")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+    let out = run_cli(&[repo2.to_str().unwrap()], env.tmp.path());
+    assert!(out.status.success(), "bare add failed: {out:?}");
+    let canon2 = repo2.canonicalize().unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Project(p) }
+                if p.repo_path == canon2 && p.name == "repo2")
+        })
+    })
+    .await;
+
+    // A directory that isn't a git repo is rejected by the daemon.
+    let plain = env.tmp.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let out = run_cli(&["add", plain.to_str().unwrap()], env.tmp.path());
+    assert!(!out.status.success(), "non-repo add must fail: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not a git repository"), "stderr: {stderr}");
+
+    // A path that doesn't exist fails client-side, before any IPC.
+    let out = run_cli(&["add", "does-not-exist"], env.tmp.path());
+    assert!(!out.status.success(), "missing dir must fail: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not exist"), "stderr: {stderr}");
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}

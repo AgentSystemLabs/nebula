@@ -10,6 +10,7 @@ pub mod keys;
 pub mod links;
 pub mod raw_attach;
 pub mod review;
+pub mod splash;
 pub mod syntax;
 pub mod theme;
 pub mod tree_browser;
@@ -45,6 +46,12 @@ pub fn shutdown_daemon_if_idle() -> Result<ipc::IdleShutdown> {
 /// `nebula rename` — agent-side session titling (see `ipc::rename_current_agent`).
 pub fn run_rename(title: String, force: bool) -> Result<()> {
     runtime()?.block_on(ipc::rename_current_agent(title, force))
+}
+
+/// `nebula add <dir>` / bare `nebula <dir>` — register a directory as a
+/// project (see `ipc::add_project`).
+pub fn run_add_project(path: String) -> Result<()> {
+    runtime()?.block_on(ipc::add_project(path))
 }
 
 /// `nebula kill`.

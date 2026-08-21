@@ -13,10 +13,21 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// Directory to add as a project — shorthand for `nebula add <dir>`.
+    /// (A directory whose name collides with a subcommand needs the long
+    /// form or a `./` prefix.)
+    dir: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Add a directory as a project, named after the repo's root directory
+    /// (`nebula add .` for the current one; bare `nebula <dir>` works too).
+    Add {
+        /// Path to a git repository (default: the current directory).
+        #[arg(default_value = ".")]
+        path: String,
+    },
     /// Run the daemon process (normally auto-spawned by the TUI).
     Daemon {
         /// Stay attached to the terminal instead of logging to file.
@@ -67,6 +78,7 @@ fn main() -> Result<()> {
             init_daemon_logging(foreground)?;
             log_fatal(nebula_daemon::run_daemon(), nebula_core::paths::daemon_log_path())
         }
+        Some(Command::Add { path }) => nebula_tui::run_add_project(path),
         Some(Command::Kill) => nebula_tui::run_kill(),
         Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),
         Some(Command::Ssh { host, path }) => ssh::run_ssh(&host, path.as_deref()),
@@ -81,10 +93,13 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::RawAttach { name }) => nebula_tui::run_raw_attach(&name),
-        None => {
-            init_tui_logging()?;
-            log_fatal(nebula_tui::run_tui(), nebula_core::paths::tui_log_path())
-        }
+        None => match cli.dir {
+            Some(dir) => nebula_tui::run_add_project(dir),
+            None => {
+                init_tui_logging()?;
+                log_fatal(nebula_tui::run_tui(), nebula_core::paths::tui_log_path())
+            }
+        },
     }
 }
 

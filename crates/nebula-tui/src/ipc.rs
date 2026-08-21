@@ -193,6 +193,50 @@ pub async fn rename_current_agent(title: String, force: bool) -> Result<()> {
     }
 }
 
+/// One-shot client for `nebula add <dir>` (and bare `nebula <dir>`): resolve
+/// the path locally — the daemon's cwd is not ours, so relative paths must be
+/// absolutized here — and ask the daemon to register it as a project. The
+/// daemon owns the rest: normalizing to the repo toplevel, naming the project
+/// after the directory, rejecting non-repos and duplicates. Spawns a daemon
+/// when none is running, same as launching the TUI would.
+pub async fn add_project(path: String) -> Result<()> {
+    let expanded = match (path.strip_prefix("~/"), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) => std::path::PathBuf::from(home).join(rest),
+        _ => std::path::PathBuf::from(&path),
+    };
+    let dir = std::fs::canonicalize(&expanded)
+        .with_context(|| format!("{} does not exist", expanded.display()))?;
+    if !dir.is_dir() {
+        bail!("{} is not a directory", dir.display());
+    }
+    let mut conn = connect_or_spawn().await?;
+    let req_id = 1u64;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::AddProject {
+            req_id,
+            path: dir.clone(),
+            name: None,
+            create_missing: false,
+        },
+    )
+    .await?;
+    loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::Ack { req_id: r, .. }) if r == req_id => {
+                println!("added project {}", dir.display());
+                return Ok(());
+            }
+            Some(ServerEvent::Error {
+                req_id: Some(r),
+                message,
+            }) if r == req_id => bail!("{message}"),
+            Some(_) => continue,
+            None => bail!("daemon closed the connection before replying"),
+        }
+    }
+}
+
 /// Ask a running daemon to shut down. Ok(false) when none is running.
 ///
 /// A daemon on a different protocol version closes the socket right after

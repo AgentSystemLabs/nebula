@@ -352,7 +352,7 @@ fn tui_projects_worktrees_agents_navigation() {
     let beta = tui.make_repo("beta-proj");
 
     // ---- boot: empty state, Projects focused ----
-    tui.wait_for_text("no projects yet");
+    tui.wait_for_text("create your first project");
     tui.wait_for_text(FOOTER_PROJECTS);
 
     // ---- add the first project via bash-style Tab completion ----
@@ -505,7 +505,7 @@ fn tui_projects_worktrees_agents_navigation() {
 #[test]
 fn tui_help_modal_grouped_keymap() {
     let mut tui = TuiHarness::spawn();
-    tui.wait_for_text("no projects yet");
+    tui.wait_for_text("create your first project");
 
     // The grouped two-column keymap: every section header on screen at
     // once, including the todo hotkey (the old single list clipped its
@@ -529,7 +529,7 @@ fn tui_todo_modal_crud_and_badge() {
     let mut tui = TuiHarness::spawn();
     let repo = tui.make_repo("todo-proj");
 
-    tui.wait_for_text("no projects yet");
+    tui.wait_for_text("create your first project");
     add_project(&mut tui, &repo, "todo-proj");
     // The root worktree row must exist before o has a list to open.
     tui.wait_for_text("⌂ root");
@@ -615,7 +615,7 @@ fn tui_git_diff_modal() {
     let mut tui = TuiHarness::spawn();
     let repo = tui.make_repo("diff-proj");
 
-    tui.wait_for_text("no projects yet");
+    tui.wait_for_text("create your first project");
     add_project(&mut tui, &repo, "diff-proj");
     // The root worktree row must exist before g has anything to diff.
     tui.wait_for_text("⌂ root");

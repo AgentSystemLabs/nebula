@@ -113,6 +113,8 @@ selection: hold `Shift` while dragging (mouse capture bypass — same as tmux).
 
 ```
 nebula                    # launch the TUI (auto-starts the daemon)
+nebula add <dir>          # add a repo as a project, named after its root directory
+nebula add .              # same, for the repo you're in (bare `nebula <dir>` / `nebula .` also work)
 nebula daemon             # run the daemon (normally auto-spawned)
 nebula daemon --foreground  # daemon with logs to stderr, for debugging
 nebula kill               # stop the daemon and all sessions cleanly

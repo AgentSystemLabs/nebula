@@ -38,6 +38,13 @@ const GIT_POLL: Duration = Duration::from_secs(2);
 /// booting well before the user picks one.
 const PREWARM_DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// How often the standing keep-warm request for the selected worktree's
+/// default-spec Claude session is re-sent. Must stay comfortably under the
+/// daemon's reap window minus its recycle threshold, so the warm slot is
+/// refreshed (a young session is a no-op, an aging one is recycled) before
+/// the reaper can empty it.
+const KEEPWARM_REFRESH: Duration = Duration::from_secs(4 * 60);
+
 /// While the metrics modal is open, how often a fresh memory reading is
 /// requested from the daemon.
 const METRICS_POLL: Duration = Duration::from_secs(2);
@@ -45,6 +52,10 @@ const METRICS_POLL: Duration = Duration::from_secs(2);
 /// With the modal closed, how often the footer's memory/session readout is
 /// refreshed.
 const FOOTER_METRICS_POLL: Duration = Duration::from_secs(5);
+
+/// Repaint cadence for the first-run splash animation — the only thing
+/// that marks the app dirty while it idles on an empty tree.
+const SPLASH_FRAME: Duration = crate::splash::FRAME;
 
 pub async fn run_app() -> Result<()> {
     let conn = ipc::connect_or_spawn().await?;
@@ -128,6 +139,7 @@ async fn main_loop(
     let mut next_draw = tokio::time::Instant::now();
     let mut next_git_poll = tokio::time::Instant::now();
     let mut next_metrics_poll = tokio::time::Instant::now();
+    let mut next_splash_frame = tokio::time::Instant::now();
     // Editor-modal PTY output; the channel outlives individual editor
     // spawns (VimEvent generations keep them apart).
     let (vim_tx, mut vim_rx) = tokio::sync::mpsc::unbounded_channel::<VimEvent>();
@@ -176,6 +188,12 @@ async fn main_loop(
                 };
                 next_metrics_poll = tokio::time::Instant::now() + period;
             }
+            // First-run splash: while it's on screen nothing else repaints
+            // an idle app, so tick the animation on a fixed cadence.
+            _ = tokio::time::sleep_until(next_splash_frame), if app.splash_active() => {
+                app.dirty = true;
+                next_splash_frame = tokio::time::Instant::now() + SPLASH_FRAME;
+            }
             _ = tokio::time::sleep(recent_expiry.unwrap_or_default() + Duration::from_millis(250)),
                 if recent_expiry.is_some() =>
             {
@@ -201,6 +219,14 @@ async fn main_loop(
                 if app.pending_prewarm.is_some() =>
             {
                 fire_pending_prewarm(&mut app, &mut out);
+            }
+            // Standing keep-warm: periodically re-assert the selected
+            // worktree's warm default-spec Claude session so the daemon's
+            // reaper never leaves the next create cold.
+            _ = tokio::time::sleep(app.keepwarm_delay().unwrap_or_default()),
+                if app.next_keepwarm.is_some() =>
+            {
+                fire_keepwarm(&mut app, &mut out);
             }
             ev = input.next() => match ev {
                 Some(Ok(event)) => {
@@ -524,6 +550,13 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         }
     }
 
+    // Splash preview up: the next key just dismisses it, back to the
+    // panels — even q, which quits on the press after.
+    if app.splash_preview {
+        app.splash_preview = false;
+        return;
+    }
+
     // Panel focus: navigation + action keymap.
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
@@ -537,6 +570,12 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         KeyCode::Char('M') => {
             app.overlay = Some(Overlay::Metrics(MetricsView::new()));
             request_metrics(app, out);
+        }
+        // Replay the first-run nebula splash, fade-in included.
+        KeyCode::Char('N') => {
+            app.splash_epoch = std::time::Instant::now();
+            app.splash_preview = true;
+            app.collapsed = false;
         }
         KeyCode::Tab => {
             app.focus = match app.focus {
@@ -562,11 +601,24 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 Focus::Terminal => Focus::Sessions,
             }
         }
-        KeyCode::Char('l') | KeyCode::Right => {
+        // Ctrl+→ still reaches the terminal pane (the counterpart of the
+        // Ctrl+← escape hatch); must precede the unguarded arm below.
+        KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.focus = match app.focus {
                 Focus::Projects => Focus::Worktrees,
                 Focus::Worktrees => Focus::Sessions,
                 Focus::Sessions => Focus::Terminal,
+                Focus::Terminal => Focus::Terminal,
+            }
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            // Stops at Sessions: entering the terminal pane means the user
+            // chose a session, which is Enter's job — plain focus movement
+            // never crosses into the pane (Tab/Ctrl+→ do).
+            app.focus = match app.focus {
+                Focus::Projects => Focus::Worktrees,
+                Focus::Worktrees => Focus::Sessions,
+                Focus::Sessions => Focus::Sessions,
                 Focus::Terminal => Focus::Terminal,
             }
         }
@@ -601,6 +653,11 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 }
             }
         },
+        // First run: with no projects every panel is empty and the splash
+        // is up — `n` creates a project no matter which panel has focus.
+        KeyCode::Char('n') if app.tree.projects.is_empty() => {
+            open_prompt(app, PromptKind::AddProject)
+        }
         KeyCode::Char('n') => match app.focus {
             Focus::Projects => open_prompt(app, PromptKind::AddProject),
             Focus::Worktrees => {
@@ -1866,7 +1923,24 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
             _ => {}
         },
         Overlay::Prompt(prompt) => match key.code {
-            KeyCode::Esc => app.overlay = None,
+            KeyCode::Esc => {
+                // Abandoning a Claude name prompt can leave the warm slot
+                // holding the submenu's off-default spec (its prewarm fired
+                // on kind-pick); put the standing default spec back. Same
+                // spec = daemon-side no-op.
+                let restore = match &prompt.kind {
+                    PromptKind::NewAgent {
+                        worktree,
+                        kind: AgentKind::Claude,
+                        ..
+                    } => Some(worktree.clone()),
+                    _ => None,
+                };
+                app.overlay = None;
+                if let Some(worktree) = restore {
+                    out.push(default_claude_prewarm(worktree));
+                }
+            }
             KeyCode::Enter => {
                 let prompt = prompt.clone();
                 app.overlay = None;
@@ -1930,8 +2004,10 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 KeyCode::Char('u') if ctrl => view.scroll_by(-half),
                 // Ctrl+r toggles the reviewed ✓ on the selected file —
                 // nebula-side bookkeeping only, no git state is touched.
-                // Reviewed files sink to the bottom and marking advances to
-                // the next file (see `DiffView::toggle_reviewed`).
+                // Reviewed files sink to the bottom; marking advances to the
+                // next file and unmarking to the next still-marked file, so
+                // held Ctrl+r sweeps either way (see
+                // `DiffView::toggle_reviewed`).
                 KeyCode::Char('r') if ctrl => {
                     if let Some(changed) = view.toggle_reviewed() {
                         crate::review::store_marks(&view.root, &view.head_key, &view.reviewed);
@@ -2412,13 +2488,18 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
             out.push(ClientRequest::CreateAgent {
                 req_id,
-                worktree,
+                worktree: worktree.clone(),
                 name,
                 kind,
                 model,
                 effort,
                 auto_title,
             });
+            // The create consumes (or, off-spec, discards) the worktree's
+            // warm Claude slot; refill it so the next create is instant too.
+            if kind == AgentKind::Claude {
+                out.push(default_claude_prewarm(worktree));
+            }
         }
         PromptKind::RenameAgent { id } => {
             let req_id = app.alloc_req_id(PendingIntent::None);
@@ -3209,10 +3290,41 @@ fn fire_pending_prewarm(app: &mut App, out: &mut Vec<ClientRequest>) {
     };
     let (cols, rows) = pane_size(app);
     out.push(ClientRequest::PrewarmWorktreeSessions {
-        worktree,
+        worktree: worktree.clone(),
         cols,
         rows,
     });
+    // The selected worktree also keeps one Claude session standing by, so
+    // creating a session there adopts an already-booted CLI.
+    out.push(default_claude_prewarm(worktree));
+    app.next_keepwarm = Some(std::time::Instant::now() + KEEPWARM_REFRESH);
+}
+
+/// The one spec kept permanently warm: a Claude CLI at the configured
+/// default model/effort. Creates matching it adopt the warm session
+/// instantly; any other spec launches cold on purpose — off-default CLIs
+/// would sit idle holding memory for a spec the user rarely repeats.
+fn default_claude_prewarm(worktree: WorktreeId) -> ClientRequest {
+    let cfg = crate::config::Config::load();
+    ClientRequest::PrewarmAgent {
+        worktree,
+        kind: AgentKind::Claude,
+        model: cfg.default_model(AgentKind::Claude),
+        effort: cfg.default_effort(AgentKind::Claude),
+    }
+}
+
+/// Periodic re-assert of the standing warm Claude session for the selected
+/// worktree. A young same-spec session makes this a daemon-side no-op and an
+/// aging one is recycled in place, so without this tick the daemon's reaper
+/// would empty the slot at its max age and the next create would boot cold.
+fn fire_keepwarm(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let Some(worktree) = app.selected_worktree().map(|w| w.id.clone()) else {
+        app.next_keepwarm = None;
+        return;
+    };
+    out.push(default_claude_prewarm(worktree));
+    app.next_keepwarm = Some(std::time::Instant::now() + KEEPWARM_REFRESH);
 }
 
 /// Mouse position → pane-relative cell, clamped into the terminal area (so a
@@ -4694,8 +4806,72 @@ mod tests {
         );
     }
 
+    /// An empty tree replaces the panel columns with the animated splash
+    /// (wordmark + create hint); the first project upsert swaps the normal
+    /// columns back in.
+    #[test]
+    fn empty_tree_draws_splash_until_first_project() {
+        let mut app = App::new();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("create your first project"), "{text}");
+        assert!(
+            text.contains("your agents keep running"),
+            "tagline on the splash: {text}"
+        );
+        assert!(!text.contains("PROJECTS"), "no panel chrome: {text}");
+        assert!(app.splash_active());
+
+        seed_tree(&mut app);
+        assert!(!app.splash_active());
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("PROJECTS"), "columns back: {text}");
+    }
+
+    /// N summons the splash as a preview over a populated tree — full-body
+    /// nebula with the "any key" hint instead of panel columns — and the
+    /// next keypress (even q) only dismisses it.
+    #[test]
+    fn shift_n_previews_splash_and_any_key_dismisses() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('N'), KeyModifiers::SHIFT, &mut out);
+        assert!(app.splash_preview && app.splash_active());
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("any key returns"), "{text}");
+        assert!(!text.contains("PROJECTS"), "panels hidden: {text}");
+
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE, &mut out);
+        assert!(!app.splash_preview, "any key dismisses");
+        assert!(!app.should_quit, "the dismissing key is swallowed");
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("PROJECTS"));
+    }
+
+    /// While the tree is empty, `n` opens the add-project prompt from any
+    /// focus — the splash hides the panels, so the per-panel meanings of
+    /// `n` would just dead-end.
+    #[test]
+    fn n_adds_project_from_any_focus_while_tree_empty() {
+        let mut app = App::new();
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Prompt(p)) = &app.overlay else {
+            panic!("expected add-project prompt, got {:?}", app.overlay);
+        };
+        assert_eq!(p.kind, crate::app::PromptKind::AddProject);
+    }
+
     /// Resting the worktree selection arms the debounced prewarm; firing it
-    /// sends one PrewarmWorktreeSessions for that worktree and disarms.
+    /// sends one PrewarmWorktreeSessions plus the standing default-spec
+    /// Claude keep-warm for that worktree, then disarms.
     #[test]
     fn worktree_move_arms_prewarm_and_fire_sends_request() {
         use nebula_core::{Entity, ProjectId, Worktree, WorktreeId};
@@ -4723,13 +4899,87 @@ mod tests {
         assert_eq!(armed, WorktreeId("w2".into()));
 
         out.clear();
-        fire_pending_prewarm(&mut app, &mut out);
+        with_default_config(|| fire_pending_prewarm(&mut app, &mut out));
         assert!(app.pending_prewarm.is_none(), "fires once, then disarms");
         assert!(matches!(
             out.as_slice(),
-            [ClientRequest::PrewarmWorktreeSessions { worktree, .. }]
-                if worktree == &WorktreeId("w2".into())
+            [
+                ClientRequest::PrewarmWorktreeSessions { worktree, .. },
+                ClientRequest::PrewarmAgent {
+                    worktree: agent_wt,
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                },
+            ] if worktree == &WorktreeId("w2".into()) && agent_wt == &WorktreeId("w2".into())
         ));
+        assert!(app.next_keepwarm.is_some(), "keep-warm re-send is armed");
+    }
+
+    /// The keep-warm tick re-sends the default-spec Claude prewarm for the
+    /// selected worktree and re-arms itself; with nothing selected it
+    /// disarms until the next worktree rest re-arms it.
+    #[test]
+    fn keepwarm_refires_for_selected_worktree_and_rearms() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.next_keepwarm = Some(std::time::Instant::now());
+            let mut out = Vec::new();
+            fire_keepwarm(&mut app, &mut out);
+            assert!(matches!(
+                out.as_slice(),
+                [ClientRequest::PrewarmAgent {
+                    worktree,
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                }] if worktree == &nebula_core::WorktreeId("w1".into())
+            ));
+            assert!(app.next_keepwarm.is_some(), "re-arms after sending");
+
+            let mut empty = App::new();
+            empty.next_keepwarm = Some(std::time::Instant::now());
+            out.clear();
+            fire_keepwarm(&mut empty, &mut out);
+            assert!(out.is_empty(), "nothing selected, nothing to keep warm");
+            assert!(empty.next_keepwarm.is_none(), "disarms without a worktree");
+        })
+    }
+
+    /// Esc on a Claude name prompt restores the standing default-spec warm
+    /// session — the submenu's off-default pick had already replaced it the
+    /// moment the kind was chosen.
+    #[test]
+    fn esc_on_claude_name_prompt_restores_default_prewarm() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.overlay = Some(Overlay::Prompt(PromptDialog {
+                title: "New agent (opus · high)".into(),
+                label: "name".into(),
+                input: String::new(),
+                kind: PromptKind::NewAgent {
+                    worktree: nebula_core::WorktreeId("w1".into()),
+                    kind: AgentKind::Claude,
+                    model: Some("opus".into()),
+                    effort: Some("high".into()),
+                },
+                candidates: Vec::new(),
+            }));
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none());
+            assert!(matches!(
+                out.as_slice(),
+                [ClientRequest::PrewarmAgent {
+                    worktree,
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                }] if worktree == &nebula_core::WorktreeId("w1".into())
+            ));
+        })
     }
 
     /// The startup snapshot arms the prewarm for the restored worktree, so
@@ -5311,12 +5561,22 @@ mod tests {
             ));
 
             // Accepting the empty prompt falls back to the next free default
-            // name.
+            // name, and the consumed warm slot is refilled right behind the
+            // create so the next one adopts a booted CLI too.
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(app.overlay.is_none());
             assert!(matches!(
+                &out[out.len() - 2],
+                ClientRequest::CreateAgent { name, kind: AgentKind::Claude, model: None, effort: None, .. } if name == "agent-2"
+            ));
+            assert!(matches!(
                 out.last(),
-                Some(ClientRequest::CreateAgent { name, kind: AgentKind::Claude, model: None, effort: None, .. }) if name == "agent-2"
+                Some(ClientRequest::PrewarmAgent {
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    ..
+                })
             ));
         })
     }
@@ -5938,6 +6198,27 @@ mod tests {
             &mut out,
         );
         assert!(app.term_locked, "Enter on the focused pane locks input");
+    }
+
+    /// Plain →/l stops at the Sessions panel: crossing into the terminal
+    /// pane means the user chose a session, which is Enter's job (Tab and
+    /// Ctrl+→ still reach the pane deliberately).
+    #[test]
+    fn plain_right_stops_at_sessions() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            80,
+            24,
+        ));
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.focus, Focus::Sessions, "→ must not enter the pane");
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
+        assert_eq!(app.focus, Focus::Sessions, "l must not enter the pane");
     }
 
     /// ↑/↓ in the Sessions panel previews the selected session in the
@@ -7164,20 +7445,25 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        // Borderless column: row 0 is the header, row 1 a spacer, row 2 the
-        // project (selected in the focused panel → accent ▌ rail), row 3
-        // the divider behind a 1-cell gutter.
+        // Borderless column: row 0 is the header, row 1 a spacer, rows 2-4
+        // the 3-tall project button (selected in the focused panel → accent
+        // ▌ rail down its edge, name on the middle row), row 5 the divider
+        // behind a 1-cell gutter.
         let lines: Vec<&str> = text.lines().collect();
         assert!(
             lines[0].starts_with("   PROJECTS"),
             "column header first:\n{text}"
         );
         assert!(
-            lines[2].starts_with("▌● demo"),
-            "project row under the header:\n{text}"
+            lines[2].starts_with("▌ ") && lines[4].starts_with("▌ "),
+            "selection rail spans the project button:\n{text}"
         );
         assert!(
-            lines[3].starts_with(&format!(" {}", "─".repeat(10))),
+            lines[3].starts_with("▌● demo"),
+            "project name centered in the button:\n{text}"
+        );
+        assert!(
+            lines[5].starts_with(&format!(" {}", "─".repeat(10))),
             "divider row under the project:\n{text}"
         );
 
@@ -7191,7 +7477,7 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(
-            text.lines().nth(3).unwrap().starts_with(" ─ work ──"),
+            text.lines().nth(5).unwrap().starts_with(" ─ work ──"),
             "labeled divider row:\n{text}"
         );
     }

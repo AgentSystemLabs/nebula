@@ -20,6 +20,12 @@ use tokio::sync::broadcast;
 /// A warm agent CLI older than this is reaped — it holds memory and its
 /// conversation context grows stale.
 const PREWARM_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+/// A live same-spec warm CLI older than this is recycled (killed and
+/// re-booted fresh) when its slot is re-requested, instead of being kept.
+/// Clients keep-warm the selected worktree on a cadence shorter than
+/// `PREWARM_MAX_AGE - PREWARM_RECYCLE_AGE`, so a slot they still care about
+/// is always refreshed before the reaper can empty it.
+const PREWARM_RECYCLE_AGE: Duration = Duration::from_secs(10 * 60);
 /// Hook events buffered on a warm session before its row exists (oldest
 /// dropped beyond this).
 const PREWARM_HOOK_BUFFER_CAP: usize = 64;
@@ -916,13 +922,15 @@ impl Daemon {
             return Ok(());
         };
         let stale = {
-            // One warm slot per key; keep a live one with the same spec,
-            // replace a dead or wrong-spec one.
+            // One warm slot per key; keep a live, young one with the same
+            // spec, replace a dead, wrong-spec, or aging one (recycling
+            // before the reaper hits keeps a re-requested slot gap-free).
             let mut pool = self.prewarmed.lock().unwrap();
             if let Some(entry) = pool.get(&(worktree_id.clone(), kind)) {
                 if self.is_alive(&SessionRef::Agent(entry.agent_id.clone()))
                     && entry.model == model
                     && entry.effort == effort
+                    && entry.spawned_at.elapsed() < PREWARM_RECYCLE_AGE
                 {
                     return Ok(());
                 }

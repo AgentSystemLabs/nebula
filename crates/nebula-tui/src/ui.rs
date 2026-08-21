@@ -29,6 +29,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
+    // First run: no projects means three empty panels, so the whole body
+    // becomes the animated nebula splash until the first project lands.
+    // N summons the same splash as a dismissable preview.
+    if app.tree.projects.is_empty() || app.splash_preview {
+        crate::splash::draw_splash(f, app, body);
+        draw_footer(f, app, footer);
+        draw_overlay(f, app);
+        draw_vim(f, app);
+        return;
+    }
+
     app.body_area = body;
     app.normalize_panel_widths(body.width);
     let [projects_a, worktrees_a, sessions_a, term_a] = Layout::horizontal([
@@ -373,6 +384,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     &[
                         ("s", "settings"),
                         ("M", "memory usage (nebula + agents)"),
+                        ("N", "nebula splash (any key returns)"),
                         ("^u", "clear typed input"),
                         ("q / ?", "quit / toggle this help"),
                     ],
@@ -1595,10 +1607,27 @@ fn row_bar(selected: bool, focused: bool, th: Theme) -> Style {
 fn render_row(
     f: &mut Frame,
     area: Rect,
+    spans: Vec<Span>,
+    selected: bool,
+    focused: bool,
+    th: Theme,
+) {
+    render_button(f, area, spans, selected, focused, th, 0);
+}
+
+/// Render one list entry as a button `area.height` rows tall: the
+/// selection fill covers the whole rect, the `▌` marker runs down its
+/// left edge, and the text sits on `text_row` (0-based, inside the rect).
+/// Dim spans (idle dots, archived names) would sink into the selection
+/// fill, so they get lifted to muted there.
+fn render_button(
+    f: &mut Frame,
+    area: Rect,
     mut spans: Vec<Span>,
     selected: bool,
     focused: bool,
     th: Theme,
+    text_row: u16,
 ) {
     if selected {
         for s in &mut spans {
@@ -1607,16 +1636,29 @@ fn render_row(
             }
         }
     }
-    let marker = if selected && focused {
-        Span::styled("▌", Style::default().fg(th.accent))
-    } else if selected {
-        Span::styled("▌", Style::default().fg(th.dim))
-    } else {
-        Span::raw(" ")
+    let marker = || {
+        if selected && focused {
+            Span::styled("▌", Style::default().fg(th.accent))
+        } else if selected {
+            Span::styled("▌", Style::default().fg(th.dim))
+        } else {
+            Span::raw(" ")
+        }
     };
-    spans.insert(0, marker);
+    let mut text_spans = Some(spans);
+    let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
+    for r in 0..area.height {
+        if r == text_row {
+            if let Some(mut spans) = text_spans.take() {
+                spans.insert(0, marker());
+                lines.push(Line::from(spans));
+                continue;
+            }
+        }
+        lines.push(Line::from(marker()));
+    }
     f.render_widget(
-        Paragraph::new(Line::from(spans)).style(row_bar(selected, focused, th)),
+        Paragraph::new(lines).style(row_bar(selected, focused, th)),
         area,
     );
 }
@@ -1661,6 +1703,82 @@ fn draw_column(
         width: inner.width.saturating_sub(1),
         ..inner
     }
+}
+
+/// Visual hierarchy of the sidebar lists, stepping down the tree.
+/// Projects are 3-row buttons (bold, text centered). Worktrees are a
+/// ~2-row pill: a 3-row cell with half-block pads so the name stays
+/// vertically centered, stacked on a 2-row stride so pads overlap and
+/// items don't pick up an extra gap. Sessions are 1-row and flush.
+const PROJECT_BTN_H: u16 = 3;
+const WORKTREE_BTN_H: u16 = 2;
+const PILL_HALF: (char, char) = ('▄', '▀');
+
+/// Render one worktree into a 3-row cell starting at `top`: half-block
+/// pad, text, half-block pad. The name sits on the middle row so it
+/// stays vertically centered in the ~2-row pill. The accent rail uses
+/// left quadrants on the pad rows so the bar matches the fill height
+/// (a step down from the 3-row project `▌`). Dim spans get lifted to
+/// muted on the fill, same as `render_button`.
+fn render_pill(
+    f: &mut Frame,
+    inner: Rect,
+    top: usize,
+    mut spans: Vec<Span>,
+    selected: bool,
+    focused: bool,
+    th: Theme,
+    (above, below): (char, char),
+) {
+    let Some(text_area) = rows_rect(inner, top + 1, 1) else {
+        return;
+    };
+    if selected {
+        for s in &mut spans {
+            if s.style.fg == Some(th.dim) {
+                s.style.fg = Some(th.muted);
+            }
+        }
+        let fill = if focused { th.sel_bg } else { th.sel_bg_dim };
+        let rail = if focused { th.accent } else { th.dim };
+        let rail_glyph = |glyph: char| match glyph {
+            '▄' => '▖',
+            '▀' => '▘',
+            other => other,
+        };
+        let mut pad = |glyph: char, row: usize| {
+            if let Some(r) = rows_rect(inner, row, 1) {
+                let rest = (inner.width as usize).saturating_sub(1);
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(
+                            rail_glyph(glyph).to_string(),
+                            Style::default().fg(rail),
+                        ),
+                        Span::styled(
+                            glyph.to_string().repeat(rest),
+                            Style::default().fg(fill),
+                        ),
+                    ])),
+                    r,
+                );
+            }
+        };
+        pad(above, top);
+        pad(below, top + 2);
+    }
+    let marker = if selected && focused {
+        Span::styled("▌", Style::default().fg(th.accent))
+    } else if selected {
+        Span::styled("▌", Style::default().fg(th.dim))
+    } else {
+        Span::raw(" ")
+    };
+    spans.insert(0, marker);
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(row_bar(selected, focused, th)),
+        text_area,
+    );
 }
 
 fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
@@ -1714,32 +1832,53 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
             }
         })
         .collect();
+    let mut screen_row = 0usize;
     for (row_idx, (row, text, roll, todos)) in rows.iter().enumerate() {
-        let Some(row_area) = row_rect(inner, row_idx) else {
-            break;
-        };
-        let spans = match row {
+        match row {
             ProjectRow::Project(_) => {
+                let Some(row_area) = rows_rect(inner, screen_row, PROJECT_BTN_H) else {
+                    break;
+                };
                 // Same todo-count badge as worktree rows: the project's own
                 // notes only (worktree notes badge on their worktree).
                 let todo_badge = todo_badge(*todos, th);
                 let badge_len = todo_badge.as_ref().map_or(0, |(s, _)| s.chars().count());
+                // Bold name: the top of the tree reads "biggest".
                 let mut spans = vec![
                     status_dot(*roll, th),
-                    Span::raw(truncate(
-                        text,
-                        (inner.width as usize).saturating_sub(2 + badge_len),
-                    )),
+                    Span::styled(
+                        truncate(
+                            text,
+                            (inner.width as usize).saturating_sub(2 + badge_len),
+                        ),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
                 ];
                 if let Some((text, style)) = todo_badge {
                     spans.push(Span::styled(text, style));
                 }
-                spans
+                render_button(
+                    f,
+                    row_area,
+                    spans,
+                    row_idx == app.sel_project,
+                    focused,
+                    th,
+                    PROJECT_BTN_H / 2,
+                );
+                app.hits.push((row_area, HitTarget::Project(row_idx)));
+                screen_row += PROJECT_BTN_H as usize;
             }
-            ProjectRow::Divider { .. } => divider_spans(text, inner.width, th),
-        };
-        render_row(f, row_area, spans, row_idx == app.sel_project, focused, th);
-        app.hits.push((row_area, HitTarget::Project(row_idx)));
+            ProjectRow::Divider { .. } => {
+                let Some(row_area) = row_rect(inner, screen_row) else {
+                    break;
+                };
+                let spans = divider_spans(text, inner.width, th);
+                render_row(f, row_area, spans, row_idx == app.sel_project, focused, th);
+                app.hits.push((row_area, HitTarget::Project(row_idx)));
+                screen_row += 1;
+            }
+        }
     }
     app.hits.push((inner, HitTarget::PanelBg(Focus::Projects)));
 }
@@ -1829,9 +1968,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         if grouped && i == pinned_count {
             header(f, "UNPINNED".into(), &mut screen_row);
         }
-        let Some(row_area) = row_rect(inner, screen_row) else {
+        if row_rect(inner, screen_row + 1).is_none() {
             break;
-        };
+        }
         let todo_badge = todo_badge(*todos, th);
         let badge_len = todo_badge.as_ref().map_or(0, |(s, _)| s.chars().count());
         let mut spans = vec![status_dot(*roll, th)];
@@ -1852,10 +1991,21 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         if let Some((text, style)) = todo_badge {
             spans.push(Span::styled(text, style));
         }
-        render_row(f, row_area, spans, i == app.sel_worktree, focused, th);
-        app.hits.push((row_area, HitTarget::Worktree(i)));
-        screen_row += 1;
-        // A quiet blank row separates the main checkout from the true
+        render_pill(
+            f,
+            inner,
+            screen_row,
+            spans,
+            i == app.sel_worktree,
+            focused,
+            th,
+            PILL_HALF,
+        );
+        if let Some(hit) = rows_rect(inner, screen_row, WORKTREE_BTN_H) {
+            app.hits.push((hit, HitTarget::Worktree(i)));
+        }
+        screen_row += WORKTREE_BTN_H as usize;
+        // An extra quiet row separates the main checkout from the true
         // worktrees below; group headers take over once something is
         // pinned.
         if !grouped && *is_main && worktrees.len() > 1 {
@@ -1918,10 +2068,10 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     if pinned_count > 0 {
         header(f, "PINNED".into(), &mut screen_row);
         for (i, row) in rows.iter().enumerate().take(pinned_count) {
-            let Some(r) = row_rect(inner, screen_row) else {
+            if row_rect(inner, screen_row).is_none() {
                 break;
-            };
-            draw_session_row(f, app, r, i, row, focused, inner.width);
+            }
+            draw_session_row(f, app, inner, screen_row, i, row, focused);
             screen_row += 1;
         }
     }
@@ -1933,10 +2083,10 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
             .skip(pinned_count)
             .take(recent_count)
         {
-            let Some(r) = row_rect(inner, screen_row) else {
+            if row_rect(inner, screen_row).is_none() {
                 break;
-            };
-            draw_session_row(f, app, r, i, row, focused, inner.width);
+            }
+            draw_session_row(f, app, inner, screen_row, i, row, focused);
             screen_row += 1;
         }
     }
@@ -1949,10 +2099,10 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         .skip(pinned_count + recent_count)
         .take(unpinned_count)
     {
-        let Some(r) = row_rect(inner, screen_row) else {
+        if row_rect(inner, screen_row).is_none() {
             break;
-        };
-        draw_session_row(f, app, r, i, row, focused, inner.width);
+        }
+        draw_session_row(f, app, inner, screen_row, i, row, focused);
         screen_row += 1;
     }
     if terminal_count > 0 {
@@ -1963,10 +2113,10 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
             .skip(active_count)
             .take(terminal_count)
         {
-            let Some(r) = row_rect(inner, screen_row) else {
+            if row_rect(inner, screen_row).is_none() {
                 break;
-            };
-            draw_session_row(f, app, r, i, row, focused, inner.width);
+            }
+            draw_session_row(f, app, inner, screen_row, i, row, focused);
             screen_row += 1;
         }
     }
@@ -1992,10 +2142,10 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
                 .enumerate()
                 .skip(active_count + terminal_count)
             {
-                let Some(r) = row_rect(inner, screen_row) else {
+                if row_rect(inner, screen_row).is_none() {
                     break;
-                };
-                draw_session_row(f, app, r, i, row, focused, inner.width);
+                }
+                draw_session_row(f, app, inner, screen_row, i, row, focused);
                 screen_row += 1;
             }
         }
@@ -2008,13 +2158,14 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_session_row(
     f: &mut Frame,
     app: &mut App,
-    area: Rect,
+    inner: Rect,
+    top: usize,
     index: usize,
     row: &SessionRow,
     focused: bool,
-    width: u16,
 ) {
     let th = app.theme;
+    let width = inner.width;
     let spans = match row {
         SessionRow::Agent(a) => {
             let dot = if a.archived {
@@ -2022,10 +2173,13 @@ fn draw_session_row(
             } else {
                 status_dot(Some(a.status), th)
             };
+            // Muted names: sessions sit at the bottom of the tree, so
+            // their text reads "smallest" next to the bold project
+            // buttons.
             let name_style = if a.archived {
                 Style::default().fg(th.dim)
             } else {
-                Style::default()
+                Style::default().fg(th.muted)
             };
             // Non-default CLIs get a dim badge (same idiom as the worktree
             // root row).
@@ -2048,12 +2202,25 @@ fn draw_session_row(
             let glyph_color = if t.alive { th.ok } else { th.dim };
             vec![
                 Span::styled("❯ ", Style::default().fg(glyph_color)),
-                Span::raw(truncate(&t.name, width.saturating_sub(2) as usize)),
+                Span::styled(
+                    truncate(&t.name, width.saturating_sub(2) as usize),
+                    Style::default().fg(th.muted),
+                ),
             ]
         }
     };
-    render_row(f, area, spans, index == app.sel_session, focused, th);
-    app.hits.push((area, HitTarget::Session(index)));
+    let Some(row_area) = row_rect(inner, top) else {
+        return;
+    };
+    render_row(
+        f,
+        row_area,
+        spans,
+        index == app.sel_session,
+        focused,
+        th,
+    );
+    app.hits.push((row_area, HitTarget::Session(index)));
 }
 
 /// Borderless terminal frame: a header row (`TERMINAL · session` plus a
@@ -2592,6 +2759,12 @@ fn fuzzy_highlight_spans(shown: &str, positions: &[usize], th: Theme) -> Vec<Spa
 
 /// The i-th single-height row inside `inner`, or None when it overflows.
 fn row_rect(inner: Rect, i: usize) -> Option<Rect> {
+    rows_rect(inner, i, 1)
+}
+
+/// A rect `height` rows tall starting at the i-th row inside `inner`:
+/// None once the first row overflows, clamped when only the tail does.
+fn rows_rect(inner: Rect, i: usize, height: u16) -> Option<Rect> {
     let y = inner.y + i as u16;
     if y >= inner.y + inner.height {
         return None;
@@ -2600,7 +2773,7 @@ fn row_rect(inner: Rect, i: usize) -> Option<Rect> {
         x: inner.x,
         y,
         width: inner.width,
-        height: 1,
+        height: height.min(inner.y + inner.height - y),
     })
 }
 

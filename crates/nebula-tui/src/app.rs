@@ -388,10 +388,12 @@ impl DiffView {
 
     /// Toggle the reviewed ✓ on the selected file and re-sink reviewed
     /// files. Marking keeps the selection row — with the marked file sunk,
-    /// that lands on the next file in the list; unmarking follows the file
-    /// back to its natural spot. `None` when no row is selected, otherwise
-    /// whether the selected file changed (the caller reloads the diff; it
-    /// persists `reviewed` either way).
+    /// that lands on the next file in the list; unmarking advances to the
+    /// next still-reviewed file so repeated presses clear a batch of marks.
+    /// Only when the last visible mark is cleared does the selection follow
+    /// the file back to its natural spot. `None` when no row is selected,
+    /// otherwise whether the selected file changed (the caller reloads the
+    /// diff; it persists `reviewed` either way).
     pub fn toggle_reviewed(&mut self) -> Option<bool> {
         let path = self.selected_file()?.path.clone();
         let before = self.matches.get(self.selected).map(|m| m.file);
@@ -401,7 +403,15 @@ impl DiffView {
             self.reviewed.insert(path.clone(), mark);
         }
         self.recompute_matches();
-        if unmarked {
+        let marks_visible = self
+            .matches
+            .iter()
+            .any(|m| self.reviewed.contains_key(&self.files[m.file].path));
+        if unmarked && marks_visible {
+            // The reviewed zone is contiguous at the bottom and the selection
+            // sat inside it, so one row down is the next still-marked file.
+            self.selected = (self.selected + 1).min(self.matches.len().saturating_sub(1));
+        } else if unmarked {
             if let Some(pos) = self
                 .matches
                 .iter()
@@ -1101,6 +1111,10 @@ pub struct App {
     /// deadline — armed on every worktree context switch, so walking the
     /// list doesn't boot every CLI it passes.
     pub pending_prewarm: Option<(WorktreeId, std::time::Instant)>,
+    /// Standing keep-warm: when to next re-assert the selected worktree's
+    /// warm default-spec Claude session, so one is always ready to adopt.
+    /// Re-armed after every send; disarmed when nothing is selected.
+    pub next_keepwarm: Option<std::time::Instant>,
     /// Mouse drag-selection over the terminal pane, if any.
     pub term_selection: Option<TermSelection>,
     /// Last left-click on the terminal pane (time + pane-relative cell), for
@@ -1160,6 +1174,12 @@ pub struct App {
     /// This TUI process's own RSS, sampled alongside each metrics request
     /// (the daemon can't see us).
     pub client_rss_bytes: u64,
+    /// Launch instant; the first-run splash animation is a pure function
+    /// of time elapsed since this.
+    pub splash_epoch: std::time::Instant,
+    /// Splash summoned on demand (N) with a populated tree; any key
+    /// dismisses it.
+    pub splash_preview: bool,
 }
 
 impl Default for App {
@@ -1196,6 +1216,7 @@ impl App {
             last_worktree_for_project: HashMap::new(),
             last_session_for_worktree: HashMap::new(),
             pending_prewarm: None,
+            next_keepwarm: None,
             term_selection: None,
             last_term_click: None,
             last_session_click: None,
@@ -1216,7 +1237,18 @@ impl App {
             git_changes: None,
             last_metrics: None,
             client_rss_bytes: 0,
+            splash_epoch: std::time::Instant::now(),
+            splash_preview: false,
         }
+    }
+
+    /// The animated splash is on screen and should be ticking: nothing in
+    /// the tree yet (first run) or summoned with N, panels not collapsed,
+    /// no editor modal covering the body.
+    pub fn splash_active(&self) -> bool {
+        (self.tree.projects.is_empty() || self.splash_preview)
+            && !self.collapsed
+            && self.vim.is_none()
     }
 
     /// Screen x of splitter `idx` — the column where the panel to its right
@@ -1545,6 +1577,12 @@ impl App {
         Some(at.saturating_duration_since(std::time::Instant::now()))
     }
 
+    /// Delay until the standing keep-warm re-send is due. None when disarmed.
+    pub fn keepwarm_delay(&self) -> Option<std::time::Duration> {
+        let at = self.next_keepwarm.as_ref()?;
+        Some(at.saturating_duration_since(std::time::Instant::now()))
+    }
+
     /// An owner's todos, in tree order (snapshot order; new ones append).
     pub fn todos_for(&self, owner: &TodoOwner) -> Vec<&Todo> {
         self.tree
@@ -1691,20 +1729,41 @@ mod tests {
         assert_eq!(order(&v), ["a", "b", "c"]);
         assert_eq!(v.selected_file().unwrap().path, "b");
 
-        // Unmark b: it pops back to its natural spot and stays selected —
-        // same file, so no diff reload.
-        assert_eq!(v.toggle_reviewed(), Some(false));
+        // Unmark b: it pops back to its natural spot but the selection
+        // advances to the next still-marked file (c), so repeated presses
+        // clear a batch of marks.
+        assert_eq!(v.toggle_reviewed(), Some(true), "advanced to c");
         assert_eq!(order(&v), ["a", "b", "c"]);
-        assert_eq!(v.selected_file().unwrap().path, "b");
+        assert_eq!(v.selected_file().unwrap().path, "c");
         assert_eq!(v.reviewed.len(), 1, "only c is still marked");
+
+        // Unmark c — the last mark: nothing left to batch through, so the
+        // selection follows the file back to its natural spot — same file,
+        // no diff reload.
+        assert_eq!(v.toggle_reviewed(), Some(false), "c stays selected");
+        assert!(v.reviewed.is_empty());
+        assert_eq!(order(&v), ["a", "b", "c"]);
+        assert_eq!(v.selected_file().unwrap().path, "c");
 
         // With every other file reviewed, marking keeps the file selected —
         // there is nowhere further to advance.
+        assert_eq!(v.toggle_reviewed(), Some(false), "c stays selected");
+        v.select(1);
         assert_eq!(v.toggle_reviewed(), Some(false), "b stays selected");
         v.select(0);
         assert_eq!(v.toggle_reviewed(), Some(false), "a stays selected");
         assert_eq!(order(&v), ["a", "b", "c"]);
         assert_eq!(v.reviewed.len(), 3);
+
+        // Batch unmark from the top of the reviewed zone: each press clears
+        // the selected mark and lands on the next one down.
+        assert_eq!(v.toggle_reviewed(), Some(true), "a cleared, on to b");
+        assert_eq!(v.selected_file().unwrap().path, "b");
+        assert_eq!(v.toggle_reviewed(), Some(true), "b cleared, on to c");
+        assert_eq!(v.selected_file().unwrap().path, "c");
+        assert_eq!(v.toggle_reviewed(), Some(false), "last mark, c stays");
+        assert!(v.reviewed.is_empty());
+        assert_eq!(order(&v), ["a", "b", "c"]);
 
         // No visible row (dead-end filter): toggling is a no-op.
         v.filter = "zzz".into();
