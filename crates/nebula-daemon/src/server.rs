@@ -87,6 +87,8 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientRequest::Subscribe => {
                     let snapshot = daemon.snapshot().unwrap_or(ServerEvent::Snapshot {
+                        workspaces: vec![],
+                        active_workspace: Default::default(),
                         projects: vec![],
                         worktrees: vec![],
                         agents: vec![],
@@ -210,12 +212,28 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             tokio::task::spawn_blocking(move || crate::metrics::collect(pids))
                                 .await;
                         if let Ok(snapshot) = snapshot {
-                            let _ =
-                                out_tx.send(ServerEvent::Metrics { req_id, snapshot }).await;
+                            let _ = out_tx.send(ServerEvent::Metrics { req_id, snapshot }).await;
                         }
                     });
                 }
                 // ---- entity CRUD: run the op, reply Ack/Error ----
+                ClientRequest::AddWorkspace { req_id, name } => {
+                    reply(&out_tx, req_id, daemon.add_workspace(&name).map(Some)).await;
+                }
+                ClientRequest::RemoveWorkspace { req_id, id } => {
+                    reply(&out_tx, req_id, daemon.remove_workspace(&id).map(|_| None)).await;
+                }
+                ClientRequest::RenameWorkspace { req_id, id, name } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.rename_workspace(&id, &name).map(|_| None),
+                    )
+                    .await;
+                }
+                ClientRequest::OpenWorkspace { req_id, id } => {
+                    reply(&out_tx, req_id, daemon.open_workspace(&id).map(|_| None)).await;
+                }
                 ClientRequest::AddProject {
                     req_id,
                     path,
@@ -225,7 +243,10 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     reply(
                         &out_tx,
                         req_id,
-                        daemon.add_project(&path, name, create_missing).await.map(Some),
+                        daemon
+                            .add_project(&path, name, create_missing)
+                            .await
+                            .map(Some),
                     )
                     .await;
                 }
@@ -420,15 +441,15 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     owner,
                     text,
                 } => {
+                    reply(&out_tx, req_id, daemon.create_todo(&owner, &text).map(Some)).await;
+                }
+                ClientRequest::UpdateTodo { req_id, id, text } => {
                     reply(
                         &out_tx,
                         req_id,
-                        daemon.create_todo(&owner, &text).map(Some),
+                        daemon.update_todo(&id, &text).map(|_| None),
                     )
                     .await;
-                }
-                ClientRequest::UpdateTodo { req_id, id, text } => {
-                    reply(&out_tx, req_id, daemon.update_todo(&id, &text).map(|_| None)).await;
                 }
                 ClientRequest::SetTodoDone { req_id, id, done } => {
                     reply(

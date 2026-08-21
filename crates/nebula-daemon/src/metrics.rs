@@ -49,7 +49,12 @@ fn snapshot_from_table(
         .iter()
         .map(|(sref, pid)| {
             let (rss_bytes, procs) = subtree_rss(*pid, &rss, &children);
-            SessionMetrics { session: sref.clone(), pid: *pid, rss_bytes, procs }
+            SessionMetrics {
+                session: sref.clone(),
+                pid: *pid,
+                rss_bytes,
+                procs,
+            }
         })
         .collect();
 
@@ -112,7 +117,10 @@ mod tests {
         let snap = snapshot_from_table(
             table,
             10,
-            &[(sref("a"), 20), (SessionRef::Terminal(TerminalId("t".into())), 30)],
+            &[
+                (sref("a"), 20),
+                (SessionRef::Terminal(TerminalId("t".into())), 30),
+            ],
             0,
         );
         assert_eq!(snap.daemon_rss_bytes, 1000 * 1024);

@@ -18,6 +18,50 @@ pub struct PathCompletion {
     pub candidates: Vec<String>,
 }
 
+/// One row of the Add-project directory listing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirEntry {
+    /// Directory name, no trailing slash.
+    pub name: String,
+    /// Whether it holds a `.git` entry (dir, or file for linked worktrees).
+    pub is_repo: bool,
+}
+
+/// Split `input` at its last '/': the typed parent (kept verbatim, tilde
+/// and all) and the partial segment being completed.
+pub fn split_input(input: &str) -> (&str, &str) {
+    match input.rfind('/') {
+        Some(idx) => (&input[..=idx], &input[idx + 1..]),
+        None => ("", input),
+    }
+}
+
+/// Live listing behind the Add-project browser: the typed parent's
+/// subdirectories narrowed to the partial segment, name-sorted. Same rules
+/// as [`complete_path`] (directories only, dotted entries need a dotted
+/// partial), plus a git-repo marker per entry.
+pub fn list_dirs(input: &str, home: Option<&Path>) -> Vec<DirEntry> {
+    let (typed_parent, partial) = split_input(input);
+    let parent_dir = expand_parent(typed_parent, home);
+    let Ok(entries) = std::fs::read_dir(&parent_dir) else {
+        return Vec::new();
+    };
+    let show_hidden = partial.starts_with('.');
+    let mut dirs: Vec<DirEntry> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| name.starts_with(partial))
+        .filter(|name| show_hidden || !name.starts_with('.'))
+        .map(|name| {
+            let is_repo = parent_dir.join(&name).join(".git").exists();
+            DirEntry { name, is_repo }
+        })
+        .collect();
+    dirs.sort_by(|a, b| a.name.cmp(&b.name));
+    dirs
+}
+
 /// Complete `input` against the filesystem. `home` backs `~` expansion.
 pub fn complete_path(input: &str, home: Option<&Path>) -> PathCompletion {
     // Bare "~" → "~/" so the next Tab lists the home directory.
@@ -28,12 +72,7 @@ pub fn complete_path(input: &str, home: Option<&Path>) -> PathCompletion {
         };
     }
 
-    // Split into the part the user typed up to the last '/' (kept verbatim,
-    // tilde and all) and the partial segment being completed.
-    let (typed_parent, partial) = match input.rfind('/') {
-        Some(idx) => (&input[..=idx], &input[idx + 1..]),
-        None => ("", input),
-    };
+    let (typed_parent, partial) = split_input(input);
 
     let parent_dir = expand_parent(typed_parent, home);
     let Ok(entries) = std::fs::read_dir(&parent_dir) else {
@@ -207,5 +246,45 @@ mod tests {
     fn nonexistent_parent_is_a_noop() {
         let got = complete_path("/definitely/not/a/real/dir/x", None);
         assert_eq!(got, PathCompletion::default());
+    }
+
+    fn names(dirs: &[DirEntry]) -> Vec<&str> {
+        dirs.iter().map(|d| d.name.as_str()).collect()
+    }
+
+    #[test]
+    fn list_dirs_narrows_by_partial_and_hides_dotted() {
+        let tmp = fixture();
+        let got = list_dirs(&p(&tmp, "projects/"), None);
+        assert_eq!(names(&got), vec!["alpha", "alps", "beta"]);
+        let got = list_dirs(&p(&tmp, "projects/al"), None);
+        assert_eq!(names(&got), vec!["alpha", "alps"]);
+        // Dotted entries need a dotted partial, files never appear.
+        let got = list_dirs(&p(&tmp, "projects/."), None);
+        assert_eq!(names(&got), vec![".hidden"]);
+        let got = list_dirs(&p(&tmp, "projects/no"), None);
+        assert!(got.is_empty(), "notes.txt is a file");
+    }
+
+    #[test]
+    fn list_dirs_marks_git_repos() {
+        let tmp = fixture();
+        std::fs::create_dir_all(tmp.path().join("projects/alpha/.git")).unwrap();
+        // Linked worktrees keep `.git` as a file — still a repo.
+        std::fs::write(tmp.path().join("projects/beta/.git"), "gitdir: x").unwrap();
+        let got = list_dirs(&p(&tmp, "projects/"), None);
+        let repos: Vec<(&str, bool)> = got.iter().map(|d| (d.name.as_str(), d.is_repo)).collect();
+        assert_eq!(
+            repos,
+            vec![("alpha", true), ("alps", false), ("beta", true)]
+        );
+    }
+
+    #[test]
+    fn list_dirs_expands_tilde_and_survives_bad_parents() {
+        let tmp = fixture();
+        let got = list_dirs("~/projects/al", Some(tmp.path()));
+        assert_eq!(names(&got), vec!["alpha", "alps"]);
+        assert!(list_dirs("/definitely/not/a/real/dir/", None).is_empty());
     }
 }

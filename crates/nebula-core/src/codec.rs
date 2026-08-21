@@ -11,10 +11,14 @@ where
     T: Serialize,
     W: AsyncWrite + Unpin,
 {
-    let payload = rmp_serde::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let payload =
+        rmp_serde::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let len = payload.len() as u32;
     if len > MAX_FRAME_LEN {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
     w.write_all(&len.to_le_bytes()).await?;
     w.write_all(&payload).await?;
@@ -35,7 +39,10 @@ where
     }
     let len = u32::from_le_bytes(len_buf);
     if len > MAX_FRAME_LEN {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
     let mut payload = vec![0u8; len as usize];
     r.read_exact(&mut payload).await?;

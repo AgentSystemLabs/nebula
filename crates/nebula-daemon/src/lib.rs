@@ -204,8 +204,7 @@ async fn serve() -> Result<()> {
 /// stored rows may be stale.
 fn worktree_probe_stamp(repo_path: &std::path::Path) -> Option<std::time::SystemTime> {
     let git_dir = repo_path.join(".git");
-    let mtime =
-        |p: std::path::PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mtime = |p: std::path::PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     let mut stamps: Vec<std::time::SystemTime> = Vec::new();
     stamps.extend(mtime(git_dir.join("HEAD")));
     stamps.extend(mtime(git_dir.join("worktrees")));

@@ -9,7 +9,8 @@ use crate::store::Store;
 use anyhow::{bail, Context, Result};
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Project, ProjectId, ServerEvent,
-    SessionRef, TerminalId, TerminalTab, Todo, TodoId, TodoOwner, Worktree, WorktreeId,
+    SessionRef, TerminalId, TerminalTab, Todo, TodoId, TodoOwner, Workspace, WorkspaceId, Worktree,
+    WorktreeId,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -144,7 +145,12 @@ impl Daemon {
         }
     }
 
-    fn buffer_prewarm_hook(&self, agent_id: &AgentId, event: HookEvent, session_id: Option<String>) {
+    fn buffer_prewarm_hook(
+        &self,
+        agent_id: &AgentId,
+        event: HookEvent,
+        session_id: Option<String>,
+    ) {
         let mut pool = self.prewarmed.lock().unwrap();
         if let Some(entry) = pool.values_mut().find(|e| &e.agent_id == agent_id) {
             if entry.buffered_hooks.len() >= PREWARM_HOOK_BUFFER_CAP {
@@ -382,6 +388,8 @@ impl Daemon {
             }
         }
         Ok(ServerEvent::Snapshot {
+            workspaces: self.store.load_workspaces()?,
+            active_workspace: self.store.active_workspace_id()?,
             projects,
             worktrees,
             agents,
@@ -403,6 +411,98 @@ impl Daemon {
         Ok(term)
     }
 
+    // ---- workspaces ----
+
+    /// Validated, trimmed workspace name, checked for collisions (excluding
+    /// `except` on renames).
+    fn checked_workspace_name(&self, name: &str, except: Option<&WorkspaceId>) -> Result<String> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("workspace name is empty");
+        }
+        if let Some(existing) = self.store.workspace_by_name(name)? {
+            if Some(&existing) != except {
+                bail!("a workspace named '{name}' already exists");
+            }
+        }
+        Ok(name.to_string())
+    }
+
+    /// Create a workspace. Does not open it — `workspace open` stays a
+    /// separate, explicit step.
+    pub fn add_workspace(self: &Arc<Self>, name: &str) -> Result<EntityId> {
+        let name = self.checked_workspace_name(name, None)?;
+        let workspace = Workspace {
+            id: WorkspaceId::generate(),
+            name,
+        };
+        self.store.insert_workspace(&workspace)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Workspace(workspace.clone()),
+        });
+        Ok(EntityId::Workspace(workspace.id))
+    }
+
+    pub fn rename_workspace(self: &Arc<Self>, id: &WorkspaceId, name: &str) -> Result<()> {
+        let mut workspace = self
+            .store
+            .get_workspace(id)?
+            .context("workspace not found")?;
+        workspace.name = self.checked_workspace_name(name, Some(id))?;
+        self.store.rename_workspace(id, &workspace.name)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Workspace(workspace),
+        });
+        Ok(())
+    }
+
+    /// Delete a workspace. Only empty ones go — its projects are the user's
+    /// to move or remove first — and never the last one. Deleting the open
+    /// workspace opens another one first so clients always have a live scope.
+    pub fn remove_workspace(self: &Arc<Self>, id: &WorkspaceId) -> Result<()> {
+        self.store
+            .get_workspace(id)?
+            .context("workspace not found")?;
+        let projects = self.store.count_workspace_projects(id)?;
+        if projects > 0 {
+            bail!(
+                "workspace still has {projects} project{} — remove them first",
+                if projects == 1 { "" } else { "s" }
+            );
+        }
+        if self.store.count_workspaces()? <= 1 {
+            bail!("cannot delete the last workspace");
+        }
+        if self.store.active_workspace_id()? == *id {
+            let fallback = self
+                .store
+                .load_workspaces()?
+                .into_iter()
+                .find(|w| &w.id != id)
+                .context("no workspace left to open")?;
+            self.store.set_active_workspace(&fallback.id)?;
+            self.broadcast(ServerEvent::ActiveWorkspaceChanged { id: fallback.id });
+        }
+        self.store.delete_workspace(id)?;
+        self.broadcast(ServerEvent::EntityRemoved {
+            id: EntityId::Workspace(id.clone()),
+        });
+        Ok(())
+    }
+
+    /// Make `id` the open workspace (daemon-global; every client follows).
+    pub fn open_workspace(self: &Arc<Self>, id: &WorkspaceId) -> Result<()> {
+        self.store
+            .get_workspace(id)?
+            .context("workspace not found")?;
+        if self.store.active_workspace_id()? == *id {
+            return Ok(()); // already open
+        }
+        self.store.set_active_workspace(id)?;
+        self.broadcast(ServerEvent::ActiveWorkspaceChanged { id: id.clone() });
+        Ok(())
+    }
+
     // ---- projects ----
 
     pub async fn add_project(
@@ -422,8 +522,18 @@ impl Daemon {
         let toplevel = git::repo_toplevel(path)
             .await
             .with_context(|| format!("{} is not a git repository", path.display()))?;
-        if self.store.project_by_path(&toplevel)?.is_some() {
-            bail!("project already added: {}", toplevel.display());
+        // New projects land in whichever workspace is open; the same repo
+        // may be added to any number of workspaces, just not twice to one.
+        let workspace_id = self.store.active_workspace_id()?;
+        if self
+            .store
+            .project_in_workspace(&toplevel, &workspace_id)?
+            .is_some()
+        {
+            bail!(
+                "project already added to this workspace: {}",
+                toplevel.display()
+            );
         }
         let name = name.unwrap_or_else(|| {
             toplevel
@@ -434,6 +544,7 @@ impl Daemon {
         let project = Project {
             id: ProjectId::generate(),
             name,
+            workspace_id,
             repo_path: toplevel.clone(),
             sort_order: self.store.next_project_sort_order()?,
             divider_after: false,
@@ -471,7 +582,18 @@ impl Daemon {
 
     pub fn remove_project(self: &Arc<Self>, id: &ProjectId) -> Result<()> {
         // Kill any live sessions under this project first.
-        let (projects, worktrees, agents, terminals) = self.store.load_tree()?;
+        let (all_projects, worktrees, agents, terminals) = self.store.load_tree()?;
+        // Divider bookkeeping is per-workspace: the list clients see is the
+        // removed project's workspace, so its neighbors are found there.
+        let workspace = all_projects
+            .iter()
+            .find(|p| &p.id == id)
+            .map(|p| p.workspace_id.clone());
+        let projects: Vec<Project> = all_projects
+            .iter()
+            .filter(|p| Some(&p.workspace_id) == workspace.as_ref())
+            .cloned()
+            .collect();
         // The leading divider belongs to the list, not the top project:
         // removing that project hands it down to the next one.
         if let (Some(first), Some(second)) = (projects.first(), projects.get(1)) {
@@ -514,7 +636,19 @@ impl Daemon {
     /// index for every project, which also normalizes legacy all-zero
     /// orders on first use.
     pub fn move_project(self: &Arc<Self>, id: &ProjectId, delta: i64) -> Result<()> {
-        let (projects, _, _, _) = self.store.load_tree()?;
+        let (all_projects, _, _, _) = self.store.load_tree()?;
+        // Reorders happen within the project's workspace — the list clients
+        // actually see. Other workspaces' rows keep their sort orders; the
+        // rewrite below only renumbers this workspace's slice, which stays
+        // correctly interleaved because clients filter before ordering.
+        let workspace = all_projects
+            .iter()
+            .find(|p| &p.id == id)
+            .map(|p| p.workspace_id.clone());
+        let projects: Vec<Project> = all_projects
+            .into_iter()
+            .filter(|p| Some(&p.workspace_id) == workspace.as_ref())
+            .collect();
         #[derive(Clone, PartialEq)]
         enum Row {
             Project(ProjectId),
@@ -569,8 +703,10 @@ impl Daemon {
                 p.divider_before_label.clone(),
             )
         }
-        let before: HashMap<ProjectId, Position> =
-            projects.iter().map(|p| (p.id.clone(), position(p))).collect();
+        let before: HashMap<ProjectId, Position> = projects
+            .iter()
+            .map(|p| (p.id.clone(), position(p)))
+            .collect();
         let mut by_id: HashMap<ProjectId, Project> =
             projects.into_iter().map(|p| (p.id.clone(), p)).collect();
         let mut ordered: Vec<Project> = Vec::new();
@@ -626,7 +762,12 @@ impl Daemon {
         let mut project = self.store.get_project(id)?.context("project not found")?;
         if before && present {
             let (projects, _, _, _) = self.store.load_tree()?;
-            if projects.first().map(|p| &p.id) != Some(id) {
+            // "First" within the project's workspace — the list clients see.
+            let first = projects
+                .iter()
+                .find(|p| p.workspace_id == project.workspace_id)
+                .map(|p| &p.id);
+            if first != Some(id) {
                 bail!("only the first project can hold the leading divider");
             }
         }
@@ -637,7 +778,10 @@ impl Daemon {
             None
         };
         let slot = if before {
-            (&mut project.divider_before, &mut project.divider_before_label)
+            (
+                &mut project.divider_before,
+                &mut project.divider_before_label,
+            )
         } else {
             (&mut project.divider_after, &mut project.divider_label)
         };
@@ -662,7 +806,16 @@ impl Daemon {
         if delta == 0 {
             return Ok(());
         }
-        let (projects, _, _, _) = self.store.load_tree()?;
+        let (all_projects, _, _, _) = self.store.load_tree()?;
+        // Neighbors live in the project's workspace — the list clients see.
+        let workspace = all_projects
+            .iter()
+            .find(|p| &p.id == id)
+            .map(|p| p.workspace_id.clone());
+        let projects: Vec<Project> = all_projects
+            .into_iter()
+            .filter(|p| Some(&p.workspace_id) == workspace.as_ref())
+            .collect();
         let Some(index) = projects.iter().position(|p| &p.id == id) else {
             bail!("project not found");
         };
@@ -883,7 +1036,8 @@ impl Daemon {
             status_changed_at: epoch_ms(),
             alive: false,
         };
-        self.store.insert_agent_with_auto_title(&agent, auto_title)?;
+        self.store
+            .insert_agent_with_auto_title(&agent, auto_title)?;
         if adopted.is_none() {
             // Cold path: boot the CLI right away.
             self.spawn_agent_session(&agent, &worktree, 80, 24)?;
@@ -1140,10 +1294,13 @@ impl Daemon {
         Ok(())
     }
 
-    /// Re-home an agent row under another worktree of the same project. The
-    /// live PTY (if any) is untouched — this moves where the row lives in
-    /// the tree, not where the process runs; the next respawn uses the new
-    /// worktree's path.
+    /// Re-home an agent row under another worktree of the same project. A
+    /// live PTY still runs — and its hooks still report a cwd — inside the
+    /// old checkout, so left alone `reparent_agent_by_cwd` would snap the
+    /// row straight back on the next hook event: kill it and respawn resumed
+    /// in the target so the process and the row agree. A respawn failure
+    /// degrades to a dead session the next attach/prewarm revives via
+    /// `ensure_session`.
     pub fn move_agent(self: &Arc<Self>, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
         let agent = self.store.get_agent(id)?.context("agent not found")?;
         if &agent.worktree_id == worktree_id {
@@ -1160,6 +1317,29 @@ impl Daemon {
         if target.project_id != current.project_id {
             bail!("target worktree belongs to a different project");
         }
+        let sref = SessionRef::Agent(id.clone());
+        let was_alive = self.session(&sref).is_some();
+        if was_alive {
+            self.kill_session(&sref);
+        }
+        self.store.set_agent_worktree(id, worktree_id)?;
+        if was_alive {
+            if let Err(e) = self.spawn_agent_session(&agent, &target, 80, 24) {
+                tracing::warn!(agent = %id, error = %e, "respawn after move failed");
+            }
+        }
+        let agent = self.agent_entity(id)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Agent(agent),
+        });
+        Ok(())
+    }
+
+    /// Row-only re-home: store update plus broadcast, never the PTY. The
+    /// hook-cwd reparent uses this — there the process already runs in the
+    /// target checkout and only the row is stale, so killing it would
+    /// interrupt a live conversation for nothing.
+    fn move_agent_row(self: &Arc<Self>, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
         self.store.set_agent_worktree(id, worktree_id)?;
         let agent = self.agent_entity(id)?;
         self.broadcast(ServerEvent::EntityUpserted {
@@ -1204,8 +1384,7 @@ impl Daemon {
         // different CLI session only counts when the event (re)establishes
         // session ownership (UserPromptSubmit / SessionStart).
         if !captures_session {
-            if let (Some(mine), Some(theirs)) = (agent.session_id.as_deref(), payload_session_id)
-            {
+            if let (Some(mine), Some(theirs)) = (agent.session_id.as_deref(), payload_session_id) {
                 if mine != theirs {
                     return Ok(());
                 }
@@ -1236,7 +1415,7 @@ impl Daemon {
                     to = %worktree.branch,
                     "agent re-homed by hook cwd"
                 );
-                self.move_agent(agent_id, &worktree.id)?;
+                self.move_agent_row(agent_id, &worktree.id)?;
             }
         }
         Ok(())
@@ -1815,7 +1994,10 @@ fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec
         cmdline.push_str(&part.replace('\'', "'\\''"));
         cmdline.push('\'');
     }
-    (shell.to_string(), vec!["-l".into(), "-i".into(), "-c".into(), cmdline])
+    (
+        shell.to_string(),
+        vec!["-l".into(), "-i".into(), "-c".into(), cmdline],
+    )
 }
 
 /// Env vars that must never leak into plain terminals (and are re-set
@@ -1885,7 +2067,13 @@ mod tests {
         );
         // Override wins for both kinds and never gets resume args.
         assert_eq!(
-            agent_spawn_command(AgentKind::Claude, Some("sid"), None, None, Some("/bin/sh -i")),
+            agent_spawn_command(
+                AgentKind::Claude,
+                Some("sid"),
+                None,
+                None,
+                Some("/bin/sh -i")
+            ),
             ("/bin/sh".into(), vec!["-i".to_string()], false)
         );
         assert_eq!(
@@ -1993,6 +2181,7 @@ mod tests {
             daemon
                 .store
                 .insert_project(&Project {
+                    workspace_id: Default::default(),
                     id: ProjectId((*name).into()),
                     name: (*name).into(),
                     repo_path: format!("/tmp/{name}").into(),
@@ -2145,16 +2334,22 @@ mod tests {
             .unwrap();
 
         // Up from under a: the divider crosses onto the top slot.
-        daemon.move_divider(&ProjectId("a".into()), false, -1).unwrap();
+        daemon
+            .move_divider(&ProjectId("a".into()), false, -1)
+            .unwrap();
         assert_eq!(leading(&daemon), Some(Some("work".to_string())));
         assert!(layout(&daemon).iter().all(|(_, divider, _)| !divider));
 
         // Up again clamps — it is already above everything.
-        daemon.move_divider(&ProjectId("a".into()), true, -1).unwrap();
+        daemon
+            .move_divider(&ProjectId("a".into()), true, -1)
+            .unwrap();
         assert_eq!(leading(&daemon), Some(Some("work".to_string())));
 
         // Down: back under a.
-        daemon.move_divider(&ProjectId("a".into()), true, 1).unwrap();
+        daemon
+            .move_divider(&ProjectId("a".into()), true, 1)
+            .unwrap();
         assert_eq!(leading(&daemon), None);
         assert_eq!(
             layout(&daemon)[0],
@@ -2174,8 +2369,12 @@ mod tests {
             .unwrap();
 
         // Neither divider can move onto the other's gap.
-        daemon.move_divider(&ProjectId("a".into()), true, 1).unwrap();
-        daemon.move_divider(&ProjectId("a".into()), false, -1).unwrap();
+        daemon
+            .move_divider(&ProjectId("a".into()), true, 1)
+            .unwrap();
+        daemon
+            .move_divider(&ProjectId("a".into()), false, -1)
+            .unwrap();
         assert_eq!(leading(&daemon), Some(Some("top".to_string())));
         assert_eq!(
             layout(&daemon)[0],
@@ -2212,7 +2411,9 @@ mod tests {
             .unwrap();
 
         // Down: the divider hops from under a to under b, label intact.
-        daemon.move_divider(&ProjectId("a".into()), false, 1).unwrap();
+        daemon
+            .move_divider(&ProjectId("a".into()), false, 1)
+            .unwrap();
         assert_eq!(
             layout(&daemon),
             [
@@ -2223,16 +2424,24 @@ mod tests {
         );
 
         // Back up under a (the top hop has its own test).
-        daemon.move_divider(&ProjectId("b".into()), false, -1).unwrap();
+        daemon
+            .move_divider(&ProjectId("b".into()), false, -1)
+            .unwrap();
         assert_eq!(
             layout(&daemon)[0],
             ("a".to_string(), true, Some("work".to_string()))
         );
 
         // Down past the last project clamps.
-        daemon.move_divider(&ProjectId("a".into()), false, 1).unwrap();
-        daemon.move_divider(&ProjectId("b".into()), false, 1).unwrap();
-        daemon.move_divider(&ProjectId("c".into()), false, 1).unwrap();
+        daemon
+            .move_divider(&ProjectId("a".into()), false, 1)
+            .unwrap();
+        daemon
+            .move_divider(&ProjectId("b".into()), false, 1)
+            .unwrap();
+        daemon
+            .move_divider(&ProjectId("c".into()), false, 1)
+            .unwrap();
         assert_eq!(
             layout(&daemon)[2],
             ("c".to_string(), true, Some("work".to_string()))
@@ -2251,8 +2460,12 @@ mod tests {
             .unwrap();
 
         // Neither divider can move onto the other's gap.
-        daemon.move_divider(&ProjectId("a".into()), false, 1).unwrap();
-        daemon.move_divider(&ProjectId("b".into()), false, -1).unwrap();
+        daemon
+            .move_divider(&ProjectId("a".into()), false, 1)
+            .unwrap();
+        daemon
+            .move_divider(&ProjectId("b".into()), false, -1)
+            .unwrap();
         assert_eq!(
             layout(&daemon),
             [
@@ -2636,5 +2849,104 @@ mod tests {
 
         daemon.reparent_agent_by_cwd(&AgentId("a1".into()), "/nebula-test/p-feat", None, false);
         assert_eq!(agent_worktree(&daemon, "a1"), "root");
+    }
+
+    // ---- workspaces ----
+
+    #[test]
+    fn workspace_lifecycle_add_open_rename_delete() {
+        let daemon = test_daemon();
+        let EntityId::Workspace(id) = daemon.add_workspace(" client ").unwrap() else {
+            panic!("add returns the workspace id");
+        };
+        // Name is trimmed; duplicates (trimmed) and blanks are refused.
+        assert_eq!(
+            daemon.store.get_workspace(&id).unwrap().unwrap().name,
+            "client"
+        );
+        assert!(daemon.add_workspace("client").is_err());
+        assert!(daemon.add_workspace("   ").is_err());
+
+        // Adding never opens; open does (and re-opening is a quiet no-op).
+        assert_eq!(
+            daemon.store.active_workspace_id().unwrap().as_str(),
+            "default"
+        );
+        daemon.open_workspace(&id).unwrap();
+        assert_eq!(daemon.store.active_workspace_id().unwrap(), id);
+        daemon.open_workspace(&id).unwrap();
+        assert!(daemon.open_workspace(&WorkspaceId("ghost".into())).is_err());
+
+        // Rename keeps names unique (a rename to itself is fine).
+        daemon.rename_workspace(&id, "acme").unwrap();
+        daemon.rename_workspace(&id, "acme").unwrap();
+        assert!(daemon.rename_workspace(&id, "default").is_err());
+
+        // Deleting the open workspace opens the surviving one first.
+        daemon.remove_workspace(&id).unwrap();
+        assert_eq!(
+            daemon.store.active_workspace_id().unwrap().as_str(),
+            "default"
+        );
+        assert!(daemon.store.get_workspace(&id).unwrap().is_none());
+
+        // The last workspace can't go.
+        assert!(daemon
+            .remove_workspace(&WorkspaceId("default".into()))
+            .is_err());
+    }
+
+    #[test]
+    fn workspace_with_projects_refuses_deletion() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]); // lands in 'default'
+        let EntityId::Workspace(empty) = daemon.add_workspace("empty").unwrap() else {
+            panic!("add returns the workspace id");
+        };
+        let err = daemon
+            .remove_workspace(&WorkspaceId("default".into()))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("1 project"),
+            "helpful refusal: {err}"
+        );
+        // An empty, closed workspace deletes cleanly.
+        daemon.remove_workspace(&empty).unwrap();
+    }
+
+    /// Reorders only see the project's own workspace: a move never swaps
+    /// across workspaces, and other workspaces' sort orders stay untouched.
+    #[test]
+    fn move_project_is_scoped_to_the_workspace() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["a", "b"]); // default ws, sort 0 and 1
+        let EntityId::Workspace(other) = daemon.add_workspace("other").unwrap() else {
+            panic!("add returns the workspace id");
+        };
+        daemon
+            .store
+            .insert_project(&Project {
+                workspace_id: other.clone(),
+                id: ProjectId("x".into()),
+                name: "x".into(),
+                repo_path: "/tmp/x".into(),
+                sort_order: 1, // interleaves between a and b globally
+                divider_after: false,
+                divider_label: None,
+                divider_before: false,
+                divider_before_label: None,
+            })
+            .unwrap();
+
+        daemon.move_project(&ProjectId("a".into()), 1).unwrap();
+        let (projects, _, _, _) = daemon.store.load_tree().unwrap();
+        let default_order: Vec<&str> = projects
+            .iter()
+            .filter(|p| p.workspace_id.as_str() == "default")
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(default_order, ["b", "a"], "a swapped with b, not x");
+        let x = projects.iter().find(|p| p.name == "x").unwrap();
+        assert_eq!(x.sort_order, 1, "other workspace untouched");
     }
 }

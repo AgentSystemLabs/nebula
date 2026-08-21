@@ -54,6 +54,13 @@ pub fn run_add_project(path: String) -> Result<()> {
     runtime()?.block_on(ipc::add_project(path))
 }
 
+pub use ipc::WorkspaceOp;
+
+/// `nebula workspace <add|open|list|delete|rename>` (see `ipc::run_workspace_op`).
+pub fn run_workspace(op: WorkspaceOp) -> Result<()> {
+    runtime()?.block_on(ipc::run_workspace_op(op))
+}
+
 /// `nebula kill`.
 pub fn run_kill() -> Result<()> {
     runtime()?.block_on(async {

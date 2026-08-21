@@ -65,11 +65,18 @@ pub fn config_path() -> PathBuf {
 pub fn log_dir() -> PathBuf {
     // Tests and parallel instances override the data dir; keep their logs
     // beside their data instead of the real user's state dir.
-    if std::env::var("NEBULA_DATA_DIR").map(|d| !d.is_empty()).unwrap_or(false) {
+    if std::env::var("NEBULA_DATA_DIR")
+        .map(|d| !d.is_empty())
+        .unwrap_or(false)
+    {
         return data_dir().join("state");
     }
     directories::ProjectDirs::from("dev", "nebula", "nebula")
-        .map(|d| d.state_dir().map(|s| s.to_path_buf()).unwrap_or_else(|| d.data_dir().join("state")))
+        .map(|d| {
+            d.state_dir()
+                .map(|s| s.to_path_buf())
+                .unwrap_or_else(|| d.data_dir().join("state"))
+        })
         .unwrap_or_else(|| data_dir().join("state"))
 }
 

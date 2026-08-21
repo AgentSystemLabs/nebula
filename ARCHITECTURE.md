@@ -17,15 +17,17 @@ IPC is length-prefixed MessagePack: the client sends `ClientRequest`s (CRUD, att
 
 Everything is nested:
 
-**Project** (a git repo) → **Worktree** (main checkout or `git worktree add`) → **Session** (an agent *or* a plain terminal tab).
+**Workspace** (a named project group) → **Project** (a git repo) → **Worktree** (main checkout or `git worktree add`) → **Session** (an agent *or* a plain terminal tab).
+
+Exactly one workspace is *open* at a time — daemon-global state, switched with `nebula workspace open <name>` or the TUI's `w` picker and broadcast to every client. The TUI scopes its Projects panel and `/` search to the open workspace; other workspaces' sessions keep running (and keep receiving status updates) in the background. Every install starts with the built-in `default` workspace, and `nebula add` files new projects under whichever workspace is open.
 
 Worktrees are real git worktrees, created under `<repo>/../<repo-name>-worktrees/<branch>`. The daemon also polls git metadata so worktrees created outside Nebula still show up.
 
 An agent is a PTY running `claude`, `codex`, or `cursor-agent` in that worktree. Restart uses `--resume <session-id>` when one is stored.
 
-Persistence is SQLite at `~/.local/share/nebula/nebula.db`: projects, worktrees, agents (kind + CLI session id), todos, last UI selection.
+Persistence is SQLite at `~/.local/share/nebula/nebula.db`: workspaces (one flagged open), projects, worktrees, agents (kind + CLI session id), todos, last UI selection.
 
-Projects and worktrees each carry their own **todo list**: plain notes with a done flag, edited in the TUI's `o` modal (Projects panel → the project's high-level notes; elsewhere → the selected worktree's notes) and counted as a badge on the owning row.
+Projects and worktrees each carry their own **todo list**: plain notes with a done flag, edited in the TUI's `t` modal (Projects panel → the project's high-level notes; elsewhere → the selected worktree's notes) and counted as a badge on the owning row.
 
 ## How the pieces talk
 

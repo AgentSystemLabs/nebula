@@ -81,7 +81,9 @@ pub struct HookPayload {
 
 impl HookPayload {
     fn session_id(&self) -> Option<String> {
-        self.session_id.clone().or_else(|| self.conversation_id.clone())
+        self.session_id
+            .clone()
+            .or_else(|| self.conversation_id.clone())
     }
 
     fn cwd(&self) -> Option<String> {
@@ -175,9 +177,7 @@ fn generate_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nebula_core::{
-        Agent, AgentKind, AgentStatus, Project, ProjectId, Worktree, WorktreeId,
-    };
+    use nebula_core::{Agent, AgentKind, AgentStatus, Project, ProjectId, Worktree, WorktreeId};
 
     /// Minimal raw HTTP/1.1 POST (Connection: close), so the real response
     /// body — what the hook one-liner pipes to the CLI's stdout — is under
@@ -208,6 +208,7 @@ mod tests {
         let store = Arc::new(Store::open_in_memory().unwrap());
         store
             .insert_project(&Project {
+                workspace_id: Default::default(),
                 id: ProjectId("p1".into()),
                 name: "p".into(),
                 repo_path: "/tmp/p".into(),

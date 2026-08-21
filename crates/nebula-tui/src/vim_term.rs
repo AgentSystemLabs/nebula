@@ -149,7 +149,10 @@ impl VimTerm {
     /// Encoded keystrokes (and bracketed pastes) go straight to the child.
     pub fn input(&mut self, data: &[u8]) {
         // A write error means the child died; the Exited event closes us.
-        let _ = self.writer.write_all(data).and_then(|_| self.writer.flush());
+        let _ = self
+            .writer
+            .write_all(data)
+            .and_then(|_| self.writer.flush());
     }
 
     /// Keep the PTY and parser sized to the drawn modal.
@@ -197,7 +200,11 @@ mod tests {
             panic!("event channel closed early");
         })
         .await;
-        assert!(ok.is_ok(), "timed out; screen:\n{}", term.parser.screen().contents());
+        assert!(
+            ok.is_ok(),
+            "timed out; screen:\n{}",
+            term.parser.screen().contents()
+        );
     }
 
     #[tokio::test]

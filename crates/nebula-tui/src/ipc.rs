@@ -237,6 +237,110 @@ pub async fn add_project(path: String) -> Result<()> {
     }
 }
 
+/// One `nebula workspace <op>` invocation, resolved and executed against the
+/// daemon (spawned when absent, same as `nebula add`).
+#[derive(Debug, Clone)]
+pub enum WorkspaceOp {
+    Add { name: String },
+    Open { name: String },
+    List,
+    Delete { name: String },
+    Rename { name: String, new_name: String },
+}
+
+/// One-shot client for `nebula workspace …`. Name→id resolution runs off a
+/// snapshot (Subscribe's first reply), so the daemon's RPC surface stays
+/// id-based for the TUI's picker.
+pub async fn run_workspace_op(op: WorkspaceOp) -> Result<()> {
+    use nebula_core::{Workspace, WorkspaceId};
+    let mut conn = connect_or_spawn().await?;
+    write_frame(&mut conn.stream, &ClientRequest::Subscribe).await?;
+    let (workspaces, active, projects) = loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::Snapshot {
+                workspaces,
+                active_workspace,
+                projects,
+                ..
+            }) => break (workspaces, active_workspace, projects),
+            Some(_) => continue,
+            None => bail!("daemon closed the connection before sending a snapshot"),
+        }
+    };
+    let resolve = |name: &str| -> Result<WorkspaceId> {
+        workspaces
+            .iter()
+            .find(|w: &&Workspace| w.name == name)
+            .map(|w| w.id.clone())
+            .with_context(|| {
+                let names: Vec<&str> = workspaces.iter().map(|w| w.name.as_str()).collect();
+                format!(
+                    "no workspace named '{name}' (available: {})",
+                    names.join(", ")
+                )
+            })
+    };
+    let req_id = 1u64;
+    let (request, done): (ClientRequest, String) = match op {
+        WorkspaceOp::List => {
+            for w in &workspaces {
+                let marker = if w.id == active { "*" } else { " " };
+                let count = projects.iter().filter(|p| p.workspace_id == w.id).count();
+                println!(
+                    "{marker} {}  ({count} project{})",
+                    w.name,
+                    if count == 1 { "" } else { "s" }
+                );
+            }
+            return Ok(());
+        }
+        WorkspaceOp::Add { name } => (
+            ClientRequest::AddWorkspace {
+                req_id,
+                name: name.clone(),
+            },
+            format!("workspace '{name}' added — open it with `nebula workspace open {name}`"),
+        ),
+        WorkspaceOp::Open { name } => (
+            ClientRequest::OpenWorkspace {
+                req_id,
+                id: resolve(&name)?,
+            },
+            format!("workspace '{name}' opened"),
+        ),
+        WorkspaceOp::Delete { name } => (
+            ClientRequest::RemoveWorkspace {
+                req_id,
+                id: resolve(&name)?,
+            },
+            format!("workspace '{name}' deleted"),
+        ),
+        WorkspaceOp::Rename { name, new_name } => (
+            ClientRequest::RenameWorkspace {
+                req_id,
+                id: resolve(&name)?,
+                name: new_name.clone(),
+            },
+            format!("workspace '{name}' renamed to '{new_name}'"),
+        ),
+    };
+    write_frame(&mut conn.stream, &request).await?;
+    loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::Ack { req_id: r, .. }) if r == req_id => {
+                println!("{done}");
+                return Ok(());
+            }
+            Some(ServerEvent::Error {
+                req_id: Some(r),
+                message,
+            }) if r == req_id => bail!("{message}"),
+            Some(_) => continue,
+            None => bail!("daemon closed the connection before replying"),
+        }
+    }
+}
+
 /// Ask a running daemon to shut down. Ok(false) when none is running.
 ///
 /// A daemon on a different protocol version closes the socket right after

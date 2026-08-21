@@ -15,7 +15,12 @@ pub struct ScrollbackRing {
 
 impl ScrollbackRing {
     pub fn new(cap: usize) -> Self {
-        Self { buf: VecDeque::with_capacity(cap), cap, start_seq: 0, end_seq: 0 }
+        Self {
+            buf: VecDeque::with_capacity(cap),
+            cap,
+            start_seq: 0,
+            end_seq: 0,
+        }
     }
 
     /// Append output; returns the seq of the chunk's first byte.

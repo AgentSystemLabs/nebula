@@ -90,14 +90,18 @@ Worktree and project rows roll up their children: red beats yellow beats green.
 | Panels | `Tab`/`Shift+Tab`, `h/l`, `j/k` | move focus / selection |
 | Panels | `Enter` | drill in; on a session: attach |
 | Projects | `n` / `d` | add project / remove from list |
+| Any panel | `o` | add ("open") a project — same prompt as `n`, from any focus |
+| Add project | type + `Tab`, `↓↑` / `→` / `←` | browse for the repo: type to filter (bash-style Tab completion), arrows pick a directory, `→` steps in, `←` steps up, `Enter` adds the highlighted (or typed) path; `●` marks git repos |
 | Projects | `Shift+J/K` | move project up / down the list (`Shift+↑/↓` too, but Terminal.app never sends those) |
 | Projects | `-` | toggle a group divider below the project |
 | Projects | `j/k` onto a divider, then `Enter`/`r` | edit the divider's label |
 | Projects | `d` or `-` on a divider | delete the divider |
 | Worktrees | `n` / `d` | new worktree / delete (typed confirm — deletes files) |
+| Projects / Worktrees | `t` | todo notes for the selected project / worktree |
 | Sessions | `n` | new session (agent or shell terminal) |
 | Sessions | `r`, `a`, `u`, `d`, `A` | rename, archive, unarchive, delete, toggle archived |
 | Any panel | `Shift+T` | new shell terminal in the selected worktree's directory (Projects panel: the repo root) |
+| Any panel | `w` | workspace switcher: `Enter` opens, `n`/`r`/`d` create/rename/delete (the open workspace shows bottom-left; `/` and the panels scope to it) |
 | Any panel | `m` or right-click | context menu |
 | Any panel | `z` | collapse sidebars (full-width terminal) |
 | Any panel | `Shift+M` | memory usage: RAM per agent/terminal process tree, nebula itself, and the machine-wide share; `↑/↓` + `Enter` opens the selected session |
@@ -119,6 +123,11 @@ nebula daemon             # run the daemon (normally auto-spawned)
 nebula daemon --foreground  # daemon with logs to stderr, for debugging
 nebula kill               # stop the daemon and all sessions cleanly
 nebula rename <title>     # title the current session (agents run this; --force to retitle)
+nebula workspace add <name>     # create a workspace (a named project group)
+nebula workspace open <name>    # open it — projects (and the TUI, live) scope to it
+nebula workspace list           # list workspaces; * marks the open one
+nebula workspace rename <a> <b> # rename a workspace
+nebula workspace delete <name>  # delete an empty workspace
 nebula upgrade            # install the latest release (--force on a dev build)
 ```
 

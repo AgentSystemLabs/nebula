@@ -25,21 +25,38 @@ pub const MAX_TRACKED_SUBAGENTS: usize = 512;
 pub enum HookEvent {
     UserPromptSubmit,
     Stop,
-    SessionStart { source: Option<String> },
+    SessionStart {
+        source: Option<String>,
+    },
     PermissionRequest,
-    Notification { notification_type: Option<String> },
-    PreToolUse { tool_name: Option<String> },
-    PostToolUse { tool_name: Option<String> },
-    SubagentStart { subagent_id: Option<String> },
-    SubagentStop { subagent_id: Option<String> },
+    Notification {
+        notification_type: Option<String>,
+    },
+    PreToolUse {
+        tool_name: Option<String>,
+    },
+    PostToolUse {
+        tool_name: Option<String>,
+    },
+    SubagentStart {
+        subagent_id: Option<String>,
+    },
+    SubagentStop {
+        subagent_id: Option<String>,
+    },
     /// Synthetic: the agent's PTY died.
-    SessionEnded { exit_code: Option<i32> },
+    SessionEnded {
+        exit_code: Option<i32>,
+    },
 }
 
 impl HookEvent {
     /// Events that (re)establish which Claude session id owns this agent.
     pub fn captures_session(&self) -> bool {
-        matches!(self, HookEvent::UserPromptSubmit | HookEvent::SessionStart { .. })
+        matches!(
+            self,
+            HookEvent::UserPromptSubmit | HookEvent::SessionStart { .. }
+        )
     }
 }
 
@@ -77,8 +94,11 @@ impl SubagentSet {
             None => {
                 if self.anon > 0 {
                     self.anon -= 1;
-                } else if let Some(oldest) =
-                    self.keyed.iter().min_by_key(|(_, t)| **t).map(|(k, _)| k.clone())
+                } else if let Some(oldest) = self
+                    .keyed
+                    .iter()
+                    .min_by_key(|(_, t)| **t)
+                    .map(|(k, _)| k.clone())
                 {
                     self.keyed.remove(&oldest);
                 }
@@ -87,7 +107,8 @@ impl SubagentSet {
     }
 
     fn prune_expired(&mut self, now: Instant) {
-        self.keyed.retain(|_, started| now.duration_since(*started) < SUBAGENT_TTL);
+        self.keyed
+            .retain(|_, started| now.duration_since(*started) < SUBAGENT_TTL);
         // Anon starts can't be aged individually; they are cleared wholesale on
         // session change / clear / prompt.
     }
@@ -232,7 +253,10 @@ impl AgentStatusMachine {
                 self.stop_held = false;
                 self.drain_idle_since = None;
                 self.finished_at = None;
-                if matches!(self.status, AgentStatus::Running | AgentStatus::NeedsFeedback) {
+                if matches!(
+                    self.status,
+                    AgentStatus::Running | AgentStatus::NeedsFeedback
+                ) {
                     let status = if exit_code == Some(0) {
                         AgentStatus::Finished
                     } else {
@@ -315,7 +339,9 @@ mod tests {
         // Answering the prompt resumes the turn (next event is tool traffic /
         // eventually Stop; a PostToolUse AskUserQuestion also flips back).
         let fx = m.handle(
-            HookEvent::PostToolUse { tool_name: Some("AskUserQuestion".into()) },
+            HookEvent::PostToolUse {
+                tool_name: Some("AskUserQuestion".into()),
+            },
             Some("s1"),
             now,
         );
@@ -329,7 +355,9 @@ mod tests {
         m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
         m.handle(HookEvent::Stop, Some("s1"), now);
         let fx = m.handle(
-            HookEvent::Notification { notification_type: Some("idle_prompt".into()) },
+            HookEvent::Notification {
+                notification_type: Some("idle_prompt".into()),
+            },
             Some("s1"),
             now,
         );
@@ -342,14 +370,22 @@ mod tests {
         let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
         let now = t0();
         m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
-        m.handle(HookEvent::SubagentStart { subagent_id: Some("sub1".into()) }, Some("s1"), now);
+        m.handle(
+            HookEvent::SubagentStart {
+                subagent_id: Some("sub1".into()),
+            },
+            Some("s1"),
+            now,
+        );
         let fx = m.handle(HookEvent::Stop, Some("s1"), now + Duration::from_secs(5));
         assert_eq!(status_of(&fx), None, "stays running — no transition");
         assert_eq!(m.status(), AgentStatus::Running);
 
         // Subagent finishes; drain grace must elapse before finished.
         m.handle(
-            HookEvent::SubagentStop { subagent_id: Some("sub1".into()) },
+            HookEvent::SubagentStop {
+                subagent_id: Some("sub1".into()),
+            },
             Some("s1"),
             now + Duration::from_secs(60),
         );
@@ -368,7 +404,9 @@ mod tests {
         assert_eq!(m.status(), AgentStatus::Finished);
         // The subagent's own POST arrives 2s later — race heal.
         let fx = m.handle(
-            HookEvent::SubagentStart { subagent_id: Some("sub1".into()) },
+            HookEvent::SubagentStart {
+                subagent_id: Some("sub1".into()),
+            },
             Some("s1"),
             now + Duration::from_secs(12),
         );
@@ -383,7 +421,9 @@ mod tests {
         m.handle(HookEvent::Stop, Some("s1"), now + Duration::from_secs(10));
         // An away-summary helper fires SubagentStart minutes later.
         let fx = m.handle(
-            HookEvent::SubagentStart { subagent_id: Some("helper".into()) },
+            HookEvent::SubagentStart {
+                subagent_id: Some("helper".into()),
+            },
             Some("s1"),
             now + Duration::from_secs(10) + RECENT_FINISH_WINDOW + Duration::from_secs(1),
         );
@@ -407,9 +447,19 @@ mod tests {
         let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
         let now = t0();
         m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
-        m.handle(HookEvent::SubagentStart { subagent_id: Some("sub1".into()) }, Some("s1"), now);
+        m.handle(
+            HookEvent::SubagentStart {
+                subagent_id: Some("sub1".into()),
+            },
+            Some("s1"),
+            now,
+        );
         // claude restarted (new session id) and a fresh prompt arrives.
-        let fx = m.handle(HookEvent::UserPromptSubmit, Some("s2"), now + Duration::from_secs(5));
+        let fx = m.handle(
+            HookEvent::UserPromptSubmit,
+            Some("s2"),
+            now + Duration::from_secs(5),
+        );
         assert!(fx.contains(&Effect::SaveSessionId("s2".into())));
         // Old subagents gone: a Stop finishes immediately.
         let fx = m.handle(HookEvent::Stop, Some("s2"), now + Duration::from_secs(6));
@@ -421,11 +471,19 @@ mod tests {
         let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
         let now = t0();
         m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
-        let fx = m.handle(HookEvent::SessionEnded { exit_code: Some(137) }, None, now);
+        let fx = m.handle(
+            HookEvent::SessionEnded {
+                exit_code: Some(137),
+            },
+            None,
+            now,
+        );
         assert_eq!(status_of(&fx), Some(AgentStatus::Terminated));
         // Laggard subagent POST must not resurrect the dead agent.
         let fx = m.handle(
-            HookEvent::SubagentStart { subagent_id: Some("sub1".into()) },
+            HookEvent::SubagentStart {
+                subagent_id: Some("sub1".into()),
+            },
             Some("s1"),
             now + Duration::from_secs(1),
         );
@@ -449,7 +507,10 @@ mod tests {
         m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
         m.handle(HookEvent::Stop, Some("s1"), now);
         let fx = m.handle(HookEvent::SessionEnded { exit_code: Some(1) }, None, now);
-        assert!(fx.is_empty(), "finished agent whose pty closes stays finished");
+        assert!(
+            fx.is_empty(),
+            "finished agent whose pty closes stays finished"
+        );
         assert_eq!(m.status(), AgentStatus::Finished);
     }
 
@@ -459,10 +520,24 @@ mod tests {
         let now = t0();
         m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
         // Keyed start, anon stop → biases toward finishing.
-        m.handle(HookEvent::SubagentStart { subagent_id: Some("sub1".into()) }, Some("s1"), now);
-        m.handle(HookEvent::SubagentStop { subagent_id: None }, Some("s1"), now);
+        m.handle(
+            HookEvent::SubagentStart {
+                subagent_id: Some("sub1".into()),
+            },
+            Some("s1"),
+            now,
+        );
+        m.handle(
+            HookEvent::SubagentStop { subagent_id: None },
+            Some("s1"),
+            now,
+        );
         let fx = m.handle(HookEvent::Stop, Some("s1"), now + Duration::from_secs(1));
-        assert_eq!(status_of(&fx), Some(AgentStatus::Finished), "set drained via cross-cancel");
+        assert_eq!(
+            status_of(&fx),
+            Some(AgentStatus::Finished),
+            "set drained via cross-cancel"
+        );
     }
 
     #[test]
@@ -470,8 +545,20 @@ mod tests {
         let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
         let now = t0();
         m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
-        m.handle(HookEvent::SubagentStart { subagent_id: Some("sub1".into()) }, Some("s1"), now);
-        m.handle(HookEvent::SessionStart { source: Some("clear".into()) }, Some("s1"), now);
+        m.handle(
+            HookEvent::SubagentStart {
+                subagent_id: Some("sub1".into()),
+            },
+            Some("s1"),
+            now,
+        );
+        m.handle(
+            HookEvent::SessionStart {
+                source: Some("clear".into()),
+            },
+            Some("s1"),
+            now,
+        );
         let fx = m.handle(HookEvent::Stop, Some("s1"), now + Duration::from_secs(1));
         assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
     }

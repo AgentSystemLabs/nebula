@@ -86,8 +86,7 @@ fn density(dx: f32, dy: f32, rot: f32) -> f32 {
 /// shine sweeping through, and the blocks materializing from static
 /// (`░` -> `▒` -> `█`) while the scene fades in.
 fn wordmark_line(row: usize, t: f32, fade: f32) -> Line<'static> {
-    let width: usize =
-        LETTERS.iter().map(|l| l[0].len()).sum::<usize>() + 2 * (LETTERS.len() - 1);
+    let width: usize = LETTERS.iter().map(|l| l[0].len()).sum::<usize>() + 2 * (LETTERS.len() - 1);
     let block = if fade < 0.5 {
         "░"
     } else if fade < 0.85 {
@@ -132,7 +131,14 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
     if area.width < 8 || area.height < 4 {
         return;
     }
-    let t = app.splash_epoch.elapsed().as_secs_f32();
+    // Animations off: the event loop doesn't tick us, so hold one finished
+    // frame (well past the fade-in) instead of whatever instant a stray
+    // redraw lands on.
+    let t = if app.animations {
+        app.splash_epoch.elapsed().as_secs_f32()
+    } else {
+        60.0
+    };
     let raw = (t / FADE_IN).clamp(0.0, 1.0);
     let fade = raw * raw * (3.0 - 2.0 * raw);
 
@@ -170,8 +176,8 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
         ]
     };
     let mut hint = Vec::new();
-    if app.tree.projects.is_empty() {
-        hint.extend(key("n", "create your first project"));
+    if !app.tree.has_visible_projects() {
+        hint.extend(key("n / o", "create your first project"));
         hint.push(Span::styled("   ·   ", Style::default().fg(th.dim)));
         hint.extend(key("?", "help"));
     } else {

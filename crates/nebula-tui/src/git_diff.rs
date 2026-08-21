@@ -128,7 +128,13 @@ pub fn parse_status_z(bytes: &[u8]) -> Vec<DiffFile> {
 pub fn list_files(root: &Path) -> Result<Vec<String>, String> {
     let output = run_git(
         root,
-        &["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
     )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

@@ -26,10 +26,17 @@ const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 /// Broadcast to attached clients (and, later, the status machine).
 #[derive(Clone, Debug)]
 pub enum PtyEvent {
-    Output { seq: u64, data: Vec<u8> },
-    Exited { exit_code: Option<i32> },
+    Output {
+        seq: u64,
+        data: Vec<u8>,
+    },
+    Exited {
+        exit_code: Option<i32>,
+    },
     /// The child pushed/popped kitty keyboard flags; clients re-encode keys.
-    KittyFlags { flags: u8 },
+    KittyFlags {
+        flags: u8,
+    },
 }
 
 enum ReaderMsg {
@@ -71,7 +78,12 @@ impl PtySession {
     pub fn spawn(sref: SessionRef, spec: SpawnSpec) -> Result<Arc<Self>> {
         let pty_system = native_pty_system();
         let pair = pty_system
-            .openpty(PtySize { rows: spec.rows, cols: spec.cols, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows: spec.rows,
+                cols: spec.cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .context("openpty")?;
 
         let mut cmd = CommandBuilder::new(&spec.program);
@@ -85,7 +97,10 @@ impl PtySession {
             cmd.env(k, v);
         }
 
-        let child = pair.slave.spawn_command(cmd).context("spawn child in pty")?;
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .context("spawn child in pty")?;
         drop(pair.slave);
 
         let killer = child.clone_killer();
@@ -121,7 +136,12 @@ impl PtySession {
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         let master = self.master.lock().unwrap();
-        master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
+        master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
         *self.last_size.lock().unwrap() = (cols, rows);
         Ok(())
     }
@@ -133,8 +153,18 @@ impl PtySession {
         let same = { *self.last_size.lock().unwrap() == (cols, rows) };
         if same && rows > 1 {
             let master = self.master.lock().unwrap();
-            master.resize(PtySize { rows: rows - 1, cols, pixel_width: 0, pixel_height: 0 })?;
-            master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
+            master.resize(PtySize {
+                rows: rows - 1,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })?;
+            master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })?;
             Ok(())
         } else {
             self.resize(cols, rows)
@@ -209,7 +239,10 @@ fn spawn_reader_thread(
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if tx.blocking_send(ReaderMsg::Data(buf[..n].to_vec())).is_err() {
+                        if tx
+                            .blocking_send(ReaderMsg::Data(buf[..n].to_vec()))
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -239,7 +272,10 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
             }
         }
         let seq = session.ring.lock().unwrap().append(pending);
-        let _ = session.events.send(PtyEvent::Output { seq, data: std::mem::take(pending) });
+        let _ = session.events.send(PtyEvent::Output {
+            seq,
+            data: std::mem::take(pending),
+        });
         if let Some(flags) = actions.flags_changed {
             tracing::debug!(session = ?session.sref, flags, "child kitty flags changed");
             let _ = session.events.send(PtyEvent::KittyFlags { flags });

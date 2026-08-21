@@ -119,7 +119,11 @@ mod tests {
         assert_eq!(timeout("15m"), Some(Duration::from_secs(900)));
         assert_eq!(timeout("30m"), Some(Duration::from_secs(1800)));
         assert_eq!(timeout("1h"), Some(Duration::from_secs(3600)));
-        assert_eq!(timeout("2s"), Some(Duration::from_secs(2)), "seconds for tests");
+        assert_eq!(
+            timeout("2s"),
+            Some(Duration::from_secs(2)),
+            "seconds for tests"
+        );
         assert_eq!(timeout("off"), None);
         assert_eq!(timeout("0"), None);
         // Malformed values fall back to the default, not to disabled.

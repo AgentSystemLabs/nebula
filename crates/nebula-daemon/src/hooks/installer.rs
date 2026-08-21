@@ -163,9 +163,7 @@ fn ensure_permission_allow(
     entry: &str,
     path: &Path,
 ) -> Result<()> {
-    let perms = root_obj
-        .entry("permissions")
-        .or_insert_with(|| json!({}));
+    let perms = root_obj.entry("permissions").or_insert_with(|| json!({}));
     let Some(perms_obj) = perms.as_object_mut() else {
         bail!(
             "\"permissions\" in {} is not an object — refusing to modify it",
@@ -248,8 +246,7 @@ fn load_hooks_root(path: &Path) -> Result<Value> {
     if !path.exists() {
         return Ok(json!({}));
     }
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     if text.trim().is_empty() {
         return Ok(json!({}));
     }
@@ -406,7 +403,10 @@ mod tests {
         let stop = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
-        assert!(stop.contains(">/dev/null 2>&1"), "stop stays silent: {stop}");
+        assert!(
+            stop.contains(">/dev/null 2>&1"),
+            "stop stays silent: {stop}"
+        );
     }
 
     #[test]
@@ -615,7 +615,10 @@ mod tests {
         assert!(cmd.contains("/api/hooks/cursor?"), "cursor endpoint: {cmd}");
         assert!(cmd.contains("hookEvent=Stop"));
         // Gating hooks must answer cursor with a JSON response.
-        assert!(cmd.contains("{\"continue\": true}"), "stdout response: {cmd}");
+        assert!(
+            cmd.contains("{\"continue\": true}"),
+            "stdout response: {cmd}"
+        );
         let submit = &hooks["hooks"]["beforeSubmitPrompt"][0];
         assert!(submit["command"]
             .as_str()
@@ -630,7 +633,12 @@ mod tests {
             .unwrap()
             .contains("hookEvent=SubagentStop"));
         // Claude-dialect events must not appear — cursor never fires them.
-        for key in ["Stop", "UserPromptSubmit", "SessionStart", "PermissionRequest"] {
+        for key in [
+            "Stop",
+            "UserPromptSubmit",
+            "SessionStart",
+            "PermissionRequest",
+        ] {
             assert!(hooks["hooks"].get(key).is_none(), "{key} leaked");
         }
     }

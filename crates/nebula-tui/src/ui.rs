@@ -1,12 +1,14 @@
 //! View layer: draws the three panels + terminal pane + footer, and records
 //! hit regions for mouse interaction.
 
-use crate::app::{App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, ProjectRow, SessionRow};
+use crate::app::{
+    App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, ProjectRow, SessionRow,
+};
 use crate::git_diff::{classify_diff_line, DiffLineKind};
 use crate::theme::Theme;
 use nebula_core::{AgentStatus, SessionRef};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
@@ -23,16 +25,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     if app.collapsed {
         draw_terminal(f, app, body);
+        if app.focus_tint && app.focus == Focus::Terminal {
+            draw_focus_tint(f.buffer_mut(), body, app.theme);
+        }
         draw_footer(f, app, footer);
         draw_overlay(f, app);
         draw_vim(f, app);
         return;
     }
 
-    // First run: no projects means three empty panels, so the whole body
-    // becomes the animated nebula splash until the first project lands.
-    // N summons the same splash as a dismissable preview.
-    if app.tree.projects.is_empty() || app.splash_preview {
+    // First run (or an empty workspace): no visible projects means three
+    // empty panels, so the whole body becomes the animated nebula splash
+    // until the first project lands. N summons the same splash as a
+    // dismissable preview.
+    if !app.tree.has_visible_projects() || app.splash_preview {
         crate::splash::draw_splash(f, app, body);
         draw_footer(f, app, footer);
         draw_overlay(f, app);
@@ -69,6 +75,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_worktrees(f, app, worktrees_a);
     draw_sessions(f, app, sessions_a);
     draw_terminal(f, app, term_a);
+    // Focus cue (opt-in, `focus_tint` setting): the focused panel's whole
+    // background picks up a faint accent tint. The sidebar columns stop
+    // one cell short of their right rule so the tint stays inside the
+    // panel.
+    if app.focus_tint {
+        let tinted = match app.focus {
+            Focus::Projects => shrink_r(projects_a),
+            Focus::Worktrees => shrink_r(worktrees_a),
+            Focus::Sessions => shrink_r(sessions_a),
+            Focus::Terminal => term_a,
+        };
+        draw_focus_tint(f.buffer_mut(), tinted, app.theme);
+    }
     draw_footer(f, app, footer);
     draw_overlay(f, app);
     draw_vim(f, app);
@@ -151,8 +170,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // Rows that expand into a submenu get a right-aligned ▸ in an
             // extra column so the affordance is visible before hovering.
             let any_submenu = menu.items.iter().any(|i| i.action.submenu().is_some());
+            // The workspace switcher carries its key verbs in the bottom
+            // border, the todos-modal pattern; the modal widens to fit.
+            let hint = menu
+                .is_workspace_picker()
+                .then_some(" n: new  r: rename  d: delete ");
             let width = (label_w + 4 + if any_submenu { 2 } else { 0 })
                 .max(title_width + 2)
+                .max(hint.map_or(0, |h| h.chars().count() + 2))
                 .min(f.area().width as usize) as u16;
             let height = menu.items.len() as u16 + 2;
             let area = match menu.at {
@@ -180,10 +205,12 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if let Some(title) = &menu.title {
                 block = block.title(Span::styled(
                     format!(" {title} "),
-                    Style::default()
-                        .fg(th.accent)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 ));
+            }
+            if let Some(hint) = hint {
+                block =
+                    block.title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
             }
             let inner = block.inner(area);
             f.render_widget(block, area);
@@ -243,10 +270,17 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Paragraph::new(lines), inner);
         }
         Overlay::Prompt(prompt) => {
-            // Paths get wide dialogs; candidate list adds a row when present.
-            let width = if prompt.completes_paths() { 72 } else { 52 };
-            let height = if prompt.candidates.is_empty() { 6 } else { 7 };
-            let area = centered_rect(f.area(), width, height);
+            // Path prompts get a wide dialog with the live directory
+            // listing between the input and the hint; the dialog grows to
+            // fit the listing (at least one row, for the empty message).
+            let is_path = prompt.completes_paths();
+            let width = if is_path { 72 } else { 52 };
+            let list_h = if is_path {
+                prompt.dirs.len().clamp(1, 8) as u16
+            } else {
+                0
+            };
+            let area = centered_rect(f.area(), width, 6 + list_h);
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -259,60 +293,110 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             let inner = block.inner(area);
             f.render_widget(block, area);
 
-            // Long paths: show the tail so the cursor position stays visible.
-            let input_budget = inner.width.saturating_sub(3) as usize;
-            let shown_input: String = if prompt.input.chars().count() > input_budget {
-                let skip = prompt.input.chars().count() - input_budget;
-                format!(
-                    "…{}",
-                    prompt.input.chars().skip(skip + 1).collect::<String>()
-                )
-            } else {
-                prompt.input.clone()
-            };
-
-            let mut lines = vec![
-                Line::from(Span::styled(
+            // Row 0: the label, with the listing size tucked after it.
+            if let Some(r) = row_rect(inner, 0) {
+                let mut spans = vec![Span::styled(
                     prompt.label.clone(),
                     Style::default().fg(th.dim),
-                )),
-                Line::from(vec![
-                    Span::raw("> "),
-                    Span::styled(shown_input, Style::default().fg(th.text)),
-                    Span::styled("█", Style::default().fg(th.text)),
-                ]),
-            ];
-            if !prompt.candidates.is_empty() {
-                let max_shown = 6;
-                let mut list = prompt
-                    .candidates
-                    .iter()
-                    .take(max_shown)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("  ");
-                if prompt.candidates.len() > max_shown {
-                    list.push_str(&format!(
-                        "  (+{} more)",
-                        prompt.candidates.len() - max_shown
+                )];
+                if prompt.dirs.len() > list_h as usize {
+                    spans.push(Span::styled(
+                        format!("  ·  {} dirs", prompt.dirs.len()),
+                        Style::default().fg(th.dim),
                     ));
                 }
-                lines.push(Line::from(Span::styled(
-                    truncate(&list, inner.width as usize),
-                    Style::default().fg(th.warn),
-                )));
+                f.render_widget(Paragraph::new(Line::from(spans)), r);
             }
-            lines.push(Line::from(""));
-            let hint = if prompt.completes_paths() {
-                "[Enter] ok   [Tab] complete   [Ctrl+u] clear   [Esc] cancel"
-            } else {
-                "[Enter] ok   [Ctrl+u] clear   [Esc] cancel"
-            };
-            lines.push(Line::from(Span::styled(
-                hint,
-                Style::default().fg(th.dim),
-            )));
-            f.render_widget(Paragraph::new(lines), inner);
+
+            // Row 1: the input. Long paths show the tail so the cursor
+            // stays visible; the cursor dims while a listing row is
+            // highlighted (Enter takes the highlight, not the text).
+            if let Some(r) = row_rect(inner, 1) {
+                let input_budget = inner.width.saturating_sub(3) as usize;
+                let shown_input: String = if prompt.input.chars().count() > input_budget {
+                    let skip = prompt.input.chars().count() - input_budget;
+                    format!(
+                        "…{}",
+                        prompt.input.chars().skip(skip + 1).collect::<String>()
+                    )
+                } else {
+                    prompt.input.clone()
+                };
+                let cursor = if prompt.hover.is_some() {
+                    th.dim
+                } else {
+                    th.text
+                };
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::raw("> "),
+                        Span::styled(shown_input, Style::default().fg(th.text)),
+                        Span::styled("█", Style::default().fg(cursor)),
+                    ])),
+                    r,
+                );
+            }
+
+            // The listing: one raised-fill row per directory, a ● on git
+            // repos, the typed partial lit like a fuzzy match. A stateless
+            // follow-window keeps the highlighted row visible.
+            let mut list_area = Rect::default();
+            if is_path {
+                list_area = Rect {
+                    x: inner.x,
+                    y: inner.y + 2,
+                    width: inner.width,
+                    height: list_h.min(inner.height.saturating_sub(2)),
+                };
+                if prompt.dirs.is_empty() {
+                    if let Some(r) = row_rect(list_area, 0) {
+                        f.render_widget(
+                            Paragraph::new(Span::styled(
+                                "  no matching directories",
+                                Style::default().fg(th.dim),
+                            )),
+                            r,
+                        );
+                    }
+                }
+                let (_, partial) = crate::completion::split_input(&prompt.input);
+                let hit = partial.chars().count();
+                let start = prompt.window_start(list_area.height as usize);
+                for (row, (i, entry)) in prompt.dirs.iter().enumerate().skip(start).enumerate() {
+                    let Some(r) = row_rect(list_area, row) else {
+                        break;
+                    };
+                    let marker = if entry.is_repo {
+                        Span::styled("● ", Style::default().fg(th.ok))
+                    } else {
+                        Span::styled("· ", Style::default().fg(th.dim))
+                    };
+                    let budget = (inner.width as usize).saturating_sub(5);
+                    let shown = truncate(&entry.name, budget);
+                    let positions: Vec<usize> = (0..hit.min(shown.chars().count())).collect();
+                    let mut spans = vec![Span::raw(" "), marker];
+                    spans.extend(fuzzy_highlight_spans(&shown, &positions, th));
+                    spans.push(Span::styled("/", Style::default().fg(th.dim)));
+                    render_row(f, r, spans, prompt.hover == Some(i), true, th);
+                }
+            }
+
+            // Bottom row: the key hints.
+            if let Some(r) = row_rect(inner, (3 + list_h) as usize) {
+                let hint = if is_path {
+                    "[Enter] add  [↓↑] pick  [→] open  [←] up  [Tab] complete  [Esc] cancel"
+                } else {
+                    "[Enter] ok   [Ctrl+u] clear   [Esc] cancel"
+                };
+                f.render_widget(
+                    Paragraph::new(Span::styled(hint, Style::default().fg(th.dim))),
+                    r,
+                );
+            }
+            // Record the listing rect for click hit-testing.
+            if let Some(Overlay::Prompt(p)) = &mut app.overlay {
+                p.list_area = list_area;
+            }
         }
         Overlay::Help => {
             // Grouped keymap in two columns: reads by task instead of one
@@ -330,14 +414,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         ("^o / ^f", "jump pick: open / focus row"),
                         ("f", "find file (^y copies path)"),
                         ("F", "find in files (git grep)"),
-                        ("t", "file tree browser"),
+                        ("b", "file tree browser"),
                     ],
                 ),
                 (
                     "PROJECTS",
                     &[
-                        ("n", "add project"),
-                        ("o", "project-level todo notes"),
+                        ("n / o", "add project (o: from anywhere)"),
+                        ("t", "project-level todo notes"),
                         ("⇧J/K", "reorder project"),
                         ("-", "divider below (Enter/r: label)"),
                         ("d / ⌫", "remove from list"),
@@ -347,7 +431,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "WORKTREES",
                     &[
                         ("n", "new worktree"),
-                        ("o", "todo notes for the worktree"),
+                        ("t", "todo notes for the worktree"),
                         ("g", "git diff (^r: mark reviewed ✓)"),
                         ("p", "pin / unpin"),
                         ("d / D", "delete one / delete all"),
@@ -382,6 +466,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 (
                     "GENERAL",
                     &[
+                        ("w", "workspaces: switch (n/r/d manage)"),
                         ("s", "settings"),
                         ("M", "memory usage (nebula + agents)"),
                         ("N", "nebula splash (any key returns)"),
@@ -420,16 +505,11 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     }
                     lines.push(Line::from(Span::styled(
                         format!(" {title}"),
-                        Style::default()
-                            .fg(th.muted)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
                     )));
                     for (k, v) in *entries {
                         lines.push(Line::from(vec![
-                            Span::styled(
-                                format!(" {k:<13}"),
-                                Style::default().fg(th.accent),
-                            ),
+                            Span::styled(format!(" {k:<13}"), Style::default().fg(th.accent)),
                             Span::styled(
                                 truncate(v, (width as usize).saturating_sub(15)),
                                 Style::default().fg(th.dim),
@@ -459,9 +539,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 .border_style(Style::default().fg(th.accent))
                 .title(Span::styled(
                     " Settings ",
-                    Style::default()
-                        .fg(th.accent)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 ));
             let inner = block.inner(area);
             f.render_widget(block, area);
@@ -474,9 +552,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     crate::config::SettingsRow::Header(title) => {
                         lines.push(Line::from(Span::styled(
                             format!(" {title}"),
-                            Style::default()
-                                .fg(th.muted)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
                         )));
                     }
                     crate::config::SettingsRow::Setting(i) => {
@@ -568,8 +644,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             let context = agent
                                 .map(|a| wt_context(&a.worktree_id))
                                 .unwrap_or_default();
-                            let kind =
-                                agent.map(|a| a.kind.as_str()).unwrap_or("agents");
+                            let kind = agent.map(|a| a.kind.as_str()).unwrap_or("agents");
                             (name, context, kind)
                         }
                         SessionRef::Terminal(id) => {
@@ -577,9 +652,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             let name = term
                                 .map(|t| t.name.clone())
                                 .unwrap_or_else(|| "(unknown terminal)".into());
-                            let context = term
-                                .map(|t| wt_context(&t.worktree_id))
-                                .unwrap_or_default();
+                            let context =
+                                term.map(|t| wt_context(&t.worktree_id)).unwrap_or_default();
                             (name, context, "shells")
                         }
                     };
@@ -637,7 +711,11 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if let Some(snap) = &view.snapshot {
                 // Rollup: one line per agent kind, then nebula, then total.
                 for (kind, (n, procs, bytes)) in &kinds {
-                    let unit = if *kind == "shells" { "terminal" } else { "session" };
+                    let unit = if *kind == "shells" {
+                        "terminal"
+                    } else {
+                        "session"
+                    };
                     let detail =
                         format!("{n} {unit}{} · {procs} proc{}", plural(*n), plural(*procs));
                     lines.push(Line::from(vec![
@@ -663,10 +741,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     String::new()
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        " total    ",
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(" total    ", Style::default().add_modifier(Modifier::BOLD)),
                     Span::styled(format!("{note:<42}"), dim),
                     Span::styled(
                         format!("{:>9}", fmt_mem(total)),
@@ -682,10 +757,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     header,
                 )));
                 // Scrolled window over the rows; everything above stays put.
-                let space = f
-                    .area()
-                    .height
-                    .saturating_sub(lines.len() as u16 + 4) as usize;
+                let space = f.area().height.saturating_sub(lines.len() as u16 + 4) as usize;
                 shown = rows.len().min(16).min(space.max(3));
                 scroll = view.scroll.min(rows.len().saturating_sub(shown));
                 // Keep the cursor inside the window.
@@ -696,7 +768,11 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 }
                 rows_start = lines.len();
                 for (i, row) in rows.iter().enumerate().skip(scroll).take(shown) {
-                    let name_style = if row.sref.is_none() { dim } else { Style::default() };
+                    let name_style = if row.sref.is_none() {
+                        dim
+                    } else {
+                        Style::default()
+                    };
                     let sel = |s: Style| {
                         if i == selected {
                             s.bg(th.sel_bg).add_modifier(Modifier::BOLD)
@@ -709,10 +785,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             format!(" {:<28} ", truncate(&row.name, 28)),
                             sel(name_style),
                         ),
-                        Span::styled(
-                            format!("{:<15} ", truncate(&row.context, 15)),
-                            sel(dim),
-                        ),
+                        Span::styled(format!("{:<15} ", truncate(&row.context, 15)), sel(dim)),
                         Span::styled(format!("{:>6} {:>5} ", row.pid, row.procs), sel(dim)),
                         Span::styled(format!("{:>9}", fmt_mem(row.bytes)), sel(mem_style)),
                     ]));
@@ -783,10 +856,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // First row: the always-on fuzzy filter input.
             if let Some(filter_area) = row_rect(files_inner, 0) {
                 let line = if view.filter.is_empty() {
-                    Line::from(Span::styled(
-                        "type to filter…",
-                        Style::default().fg(th.dim),
-                    ))
+                    Line::from(Span::styled("type to filter…", Style::default().fg(th.dim)))
                 } else {
                     Line::from(vec![
                         Span::raw(view.filter.clone()),
@@ -804,10 +874,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if view.matches.is_empty() {
                 if let Some(row_area) = row_rect(list_inner, 0) {
                     f.render_widget(
-                        Paragraph::new(Span::styled(
-                            "no matches",
-                            Style::default().fg(th.dim),
-                        )),
+                        Paragraph::new(Span::styled("no matches", Style::default().fg(th.dim))),
                         row_area,
                     );
                 }
@@ -924,9 +991,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 .border_style(Style::default().fg(th.accent))
                 .title(Span::styled(
                     title,
-                    Style::default()
-                        .fg(th.accent)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 ));
             let inner = block.inner(area);
             f.render_widget(block, area);
@@ -934,10 +999,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // First row: the always-on fuzzy query input.
             if let Some(query_area) = row_rect(inner, 0) {
                 let line = if palette.query.is_empty() {
-                    Line::from(Span::styled(
-                        "type to search…",
-                        Style::default().fg(th.dim),
-                    ))
+                    Line::from(Span::styled("type to search…", Style::default().fg(th.dim)))
                 } else {
                     Line::from(vec![
                         Span::raw(palette.query.clone()),
@@ -955,10 +1017,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if palette.matches.is_empty() {
                 if let Some(row_area) = row_rect(list_inner, 0) {
                     f.render_widget(
-                        Paragraph::new(Span::styled(
-                            "no matches",
-                            Style::default().fg(th.dim),
-                        )),
+                        Paragraph::new(Span::styled("no matches", Style::default().fg(th.dim))),
                         row_area,
                     );
                 }
@@ -993,16 +1052,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 } else {
                     &m.positions[..]
                 };
-                let mut spans = vec![Span::styled(
-                    glyph,
-                    Style::default().fg(glyph_color),
-                )];
-                spans.extend(path_highlight_spans(
-                    &shown,
-                    positions,
-                    item.archived,
-                    th,
-                ));
+                let mut spans = vec![Span::styled(glyph, Style::default().fg(glyph_color))];
+                spans.extend(path_highlight_spans(&shown, positions, item.archived, th));
                 render_row(f, row_area, spans, i == palette.selected, true, th);
             }
 
@@ -1032,9 +1083,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 .border_style(Style::default().fg(th.accent))
                 .title(Span::styled(
                     title,
-                    Style::default()
-                        .fg(th.accent)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 ));
             let inner = block.inner(area);
             f.render_widget(block, area);
@@ -1042,10 +1091,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // First row: the always-on fuzzy query input.
             if let Some(query_area) = row_rect(inner, 0) {
                 let line = if finder.query.is_empty() {
-                    Line::from(Span::styled(
-                        "type to filter…",
-                        Style::default().fg(th.dim),
-                    ))
+                    Line::from(Span::styled("type to filter…", Style::default().fg(th.dim)))
                 } else {
                     Line::from(vec![
                         Span::raw(finder.query.clone()),
@@ -1063,10 +1109,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if finder.matches.is_empty() {
                 if let Some(row_area) = row_rect(list_inner, 0) {
                     f.render_widget(
-                        Paragraph::new(Span::styled(
-                            "no matches",
-                            Style::default().fg(th.dim),
-                        )),
+                        Paragraph::new(Span::styled("no matches", Style::default().fg(th.dim))),
                         row_area,
                     );
                 }
@@ -1128,9 +1171,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 .border_style(Style::default().fg(th.accent))
                 .title(Span::styled(
                     title,
-                    Style::default()
-                        .fg(th.accent)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 ));
             let inner = block.inner(area);
             f.render_widget(block, area);
@@ -1138,10 +1179,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // First row: the always-live grep query.
             if let Some(query_area) = row_rect(inner, 0) {
                 let line = if view.query.is_empty() {
-                    Line::from(Span::styled(
-                        "type to search…",
-                        Style::default().fg(th.dim),
-                    ))
+                    Line::from(Span::styled("type to search…", Style::default().fg(th.dim)))
                 } else {
                     Line::from(vec![
                         Span::raw(view.query.clone()),
@@ -1237,7 +1275,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             let hint = if view.input.is_some() {
                 " Enter: save  Esc: cancel "
             } else {
-                " o: add  Enter: edit  Space: done  d: delete "
+                " t: add  Enter: edit  Space: done  d: delete "
             };
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -1245,14 +1283,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 .border_style(Style::default().fg(th.accent))
                 .title(Span::styled(
                     truncate(&title, (area.width as usize).saturating_sub(2)),
-                    Style::default()
-                        .fg(th.accent)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 ))
-                .title_bottom(Line::from(Span::styled(
-                    hint,
-                    Style::default().fg(th.dim),
-                )));
+                .title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
             let inner = block.inner(area);
             f.render_widget(block, area);
 
@@ -1260,7 +1293,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 if let Some(row_area) = row_rect(inner, 0) {
                     f.render_widget(
                         Paragraph::new(Span::styled(
-                            "no todos yet — o adds one",
+                            "no todos yet — t adds one",
                             Style::default().fg(th.dim),
                         )),
                         row_area,
@@ -1304,10 +1337,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 } else if todo.done {
                     vec![
                         Span::styled("✓ ", Style::default().fg(th.ok)),
-                        Span::styled(
-                            truncate(&todo.text, budget),
-                            Style::default().fg(th.dim),
-                        ),
+                        Span::styled(truncate(&todo.text, budget), Style::default().fg(th.dim)),
                     ]
                 } else {
                     vec![
@@ -1386,10 +1416,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // First row: the always-on fuzzy filter input.
             if let Some(filter_area) = row_rect(tree_inner, 0) {
                 let line = if view.filter.is_empty() {
-                    Line::from(Span::styled(
-                        "type to filter…",
-                        Style::default().fg(th.dim),
-                    ))
+                    Line::from(Span::styled("type to filter…", Style::default().fg(th.dim)))
                 } else {
                     Line::from(vec![
                         Span::raw(view.filter.clone()),
@@ -1407,10 +1434,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if view.rows.is_empty() {
                 if let Some(row_area) = row_rect(list_inner, 0) {
                     f.render_widget(
-                        Paragraph::new(Span::styled(
-                            "no matches",
-                            Style::default().fg(th.dim),
-                        )),
+                        Paragraph::new(Span::styled("no matches", Style::default().fg(th.dim))),
                         row_area,
                     );
                 }
@@ -1430,8 +1454,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 } else {
                     "▸ "
                 };
-                let budget = (list_inner.width as usize)
-                    .saturating_sub(indent.chars().count() + 3);
+                let budget = (list_inner.width as usize).saturating_sub(indent.chars().count() + 3);
                 let shown = truncate(&node.name, budget);
                 // Truncation puts `…` at the last char of `shown`; a match
                 // landing on that index must not light the ellipsis.
@@ -1536,6 +1559,31 @@ fn centered_rect_pct(frame: Rect, pct_w: u16, pct_h: u16) -> Rect {
     centered_rect(frame, frame.width * pct_w / 100, frame.height * pct_h / 100)
 }
 
+/// A sidebar column's rect minus its right rule column.
+fn shrink_r(area: Rect) -> Rect {
+    Rect {
+        width: area.width.saturating_sub(1),
+        ..area
+    }
+}
+
+/// Subtle focus cue: fill the whole focused panel with the theme's
+/// `focus_tint` — the accent at ~10% opacity, so the panel reads as a
+/// faintly lit surface. Painted after content, and only onto cells whose
+/// background is still untouched, so selection fills and PTY-drawn
+/// colors sit on top of the tint instead of under it.
+fn draw_focus_tint(buf: &mut ratatui::buffer::Buffer, area: Rect, th: Theme) {
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                if cell.bg == Color::Reset {
+                    cell.bg = th.focus_tint;
+                }
+            }
+        }
+    }
+}
+
 /// Bordered panel frame: rounded corners everywhere for a softer, modern
 /// look. Focus has to be unmissable, so the focused panel gets an accent
 /// border plus a solid accent-background title chip, versus a thin dim
@@ -1572,6 +1620,61 @@ fn todo_badge((open, total): (usize, usize), th: Theme) -> Option<(String, Style
         (_, 0) => None,
         (0, total) => Some((format!(" ✓{total}"), Style::default().fg(th.ok))),
         (open, _) => Some((format!(" ☐{open}"), Style::default().fg(th.warn))),
+    }
+}
+
+/// Sweep shades for a status that animates: running rows shimmer yellow,
+/// needs-feedback rows red; every other status holds still. `enabled` is
+/// the animations setting — off, nothing animates.
+fn sweep_ramp(status: Option<AgentStatus>, th: Theme, enabled: bool) -> Option<[Color; 3]> {
+    if !enabled {
+        return None;
+    }
+    match status {
+        Some(AgentStatus::Running) => Some(th.warn_sweep),
+        Some(AgentStatus::NeedsFeedback) => Some(th.err_sweep),
+        _ => None,
+    }
+}
+
+/// Per-cell spans for `text` with a highlight band sweeping left to right:
+/// the whole text sits on the ramp's tail shade while the band head (bright,
+/// bold) crosses it with the mid shade trailing one cell behind. The band
+/// wraps on a period a few cells longer than the text so each pass reads as
+/// a wipe with a beat between; `phase` advances one cell per frame.
+fn sweep_spans(text: &str, base: Style, ramp: [Color; 3], phase: usize) -> Vec<Span<'static>> {
+    // Off-text cells appended to the period: the pause between passes.
+    const GAP: usize = 4;
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let head = phase % (chars.len() + GAP);
+    chars
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let style = match head.checked_sub(i) {
+                Some(0) => base.fg(ramp[2]).add_modifier(Modifier::BOLD),
+                Some(1) => base.fg(ramp[1]),
+                _ => base.fg(ramp[0]),
+            };
+            Span::styled(c.to_string(), style)
+        })
+        .collect()
+}
+
+/// The name spans for a status-bearing row: one plain span normally,
+/// per-cell [`sweep_spans`] while the row's status animates.
+fn status_name_spans(
+    name: String,
+    base: Style,
+    ramp: Option<[Color; 3]>,
+    phase: usize,
+) -> Vec<Span<'static>> {
+    match ramp {
+        Some(ramp) => sweep_spans(&name, base, ramp, phase),
+        None => vec![Span::styled(name, base)],
     }
 }
 
@@ -1685,25 +1788,33 @@ fn draw_column(
     } else {
         Style::default().fg(th.muted).add_modifier(Modifier::BOLD)
     };
-    if let Some(r) = row_rect(inner, 0) {
-        let mut spans = vec![Span::styled(format!("   {title}"), header_style)];
+    // Row 0 is a blank spacer so the title never sits flush against the
+    // very top of the screen; row 1 carries it. `ROW_GUTTER` is the same
+    // 3-column indent a list row gets from its 1-column selection marker
+    // plus a 2-column status glyph, so the title's text lines up with
+    // row text below it.
+    if let Some(r) = row_rect(inner, 1) {
+        let mut spans = vec![Span::styled(format!("{ROW_GUTTER}{title}"), header_style)];
         if let Some(n) = count {
-            spans.push(Span::styled(
-                format!(" · {n}"),
-                Style::default().fg(th.dim),
-            ));
+            spans.push(Span::styled(format!(" · {n}"), Style::default().fg(th.dim)));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), r);
     }
     // One extra column of right padding so row text never touches the
     // column rule.
     Rect {
-        y: inner.y + 2,
-        height: inner.height.saturating_sub(2),
+        y: inner.y + 3,
+        height: inner.height.saturating_sub(3),
         width: inner.width.saturating_sub(1),
         ..inner
     }
 }
+
+/// Left gutter every list row gets from its 1-column selection marker
+/// (`▌`/space) plus a 2-column status glyph (`● `/`○ `/`❯ `): headers and
+/// empty-panel hints use the same string so their text lines up with row
+/// text below them.
+const ROW_GUTTER: &str = "   ";
 
 /// Visual hierarchy of the sidebar lists, stepping down the tree.
 /// Projects are 3-row buttons (bold, text centered). Worktrees are a
@@ -1716,10 +1827,13 @@ const PILL_HALF: (char, char) = ('▄', '▀');
 
 /// Render one worktree into a 3-row cell starting at `top`: half-block
 /// pad, text, half-block pad. The name sits on the middle row so it
-/// stays vertically centered in the ~2-row pill. The accent rail uses
-/// left quadrants on the pad rows so the bar matches the fill height
-/// (a step down from the 3-row project `▌`). Dim spans get lifted to
-/// muted on the fill, same as `render_button`.
+/// stays vertically centered in the ~2-row pill. The pads run the full
+/// width — rail column included — so the fill has no dark notch beside
+/// the status dot (a cell can't hold a rail quadrant, a fill quarter,
+/// and bare background at once), and the accent `▌` marks the text row
+/// only (a step down from the 3-row project bar, same idiom as session
+/// rows). Dim spans get lifted to muted on the fill, same as
+/// `render_button`.
 fn render_pill(
     f: &mut Frame,
     inner: Rect,
@@ -1740,26 +1854,13 @@ fn render_pill(
             }
         }
         let fill = if focused { th.sel_bg } else { th.sel_bg_dim };
-        let rail = if focused { th.accent } else { th.dim };
-        let rail_glyph = |glyph: char| match glyph {
-            '▄' => '▖',
-            '▀' => '▘',
-            other => other,
-        };
         let mut pad = |glyph: char, row: usize| {
             if let Some(r) = rows_rect(inner, row, 1) {
-                let rest = (inner.width as usize).saturating_sub(1);
                 f.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(
-                            rail_glyph(glyph).to_string(),
-                            Style::default().fg(rail),
-                        ),
-                        Span::styled(
-                            glyph.to_string().repeat(rest),
-                            Style::default().fg(fill),
-                        ),
-                    ])),
+                    Paragraph::new(Line::from(Span::styled(
+                        glyph.to_string().repeat(inner.width as usize),
+                        Style::default().fg(fill),
+                    ))),
                     r,
                 );
             }
@@ -1784,18 +1885,18 @@ fn render_pill(
 fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Projects;
-    let count = Some(app.tree.projects.len()).filter(|n| *n > 0);
+    let count = Some(app.tree.visible_project_count()).filter(|n| *n > 0);
     let inner = draw_column(f, area, "PROJECTS", count, focused, th);
 
-    if app.tree.projects.is_empty() {
+    if !app.tree.has_visible_projects() {
         f.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
-                    "  no projects yet",
+                    format!("{ROW_GUTTER}no projects yet"),
                     Style::default().fg(th.dim),
                 )),
                 Line::from(vec![
-                    Span::styled("  n", Style::default().fg(th.accent)),
+                    Span::styled(format!("{ROW_GUTTER}n"), Style::default().fg(th.accent)),
                     Span::styled(" adds one", Style::default().fg(th.dim)),
                 ]),
             ]),
@@ -1844,16 +1945,13 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                 let todo_badge = todo_badge(*todos, th);
                 let badge_len = todo_badge.as_ref().map_or(0, |(s, _)| s.chars().count());
                 // Bold name: the top of the tree reads "biggest".
-                let mut spans = vec![
-                    status_dot(*roll, th),
-                    Span::styled(
-                        truncate(
-                            text,
-                            (inner.width as usize).saturating_sub(2 + badge_len),
-                        ),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                ];
+                let mut spans = vec![status_dot(*roll, th)];
+                spans.extend(status_name_spans(
+                    truncate(text, (inner.width as usize).saturating_sub(2 + badge_len)),
+                    Style::default().add_modifier(Modifier::BOLD),
+                    sweep_ramp(*roll, th, app.animations),
+                    app.sweep_phase(),
+                ));
                 if let Some((text, style)) = todo_badge {
                     spans.push(Span::styled(text, style));
                 }
@@ -1897,9 +1995,7 @@ fn divider_spans(label: &str, width: u16, th: Theme) -> Vec<Span<'static>> {
         Span::styled("─ ".to_string(), dim),
         Span::styled(
             label,
-            Style::default()
-                .fg(th.muted)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!(" {}", "─".repeat(tail)), dim),
     ]
@@ -1932,10 +2028,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     if worktrees.is_empty() {
-        if !app.tree.projects.is_empty() {
+        if app.tree.has_visible_projects() {
             f.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("  n", Style::default().fg(th.accent)),
+                    Span::styled(format!("{ROW_GUTTER}n"), Style::default().fg(th.accent)),
                     Span::styled(" starts a worktree", Style::default().fg(th.dim)),
                 ])),
                 inner,
@@ -1973,20 +2069,25 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         }
         let todo_badge = todo_badge(*todos, th);
         let badge_len = todo_badge.as_ref().map_or(0, |(s, _)| s.chars().count());
+        let ramp = sweep_ramp(*roll, th, app.animations);
         let mut spans = vec![status_dot(*roll, th)];
         if *is_main {
-            let max = (inner.width as usize)
-                .saturating_sub(2 + ROOT_BADGE.chars().count() + badge_len);
-            spans.push(Span::raw(truncate(branch, max)));
-            spans.push(Span::styled(
-                ROOT_BADGE,
-                Style::default().fg(th.dim),
+            let max =
+                (inner.width as usize).saturating_sub(2 + ROOT_BADGE.chars().count() + badge_len);
+            spans.extend(status_name_spans(
+                truncate(branch, max),
+                Style::default(),
+                ramp,
+                app.sweep_phase(),
             ));
+            spans.push(Span::styled(ROOT_BADGE, Style::default().fg(th.dim)));
         } else {
-            spans.push(Span::raw(truncate(
-                branch,
-                (inner.width as usize).saturating_sub(2 + badge_len),
-            )));
+            spans.extend(status_name_spans(
+                truncate(branch, (inner.width as usize).saturating_sub(2 + badge_len)),
+                Style::default(),
+                ramp,
+                app.sweep_phase(),
+            ));
         }
         if let Some((text, style)) = todo_badge {
             spans.push(Span::styled(text, style));
@@ -2033,7 +2134,7 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     if rows.is_empty() && app.selected_worktree().is_some() {
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("  n", Style::default().fg(th.accent)),
+                Span::styled(format!("{ROW_GUTTER}n"), Style::default().fg(th.accent)),
                 Span::styled(" agent · ", Style::default().fg(th.dim)),
                 Span::styled("T", Style::default().fg(th.accent)),
                 Span::styled(" terminal", Style::default().fg(th.dim)),
@@ -2137,11 +2238,7 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
             screen_row += 1;
         }
         if app.show_archived {
-            for (i, row) in rows
-                .iter()
-                .enumerate()
-                .skip(active_count + terminal_count)
-            {
+            for (i, row) in rows.iter().enumerate().skip(active_count + terminal_count) {
                 if row_rect(inner, screen_row).is_none() {
                     break;
                 }
@@ -2190,7 +2287,19 @@ fn draw_session_row(
             };
             let name_max =
                 (width.saturating_sub(2) as usize).saturating_sub(badge.map_or(0, str::len));
-            let mut spans = vec![dot, Span::styled(truncate(&a.name, name_max), name_style)];
+            // Archived rows stay quiet even if their last status was live.
+            let ramp = if a.archived {
+                None
+            } else {
+                sweep_ramp(Some(a.status), th, app.animations)
+            };
+            let mut spans = vec![dot];
+            spans.extend(status_name_spans(
+                truncate(&a.name, name_max),
+                name_style,
+                ramp,
+                app.sweep_phase(),
+            ));
             if let Some(badge) = badge {
                 spans.push(Span::styled(badge, Style::default().fg(th.dim)));
             }
@@ -2212,14 +2321,7 @@ fn draw_session_row(
     let Some(row_area) = row_rect(inner, top) else {
         return;
     };
-    render_row(
-        f,
-        row_area,
-        spans,
-        index == app.sel_session,
-        focused,
-        th,
-    );
+    render_row(f, row_area, spans, index == app.sel_session, focused, th);
     app.hits.push((row_area, HitTarget::Session(index)));
 }
 
@@ -2258,10 +2360,7 @@ fn terminal_frame(
             Style::default().fg(th.edge)
         };
         f.render_widget(
-            Paragraph::new(Span::styled(
-                "─".repeat(area.width as usize),
-                rule_style,
-            )),
+            Paragraph::new(Span::styled("─".repeat(area.width as usize), rule_style)),
             r,
         );
     }
@@ -2450,9 +2549,7 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
         Span::styled(
             truncate(name, 20),
             if active {
-                Style::default()
-                    .fg(th.accent)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(th.muted)
             },
@@ -2544,7 +2641,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             if view.input.is_some() {
                 "type the note  Enter: save  Esc: cancel"
             } else {
-                "o: add  Enter: edit  Space: toggle done  d: delete  Esc: close"
+                "t: add  Enter: edit  Space: toggle done  d: delete  Esc: close"
             },
             Style::default().fg(th.dim),
         )
@@ -2553,11 +2650,13 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             "↑/↓: select  Enter: open session  Esc: close  (refreshes every 2s)",
             Style::default().fg(th.dim),
         )
-    } else if app.overlay.is_some() {
+    } else if matches!(&app.overlay, Some(Overlay::Menu(m)) if m.is_workspace_picker()) {
         Span::styled(
-            "Esc: close  Enter: confirm",
+            "Enter: open  n: new  r: rename  d: delete  Esc: close",
             Style::default().fg(th.dim),
         )
+    } else if app.overlay.is_some() {
+        Span::styled("Esc: close  Enter: confirm", Style::default().fg(th.dim))
     } else {
         let text = match app.focus {
             Focus::Terminal if app.term.as_ref().is_some_and(|t| t.exited) => {
@@ -2572,10 +2671,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 Some(ProjectRow::Divider { .. }) => {
                     "Enter/r: label  d: delete divider  ⇧J/K: move  m: menu  ?: help"
                 }
-                _ => "n: add  o: todos  d: remove  -: divider  ⇧J/K: move  /: search  m: menu  ?: help",
+                _ => "n/o: add  t: todos  d: remove  -: divider  ⇧J/K: move  /: search  m: menu  ?: help",
             },
             Focus::Worktrees => {
-                "n: new worktree  o: todos  T: terminal  p: pin  d: delete  /: search  m: menu  ?: help"
+                "n: new worktree  t: todos  T: terminal  p: pin  d: delete  /: search  m: menu  ?: help"
             }
             Focus::Sessions => {
                 "↵: focus  n: agent  T: terminal  r: rename  p: pin  a: archive  d: del  m: menu  ?: help"
@@ -2587,6 +2686,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     // hostname only earns a slot when it's a remote session, and the
     // connection state only when something is wrong.
     let mut spans = vec![Span::raw(" ")];
+    // The open workspace leads the bar — it scopes everything else shown.
+    spans.push(Span::styled(
+        format!("◇ {}", truncate(app.tree.active_workspace_name(), 20)),
+        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled("  ·  ", Style::default().fg(th.dim)));
     if app.is_remote {
         spans.push(Span::styled(
             truncate(&app.hostname, 24),
@@ -2730,9 +2835,7 @@ fn fuzzy_highlight_spans(shown: &str, positions: &[usize], th: Theme) -> Vec<Spa
     if positions.is_empty() {
         return vec![Span::raw(shown.to_string())];
     }
-    let hl = Style::default()
-        .fg(th.accent)
-        .add_modifier(Modifier::BOLD);
+    let hl = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
     let mut spans = Vec::new();
     let mut run = String::new();
     let mut run_hl = false;
@@ -2803,5 +2906,100 @@ fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RAMP: [Color; 3] = [Color::Yellow, Color::Indexed(220), Color::Indexed(230)];
+
+    fn colors(spans: &[Span]) -> Vec<Color> {
+        spans.iter().map(|s| s.style.fg.unwrap()).collect()
+    }
+
+    /// The sweep must recolor cells without ever changing what they spell.
+    #[test]
+    fn sweep_spans_preserve_text() {
+        for phase in 0..12 {
+            let spans = sweep_spans("run", Style::default(), RAMP, phase);
+            let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(text, "run", "phase {phase}");
+        }
+    }
+
+    #[test]
+    fn sweep_band_marches_then_pauses() {
+        // Phase 1 on "run": head on 'u' (bright + bold), mid trailing on
+        // 'r', tail ahead on 'n'.
+        let spans = sweep_spans("run", Style::default(), RAMP, 1);
+        assert_eq!(colors(&spans), vec![RAMP[1], RAMP[2], RAMP[0]]);
+        assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert!(!spans[0].style.add_modifier.contains(Modifier::BOLD));
+        // Off-text phases: the whole word rests on the tail shade.
+        let spans = sweep_spans("run", Style::default(), RAMP, 5);
+        assert_eq!(colors(&spans), vec![RAMP[0]; 3]);
+        // The period is len + gap (3 + 4), so phase 7 restarts the pass.
+        assert_eq!(
+            colors(&sweep_spans("run", Style::default(), RAMP, 7)),
+            colors(&sweep_spans("run", Style::default(), RAMP, 0)),
+        );
+    }
+
+    /// Only yellow (running) and red (needs feedback) animate; every other
+    /// status renders still text, and the animations setting kills even
+    /// those two.
+    #[test]
+    fn sweep_ramp_gates_on_live_statuses_and_the_setting() {
+        let th = Theme::default();
+        assert_eq!(
+            sweep_ramp(Some(AgentStatus::Running), th, true),
+            Some(th.warn_sweep)
+        );
+        assert_eq!(
+            sweep_ramp(Some(AgentStatus::NeedsFeedback), th, true),
+            Some(th.err_sweep)
+        );
+        for status in [
+            AgentStatus::Fresh,
+            AgentStatus::Finished,
+            AgentStatus::Terminated,
+            AgentStatus::Disconnected,
+        ] {
+            assert_eq!(sweep_ramp(Some(status), th, true), None, "{status:?}");
+        }
+        assert_eq!(sweep_ramp(None, th, true), None);
+        assert_eq!(sweep_ramp(Some(AgentStatus::Running), th, false), None);
+        assert_eq!(
+            sweep_ramp(Some(AgentStatus::NeedsFeedback), th, false),
+            None
+        );
+    }
+
+    /// The tint fills every untouched cell of the panel rect — and only
+    /// those: a selection fill keeps its own, and cells outside the rect
+    /// stay untinted.
+    #[test]
+    fn focus_tint_fills_panel_and_skips_painted_cells() {
+        let th = Theme::default();
+        let area = Rect::new(1, 1, 3, 4);
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 5, 6));
+        buf.cell_mut((2, 2)).unwrap().bg = th.sel_bg;
+        draw_focus_tint(&mut buf, area, th);
+        let bg = |x, y| buf.cell((x, y)).unwrap().bg;
+        for y in 1..5 {
+            for x in 1..4 {
+                if (x, y) == (2, 2) {
+                    assert_eq!(bg(x, y), th.sel_bg, "painted cell must keep its fill");
+                } else {
+                    assert_eq!(bg(x, y), th.focus_tint, "({x},{y})");
+                }
+            }
+        }
+        assert_eq!(bg(0, 1), Color::Reset, "left of the panel");
+        assert_eq!(bg(4, 1), Color::Reset, "right of the panel");
+        assert_eq!(bg(1, 0), Color::Reset, "above the panel");
+        assert_eq!(bg(1, 5), Color::Reset, "below the panel");
     }
 }

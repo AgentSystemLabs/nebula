@@ -1,4 +1,4 @@
-//! Full-worktree tree browser (`t`): directory tree left, file preview
+//! Full-worktree tree browser (`b`): directory tree left, file preview
 //! right, with an always-live fuzzy filter that narrows the tree to the
 //! matching files and the hierarchies containing them.
 
@@ -390,7 +390,10 @@ fn read_preview(path: &std::path::Path) -> Result<String, String> {
         Err(e) => return Err(format!("couldn't read file: {e}")),
     };
     let mut bytes = Vec::new();
-    if let Err(e) = file.take((MAX_PREVIEW_BYTES + 1) as u64).read_to_end(&mut bytes) {
+    if let Err(e) = file
+        .take((MAX_PREVIEW_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+    {
         return Err(format!("couldn't read file: {e}"));
     }
     if bytes.iter().take(8192).any(|b| *b == 0) {
@@ -605,7 +608,11 @@ mod tests {
         assert_eq!(b.preview_line_count, 2);
         b.filter = "gone".into();
         b.apply_filter();
-        assert!(b.preview.starts_with("couldn't read file:"), "{}", b.preview);
+        assert!(
+            b.preview.starts_with("couldn't read file:"),
+            "{}",
+            b.preview
+        );
     }
 
     #[test]

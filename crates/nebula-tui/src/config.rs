@@ -72,6 +72,8 @@ pub enum SettingKind {
     RecentWindow,
     SessionIdleTimeout,
     Theme,
+    Animations,
+    FocusTint,
     ClaudeModel,
     ClaudeEffort,
     CodexModel,
@@ -111,11 +113,23 @@ pub const SETTING_GROUPS: &[SettingGroup] = &[
     },
     SettingGroup {
         title: "APPEARANCE",
-        settings: &[SettingSpec {
-            kind: SettingKind::Theme,
-            label: "Color theme",
-            hint: "Accent colors used across the panels and overlays",
-        }],
+        settings: &[
+            SettingSpec {
+                kind: SettingKind::Theme,
+                label: "Color theme",
+                hint: "Accent colors used across the panels and overlays",
+            },
+            SettingSpec {
+                kind: SettingKind::Animations,
+                label: "Animations",
+                hint: "Status text sweep and splash motion (off = fewer repaints)",
+            },
+            SettingSpec {
+                kind: SettingKind::FocusTint,
+                label: "Focused panel tint",
+                hint: "Faint accent-colored background on the focused panel",
+            },
+        ],
     },
     SettingGroup {
         title: "AGENT DEFAULTS",
@@ -208,6 +222,13 @@ pub struct Config {
     /// Color theme name (see `theme::THEMES`). Unknown names fall back to
     /// the default theme.
     pub theme: String,
+    /// Master switch for the TUI's animations (the running/needs-feedback
+    /// status-text sweep and the splash's motion). Off trades them for
+    /// fewer repaints on constrained machines.
+    pub animations: bool,
+    /// Faint accent-tinted background fill on the focused panel. Off by
+    /// default — it's a taste call, not everyone wants the extra color.
+    pub focus_tint: bool,
     /// Default model/effort for new Claude / Codex sessions. "default"
     /// means "don't pass the flag" (the CLI picks); any other value is
     /// passed through verbatim, so hand-edited configs can name models the
@@ -226,6 +247,8 @@ impl Default for Config {
             recent_window: "30m".into(),
             session_idle_timeout: "5m".into(),
             theme: "default".into(),
+            animations: true,
+            focus_tint: false,
             claude_model: "default".into(),
             claude_effort: "default".into(),
             codex_model: "default".into(),
@@ -277,6 +300,8 @@ impl Config {
             serde_json::json!(self.session_idle_timeout),
         );
         obj.insert("theme".into(), serde_json::json!(self.theme));
+        obj.insert("animations".into(), serde_json::json!(self.animations));
+        obj.insert("focus_tint".into(), serde_json::json!(self.focus_tint));
         obj.insert("claude_model".into(), serde_json::json!(self.claude_model));
         obj.insert(
             "claude_effort".into(),
@@ -334,6 +359,8 @@ impl Config {
             SettingKind::RecentWindow => self.recent_window.clone(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
             SettingKind::Theme => self.theme.clone(),
+            SettingKind::Animations => on_off(self.animations).into(),
+            SettingKind::FocusTint => on_off(self.focus_tint).into(),
             SettingKind::ClaudeModel => self.claude_model.clone(),
             SettingKind::ClaudeEffort => self.claude_effort.clone(),
             SettingKind::CodexModel => self.codex_model.clone(),
@@ -364,6 +391,12 @@ impl Config {
             }
             SettingKind::Theme => {
                 self.theme = cycle_choice(&self.theme, crate::theme::THEMES, step).into();
+            }
+            SettingKind::Animations => {
+                self.animations = !self.animations;
+            }
+            SettingKind::FocusTint => {
+                self.focus_tint = !self.focus_tint;
             }
             SettingKind::ClaudeModel => {
                 self.claude_model = cycle_choice(&self.claude_model, CLAUDE_MODELS, step).into();
@@ -554,6 +587,44 @@ mod tests {
     }
 
     #[test]
+    fn animations_default_on_toggle_and_persist() {
+        let mut cfg = Config::default();
+        assert!(cfg.animations);
+        let row = settings()
+            .position(|s| s.kind == SettingKind::Animations)
+            .unwrap();
+        cfg.cycle(row, 0);
+        assert!(!cfg.animations);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(!load_from(&path).animations);
+        // A config predating the key keeps animations on.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.animations);
+    }
+
+    #[test]
+    fn focus_tint_default_off_toggle_and_persist() {
+        let mut cfg = Config::default();
+        assert!(!cfg.focus_tint);
+        let row = settings()
+            .position(|s| s.kind == SettingKind::FocusTint)
+            .unwrap();
+        cfg.cycle(row, 0);
+        assert!(cfg.focus_tint);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).focus_tint);
+        // A config predating the key keeps the tint off.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.focus_tint);
+    }
+
+    #[test]
     fn model_effort_defaults_resolve_and_cycle() {
         let mut cfg = Config::default();
         // "default" everywhere → no flags for any kind.
@@ -564,10 +635,16 @@ mod tests {
 
         cfg.claude_model = "opus".into();
         cfg.codex_effort = "high".into();
-        assert_eq!(cfg.default_model(AgentKind::Claude).as_deref(), Some("opus"));
+        assert_eq!(
+            cfg.default_model(AgentKind::Claude).as_deref(),
+            Some("opus")
+        );
         assert_eq!(cfg.default_effort(AgentKind::Claude), None);
         assert_eq!(cfg.default_model(AgentKind::Codex), None);
-        assert_eq!(cfg.default_effort(AgentKind::Codex).as_deref(), Some("high"));
+        assert_eq!(
+            cfg.default_effort(AgentKind::Codex).as_deref(),
+            Some("high")
+        );
         // Cursor has no model/effort knobs regardless of settings.
         assert_eq!(cfg.default_model(AgentKind::Cursor), None);
         assert_eq!(cfg.default_effort(AgentKind::Cursor), None);
@@ -585,7 +662,10 @@ mod tests {
             .position(|s| s.kind == SettingKind::CodexEffort)
             .unwrap();
         cfg.cycle(row, 0);
-        assert_eq!(cfg.codex_effort, "xhigh", "activate steps forward from high");
+        assert_eq!(
+            cfg.codex_effort, "xhigh",
+            "activate steps forward from high"
+        );
     }
 
     #[test]

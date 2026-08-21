@@ -198,7 +198,10 @@ fn line_suffix(rest: &[(char, (u16, u16))]) -> (Option<u64>, usize) {
     if rest.first().is_some_and(|&(c, _)| c == ':') {
         let d = digits(1);
         // Digits running into a word (":12abc") are not a line reference.
-        let word_after = |at: usize| rest.get(at).is_some_and(|&(c, _)| c.is_ascii_alphanumeric());
+        let word_after = |at: usize| {
+            rest.get(at)
+                .is_some_and(|&(c, _)| c.is_ascii_alphanumeric())
+        };
         if d > 0 && !word_after(1 + d) {
             let line: u64 = rest[1..1 + d]
                 .iter()
@@ -261,11 +264,11 @@ fn path_qualifies(token: &str, has_line: bool) -> bool {
 
 /// Extensions that make a bare (slash-less) filename clickable.
 const KNOWN_EXTENSIONS: &[&str] = &[
-    "bash", "c", "cc", "cfg", "cjs", "conf", "cpp", "cs", "css", "dart", "env", "erl", "ex",
-    "exs", "fish", "go", "gql", "graphql", "h", "hpp", "hs", "htm", "html", "ini", "ipynb",
-    "java", "js", "json", "jsx", "kt", "kts", "less", "lock", "lua", "md", "mjs", "php",
-    "prisma", "proto", "py", "rb", "rs", "scss", "sh", "sql", "svelte", "swift", "tf", "toml",
-    "ts", "tsx", "txt", "vue", "xml", "yaml", "yml", "zig", "zsh",
+    "bash", "c", "cc", "cfg", "cjs", "conf", "cpp", "cs", "css", "dart", "env", "erl", "ex", "exs",
+    "fish", "go", "gql", "graphql", "h", "hpp", "hs", "htm", "html", "ini", "ipynb", "java", "js",
+    "json", "jsx", "kt", "kts", "less", "lock", "lua", "md", "mjs", "php", "prisma", "proto", "py",
+    "rb", "rs", "scss", "sh", "sql", "svelte", "swift", "tf", "toml", "ts", "tsx", "txt", "vue",
+    "xml", "yaml", "yml", "zig", "zsh",
 ];
 
 /// Characters a path token may contain. `:`, `#` and `†` are excluded —
@@ -396,11 +399,12 @@ mod tests {
 
     #[test]
     fn line_col_and_github_and_codex_suffixes() {
-        let files = screen_files(80, "a src/x.ts:12:5 b src/y.go#L7 c src/z.py\u{2020}L42".as_bytes());
-        let got: Vec<(&str, Option<u64>)> = files
-            .iter()
-            .map(|f| (f.path.as_str(), f.line))
-            .collect();
+        let files = screen_files(
+            80,
+            "a src/x.ts:12:5 b src/y.go#L7 c src/z.py\u{2020}L42".as_bytes(),
+        );
+        let got: Vec<(&str, Option<u64>)> =
+            files.iter().map(|f| (f.path.as_str(), f.line)).collect();
         assert_eq!(
             got,
             [
@@ -428,7 +432,10 @@ mod tests {
 
     #[test]
     fn bare_filenames_need_a_known_extension() {
-        assert_eq!(screen_files(80, b"check Cargo.toml please")[0].path, "Cargo.toml");
+        assert_eq!(
+            screen_files(80, b"check Cargo.toml please")[0].path,
+            "Cargo.toml"
+        );
         assert!(screen_files(80, b"visit example.com today").is_empty());
         assert!(screen_files(80, b"e.g. this, i.e. that").is_empty());
     }

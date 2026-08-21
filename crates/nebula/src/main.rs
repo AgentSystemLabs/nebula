@@ -46,6 +46,12 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Manage workspaces — named project groups; one is open at a time and
+    /// the TUI scopes its project list (and `/` search) to it.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
     /// Open nebula on a remote host over ssh (installs it there if missing).
     Ssh {
         /// ssh destination, passed verbatim (e.g. user@server).
@@ -71,14 +77,44 @@ enum Command {
     StaleDaemonNote,
 }
 
+#[derive(Subcommand)]
+enum WorkspaceCommand {
+    /// Create a workspace (does not open it).
+    Add { name: String },
+    /// Open a workspace: projects (and the TUI, live) scope to it.
+    Open { name: String },
+    /// List workspaces; `*` marks the open one.
+    List,
+    /// Delete an empty workspace.
+    Delete { name: String },
+    /// Rename a workspace.
+    Rename { name: String, new_name: String },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Daemon { foreground }) => {
             init_daemon_logging(foreground)?;
-            log_fatal(nebula_daemon::run_daemon(), nebula_core::paths::daemon_log_path())
+            log_fatal(
+                nebula_daemon::run_daemon(),
+                nebula_core::paths::daemon_log_path(),
+            )
         }
         Some(Command::Add { path }) => nebula_tui::run_add_project(path),
+        Some(Command::Workspace { command }) => {
+            use nebula_tui::WorkspaceOp;
+            let op = match command {
+                WorkspaceCommand::Add { name } => WorkspaceOp::Add { name },
+                WorkspaceCommand::Open { name } => WorkspaceOp::Open { name },
+                WorkspaceCommand::List => WorkspaceOp::List,
+                WorkspaceCommand::Delete { name } => WorkspaceOp::Delete { name },
+                WorkspaceCommand::Rename { name, new_name } => {
+                    WorkspaceOp::Rename { name, new_name }
+                }
+            };
+            nebula_tui::run_workspace(op)
+        }
         Some(Command::Kill) => nebula_tui::run_kill(),
         Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),
         Some(Command::Ssh { host, path }) => ssh::run_ssh(&host, path.as_deref()),

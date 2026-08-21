@@ -1,14 +1,14 @@
 use crate::entities::{
     Agent, AgentKind, AgentStatus, Entity, EntityId, Project, TerminalTab, Todo, TodoOwner,
-    Worktree,
+    Workspace, Worktree,
 };
-use crate::ids::{AgentId, ProjectId, TerminalId, TodoId, WorktreeId};
+use crate::ids::{AgentId, ProjectId, TerminalId, TodoId, WorkspaceId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -50,6 +50,29 @@ pub enum ClientRequest {
     },
 
     // -- entity CRUD (RPC-style; answered by Ack/Error with matching req_id) --
+    /// Create a workspace. Does not open it — that stays a separate step.
+    AddWorkspace {
+        req_id: u64,
+        name: String,
+    },
+    /// Delete a workspace. Refused while it still holds projects, or when it
+    /// is the last workspace. Deleting the open workspace opens another one
+    /// first (broadcast as ActiveWorkspaceChanged).
+    RemoveWorkspace {
+        req_id: u64,
+        id: WorkspaceId,
+    },
+    RenameWorkspace {
+        req_id: u64,
+        id: WorkspaceId,
+        name: String,
+    },
+    /// Make this the open workspace — daemon-global state, persisted and
+    /// broadcast to every client as ActiveWorkspaceChanged.
+    OpenWorkspace {
+        req_id: u64,
+        id: WorkspaceId,
+    },
     AddProject {
         req_id: u64,
         path: PathBuf,
@@ -160,7 +183,9 @@ pub enum ClientRequest {
         name: String,
     },
     /// Re-home the agent row under another worktree of the same project.
-    /// The live PTY is untouched; the next respawn uses the new path.
+    /// A live PTY is killed and respawned (resumed) in the new path — left
+    /// running, its hooks would keep reporting the old checkout's cwd and
+    /// the daemon would re-home the row right back.
     MoveAgent {
         req_id: u64,
         id: AgentId,
@@ -276,6 +301,9 @@ pub enum ServerEvent {
         daemon_protocol_version: u32,
     },
     Snapshot {
+        workspaces: Vec<Workspace>,
+        /// The open workspace clients scope their project lists to.
+        active_workspace: WorkspaceId,
         projects: Vec<Project>,
         worktrees: Vec<Worktree>,
         agents: Vec<Agent>,
@@ -299,6 +327,11 @@ pub enum ServerEvent {
     },
     EntityRemoved {
         id: EntityId,
+    },
+    /// A different workspace was opened (`nebula workspace open`, or the
+    /// TUI's switcher — daemon-global, so every client follows).
+    ActiveWorkspaceChanged {
+        id: WorkspaceId,
     },
     StatusChanged {
         agent: AgentId,

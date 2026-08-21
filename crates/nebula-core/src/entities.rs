@@ -1,4 +1,4 @@
-use crate::ids::{AgentId, ProjectId, TerminalId, TodoId, WorktreeId};
+use crate::ids::{AgentId, ProjectId, TerminalId, TodoId, WorkspaceId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -83,10 +83,22 @@ impl AgentKind {
     }
 }
 
+/// A named group of projects. Exactly one workspace is "open" at a time
+/// (daemon-global state); the TUI shows only the open workspace's projects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workspace {
+    pub id: WorkspaceId,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: ProjectId,
     pub name: String,
+    /// The workspace this project lives in. Defaults to the built-in
+    /// `default` workspace for rows that predate workspaces.
+    #[serde(default)]
+    pub workspace_id: WorkspaceId,
     pub repo_path: PathBuf,
     pub sort_order: i64,
     /// Draw a group divider under this row. Dividers belong to list
@@ -181,6 +193,7 @@ pub struct Todo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Entity {
+    Workspace(Workspace),
     Project(Project),
     Worktree(Worktree),
     Agent(Agent),
@@ -190,6 +203,7 @@ pub enum Entity {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EntityId {
+    Workspace(WorkspaceId),
     Project(ProjectId),
     Worktree(WorktreeId),
     Agent(AgentId),

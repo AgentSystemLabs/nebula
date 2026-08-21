@@ -3,11 +3,16 @@
 use crate::git_diff::DiffFile;
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Project, ProjectId, SessionRef, TerminalId,
-    TerminalTab, Todo, TodoId, TodoOwner, Worktree, WorktreeId,
+    TerminalTab, Todo, TodoId, TodoOwner, Workspace, WorkspaceId, Worktree, WorktreeId,
 };
 use ratatui::layout::Rect;
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+/// Frame duration of the status-sweep text animation: the event loop's
+/// repaint cadence while [`App::status_anim_active`] holds, and the step
+/// size of [`App::sweep_phase`] (one text cell per frame).
+pub const SWEEP_FRAME: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Wall-clock epoch ms, comparable to the daemon's `status_changed_at`.
 pub fn now_ms() -> i64 {
@@ -95,6 +100,10 @@ pub enum MenuAction {
     DeleteWorktree(WorktreeId),
     AddProject,
     RemoveProject(ProjectId),
+    /// Workspace-switcher row: open this workspace. The switcher's other
+    /// verbs are keys, not rows — n: new, r: rename, d: delete (footer
+    /// hints, the todos-modal pattern).
+    OpenWorkspace(WorkspaceId),
     SetProjectDivider {
         id: ProjectId,
         before: bool,
@@ -161,6 +170,24 @@ pub struct ContextMenu {
     pub parent: Option<Box<ContextMenu>>,
 }
 
+impl ContextMenu {
+    /// Is this the `w` workspace switcher? Its rows are all OpenWorkspace,
+    /// which gates the switcher-only keys (n/r/d) and its footer hint.
+    pub fn is_workspace_picker(&self) -> bool {
+        self.items
+            .iter()
+            .any(|i| matches!(i.action, MenuAction::OpenWorkspace(_)))
+    }
+
+    /// The workspace under the switcher's cursor, if this is the switcher.
+    pub fn hovered_workspace(&self) -> Option<WorkspaceId> {
+        match &self.items.get(self.hover)?.action {
+            MenuAction::OpenWorkspace(id) => Some(id.clone()),
+            _ => None,
+        }
+    }
+}
+
 /// Destructive action waiting behind a confirmation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PendingAction {
@@ -215,6 +242,11 @@ pub enum PromptKind {
     RenameTerminal {
         id: TerminalId,
     },
+    /// Name for a workspace created from the switcher; opened on Ack.
+    NewWorkspace,
+    RenameWorkspace {
+        id: WorkspaceId,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -223,14 +255,113 @@ pub struct PromptDialog {
     pub label: String,
     pub input: String,
     pub kind: PromptKind,
-    /// Tab-completion candidates to display (path prompts only).
-    pub candidates: Vec<String>,
+    /// Live directory listing under the input (path prompts only): the
+    /// typed parent's subdirectories narrowed by the partial segment.
+    pub dirs: Vec<crate::completion::DirEntry>,
+    /// Listing row highlighted by ↓↑; None = the typed path itself.
+    pub hover: Option<usize>,
+    /// Screen rect of the listing rows, written during draw for click
+    /// hit-testing.
+    pub list_area: Rect,
 }
 
 impl PromptDialog {
+    pub fn new(
+        title: impl Into<String>,
+        label: impl Into<String>,
+        input: impl Into<String>,
+        kind: PromptKind,
+    ) -> Self {
+        let mut prompt = Self {
+            title: title.into(),
+            label: label.into(),
+            input: input.into(),
+            kind,
+            dirs: Vec::new(),
+            hover: None,
+            list_area: Rect::default(),
+        };
+        prompt.refresh_dirs();
+        prompt
+    }
+
     /// Does Tab complete filesystem paths in this prompt?
     pub fn completes_paths(&self) -> bool {
         matches!(self.kind, PromptKind::AddProject)
+    }
+
+    fn home() -> Option<std::path::PathBuf> {
+        std::env::var_os("HOME").map(std::path::PathBuf::from)
+    }
+
+    /// Recompute `dirs` from `input` after any edit; the hover returns to
+    /// the input row. Non-path prompts keep an empty listing.
+    pub fn refresh_dirs(&mut self) {
+        self.hover = None;
+        self.dirs = if self.completes_paths() {
+            crate::completion::list_dirs(&self.input, Self::home().as_deref())
+        } else {
+            Vec::new()
+        };
+    }
+
+    /// Full path of the hovered listing row (typed parent + entry name).
+    pub fn hovered_path(&self) -> Option<String> {
+        let entry = self.dirs.get(self.hover?)?;
+        let (parent, _) = crate::completion::split_input(&self.input);
+        Some(format!("{parent}{}", entry.name))
+    }
+
+    /// ↓↑ over the listing; Up from the first row returns to the input.
+    pub fn move_hover(&mut self, delta: i32) {
+        if self.dirs.is_empty() {
+            return;
+        }
+        let next = self.hover.map_or(-1, |h| h as i32) + delta;
+        self.hover = (next >= 0).then(|| (next as usize).min(self.dirs.len() - 1));
+    }
+
+    /// → (or a click) on listing row `i`: step into that directory.
+    pub fn dive(&mut self, i: usize) {
+        let Some(entry) = self.dirs.get(i) else {
+            return;
+        };
+        let (parent, _) = crate::completion::split_input(&self.input);
+        self.input = format!("{parent}{}/", entry.name);
+        self.refresh_dirs();
+    }
+
+    /// ← steps up: a typed partial segment is cleared first; from a bare
+    /// "dir/" the last segment is dropped. "~/" expands so browsing keeps
+    /// working above the home directory.
+    pub fn ascend(&mut self) {
+        let (parent, partial) = crate::completion::split_input(&self.input);
+        if !partial.is_empty() {
+            self.input = parent.to_string();
+            self.refresh_dirs();
+            return;
+        }
+        let mut path = self.input.clone();
+        if path == "~/" {
+            match Self::home() {
+                Some(home) => path = format!("{}/", home.display()),
+                None => return,
+            }
+        }
+        if path.len() <= 1 {
+            return; // "" or "/" — nowhere further up
+        }
+        path.pop(); // the trailing '/'
+        let cut = path.rfind('/').map(|i| i + 1).unwrap_or(0);
+        path.truncate(cut);
+        self.input = path;
+        self.refresh_dirs();
+    }
+
+    /// First visible listing row of the stateless follow-window for a list
+    /// `height` rows tall.
+    pub fn window_start(&self, height: usize) -> usize {
+        self.hover.map_or(0, |h| h + 1).saturating_sub(height)
     }
 }
 
@@ -546,17 +677,23 @@ impl Palette {
 
 /// Every jumpable entity: projects in tree order, then each project's
 /// worktrees, then each worktree's sessions. Archived sessions appear only
-/// when the archived toggle is on (the Sessions panel rule).
+/// when the archived toggle is on (the Sessions panel rule). Scoped to the
+/// open workspace — `/` never searches across other workspaces.
 fn build_palette_items(tree: &Tree, show_archived: bool) -> Vec<PaletteItem> {
+    let projects: Vec<&Project> = tree
+        .projects
+        .iter()
+        .filter(|p| tree.in_active_workspace(p))
+        .collect();
     let mut items = Vec::new();
-    for p in &tree.projects {
+    for p in &projects {
         items.push(PaletteItem {
             target: PaletteTarget::Project(p.id.clone()),
             text: p.name.clone(),
             archived: false,
         });
     }
-    for p in &tree.projects {
+    for p in &projects {
         for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
             items.push(PaletteItem {
                 target: PaletteTarget::Worktree(w.id.clone()),
@@ -565,7 +702,7 @@ fn build_palette_items(tree: &Tree, show_archived: bool) -> Vec<PaletteItem> {
             });
         }
     }
-    for p in &tree.projects {
+    for p in &projects {
         for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
             for a in tree.agents.iter().filter(|a| a.worktree_id == w.id) {
                 if a.archived && !show_archived {
@@ -801,8 +938,13 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
-    pub fn new() -> Self {
-        Self::default()
+    /// `selected` is the remembered cursor row (`App::settings_selected`),
+    /// clamped in case the settings list ever shrinks between builds.
+    pub fn new(selected: usize) -> Self {
+        Self {
+            selected: selected.min(crate::config::settings_len().saturating_sub(1)),
+            area: Rect::default(),
+        }
     }
 }
 
@@ -874,6 +1016,9 @@ pub enum PendingIntent {
     SelectCreatedWorktree,
     /// Move the todo modal's cursor onto the created todo.
     SelectCreatedTodo,
+    /// Open the workspace this Ack just created (switcher's "New workspace…"
+    /// flow: creating from there means you want to be in it).
+    OpenCreatedWorkspace,
     /// Worktree removed optimistically; restore these rows on Error.
     DeleteWorktree(WorktreeRollback),
     None,
@@ -954,14 +1099,52 @@ fn rollup(statuses: impl Iterator<Item = AgentStatus>) -> Option<AgentStatus> {
     best
 }
 
-/// Client-side mirror of the entity tree.
+/// Client-side mirror of the entity tree. `projects` holds EVERY workspace's
+/// projects; the view layer scopes to `active_workspace` (see
+/// [`App::project_rows`] and [`build_palette_items`]), so a workspace switch
+/// is a pure re-filter — no refetch, and background workspaces keep
+/// receiving status updates.
 #[derive(Debug, Clone, Default)]
 pub struct Tree {
+    pub workspaces: Vec<Workspace>,
+    /// The open workspace (daemon-global; every client shows the same one).
+    pub active_workspace: WorkspaceId,
     pub projects: Vec<Project>,
     pub worktrees: Vec<Worktree>,
     pub agents: Vec<Agent>,
     pub terminals: Vec<TerminalTab>,
     pub todos: Vec<Todo>,
+}
+
+impl Tree {
+    /// Is this project in the open workspace (i.e. visible)?
+    pub fn in_active_workspace(&self, p: &Project) -> bool {
+        p.workspace_id == self.active_workspace
+    }
+
+    /// Display name of the open workspace, for the footer and switcher.
+    pub fn active_workspace_name(&self) -> &str {
+        self.workspaces
+            .iter()
+            .find(|w| w.id == self.active_workspace)
+            .map(|w| w.name.as_str())
+            .unwrap_or("default")
+    }
+
+    /// Any project visible in the open workspace? (The splash and the
+    /// empty-panel hints key off this, not the raw project list — other
+    /// workspaces' projects don't count.)
+    pub fn has_visible_projects(&self) -> bool {
+        self.projects.iter().any(|p| self.in_active_workspace(p))
+    }
+
+    /// Visible-project count for the PROJECTS panel header.
+    pub fn visible_project_count(&self) -> usize {
+        self.projects
+            .iter()
+            .filter(|p| self.in_active_workspace(p))
+            .count()
+    }
 }
 
 pub struct AttachedTerm {
@@ -1134,6 +1317,8 @@ pub struct App {
     pub panel_widths: [u16; 3],
     /// File-list width of the diff modal, remembered across opens.
     pub diff_files_width: u16,
+    /// Cursor row of the settings modal, remembered across opens.
+    pub settings_selected: usize,
     /// In-progress splitter drag, if any.
     pub splitter_drag: Option<SplitterDrag>,
     /// Body rect (everything above the footer) from the last draw; bounds
@@ -1174,12 +1359,22 @@ pub struct App {
     /// This TUI process's own RSS, sampled alongside each metrics request
     /// (the daemon can't see us).
     pub client_rss_bytes: u64,
-    /// Launch instant; the first-run splash animation is a pure function
-    /// of time elapsed since this.
+    /// Launch instant; the first-run splash animation and the status-sweep
+    /// text animation are pure functions of time elapsed since this. (The
+    /// N-key splash preview resets it to restart the fade-in — the sweep
+    /// isn't visible under the splash, so the phase jump never shows.)
     pub splash_epoch: std::time::Instant,
     /// Splash summoned on demand (N) with a populated tree; any key
     /// dismisses it.
     pub splash_preview: bool,
+    /// The `animations` setting: master switch for the status-text sweep
+    /// and the splash's motion (off = fewer repaints). Mirrors the config,
+    /// refreshed at startup and when the settings overlay applies a change.
+    pub animations: bool,
+    /// The `focus_tint` setting: paints the focused panel's background
+    /// with a faint accent tint. Off by default; mirrors the config,
+    /// refreshed at startup and when the settings overlay applies a change.
+    pub focus_tint: bool,
 }
 
 impl Default for App {
@@ -1224,6 +1419,7 @@ impl App {
             term_file_links: Vec::new(),
             panel_widths: DEFAULT_PANEL_WIDTHS,
             diff_files_width: DEFAULT_DIFF_FILES_W,
+            settings_selected: 0,
             splitter_drag: None,
             body_area: Rect::default(),
             hostname: nebula_core::host::hostname(),
@@ -1239,16 +1435,42 @@ impl App {
             client_rss_bytes: 0,
             splash_epoch: std::time::Instant::now(),
             splash_preview: false,
+            animations: true,
+            focus_tint: false,
         }
     }
 
     /// The animated splash is on screen and should be ticking: nothing in
     /// the tree yet (first run) or summoned with N, panels not collapsed,
-    /// no editor modal covering the body.
+    /// no editor modal covering the body, animations enabled (off, the
+    /// splash still draws — as a still frame).
     pub fn splash_active(&self) -> bool {
-        (self.tree.projects.is_empty() || self.splash_preview)
+        self.animations
+            && (!self.tree.has_visible_projects() || self.splash_preview)
             && !self.collapsed
             && self.vim.is_none()
+    }
+
+    /// Some sidebar row is showing a running (yellow) or needs-feedback
+    /// (red) status, so its text sweep should be ticking. Any live agent in
+    /// one of those states surfaces somewhere — its own row, or a worktree /
+    /// project rollup — unless the panels are hidden (collapsed, editor
+    /// modal, splash) or animations are switched off.
+    pub fn status_anim_active(&self) -> bool {
+        self.animations
+            && !self.collapsed
+            && self.vim.is_none()
+            && !self.splash_active()
+            && self.tree.agents.iter().any(|a| {
+                !a.archived && matches!(a.status, AgentStatus::Running | AgentStatus::NeedsFeedback)
+            })
+    }
+
+    /// Frame counter for the status-sweep text animation — a pure function
+    /// of elapsed time (same model as the splash), so a missed tick just
+    /// skips ahead instead of stuttering.
+    pub fn sweep_phase(&self) -> usize {
+        (self.splash_epoch.elapsed().as_millis() / SWEEP_FRAME.as_millis()) as usize
     }
 
     /// Screen x of splitter `idx` — the column where the panel to its right
@@ -1297,15 +1519,22 @@ impl App {
 
     /// Projects panel rows in display order: the leading divider (when
     /// present), then each project with its divider directly below it.
+    /// Scoped to the open workspace — rows index the FULL `tree.projects`
+    /// list but other workspaces' projects get no row.
     pub fn project_rows(&self) -> Vec<ProjectRow> {
         let mut rows = Vec::with_capacity(self.tree.projects.len() + 1);
-        if self.tree.projects.first().is_some_and(|p| p.divider_before) {
-            rows.push(ProjectRow::Divider {
-                project: 0,
-                before: true,
-            });
-        }
+        let mut first = true;
         for (i, p) in self.tree.projects.iter().enumerate() {
+            if !self.tree.in_active_workspace(p) {
+                continue;
+            }
+            if first && p.divider_before {
+                rows.push(ProjectRow::Divider {
+                    project: i,
+                    before: true,
+                });
+            }
+            first = false;
             rows.push(ProjectRow::Project(i));
             if p.divider_after {
                 rows.push(ProjectRow::Divider {
@@ -1321,7 +1550,10 @@ impl App {
     /// Worktrees/Sessions panels and the terminal pane blank their content
     /// while it is — a separator has nothing underneath it to show.
     pub fn divider_focused(&self) -> bool {
-        matches!(self.selected_project_row(), Some(ProjectRow::Divider { .. }))
+        matches!(
+            self.selected_project_row(),
+            Some(ProjectRow::Divider { .. })
+        )
     }
 
     pub fn selected_project_row(&self) -> Option<ProjectRow> {

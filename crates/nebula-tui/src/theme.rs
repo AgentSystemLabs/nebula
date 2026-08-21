@@ -4,7 +4,10 @@
 //! by the event loop when the setting changes.
 //!
 //! Presets stick to ANSI-16 and 256-color indexed values so they render
-//! everywhere (Terminal.app has no truecolor).
+//! everywhere. One exception: `focus_tint` needs a ~10%-opacity accent
+//! shade that the 256 palette simply doesn't have (its darkest chromatic
+//! steps start around 40%), so it's truecolor RGB — supported by modern
+//! terminals including Terminal.app since macOS Tahoe.
 
 use ratatui::style::Color;
 
@@ -43,6 +46,17 @@ pub struct Theme {
     /// Structural chrome: column rules, header underlines, dividers.
     /// Darker than `dim` so the frame recedes behind the content.
     pub edge: Color,
+    /// Shades for the running-row text sweep, `[tail, mid, head]`: the
+    /// whole name sits on the tail shade while a brighter two-cell band
+    /// sweeps across it. Yellow family, paired with `warn`.
+    pub warn_sweep: [Color; 3],
+    /// Needs-feedback counterpart of `warn_sweep`. Red family, paired
+    /// with `err`.
+    pub err_sweep: [Color; 3],
+    /// Focused-panel background: the accent at roughly 5% opacity over
+    /// a dark ground, filling the whole focused panel so it reads as a
+    /// faintly lit surface. Truecolor by necessity (see module docs).
+    pub focus_tint: Color,
 }
 
 impl Default for Theme {
@@ -61,6 +75,9 @@ impl Default for Theme {
             sel_bg: Color::Indexed(237),
             sel_bg_dim: Color::Indexed(235),
             edge: Color::Indexed(238),
+            warn_sweep: [Color::Yellow, Color::Indexed(220), Color::Indexed(230)],
+            err_sweep: [Color::Red, Color::Indexed(203), Color::Indexed(217)],
+            focus_tint: Color::Rgb(4, 15, 16),
         }
     }
 }
@@ -70,23 +87,27 @@ impl Theme {
         let base = Self::default();
         match name.trim().to_ascii_lowercase().as_str() {
             "ocean" => Self {
-                accent: Color::Indexed(39),   // deep sky blue
-                special: Color::Indexed(75),  // steel blue
+                accent: Color::Indexed(39),  // deep sky blue
+                special: Color::Indexed(75), // steel blue
+                focus_tint: Color::Rgb(3, 13, 20),
                 ..base
             },
             "forest" => Self {
                 accent: Color::Indexed(114),  // pale green
                 special: Color::Indexed(108), // sage
+                focus_tint: Color::Rgb(8, 16, 9),
                 ..base
             },
             "rose" => Self {
                 accent: Color::Indexed(211),  // pink
                 special: Color::Indexed(141), // violet
+                focus_tint: Color::Rgb(19, 10, 14),
                 ..base
             },
             "amber" => Self {
                 accent: Color::Indexed(214),  // orange
                 special: Color::Indexed(173), // copper
+                focus_tint: Color::Rgb(19, 14, 4),
                 ..base
             },
             _ => base,

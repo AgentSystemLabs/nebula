@@ -25,7 +25,10 @@ pub fn append(path: &Path, msg: &str) {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         writeln!(f, "{} {msg}", timestamp())
     };
     let _ = write();
@@ -80,7 +83,10 @@ mod tests {
         install_panic_hook(path.clone());
         let _ = std::thread::spawn(|| panic!("crashlog-hook-test")).join();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("PANIC") && text.contains("crashlog-hook-test"), "got: {text}");
+        assert!(
+            text.contains("PANIC") && text.contains("crashlog-hook-test"),
+            "got: {text}"
+        );
         assert!(text.contains("backtrace:"), "got: {text}");
         let _ = std::fs::remove_dir_all(&dir);
     }

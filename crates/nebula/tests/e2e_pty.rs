@@ -994,6 +994,200 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
     wait_for_exit(&mut daemon);
 }
 
+/// The inverse of the cwd-rehome test: a *user* move of a live agent must
+/// relocate the process too. The PTY is killed and respawned in the target
+/// checkout — left running in the old one, its hooks would keep reporting
+/// the old cwd and the daemon would snap the row right back.
+#[tokio::test]
+async fn move_agent_respawns_live_session_in_target_worktree() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: repo.clone(),
+            name: None,
+            create_missing: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| {
+            matches!(
+                e,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(_)
+                }
+            )
+        })
+    })
+    .await;
+    let main_worktree = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } => Some(w.clone()),
+            _ => None,
+        })
+        .unwrap();
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateWorktree {
+            req_id: 2,
+            project: main_worktree.project_id.clone(),
+            branch: "feat".into(),
+            base: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Worktree(w) }
+                if w.branch == "feat")
+        })
+    })
+    .await;
+    let feat_worktree = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } if w.branch == "feat" => Some(w.clone()),
+            _ => None,
+        })
+        .expect("feat worktree upsert");
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 3,
+            worktree: main_worktree.id.clone(),
+            name: "mover".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 3).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 3).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+    let sref = SessionRef::Agent(agent_id.clone());
+
+    // Sanity: the stand-in sh really runs in the main checkout ("…/repo",
+    // never "repo-worktrees"). Suffix match sidesteps macOS /private
+    // symlink canonicalization in pwd's output.
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 120,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: b"pwd\n".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        String::from_utf8_lossy(&collected_output(evs)).contains("/repo\r")
+    })
+    .await;
+
+    // The move: row re-homes AND the PTY comes back alive in the target.
+    write_frame(
+        &mut c,
+        &ClientRequest::MoveAgent {
+            req_id: 4,
+            id: agent_id.clone(),
+            worktree: feat_worktree.id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.worktree_id == feat_worktree.id && a.alive)
+        })
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.worktree_id == feat_worktree.id && a.alive)
+        }),
+        "moved agent re-homed and respawned alive: {events:#?}"
+    );
+
+    // The respawned process must actually sit in the feat checkout — that
+    // is what keeps its hook cwds from re-homing the row back.
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 120,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: b"pwd\n".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        String::from_utf8_lossy(&collected_output(evs)).contains("repo-worktrees/feat")
+    })
+    .await;
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// Codex mirror of the claude hook test: a codex-kind agent gets
 /// `.codex/hooks.json` installed, and posts to `/api/hooks/codex` drive the
 /// same status machine (PermissionRequest is codex's native waiting signal).
@@ -1541,10 +1735,7 @@ async fn add_project_creates_missing_dir_and_inits() {
 }
 
 /// Subscribe + AddProject boilerplate; returns the main worktree row.
-async fn add_project_get_main_worktree(
-    c: &mut UnixStream,
-    repo: &Path,
-) -> nebula_core::Worktree {
+async fn add_project_get_main_worktree(c: &mut UnixStream, repo: &Path) -> nebula_core::Worktree {
     write_frame(c, &ClientRequest::Subscribe).await.unwrap();
     read_events_until(c, Duration::from_secs(5), |evs| {
         evs.iter()
@@ -1708,7 +1899,9 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
     // buffered and replayed: the agent row carries the resume session id.
     let mut c2 = connect(&env.sock()).await;
     handshake(&mut c2).await;
-    write_frame(&mut c2, &ClientRequest::Subscribe).await.unwrap();
+    write_frame(&mut c2, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
     let events = read_events_until(&mut c2, Duration::from_secs(5), |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
@@ -1905,9 +2098,15 @@ async fn archive_and_delete_kill_the_agent_process() {
     assert!(pid_alive(pid1) && pid_alive(pid2), "fake CLIs should be up");
 
     // ---- archive kills the CLI and broadcasts archived + not-alive ----
-    write_frame(&mut c, &ClientRequest::ArchiveAgent { req_id: 4, id: a1.clone() })
-        .await
-        .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::ArchiveAgent {
+            req_id: 4,
+            id: a1.clone(),
+        },
+    )
+    .await
+    .unwrap();
     // The Ack and the EntityUpserted broadcast race on the client stream —
     // wait for both.
     let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
@@ -1927,14 +2126,23 @@ async fn archive_and_delete_kill_the_agent_process() {
             _ => None,
         })
         .expect("archive upsert");
-    assert!(!archived.alive, "archived agent should not be alive: {archived:?}");
+    assert!(
+        !archived.alive,
+        "archived agent should not be alive: {archived:?}"
+    );
     wait_pid_dead(pid1, Duration::from_secs(5), "archived agent CLI").await;
     assert!(pid_alive(pid2), "the other agent must be untouched");
 
     // ---- delete kills the CLI too ----
-    write_frame(&mut c, &ClientRequest::DeleteAgent { req_id: 5, id: a2.clone() })
-        .await
-        .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::DeleteAgent {
+            req_id: 5,
+            id: a2.clone(),
+        },
+    )
+    .await
+    .unwrap();
     read_events_until(&mut c, Duration::from_secs(5), |evs| {
         find_ack(evs, 5).is_some()
             && evs
@@ -2014,9 +2222,15 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
     let shell_pid = read_pidfile(&dir.join("agent.pid")).await;
     let child_pid = read_pidfile(&dir.join("child.pid")).await;
 
-    write_frame(&mut c, &ClientRequest::ArchiveAgent { req_id: 3, id: agent_id })
-        .await
-        .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::ArchiveAgent {
+            req_id: 3,
+            id: agent_id,
+        },
+    )
+    .await
+    .unwrap();
     read_events_until(&mut c, Duration::from_secs(5), |evs| {
         find_ack(evs, 3).is_some()
     })
@@ -2610,7 +2824,9 @@ async fn cli_add_project() {
     let mut daemon = env.spawn_daemon();
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe).await.unwrap();
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
     read_events_until(&mut c, Duration::from_secs(5), |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
@@ -2647,6 +2863,58 @@ async fn cli_add_project() {
     assert!(!out.status.success(), "duplicate add must fail: {out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("already added"), "stderr: {stderr}");
+
+    // Dedupe is per-workspace: the same repo is welcome in a second
+    // workspace (workspaces are free-form groupings the user curates).
+    write_frame(
+        &mut c,
+        &ClientRequest::AddWorkspace {
+            req_id: 91,
+            name: "second".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Ack { req_id: 91, .. }))
+    })
+    .await;
+    let ws_id = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::Ack {
+                req_id: 91,
+                created: Some(EntityId::Workspace(id)),
+            } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("AddWorkspace ack carries the new workspace id");
+    write_frame(
+        &mut c,
+        &ClientRequest::OpenWorkspace {
+            req_id: 92,
+            id: ws_id,
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Ack { req_id: 92, .. }))
+    })
+    .await;
+    let out = run_cli(&["add", repo.to_str().unwrap()], env.tmp.path());
+    assert!(
+        out.status.success(),
+        "same repo in another workspace must succeed: {out:?}"
+    );
+    // …but only once per workspace.
+    let out = run_cli(&["add", repo.to_str().unwrap()], env.tmp.path());
+    assert!(
+        !out.status.success(),
+        "duplicate within the second workspace must fail: {out:?}"
+    );
 
     // Bare `nebula <dir>` shorthand on a second repo.
     let repo2 = env.tmp.path().join("repo2");

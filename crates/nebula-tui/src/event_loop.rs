@@ -1,11 +1,10 @@
 //! The main TUI loop: terminal setup/teardown, message routing, update logic.
 
 use crate::app::{
-    App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder,
-    Focus, GrepView,
-    HitTarget, MenuAction, MenuItem, Overlay, Palette, PaletteTarget, PendingAction, PendingIntent,
-    MetricsView, ProjectRow, PromptDialog, PromptKind, SessionRow, SettingsView, SplitterDrag,
-    SubmenuKind, TermSelection, TodoInput, TodoView, WorktreeRollback,
+    App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder, Focus,
+    GrepView, HitTarget, MenuAction, MenuItem, MetricsView, Overlay, Palette, PaletteTarget,
+    PendingAction, PendingIntent, ProjectRow, PromptDialog, PromptKind, SessionRow, SettingsView,
+    SplitterDrag, SubmenuKind, TermSelection, TodoInput, TodoView, WorktreeRollback,
 };
 use crate::tree_browser::TreeBrowser;
 use crate::vim_term::{VimEvent, VimTerm};
@@ -56,6 +55,10 @@ const FOOTER_METRICS_POLL: Duration = Duration::from_secs(5);
 /// Repaint cadence for the first-run splash animation — the only thing
 /// that marks the app dirty while it idles on an empty tree.
 const SPLASH_FRAME: Duration = crate::splash::FRAME;
+
+/// Repaint cadence for the status-sweep text animation on running /
+/// needs-feedback rows.
+const SWEEP_FRAME: Duration = crate::app::SWEEP_FRAME;
 
 pub async fn run_app() -> Result<()> {
     let conn = ipc::connect_or_spawn().await?;
@@ -134,12 +137,15 @@ async fn main_loop(
     let cfg = crate::config::Config::load();
     app.recent_window_ms = cfg.recent_window_ms();
     app.theme = cfg.theme();
+    app.animations = cfg.animations;
+    app.focus_tint = cfg.focus_tint;
     let mut input = crossterm::event::EventStream::new();
     let mut out: Vec<ClientRequest> = Vec::new();
     let mut next_draw = tokio::time::Instant::now();
     let mut next_git_poll = tokio::time::Instant::now();
     let mut next_metrics_poll = tokio::time::Instant::now();
     let mut next_splash_frame = tokio::time::Instant::now();
+    let mut next_sweep_frame = tokio::time::Instant::now();
     // Editor-modal PTY output; the channel outlives individual editor
     // spawns (VimEvent generations keep them apart).
     let (vim_tx, mut vim_rx) = tokio::sync::mpsc::unbounded_channel::<VimEvent>();
@@ -193,6 +199,13 @@ async fn main_loop(
             _ = tokio::time::sleep_until(next_splash_frame), if app.splash_active() => {
                 app.dirty = true;
                 next_splash_frame = tokio::time::Instant::now() + SPLASH_FRAME;
+            }
+            // Status sweep: running / needs-feedback rows shimmer, so keep
+            // repainting while any are visible (same pure-function-of-time
+            // model as the splash — a missed tick skips ahead cleanly).
+            _ = tokio::time::sleep_until(next_sweep_frame), if app.status_anim_active() => {
+                app.dirty = true;
+                next_sweep_frame = tokio::time::Instant::now() + SWEEP_FRAME;
             }
             _ = tokio::time::sleep(recent_expiry.unwrap_or_default() + Duration::from_millis(250)),
                 if recent_expiry.is_some() =>
@@ -564,7 +577,9 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             app.should_quit = true
         }
         KeyCode::Char('?') => app.overlay = Some(Overlay::Help),
-        KeyCode::Char('s') => app.overlay = Some(Overlay::Settings(SettingsView::new())),
+        KeyCode::Char('s') => {
+            app.overlay = Some(Overlay::Settings(SettingsView::new(app.settings_selected)))
+        }
         // Request a reading right away — the main loop's poll may be up to
         // FOOTER_METRICS_POLL out.
         KeyCode::Char('M') => {
@@ -653,9 +668,10 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 }
             }
         },
-        // First run: with no projects every panel is empty and the splash
-        // is up — `n` creates a project no matter which panel has focus.
-        KeyCode::Char('n') if app.tree.projects.is_empty() => {
+        // First run (or an empty workspace): with no visible projects every
+        // panel is empty and the splash is up — `n` creates a project no
+        // matter which panel has focus.
+        KeyCode::Char('n') if !app.tree.has_visible_projects() => {
             open_prompt(app, PromptKind::AddProject)
         }
         KeyCode::Char('n') => match app.focus {
@@ -755,6 +771,12 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 toggle_archived(app, out);
             }
         }
+        // Workspace switcher: pick which workspace is open.
+        KeyCode::Char('w') => {
+            if app.focus != Focus::Terminal {
+                open_workspace_picker(app);
+            }
+        }
         // Fuzzy-search palette over every project / worktree / session.
         // The config read is per-open so edits apply without restarting.
         KeyCode::Char('/') => {
@@ -803,10 +825,13 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         KeyCode::Char('D') => open_delete_all_confirm(app),
         KeyCode::Char('m') => open_context_menu_for_selection(app),
         KeyCode::Char('g') => open_diff_view(app),
-        KeyCode::Char('o') => open_todo_view(app),
+        // `o` opens (adds) a project from ANY panel — unlike `n` it never
+        // changes meaning with focus, matching the "open a repo" instinct.
+        KeyCode::Char('o') => open_prompt(app, PromptKind::AddProject),
         KeyCode::Char('f') => open_file_finder(app),
         KeyCode::Char('F') => open_grep_view(app),
-        KeyCode::Char('t') => open_tree_browser(app),
+        KeyCode::Char('t') => open_todo_view(app),
+        KeyCode::Char('b') => open_tree_browser(app),
         // Shift+T: new shell terminal, spawned in the worktree's directory.
         // (Cmd+T never reaches a TUI — the emulator opens its own tab.)
         KeyCode::Char('T') => create_terminal_for_context(app, out),
@@ -827,10 +852,17 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
 
 fn open_prompt(app: &mut App, kind: PromptKind) {
     let (title, label, input) = match &kind {
+        // Starts at "~/" with the home listing already showing, so the
+        // browser is one ↓ away; typing a leading '/' or '~' replaces the
+        // prefill (see the Char arm), and Ctrl+u clears it.
         PromptKind::AddProject => (
             "Add project".to_string(),
             "path to a git repository".to_string(),
-            String::new(),
+            if std::env::var_os("HOME").is_some() {
+                "~/".to_string()
+            } else {
+                String::new()
+            },
         ),
         PromptKind::DividerLabel { id, before } => {
             let current = app
@@ -896,14 +928,25 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
                 .unwrap_or_default();
             ("Rename terminal".to_string(), "name".to_string(), current)
         }
+        PromptKind::NewWorkspace => (
+            "New workspace".to_string(),
+            "name".to_string(),
+            String::new(),
+        ),
+        PromptKind::RenameWorkspace { id } => {
+            let current = app
+                .tree
+                .workspaces
+                .iter()
+                .find(|w| &w.id == id)
+                .map(|w| w.name.clone())
+                .unwrap_or_default();
+            ("Rename workspace".to_string(), "name".to_string(), current)
+        }
     };
-    app.overlay = Some(Overlay::Prompt(PromptDialog {
-        title,
-        label,
-        input,
-        kind,
-        candidates: vec![],
-    }));
+    app.overlay = Some(Overlay::Prompt(PromptDialog::new(
+        title, label, input, kind,
+    )));
 }
 
 fn open_diff_view(app: &mut App) {
@@ -1046,7 +1089,7 @@ fn open_file_finder(app: &mut App) {
     app.overlay = Some(Overlay::Files(FileFinder::new(path, branch, editor, files)));
 }
 
-/// Tree browser (`t`): full file tree of the selected worktree with a
+/// Tree browser (`b`): full file tree of the selected worktree with a
 /// content preview, filterable by file name. Same shell as `open_diff_view`:
 /// flash instead of opening when there's no worktree, the path is gone, or
 /// git fails.
@@ -1147,16 +1190,7 @@ fn open_selected_file_in_editor(app: &mut App) {
     // Size guess from the last-drawn body; the post-draw sync corrects it.
     let (cols, rows) = vim_size_guess(app);
     app.vim_generation += 1;
-    match VimTerm::spawn_editor(
-        &editor,
-        &root,
-        &path,
-        1,
-        cols,
-        rows,
-        app.vim_generation,
-        tx,
-    ) {
+    match VimTerm::spawn_editor(&editor, &root, &path, 1, cols, rows, app.vim_generation, tx) {
         Ok(vim) => app.vim = Some(vim),
         Err(msg) => app.flash = Some(msg),
     }
@@ -1188,16 +1222,7 @@ fn open_selected_tree_file_in_editor(app: &mut App) {
         vim_size_guess(app) // never drawn yet
     };
     app.vim_generation += 1;
-    match VimTerm::spawn_editor(
-        &editor,
-        &root,
-        &path,
-        1,
-        cols,
-        rows,
-        app.vim_generation,
-        tx,
-    ) {
+    match VimTerm::spawn_editor(&editor, &root, &path, 1, cols, rows, app.vim_generation, tx) {
         Ok(mut vim) => {
             vim.embedded = true;
             app.vim = Some(vim);
@@ -1212,8 +1237,12 @@ fn open_selected_tree_file_in_editor(app: &mut App) {
 fn vim_size_guess(app: &App) -> (u16, u16) {
     let frame_w = app.body_area.width;
     let frame_h = app.body_area.height + 1; // + footer row
-    let cols = (frame_w * ui::VIM_MODAL_PCT.0 / 100).saturating_sub(2).max(2);
-    let rows = (frame_h * ui::VIM_MODAL_PCT.1 / 100).saturating_sub(2).max(2);
+    let cols = (frame_w * ui::VIM_MODAL_PCT.0 / 100)
+        .saturating_sub(2)
+        .max(2);
+    let rows = (frame_h * ui::VIM_MODAL_PCT.1 / 100)
+        .saturating_sub(2)
+        .max(2);
     (cols, rows)
 }
 
@@ -1779,6 +1808,80 @@ fn open_move_agent_picker(app: &mut App, agent: AgentId) {
     }));
 }
 
+/// Workspace switcher (`w`): pick which workspace is open. The active one is
+/// checked and starts highlighted; Enter asks the daemon to open the pick
+/// (the switch lands via ActiveWorkspaceChanged, so every client follows).
+/// Management verbs are keys with footer hints, the todos-modal pattern:
+/// n creates (and opens) a workspace, r renames the hovered one, d deletes
+/// it. The list refreshes in place as workspace deltas arrive.
+fn open_workspace_picker(app: &mut App) {
+    let active = &app.tree.active_workspace;
+    let items: Vec<MenuItem> = app
+        .tree
+        .workspaces
+        .iter()
+        .map(|w| {
+            let projects = app
+                .tree
+                .projects
+                .iter()
+                .filter(|p| p.workspace_id == w.id)
+                .count();
+            MenuItem {
+                label: format!(
+                    "{}{}  ({projects})",
+                    w.name,
+                    if &w.id == active { " ✓" } else { "" }
+                ),
+                action: MenuAction::OpenWorkspace(w.id.clone()),
+                destructive: false,
+            }
+        })
+        .collect();
+    if items.is_empty() {
+        // Never expected — every install has the 'default' workspace — but
+        // an empty menu would render as a dead overlay.
+        app.flash = Some("no workspaces — `nebula workspace add <name>` creates one".into());
+        return;
+    }
+    let hover = app
+        .tree
+        .workspaces
+        .iter()
+        .position(|w| &w.id == active)
+        .unwrap_or(0);
+    app.overlay = Some(Overlay::Menu(ContextMenu {
+        title: Some("Workspace".into()),
+        items,
+        at: None,
+        hover,
+        area: ratatui::layout::Rect::default(),
+        parent: None,
+    }));
+}
+
+/// Rebuild an open workspace switcher after the workspace list (or the ✓
+/// marker) changed under it, keeping the cursor row. The todos modal gets
+/// this for free by reading the tree at draw time; the menu's rows are
+/// snapshots, so refresh them here.
+fn refresh_workspace_picker(app: &mut App) {
+    let Some(Overlay::Menu(menu)) = &app.overlay else {
+        return;
+    };
+    if !menu.is_workspace_picker() {
+        return;
+    }
+    let hover = menu.hover;
+    if app.tree.workspaces.is_empty() {
+        app.overlay = None; // nothing left to list
+        return;
+    }
+    open_workspace_picker(app);
+    if let Some(Overlay::Menu(menu)) = &mut app.overlay {
+        menu.hover = hover.min(menu.items.len().saturating_sub(1));
+    }
+}
+
 fn open_context_menu_for_selection(app: &mut App) {
     // Keyboard-invoked menu: anchor near the selected row's panel.
     let at = (30, 4);
@@ -1915,6 +2018,24 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                     *menu = *parent;
                 }
             }
+            // Workspace-switcher verbs (footer-hinted, the todos-modal
+            // pattern): n creates a workspace (opened on Ack), r renames
+            // the hovered one, d deletes it — no confirm, the daemon only
+            // deletes empty workspaces so a refusal just flashes.
+            KeyCode::Char('n') if menu.is_workspace_picker() => {
+                open_prompt(app, PromptKind::NewWorkspace);
+            }
+            KeyCode::Char('r') if menu.is_workspace_picker() => {
+                if let Some(id) = menu.hovered_workspace() {
+                    open_prompt(app, PromptKind::RenameWorkspace { id });
+                }
+            }
+            KeyCode::Char('d') if menu.is_workspace_picker() => {
+                if let Some(id) = menu.hovered_workspace() {
+                    let req_id = app.alloc_req_id(PendingIntent::None);
+                    out.push(ClientRequest::RemoveWorkspace { req_id, id });
+                }
+            }
             KeyCode::Enter => {
                 let action = menu.items[menu.hover].action.clone();
                 app.overlay = None;
@@ -1942,7 +2063,12 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 }
             }
             KeyCode::Enter => {
-                let prompt = prompt.clone();
+                // Enter on a highlighted listing row adds that directory;
+                // on the input row it submits the typed path as before.
+                let mut prompt = prompt.clone();
+                if let Some(path) = prompt.hovered_path() {
+                    prompt.input = path;
+                }
                 app.overlay = None;
                 submit_prompt(app, prompt, out);
             }
@@ -1951,20 +2077,33 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 let result = crate::completion::complete_path(&prompt.input, home.as_deref());
                 if let Some(completed) = result.completed {
                     prompt.input = completed;
+                    prompt.refresh_dirs();
                 }
-                prompt.candidates = result.candidates;
             }
+            KeyCode::Down if prompt.completes_paths() => prompt.move_hover(1),
+            KeyCode::Up if prompt.completes_paths() => prompt.move_hover(-1),
+            KeyCode::Right if prompt.completes_paths() => {
+                if let Some(i) = prompt.hover {
+                    prompt.dive(i);
+                }
+            }
+            KeyCode::Left if prompt.completes_paths() => prompt.ascend(),
             KeyCode::Backspace => {
                 prompt.input.pop();
-                prompt.candidates.clear();
+                prompt.refresh_dirs();
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 prompt.input.clear();
-                prompt.candidates.clear();
+                prompt.refresh_dirs();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // The untouched "~/" prefill yields to an absolute (or
+                // re-typed tilde) path — no clearing required first.
+                if prompt.completes_paths() && prompt.input == "~/" && (c == '/' || c == '~') {
+                    prompt.input.clear();
+                }
                 prompt.input.push(c);
-                prompt.candidates.clear();
+                prompt.refresh_dirs();
             }
             _ => {}
         },
@@ -2305,8 +2444,8 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                     KeyCode::Esc | KeyCode::Char('q') => TodoCmd::Close,
                     KeyCode::Char('j') | KeyCode::Down => TodoCmd::Move(1),
                     KeyCode::Char('k') | KeyCode::Up => TodoCmd::Move(-1),
-                    // `o` mirrors the key that opened the modal; a/n too.
-                    KeyCode::Char('o') | KeyCode::Char('a') | KeyCode::Char('n') => {
+                    // `t` mirrors the key that opened the modal; a/n too.
+                    KeyCode::Char('t') | KeyCode::Char('a') | KeyCode::Char('n') => {
                         TodoCmd::StartCreate
                     }
                     KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('r') => {
@@ -2394,6 +2533,7 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
     match cmd {
         SettingsCmd::Close => app.overlay = None,
         SettingsCmd::Move(i) => {
+            app.settings_selected = i;
             if let Some(Overlay::Settings(view)) = &mut app.overlay {
                 view.selected = i;
             }
@@ -2417,6 +2557,8 @@ fn apply_setting_at(app: &mut App, index: usize, delta: i32) {
     }
     app.recent_window_ms = cfg.recent_window_ms();
     app.theme = cfg.theme();
+    app.animations = cfg.animations;
+    app.focus_tint = cfg.focus_tint;
 }
 
 fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientRequest>) {
@@ -2512,6 +2654,22 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
         PromptKind::RenameTerminal { id } => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::RenameTerminal {
+                req_id,
+                id,
+                name: value,
+            });
+        }
+        PromptKind::NewWorkspace => {
+            // Created from the switcher: open it as soon as the Ack lands.
+            let req_id = app.alloc_req_id(PendingIntent::OpenCreatedWorkspace);
+            out.push(ClientRequest::AddWorkspace {
+                req_id,
+                name: value,
+            });
+        }
+        PromptKind::RenameWorkspace { id } => {
+            let req_id = app.alloc_req_id(PendingIntent::None);
+            out.push(ClientRequest::RenameWorkspace {
                 req_id,
                 id,
                 name: value,
@@ -2719,6 +2877,13 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             }
         }
         MenuAction::AddProject => open_prompt(app, PromptKind::AddProject),
+        MenuAction::OpenWorkspace(id) => {
+            // The switch itself lands when ActiveWorkspaceChanged arrives.
+            if id != app.tree.active_workspace {
+                let req_id = app.alloc_req_id(PendingIntent::None);
+                out.push(ClientRequest::OpenWorkspace { req_id, id });
+            }
+        }
         MenuAction::RemoveProject(id) => {
             if let Some(p) = app.tree.projects.iter().find(|p| p.id == id).cloned() {
                 app.overlay = Some(Overlay::Confirm(ConfirmDialog {
@@ -2808,7 +2973,26 @@ fn move_project(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
 /// including the slot above the whole list (the leading divider). Mirrors
 /// the daemon's own rules so a blocked move flashes immediately instead of
 /// arming a selection-follow that never fires.
-fn move_divider(app: &mut App, project: usize, before: bool, delta: i64, out: &mut Vec<ClientRequest>) {
+fn move_divider(
+    app: &mut App,
+    project: usize,
+    before: bool,
+    delta: i64,
+    out: &mut Vec<ClientRequest>,
+) {
+    // Neighbors live in the open workspace's visible sequence — `project`
+    // indexes the full tree, where another workspace's rows may interleave.
+    let visible: Vec<usize> = app
+        .tree
+        .projects
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| app.tree.in_active_workspace(p))
+        .map(|(i, _)| i)
+        .collect();
+    let Some(vpos) = visible.iter().position(|&i| i == project) else {
+        return;
+    };
     let down = delta.signum() > 0;
     if before {
         // The leading divider: up is already the top; down hops below the
@@ -2821,18 +3005,19 @@ fn move_divider(app: &mut App, project: usize, before: bool, delta: i64, out: &m
             return;
         }
         app.select_divider_when_seen = Some((app.tree.projects[project].id.clone(), false));
-    } else if project == 0 && !down {
+    } else if vpos == 0 && !down {
         // The divider under the first project hops above the whole list.
-        if app.tree.projects[0].divider_before {
+        if app.tree.projects[project].divider_before {
             app.flash = Some("that gap already has a divider".into());
             return;
         }
-        app.select_divider_when_seen = Some((app.tree.projects[0].id.clone(), true));
+        app.select_divider_when_seen = Some((app.tree.projects[project].id.clone(), true));
     } else {
-        let neighbor = project as i64 + delta.signum();
+        let neighbor = vpos as i64 + delta.signum();
         let Some(neighbor) = usize::try_from(neighbor)
             .ok()
-            .and_then(|i| app.tree.projects.get(i))
+            .and_then(|i| visible.get(i))
+            .and_then(|&i| app.tree.projects.get(i))
         else {
             return; // no project below: the divider is at the bottom edge
         };
@@ -3511,6 +3696,43 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         }
         return;
     }
+    // A prompt dialog is modal too: the wheel and clicks drive the
+    // Add-project directory listing (click highlights, a second click on
+    // the highlighted row steps in); everything else is swallowed.
+    if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                prompt.move_hover(1);
+                app.dirty = true;
+            }
+            MouseEventKind::ScrollUp => {
+                prompt.move_hover(-1);
+                app.dirty = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let area = prompt.list_area;
+                if area.width > 0
+                    && mouse.column >= area.x
+                    && mouse.column < area.x + area.width
+                    && mouse.row >= area.y
+                    && mouse.row < area.y + area.height
+                {
+                    let i =
+                        prompt.window_start(area.height as usize) + (mouse.row - area.y) as usize;
+                    if i < prompt.dirs.len() {
+                        if prompt.hover == Some(i) {
+                            prompt.dive(i);
+                        } else {
+                            prompt.hover = Some(i);
+                        }
+                    }
+                }
+                app.dirty = true;
+            }
+            _ => {}
+        }
+        return;
+    }
     // Diff modal: the wheel scrolls the diff, a click on a file-list row
     // selects that file, a drag on the files/diff border resizes the file
     // list; everything else is swallowed.
@@ -3830,6 +4052,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         if let Some(Overlay::Settings(view)) = &mut app.overlay {
                             view.selected = index;
                         }
+                        app.settings_selected = index;
                         if selected == index {
                             apply_setting_at(app, index, 0);
                         }
@@ -3980,10 +4203,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                             let now = std::time::Instant::now();
                             // Double-click attaches; `last_session_click` was
                             // consumed, so a third click starts over.
-                            let double =
-                                app.last_session_click.take().is_some_and(|(at, id)| {
-                                    id == sref && now.duration_since(at) <= DOUBLE_CLICK
-                                });
+                            let double = app.last_session_click.take().is_some_and(|(at, id)| {
+                                id == sref && now.duration_since(at) <= DOUBLE_CLICK
+                            });
                             if double {
                                 attach_selected(app, out);
                             } else {
@@ -4006,7 +4228,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     // Empty projects list: left click opens the obvious
                     // creation prompt. Other panels just take focus.
                     app.focus = focus;
-                    if focus == Focus::Projects && app.tree.projects.is_empty() {
+                    if focus == Focus::Projects && !app.tree.has_visible_projects() {
                         open_prompt(app, PromptKind::AddProject);
                     }
                 }
@@ -4111,7 +4333,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 Some(HitTarget::Project(i)) => {
                     app.sel_project = i;
                     app.focus = Focus::Projects;
-                    if let Some(ProjectRow::Divider { project, before }) = app.selected_project_row()
+                    if let Some(ProjectRow::Divider { project, before }) =
+                        app.selected_project_row()
                     {
                         let id = app.tree.projects[project].id.clone();
                         open_menu_at(app, divider_row_menu(id, before), at);
@@ -4231,6 +4454,8 @@ fn open_menu_at(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
 fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequest>) {
     match event {
         ServerEvent::Snapshot {
+            workspaces,
+            active_workspace,
             projects,
             worktrees,
             agents,
@@ -4238,6 +4463,8 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             todos,
             ui_state,
         } => {
+            app.tree.workspaces = workspaces;
+            app.tree.active_workspace = active_workspace;
             app.tree.projects = projects;
             app.tree.worktrees = worktrees;
             app.tree.agents = agents;
@@ -4342,6 +4569,12 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         app.select_todo_when_seen = Some(id);
                     }
                 }
+                (Some(PendingIntent::OpenCreatedWorkspace), Some(EntityId::Workspace(id))) => {
+                    // Switcher-created workspace: open it right away (the
+                    // switch lands via ActiveWorkspaceChanged as usual).
+                    let req_id = app.alloc_req_id(PendingIntent::None);
+                    out.push(ClientRequest::OpenWorkspace { req_id, id });
+                }
                 _ => {}
             }
             app.dirty = true;
@@ -4370,6 +4603,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 }
             }
             refresh_palette(app);
+            refresh_workspace_picker(app);
             app.dirty = true;
         }
         ServerEvent::EntityRemoved { id } => {
@@ -4379,6 +4613,24 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // neighbor — show that neighbor's session/context.
             reconcile_selection(app, before, out);
             refresh_palette(app);
+            refresh_workspace_picker(app);
+            app.dirty = true;
+        }
+        ServerEvent::ActiveWorkspaceChanged { id } => {
+            // A different workspace was opened — here, via the CLI, or by
+            // another client; daemon-global either way. Everything visible
+            // re-filters; selections land on the new workspace's first
+            // project with its remembered worktree/session brought back.
+            if app.tree.active_workspace != id {
+                remember_context(app);
+                app.tree.active_workspace = id;
+                app.sel_project = 0;
+                restore_context(app, out);
+                clamp_selections(app);
+                refresh_palette(app);
+                // An open switcher keeps its ✓ on the now-open workspace.
+                refresh_workspace_picker(app);
+            }
             app.dirty = true;
         }
         ServerEvent::Metrics { req_id, snapshot } => {
@@ -4409,6 +4661,10 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
 fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
     use nebula_core::Entity;
     match entity {
+        Entity::Workspace(w) => match app.tree.workspaces.iter_mut().find(|x| x.id == w.id) {
+            Some(existing) => *existing = w,
+            None => app.tree.workspaces.push(w),
+        },
         Entity::Project(p) => {
             // A row's kind: None = the project itself, Some(before) = one
             // of its dividers.
@@ -4449,8 +4705,7 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             if let Some((target, before)) = app.select_divider_when_seen.clone() {
                 let rows = app.project_rows();
                 let landed = rows.iter().position(|row| {
-                    kind(row) == Some(before)
-                        && app.tree.projects[row.project_index()].id == target
+                    kind(row) == Some(before) && app.tree.projects[row.project_index()].id == target
                 });
                 if let Some(i) = landed {
                     app.sel_project = i;
@@ -4501,6 +4756,12 @@ fn select_todo_by_id(app: &mut App, id: &TodoId) -> bool {
 fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
     use nebula_core::EntityId;
     match id {
+        EntityId::Workspace(id) => {
+            // Only empty, non-open workspaces get deleted (and an open one is
+            // switched away from first, via ActiveWorkspaceChanged), so no
+            // project rows need cleanup here.
+            app.tree.workspaces.retain(|w| &w.id != id);
+        }
         EntityId::Project(id) => {
             // Children cascade server-side; mirror that here.
             let wt_ids: Vec<_> = app
@@ -4627,7 +4888,10 @@ fn selection_snapshot(app: &App) -> SelectionSnapshot {
     let row = app.selected_session_row();
     SelectionSnapshot {
         project: app.selected_project().map(|p| p.id.clone()),
-        project_kind: app.selected_project_row().as_ref().and_then(project_row_kind),
+        project_kind: app
+            .selected_project_row()
+            .as_ref()
+            .and_then(project_row_kind),
         divider_chase: app.select_divider_when_seen.is_some(),
         worktree: app.selected_worktree().map(|w| w.id.clone()),
         session_archived: row.as_ref().is_some_and(|r| r.is_archived_agent()),
@@ -4758,6 +5022,7 @@ mod tests {
             app,
             ServerEvent::EntityUpserted {
                 entity: Entity::Project(Project {
+                    workspace_id: Default::default(),
                     id: project_id.clone(),
                     name: "demo".into(),
                     repo_path: "/tmp/demo".into(),
@@ -4830,6 +5095,24 @@ mod tests {
         assert!(text.contains("PROJECTS"), "columns back: {text}");
     }
 
+    /// The animations setting is a master off-switch for both repaint
+    /// tickers: the status sweep (running/red rows) and the splash.
+    #[test]
+    fn animations_off_stops_sweep_and_splash_ticking() {
+        let mut app = App::new();
+        assert!(app.splash_active(), "empty tree splash ticks by default");
+        app.animations = false;
+        assert!(!app.splash_active(), "still splash: drawn but not ticked");
+
+        app.animations = true;
+        seed_tree(&mut app);
+        assert!(!app.status_anim_active(), "fresh agent doesn't animate");
+        app.tree.agents[0].status = nebula_core::AgentStatus::Running;
+        assert!(app.status_anim_active());
+        app.animations = false;
+        assert!(!app.status_anim_active());
+    }
+
     /// N summons the splash as a preview over a populated tree — full-body
     /// nebula with the "any key" hint instead of panel columns — and the
     /// next keypress (even q) only dismisses it.
@@ -4867,6 +5150,38 @@ mod tests {
             panic!("expected add-project prompt, got {:?}", app.overlay);
         };
         assert_eq!(p.kind, crate::app::PromptKind::AddProject);
+    }
+
+    /// `o` opens the add-project prompt regardless of focus or tree state —
+    /// unlike `n` it never takes on a per-panel meaning.
+    #[test]
+    fn o_adds_project_from_any_focus() {
+        for focus in [Focus::Projects, Focus::Worktrees, Focus::Sessions] {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = focus;
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(p)) = &app.overlay else {
+                panic!("expected add-project prompt at {focus:?}, got {:?}", app.overlay);
+            };
+            assert_eq!(p.kind, crate::app::PromptKind::AddProject);
+        }
+    }
+
+    /// `t` opens the todos modal for the current selection.
+    #[test]
+    fn t_opens_todos_for_selection() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Todos(_))),
+            "expected todos overlay, got {:?}",
+            app.overlay
+        );
     }
 
     /// Resting the worktree selection arms the debounced prewarm; firing it
@@ -4955,18 +5270,17 @@ mod tests {
         with_default_config(|| {
             let mut app = App::new();
             seed_tree(&mut app);
-            app.overlay = Some(Overlay::Prompt(PromptDialog {
-                title: "New agent (opus · high)".into(),
-                label: "name".into(),
-                input: String::new(),
-                kind: PromptKind::NewAgent {
+            app.overlay = Some(Overlay::Prompt(PromptDialog::new(
+                "New agent (opus · high)",
+                "name",
+                "",
+                PromptKind::NewAgent {
                     worktree: nebula_core::WorktreeId("w1".into()),
                     kind: AgentKind::Claude,
                     model: Some("opus".into()),
                     effort: Some("high".into()),
                 },
-                candidates: Vec::new(),
-            }));
+            )));
             let mut out = Vec::new();
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
             assert!(app.overlay.is_none());
@@ -4994,6 +5308,8 @@ mod tests {
         hse(
             &mut fresh,
             ServerEvent::Snapshot {
+                workspaces: tree.workspaces,
+                active_workspace: tree.active_workspace,
                 projects: tree.projects,
                 worktrees: tree.worktrees,
                 agents: tree.agents,
@@ -5378,6 +5694,10 @@ mod tests {
         );
     }
 
+    fn dir_names(p: &crate::app::PromptDialog) -> Vec<&str> {
+        p.dirs.iter().map(|d| d.name.as_str()).collect()
+    }
+
     #[test]
     fn tab_in_add_project_prompt_completes_paths() {
         use crate::app::{Overlay, PromptDialog, PromptKind};
@@ -5387,15 +5707,14 @@ mod tests {
 
         let mut app = App::new();
         let mut out = Vec::new();
-        app.overlay = Some(Overlay::Prompt(PromptDialog {
-            title: "Add project".into(),
-            label: "path".into(),
-            input: format!("{}/work", tmp.path().display()),
-            kind: PromptKind::AddProject,
-            candidates: vec![],
-        }));
+        app.overlay = Some(Overlay::Prompt(PromptDialog::new(
+            "Add project",
+            "path",
+            format!("{}/work", tmp.path().display()),
+            PromptKind::AddProject,
+        )));
 
-        // Unambiguous: work → workspace/
+        // Unambiguous: work → workspace/, and the listing follows it in.
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
@@ -5405,9 +5724,9 @@ mod tests {
             panic!("prompt closed")
         };
         assert_eq!(p.input, format!("{}/workspace/", tmp.path().display()));
-        assert!(p.candidates.is_empty());
+        assert_eq!(dir_names(p), vec!["herdr", "nebula"]);
 
-        // Ambiguous at the directory root: list both candidates.
+        // Ambiguous: Tab makes no progress, the listing already shows both.
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
@@ -5416,9 +5735,10 @@ mod tests {
         let Some(Overlay::Prompt(p)) = &app.overlay else {
             panic!("prompt closed")
         };
-        assert_eq!(p.candidates, vec!["herdr/", "nebula/"]);
+        assert_eq!(p.input, format!("{}/workspace/", tmp.path().display()));
+        assert_eq!(dir_names(p), vec!["herdr", "nebula"]);
 
-        // Typing narrows; next Tab completes fully and clears the list.
+        // Typing narrows the listing; the next Tab completes fully.
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
@@ -5427,7 +5747,7 @@ mod tests {
         let Some(Overlay::Prompt(p)) = &app.overlay else {
             panic!("prompt closed")
         };
-        assert!(p.candidates.is_empty(), "editing clears candidates");
+        assert_eq!(dir_names(p), vec!["nebula"]);
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
@@ -5443,20 +5763,120 @@ mod tests {
     }
 
     #[test]
+    fn add_project_prompt_browses_with_arrows_and_submits_hovered() {
+        use crate::app::{Overlay, PromptDialog, PromptKind};
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("ws/beta/inner")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("ws/alpha/.git")).unwrap();
+
+        let mut app = App::new();
+        let mut out = Vec::new();
+        app.overlay = Some(Overlay::Prompt(PromptDialog::new(
+            "Add project",
+            "path",
+            format!("{}/ws/", tmp.path().display()),
+            PromptKind::AddProject,
+        )));
+        let Some(Overlay::Prompt(p)) = &app.overlay else {
+            panic!("prompt closed")
+        };
+        assert_eq!(dir_names(p), vec!["alpha", "beta"]);
+        assert!(p.dirs[0].is_repo && !p.dirs[1].is_repo);
+        assert_eq!(p.hover, None, "opens on the input row");
+
+        // ↓↓ highlights beta; → dives into it and lists its children.
+        for _ in 0..2 {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &mut out,
+            );
+        }
+        let Some(Overlay::Prompt(p)) = &app.overlay else {
+            panic!("prompt closed")
+        };
+        assert_eq!(
+            p.hovered_path(),
+            Some(format!("{}/ws/beta", tmp.path().display()))
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &mut out,
+        );
+        let Some(Overlay::Prompt(p)) = &app.overlay else {
+            panic!("prompt closed")
+        };
+        assert_eq!(p.input, format!("{}/ws/beta/", tmp.path().display()));
+        assert_eq!(dir_names(p), vec!["inner"]);
+        assert_eq!(p.hover, None, "diving resets the highlight");
+
+        // ← steps back up to ws/.
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &mut out,
+        );
+        let Some(Overlay::Prompt(p)) = &app.overlay else {
+            panic!("prompt closed")
+        };
+        assert_eq!(p.input, format!("{}/ws/", tmp.path().display()));
+
+        // ↓ + Enter adds the highlighted directory, not the typed parent.
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut out,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut out,
+        );
+        assert!(app.overlay.is_none());
+        assert!(matches!(
+            out.as_slice(),
+            [ClientRequest::AddProject { path, create_missing: false, .. }]
+                if path == &tmp.path().join("ws/alpha")
+        ));
+    }
+
+    #[test]
+    fn add_project_prefill_yields_to_absolute_paths() {
+        use crate::app::{Overlay, PromptDialog, PromptKind};
+        let mut app = App::new();
+        let mut out = Vec::new();
+        app.overlay = Some(Overlay::Prompt(PromptDialog::new(
+            "Add project",
+            "path",
+            "~/",
+            PromptKind::AddProject,
+        )));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut out,
+        );
+        let Some(Overlay::Prompt(p)) = &app.overlay else {
+            panic!("prompt closed")
+        };
+        assert_eq!(p.input, "/", "leading '/' replaces the untouched prefill");
+    }
+
+    #[test]
     fn tab_in_name_prompt_does_not_complete() {
         use crate::app::{Overlay, PromptDialog, PromptKind};
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
-        app.overlay = Some(Overlay::Prompt(PromptDialog {
-            title: "Rename agent".into(),
-            label: "name".into(),
-            input: "src".into(), // a dir that exists in cwd — must NOT complete
-            kind: PromptKind::RenameAgent {
+        app.overlay = Some(Overlay::Prompt(PromptDialog::new(
+            "Rename agent",
+            "name",
+            "src", // a dir that exists in cwd — must NOT complete
+            PromptKind::RenameAgent {
                 id: nebula_core::AgentId("a1".into()),
             },
-            candidates: vec![],
-        }));
+        )));
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
@@ -6647,7 +7067,8 @@ mod tests {
             &mut out,
         );
         assert!(
-            out.iter().any(|r| matches!(r, ClientRequest::Attach { .. })),
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { .. })),
             "single click previews the session's terminal"
         );
         assert_eq!(app.focus, Focus::Sessions, "single click keeps list focus");
@@ -6801,7 +7222,11 @@ mod tests {
             "absolute paths pass through"
         );
         assert_eq!(resolve_file_link(root, "src/nope.rs"), None);
-        assert_eq!(resolve_file_link(root, "src"), None, "directories don't open");
+        assert_eq!(
+            resolve_file_link(root, "src"),
+            None,
+            "directories don't open"
+        );
     }
 
     /// Mirror ui::draw's splitter registration for a 120x35 body with the
@@ -6979,6 +7404,7 @@ mod tests {
     ) -> nebula_core::Entity {
         use nebula_core::{Entity, Project, ProjectId};
         Entity::Project(Project {
+            workspace_id: Default::default(),
             id: ProjectId(id.into()),
             name: name.into(),
             repo_path: format!("/tmp/{name}").into(),
@@ -7445,25 +7871,25 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        // Borderless column: row 0 is the header, row 1 a spacer, rows 2-4
-        // the 3-tall project button (selected in the focused panel → accent
-        // ▌ rail down its edge, name on the middle row), row 5 the divider
-        // behind a 1-cell gutter.
+        // Borderless column: row 0 a top-padding spacer, row 1 the header,
+        // row 2 a spacer, rows 3-5 the 3-tall project button (selected in
+        // the focused panel → accent ▌ rail down its edge, name on the
+        // middle row), row 6 the divider behind a 1-cell gutter.
         let lines: Vec<&str> = text.lines().collect();
         assert!(
-            lines[0].starts_with("   PROJECTS"),
+            lines[1].starts_with("   PROJECTS"),
             "column header first:\n{text}"
         );
         assert!(
-            lines[2].starts_with("▌ ") && lines[4].starts_with("▌ "),
+            lines[3].starts_with("▌ ") && lines[5].starts_with("▌ "),
             "selection rail spans the project button:\n{text}"
         );
         assert!(
-            lines[3].starts_with("▌● demo"),
+            lines[4].starts_with("▌● demo"),
             "project name centered in the button:\n{text}"
         );
         assert!(
-            lines[5].starts_with(&format!(" {}", "─".repeat(10))),
+            lines[6].starts_with(&format!(" {}", "─".repeat(10))),
             "divider row under the project:\n{text}"
         );
 
@@ -7477,7 +7903,7 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(
-            text.lines().nth(5).unwrap().starts_with(" ─ work ──"),
+            text.lines().nth(6).unwrap().starts_with(" ─ work ──"),
             "labeled divider row:\n{text}"
         );
     }
@@ -7491,6 +7917,7 @@ mod tests {
     ) -> nebula_core::Entity {
         use nebula_core::{Entity, Project, ProjectId};
         Entity::Project(Project {
+            workspace_id: Default::default(),
             id: ProjectId(id.into()),
             name: name.into(),
             repo_path: format!("/tmp/{name}").into(),
@@ -7828,6 +8255,7 @@ mod tests {
             app,
             ServerEvent::EntityUpserted {
                 entity: Entity::Project(Project {
+                    workspace_id: Default::default(),
                     id: ProjectId("p1".into()),
                     name: "demo".into(),
                     repo_path: path.to_path_buf(),
@@ -8153,14 +8581,23 @@ mod tests {
             press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
             // Status is path-ordered, so a.txt is the selected file. Marking
             // sinks it below z.txt and advances to the next file.
-            press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL, &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
             let v = diff_view(&app);
             assert!(v.reviewed.contains_key("a.txt"), "{:?}", v.reviewed);
             assert!(!v.head_key.is_empty(), "head OID captured for scoping");
             assert_eq!(diff_order(&app), ["z.txt", "a.txt"], "reviewed sinks");
             let v = diff_view(&app);
             assert_eq!(v.selected_file().unwrap().path, "z.txt", "auto-advance");
-            assert!(v.diff.contains("+fresh"), "next file's diff loaded: {}", v.diff);
+            assert!(
+                v.diff.contains("+fresh"),
+                "next file's diff loaded: {}",
+                v.diff
+            );
 
             // Reopen: the mark comes back from the store, already sunk, and
             // the first unreviewed file starts selected.
@@ -8172,7 +8609,12 @@ mod tests {
             // Ctrl+r on the reviewed row unmarks it; the file pops back up
             // to git order, stays selected, and the store forgets the mark.
             press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL, &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
             let v = diff_view(&app);
             assert!(v.reviewed.is_empty());
             assert_eq!(diff_order(&app), ["a.txt", "z.txt"], "git order back");
@@ -8200,7 +8642,12 @@ mod tests {
             seed_repo_tree(&mut app, &repo);
             let mut out = Vec::new();
             press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL, &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
 
             // The approved diff no longer matches what's on disk.
@@ -8224,7 +8671,12 @@ mod tests {
             seed_repo_tree(&mut app, &repo);
             let mut out = Vec::new();
             press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL, &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
 
             // Commit moves HEAD; the next round of changes starts unreviewed.
@@ -8514,6 +8966,7 @@ mod tests {
             app,
             ServerEvent::EntityUpserted {
                 entity: Entity::Project(Project {
+                    workspace_id: Default::default(),
                     id: ProjectId("p2".into()),
                     name: "nebula".into(),
                     repo_path: "/tmp/nebula".into(),
@@ -8820,6 +9273,7 @@ mod tests {
             &mut app,
             ServerEvent::EntityUpserted {
                 entity: Entity::Project(Project {
+                    workspace_id: Default::default(),
                     id: ProjectId("p9".into()),
                     name: "fresh".into(),
                     repo_path: "/tmp/fresh".into(),
@@ -8921,6 +9375,21 @@ mod tests {
             panic!("settings closed");
         };
         assert_eq!(view.selected, 0, "selection does not wrap");
+    }
+
+    #[test]
+    fn settings_reopens_on_last_focused_row() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Settings(view)) = &app.overlay else {
+            panic!("settings closed");
+        };
+        assert_eq!(view.selected, 2, "reopen lands on the last focused row");
     }
 
     #[test]
@@ -9118,20 +9587,26 @@ mod tests {
         assert!(app.term_locked, "opened session locks input like an attach");
         let sref = SessionRef::Agent(AgentId("a1".into()));
         assert!(
-            out.iter().any(
-                |r| matches!(r, ClientRequest::Attach { session, .. } if *session == sref)
-            ),
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == sref)),
             "Enter attaches the selected session: {out:?}"
         );
         assert_eq!(
-            app.visible_session_rows().get(app.sel_session).map(|r| r.sref()),
+            app.visible_session_rows()
+                .get(app.sel_session)
+                .map(|r| r.sref()),
             Some(sref),
             "the panel selection landed on the opened session"
         );
 
         // Reopen (Ctrl+q first — the attach locked input to the terminal);
         // Enter on one of nebula's own rows (no session) is inert.
-        press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL, &mut out);
+        press(
+            &mut app,
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
         press(&mut app, KeyCode::Char('M'), KeyModifiers::SHIFT, &mut out);
         request_metrics(&mut app, &mut out);
         let req_id = match out.last() {
@@ -9181,7 +9656,10 @@ mod tests {
                 },
             },
         );
-        assert!(app.overlay.is_none(), "late reply must not reopen the modal");
+        assert!(
+            app.overlay.is_none(),
+            "late reply must not reopen the modal"
+        );
         assert!(app.pending.is_empty(), "late reply still clears its slot");
     }
 
@@ -9236,9 +9714,19 @@ mod tests {
 
         // Ctrl+Q closes the editor, landing back on the finder; Ctrl+y
         // copies the selected path and closes.
-        press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL, &mut out);
+        press(
+            &mut app,
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
         assert!(app.vim.is_none(), "Ctrl+Q force-closes the editor");
-        press(&mut app, KeyCode::Char('y'), KeyModifiers::CONTROL, &mut out);
+        press(
+            &mut app,
+            KeyCode::Char('y'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
         assert!(app.overlay.is_none(), "ctrl+y closes the finder");
         assert_eq!(app.flash.as_deref(), Some("copied fresh.txt"));
     }
@@ -9291,7 +9779,7 @@ mod tests {
         assert!(fin.list_area.height > 0, "draw writes list area");
     }
 
-    // ---- `t` tree browser ----
+    // ---- `b` tree browser ----
 
     fn tree_view(app: &App) -> &crate::tree_browser::TreeBrowser {
         match &app.overlay {
@@ -9321,7 +9809,7 @@ mod tests {
         app.vim_tx = Some(tx);
         let mut out = Vec::new();
 
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
         assert_eq!(tree_view(&app).file_count, 3);
         // Collapsed by default: dirs first, then top-level files; the
         // selected dir previews its children.
@@ -9368,7 +9856,12 @@ mod tests {
         // Closing the editor reloads the preview — the file may have been
         // edited under it.
         std::fs::write(repo.join("src/sub/deep.rs"), "deeper\n").unwrap();
-        press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL, &mut out);
+        press(
+            &mut app,
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
         assert!(app.vim.is_none(), "Ctrl+Q force-closes the editor");
         assert_eq!(tree_view(&app).preview, "deeper");
 
@@ -9391,7 +9884,7 @@ mod tests {
         seed_repo_tree(&mut app, &repo);
         let mut out = Vec::new();
 
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
         for c in ['l', 'i', 'b'] {
             press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
         }
@@ -9404,7 +9897,11 @@ mod tests {
             &mut out,
         );
         assert_eq!(tree_view(&app).filter, "", "Ctrl+u clears the filter");
-        assert_eq!(tree_rows(&app), vec!["src", "a.txt"], "folded tree restored");
+        assert_eq!(
+            tree_rows(&app),
+            vec!["src", "a.txt"],
+            "folded tree restored"
+        );
 
         // With nothing typed, Ctrl+u falls back to scrolling: the browser
         // stays open and the filter stays empty.
@@ -9422,10 +9919,10 @@ mod tests {
     }
 
     #[test]
-    fn t_without_worktree_flashes() {
+    fn b_without_worktree_flashes() {
         let mut app = App::new();
         let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
         assert!(app.overlay.is_none());
         assert_eq!(app.flash.as_deref(), Some("no worktree selected"));
     }
@@ -9437,7 +9934,7 @@ mod tests {
         let mut app = App::new();
         seed_repo_tree(&mut app, &repo);
         let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
 
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
@@ -9461,7 +9958,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         app.vim_tx = Some(tx);
         let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
 
         // A draw teaches the browser its preview rect, so the editor can
         // spawn at the pane's size. Row 0 is a.txt (the only file).
@@ -9482,7 +9979,10 @@ mod tests {
 
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("— editing"), "title shows edit state:\n{text}");
+        assert!(
+            text.contains("— editing"),
+            "title shows edit state:\n{text}"
+        );
         assert_eq!(
             app.vim.as_ref().unwrap().area,
             tree_view(&app).preview_area,
@@ -9587,7 +10087,12 @@ mod tests {
         assert!(app.vim.is_some());
 
         // Ctrl+Q is the hatch.
-        press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL, &mut out);
+        press(
+            &mut app,
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
         assert!(app.vim.is_none(), "Ctrl+Q force-closes the editor");
         assert!(
             matches!(&app.overlay, Some(Overlay::Grep(_))),
@@ -9625,7 +10130,13 @@ mod tests {
         handle_vim_event(&mut app, VimEvent::Exited { generation: 1 });
         assert!(app.vim.is_some(), "stale exit must not close a new editor");
         assert!(
-            !app.vim.as_ref().unwrap().parser.screen().contents().contains("stale"),
+            !app.vim
+                .as_ref()
+                .unwrap()
+                .parser
+                .screen()
+                .contents()
+                .contains("stale"),
             "stale output must not reach the new editor's screen"
         );
 
@@ -9652,7 +10163,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("Find in files — main (2 hits)"), "title:\n{text}");
+        assert!(
+            text.contains("Find in files — main (2 hits)"),
+            "title:\n{text}"
+        );
         assert!(text.contains("src/alpha.rs:3"), "hit location:\n{text}");
         assert!(text.contains("let zz = 1;"), "hit text:\n{text}");
         let view = grep_view(&app);
@@ -9965,7 +10479,8 @@ mod tests {
             "the attached pane is untouched"
         );
         assert!(
-            !out.iter().any(|r| matches!(r, ClientRequest::Attach { .. })),
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { .. })),
             "no re-attach when the highlighted session didn't change: {out:?}"
         );
     }
@@ -10154,5 +10669,369 @@ mod tests {
             Some(a1),
             "the pane shows the survivor's remembered session"
         );
+    }
+
+    // ---- workspaces ----
+
+    /// A second workspace ("client") holding project "secret", next to
+    /// `seed_tree`'s demo project in the default workspace.
+    fn seed_other_workspace(app: &mut App) {
+        use nebula_core::{
+            Entity, Project, ProjectId, Workspace, WorkspaceId, Worktree, WorktreeId,
+        };
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Workspace(Workspace {
+                    id: WorkspaceId("ws2".into()),
+                    name: "client".into(),
+                }),
+            },
+        );
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(Project {
+                    workspace_id: WorkspaceId("ws2".into()),
+                    id: ProjectId("p9".into()),
+                    name: "secret".into(),
+                    repo_path: "/tmp/secret".into(),
+                    sort_order: 9,
+                    divider_after: false,
+                    divider_label: None,
+                    divider_before: false,
+                    divider_before_label: None,
+                }),
+            },
+        );
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w9".into()),
+                    project_id: ProjectId("p9".into()),
+                    path: "/tmp/secret".into(),
+                    branch: "main".into(),
+                    is_main: true,
+                    pinned: false,
+                    sort_order: 0,
+                }),
+            },
+        );
+    }
+
+    /// Projects outside the open workspace get no panel row, don't count
+    /// toward the header, and never surface in the `/` palette.
+    #[test]
+    fn other_workspaces_projects_are_hidden_and_unsearchable() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_other_workspace(&mut app);
+        assert_eq!(app.project_rows().len(), 1, "only demo has a row");
+        assert_eq!(app.tree.visible_project_count(), 1);
+
+        let palette = Palette::new(&app.tree, true, false);
+        assert!(
+            !palette.items.is_empty() && palette.items.iter().all(|i| !i.text.contains("secret")),
+            "palette must not search other workspaces: {:?}",
+            palette.items.iter().map(|i| &i.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// ActiveWorkspaceChanged re-filters everything live: panel rows, an
+    /// open palette, the selection, and the footer's workspace name.
+    #[test]
+    fn switching_workspace_refilters_rows_palette_and_footer() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_other_workspace(&mut app);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("◇ default"), "{text}");
+        assert!(text.contains("demo"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+
+        app.overlay = Some(Overlay::Palette(Palette::new(&app.tree, false, false)));
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut app,
+            ServerEvent::ActiveWorkspaceChanged {
+                id: nebula_core::WorkspaceId("ws2".into()),
+            },
+            &mut out,
+        );
+        assert_eq!(
+            app.selected_project().map(|p| p.name.clone()),
+            Some("secret".into()),
+            "selection lands in the opened workspace"
+        );
+        match &app.overlay {
+            Some(Overlay::Palette(palette)) => assert!(
+                palette.items.iter().all(|i| !i.text.contains("demo")),
+                "open palette re-scopes to the new workspace"
+            ),
+            other => panic!("palette should stay open, got {other:?}"),
+        }
+
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("◇ client"), "{text}");
+        assert!(text.contains("secret"), "{text}");
+        assert!(!text.contains("demo"), "{text}");
+    }
+
+    /// Opening an empty workspace clears the child panels and the terminal
+    /// pane instead of keeping the previous workspace's session on screen.
+    #[test]
+    fn switching_to_empty_workspace_blanks_the_pane() {
+        use nebula_core::{Entity, Workspace, WorkspaceId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Workspace(Workspace {
+                    id: WorkspaceId("ws-empty".into()),
+                    name: "fresh".into(),
+                }),
+            },
+        );
+        let mut out = Vec::new();
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        assert!(app.term.is_some());
+        handle_server_event(
+            &mut app,
+            ServerEvent::ActiveWorkspaceChanged {
+                id: WorkspaceId("ws-empty".into()),
+            },
+            &mut out,
+        );
+        assert!(app.project_rows().is_empty(), "no visible projects");
+        assert!(app.term.is_none(), "pane blanked");
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Detach { .. })),
+            "old session detached: {out:?}"
+        );
+        assert!(app.splash_active(), "empty workspace shows the splash");
+    }
+
+    /// `w` opens the workspace switcher with the open workspace checked and
+    /// highlighted; Enter on another row asks the daemon to open it.
+    #[test]
+    fn w_key_opens_workspace_switcher_and_enter_switches() {
+        use nebula_core::{Entity, Workspace, WorkspaceId};
+        let mut app = App::new();
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Workspace(Workspace {
+                    id: WorkspaceId::default(),
+                    name: "default".into(),
+                }),
+            },
+        );
+        seed_tree(&mut app);
+        seed_other_workspace(&mut app);
+
+        let mut out = Vec::new();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+            &mut out,
+        );
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("workspace switcher should open");
+        };
+        assert_eq!(menu.title.as_deref(), Some("Workspace"));
+        assert_eq!(menu.items.len(), 2);
+        assert!(
+            menu.items[0].label.contains("default ✓"),
+            "active workspace checked: {}",
+            menu.items[0].label
+        );
+        assert_eq!(menu.hover, 0, "active row starts highlighted");
+
+        // The key verbs ride the modal's bottom border (todos-modal style).
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("n: new  r: rename  d: delete"),
+            "hints at the bottom of the modal: {text}"
+        );
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut out,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut out,
+        );
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::OpenWorkspace { id, .. }) if id.as_str() == "ws2"
+            ),
+            "Enter requests the switch: {out:?}"
+        );
+        assert!(app.overlay.is_none(), "menu closed");
+
+        // Picking the already-open workspace sends nothing.
+        let mut out = Vec::new();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+            &mut out,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut out,
+        );
+        assert!(out.is_empty(), "re-picking the open workspace is a no-op");
+    }
+
+    /// `n` in the switcher prompts for a name, creates the workspace, and
+    /// opens it as soon as the daemon acks the create.
+    #[test]
+    fn switcher_creates_a_workspace_and_opens_it_on_ack() {
+        use nebula_core::{Entity, EntityId, Workspace, WorkspaceId};
+        let mut app = App::new();
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Workspace(Workspace {
+                    id: WorkspaceId::default(),
+                    name: "default".into(),
+                }),
+            },
+        );
+        seed_tree(&mut app);
+
+        let mut out = Vec::new();
+        let press = |app: &mut App, code, out: &mut Vec<ClientRequest>| {
+            handle_key(app, KeyEvent::new(code, KeyModifiers::NONE), out);
+        };
+        press(&mut app, KeyCode::Char('w'), &mut out);
+        press(&mut app, KeyCode::Char('n'), &mut out);
+        match &app.overlay {
+            Some(Overlay::Prompt(p)) => assert_eq!(p.title, "New workspace"),
+            other => panic!("name prompt should open, got {other:?}"),
+        }
+        for c in "acme".chars() {
+            press(&mut app, KeyCode::Char(c), &mut out);
+        }
+        press(&mut app, KeyCode::Enter, &mut out);
+        let req_id = match out.last() {
+            Some(ClientRequest::AddWorkspace { req_id, name }) => {
+                assert_eq!(name, "acme");
+                *req_id
+            }
+            other => panic!("expected AddWorkspace, got {other:?}"),
+        };
+
+        // The Ack carries the created id; the switch request follows.
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(EntityId::Workspace(nebula_core::WorkspaceId(
+                    "ws-new".into(),
+                ))),
+            },
+            &mut out,
+        );
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::OpenWorkspace { id, .. }) if id.as_str() == "ws-new"
+            ),
+            "created workspace gets opened: {out:?}"
+        );
+    }
+
+    /// `r` and `d` in the switcher act on the hovered workspace (the
+    /// todos-modal pattern — footer hints, no submenus); after a delete the
+    /// open switcher refreshes its rows in place.
+    #[test]
+    fn switcher_r_and_d_act_on_the_hovered_workspace() {
+        use nebula_core::{Entity, EntityId, Workspace, WorkspaceId};
+        let mut app = App::new();
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Workspace(Workspace {
+                    id: WorkspaceId::default(),
+                    name: "default".into(),
+                }),
+            },
+        );
+        seed_tree(&mut app);
+        seed_other_workspace(&mut app); // "client" (ws2)
+
+        let mut out = Vec::new();
+        let press = |app: &mut App, code, out: &mut Vec<ClientRequest>| {
+            handle_key(app, KeyEvent::new(code, KeyModifiers::NONE), out);
+        };
+
+        // r: rename prompt prefilled with the hovered workspace's name.
+        press(&mut app, KeyCode::Char('w'), &mut out);
+        press(&mut app, KeyCode::Char('j'), &mut out); // onto "client"
+        press(&mut app, KeyCode::Char('r'), &mut out);
+        match &app.overlay {
+            Some(Overlay::Prompt(p)) => {
+                assert_eq!(p.title, "Rename workspace");
+                assert_eq!(p.input, "client");
+            }
+            other => panic!("rename prompt should open, got {other:?}"),
+        }
+        press(&mut app, KeyCode::Enter, &mut out);
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::RenameWorkspace { id, name, .. })
+                    if id.as_str() == "ws2" && name == "client"
+            ),
+            "rename request sent: {out:?}"
+        );
+
+        // d: straight to the request (the daemon guards misuse); the menu
+        // stays up and drops the row when the removal delta lands.
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('w'), &mut out);
+        press(&mut app, KeyCode::Char('j'), &mut out);
+        press(&mut app, KeyCode::Char('d'), &mut out);
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::RemoveWorkspace { id, .. }) if id.as_str() == "ws2"
+            ),
+            "delete request sent: {out:?}"
+        );
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Menu(_))),
+            "switcher stays open"
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityRemoved {
+                id: EntityId::Workspace(WorkspaceId("ws2".into())),
+            },
+        );
+        match &app.overlay {
+            Some(Overlay::Menu(menu)) => {
+                assert_eq!(menu.items.len(), 1, "deleted row dropped in place");
+                assert!(menu.items[0].label.contains("default"));
+                assert_eq!(menu.hover, 0, "cursor clamped onto a live row");
+            }
+            other => panic!("switcher should stay open, got {other:?}"),
+        }
     }
 }

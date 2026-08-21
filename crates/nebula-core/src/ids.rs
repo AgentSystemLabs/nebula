@@ -31,8 +31,20 @@ macro_rules! id_newtype {
     };
 }
 
+id_newtype!(WorkspaceId);
 id_newtype!(ProjectId);
 id_newtype!(WorktreeId);
 id_newtype!(AgentId);
 id_newtype!(TerminalId);
 id_newtype!(TodoId);
+
+/// Id of the built-in workspace every install starts with (and the home of
+/// projects that predate workspaces). A fixed literal, not a ULID, so the
+/// store migration can reference it.
+pub const DEFAULT_WORKSPACE_ID: &str = "default";
+
+impl Default for WorkspaceId {
+    fn default() -> Self {
+        Self(DEFAULT_WORKSPACE_ID.into())
+    }
+}
