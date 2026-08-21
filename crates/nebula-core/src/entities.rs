@@ -1,4 +1,4 @@
-use crate::ids::{AgentId, ProjectId, TerminalId, TodoId, WorkspaceId, WorktreeId};
+use crate::ids::{AgentId, ProjectId, TerminalId, NoteId, WorkspaceId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -172,20 +172,20 @@ pub struct TerminalTab {
     pub alive: bool,
 }
 
-/// Who a todo list hangs off: a project (high-level notes spanning its
+/// Who a note list hangs off: a project (high-level notes spanning its
 /// worktrees) or one worktree (notes for that checkout). The two are
 /// separate lists — a project's notes never mix into its worktrees'.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum TodoOwner {
+pub enum NoteOwner {
     Project(ProjectId),
     Worktree(WorktreeId),
 }
 
-/// One todo note.
+/// One note.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Todo {
-    pub id: TodoId,
-    pub owner: TodoOwner,
+pub struct Note {
+    pub id: NoteId,
+    pub owner: NoteOwner,
     pub text: String,
     pub done: bool,
     pub sort_order: i64,
@@ -198,7 +198,7 @@ pub enum Entity {
     Worktree(Worktree),
     Agent(Agent),
     Terminal(TerminalTab),
-    Todo(Todo),
+    Note(Note),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -208,5 +208,5 @@ pub enum EntityId {
     Worktree(WorktreeId),
     Agent(AgentId),
     Terminal(TerminalId),
-    Todo(TodoId),
+    Note(NoteId),
 }

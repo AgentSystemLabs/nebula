@@ -5,6 +5,7 @@ pub mod event_loop;
 pub mod fuzzy;
 pub mod git_diff;
 pub mod grep_search;
+pub mod hosts;
 pub mod ipc;
 pub mod keys;
 pub mod links;
@@ -27,8 +28,10 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 }
 
 /// Entry point for the TUI client. Terminal setup/teardown lives here so the
-/// binary crate stays a thin arg-parser.
-pub fn run_tui() -> Result<()> {
+/// binary crate stays a thin arg-parser. `Some(entry)` means the user picked
+/// a recent ssh host — the terminal is restored and the caller should exec
+/// `nebula ssh` at it.
+pub fn run_tui() -> Result<Option<hosts::HostEntry>> {
     runtime()?.block_on(event_loop::run_app())
 }
 

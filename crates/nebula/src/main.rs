@@ -133,7 +133,17 @@ fn main() -> Result<()> {
             Some(dir) => nebula_tui::run_add_project(dir),
             None => {
                 init_tui_logging()?;
-                log_fatal(nebula_tui::run_tui(), nebula_core::paths::tui_log_path())
+                let handoff = log_fatal(nebula_tui::run_tui(), nebula_core::paths::tui_log_path())?;
+                match handoff {
+                    // Hosts-picker handoff: the TUI quit and restored the
+                    // terminal so a fresh `nebula ssh` can exec over us (the
+                    // local daemon and its sessions stay up).
+                    Some(entry) => {
+                        eprintln!("nebula: connecting to {}…", entry.host);
+                        ssh::run_ssh(&entry.host, entry.path.as_deref())
+                    }
+                    None => Ok(()),
+                }
             }
         },
     }
@@ -141,7 +151,7 @@ fn main() -> Result<()> {
 
 /// Record a fatal top-level error in the log file before it goes to stderr —
 /// the TUI's stderr disappears with the terminal, the daemon's is /dev/null.
-fn log_fatal(result: Result<()>, log_path: std::path::PathBuf) -> Result<()> {
+fn log_fatal<T>(result: Result<T>, log_path: std::path::PathBuf) -> Result<T> {
     if let Err(err) = &result {
         nebula_core::crashlog::append(&log_path, &format!("FATAL {err:#}"));
     }

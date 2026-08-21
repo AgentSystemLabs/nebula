@@ -22,6 +22,11 @@ pub const RECENT_WINDOWS: &[&str] = &["off", "5m", "10m", "30m", "1h", "24h"];
 /// is reaped).
 pub const SESSION_IDLE_TIMEOUTS: &[&str] = &["off", "1m", "5m", "15m", "30m", "1h"];
 
+/// Editor commands the settings overlay cycles through. Every entry
+/// accepts `+<line> <file>`, which is how the overlays launch it. As with
+/// models, hand-edited configs can name any command the list doesn't.
+pub const EDITORS: &[&str] = &["vim", "nvim", "nano", "emacs", "hx"];
+
 /// Model/effort choices for the new-session submenus and the settings
 /// overlay. "default" everywhere means "don't pass the flag — let the CLI
 /// pick" and is what the daemon sees as None.
@@ -69,6 +74,7 @@ pub struct SettingGroup {
 pub enum SettingKind {
     PaletteEnterAttaches,
     GitInitOnCreate,
+    Editor,
     RecentWindow,
     SessionIdleTimeout,
     Theme,
@@ -93,6 +99,11 @@ pub const SETTING_GROUPS: &[SettingGroup] = &[
                 kind: SettingKind::GitInitOnCreate,
                 label: "git init new projects",
                 hint: "When adding a missing directory, run git init in it",
+            },
+            SettingSpec {
+                kind: SettingKind::Editor,
+                label: "File editor",
+                hint: "Editor f/b/F and ⌥click launch (NEBULA_EDITOR overrides)",
             },
         ],
     },
@@ -210,6 +221,13 @@ pub struct Config {
     /// Owned by the daemon; the TUI writes it so the settings overlay can
     /// toggle every key in the shared file.
     pub git_init_on_create: bool,
+    /// Editor command the file finder (`f`), tree browser (`b`),
+    /// find-in-files (`F`), and ⌥click file links launch, invoked as
+    /// `<editor> +<line> <file>`. Any command passes through verbatim, so
+    /// hand-edited configs can name editors the picker doesn't list. The
+    /// `NEBULA_EDITOR` env var overrides it for the process; see
+    /// [`Config::editor_command`].
+    pub editor: String,
     /// How long a session stays in the RECENT group after its status last
     /// changed: "5m", "10m", "30m", "1h", "24h" (any `<n>m`/`<n>h` works).
     /// "off" disables the group. Malformed values fall back to 30m.
@@ -244,6 +262,7 @@ impl Default for Config {
         Self {
             palette_enter_attaches: true,
             git_init_on_create: true,
+            editor: "vim".into(),
             recent_window: "30m".into(),
             session_idle_timeout: "5m".into(),
             theme: "default".into(),
@@ -291,6 +310,7 @@ impl Config {
             "git_init_on_create".into(),
             serde_json::json!(self.git_init_on_create),
         );
+        obj.insert("editor".into(), serde_json::json!(self.editor));
         obj.insert(
             "recent_window".into(),
             serde_json::json!(self.recent_window),
@@ -330,6 +350,12 @@ impl Config {
         crate::theme::Theme::by_name(&self.theme)
     }
 
+    /// The editor the file overlays launch: `NEBULA_EDITOR` when set,
+    /// otherwise the `editor` setting, otherwise vim.
+    pub fn editor_command(&self) -> String {
+        resolve_editor(std::env::var("NEBULA_EDITOR").ok().as_deref(), &self.editor)
+    }
+
     /// The configured default model for new sessions of `kind`, as the
     /// daemon wants it: None = "default" = don't pass the flag.
     pub fn default_model(&self, kind: AgentKind) -> Option<String> {
@@ -356,6 +382,7 @@ impl Config {
         match kind {
             SettingKind::PaletteEnterAttaches => on_off(self.palette_enter_attaches).into(),
             SettingKind::GitInitOnCreate => on_off(self.git_init_on_create).into(),
+            SettingKind::Editor => self.editor.clone(),
             SettingKind::RecentWindow => self.recent_window.clone(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
             SettingKind::Theme => self.theme.clone(),
@@ -381,6 +408,9 @@ impl Config {
             }
             SettingKind::GitInitOnCreate => {
                 self.git_init_on_create = !self.git_init_on_create;
+            }
+            SettingKind::Editor => {
+                self.editor = cycle_choice(&self.editor, EDITORS, step).into();
             }
             SettingKind::RecentWindow => {
                 self.recent_window = cycle_choice(&self.recent_window, RECENT_WINDOWS, step).into();
@@ -412,6 +442,17 @@ impl Config {
             }
         }
     }
+}
+
+/// First non-blank of env override → configured value → vim.
+fn resolve_editor(env: Option<&str>, configured: &str) -> String {
+    for value in [env.unwrap_or(""), configured] {
+        let value = value.trim();
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+    "vim".into()
 }
 
 /// "default" (or blank) → None; anything else passes through.
@@ -539,12 +580,49 @@ mod tests {
         assert!(cfg.palette_enter_attaches);
 
         assert_eq!(cfg.recent_window, "30m");
-        cfg.cycle(2, 0);
+        let row = settings()
+            .position(|s| s.kind == SettingKind::RecentWindow)
+            .unwrap();
+        cfg.cycle(row, 0);
         assert_eq!(cfg.recent_window, "1h");
-        cfg.cycle(2, -1);
+        cfg.cycle(row, -1);
         assert_eq!(cfg.recent_window, "30m");
-        cfg.cycle(2, -1);
+        cfg.cycle(row, -1);
         assert_eq!(cfg.recent_window, "10m");
+    }
+
+    #[test]
+    fn editor_defaults_cycles_and_persists() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.editor, "vim");
+        let row = settings()
+            .position(|s| s.kind == SettingKind::Editor)
+            .unwrap();
+        cfg.cycle(row, 1);
+        assert_eq!(cfg.editor, "nvim");
+        cfg.cycle(row, -1);
+        assert_eq!(cfg.editor, "vim");
+        // Hand-edited commands the picker doesn't list cycle from the start.
+        cfg.editor = "kak".into();
+        cfg.cycle(row, 1);
+        assert_eq!(cfg.editor, "nvim");
+
+        cfg.editor = "nvim".into();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert_eq!(load_from(&path).editor, "nvim");
+        // A config predating the key keeps vim.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.editor, "vim");
+    }
+
+    #[test]
+    fn editor_resolution_prefers_env_then_setting_then_vim() {
+        assert_eq!(resolve_editor(Some("hx"), "nvim"), "hx");
+        assert_eq!(resolve_editor(Some("  "), "nvim"), "nvim");
+        assert_eq!(resolve_editor(None, " nvim "), "nvim");
+        assert_eq!(resolve_editor(None, ""), "vim");
     }
 
     #[test]

@@ -2,9 +2,10 @@
 
 use crate::app::{
     App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder, Focus,
-    GrepView, HitTarget, MenuAction, MenuItem, MetricsView, Overlay, Palette, PaletteTarget,
-    PendingAction, PendingIntent, ProjectRow, PromptDialog, PromptKind, SessionRow, SettingsView,
-    SplitterDrag, SubmenuKind, TermSelection, TodoInput, TodoView, WorktreeRollback,
+    GrepView, HitTarget, MenuAction, MenuItem, MetricsView, NoteInput, NoteView, Overlay, Palette,
+    PaletteTarget, PendingAction, PendingIntent, PointerShape, ProjectRow, PromptDialog,
+    PromptKind, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection,
+    WorktreeRollback,
 };
 use crate::tree_browser::TreeBrowser;
 use crate::vim_term::{VimEvent, VimTerm};
@@ -15,7 +16,7 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use nebula_core::{
-    AgentId, AgentKind, ClientRequest, EntityId, ServerEvent, SessionRef, TodoId, TodoOwner,
+    AgentId, AgentKind, ClientRequest, EntityId, NoteId, NoteOwner, ServerEvent, SessionRef,
     WorktreeId,
 };
 use ratatui::backend::CrosstermBackend;
@@ -60,7 +61,9 @@ const SPLASH_FRAME: Duration = crate::splash::FRAME;
 /// needs-feedback rows.
 const SWEEP_FRAME: Duration = crate::app::SWEEP_FRAME;
 
-pub async fn run_app() -> Result<()> {
+/// `Some(entry)` = quit via the hosts picker: the caller should exec
+/// `nebula ssh` at it now that the terminal is restored.
+pub async fn run_app() -> Result<Option<crate::hosts::HostEntry>> {
     let conn = ipc::connect_or_spawn().await?;
     let mut channels = ipc::split_connection(conn);
     channels.tx.send(ClientRequest::Subscribe).await?;
@@ -121,6 +124,9 @@ pub fn restore_terminal() {
     }
     let _ = execute!(
         std::io::stdout(),
+        // Hand back the default pointer in case we left it col-resize
+        // (OSC 22; terminals without pointer-shape support drop it).
+        crossterm::style::Print("\x1b]22;default\x1b\\"),
         crossterm::event::DisableBracketedPaste,
         crossterm::event::DisableMouseCapture,
         LeaveAlternateScreen,
@@ -131,7 +137,7 @@ pub fn restore_terminal() {
 async fn main_loop(
     terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
     channels: &mut ipc::IpcChannels,
-) -> Result<()> {
+) -> Result<Option<crate::hosts::HostEntry>> {
     let mut app = App::new();
     app.conn = ConnState::Connected;
     let cfg = crate::config::Config::load();
@@ -141,6 +147,9 @@ async fn main_loop(
     app.focus_tint = cfg.focus_tint;
     let mut input = crossterm::event::EventStream::new();
     let mut out: Vec<ClientRequest> = Vec::new();
+    // Pointer shape last sent to the terminal (OSC 22), so hover over a
+    // splitter swaps the cursor once instead of on every motion event.
+    let mut pointer_sent = PointerShape::default();
     let mut next_draw = tokio::time::Instant::now();
     let mut next_git_poll = tokio::time::Instant::now();
     let mut next_metrics_poll = tokio::time::Instant::now();
@@ -280,6 +289,17 @@ async fn main_loop(
             handle_vim_event(&mut app, ev);
         }
 
+        // Mouse handlers only record the pointer shape they want; emit the
+        // OSC 22 request when it changes. Terminals without pointer-shape
+        // support (Terminal.app) parse and drop the sequence.
+        if app.pointer_shape != pointer_sent {
+            pointer_sent = app.pointer_shape;
+            use std::io::Write;
+            let backend = terminal.backend_mut();
+            let _ = write!(backend, "\x1b]22;{}\x1b\\", pointer_sent.osc_name());
+            let _ = backend.flush();
+        }
+
         for req in out.drain(..) {
             if channels.tx.send(req).await.is_err() {
                 app.conn = ConnState::Disconnected;
@@ -295,7 +315,7 @@ async fn main_loop(
                     json: ui_state_json(&app),
                 })
                 .await;
-            return Ok(());
+            return Ok(app.pending_ssh.take());
         }
     }
 }
@@ -608,7 +628,9 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 Focus::Terminal => Focus::Sessions,
             }
         }
-        KeyCode::Char('h') | KeyCode::Left => {
+        // `h` belongs to the hosts picker (below), so ← alone moves left —
+        // the one asymmetry in the hjkl set.
+        KeyCode::Left => {
             app.focus = match app.focus {
                 Focus::Projects => Focus::Projects,
                 Focus::Worktrees => Focus::Projects,
@@ -616,6 +638,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 Focus::Terminal => Focus::Sessions,
             }
         }
+        KeyCode::Char('h') => open_hosts_picker(app),
         // Ctrl+→ still reaches the terminal pane (the counterpart of the
         // Ctrl+← escape hatch); must precede the unguarded arm below.
         KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -830,11 +853,12 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         KeyCode::Char('o') => open_prompt(app, PromptKind::AddProject),
         KeyCode::Char('f') => open_file_finder(app),
         KeyCode::Char('F') => open_grep_view(app),
-        KeyCode::Char('t') => open_todo_view(app),
+        // `e` for not(e)s.
+        KeyCode::Char('e') => open_note_view(app),
         KeyCode::Char('b') => open_tree_browser(app),
-        // Shift+T: new shell terminal, spawned in the worktree's directory.
+        // t/T: new shell terminal, spawned in the worktree's directory.
         // (Cmd+T never reaches a TUI — the emulator opens its own tab.)
-        KeyCode::Char('T') => create_terminal_for_context(app, out),
+        KeyCode::Char('t') | KeyCode::Char('T') => create_terminal_for_context(app, out),
         KeyCode::Char('z') => {
             if app.term.is_some() {
                 app.collapsed = true;
@@ -1012,37 +1036,37 @@ fn restore_reviewed_marks(view: &mut DiffView) {
 /// Fuzzy file finder over every tracked + untracked file of the selected
 /// worktree (`f`). Same shell as `open_diff_view`: flash instead of opening
 /// when there's no worktree, the path is gone, or git fails.
-/// Open the todo modal (`o`): the project's own notes from the Projects
+/// Open the note modal (`o`): the project's own notes from the Projects
 /// panel, the selected worktree's notes elsewhere (falling back to the
 /// project when it has no worktrees yet).
-fn open_todo_view(app: &mut App) {
+fn open_note_view(app: &mut App) {
     let owner = if app.focus == Focus::Projects {
         app.selected_project()
-            .map(|p| TodoOwner::Project(p.id.clone()))
+            .map(|p| NoteOwner::Project(p.id.clone()))
     } else {
         app.selected_worktree()
-            .map(|w| TodoOwner::Worktree(w.id.clone()))
+            .map(|w| NoteOwner::Worktree(w.id.clone()))
             .or_else(|| {
                 app.selected_project()
-                    .map(|p| TodoOwner::Project(p.id.clone()))
+                    .map(|p| NoteOwner::Project(p.id.clone()))
             })
     };
     let Some(owner) = owner else {
         app.flash = Some("select a project or worktree first".into());
         return;
     };
-    open_todos_for_owner(app, owner);
+    open_notes_for_owner(app, owner);
 }
 
-fn open_todos_for_owner(app: &mut App, owner: TodoOwner) {
+fn open_notes_for_owner(app: &mut App, owner: NoteOwner) {
     let context = match &owner {
-        TodoOwner::Project(id) => {
+        NoteOwner::Project(id) => {
             let Some(project) = app.tree.projects.iter().find(|p| &p.id == id) else {
                 return;
             };
             project.name.clone()
         }
-        TodoOwner::Worktree(id) => {
+        NoteOwner::Worktree(id) => {
             let Some(worktree) = app.tree.worktrees.iter().find(|w| &w.id == id) else {
                 return;
             };
@@ -1058,7 +1082,15 @@ fn open_todos_for_owner(app: &mut App, owner: TodoOwner) {
             )
         }
     };
-    app.overlay = Some(Overlay::Todos(TodoView::new(owner, context)));
+    app.overlay = Some(Overlay::Notes(NoteView::new(owner, context)));
+}
+
+/// `h`: destinations remembered by `nebula ssh`, newest first. Opens even
+/// when empty — the modal's hint is how the feature introduces itself.
+fn open_hosts_picker(app: &mut App) {
+    app.overlay = Some(Overlay::Hosts(crate::app::HostsView::new(
+        crate::hosts::load(),
+    )));
 }
 
 fn open_file_finder(app: &mut App) {
@@ -1085,7 +1117,7 @@ fn open_file_finder(app: &mut App) {
         app.flash = Some(format!("no files in {branch}"));
         return;
     }
-    let editor = std::env::var("NEBULA_EDITOR").unwrap_or_else(|_| "vim".into());
+    let editor = crate::config::Config::load().editor_command();
     app.overlay = Some(Overlay::Files(FileFinder::new(path, branch, editor, files)));
 }
 
@@ -1117,7 +1149,7 @@ fn open_tree_browser(app: &mut App) {
         app.flash = Some(format!("no files in {branch}"));
         return;
     }
-    let editor = std::env::var("NEBULA_EDITOR").unwrap_or_else(|_| "vim".into());
+    let editor = crate::config::Config::load().editor_command();
     app.overlay = Some(Overlay::Tree(TreeBrowser::new(path, branch, editor, files)));
 }
 
@@ -1136,7 +1168,7 @@ fn open_grep_view(app: &mut App) {
         app.flash = Some(format!("worktree path missing on disk: {}", path.display()));
         return;
     }
-    let editor = std::env::var("NEBULA_EDITOR").unwrap_or_else(|_| "vim".into());
+    let editor = crate::config::Config::load().editor_command();
     app.overlay = Some(Overlay::Grep(GrepView::new(path, branch, editor)));
 }
 
@@ -1258,7 +1290,7 @@ fn open_file_link(app: &mut App, path: &str, line: Option<u64>) {
         app.flash = Some(format!("file not found: {path}"));
         return;
     };
-    let editor = std::env::var("NEBULA_EDITOR").unwrap_or_else(|_| "vim".into());
+    let editor = crate::config::Config::load().editor_command();
     let Some(tx) = app.vim_tx.clone() else {
         return; // main loop not running (unit tests without a channel)
     };
@@ -1811,7 +1843,7 @@ fn open_move_agent_picker(app: &mut App, agent: AgentId) {
 /// Workspace switcher (`w`): pick which workspace is open. The active one is
 /// checked and starts highlighted; Enter asks the daemon to open the pick
 /// (the switch lands via ActiveWorkspaceChanged, so every client follows).
-/// Management verbs are keys with footer hints, the todos-modal pattern:
+/// Management verbs are keys with footer hints, the notes-modal pattern:
 /// n creates (and opens) a workspace, r renames the hovered one, d deletes
 /// it. The list refreshes in place as workspace deltas arrive.
 fn open_workspace_picker(app: &mut App) {
@@ -1861,7 +1893,7 @@ fn open_workspace_picker(app: &mut App) {
 }
 
 /// Rebuild an open workspace switcher after the workspace list (or the ✓
-/// marker) changed under it, keeping the cursor row. The todos modal gets
+/// marker) changed under it, keeping the cursor row. The notes modal gets
 /// this for free by reading the tree at draw time; the menu's rows are
 /// snapshots, so refresh them here.
 fn refresh_workspace_picker(app: &mut App) {
@@ -1907,8 +1939,8 @@ fn open_context_menu_for_selection(app: &mut App) {
                     },
                 );
                 items.push(MenuItem {
-                    label: "Todos".into(),
-                    action: MenuAction::OpenTodos(TodoOwner::Project(p.id.clone())),
+                    label: "Notes".into(),
+                    action: MenuAction::OpenNotes(NoteOwner::Project(p.id.clone())),
                     destructive: false,
                 });
                 items.push(divider_menu_item(p));
@@ -1934,8 +1966,8 @@ fn open_context_menu_for_selection(app: &mut App) {
                         destructive: false,
                     },
                     MenuItem {
-                        label: "Todos".into(),
-                        action: MenuAction::OpenTodos(TodoOwner::Worktree(w.id.clone())),
+                        label: "Notes".into(),
+                        action: MenuAction::OpenNotes(NoteOwner::Worktree(w.id.clone())),
                         destructive: false,
                     },
                     MenuItem {
@@ -1996,6 +2028,63 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
             }
             _ => {}
         },
+        Overlay::Hosts(view) => {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            // Typing a new destination (`a`): the input owns printable keys.
+            if let Some(input) = &mut view.input {
+                match key.code {
+                    KeyCode::Esc => view.input = None,
+                    KeyCode::Enter => {
+                        let entry = crate::hosts::parse_destination(input);
+                        view.input = None;
+                        // Nothing typed = cancel; otherwise connect exactly
+                        // like `nebula ssh host [dir]` would.
+                        if let Some(entry) = entry {
+                            app.overlay = None;
+                            app.pending_ssh = Some(entry);
+                            app.should_quit = true;
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        input.pop();
+                    }
+                    KeyCode::Char('u') if ctrl => input.clear(),
+                    KeyCode::Char(c) if !ctrl => input.push(c),
+                    _ => {}
+                }
+                return;
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => app.overlay = None,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    view.selected = (view.selected + 1).min(view.hosts.len().saturating_sub(1));
+                }
+                KeyCode::Char('k') | KeyCode::Up => view.selected = view.selected.saturating_sub(1),
+                // A destination the list doesn't have yet — typed here so an
+                // open nebula never needs a shell for `nebula ssh`.
+                KeyCode::Char('a') | KeyCode::Char('n') => view.input = Some(String::new()),
+                // Enter hands off: quit the TUI, then the binary execs a
+                // fresh `nebula ssh` at the entry (the daemon and its
+                // sessions stay up).
+                KeyCode::Enter => {
+                    if let Some(entry) = view.hosts.get(view.selected).cloned() {
+                        app.overlay = None;
+                        app.pending_ssh = Some(entry);
+                        app.should_quit = true;
+                    }
+                }
+                // Forget the entry — no confirm, the next `nebula ssh` to it
+                // just re-adds it.
+                KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Backspace | KeyCode::Delete => {
+                    if view.selected < view.hosts.len() {
+                        let entry = view.hosts.remove(view.selected);
+                        view.selected = view.selected.min(view.hosts.len().saturating_sub(1));
+                        crate::hosts::remove(&entry);
+                    }
+                }
+                _ => {}
+            }
+        }
         Overlay::Menu(menu) => match key.code {
             // Esc in a submenu backs out one level; at the top it closes.
             KeyCode::Esc => match menu.parent.take() {
@@ -2018,7 +2107,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                     *menu = *parent;
                 }
             }
-            // Workspace-switcher verbs (footer-hinted, the todos-modal
+            // Workspace-switcher verbs (footer-hinted, the notes-modal
             // pattern): n creates a workspace (opened on Ack), r renames
             // the hovered one, d deletes it — no confirm, the daemon only
             // deletes empty workspaces so a refusal just flashes.
@@ -2389,26 +2478,26 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 _ => {}
             }
         }
-        Overlay::Todos(view) => {
+        Overlay::Notes(view) => {
             // The CRUD keys need both the view (cursor/input) and the tree
             // (rows) — resolve the key to a command first, then act, so the
             // overlay borrow never overlaps the request plumbing.
-            enum TodoCmd {
+            enum NoteCmd {
                 Nothing,
                 Close,
                 Move(i64),
                 StartCreate,
-                StartEdit(TodoId, String),
+                StartEdit(NoteId, String),
                 CancelInput,
                 Create(String),
-                Update(TodoId, String),
-                Toggle(TodoId, bool),
-                Delete(TodoId),
+                Update(NoteId, String),
+                Toggle(NoteId, bool),
+                Delete(NoteId),
             }
             // Row order matches the draw: tree order for this owner.
-            let rows: Vec<(TodoId, String, bool)> = app
+            let rows: Vec<(NoteId, String, bool)> = app
                 .tree
-                .todos
+                .notes
                 .iter()
                 .filter(|t| t.owner == view.owner)
                 .map(|t| (t.id.clone(), t.text.clone(), t.done))
@@ -2418,98 +2507,99 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             let cmd = if let Some(input) = &mut view.input {
                 match key.code {
-                    KeyCode::Esc => TodoCmd::CancelInput,
+                    KeyCode::Esc => NoteCmd::CancelInput,
                     // Nothing typed = cancel; edits and adds both no-op.
                     KeyCode::Enter => match (&input.editing, input.text.trim()) {
-                        (_, "") => TodoCmd::CancelInput,
-                        (Some(id), text) => TodoCmd::Update(id.clone(), text.to_string()),
-                        (None, text) => TodoCmd::Create(text.to_string()),
+                        (_, "") => NoteCmd::CancelInput,
+                        (Some(id), text) => NoteCmd::Update(id.clone(), text.to_string()),
+                        (None, text) => NoteCmd::Create(text.to_string()),
                     },
                     KeyCode::Backspace => {
                         input.text.pop();
-                        TodoCmd::Nothing
+                        NoteCmd::Nothing
                     }
                     KeyCode::Char('u') if ctrl => {
                         input.text.clear();
-                        TodoCmd::Nothing
+                        NoteCmd::Nothing
                     }
                     KeyCode::Char(c) if !ctrl => {
                         input.text.push(c);
-                        TodoCmd::Nothing
+                        NoteCmd::Nothing
                     }
-                    _ => TodoCmd::Nothing,
+                    _ => NoteCmd::Nothing,
                 }
             } else {
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => TodoCmd::Close,
-                    KeyCode::Char('j') | KeyCode::Down => TodoCmd::Move(1),
-                    KeyCode::Char('k') | KeyCode::Up => TodoCmd::Move(-1),
-                    // `t` mirrors the key that opened the modal; a/n too.
-                    KeyCode::Char('t') | KeyCode::Char('a') | KeyCode::Char('n') => {
-                        TodoCmd::StartCreate
+                    KeyCode::Esc | KeyCode::Char('q') => NoteCmd::Close,
+                    KeyCode::Char('j') | KeyCode::Down => NoteCmd::Move(1),
+                    KeyCode::Char('k') | KeyCode::Up => NoteCmd::Move(-1),
+                    // `e` mirrors the key that opened the modal; a/n too.
+                    // (That costs `e` as an edit key — Enter/r cover it.)
+                    KeyCode::Char('e') | KeyCode::Char('a') | KeyCode::Char('n') => {
+                        NoteCmd::StartCreate
                     }
-                    KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('r') => {
+                    KeyCode::Enter | KeyCode::Char('r') => {
                         match rows.get(selected) {
-                            Some((id, text, _)) => TodoCmd::StartEdit(id.clone(), text.clone()),
+                            Some((id, text, _)) => NoteCmd::StartEdit(id.clone(), text.clone()),
                             // Empty list: Enter starts the first note.
-                            None => TodoCmd::StartCreate,
+                            None => NoteCmd::StartCreate,
                         }
                     }
                     KeyCode::Char(' ') | KeyCode::Char('x') => match rows.get(selected) {
-                        Some((id, _, done)) => TodoCmd::Toggle(id.clone(), !done),
-                        None => TodoCmd::Nothing,
+                        Some((id, _, done)) => NoteCmd::Toggle(id.clone(), !done),
+                        None => NoteCmd::Nothing,
                     },
                     KeyCode::Char('d') | KeyCode::Backspace | KeyCode::Delete => {
                         match rows.get(selected) {
-                            Some((id, _, _)) => TodoCmd::Delete(id.clone()),
-                            None => TodoCmd::Nothing,
+                            Some((id, _, _)) => NoteCmd::Delete(id.clone()),
+                            None => NoteCmd::Nothing,
                         }
                     }
-                    _ => TodoCmd::Nothing,
+                    _ => NoteCmd::Nothing,
                 }
             };
             match cmd {
-                TodoCmd::Nothing => {}
-                TodoCmd::Close => app.overlay = None,
-                TodoCmd::Move(delta) => {
+                NoteCmd::Nothing => {}
+                NoteCmd::Close => app.overlay = None,
+                NoteCmd::Move(delta) => {
                     let max = rows.len().saturating_sub(1) as i64;
                     view.selected = (selected as i64 + delta).clamp(0, max) as usize;
                 }
-                TodoCmd::StartCreate => {
-                    view.input = Some(TodoInput {
+                NoteCmd::StartCreate => {
+                    view.input = Some(NoteInput {
                         editing: None,
                         text: String::new(),
                     });
                 }
-                TodoCmd::StartEdit(id, text) => {
-                    view.input = Some(TodoInput {
+                NoteCmd::StartEdit(id, text) => {
+                    view.input = Some(NoteInput {
                         editing: Some(id),
                         text,
                     });
                 }
-                TodoCmd::CancelInput => view.input = None,
-                TodoCmd::Create(text) => {
+                NoteCmd::CancelInput => view.input = None,
+                NoteCmd::Create(text) => {
                     view.input = None;
                     let owner = view.owner.clone();
-                    let req_id = app.alloc_req_id(PendingIntent::SelectCreatedTodo);
-                    out.push(ClientRequest::CreateTodo {
+                    let req_id = app.alloc_req_id(PendingIntent::SelectCreatedNote);
+                    out.push(ClientRequest::CreateNote {
                         req_id,
                         owner,
                         text,
                     });
                 }
-                TodoCmd::Update(id, text) => {
+                NoteCmd::Update(id, text) => {
                     view.input = None;
                     let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::UpdateTodo { req_id, id, text });
+                    out.push(ClientRequest::UpdateNote { req_id, id, text });
                 }
-                TodoCmd::Toggle(id, done) => {
+                NoteCmd::Toggle(id, done) => {
                     let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::SetTodoDone { req_id, id, done });
+                    out.push(ClientRequest::SetNoteDone { req_id, id, done });
                 }
-                TodoCmd::Delete(id) => {
+                NoteCmd::Delete(id) => {
                     let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::DeleteTodo { req_id, id });
+                    out.push(ClientRequest::DeleteNote { req_id, id });
                 }
             }
         }
@@ -2862,7 +2952,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             )
         }
         MenuAction::NewWorktree(project) => open_prompt(app, PromptKind::NewWorktree { project }),
-        MenuAction::OpenTodos(owner) => open_todos_for_owner(app, owner),
+        MenuAction::OpenNotes(owner) => open_notes_for_owner(app, owner),
         MenuAction::SetWorktreePinned(id, pinned) => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::SetWorktreePinned { req_id, id, pinned });
@@ -3667,7 +3757,67 @@ fn open_url(url: &str) -> bool {
 /// Two clicks on the same cell within this window make a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
+/// The two touching border cells at a vertical panel boundary `bx`, bounded
+/// by `area` — the shared grab-zone rule for every splitter.
+fn on_vsplit(bx: u16, area: ratatui::layout::Rect, column: u16, row: u16) -> bool {
+    area.width > 0
+        && row >= area.y
+        && row < area.y + area.height
+        && column.saturating_add(1) >= bx
+        && column <= bx
+}
+
+/// Whether the mouse is somewhere a horizontal resize could start (or one is
+/// already in progress): a main-screen splitter, or the file-list border of
+/// the diff / tree modals.
+fn pointer_wants_resize(app: &App, column: u16, row: u16) -> bool {
+    if app.vim.is_some() {
+        return false;
+    }
+    match &app.overlay {
+        Some(Overlay::Diff(view)) => {
+            view.files_drag.is_some() || on_vsplit(view.splitter_x(), view.area, column, row)
+        }
+        Some(Overlay::Tree(view)) => {
+            view.files_drag.is_some() || on_vsplit(view.splitter_x(), view.area, column, row)
+        }
+        Some(_) => false,
+        None => {
+            app.splitter_drag.is_some()
+                || matches!(app.hit_at(column, row), Some(HitTarget::Splitter(_)))
+        }
+    }
+}
+
+/// Track the mouse for the resize affordances: the pointer shape the outer
+/// terminal should show (col-resize over any draggable boundary) and the
+/// main-screen grip highlight. Runs on every mouse event — including plain
+/// motion, the only kind that arrives with nothing pressed. Terminals that
+/// don't report motion (Terminal.app) still pass through here on clicks and
+/// drags, so drag state keeps the shape honest where hover can't.
+fn update_pointer(app: &mut App, mouse: &MouseEvent) {
+    app.pointer_shape = if pointer_wants_resize(app, mouse.column, mouse.row) {
+        PointerShape::ColResize
+    } else {
+        PointerShape::Default
+    };
+    let hover = if app.vim.is_none() && app.overlay.is_none() {
+        match (app.splitter_drag, app.hit_at(mouse.column, mouse.row)) {
+            (Some(drag), _) => Some(drag.idx),
+            (None, Some(HitTarget::Splitter(i))) => Some(i),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if app.hover_splitter != hover {
+        app.hover_splitter = hover;
+        app.dirty = true;
+    }
+}
+
 fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) {
+    update_pointer(app, &mouse);
     // The editor modal swallows the mouse entirely — its selection/scroll
     // story is vim's, not ours.
     if app.vim.is_some() {
@@ -3750,12 +3900,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 // Border grab zone: the two touching border cells at the
                 // files/diff boundary (the panel `Splitter` pattern).
                 let bx = view.splitter_x();
-                let on_border = view.area.width > 0
-                    && mouse.row >= view.area.y
-                    && mouse.row < view.area.y + view.area.height
-                    && mouse.column.saturating_add(1) >= bx
-                    && mouse.column <= bx;
-                if on_border {
+                if on_vsplit(bx, view.area, mouse.column, mouse.row) {
                     view.files_drag = Some(bx as i32 - mouse.column as i32);
                     return;
                 }
@@ -3934,12 +4079,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 // Border grab zone: the two touching border cells at the
                 // tree/preview boundary (the panel `Splitter` pattern).
                 let bx = view.splitter_x();
-                let on_border = view.area.width > 0
-                    && mouse.row >= view.area.y
-                    && mouse.row < view.area.y + view.area.height
-                    && mouse.column.saturating_add(1) >= bx
-                    && mouse.column <= bx;
-                if on_border {
+                if on_vsplit(bx, view.area, mouse.column, mouse.row) {
                     view.files_drag = Some(bx as i32 - mouse.column as i32);
                     return;
                 }
@@ -3981,12 +4121,56 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         }
         return;
     }
-    // Todo modal: the wheel moves the selection, a click on a row selects
+    // Hosts picker: the wheel moves the selection, a click on a row connects
+    // (the context-menu convention — rows are actions, not editable items),
+    // a click outside the modal closes; everything else is swallowed.
+    if let Some(Overlay::Hosts(view)) = &mut app.overlay {
+        let max = view.hosts.len().saturating_sub(1) as i64;
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                view.selected = (view.selected as i64 - 1).clamp(0, max) as usize;
+                app.dirty = true;
+            }
+            MouseEventKind::ScrollDown => {
+                view.selected = (view.selected as i64 + 1).clamp(0, max) as usize;
+                app.dirty = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let list = view.list_area;
+                let area = view.area;
+                let inside_list = list.width > 0
+                    && mouse.column >= list.x
+                    && mouse.column < list.x + list.width
+                    && mouse.row >= list.y
+                    && mouse.row < list.y + list.height;
+                let inside_modal = mouse.column >= area.x
+                    && mouse.column < area.x + area.width
+                    && mouse.row >= area.y
+                    && mouse.row < area.y + area.height;
+                if inside_list {
+                    let start = view.window_start(list.height as usize);
+                    let index = start + (mouse.row - list.y) as usize;
+                    if let Some(entry) = view.hosts.get(index).cloned() {
+                        view.selected = index;
+                        app.overlay = None;
+                        app.pending_ssh = Some(entry);
+                        app.should_quit = true;
+                    }
+                } else if !inside_modal {
+                    app.overlay = None;
+                }
+                app.dirty = true;
+            }
+            _ => {}
+        }
+        return;
+    }
+    // Note modal: the wheel moves the selection, a click on a row selects
     // it, a click outside the modal closes; everything else is swallowed.
-    if let Some(Overlay::Todos(view)) = &mut app.overlay {
+    if let Some(Overlay::Notes(view)) = &mut app.overlay {
         let count = app
             .tree
-            .todos
+            .notes
             .iter()
             .filter(|t| t.owner == view.owner)
             .count();
@@ -4304,8 +4488,39 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     // Scrolling shifts the content under a (screen-anchored)
                     // selection highlight — drop it.
                     app.term_selection = None;
-                    if term.parser.screen().alternate_screen() {
-                        // Full-screen apps (vim, htop, claude) expect arrows.
+                    let screen = term.parser.screen();
+                    let mouse_mode = screen.mouse_protocol_mode();
+                    let sgr = screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr;
+                    let alternate = screen.alternate_screen();
+                    if mouse_mode != vt100::MouseProtocolMode::None {
+                        // The child asked for the mouse (claude's alt-screen
+                        // UI, vim `mouse=a`, htop): forward the wheel event
+                        // itself. Synthesized arrows would land in claude's
+                        // input box — cycling prompt history and tripping its
+                        // "Scroll wheel is sending arrow keys" warning.
+                        let (col, row) = pane_cell(app.term_area, mouse.column, mouse.row);
+                        let button: u16 = if up { 64 } else { 65 };
+                        let data = if sgr {
+                            format!("\x1b[<{button};{};{}M", col + 1, row + 1).into_bytes()
+                        } else {
+                            // Legacy X10 bytes: 32 + button/coord, 1-based
+                            // coords capped at the encoding's 223 limit.
+                            vec![
+                                0x1b,
+                                b'[',
+                                b'M',
+                                32 + button as u8,
+                                32 + (col + 1).min(223) as u8,
+                                32 + (row + 1).min(223) as u8,
+                            ]
+                        };
+                        out.push(ClientRequest::Input {
+                            session: term.sref.clone(),
+                            data,
+                        });
+                    } else if alternate {
+                        // Full-screen apps that ignore the mouse (plain vim,
+                        // less, htop with mouse off) expect arrows.
                         let arrow: &[u8] = if up {
                             b"\x1b[A\x1b[A\x1b[A"
                         } else {
@@ -4460,7 +4675,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             worktrees,
             agents,
             terminals,
-            todos,
+            notes,
             ui_state,
         } => {
             app.tree.workspaces = workspaces;
@@ -4469,7 +4684,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.tree.worktrees = worktrees;
             app.tree.agents = agents;
             app.tree.terminals = terminals;
-            app.tree.todos = todos;
+            app.tree.notes = notes;
             if let Some(json) = ui_state {
                 restore_ui_state(app, &json);
             }
@@ -4562,11 +4777,11 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         app.select_worktree_when_seen = Some(id);
                     }
                 }
-                (Some(PendingIntent::SelectCreatedTodo), Some(EntityId::Todo(id))) => {
+                (Some(PendingIntent::SelectCreatedNote), Some(EntityId::Note(id))) => {
                     // Same idiom: land the modal's cursor now, or when the
                     // upsert arrives.
-                    if !select_todo_by_id(app, &id) {
-                        app.select_todo_when_seen = Some(id);
+                    if !select_note_by_id(app, &id) {
+                        app.select_note_when_seen = Some(id);
                     }
                 }
                 (Some(PendingIntent::OpenCreatedWorkspace), Some(EntityId::Workspace(id))) => {
@@ -4596,10 +4811,10 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     app.select_worktree_when_seen = None;
                 }
             }
-            // ...and the todo modal's cursor onto a todo we just created.
-            if let Some(todo_id) = app.select_todo_when_seen.clone() {
-                if select_todo_by_id(app, &todo_id) {
-                    app.select_todo_when_seen = None;
+            // ...and the note modal's cursor onto a note we just created.
+            if let Some(note_id) = app.select_note_when_seen.clone() {
+                if select_note_by_id(app, &note_id) {
+                    app.select_note_when_seen = None;
                 }
             }
             refresh_palette(app);
@@ -4725,27 +4940,27 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             Some(existing) => *existing = t,
             None => app.tree.terminals.push(t),
         },
-        Entity::Todo(t) => match app.tree.todos.iter_mut().find(|x| x.id == t.id) {
+        Entity::Note(t) => match app.tree.notes.iter_mut().find(|x| x.id == t.id) {
             Some(existing) => *existing = t,
-            None => app.tree.todos.push(t),
+            None => app.tree.notes.push(t),
         },
     }
 }
 
-/// Land the todo modal's cursor on `id`; false when the modal isn't open on
-/// that todo's owner or the todo hasn't arrived in the tree yet.
-fn select_todo_by_id(app: &mut App, id: &TodoId) -> bool {
+/// Land the note modal's cursor on `id`; false when the modal isn't open on
+/// that note's owner or the note hasn't arrived in the tree yet.
+fn select_note_by_id(app: &mut App, id: &NoteId) -> bool {
     let pos = match &app.overlay {
-        Some(Overlay::Todos(view)) => app
+        Some(Overlay::Notes(view)) => app
             .tree
-            .todos
+            .notes
             .iter()
             .filter(|t| t.owner == view.owner)
             .position(|t| &t.id == id),
         _ => return false,
     };
     match (pos, &mut app.overlay) {
-        (Some(i), Some(Overlay::Todos(view))) => {
+        (Some(i), Some(Overlay::Notes(view))) => {
             view.selected = i;
             true
         }
@@ -4775,9 +4990,9 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
             app.tree
                 .terminals
                 .retain(|t| !wt_ids.contains(&t.worktree_id));
-            app.tree.todos.retain(|t| match &t.owner {
-                TodoOwner::Project(p) => p != id,
-                TodoOwner::Worktree(w) => !wt_ids.contains(w),
+            app.tree.notes.retain(|t| match &t.owner {
+                NoteOwner::Project(p) => p != id,
+                NoteOwner::Worktree(w) => !wt_ids.contains(w),
             });
             app.tree.worktrees.retain(|w| &w.project_id != id);
             app.tree.projects.retain(|p| &p.id != id);
@@ -4786,19 +5001,19 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
             app.tree.agents.retain(|a| &a.worktree_id != id);
             app.tree.terminals.retain(|t| &t.worktree_id != id);
             app.tree
-                .todos
-                .retain(|t| t.owner != TodoOwner::Worktree(id.clone()));
+                .notes
+                .retain(|t| t.owner != NoteOwner::Worktree(id.clone()));
             app.tree.worktrees.retain(|w| &w.id != id);
         }
         EntityId::Agent(id) => app.tree.agents.retain(|a| &a.id != id),
         EntityId::Terminal(id) => app.tree.terminals.retain(|t| &t.id != id),
-        EntityId::Todo(id) => app.tree.todos.retain(|t| &t.id != id),
+        EntityId::Note(id) => app.tree.notes.retain(|t| &t.id != id),
     }
-    // A todo modal aimed at a vanished owner has nothing left to show.
-    if let Some(Overlay::Todos(view)) = &app.overlay {
+    // A note modal aimed at a vanished owner has nothing left to show.
+    if let Some(Overlay::Notes(view)) = &app.overlay {
         let gone = match &view.owner {
-            TodoOwner::Project(id) => !app.tree.projects.iter().any(|p| &p.id == id),
-            TodoOwner::Worktree(id) => !app.tree.worktrees.iter().any(|w| &w.id == id),
+            NoteOwner::Project(id) => !app.tree.projects.iter().any(|p| &p.id == id),
+            NoteOwner::Worktree(id) => !app.tree.worktrees.iter().any(|w| &w.id == id),
         };
         if gone {
             app.overlay = None;
@@ -5163,23 +5378,26 @@ mod tests {
             let mut out = Vec::new();
             press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE, &mut out);
             let Some(Overlay::Prompt(p)) = &app.overlay else {
-                panic!("expected add-project prompt at {focus:?}, got {:?}", app.overlay);
+                panic!(
+                    "expected add-project prompt at {focus:?}, got {:?}",
+                    app.overlay
+                );
             };
             assert_eq!(p.kind, crate::app::PromptKind::AddProject);
         }
     }
 
-    /// `t` opens the todos modal for the current selection.
+    /// `e` opens the notes modal for the current selection.
     #[test]
-    fn t_opens_todos_for_selection() {
+    fn e_opens_notes_for_selection() {
         let mut app = App::new();
         seed_tree(&mut app);
         app.focus = Focus::Worktrees;
         let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
         assert!(
-            matches!(app.overlay, Some(Overlay::Todos(_))),
-            "expected todos overlay, got {:?}",
+            matches!(app.overlay, Some(Overlay::Notes(_))),
+            "expected notes overlay, got {:?}",
             app.overlay
         );
     }
@@ -5314,7 +5532,7 @@ mod tests {
                 worktrees: tree.worktrees,
                 agents: tree.agents,
                 terminals: tree.terminals,
-                todos: tree.todos,
+                notes: tree.notes,
                 ui_state: None,
             },
         );
@@ -7251,6 +7469,62 @@ mod tests {
         }
     }
 
+    /// A wheel tick over an app that enabled mouse reporting (claude's
+    /// alt-screen UI, vim `mouse=a`, htop) forwards the wheel event itself.
+    /// Synthesized arrows would land in claude's input box, cycling prompt
+    /// history and tripping its "Scroll wheel is sending arrow keys" hint.
+    #[test]
+    fn wheel_forwards_mouse_report_when_child_wants_mouse() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        let mut term = AttachedTerm::new(sref, 80, 24);
+        // Claude's alt-screen entry: 1049 + tracking modes + SGR encoding.
+        term.parser
+            .process(b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
+        app.term = Some(term);
+        app.term_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        app.hits.push((app.term_area, HitTarget::TerminalPane));
+
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollUp, 10, 5), &mut out);
+        match out.as_slice() {
+            [ClientRequest::Input { data, .. }] => assert_eq!(
+                data, b"\x1b[<64;11;6M",
+                "wheel-up becomes an SGR report at the 1-based pane cell"
+            ),
+            other => panic!("expected one Input request, got {other:?}"),
+        }
+
+        out.clear();
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollDown, 0, 0), &mut out);
+        match out.as_slice() {
+            [ClientRequest::Input { data, .. }] => assert_eq!(data, b"\x1b[<65;1;1M"),
+            other => panic!("expected one Input request, got {other:?}"),
+        }
+    }
+
+    /// Alt-screen apps that never asked for the mouse (plain vim, less) keep
+    /// the arrow-key emulation.
+    #[test]
+    fn wheel_sends_arrows_to_mouseless_alt_screen_apps() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        let mut term = AttachedTerm::new(sref, 80, 24);
+        term.parser.process(b"\x1b[?1049h");
+        app.term = Some(term);
+        app.term_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        app.hits.push((app.term_area, HitTarget::TerminalPane));
+
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollUp, 10, 5), &mut out);
+        match out.as_slice() {
+            [ClientRequest::Input { data, .. }] => assert_eq!(data, b"\x1b[A\x1b[A\x1b[A"),
+            other => panic!("expected one Input request, got {other:?}"),
+        }
+    }
+
     #[test]
     fn splitter_drag_resizes_panel() {
         let mut app = App::new();
@@ -7339,6 +7613,56 @@ mod tests {
             &mut out,
         );
         assert_eq!(app.panel_widths[0], 25);
+    }
+
+    #[test]
+    fn pointer_shape_tracks_splitter_hover() {
+        let mut app = App::new();
+        seed_splitters(&mut app);
+        let mut out = Vec::new();
+
+        // Hover onto the projects|worktrees boundary: col-resize + grip lit.
+        app.dirty = false;
+        handle_mouse(&mut app, mev(MouseEventKind::Moved, 20, 5), &mut out);
+        assert_eq!(app.pointer_shape, PointerShape::ColResize);
+        assert_eq!(app.hover_splitter, Some(0));
+        assert!(app.dirty, "hover change repaints the grip");
+
+        // Hover away: back to default, grip resting.
+        app.dirty = false;
+        handle_mouse(&mut app, mev(MouseEventKind::Moved, 5, 5), &mut out);
+        assert_eq!(app.pointer_shape, PointerShape::Default);
+        assert_eq!(app.hover_splitter, None);
+        assert!(app.dirty);
+
+        // Motion with nothing to change must not schedule repaints.
+        app.dirty = false;
+        handle_mouse(&mut app, mev(MouseEventKind::Moved, 6, 5), &mut out);
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn pointer_shape_holds_while_dragging_past_the_boundary() {
+        let mut app = App::new();
+        seed_splitters(&mut app);
+        let mut out = Vec::new();
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 20, 5),
+            &mut out,
+        );
+        assert_eq!(app.pointer_shape, PointerShape::ColResize);
+
+        // Mid-drag the cursor outruns the grab zone; the drag keeps the
+        // resize shape (and the grip highlight) anyway.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 60, 5),
+            &mut out,
+        );
+        assert_eq!(app.pointer_shape, PointerShape::ColResize);
+        assert_eq!(app.hover_splitter, Some(0));
     }
 
     #[test]
@@ -7905,6 +8229,89 @@ mod tests {
         assert!(
             text.lines().nth(6).unwrap().starts_with(" ─ work ──"),
             "labeled divider row:\n{text}"
+        );
+    }
+
+    /// The selection rail on a worktree/session pill runs the pill's full
+    /// visual height — quadrant caps on the half-block pad rows, `▌` on
+    /// the text row — and sessions share the worktrees' 2-row pill stride
+    /// so the two lists read uniformly.
+    #[test]
+    fn pill_rail_spans_pads_and_sessions_match_worktree_stride() {
+        use nebula_core::{Agent, AgentStatus, Entity, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        // A second session proves the stride between session rows.
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a2".into()),
+                    worktree_id: WorktreeId("w1".into()),
+                    name: "agent-2".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    sort_order: 1,
+                    status_changed_at: 0,
+                    alive: true,
+                }),
+            },
+        );
+        app.focus = Focus::Worktrees;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let lines: Vec<&str> = text.lines().collect();
+
+        // Char column of `needle` in `line` (buffer glyphs are multi-byte,
+        // so byte offsets from find() need converting).
+        let char_col =
+            |line: &str, needle: &str| line.find(needle).map(|b| line[..b].chars().count());
+        let at = |row: usize, col: usize| lines[row].chars().nth(col);
+        // rail col ▌, then dot + name: the rail sits one cell left of the dot.
+        let rail_check = |name: &str, text: &str, lines: &Vec<&str>| {
+            let dot = format!("● {name}");
+            let row = lines
+                .iter()
+                .position(|l| l.contains(&dot))
+                .unwrap_or_else(|| panic!("row {name:?} not on screen:\n{text}"));
+            let col = char_col(lines[row], &dot).unwrap() - 1;
+            assert_eq!(
+                at(row, col),
+                Some('▌'),
+                "rail on {name}'s text row:\n{text}"
+            );
+            assert_eq!(
+                at(row - 1, col),
+                Some('▖'),
+                "rail cap on {name}'s top pad:\n{text}"
+            );
+            assert_eq!(
+                at(row + 1, col),
+                Some('▘'),
+                "rail cap on {name}'s bottom pad:\n{text}"
+            );
+            row
+        };
+        rail_check("main", &text, &lines);
+
+        // Sessions panel (unfocused, still selected → dim rail, same caps),
+        // and the second row sits exactly one pill stride below the first.
+        let a1_row = rail_check("agent-1", &text, &lines);
+        let a2_row = lines
+            .iter()
+            .position(|l| l.contains("● agent-2"))
+            .unwrap_or_else(|| panic!("agent-2 row not on screen:\n{text}"));
+        assert_eq!(
+            a2_row,
+            a1_row + 2,
+            "session rows stack on the 2-row pill stride:\n{text}"
         );
     }
 
@@ -9424,8 +9831,12 @@ mod tests {
             let mut app = App::new();
             let mut out = Vec::new();
             press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            let row = crate::config::settings()
+                .position(|s| s.kind == crate::config::SettingKind::RecentWindow)
+                .unwrap();
+            for _ in 0..row {
+                press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            }
             press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
             let cfg = crate::config::Config::load();
             assert_eq!(cfg.recent_window, "1h");
@@ -9748,6 +10159,36 @@ mod tests {
         assert_eq!(finder(&app).matches.len(), 2, "cleared query shows all");
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
         assert!(app.overlay.is_none(), "second Esc closes the finder");
+    }
+
+    #[test]
+    fn file_overlays_launch_the_configured_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        let cfg_dir = tempfile::tempdir().unwrap();
+        crate::config::with_config_path(cfg_dir.path().join("config.json"), || {
+            let mut cfg = crate::config::Config::load();
+            cfg.editor = "nvim".into();
+            cfg.save().unwrap();
+            // What the overlays should capture: the setting, unless the
+            // test environment carries a NEBULA_EDITOR override.
+            let expect = crate::config::Config::load().editor_command();
+
+            let mut app = App::new();
+            seed_repo_tree(&mut app, &repo);
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE, &mut out);
+            assert_eq!(finder(&app).editor, expect);
+            app.overlay = None;
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
+            assert_eq!(tree_view(&app).editor, expect);
+            app.overlay = None;
+            press(&mut app, KeyCode::Char('F'), KeyModifiers::SHIFT, &mut out);
+            let Some(Overlay::Grep(view)) = &app.overlay else {
+                panic!("F opens the grep overlay");
+            };
+            assert_eq!(view.editor, expect);
+        });
     }
 
     #[test]
@@ -10854,7 +11295,7 @@ mod tests {
         );
         assert_eq!(menu.hover, 0, "active row starts highlighted");
 
-        // The key verbs ride the modal's bottom border (todos-modal style).
+        // The key verbs ride the modal's bottom border (notes-modal style).
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
@@ -10958,7 +11399,7 @@ mod tests {
     }
 
     /// `r` and `d` in the switcher act on the hovered workspace (the
-    /// todos-modal pattern — footer hints, no submenus); after a delete the
+    /// notes-modal pattern — footer hints, no submenus); after a delete the
     /// open switcher refreshes its rows in place.
     #[test]
     fn switcher_r_and_d_act_on_the_hovered_workspace() {
@@ -11033,5 +11474,208 @@ mod tests {
             }
             other => panic!("switcher should stay open, got {other:?}"),
         }
+    }
+
+    // ---- ssh hosts picker ----
+
+    /// Route the host store at a temp file and pre-seed it with two
+    /// destinations, "old@one" first, then "new@two /srv/app" (so the list
+    /// reads newest-first: new@two, old@one).
+    fn with_seeded_hosts(f: impl FnOnce()) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ssh_hosts.json");
+        crate::hosts::with_hosts_path(path, || {
+            crate::hosts::record("old@one", None);
+            crate::hosts::record("new@two", Some("/srv/app"));
+            f();
+        });
+    }
+
+    #[test]
+    fn h_opens_hosts_picker_newest_first() {
+        with_seeded_hosts(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Hosts(view)) = &app.overlay else {
+                panic!("h should open the hosts picker, got {:?}", app.overlay);
+            };
+            assert_eq!(view.hosts.len(), 2);
+            assert_eq!(view.hosts[0].host, "new@two", "most recent first");
+            assert_eq!(view.hosts[0].path.as_deref(), Some("/srv/app"));
+            assert_eq!(view.hosts[1].host, "old@one");
+            assert_eq!(view.selected, 0);
+
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("SSH Hosts"), "title rendered:\n{text}");
+            assert!(text.contains("new@two"), "hosts rendered:\n{text}");
+            assert!(text.contains("/srv/app"), "start dir rendered:\n{text}");
+            assert!(text.contains("just now"), "ago label rendered:\n{text}");
+
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "Esc closes the picker");
+            assert!(!app.should_quit);
+        });
+    }
+
+    #[test]
+    fn hosts_enter_quits_with_the_selected_destination() {
+        with_seeded_hosts(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.should_quit, "Enter hands off by quitting");
+            assert!(app.overlay.is_none());
+            let entry = app.pending_ssh.as_ref().expect("handoff target set");
+            assert_eq!(entry.host, "old@one");
+            assert_eq!(entry.path, None);
+        });
+    }
+
+    #[test]
+    fn hosts_d_removes_the_entry_and_persists() {
+        with_seeded_hosts(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+            match &app.overlay {
+                Some(Overlay::Hosts(view)) => {
+                    assert_eq!(view.hosts.len(), 1, "row dropped in place");
+                    assert_eq!(view.hosts[0].host, "old@one");
+                    assert_eq!(view.selected, 0, "cursor clamped");
+                }
+                other => panic!("picker should stay open, got {other:?}"),
+            }
+            let left = crate::hosts::load();
+            assert_eq!(left.len(), 1, "removal reached the store");
+            assert_eq!(left[0].host, "old@one");
+        });
+    }
+
+    #[test]
+    fn hosts_click_on_a_row_connects_and_outside_closes() {
+        with_seeded_hosts(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+            // Draw once so the modal writes back its hit-test rects.
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let list = match &app.overlay {
+                Some(Overlay::Hosts(view)) => view.list_area,
+                other => panic!("picker open, got {other:?}"),
+            };
+            // Click the second row: connect to it.
+            handle_mouse(
+                &mut app,
+                mev(
+                    MouseEventKind::Down(MouseButton::Left),
+                    list.x + 1,
+                    list.y + 1,
+                ),
+                &mut out,
+            );
+            assert!(app.should_quit, "click connects");
+            assert_eq!(app.pending_ssh.as_ref().unwrap().host, "old@one");
+
+            // Reopened, a click outside the modal closes it.
+            app.should_quit = false;
+            app.pending_ssh = None;
+            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            handle_mouse(
+                &mut app,
+                mev(MouseEventKind::Down(MouseButton::Left), 0, 0),
+                &mut out,
+            );
+            assert!(app.overlay.is_none(), "outside click closes");
+            assert!(!app.should_quit);
+        });
+    }
+
+    #[test]
+    fn hosts_a_types_a_new_destination_and_enter_connects() {
+        with_seeded_hosts(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+            // While typing, list verbs are just characters — q must not
+            // close, d must not delete.
+            for c in "qd@db /var".chars() {
+                press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+            }
+            match &app.overlay {
+                Some(Overlay::Hosts(view)) => {
+                    assert_eq!(view.input.as_deref(), Some("qd@db /var"));
+                    assert_eq!(view.hosts.len(), 2, "d typed, not deleted");
+                }
+                other => panic!("picker should stay open, got {other:?}"),
+            }
+            // Draw shows the input row.
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("+ qd@db /var"), "input row rendered:\n{text}");
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.should_quit, "Enter connects to the typed host");
+            let entry = app.pending_ssh.as_ref().expect("handoff target set");
+            assert_eq!(entry.host, "qd@db");
+            assert_eq!(entry.path.as_deref(), Some("/var"));
+        });
+    }
+
+    #[test]
+    fn hosts_input_esc_cancels_and_empty_enter_is_a_noop() {
+        with_seeded_hosts(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            match &app.overlay {
+                Some(Overlay::Hosts(view)) => {
+                    assert!(view.input.is_none(), "empty Enter cancels the input");
+                }
+                other => panic!("picker should stay open, got {other:?}"),
+            }
+            assert!(!app.should_quit);
+            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            match &app.overlay {
+                Some(Overlay::Hosts(view)) => assert!(view.input.is_none()),
+                other => panic!("Esc only cancels the input, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn empty_hosts_picker_shows_the_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ssh_hosts.json");
+        crate::hosts::with_hosts_path(path, || {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+            assert!(matches!(app.overlay, Some(Overlay::Hosts(_))));
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("no hosts yet"),
+                "empty state introduces the feature:\n{text}"
+            );
+            // d on the empty list must not panic or write.
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(!app.should_quit, "Enter on an empty list is a no-op");
+        });
     }
 }

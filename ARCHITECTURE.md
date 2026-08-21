@@ -25,9 +25,9 @@ Worktrees are real git worktrees, created under `<repo>/../<repo-name>-worktrees
 
 An agent is a PTY running `claude`, `codex`, or `cursor-agent` in that worktree. Restart uses `--resume <session-id>` when one is stored.
 
-Persistence is SQLite at `~/.local/share/nebula/nebula.db`: workspaces (one flagged open), projects, worktrees, agents (kind + CLI session id), todos, last UI selection.
+Persistence is SQLite at `~/.local/share/nebula/nebula.db`: workspaces (one flagged open), projects, worktrees, agents (kind + CLI session id), notes, last UI selection.
 
-Projects and worktrees each carry their own **todo list**: plain notes with a done flag, edited in the TUI's `t` modal (Projects panel → the project's high-level notes; elsewhere → the selected worktree's notes) and counted as a badge on the owning row.
+Projects and worktrees each carry their own **note list**: plain notes with a done flag, edited in the TUI's `e` modal (Projects panel → the project's high-level notes; elsewhere → the selected worktree's notes) and counted as a badge on the owning row.
 
 ## How the pieces talk
 
@@ -56,6 +56,8 @@ Projects and worktrees each carry their own **todo list**: plain notes with a do
 **Auto-title path (hooks again, still not MCP):** a session created with the default `agent-N` name carries a store-only `auto_title_pending` flag. While it's set, the daemon answers the Claude/Codex `UserPromptSubmit` hook POST with an instruction body instead of the usual discarded JSON — the installer's `UserPromptSubmit` command (alone among the hooks) pipes the response to stdout, which those CLIs add to the model's context. The instruction tells the agent to run `nebula rename <3-4 word title>` once; that subcommand resolves the agent from `NEBULA_AGENT_ID`, does a one-shot IPC `AutoRenameAgent`, and the daemon applies it only while the flag is still pending (atomic conditional update), so a user rename — which clears the flag — always wins and repeated attempts get a polite "already titled" error. Claude also gets a `Bash(nebula rename:*)` entry merged into `permissions.allow` so the command runs unprompted; Codex/Cursor already run with `--yolo`/`--force`. Cursor's hooks can't inject context, so it gets a managed, env-guarded `.cursor/rules/nebula-title.mdc` project rule carrying the same instruction — safe to fire repeatedly because the daemon-side flag is the arbiter.
 
 **Metrics path:** the memory modal (`Shift+M`) asks the daemon for one reading (`GetMetrics` → `Metrics`). The daemon runs a single machine-wide `ps` sweep and sums RSS over each live session's process subtree (the PTY child plus its descendants — an agent CLI fans out into workers and MCP servers), reporting itself separately since sessions are its own descendants. The TUI adds its own RSS client-side (it is not a daemon child) and re-polls every 2s while the modal is open.
+
+**Remote hosts path:** `nebula ssh host [dir]` execs `ssh -t` with a self-installing remote command, and first records the destination in `~/.local/share/nebula/ssh_hosts.json` (newest first, capped at 20, keyed by host + start dir). The TUI's `h` picker lists that file; choosing an entry — or typing a new `user@host [dir]` with `a` — quits the TUI cleanly (UI state saved, terminal restored) and hands the destination back to the binary, which execs a fresh `nebula ssh` over the same terminal. The local daemon and its sessions keep running; exiting the remote nebula lands back in the local shell. `d` in the picker forgets an entry.
 
 ## Crate layout
 

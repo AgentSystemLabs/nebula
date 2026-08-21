@@ -9,7 +9,7 @@ use crate::store::Store;
 use anyhow::{bail, Context, Result};
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Project, ProjectId, ServerEvent,
-    SessionRef, TerminalId, TerminalTab, Todo, TodoId, TodoOwner, Workspace, WorkspaceId, Worktree,
+    SessionRef, TerminalId, TerminalTab, Note, NoteId, NoteOwner, Workspace, WorkspaceId, Worktree,
     WorktreeId,
 };
 use std::collections::HashMap;
@@ -394,7 +394,7 @@ impl Daemon {
             worktrees,
             agents,
             terminals,
-            todos: self.store.load_todos()?,
+            notes: self.store.load_notes()?,
             ui_state: self.store.load_ui_state()?,
         })
     }
@@ -1530,61 +1530,61 @@ impl Daemon {
         Ok(())
     }
 
-    // ---- todos ----
+    // ---- notes ----
 
-    pub fn create_todo(self: &Arc<Self>, owner: &TodoOwner, text: &str) -> Result<EntityId> {
+    pub fn create_note(self: &Arc<Self>, owner: &NoteOwner, text: &str) -> Result<EntityId> {
         let text = text.trim();
         if text.is_empty() {
-            bail!("todo text is empty");
+            bail!("note text is empty");
         }
         match owner {
-            TodoOwner::Project(id) => {
+            NoteOwner::Project(id) => {
                 self.store.get_project(id)?.context("project not found")?;
             }
-            TodoOwner::Worktree(id) => {
+            NoteOwner::Worktree(id) => {
                 self.store.get_worktree(id)?.context("worktree not found")?;
             }
         }
-        let todo = Todo {
-            id: TodoId::generate(),
+        let note = Note {
+            id: NoteId::generate(),
             owner: owner.clone(),
             text: text.to_string(),
             done: false,
-            sort_order: self.store.next_todo_sort_order(owner)?,
+            sort_order: self.store.next_note_sort_order(owner)?,
         };
-        self.store.insert_todo(&todo)?;
+        self.store.insert_note(&note)?;
         self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Todo(todo.clone()),
+            entity: Entity::Note(note.clone()),
         });
-        Ok(EntityId::Todo(todo.id))
+        Ok(EntityId::Note(note.id))
     }
 
-    pub fn update_todo(self: &Arc<Self>, id: &TodoId, text: &str) -> Result<()> {
+    pub fn update_note(self: &Arc<Self>, id: &NoteId, text: &str) -> Result<()> {
         let text = text.trim();
         if text.is_empty() {
-            bail!("todo text is empty");
+            bail!("note text is empty");
         }
-        self.store.set_todo_text(id, text)?;
-        let todo = self.store.get_todo(id)?.context("todo not found")?;
+        self.store.set_note_text(id, text)?;
+        let note = self.store.get_note(id)?.context("note not found")?;
         self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Todo(todo),
+            entity: Entity::Note(note),
         });
         Ok(())
     }
 
-    pub fn set_todo_done(self: &Arc<Self>, id: &TodoId, done: bool) -> Result<()> {
-        self.store.set_todo_done(id, done)?;
-        let todo = self.store.get_todo(id)?.context("todo not found")?;
+    pub fn set_note_done(self: &Arc<Self>, id: &NoteId, done: bool) -> Result<()> {
+        self.store.set_note_done(id, done)?;
+        let note = self.store.get_note(id)?.context("note not found")?;
         self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Todo(todo),
+            entity: Entity::Note(note),
         });
         Ok(())
     }
 
-    pub fn delete_todo(self: &Arc<Self>, id: &TodoId) -> Result<()> {
-        self.store.delete_todo(id)?;
+    pub fn delete_note(self: &Arc<Self>, id: &NoteId) -> Result<()> {
+        self.store.delete_note(id)?;
         self.broadcast(ServerEvent::EntityRemoved {
-            id: EntityId::Todo(id.clone()),
+            id: EntityId::Note(id.clone()),
         });
         Ok(())
     }

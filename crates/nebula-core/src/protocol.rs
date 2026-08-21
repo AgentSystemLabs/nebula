@@ -1,14 +1,14 @@
 use crate::entities::{
-    Agent, AgentKind, AgentStatus, Entity, EntityId, Project, TerminalTab, Todo, TodoOwner,
+    Agent, AgentKind, AgentStatus, Entity, EntityId, Project, TerminalTab, Note, NoteOwner,
     Workspace, Worktree,
 };
-use crate::ids::{AgentId, ProjectId, TerminalId, TodoId, WorkspaceId, WorktreeId};
+use crate::ids::{AgentId, ProjectId, TerminalId, NoteId, WorkspaceId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -221,25 +221,25 @@ pub enum ClientRequest {
         worktree: WorktreeId,
         name: Option<String>,
     },
-    CreateTodo {
+    CreateNote {
         req_id: u64,
-        owner: TodoOwner,
+        owner: NoteOwner,
         text: String,
     },
-    /// Rewrite a todo's text.
-    UpdateTodo {
+    /// Rewrite a note's text.
+    UpdateNote {
         req_id: u64,
-        id: TodoId,
+        id: NoteId,
         text: String,
     },
-    SetTodoDone {
+    SetNoteDone {
         req_id: u64,
-        id: TodoId,
+        id: NoteId,
         done: bool,
     },
-    DeleteTodo {
+    DeleteNote {
         req_id: u64,
-        id: TodoId,
+        id: NoteId,
     },
     RenameTerminal {
         req_id: u64,
@@ -308,7 +308,7 @@ pub enum ServerEvent {
         worktrees: Vec<Worktree>,
         agents: Vec<Agent>,
         terminals: Vec<TerminalTab>,
-        todos: Vec<Todo>,
+        notes: Vec<Note>,
         ui_state: Option<String>,
     },
 

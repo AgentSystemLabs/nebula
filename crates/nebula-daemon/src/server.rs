@@ -93,7 +93,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         worktrees: vec![],
                         agents: vec![],
                         terminals: vec![],
-                        todos: vec![],
+                        notes: vec![],
                         ui_state: None,
                     });
                     let _ = out_tx.send(snapshot).await;
@@ -436,31 +436,31 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     )
                     .await;
                 }
-                ClientRequest::CreateTodo {
+                ClientRequest::CreateNote {
                     req_id,
                     owner,
                     text,
                 } => {
-                    reply(&out_tx, req_id, daemon.create_todo(&owner, &text).map(Some)).await;
+                    reply(&out_tx, req_id, daemon.create_note(&owner, &text).map(Some)).await;
                 }
-                ClientRequest::UpdateTodo { req_id, id, text } => {
+                ClientRequest::UpdateNote { req_id, id, text } => {
                     reply(
                         &out_tx,
                         req_id,
-                        daemon.update_todo(&id, &text).map(|_| None),
+                        daemon.update_note(&id, &text).map(|_| None),
                     )
                     .await;
                 }
-                ClientRequest::SetTodoDone { req_id, id, done } => {
+                ClientRequest::SetNoteDone { req_id, id, done } => {
                     reply(
                         &out_tx,
                         req_id,
-                        daemon.set_todo_done(&id, done).map(|_| None),
+                        daemon.set_note_done(&id, done).map(|_| None),
                     )
                     .await;
                 }
-                ClientRequest::DeleteTodo { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.delete_todo(&id).map(|_| None)).await;
+                ClientRequest::DeleteNote { req_id, id } => {
+                    reply(&out_tx, req_id, daemon.delete_note(&id).map(|_| None)).await;
                 }
                 ClientRequest::RenameTerminal { req_id, id, name } => {
                     reply(

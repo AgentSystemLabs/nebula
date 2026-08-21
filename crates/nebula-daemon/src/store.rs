@@ -4,8 +4,8 @@
 
 use anyhow::{Context, Result};
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Project, ProjectId, TerminalId, TerminalTab, Todo,
-    TodoId, TodoOwner, Workspace, WorkspaceId, Worktree, WorktreeId, DEFAULT_WORKSPACE_ID,
+    Agent, AgentId, AgentKind, AgentStatus, Note, NoteId, NoteOwner, Project, ProjectId,
+    TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId, DEFAULT_WORKSPACE_ID,
 };
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
@@ -168,6 +168,10 @@ const MIGRATIONS: &[&str] = &[
     DROP TABLE projects;
     ALTER TABLE projects_new RENAME TO projects;
     CREATE UNIQUE INDEX projects_workspace_repo ON projects (COALESCE(workspace_id, 'default'), repo_path);
+    ",
+    // 15: todos are now "notes" everywhere — rename the table to match.
+    "
+    ALTER TABLE todos RENAME TO notes;
     ",
 ];
 
@@ -611,31 +615,31 @@ impl Store {
         Ok(())
     }
 
-    // ---- todos ----
+    // ---- notes ----
 
     /// (project_id, worktree_id) column values for an owner — exactly one
     /// is Some, mirroring the table's CHECK.
-    fn todo_owner_cols(owner: &TodoOwner) -> (Option<&str>, Option<&str>) {
+    fn note_owner_cols(owner: &NoteOwner) -> (Option<&str>, Option<&str>) {
         match owner {
-            TodoOwner::Project(id) => (Some(id.as_str()), None),
-            TodoOwner::Worktree(id) => (None, Some(id.as_str())),
+            NoteOwner::Project(id) => (Some(id.as_str()), None),
+            NoteOwner::Worktree(id) => (None, Some(id.as_str())),
         }
     }
 
     /// Owner from a row's (project_id, worktree_id) pair.
-    fn todo_owner_from(project_id: Option<String>, worktree_id: Option<String>) -> TodoOwner {
+    fn note_owner_from(project_id: Option<String>, worktree_id: Option<String>) -> NoteOwner {
         match (project_id, worktree_id) {
-            (Some(p), _) => TodoOwner::Project(ProjectId(p)),
-            (None, Some(w)) => TodoOwner::Worktree(WorktreeId(w)),
+            (Some(p), _) => NoteOwner::Project(ProjectId(p)),
+            (None, Some(w)) => NoteOwner::Worktree(WorktreeId(w)),
             // Unreachable per the CHECK constraint.
-            (None, None) => TodoOwner::Worktree(WorktreeId(String::new())),
+            (None, None) => NoteOwner::Worktree(WorktreeId(String::new())),
         }
     }
 
-    pub fn insert_todo(&self, t: &Todo) -> Result<()> {
-        let (project_id, worktree_id) = Self::todo_owner_cols(&t.owner);
+    pub fn insert_note(&self, t: &Note) -> Result<()> {
+        let (project_id, worktree_id) = Self::note_owner_cols(&t.owner);
         self.conn.lock().unwrap().execute(
-            "INSERT INTO todos (id, project_id, worktree_id, text, done, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO notes (id, project_id, worktree_id, text, done, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 t.id.as_str(),
                 project_id,
@@ -649,71 +653,71 @@ impl Store {
         Ok(())
     }
 
-    /// Sort slot for a new todo: after everything else in its owner's list.
-    pub fn next_todo_sort_order(&self, owner: &TodoOwner) -> Result<i64> {
-        let (project_id, worktree_id) = Self::todo_owner_cols(owner);
+    /// Sort slot for a new note: after everything else in its owner's list.
+    pub fn next_note_sort_order(&self, owner: &NoteOwner) -> Result<i64> {
+        let (project_id, worktree_id) = Self::note_owner_cols(owner);
         Ok(self.conn.lock().unwrap().query_row(
-            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM todos WHERE project_id IS ?1 AND worktree_id IS ?2",
+            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM notes WHERE project_id IS ?1 AND worktree_id IS ?2",
             params![project_id, worktree_id],
             |r| r.get(0),
         )?)
     }
 
-    pub fn set_todo_text(&self, id: &TodoId, text: &str) -> Result<()> {
+    pub fn set_note_text(&self, id: &NoteId, text: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "UPDATE todos SET text = ?2 WHERE id = ?1",
+            "UPDATE notes SET text = ?2 WHERE id = ?1",
             params![id.as_str(), text],
         )?;
         Ok(())
     }
 
-    pub fn set_todo_done(&self, id: &TodoId, done: bool) -> Result<()> {
+    pub fn set_note_done(&self, id: &NoteId, done: bool) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "UPDATE todos SET done = ?2 WHERE id = ?1",
+            "UPDATE notes SET done = ?2 WHERE id = ?1",
             params![id.as_str(), done as i64],
         )?;
         Ok(())
     }
 
-    pub fn delete_todo(&self, id: &TodoId) -> Result<()> {
+    pub fn delete_note(&self, id: &NoteId) -> Result<()> {
         self.conn
             .lock()
             .unwrap()
-            .execute("DELETE FROM todos WHERE id = ?1", params![id.as_str()])?;
+            .execute("DELETE FROM notes WHERE id = ?1", params![id.as_str()])?;
         Ok(())
     }
 
-    pub fn get_todo(&self, id: &TodoId) -> Result<Option<Todo>> {
+    pub fn get_note(&self, id: &NoteId) -> Result<Option<Note>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, worktree_id, text, done, sort_order FROM todos WHERE id = ?1",
+            "SELECT id, project_id, worktree_id, text, done, sort_order FROM notes WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.as_str()])?;
-        Ok(rows.next()?.map(|r| Todo {
-            id: TodoId(r.get::<_, String>(0).unwrap()),
-            owner: Self::todo_owner_from(r.get(1).unwrap(), r.get(2).unwrap()),
+        Ok(rows.next()?.map(|r| Note {
+            id: NoteId(r.get::<_, String>(0).unwrap()),
+            owner: Self::note_owner_from(r.get(1).unwrap(), r.get(2).unwrap()),
             text: r.get(3).unwrap(),
             done: r.get::<_, i64>(4).unwrap() != 0,
             sort_order: r.get(5).unwrap(),
         }))
     }
 
-    /// Every todo, in per-owner list order.
-    pub fn load_todos(&self) -> Result<Vec<Todo>> {
+    /// Every note, in per-owner list order.
+    pub fn load_notes(&self) -> Result<Vec<Note>> {
         let conn = self.conn.lock().unwrap();
-        let todos = conn
-            .prepare("SELECT id, project_id, worktree_id, text, done, sort_order FROM todos ORDER BY COALESCE(project_id, worktree_id), sort_order, created_at")?
+        let notes = conn
+            .prepare("SELECT id, project_id, worktree_id, text, done, sort_order FROM notes ORDER BY COALESCE(project_id, worktree_id), sort_order, created_at")?
             .query_map([], |r| {
-                Ok(Todo {
-                    id: TodoId(r.get(0)?),
-                    owner: Self::todo_owner_from(r.get(1)?, r.get(2)?),
+                Ok(Note {
+                    id: NoteId(r.get(0)?),
+                    owner: Self::note_owner_from(r.get(1)?, r.get(2)?),
                     text: r.get(3)?,
                     done: r.get::<_, i64>(4)? != 0,
                     sort_order: r.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(todos)
+        Ok(notes)
     }
 
     // ---- point lookups ----
@@ -990,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn todo_crud_roundtrip_and_cascade() {
+    fn note_crud_roundtrip_and_cascade() {
         let store = Store::open_in_memory().unwrap();
         let project = Project {
             workspace_id: Default::default(),
@@ -1015,53 +1019,53 @@ mod tests {
         };
         store.insert_worktree(&worktree).unwrap();
 
-        let wt_owner = TodoOwner::Worktree(worktree.id.clone());
-        let todo = Todo {
-            id: TodoId::generate(),
+        let wt_owner = NoteOwner::Worktree(worktree.id.clone());
+        let note = Note {
+            id: NoteId::generate(),
             owner: wt_owner.clone(),
             text: "write tests".into(),
             done: false,
-            sort_order: store.next_todo_sort_order(&wt_owner).unwrap(),
+            sort_order: store.next_note_sort_order(&wt_owner).unwrap(),
         };
-        store.insert_todo(&todo).unwrap();
-        assert_eq!(store.next_todo_sort_order(&wt_owner).unwrap(), 1);
+        store.insert_note(&note).unwrap();
+        assert_eq!(store.next_note_sort_order(&wt_owner).unwrap(), 1);
 
         // Project-scoped notes are their own list: separate sort space.
-        let p_owner = TodoOwner::Project(project.id.clone());
-        assert_eq!(store.next_todo_sort_order(&p_owner).unwrap(), 0);
-        let project_todo = Todo {
-            id: TodoId::generate(),
+        let p_owner = NoteOwner::Project(project.id.clone());
+        assert_eq!(store.next_note_sort_order(&p_owner).unwrap(), 0);
+        let project_note = Note {
+            id: NoteId::generate(),
             owner: p_owner.clone(),
             text: "high level plan".into(),
             done: false,
             sort_order: 0,
         };
-        store.insert_todo(&project_todo).unwrap();
-        let read = store.get_todo(&project_todo.id).unwrap().unwrap();
+        store.insert_note(&project_note).unwrap();
+        let read = store.get_note(&project_note.id).unwrap().unwrap();
         assert_eq!(read.owner, p_owner);
 
-        store.set_todo_text(&todo.id, "write MORE tests").unwrap();
-        store.set_todo_done(&todo.id, true).unwrap();
-        let read = store.get_todo(&todo.id).unwrap().unwrap();
+        store.set_note_text(&note.id, "write MORE tests").unwrap();
+        store.set_note_done(&note.id, true).unwrap();
+        let read = store.get_note(&note.id).unwrap().unwrap();
         assert_eq!(read.text, "write MORE tests");
         assert!(read.done);
         assert_eq!(read.owner, wt_owner);
-        assert_eq!(store.load_todos().unwrap().len(), 2);
+        assert_eq!(store.load_notes().unwrap().len(), 2);
 
-        store.delete_todo(&todo.id).unwrap();
-        assert!(store.get_todo(&todo.id).unwrap().is_none());
+        store.delete_note(&note.id).unwrap();
+        assert!(store.get_note(&note.id).unwrap().is_none());
 
-        // Deleting the project cascades to its own todos AND (via the
-        // worktree) its worktrees' todos.
-        store.insert_todo(&todo).unwrap();
+        // Deleting the project cascades to its own notes AND (via the
+        // worktree) its worktrees' notes.
+        store.insert_note(&note).unwrap();
         store.delete_project(&project.id).unwrap();
-        assert!(store.load_todos().unwrap().is_empty());
+        assert!(store.load_notes().unwrap().is_empty());
     }
 
-    /// Real upgrade path: a v9 database (todos still worktree-only) picks
+    /// Real upgrade path: a v9 database (notes still worktree-only) picks
     /// up migration 10's table rebuild without losing any notes.
     #[test]
-    fn migration_10_preserves_existing_worktree_todos() {
+    fn migration_10_preserves_existing_worktree_notes() {
         let path =
             std::env::temp_dir().join(format!("nebula-mig10-test-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -1084,12 +1088,12 @@ mod tests {
         }
 
         let store = Store::open(&path).unwrap();
-        let todos = store.load_todos().unwrap();
-        assert_eq!(todos.len(), 1);
-        assert_eq!(todos[0].owner, TodoOwner::Worktree(WorktreeId("w1".into())));
-        assert_eq!(todos[0].text, "old note");
-        assert!(todos[0].done);
-        assert_eq!(todos[0].sort_order, 3);
+        let notes = store.load_notes().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].owner, NoteOwner::Worktree(WorktreeId("w1".into())));
+        assert_eq!(notes[0].text, "old note");
+        assert!(notes[0].done);
+        assert_eq!(notes[0].sort_order, 3);
         drop(store);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));

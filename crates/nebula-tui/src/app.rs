@@ -2,8 +2,8 @@
 
 use crate::git_diff::DiffFile;
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Project, ProjectId, SessionRef, TerminalId,
-    TerminalTab, Todo, TodoId, TodoOwner, Workspace, WorkspaceId, Worktree, WorktreeId,
+    Agent, AgentId, AgentKind, AgentStatus, Note, NoteId, NoteOwner, Project, ProjectId,
+    SessionRef, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
 };
 use ratatui::layout::Rect;
 use std::collections::HashMap;
@@ -94,15 +94,15 @@ pub enum MenuAction {
     RenameTerminal(TerminalId),
     CloseTerminal(TerminalId),
     NewWorktree(ProjectId),
-    /// Open the todo modal for this owner (project or worktree).
-    OpenTodos(TodoOwner),
+    /// Open the note modal for this owner (project or worktree).
+    OpenNotes(NoteOwner),
     SetWorktreePinned(WorktreeId, bool),
     DeleteWorktree(WorktreeId),
     AddProject,
     RemoveProject(ProjectId),
     /// Workspace-switcher row: open this workspace. The switcher's other
     /// verbs are keys, not rows — n: new, r: rename, d: delete (footer
-    /// hints, the todos-modal pattern).
+    /// hints, the notes-modal pattern).
     OpenWorkspace(WorkspaceId),
     SetProjectDivider {
         id: ProjectId,
@@ -734,8 +734,8 @@ pub struct FileFinder {
     pub root: PathBuf,
     /// Branch name for the modal title.
     pub branch: String,
-    /// Editor command Enter launches (NEBULA_EDITOR, default vim), captured
-    /// at open time.
+    /// Editor command Enter launches (NEBULA_EDITOR, then the `editor`
+    /// setting, default vim), captured at open time.
     pub editor: String,
     /// Paths relative to `root`, in git listing order.
     pub files: Vec<String>,
@@ -807,8 +807,8 @@ pub struct GrepView {
     pub root: PathBuf,
     /// Branch name for the modal title.
     pub branch: String,
-    /// Editor command Enter launches (NEBULA_EDITOR, default vim), captured
-    /// at open time.
+    /// Editor command Enter launches (NEBULA_EDITOR, then the `editor`
+    /// setting, default vim), captured at open time.
     pub editor: String,
     /// The search text; every edit re-runs the grep.
     pub query: String,
@@ -884,38 +884,76 @@ impl GrepView {
     }
 }
 
-/// In-progress add/edit inside the todo modal; keys feed `text` while set.
+/// In-progress add/edit inside the note modal; keys feed `text` while set.
 #[derive(Debug, Clone)]
-pub struct TodoInput {
-    /// None = creating a new todo; Some = rewriting that todo's text.
-    pub editing: Option<TodoId>,
+pub struct NoteInput {
+    /// None = creating a new note; Some = rewriting that note's text.
+    pub editing: Option<NoteId>,
     pub text: String,
 }
 
-/// Todo notes modal (`o`) for one owner — a project (high-level notes) or
-/// a worktree. The rows themselves live in `App::tree.todos` (kept fresh
+/// Note notes modal (`o`) for one owner — a project (high-level notes) or
+/// a worktree. The rows themselves live in `App::tree.notes` (kept fresh
 /// by upserts) — the view only holds the owner plus cursor/input state.
 #[derive(Debug, Clone)]
-pub struct TodoView {
-    pub owner: TodoOwner,
+pub struct NoteView {
+    pub owner: NoteOwner,
     /// `project` or `project/branch`, for the modal title.
     pub context: String,
-    /// Index into the owner's todo rows.
+    /// Index into the owner's note rows.
     pub selected: usize,
     /// Active add/edit input, if any.
-    pub input: Option<TodoInput>,
+    pub input: Option<NoteInput>,
     /// Whole modal rect, written back during draw so clicks outside close.
     pub area: Rect,
-    /// Screen rect of the todo rows, written back during draw so clicks can
+    /// Screen rect of the note rows, written back during draw so clicks can
     /// hit-test rows.
     pub list_area: Rect,
 }
 
-impl TodoView {
-    pub fn new(owner: TodoOwner, context: String) -> Self {
+impl NoteView {
+    pub fn new(owner: NoteOwner, context: String) -> Self {
         Self {
             owner,
             context,
+            selected: 0,
+            input: None,
+            area: Rect::default(),
+            list_area: Rect::default(),
+        }
+    }
+
+    /// First visible row of the list's stateless follow-window for a list of
+    /// `height` rows.
+    pub fn window_start(&self, height: usize) -> usize {
+        (self.selected + 1).saturating_sub(height)
+    }
+}
+
+/// Recent-hosts modal (`h`): destinations remembered by `nebula ssh`.
+/// Enter (or a click) quits the TUI and execs a fresh `nebula ssh` at the
+/// selected entry; `a` types a new destination, `d` forgets one. The rows
+/// are a snapshot loaded when the modal opens — nothing else writes the
+/// list while the TUI is up.
+#[derive(Debug, Clone)]
+pub struct HostsView {
+    pub hosts: Vec<crate::hosts::HostEntry>,
+    /// Cursor into `hosts`.
+    pub selected: usize,
+    /// Active "connect to a new destination" input (`a`), if any — typed as
+    /// `user@host [dir]`, Enter connects like a `nebula ssh` invocation.
+    pub input: Option<String>,
+    /// Whole modal rect, written back during draw so clicks outside close.
+    pub area: Rect,
+    /// Screen rect of the host rows, written back during draw so clicks can
+    /// hit-test rows.
+    pub list_area: Rect,
+}
+
+impl HostsView {
+    pub fn new(hosts: Vec<crate::hosts::HostEntry>) -> Self {
+        Self {
+            hosts,
             selected: 0,
             input: None,
             area: Rect::default(),
@@ -992,8 +1030,9 @@ pub enum Overlay {
     Files(FileFinder),
     Grep(GrepView),
     Tree(crate::tree_browser::TreeBrowser),
-    Todos(TodoView),
+    Notes(NoteView),
     Metrics(MetricsView),
+    Hosts(HostsView),
 }
 
 /// Rows optimistically removed for an in-flight DeleteWorktree, kept so an
@@ -1014,8 +1053,8 @@ pub enum PendingIntent {
     AttachCreated,
     /// Select the created worktree in the Worktrees panel.
     SelectCreatedWorktree,
-    /// Move the todo modal's cursor onto the created todo.
-    SelectCreatedTodo,
+    /// Move the note modal's cursor onto the created note.
+    SelectCreatedNote,
     /// Open the workspace this Ack just created (switcher's "New workspace…"
     /// flow: creating from there means you want to be in it).
     OpenCreatedWorkspace,
@@ -1113,7 +1152,7 @@ pub struct Tree {
     pub worktrees: Vec<Worktree>,
     pub agents: Vec<Agent>,
     pub terminals: Vec<TerminalTab>,
-    pub todos: Vec<Todo>,
+    pub notes: Vec<Note>,
 }
 
 impl Tree {
@@ -1248,6 +1287,29 @@ pub struct SplitterDrag {
     pub grab_offset: i32,
 }
 
+/// Mouse pointer shape the outer terminal should show, requested via the
+/// xterm OSC 22 pointer-shape escape (CSS cursor names, per the kitty
+/// pointer-shapes protocol). Mouse handlers record the want here; the event
+/// loop emits the escape when it changes. Terminals that don't support the
+/// sequence (Terminal.app) parse and drop it, so requesting is always safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PointerShape {
+    #[default]
+    Default,
+    /// Horizontal-resize arrows over a draggable panel boundary.
+    ColResize,
+}
+
+impl PointerShape {
+    /// The shape's name inside the OSC 22 escape.
+    pub fn osc_name(self) -> &'static str {
+        match self {
+            PointerShape::Default => "default",
+            PointerShape::ColResize => "col-resize",
+        }
+    }
+}
+
 pub struct App {
     pub tree: Tree,
     pub focus: Focus,
@@ -1266,6 +1328,10 @@ pub struct App {
     pub term_area: Rect,
     pub dirty: bool,
     pub should_quit: bool,
+    /// Set with `should_quit` when the hosts picker chose a destination:
+    /// after teardown the binary execs `nebula ssh` at it, replacing this
+    /// process with a fresh connection.
+    pub pending_ssh: Option<crate::hosts::HostEntry>,
     pub flash: Option<String>,
     pub overlay: Option<Overlay>,
     pub show_archived: bool,
@@ -1281,8 +1347,8 @@ pub struct App {
     pub select_divider_when_seen: Option<(ProjectId, bool)>,
     /// Worktree created by us, awaiting its upsert to fix the selection.
     pub select_worktree_when_seen: Option<WorktreeId>,
-    /// Todo created by us, awaiting its upsert to land the modal's cursor.
-    pub select_todo_when_seen: Option<TodoId>,
+    /// Note created by us, awaiting its upsert to land the modal's cursor.
+    pub select_note_when_seen: Option<NoteId>,
     /// Last selected worktree per project — switching back to a project
     /// returns to the worktree the user left it on.
     pub last_worktree_for_project: HashMap<ProjectId, WorktreeId>,
@@ -1321,6 +1387,12 @@ pub struct App {
     pub settings_selected: usize,
     /// In-progress splitter drag, if any.
     pub splitter_drag: Option<SplitterDrag>,
+    /// Main-screen splitter under the mouse (a drag counts), highlighting
+    /// that boundary's grip. Only ever set in terminals that report plain
+    /// mouse motion; elsewhere the grip just stays in its resting shade.
+    pub hover_splitter: Option<usize>,
+    /// Pointer shape the outer terminal should currently show (OSC 22).
+    pub pointer_shape: PointerShape,
     /// Body rect (everything above the footer) from the last draw; bounds
     /// splitter drags.
     pub body_area: Rect,
@@ -1398,6 +1470,7 @@ impl App {
             term_area: Rect::default(),
             dirty: true,
             should_quit: false,
+            pending_ssh: None,
             flash: None,
             overlay: None,
             show_archived: false,
@@ -1407,7 +1480,7 @@ impl App {
             select_when_seen: None,
             select_divider_when_seen: None,
             select_worktree_when_seen: None,
-            select_todo_when_seen: None,
+            select_note_when_seen: None,
             last_worktree_for_project: HashMap::new(),
             last_session_for_worktree: HashMap::new(),
             pending_prewarm: None,
@@ -1421,6 +1494,8 @@ impl App {
             diff_files_width: DEFAULT_DIFF_FILES_W,
             settings_selected: 0,
             splitter_drag: None,
+            hover_splitter: None,
+            pointer_shape: PointerShape::default(),
             body_area: Rect::default(),
             hostname: nebula_core::host::hostname(),
             is_remote: nebula_core::host::is_remote_session(),
@@ -1815,21 +1890,21 @@ impl App {
         Some(at.saturating_duration_since(std::time::Instant::now()))
     }
 
-    /// An owner's todos, in tree order (snapshot order; new ones append).
-    pub fn todos_for(&self, owner: &TodoOwner) -> Vec<&Todo> {
+    /// An owner's notes, in tree order (snapshot order; new ones append).
+    pub fn notes_for(&self, owner: &NoteOwner) -> Vec<&Note> {
         self.tree
-            .todos
+            .notes
             .iter()
             .filter(|t| &t.owner == owner)
             .collect()
     }
 
-    /// (open, total) todo counts for an owner — the row badges.
-    pub fn todo_stats(&self, owner: &TodoOwner) -> (usize, usize) {
-        let total = self.tree.todos.iter().filter(|t| &t.owner == owner).count();
+    /// (open, total) note counts for an owner — the row badges.
+    pub fn note_stats(&self, owner: &NoteOwner) -> (usize, usize) {
+        let total = self.tree.notes.iter().filter(|t| &t.owner == owner).count();
         let open = self
             .tree
-            .todos
+            .notes
             .iter()
             .filter(|t| &t.owner == owner && !t.done)
             .count();
