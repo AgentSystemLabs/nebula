@@ -4766,7 +4766,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         assert!(
-            !buffer_text(&terminal).contains("proc"),
+            !buffer_text(&terminal).contains("agent ·"),
             "no readout before the first reading"
         );
 
@@ -4793,7 +4793,7 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(
-            text.contains("1 agent · 1 term · 5 procs · 1.0 GB"),
+            text.contains("1 agent · 1 term · 1.0 GB"),
             "footer readout rendered:\n{text}"
         );
     }
@@ -7164,16 +7164,20 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        // Projects panel is 20 wide: row 1 is the project, row 2 the divider
-        // spanning the 18 inner columns between the borders (thick ┃ — the
-        // Projects panel starts focused).
+        // Borderless column: row 0 is the header, row 1 a spacer, row 2 the
+        // project (selected in the focused panel → accent ▌ rail), row 3
+        // the divider behind a 1-cell gutter.
         let lines: Vec<&str> = text.lines().collect();
         assert!(
-            lines[1].starts_with("┃● demo"),
-            "project row first:\n{text}"
+            lines[0].starts_with("   PROJECTS"),
+            "column header first:\n{text}"
         );
         assert!(
-            lines[2].starts_with(&format!("┃{}┃", "─".repeat(18))),
+            lines[2].starts_with("▌● demo"),
+            "project row under the header:\n{text}"
+        );
+        assert!(
+            lines[3].starts_with(&format!(" {}", "─".repeat(10))),
             "divider row under the project:\n{text}"
         );
 
@@ -7187,7 +7191,7 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(
-            text.lines().nth(2).unwrap().starts_with("┃─ work ──"),
+            text.lines().nth(3).unwrap().starts_with(" ─ work ──"),
             "labeled divider row:\n{text}"
         );
     }
@@ -7692,33 +7696,33 @@ mod tests {
 
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         assert!(
-            !buffer_text(&terminal).contains("changed file"),
+            !buffer_text(&terminal).contains("+1 file"),
             "no badge before a count exists"
         );
 
         app.git_changes = Some((WorktreeId("w1".into()), Some(2)));
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("2 changed files"), "badge rendered:\n{text}");
+        assert!(text.contains("+2 files"), "badge rendered:\n{text}");
 
         app.git_changes = Some((WorktreeId("w1".into()), Some(1)));
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("1 changed file "), "singular form:\n{text}");
+        assert!(text.contains("+1 file "), "singular form:\n{text}");
 
         app.git_changes = Some((WorktreeId("w1".into()), Some(0)));
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         assert!(
-            !buffer_text(&terminal).contains("changed file"),
+            !buffer_text(&terminal).contains("+0 file"),
             "clean checkout stays quiet"
         );
 
         // A count cached for some other worktree must not leak onto the
-        // selected row's panel.
+        // selected row's footer crumb.
         app.git_changes = Some((WorktreeId("w2".into()), Some(5)));
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         assert!(
-            !buffer_text(&terminal).contains("changed file"),
+            !buffer_text(&terminal).contains("+5 file"),
             "stale cache renders nothing"
         );
     }
@@ -8563,7 +8567,7 @@ mod tests {
     }
 
     #[test]
-    fn palette_renders_with_kind_badges_and_emoji_panel_titles() {
+    fn palette_renders_with_kind_glyphs_and_column_headers() {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
@@ -8576,13 +8580,16 @@ mod tests {
             text.contains("type to search"),
             "query placeholder rendered:\n{text}"
         );
-        // The TestBackend pads a double-width emoji with a placeholder
-        // cell, so match badge and label separately rather than adjacent.
-        assert!(text.contains("📁") && text.contains("Projects"), "{text}");
-        assert!(text.contains("🌳") && text.contains("Worktrees"), "{text}");
-        assert!(text.contains("🤖") && text.contains("Sessions"), "{text}");
+        // Sidebar headers are plain uppercase text (no emoji).
+        assert!(text.contains("PROJECTS"), "{text}");
+        assert!(text.contains("WORKTREES"), "{text}");
+        assert!(text.contains("SESSIONS"), "{text}");
+        // Palette rows carry per-kind glyphs: ▪ project, ▸ worktree,
+        // ● session.
+        assert!(text.contains("▪ demo"), "project glyph row:\n{text}");
+        assert!(text.contains("▸ demo/main"), "worktree glyph row:\n{text}");
         assert!(
-            text.contains("demo/main/agent-1"),
+            text.contains("● demo/main/agent-1"),
             "session row rendered in the palette:\n{text}"
         );
         // Rects for mouse hit-testing were written back during the draw.

@@ -94,7 +94,7 @@ fn draw_vim(f: &mut Frame, app: &mut App) {
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Thick)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(th.accent))
         .title(Span::styled(
             format!(" {} ", vim.title),
@@ -164,6 +164,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Clear, area);
             let mut block = Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th.accent));
             if let Some(title) = &menu.title {
                 block = block.title(Span::styled(
@@ -183,7 +184,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     Style::default()
                 };
                 if i == menu.hover {
-                    style = style.add_modifier(Modifier::REVERSED);
+                    style = style.bg(th.sel_bg).add_modifier(Modifier::BOLD);
                 }
                 let text = if item.action.submenu().is_some() {
                     format!(" {:<label_w$} ▸ ", item.label)
@@ -210,6 +211,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th.err))
                 .title(Span::styled(
                     format!(" {} ", confirm.title),
@@ -237,6 +239,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th.accent))
                 .title(Span::styled(
                     format!(" {} ", prompt.title),
@@ -389,6 +392,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th.accent))
                 .title(" Help ");
             let inner = block.inner(area);
@@ -439,6 +443,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th.accent))
                 .title(Span::styled(
                     " Settings ",
@@ -469,8 +474,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         let mut label_style = Style::default();
                         let mut value_style = Style::default().fg(th.accent);
                         if *i == view.selected {
-                            label_style = label_style.add_modifier(Modifier::REVERSED);
-                            value_style = value_style.add_modifier(Modifier::REVERSED);
+                            label_style = label_style.bg(th.sel_bg).add_modifier(Modifier::BOLD);
+                            value_style = value_style.bg(th.sel_bg).add_modifier(Modifier::BOLD);
                         }
                         lines.push(Line::from(vec![
                             Span::styled(format!("   {:<28}", spec.label), label_style),
@@ -682,7 +687,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     let name_style = if row.sref.is_none() { dim } else { Style::default() };
                     let sel = |s: Style| {
                         if i == selected {
-                            s.add_modifier(Modifier::REVERSED)
+                            s.bg(th.sel_bg).add_modifier(Modifier::BOLD)
                         } else {
                             s
                         }
@@ -715,6 +720,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th.accent))
                 .title(Span::styled(
                     " Memory ",
@@ -902,6 +908,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             };
             let block = Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th.accent))
                 .title(Span::styled(
                     title,
@@ -950,19 +957,15 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     break;
                 };
                 let item = &palette.items[m.item];
-                // Kind indicator: badge emoji + a per-kind text color, so
-                // rows read at a glance; the cyan-bold match highlight
-                // stands out against all three.
-                let (badge, kind_color) = match &item.target {
-                    PaletteTarget::Project(_) => ("📁 ", None),
-                    PaletteTarget::Worktree(_) => ("🌳 ", Some(th.ok)),
-                    PaletteTarget::Session(_) => ("🤖 ", Some(th.special)),
+                // Kind indicator: a small colored glyph; the row text stays
+                // quiet (dim parent path, bright leaf) so the cyan-bold
+                // match highlight is the loudest thing in the list.
+                let (glyph, glyph_color) = match &item.target {
+                    PaletteTarget::Project(_) => ("▪ ", th.accent),
+                    PaletteTarget::Worktree(_) => ("▸ ", th.ok),
+                    PaletteTarget::Session(_) => ("● ", th.special),
                 };
-                let base_fg = if item.archived {
-                    Some(th.dim)
-                } else {
-                    kind_color
-                };
+                let glyph_color = if item.archived { th.dim } else { glyph_color };
                 let budget = (list_inner.width as usize).saturating_sub(4);
                 let shown = truncate(&item.text, budget);
                 // Truncation puts `…` at the last char of `shown`; a match
@@ -978,16 +981,16 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 } else {
                     &m.positions[..]
                 };
-                let mut spans = vec![Span::raw(badge)];
-                let mut text_spans = fuzzy_highlight_spans(&shown, positions, th);
-                if let Some(fg) = base_fg {
-                    for s in &mut text_spans {
-                        if s.style.fg.is_none() {
-                            s.style.fg = Some(fg);
-                        }
-                    }
-                }
-                spans.extend(text_spans);
+                let mut spans = vec![Span::styled(
+                    glyph,
+                    Style::default().fg(glyph_color),
+                )];
+                spans.extend(path_highlight_spans(
+                    &shown,
+                    positions,
+                    item.archived,
+                    th,
+                ));
                 render_row(f, row_area, spans, i == palette.selected, true, th);
             }
 
@@ -1013,6 +1016,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             };
             let block = Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th.accent))
                 .title(Span::styled(
                     title,
@@ -1108,6 +1112,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             };
             let block = Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th.accent))
                 .title(Span::styled(
                     title,
@@ -1224,6 +1229,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             };
             let block = Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th.accent))
                 .title(Span::styled(
                     truncate(&title, (area.width as usize).saturating_sub(2)),
@@ -1518,14 +1524,15 @@ fn centered_rect_pct(frame: Rect, pct_w: u16, pct_h: u16) -> Rect {
     centered_rect(frame, frame.width * pct_w / 100, frame.height * pct_h / 100)
 }
 
-/// Bordered panel frame. Focus has to be unmissable, so the focused panel
-/// differs in shape as well as color: a THICK border and a solid
-/// accent-background title chip, versus a thin dim border and plain title.
+/// Bordered panel frame: rounded corners everywhere for a softer, modern
+/// look. Focus has to be unmissable, so the focused panel gets an accent
+/// border plus a solid accent-background title chip, versus a thin dim
+/// border and plain muted title.
 fn panel_block(title: &str, focused: bool, th: Theme) -> Block<'_> {
     if focused {
         Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Thick)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(th.accent))
             .title(Span::styled(
                 format!(" {title} "),
@@ -1537,6 +1544,7 @@ fn panel_block(title: &str, focused: bool, th: Theme) -> Block<'_> {
     } else {
         Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(th.dim))
             .title(Span::styled(
                 format!(" {title} "),
@@ -1567,25 +1575,23 @@ fn status_dot(status: Option<AgentStatus>, th: Theme) -> Span<'static> {
     }
 }
 
-/// Base style for a whole list row. Selection reads as a full-width bar so
-/// the active project → worktree → session path stays visible at a glance:
-/// bright (reversed) in the focused panel, dim gray in unfocused panels.
+/// Base style for a whole list row. Selection reads as a subtly raised
+/// full-width surface (never a reverse-video slab), brighter in the
+/// focused panel than in unfocused ones.
 fn row_bar(selected: bool, focused: bool, th: Theme) -> Style {
     if selected && focused {
-        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        Style::default().bg(th.sel_bg).add_modifier(Modifier::BOLD)
     } else if selected {
-        Style::default()
-            .bg(th.dim)
-            .fg(th.text)
-            .add_modifier(Modifier::BOLD)
+        Style::default().bg(th.sel_bg_dim)
     } else {
         Style::default()
     }
 }
 
-/// Render one list row as a full-width bar. Dim spans (idle dots,
-/// archived names) would vanish against the unfocused-selection bar, so
-/// they get lifted to muted there.
+/// Render one list row as a full-width bar: an accent `▌` marker pins the
+/// selection in the focused panel; every other row gets a plain 1-cell
+/// gutter so text stays aligned. Dim spans (idle dots, archived names)
+/// would sink into the selection fill, so they get lifted to muted there.
 fn render_row(
     f: &mut Frame,
     area: Rect,
@@ -1594,37 +1600,86 @@ fn render_row(
     focused: bool,
     th: Theme,
 ) {
-    if selected && !focused {
+    if selected {
         for s in &mut spans {
             if s.style.fg == Some(th.dim) {
                 s.style.fg = Some(th.muted);
             }
         }
     }
+    let marker = if selected && focused {
+        Span::styled("▌", Style::default().fg(th.accent))
+    } else if selected {
+        Span::styled("▌", Style::default().fg(th.dim))
+    } else {
+        Span::raw(" ")
+    };
+    spans.insert(0, marker);
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(row_bar(selected, focused, th)),
         area,
     );
 }
 
+/// Borderless sidebar column: a single dim rule on the right edge, an
+/// uppercase header row, one blank spacer, then the list area (returned).
+/// The header carries the focus signal — accent when focused, muted
+/// otherwise — so the chrome itself can stay quiet.
+fn draw_column(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    count: Option<usize>,
+    focused: bool,
+    th: Theme,
+) -> Rect {
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(th.edge));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let header_style = if focused {
+        Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(th.muted).add_modifier(Modifier::BOLD)
+    };
+    if let Some(r) = row_rect(inner, 0) {
+        let mut spans = vec![Span::styled(format!("   {title}"), header_style)];
+        if let Some(n) = count {
+            spans.push(Span::styled(
+                format!(" · {n}"),
+                Style::default().fg(th.dim),
+            ));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), r);
+    }
+    // One extra column of right padding so row text never touches the
+    // column rule.
+    Rect {
+        y: inner.y + 2,
+        height: inner.height.saturating_sub(2),
+        width: inner.width.saturating_sub(1),
+        ..inner
+    }
+}
+
 fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Projects;
-    let block = panel_block("📁 Projects", focused, th);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let count = Some(app.tree.projects.len()).filter(|n| *n > 0);
+    let inner = draw_column(f, area, "PROJECTS", count, focused, th);
 
     if app.tree.projects.is_empty() {
         f.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
-                    "No projects yet",
+                    "  no projects yet",
                     Style::default().fg(th.dim),
                 )),
-                Line::from(Span::styled(
-                    "n: add project",
-                    Style::default().fg(th.dim),
-                )),
+                Line::from(vec![
+                    Span::styled("  n", Style::default().fg(th.accent)),
+                    Span::styled(" adds one", Style::default().fg(th.dim)),
+                ]),
             ]),
             inner,
         );
@@ -1693,7 +1748,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
 /// `─ label ────────`.
 fn divider_spans(label: &str, width: u16, th: Theme) -> Vec<Span<'static>> {
     let w = width as usize;
-    let dim = Style::default().fg(th.dim);
+    let dim = Style::default().fg(th.edge);
     if label.is_empty() {
         return vec![Span::styled("─".repeat(w), dim)];
     }
@@ -1714,19 +1769,9 @@ fn divider_spans(label: &str, width: u16, th: Theme) -> Vec<Span<'static>> {
 fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Worktrees;
-    let mut block = panel_block("🌳 Worktrees", focused, th);
-    // Bottom badge: the selected checkout's changed-file count, so a dirty
-    // worktree (or root) is obvious at a glance. Clean stays quiet.
-    if !app.divider_focused() {
-        if let Some(n) = app.selected_worktree_changes().filter(|n| *n > 0) {
-            block = block.title_bottom(Line::from(Span::styled(
-                format!(" {n} changed file{} ", if n == 1 { "" } else { "s" }),
-                Style::default().fg(th.warn),
-            )));
-        }
-    }
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let wt_count = app.visible_worktrees().len();
+    let count = Some(wt_count).filter(|n| *n > 0 && !app.divider_focused());
+    let inner = draw_column(f, area, "WORKTREES", count, focused, th);
 
     // A selected separator has nothing underneath it: keep the panel, hide
     // the rows (the terminal pane carries the hint).
@@ -1748,15 +1793,15 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     if worktrees.is_empty() {
-        let hint = if app.tree.projects.is_empty() {
-            "—"
-        } else {
-            "n: new worktree"
-        };
-        f.render_widget(
-            Paragraph::new(hint).style(Style::default().fg(th.dim)),
-            inner,
-        );
+        if !app.tree.projects.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("  n", Style::default().fg(th.accent)),
+                    Span::styled(" starts a worktree", Style::default().fg(th.dim)),
+                ])),
+                inner,
+            );
+        }
         app.hits.push((inner, HitTarget::PanelBg(Focus::Worktrees)));
         return;
     }
@@ -1773,7 +1818,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let mut screen_row = 0usize;
     let header = |f: &mut Frame, text: String, screen_row: &mut usize| {
         if let Some(r) = row_rect(inner, *screen_row) {
-            f.render_widget(Paragraph::new(Span::styled(text, dim)), r);
+            f.render_widget(Paragraph::new(Span::styled(format!(" {text}"), dim)), r);
             *screen_row += 1;
         }
     };
@@ -1810,19 +1855,11 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         render_row(f, row_area, spans, i == app.sel_worktree, focused, th);
         app.hits.push((row_area, HitTarget::Worktree(i)));
         screen_row += 1;
-        // The root rule belongs to the flat list; group headers already
-        // separate the rows once something is pinned.
+        // A quiet blank row separates the main checkout from the true
+        // worktrees below; group headers take over once something is
+        // pinned.
         if !grouped && *is_main && worktrees.len() > 1 {
-            if let Some(r) = row_rect(inner, screen_row) {
-                f.render_widget(
-                    Paragraph::new(Span::styled(
-                        "─".repeat(inner.width as usize),
-                        Style::default().fg(th.dim),
-                    )),
-                    r,
-                );
-                screen_row += 1;
-            }
+            screen_row += 1;
         }
     }
     app.hits.push((inner, HitTarget::PanelBg(Focus::Worktrees)));
@@ -1831,9 +1868,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Sessions;
-    let block = panel_block("🤖 Sessions", focused, th);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let visible = app.visible_session_rows().len();
+    let count = Some(visible).filter(|n| *n > 0 && !app.divider_focused());
+    let inner = draw_column(f, area, "SESSIONS", count, focused, th);
 
     // A selected separator has nothing underneath it: keep the panel, hide
     // the rows (the terminal pane carries the hint).
@@ -1843,6 +1880,17 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let rows = app.visible_session_rows();
+    if rows.is_empty() && app.selected_worktree().is_some() {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("  n", Style::default().fg(th.accent)),
+                Span::styled(" agent · ", Style::default().fg(th.dim)),
+                Span::styled("T", Style::default().fg(th.accent)),
+                Span::styled(" terminal", Style::default().fg(th.dim)),
+            ])),
+            inner,
+        );
+    }
     let (pinned_count, recent_count, unpinned_count, archived_count) = app.session_group_counts();
     let active_count = pinned_count + recent_count + unpinned_count;
     let terminal_count = rows
@@ -1853,8 +1901,13 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
 
     let mut screen_row: usize = 0;
     let header = |f: &mut Frame, text: String, screen_row: &mut usize| {
+        // A blank row above every group after the first keeps the groups
+        // scannable without drawing more chrome.
+        if *screen_row > 0 {
+            *screen_row += 1;
+        }
         if let Some(r) = row_rect(inner, *screen_row) {
-            f.render_widget(Paragraph::new(Span::styled(text, dim)), r);
+            f.render_widget(Paragraph::new(Span::styled(format!(" {text}"), dim)), r);
             *screen_row += 1;
         }
     };
@@ -1918,13 +1971,15 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     if archived_count > 0 {
-        header(f, "─".repeat(inner.width as usize), &mut screen_row);
+        if screen_row > 0 {
+            screen_row += 1;
+        }
         // Both header forms are click targets: a click expands/collapses
         // the group, same as the A key.
         let text = if app.show_archived {
-            format!("ARCHIVED ({archived_count}) (A to hide)")
+            format!(" ARCHIVED · {archived_count} (A hides)")
         } else {
-            format!("… {archived_count} archived (A to show)")
+            format!(" … {archived_count} archived (A shows)")
         };
         if let Some(r) = row_rect(inner, screen_row) {
             f.render_widget(Paragraph::new(Span::styled(text, dim)), r);
@@ -2001,6 +2056,55 @@ fn draw_session_row(
     app.hits.push((area, HitTarget::Session(index)));
 }
 
+/// Borderless terminal frame: a header row (`TERMINAL · session` plus a
+/// right-aligned state tag), a thin rule, then the content area. The
+/// header carries the focus signal like the sidebar columns do.
+fn terminal_frame(
+    f: &mut Frame,
+    area: Rect,
+    left: Vec<Span<'static>>,
+    right: Option<Span<'static>>,
+    focused: bool,
+    th: Theme,
+) -> Rect {
+    let header_style = if focused {
+        Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(th.muted).add_modifier(Modifier::BOLD)
+    };
+    if let Some(r) = row_rect(area, 0) {
+        let mut spans = vec![Span::styled("  TERMINAL".to_string(), header_style)];
+        spans.extend(left);
+        f.render_widget(Paragraph::new(Line::from(spans)), r);
+        if let Some(tag) = right {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![tag, Span::raw(" ")]))
+                    .alignment(ratatui::layout::Alignment::Right),
+                r,
+            );
+        }
+    }
+    if let Some(r) = row_rect(area, 1) {
+        let rule_style = if focused {
+            Style::default().fg(th.accent)
+        } else {
+            Style::default().fg(th.edge)
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "─".repeat(area.width as usize),
+                rule_style,
+            )),
+            r,
+        );
+    }
+    Rect {
+        y: area.y + 2,
+        height: area.height.saturating_sub(2),
+        ..area
+    }
+}
+
 fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Terminal;
@@ -2008,9 +2112,7 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     // the content for a hint. The attachment itself stays live so walking
     // the list across a divider doesn't churn detach/attach.
     if app.divider_focused() {
-        let block = panel_block("Terminal", focused, th);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
+        let inner = terminal_frame(f, area, Vec::new(), None, focused, th);
         app.term_area = inner;
         let msg = Paragraph::new(vec![
             Line::from(""),
@@ -2030,21 +2132,35 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         app.term_file_links = Vec::new();
         return;
     }
-    // Name the attached session in the title so it's clear what you're
+    // Name the attached session in the header so it's clear what you're
     // looking at (and typing into) even with the sidebars collapsed.
-    let who = attached_session_name(app)
-        .map(|n| format!(" — {n}"))
-        .unwrap_or_default();
-    let title = match &app.term {
-        Some(t) if t.exited => format!("Terminal{who} (exited)"),
-        Some(t) if t.scroll > 0 => format!("Terminal{who} [SCROLL {}]", t.scroll),
-        Some(_) if app.term_locked => format!("Terminal{who} [input]"),
-        Some(_) => format!("Terminal{who}"),
-        None => "Terminal".to_string(),
+    let mut left = Vec::new();
+    if let Some(name) = attached_session_name(app) {
+        left.push(Span::styled(" · ".to_string(), Style::default().fg(th.dim)));
+        left.push(Span::styled(name, Style::default().fg(th.muted)));
+    }
+    let right = match &app.term {
+        Some(t) if t.exited => Some(Span::styled(
+            "exited".to_string(),
+            Style::default().fg(th.err).add_modifier(Modifier::BOLD),
+        )),
+        Some(t) if t.scroll > 0 => Some(Span::styled(
+            format!("scroll {}", t.scroll),
+            Style::default().fg(th.warn).add_modifier(Modifier::BOLD),
+        )),
+        Some(_) if app.term_locked => Some(Span::styled(
+            "INPUT".to_string(),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        )),
+        _ => None,
     };
-    let block = panel_block(&title, focused, th);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = terminal_frame(f, area, left, right, focused, th);
+    // One cell of inset so PTY content doesn't hug the sessions rule.
+    let inner = Rect {
+        x: inner.x + 1,
+        width: inner.width.saturating_sub(1),
+        ..inner
+    };
     app.term_area = inner;
     app.hits.push((inner, HitTarget::TerminalPane));
 
@@ -2081,21 +2197,45 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
             )
         }
         None => {
-            let msg = Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(
+            // Empty-pane hero: vertically centered wordmark + a compact
+            // key cheat-sheet, so the big blank pane earns its keep.
+            let key = |k: &str, label: &str| {
+                vec![
+                    Span::styled(
+                        k.to_string(),
+                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!(" {label}"), Style::default().fg(th.dim)),
+                ]
+            };
+            let sep = || Span::styled("   ·   ", Style::default().fg(th.dim));
+            let mut hint = Vec::new();
+            hint.extend(key("Enter", "attach"));
+            hint.push(sep());
+            hint.extend(key("n", "new agent"));
+            hint.push(sep());
+            hint.extend(key("/", "jump"));
+            hint.push(sep());
+            hint.extend(key("?", "help"));
+            let mut lines = vec![Line::from("")];
+            let blank = inner.height.saturating_sub(6) / 2;
+            for _ in 0..blank {
+                lines.insert(0, Line::from(""));
+            }
+            lines.push(Line::from(vec![
+                Span::styled("◆ ", Style::default().fg(th.accent)),
+                Span::styled(
                     "nebula",
-                    Style::default()
-                        .fg(th.accent)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "select a session and press Enter to attach",
-                    Style::default().fg(th.dim),
-                )),
-            ])
-            .centered();
+                    Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "your agents keep running, even when you leave",
+                Style::default().fg(th.dim),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(hint));
+            let msg = Paragraph::new(lines).centered();
             f.render_widget(msg, inner);
             (Vec::new(), Vec::new())
         }
@@ -2189,6 +2329,8 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let th = app.theme;
+    // The hint branches below build with `dim`; lift to muted at the end
+    // so hints read as secondary, not disabled (flash/warn stays as-is).
     let conn = match app.conn {
         ConnState::Connected => Span::styled("⏻ connected", Style::default().fg(th.ok)),
         ConnState::Disconnected => Span::styled("✗ disconnected", Style::default().fg(th.err)),
@@ -2274,23 +2416,39 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         };
         Span::styled(text, Style::default().fg(th.dim))
     };
-    let host_style = if app.is_remote {
-        Style::default()
-            .fg(th.warn)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(th.dim)
-    };
-    let mut spans = vec![
-        Span::styled(truncate(&app.hostname, 24), host_style),
-        Span::raw("  │  "),
-        conn,
-        Span::raw("  │  "),
-    ];
+    // Quiet footer: context on the left, live stats on the right. The
+    // hostname only earns a slot when it's a remote session, and the
+    // connection state only when something is wrong.
+    let mut spans = vec![Span::raw(" ")];
+    if app.is_remote {
+        spans.push(Span::styled(
+            truncate(&app.hostname, 24),
+            Style::default().fg(th.warn).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled("  ·  ", Style::default().fg(th.dim)));
+    }
+    if matches!(app.conn, ConnState::Disconnected) {
+        spans.push(conn);
+        spans.push(Span::styled("  ·  ", Style::default().fg(th.dim)));
+    }
     let crumbs = breadcrumb(app);
     if !crumbs.is_empty() {
         spans.extend(crumbs);
-        spans.push(Span::raw("  │  "));
+        // The selected checkout's dirty-file count rides the breadcrumb —
+        // it's context, not chrome.
+        if !app.divider_focused() {
+            if let Some(n) = app.selected_worktree_changes().filter(|n| *n > 0) {
+                spans.push(Span::styled(
+                    format!("  +{n} file{}", if n == 1 { "" } else { "s" }),
+                    Style::default().fg(th.warn),
+                ));
+            }
+        }
+        spans.push(Span::styled("    ", Style::default()));
+    }
+    let mut hints = hints;
+    if hints.style.fg == Some(th.dim) {
+        hints.style.fg = Some(th.muted);
     }
     spans.push(hints);
     // Right edge: live session/process counts and nebula's total memory
@@ -2332,16 +2490,14 @@ fn footer_usage(app: &App) -> Option<String> {
         .filter(|s| matches!(s.session, SessionRef::Agent(_)))
         .count();
     let terms = m.sessions.len() - agents;
-    let procs: usize = m.sessions.iter().map(|s| s.procs as usize).sum();
     let total = m.daemon_rss_bytes
         + app.client_rss_bytes
         + m.sessions.iter().map(|s| s.rss_bytes).sum::<u64>();
     let plural = |n: usize| if n == 1 { "" } else { "s" };
     Some(format!(
-        "{agents} agent{} · {terms} term{} · {procs} proc{} · {}",
+        "{agents} agent{} · {terms} term{} · {}",
         plural(agents),
         plural(terms),
-        plural(procs),
         fmt_mem(total)
     ))
 }
@@ -2357,6 +2513,47 @@ fn token_style(kind: crate::syntax::TokenKind, th: Theme) -> Style {
         TokenKind::Number => Style::default().fg(th.warn),
         TokenKind::Text => Style::default(),
     }
+}
+
+/// Palette row text: dim `parent/path/` prefix, normal leaf segment, with
+/// fuzzy-match chars lit accent-bold on top. Archived rows stay dim all
+/// the way through.
+fn path_highlight_spans(
+    shown: &str,
+    positions: &[usize],
+    archived: bool,
+    th: Theme,
+) -> Vec<Span<'static>> {
+    let boundary = shown
+        .rfind('/')
+        .map(|b| shown[..=b].chars().count())
+        .unwrap_or(0);
+    let hl = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    let mut run = String::new();
+    let mut run_style: Option<Style> = None;
+    for (i, c) in shown.chars().enumerate() {
+        let style = if positions.binary_search(&i).is_ok() {
+            hl
+        } else if archived || i < boundary {
+            Style::default().fg(th.dim)
+        } else {
+            Style::default().fg(th.text)
+        };
+        if run_style != Some(style) {
+            if let Some(s) = run_style.take() {
+                if !run.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut run), s));
+                }
+            }
+            run_style = Some(style);
+        }
+        run.push(c);
+    }
+    if let (Some(s), false) = (run_style, run.is_empty()) {
+        spans.push(Span::styled(run, s));
+    }
+    spans
 }
 
 /// Split a (possibly truncated) path into spans, lighting the chars the

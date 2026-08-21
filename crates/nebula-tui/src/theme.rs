@@ -35,6 +35,14 @@ pub struct Theme {
     pub err: Color,
     /// Terminated sessions and the session kind badge.
     pub special: Color,
+    /// Selected-row fill in the focused panel (a subtle raised surface,
+    /// not a reverse-video slab).
+    pub sel_bg: Color,
+    /// Selected-row fill in unfocused panels (barely raised).
+    pub sel_bg_dim: Color,
+    /// Structural chrome: column rules, header underlines, dividers.
+    /// Darker than `dim` so the frame recedes behind the content.
+    pub edge: Color,
 }
 
 impl Default for Theme {
@@ -50,6 +58,9 @@ impl Default for Theme {
             warn: Color::Yellow,
             err: Color::Red,
             special: Color::Magenta,
+            sel_bg: Color::Indexed(237),
+            sel_bg_dim: Color::Indexed(235),
+            edge: Color::Indexed(238),
         }
     }
 }

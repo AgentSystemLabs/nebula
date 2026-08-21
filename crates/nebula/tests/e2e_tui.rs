@@ -189,11 +189,11 @@ impl TuiHarness {
         });
     }
 
-    /// Wait until the row containing `needle` renders with the REVERSED
-    /// attribute — i.e. it is the selected row of a focused panel.
+    /// Wait until the row containing `needle` renders with the selection
+    /// fill (the raised `sel_bg` / `sel_bg_dim` background bar).
     fn wait_for_selected(&self, needle: &str) {
-        self.wait_for(&format!("row {needle:?} selected (reversed)"), |s| {
-            row_is_reversed(s, needle)
+        self.wait_for(&format!("row {needle:?} selected (filled)"), |s| {
+            row_is_selected(s, needle)
         });
     }
 
@@ -274,7 +274,7 @@ fn sessions_panel_contains(screen: &vt100::Screen, needle: &str) -> bool {
     false
 }
 
-fn row_is_reversed(screen: &vt100::Screen, needle: &str) -> bool {
+fn row_is_selected(screen: &vt100::Screen, needle: &str) -> bool {
     let (rows, cols) = screen.size();
     for row in 0..rows {
         let mut line = String::new();
@@ -290,9 +290,16 @@ fn row_is_reversed(screen: &vt100::Screen, needle: &str) -> bool {
             }
         }
         if line.contains(needle) {
-            let reversed =
-                (0..cols).any(|col| screen.cell(row, col).map(|c| c.inverse()).unwrap_or(false));
-            if reversed {
+            // Selection paints the row with the raised fill: indexed 237 in
+            // the focused panel, 235 in unfocused ones (theme sel_bg /
+            // sel_bg_dim).
+            let filled = (0..cols).any(|col| {
+                matches!(
+                    screen.cell(row, col).map(|c| c.bgcolor()),
+                    Some(vt100::Color::Idx(237)) | Some(vt100::Color::Idx(235))
+                )
+            });
+            if filled {
                 return true;
             }
         }
@@ -345,7 +352,7 @@ fn tui_projects_worktrees_agents_navigation() {
     let beta = tui.make_repo("beta-proj");
 
     // ---- boot: empty state, Projects focused ----
-    tui.wait_for_text("No projects yet");
+    tui.wait_for_text("no projects yet");
     tui.wait_for_text(FOOTER_PROJECTS);
 
     // ---- add the first project via bash-style Tab completion ----
@@ -498,7 +505,7 @@ fn tui_projects_worktrees_agents_navigation() {
 #[test]
 fn tui_help_modal_grouped_keymap() {
     let mut tui = TuiHarness::spawn();
-    tui.wait_for_text("No projects yet");
+    tui.wait_for_text("no projects yet");
 
     // The grouped two-column keymap: every section header on screen at
     // once, including the todo hotkey (the old single list clipped its
@@ -522,7 +529,7 @@ fn tui_todo_modal_crud_and_badge() {
     let mut tui = TuiHarness::spawn();
     let repo = tui.make_repo("todo-proj");
 
-    tui.wait_for_text("No projects yet");
+    tui.wait_for_text("no projects yet");
     add_project(&mut tui, &repo, "todo-proj");
     // The root worktree row must exist before o has a list to open.
     tui.wait_for_text("⌂ root");
@@ -608,7 +615,7 @@ fn tui_git_diff_modal() {
     let mut tui = TuiHarness::spawn();
     let repo = tui.make_repo("diff-proj");
 
-    tui.wait_for_text("No projects yet");
+    tui.wait_for_text("no projects yet");
     add_project(&mut tui, &repo, "diff-proj");
     // The root worktree row must exist before g has anything to diff.
     tui.wait_for_text("⌂ root");
@@ -619,7 +626,7 @@ fn tui_git_diff_modal() {
 
     // The worktree panel's bottom badge picks the changes up on its own
     // poll — no keypress in between.
-    tui.wait_for_text("2 changed files");
+    tui.wait_for_text("+2 files");
 
     // ---- open the modal; the selected file's diff renders ----
     tui.send(b"g");
@@ -676,7 +683,7 @@ fn tui_git_diff_modal() {
     repo_git(&repo, &["add", "."]);
     repo_git(&repo, &["commit", "-m", "wip"]);
     // The commit empties the badge on the next poll.
-    tui.wait_for_gone("2 changed files");
+    tui.wait_for_gone("+2 files");
     tui.send(b"g");
     tui.wait_for_text("no changes in main");
 }
