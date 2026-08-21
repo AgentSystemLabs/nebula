@@ -10,15 +10,25 @@
 pub mod installer;
 
 use crate::status::HookEvent;
+use crate::store::Store;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
-use axum::{Json, Router};
+use axum::Router;
 use nebula_core::AgentId;
 use serde::Deserialize;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
+
+/// Injected into the agent's context (via UserPromptSubmit hook stdout)
+/// while its session still awaits an auto-title. Repeats on every prompt
+/// until a title sticks, then the daemon stops sending it.
+pub const AUTO_TITLE_INSTRUCTION: &str = "[nebula] This session is untitled. \
+Before addressing the user's request, run this shell command exactly once:\n\n  \
+nebula rename <title>\n\nReplace <title> with 3-4 Title Case words describing \
+the user's request, unquoted (example: nebula rename Fix Login Redirect). \
+Then continue with the request. Don't mention the rename to the user.";
 
 #[derive(Clone)]
 pub struct HookEnv {
@@ -29,6 +39,9 @@ pub struct HookEnv {
 pub struct HookServerState {
     token: String,
     tx: mpsc::Sender<HookDelivery>,
+    /// Read-only peek at agent rows: drives the auto-title injection
+    /// decision without a round-trip through the daemon's drain loop.
+    store: Arc<Store>,
 }
 
 /// One accepted hook POST, decoded for the daemon's drain loop.
@@ -119,7 +132,9 @@ pub fn parse_event(hook_event: &str, payload: &HookPayload) -> Option<HookEvent>
 
 /// Bind 127.0.0.1:0 and serve the hook route. Returns the env (port + fresh
 /// bearer token) and the receiving end of the event pipe.
-pub async fn start_hook_server() -> anyhow::Result<(HookEnv, mpsc::Receiver<HookDelivery>)> {
+pub async fn start_hook_server(
+    store: Arc<Store>,
+) -> anyhow::Result<(HookEnv, mpsc::Receiver<HookDelivery>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let token = generate_token();
@@ -128,11 +143,17 @@ pub async fn start_hook_server() -> anyhow::Result<(HookEnv, mpsc::Receiver<Hook
     let state = Arc::new(HookServerState {
         token: token.clone(),
         tx,
+        store,
     });
+    // Claude and Codex UserPromptSubmit hooks pipe this server's response
+    // body to the CLI's stdout, where it lands in the model's context —
+    // that's the auto-title instruction channel. Cursor's dialect has no
+    // such channel (its hooks answer with their own gating JSON), so it
+    // takes the plain route.
     let app = Router::new()
-        .route("/api/hooks/claude", post(receive_hook))
-        .route("/api/hooks/codex", post(receive_hook))
-        .route("/api/hooks/cursor", post(receive_hook))
+        .route("/api/hooks/claude", post(receive_injectable_hook))
+        .route("/api/hooks/codex", post(receive_injectable_hook))
+        .route("/api/hooks/cursor", post(receive_plain_hook))
         .with_state(state);
 
     tokio::spawn(async move {
@@ -154,6 +175,166 @@ fn generate_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nebula_core::{
+        Agent, AgentKind, AgentStatus, Project, ProjectId, Worktree, WorktreeId,
+    };
+
+    /// Minimal raw HTTP/1.1 POST (Connection: close), so the real response
+    /// body — what the hook one-liner pipes to the CLI's stdout — is under
+    /// test, not a re-implementation of the handler's logic.
+    async fn http_post(port: u16, path_query: &str, token: &str, body: &str) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let req = format!(
+            "POST {path_query} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf).to_string();
+        let status: u16 = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let body = text
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    fn seeded_store() -> Arc<Store> {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store
+            .insert_project(&Project {
+                id: ProjectId("p1".into()),
+                name: "p".into(),
+                repo_path: "/tmp/p".into(),
+                sort_order: 0,
+                divider_after: false,
+                divider_label: None,
+                divider_before: false,
+                divider_before_label: None,
+            })
+            .unwrap();
+        store
+            .insert_worktree(&Worktree {
+                id: WorktreeId("w1".into()),
+                project_id: ProjectId("p1".into()),
+                path: "/tmp/p".into(),
+                branch: "main".into(),
+                is_main: true,
+                pinned: false,
+                sort_order: 0,
+            })
+            .unwrap();
+        let agent = |id: &str| Agent {
+            id: AgentId(id.into()),
+            worktree_id: WorktreeId("w1".into()),
+            name: "agent-1".into(),
+            status: AgentStatus::Fresh,
+            archived: false,
+            archived_at: 0,
+            pinned: false,
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            session_id: None,
+            sort_order: 0,
+            status_changed_at: 0,
+            alive: false,
+        };
+        store
+            .insert_agent_with_auto_title(&agent("pending"), true)
+            .unwrap();
+        store.insert_agent(&agent("titled")).unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_injects_title_instruction_only_while_pending() {
+        let store = seeded_store();
+        let (env, mut rx) = start_hook_server(store.clone()).await.unwrap();
+        let payload = r#"{"session_id":"s1"}"#;
+
+        // Untitled session: the instruction rides the response body (and the
+        // status delivery still flows).
+        let (status, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=pending&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, AUTO_TITLE_INSTRUCTION);
+        let delivery = rx.recv().await.unwrap();
+        assert_eq!(delivery.agent_id.as_str(), "pending");
+        assert_eq!(delivery.event, HookEvent::UserPromptSubmit);
+
+        // Codex shares the injectable dialect.
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/codex?agentId=pending&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, AUTO_TITLE_INSTRUCTION);
+
+        // Titled session: strictly empty — anything else would leak into
+        // the model's context.
+        let (status, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=titled&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (200, ""));
+
+        // Unknown agent (prewarm/stale env): same silence.
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=ghost&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, "");
+
+        // Other events keep their diagnostic body (discarded by the hooks).
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=pending&hookEvent=Stop",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, r#"{"ok": true}"#);
+
+        // Cursor's dialect can't inject — no instruction even while pending.
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/cursor?agentId=pending&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, r#"{"ok": true}"#);
+
+        // Bad token on the injectable path: 401 and an EMPTY body, so a
+        // misconfigured hook can't inject diagnostics as context.
+        let (status, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=pending&hookEvent=UserPromptSubmit",
+            "wrong-token",
+            payload,
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (401, ""));
+    }
 
     #[test]
     fn payload_parses_cwd_and_tolerates_unknown_fields() {
@@ -197,12 +378,48 @@ mod tests {
     }
 }
 
-async fn receive_hook(
+/// Claude/Codex route: the UserPromptSubmit hook command pipes this
+/// response's body to stdout, so it must be empty or the injected
+/// instruction — never diagnostic JSON.
+async fn receive_injectable_hook(
     State(state): State<Arc<HookServerState>>,
     Query(query): Query<HookQuery>,
     headers: HeaderMap,
     body: String,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> (StatusCode, String) {
+    receive_hook(true, state, query, headers, body).await
+}
+
+/// Cursor route: every hook command answers cursor with its own gating JSON
+/// and discards this body, so the `{"ok": ...}` diagnostics stay.
+async fn receive_plain_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(false, state, query, headers, body).await
+}
+
+async fn receive_hook(
+    inject_capable: bool,
+    state: Arc<HookServerState>,
+    query: HookQuery,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    // On this path the response body reaches the model's context, so every
+    // outcome (auth failure included) must answer with empty-or-instruction.
+    let injectable = inject_capable && query.hook_event == "UserPromptSubmit";
+    let quiet_or = |status: StatusCode, diag: &str| {
+        let body = if injectable {
+            String::new()
+        } else {
+            diag.to_string()
+        };
+        (status, body)
+    };
+
     let authorized = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -210,27 +427,40 @@ async fn receive_hook(
         .map(|presented| presented.as_bytes().ct_eq(state.token.as_bytes()).into())
         .unwrap_or(false);
     if !authorized {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"ok": false})),
-        );
+        return quiet_or(StatusCode::UNAUTHORIZED, r#"{"ok": false}"#);
     }
 
     // Parse failures still 200 — never fault a hook.
     let payload: HookPayload = serde_json::from_str(&body).unwrap_or_default();
     let Some(event) = parse_event(&query.hook_event, &payload) else {
-        return (StatusCode::OK, Json(serde_json::json!({"ok": false})));
+        return quiet_or(StatusCode::OK, r#"{"ok": false}"#);
     };
-    let agent_id = AgentId(query.agent_id);
+    let agent_id = AgentId(query.agent_id.clone());
     tracing::debug!(agent = %agent_id, event = ?event, "hook received");
     let _ = state
         .tx
         .send(HookDelivery {
-            agent_id,
+            agent_id: agent_id.clone(),
             event,
             session_id: payload.session_id(),
             cwd: payload.cwd(),
         })
         .await;
-    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+
+    if injectable {
+        // Prompt submitted on a still-untitled session: hand the CLI the
+        // titling instruction. Unknown ids (prewarm, stale env) and store
+        // errors degrade to no injection.
+        let inject = state
+            .store
+            .agent_auto_title_pending(&agent_id)
+            .unwrap_or(false);
+        let body = if inject {
+            AUTO_TITLE_INSTRUCTION.to_string()
+        } else {
+            String::new()
+        };
+        return (StatusCode::OK, body);
+    }
+    (StatusCode::OK, r#"{"ok": true}"#.to_string())
 }

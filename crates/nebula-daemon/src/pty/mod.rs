@@ -19,6 +19,9 @@ const COALESCE_HOLD: std::time::Duration = std::time::Duration::from_millis(5);
 /// Reader thread → pump channel bound; blocking_send gives natural
 /// backpressure against a fire-hosing child.
 const READER_CHANNEL_BOUND: usize = 64;
+/// After the polite SIGHUP, how long the child gets to exit before its whole
+/// process group is SIGKILLed.
+const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Broadcast to attached clients (and, later, the status machine).
 #[derive(Clone, Debug)]
@@ -39,6 +42,10 @@ pub struct PtySession {
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    /// Child pid: drives the SIGHUP → SIGKILL escalation (the child is its
+    /// PTY session's leader — portable-pty does setsid — so pgid == pid)
+    /// and the metrics modal's process-tree sums.
+    pub child_pid: Option<u32>,
     pub ring: Mutex<ScrollbackRing>,
     pub events: broadcast::Sender<PtyEvent>,
     /// Last applied size, for the attach-time SIGWINCH jiggle.
@@ -82,6 +89,7 @@ impl PtySession {
         drop(pair.slave);
 
         let killer = child.clone_killer();
+        let child_pid = child.process_id();
         let reader = pair.master.try_clone_reader().context("clone pty reader")?;
         let writer = pair.master.take_writer().context("take pty writer")?;
 
@@ -91,6 +99,7 @@ impl PtySession {
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
             killer: Mutex::new(killer),
+            child_pid,
             ring: Mutex::new(ScrollbackRing::new(RING_CAPACITY)),
             events,
             last_size: Mutex::new((spec.cols, spec.rows)),
@@ -132,8 +141,45 @@ impl PtySession {
         }
     }
 
+    /// SIGHUP the child, then SIGKILL its whole process group if it hasn't
+    /// exited within [`KILL_GRACE`]. The group kill also reaps grandchildren
+    /// that would otherwise hold the slave fd open (no EOF → reader thread,
+    /// pump task, and the 1MB ring all pinned forever).
     pub fn kill(&self) {
+        // Subscribe before signalling so an immediate exit can't be missed.
+        let mut rx = self.events.subscribe();
         let _ = self.killer.lock().unwrap().kill();
+        let Some(pid) = self.child_pid else { return };
+        let sref = self.sref.clone();
+        // Watchdog on a plain thread: it must not hold the session Arc (that
+        // would pin the ring), and it outlives any tokio context `kill` was
+        // called from.
+        std::thread::Builder::new()
+            .name("pty-kill-watchdog".into())
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let deadline = std::time::Instant::now() + KILL_GRACE;
+                let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+                while std::time::Instant::now() < deadline {
+                    loop {
+                        use tokio::sync::broadcast::error::TryRecvError;
+                        match rx.try_recv() {
+                            Ok(PtyEvent::Exited { .. }) | Err(TryRecvError::Closed) => return,
+                            Ok(_) | Err(TryRecvError::Lagged(_)) => continue,
+                            Err(TryRecvError::Empty) => break,
+                        }
+                    }
+                    // Reaped (ESRCH) strictly precedes the Exited broadcast,
+                    // so this also covers an Exited lost to channel lag.
+                    if nix::sys::signal::kill(nix_pid, None).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                tracing::warn!(session = ?sref, pid, "child ignored SIGHUP — SIGKILLing its process group");
+                let _ = nix::sys::signal::killpg(nix_pid, nix::sys::signal::Signal::SIGKILL);
+            })
+            .expect("spawn pty kill watchdog");
     }
 
     /// Ring snapshot for attach replay: (base_seq, bytes).

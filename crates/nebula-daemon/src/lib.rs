@@ -2,6 +2,7 @@ pub mod config;
 pub mod git;
 pub mod hooks;
 pub mod lifecycle;
+pub mod metrics;
 pub mod pty;
 pub mod registry;
 pub mod server;
@@ -32,7 +33,7 @@ async fn serve() -> Result<()> {
         .with_context(|| format!("bind {}", sock.display()))?;
     tracing::info!(pid = std::process::id(), socket = %sock.display(), "nebula daemon listening");
 
-    let store = store::Store::open(&paths::db_path())?;
+    let store = std::sync::Arc::new(store::Store::open(&paths::db_path())?);
     // Agents persisted as live had their PTYs die with the previous daemon.
     match store.sweep_disconnected() {
         Ok(swept) if !swept.is_empty() => {
@@ -46,7 +47,9 @@ async fn serve() -> Result<()> {
     }
 
     // Hook receiver: loopback HTTP endpoint the claude hook one-liners hit.
-    let (hook_env, mut hook_rx) = hooks::start_hook_server().await?;
+    // It shares the store to answer UserPromptSubmit hooks with the
+    // auto-title instruction while a session is still untitled.
+    let (hook_env, mut hook_rx) = hooks::start_hook_server(store.clone()).await?;
     tracing::info!(port = hook_env.port, "hook receiver listening");
 
     let daemon = registry::Daemon::new(store, hook_env);
@@ -89,6 +92,28 @@ async fn serve() -> Result<()> {
                         daemon.tick_status_machines();
                         daemon.reap_prewarmed();
                     }
+                }
+            }
+        });
+    }
+
+    // Idle-session reaper: kill PTYs in worktrees no client is looking at
+    // once they age past `session_idle_timeout` (bounds what prewarmed and
+    // walked-away-from sessions cost). Its own loop so tests can speed the
+    // sweep up without touching the status-machine cadence.
+    {
+        let daemon = daemon.clone();
+        tokio::spawn(async move {
+            let period = std::env::var("NEBULA_IDLE_REAP_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(15_000)
+                .max(50);
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(period));
+            loop {
+                tokio::select! {
+                    _ = daemon.shutdown.cancelled() => break,
+                    _ = interval.tick() => daemon.reap_idle_sessions(),
                 }
             }
         });

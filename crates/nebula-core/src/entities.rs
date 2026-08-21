@@ -1,4 +1,4 @@
-use crate::ids::{AgentId, ProjectId, TerminalId, WorktreeId};
+use crate::ids::{AgentId, ProjectId, TerminalId, TodoId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -122,6 +122,10 @@ pub struct Agent {
     pub name: String,
     pub status: AgentStatus,
     pub archived: bool,
+    /// Epoch ms of the last archive; 0 = never archived (or archived before
+    /// this field existed). Orders the ARCHIVED group newest-first.
+    #[serde(default)]
+    pub archived_at: i64,
     /// Pinned agents sort into their own PINNED group in the sessions list.
     #[serde(default)]
     pub pinned: bool,
@@ -131,6 +135,14 @@ pub struct Agent {
     pub status_changed_at: i64,
     #[serde(default)]
     pub kind: AgentKind,
+    /// Model the CLI is launched with (claude `--model` / codex `-m`);
+    /// None = the CLI's own default. Persisted so respawns keep it.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Reasoning effort the CLI is launched with (claude `--effort` /
+    /// codex `model_reasoning_effort`); None = the CLI's own default.
+    #[serde(default)]
+    pub effort: Option<String>,
     /// CLI session id used for resume (claude, codex, or cursor, per `kind`).
     pub session_id: Option<String>,
     pub sort_order: i64,
@@ -148,12 +160,32 @@ pub struct TerminalTab {
     pub alive: bool,
 }
 
+/// Who a todo list hangs off: a project (high-level notes spanning its
+/// worktrees) or one worktree (notes for that checkout). The two are
+/// separate lists — a project's notes never mix into its worktrees'.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TodoOwner {
+    Project(ProjectId),
+    Worktree(WorktreeId),
+}
+
+/// One todo note.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Todo {
+    pub id: TodoId,
+    pub owner: TodoOwner,
+    pub text: String,
+    pub done: bool,
+    pub sort_order: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Entity {
     Project(Project),
     Worktree(Worktree),
     Agent(Agent),
     Terminal(TerminalTab),
+    Todo(Todo),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -162,4 +194,5 @@ pub enum EntityId {
     Worktree(WorktreeId),
     Agent(AgentId),
     Terminal(TerminalId),
+    Todo(TodoId),
 }

@@ -3,7 +3,7 @@
 use crate::git_diff::DiffFile;
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Project, ProjectId, SessionRef, TerminalId,
-    TerminalTab, Worktree, WorktreeId,
+    TerminalTab, Todo, TodoId, TodoOwner, Worktree, WorktreeId,
 };
 use ratatui::layout::Rect;
 use std::collections::HashMap;
@@ -32,6 +32,9 @@ pub enum HitTarget {
     Project(usize),
     Worktree(usize),
     Session(usize),
+    /// The ARCHIVED group header (either form); a click toggles the group
+    /// open/closed, same as the A key.
+    ArchivedHeader,
     /// Panel background (registered after rows, so rows win).
     PanelBg(Focus),
     TerminalPane,
@@ -70,14 +73,24 @@ pub enum MenuAction {
     SetAgentPinned(AgentId, bool),
     DeleteAgent(AgentId),
     NewAgent(WorktreeId),
-    /// Picker result: create an agent of this kind (chains into the name prompt).
-    NewAgentOfKind(WorktreeId, AgentKind),
+    /// Picker result: create an agent of this kind (chains into the name
+    /// prompt). `model`/`effort` are submenu choices: None means the row
+    /// hasn't drilled into that submenu (its configured default applies);
+    /// "default" is the submenu row that picks the default explicitly.
+    NewAgentOfKind {
+        worktree: WorktreeId,
+        kind: AgentKind,
+        model: Option<String>,
+        effort: Option<String>,
+    },
     /// Shell terminal in the worktree's directory; created immediately with
     /// a default name (no prompt), renameable later.
     NewTerminal(WorktreeId),
     RenameTerminal(TerminalId),
     CloseTerminal(TerminalId),
     NewWorktree(ProjectId),
+    /// Open the todo modal for this owner (project or worktree).
+    OpenTodos(TodoOwner),
     SetWorktreePinned(WorktreeId, bool),
     DeleteWorktree(WorktreeId),
     AddProject,
@@ -89,6 +102,41 @@ pub enum MenuAction {
     },
     LabelDivider(ProjectId, bool),
     ToggleArchived,
+}
+
+/// Which submenu → (right arrow) opens from a menu row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmenuKind {
+    /// Model list for a Claude/Codex session (new-session picker rows).
+    Models,
+    /// Effort list, offered once a model row is highlighted.
+    Efforts,
+}
+
+impl MenuAction {
+    /// The submenu this action's row expands into, if any. Drives both the
+    /// `▸` indicator and the → key. New-session rows drill kind → model →
+    /// effort; a row that already carries an effort is a leaf.
+    pub fn submenu(&self) -> Option<SubmenuKind> {
+        match self {
+            MenuAction::NewAgentOfKind {
+                kind,
+                model,
+                effort,
+                ..
+            } => {
+                if crate::config::model_choices(*kind).is_empty() {
+                    return None;
+                }
+                match (model, effort) {
+                    (None, None) => Some(SubmenuKind::Models),
+                    (Some(_), None) => Some(SubmenuKind::Efforts),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +157,8 @@ pub struct ContextMenu {
     pub hover: usize,
     /// Set during draw for click hit-testing.
     pub area: Rect,
+    /// The menu ← returns to when this one is a submenu.
+    pub parent: Option<Box<ContextMenu>>,
 }
 
 /// Destructive action waiting behind a confirmation.
@@ -154,6 +204,10 @@ pub enum PromptKind {
     NewAgent {
         worktree: WorktreeId,
         kind: AgentKind,
+        /// Resolved launch options (picker choice or configured default);
+        /// None = the CLI's own default.
+        model: Option<String>,
+        effort: Option<String>,
     },
     RenameAgent {
         id: AgentId,
@@ -683,6 +737,52 @@ impl GrepView {
     }
 }
 
+/// In-progress add/edit inside the todo modal; keys feed `text` while set.
+#[derive(Debug, Clone)]
+pub struct TodoInput {
+    /// None = creating a new todo; Some = rewriting that todo's text.
+    pub editing: Option<TodoId>,
+    pub text: String,
+}
+
+/// Todo notes modal (`o`) for one owner — a project (high-level notes) or
+/// a worktree. The rows themselves live in `App::tree.todos` (kept fresh
+/// by upserts) — the view only holds the owner plus cursor/input state.
+#[derive(Debug, Clone)]
+pub struct TodoView {
+    pub owner: TodoOwner,
+    /// `project` or `project/branch`, for the modal title.
+    pub context: String,
+    /// Index into the owner's todo rows.
+    pub selected: usize,
+    /// Active add/edit input, if any.
+    pub input: Option<TodoInput>,
+    /// Whole modal rect, written back during draw so clicks outside close.
+    pub area: Rect,
+    /// Screen rect of the todo rows, written back during draw so clicks can
+    /// hit-test rows.
+    pub list_area: Rect,
+}
+
+impl TodoView {
+    pub fn new(owner: TodoOwner, context: String) -> Self {
+        Self {
+            owner,
+            context,
+            selected: 0,
+            input: None,
+            area: Rect::default(),
+            list_area: Rect::default(),
+        }
+    }
+
+    /// First visible row of the list's stateless follow-window for a list of
+    /// `height` rows.
+    pub fn window_start(&self, height: usize) -> usize {
+        (self.selected + 1).saturating_sub(height)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SettingsView {
     pub selected: usize,
@@ -691,6 +791,38 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Memory-usage modal (`M`): how much RAM nebula and every live session's
+/// process tree (claude, codex, shells and their children) are using. The
+/// daemon's half arrives async as `ServerEvent::Metrics`; the event loop
+/// re-requests on a slow poll while the modal is open.
+#[derive(Debug, Clone, Default)]
+pub struct MetricsView {
+    /// Last daemon reading; None until the first reply lands.
+    pub snapshot: Option<nebula_core::MetricsSnapshot>,
+    /// This TUI process's own RSS, sampled client-side with each request
+    /// (the daemon can't see us — we're not its child).
+    pub client_rss_bytes: u64,
+    /// Cursor into `rows`; Enter opens the session under it.
+    pub selected: usize,
+    /// Scroll offset into the per-session rows, clamped during draw.
+    pub scroll: usize,
+    /// Display order of the rows, written back during draw so the key and
+    /// mouse handlers agree with what's on screen. `None` = one of nebula's
+    /// own processes (daemon / this UI) — selectable but not openable.
+    pub rows: Vec<Option<SessionRef>>,
+    /// Whole modal rect, written back during draw so clicks outside close.
+    pub area: Rect,
+    /// Screen rect of the session rows, written back during draw so clicks
+    /// can hit-test rows.
+    pub list_area: Rect,
+}
+
+impl MetricsView {
     pub fn new() -> Self {
         Self::default()
     }
@@ -708,6 +840,8 @@ pub enum Overlay {
     Files(FileFinder),
     Grep(GrepView),
     Tree(crate::tree_browser::TreeBrowser),
+    Todos(TodoView),
+    Metrics(MetricsView),
 }
 
 /// Rows optimistically removed for an in-flight DeleteWorktree, kept so an
@@ -728,6 +862,8 @@ pub enum PendingIntent {
     AttachCreated,
     /// Select the created worktree in the Worktrees panel.
     SelectCreatedWorktree,
+    /// Move the todo modal's cursor onto the created todo.
+    SelectCreatedTodo,
     /// Worktree removed optimistically; restore these rows on Error.
     DeleteWorktree(WorktreeRollback),
     None,
@@ -815,6 +951,7 @@ pub struct Tree {
     pub worktrees: Vec<Worktree>,
     pub agents: Vec<Agent>,
     pub terminals: Vec<TerminalTab>,
+    pub todos: Vec<Todo>,
 }
 
 pub struct AttachedTerm {
@@ -951,12 +1088,19 @@ pub struct App {
     pub select_divider_when_seen: Option<(ProjectId, bool)>,
     /// Worktree created by us, awaiting its upsert to fix the selection.
     pub select_worktree_when_seen: Option<WorktreeId>,
+    /// Todo created by us, awaiting its upsert to land the modal's cursor.
+    pub select_todo_when_seen: Option<TodoId>,
     /// Last selected worktree per project — switching back to a project
     /// returns to the worktree the user left it on.
     pub last_worktree_for_project: HashMap<ProjectId, WorktreeId>,
     /// Last selected session per worktree — switching back to a worktree
     /// re-shows the session the user left it on.
     pub last_session_for_worktree: HashMap<WorktreeId, SessionRef>,
+    /// Debounced session prewarm: the worktree whose dead sessions the
+    /// daemon should pre-spawn once the selection has rested on it past the
+    /// deadline — armed on every worktree context switch, so walking the
+    /// list doesn't boot every CLI it passes.
+    pub pending_prewarm: Option<(WorktreeId, std::time::Instant)>,
     /// Mouse drag-selection over the terminal pane, if any.
     pub term_selection: Option<TermSelection>,
     /// Last left-click on the terminal pane (time + pane-relative cell), for
@@ -1009,6 +1153,13 @@ pub struct App {
     /// the inner `None` means the checkout wasn't readable. The event loop
     /// refreshes it on a slow poll and before drawing a changed selection.
     pub git_changes: Option<(WorktreeId, Option<usize>)>,
+    /// Latest daemon metrics reading (daemon + per-session process trees),
+    /// for the footer's memory/session readout. Refreshed on a slow poll;
+    /// the metrics modal shares the same replies at a faster cadence.
+    pub last_metrics: Option<nebula_core::MetricsSnapshot>,
+    /// This TUI process's own RSS, sampled alongside each metrics request
+    /// (the daemon can't see us).
+    pub client_rss_bytes: u64,
 }
 
 impl Default for App {
@@ -1041,8 +1192,10 @@ impl App {
             select_when_seen: None,
             select_divider_when_seen: None,
             select_worktree_when_seen: None,
+            select_todo_when_seen: None,
             last_worktree_for_project: HashMap::new(),
             last_session_for_worktree: HashMap::new(),
+            pending_prewarm: None,
             term_selection: None,
             last_term_click: None,
             last_session_click: None,
@@ -1061,6 +1214,8 @@ impl App {
             vim_tx: None,
             vim_generation: 0,
             git_changes: None,
+            last_metrics: None,
+            client_rss_bytes: 0,
         }
     }
 
@@ -1319,13 +1474,17 @@ impl App {
                 .cloned(),
         );
         if self.show_archived {
-            rows.extend(
-                self.tree
-                    .agents
-                    .iter()
-                    .filter(|a| a.worktree_id == wt.id && a.archived)
-                    .cloned(),
-            );
+            let mut archived: Vec<Agent> = self
+                .tree
+                .agents
+                .iter()
+                .filter(|a| a.worktree_id == wt.id && a.archived)
+                .cloned()
+                .collect();
+            // Most recently archived first; pre-`archived_at` rows (stamp 0)
+            // keep tree order at the bottom (stable sort).
+            archived.sort_by_key(|a| std::cmp::Reverse(a.archived_at));
+            rows.extend(archived);
         }
         rows
     }
@@ -1377,6 +1536,34 @@ impl App {
             .map(|a| (a.status_changed_at + self.recent_window_ms - now).max(0) as u64)
             .min()
             .map(std::time::Duration::from_millis)
+    }
+
+    /// Delay until the pending worktree-sessions prewarm is due, so the
+    /// event loop can wake up and fire it. None when nothing is armed.
+    pub fn prewarm_delay(&self) -> Option<std::time::Duration> {
+        let (_, at) = self.pending_prewarm.as_ref()?;
+        Some(at.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// An owner's todos, in tree order (snapshot order; new ones append).
+    pub fn todos_for(&self, owner: &TodoOwner) -> Vec<&Todo> {
+        self.tree
+            .todos
+            .iter()
+            .filter(|t| &t.owner == owner)
+            .collect()
+    }
+
+    /// (open, total) todo counts for an owner — the row badges.
+    pub fn todo_stats(&self, owner: &TodoOwner) -> (usize, usize) {
+        let total = self.tree.todos.iter().filter(|t| &t.owner == owner).count();
+        let open = self
+            .tree
+            .todos
+            .iter()
+            .filter(|t| &t.owner == owner && !t.done)
+            .count();
+        (open, total)
     }
 
     /// Aggregate status for a worktree row: red > yellow > green > gray,

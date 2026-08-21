@@ -79,13 +79,13 @@ main() {
     esac
 
     # Replacing the file doesn't touch an already-running daemon: sessions keep
-    # running on the old binary until it's restarted, and kill-server is the
+    # running on the old binary until it's restarted, and `nebula kill` is the
     # user's call because it stops every session. `nebula upgrade` handles this
     # itself (shutting down an idle daemon) and suppresses the note via
     # NEBULA_UPGRADE_HANDOFF.
     if [ -z "${NEBULA_UPGRADE_HANDOFF:-}" ] && pgrep -f 'nebula daemon' >/dev/null 2>&1; then
         say "note: a nebula daemon from the previous version is still running."
-        say "      run 'nebula kill-server' to restart onto the new one (stops all sessions)."
+        say "      run 'nebula kill' to restart onto the new one (stops all sessions)."
     fi
 }
 

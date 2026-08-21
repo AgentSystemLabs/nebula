@@ -4,8 +4,8 @@ use crate::app::{
     App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder,
     Focus, GrepView,
     HitTarget, MenuAction, MenuItem, Overlay, Palette, PaletteTarget, PendingAction, PendingIntent,
-    ProjectRow, PromptDialog, PromptKind, SessionRow, SettingsView, SplitterDrag, TermSelection,
-    WorktreeRollback,
+    MetricsView, ProjectRow, PromptDialog, PromptKind, SessionRow, SettingsView, SplitterDrag,
+    SubmenuKind, TermSelection, TodoInput, TodoView, WorktreeRollback,
 };
 use crate::tree_browser::TreeBrowser;
 use crate::vim_term::{VimEvent, VimTerm};
@@ -16,7 +16,8 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use nebula_core::{
-    AgentId, AgentKind, ClientRequest, EntityId, ServerEvent, SessionRef, WorktreeId,
+    AgentId, AgentKind, ClientRequest, EntityId, ServerEvent, SessionRef, TodoId, TodoOwner,
+    WorktreeId,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -30,6 +31,20 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// How often the worktree panel's changed-file badge re-reads `git status`
 /// for the selected checkout, so agent edits surface without a keypress.
 const GIT_POLL: Duration = Duration::from_secs(2);
+
+/// How long the worktree selection must rest before asking the daemon to
+/// pre-spawn that worktree's dead sessions — long enough that walking the
+/// list doesn't boot every CLI passed, short enough that the sessions are
+/// booting well before the user picks one.
+const PREWARM_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// While the metrics modal is open, how often a fresh memory reading is
+/// requested from the daemon.
+const METRICS_POLL: Duration = Duration::from_secs(2);
+
+/// With the modal closed, how often the footer's memory/session readout is
+/// refreshed.
+const FOOTER_METRICS_POLL: Duration = Duration::from_secs(5);
 
 pub async fn run_app() -> Result<()> {
     let conn = ipc::connect_or_spawn().await?;
@@ -112,6 +127,7 @@ async fn main_loop(
     let mut out: Vec<ClientRequest> = Vec::new();
     let mut next_draw = tokio::time::Instant::now();
     let mut next_git_poll = tokio::time::Instant::now();
+    let mut next_metrics_poll = tokio::time::Instant::now();
     // Editor-modal PTY output; the channel outlives individual editor
     // spawns (VimEvent generations keep them apart).
     let (vim_tx, mut vim_rx) = tokio::sync::mpsc::unbounded_channel::<VimEvent>();
@@ -148,6 +164,18 @@ async fn main_loop(
                 refresh_git_changes(&mut app);
                 next_git_poll = tokio::time::Instant::now() + GIT_POLL;
             }
+            // Metrics poll: always on for the footer's memory/session
+            // readout, tightened while the metrics modal is open (its
+            // initial reading is requested by the M keypress itself).
+            _ = tokio::time::sleep_until(next_metrics_poll) => {
+                request_metrics(&mut app, &mut out);
+                let period = if matches!(app.overlay, Some(Overlay::Metrics(_))) {
+                    METRICS_POLL
+                } else {
+                    FOOTER_METRICS_POLL
+                };
+                next_metrics_poll = tokio::time::Instant::now() + period;
+            }
             _ = tokio::time::sleep(recent_expiry.unwrap_or_default() + Duration::from_millis(250)),
                 if recent_expiry.is_some() =>
             {
@@ -165,6 +193,14 @@ async fn main_loop(
                     }
                 }
                 app.dirty = true;
+            }
+            // The worktree selection rested past the debounce: ask the
+            // daemon to boot its dead sessions in the background so
+            // attaching one replays a live screen instead of a cold boot.
+            _ = tokio::time::sleep(app.prewarm_delay().unwrap_or_default()),
+                if app.pending_prewarm.is_some() =>
+            {
+                fire_pending_prewarm(&mut app, &mut out);
             }
             ev = input.next() => match ev {
                 Some(Ok(event)) => {
@@ -240,6 +276,18 @@ fn refresh_git_changes(app: &mut App) {
         app.git_changes = next;
         app.dirty = true;
     }
+}
+
+/// Fire one memory reading for the metrics modal: sample this client's own
+/// RSS now (the daemon can't see us), ask the daemon for itself plus every
+/// session's process tree. The reply arrives as `ServerEvent::Metrics`.
+fn request_metrics(app: &mut App, out: &mut Vec<ClientRequest>) {
+    app.client_rss_bytes = nebula_core::mem::process_rss_bytes(std::process::id()).unwrap_or(0);
+    if let Some(Overlay::Metrics(view)) = &mut app.overlay {
+        view.client_rss_bytes = app.client_rss_bytes;
+    }
+    let req_id = app.alloc_req_id(PendingIntent::None);
+    out.push(ClientRequest::GetMetrics { req_id });
 }
 
 fn log_server_event(ev: &ServerEvent) {
@@ -484,6 +532,12 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         }
         KeyCode::Char('?') => app.overlay = Some(Overlay::Help),
         KeyCode::Char('s') => app.overlay = Some(Overlay::Settings(SettingsView::new())),
+        // Request a reading right away — the main loop's poll may be up to
+        // FOOTER_METRICS_POLL out.
+        KeyCode::Char('M') => {
+            app.overlay = Some(Overlay::Metrics(MetricsView::new()));
+            request_metrics(app, out);
+        }
         KeyCode::Tab => {
             app.focus = match app.focus {
                 Focus::Projects => Focus::Worktrees,
@@ -641,7 +695,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         }
         KeyCode::Char('A') => {
             if app.focus == Focus::Sessions {
-                app.show_archived = !app.show_archived;
+                toggle_archived(app, out);
             }
         }
         // Fuzzy-search palette over every project / worktree / session.
@@ -692,6 +746,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         KeyCode::Char('D') => open_delete_all_confirm(app),
         KeyCode::Char('m') => open_context_menu_for_selection(app),
         KeyCode::Char('g') => open_diff_view(app),
+        KeyCode::Char('o') => open_todo_view(app),
         KeyCode::Char('f') => open_file_finder(app),
         KeyCode::Char('F') => open_grep_view(app),
         KeyCode::Char('t') => open_tree_browser(app),
@@ -745,11 +800,25 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
             "branch name".to_string(),
             String::new(),
         ),
-        PromptKind::NewAgent { .. } => (
-            "New agent".to_string(),
-            format!("name (empty = {})", app.default_session_name("agent")),
-            String::new(),
-        ),
+        PromptKind::NewAgent { model, effort, .. } => {
+            // Surface the resolved launch options so Enter-with-defaults is
+            // visibly what it is; plain "New agent" means CLI defaults.
+            let opts: Vec<&str> = model
+                .as_deref()
+                .into_iter()
+                .chain(effort.as_deref())
+                .collect();
+            let title = if opts.is_empty() {
+                "New agent".to_string()
+            } else {
+                format!("New agent ({})", opts.join(" · "))
+            };
+            (
+                title,
+                format!("name (empty = {})", app.default_session_name("agent")),
+                String::new(),
+            )
+        }
         PromptKind::RenameAgent { id } => {
             let current = app
                 .tree
@@ -843,6 +912,55 @@ fn restore_reviewed_marks(view: &mut DiffView) {
 /// Fuzzy file finder over every tracked + untracked file of the selected
 /// worktree (`f`). Same shell as `open_diff_view`: flash instead of opening
 /// when there's no worktree, the path is gone, or git fails.
+/// Open the todo modal (`o`): the project's own notes from the Projects
+/// panel, the selected worktree's notes elsewhere (falling back to the
+/// project when it has no worktrees yet).
+fn open_todo_view(app: &mut App) {
+    let owner = if app.focus == Focus::Projects {
+        app.selected_project()
+            .map(|p| TodoOwner::Project(p.id.clone()))
+    } else {
+        app.selected_worktree()
+            .map(|w| TodoOwner::Worktree(w.id.clone()))
+            .or_else(|| {
+                app.selected_project()
+                    .map(|p| TodoOwner::Project(p.id.clone()))
+            })
+    };
+    let Some(owner) = owner else {
+        app.flash = Some("select a project or worktree first".into());
+        return;
+    };
+    open_todos_for_owner(app, owner);
+}
+
+fn open_todos_for_owner(app: &mut App, owner: TodoOwner) {
+    let context = match &owner {
+        TodoOwner::Project(id) => {
+            let Some(project) = app.tree.projects.iter().find(|p| &p.id == id) else {
+                return;
+            };
+            project.name.clone()
+        }
+        TodoOwner::Worktree(id) => {
+            let Some(worktree) = app.tree.worktrees.iter().find(|w| &w.id == id) else {
+                return;
+            };
+            let project = app
+                .tree
+                .projects
+                .iter()
+                .find(|p| p.id == worktree.project_id);
+            format!(
+                "{}/{}",
+                project.map(|p| p.name.as_str()).unwrap_or("?"),
+                worktree.branch
+            )
+        }
+    };
+    app.overlay = Some(Overlay::Todos(TodoView::new(owner, context)));
+}
+
 fn open_file_finder(app: &mut App) {
     // Clone before touching app.overlay — selected_worktree borrows app.
     let Some((path, branch)) = app
@@ -1149,6 +1267,15 @@ fn archive_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
     out.push(ClientRequest::ArchiveAgent { req_id, id });
 }
 
+/// Expand/collapse the ARCHIVED group (A key, header click, context menu).
+/// Collapsing while the cursor sits on an archived row re-lands it on a
+/// surviving row and previews it, same as any other regroup.
+fn toggle_archived(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let before = selection_snapshot(app);
+    app.show_archived = !app.show_archived;
+    reconcile_selection(app, before, out);
+}
+
 /// Shift+T: create a shell terminal whose pwd is the selection's checkout —
 /// the selected worktree, or the project's main checkout (root) when the
 /// Projects panel has focus. The daemon names it (`term-N`) and the Ack
@@ -1448,31 +1575,32 @@ fn open_menu(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
         at: Some(at),
         hover: 0,
         area: ratatui::layout::Rect::default(),
+        parent: None,
     }));
 }
 
 /// Step 1 of new-session creation: pick which CLI the session runs — or a
 /// plain shell terminal. An agent kind chains into the name prompt via
 /// `MenuAction::NewAgentOfKind`; the terminal is created immediately.
+/// Claude/Codex rows expand (→) into model and effort submenus; Enter
+/// anywhere takes the configured defaults for whatever wasn't drilled into.
 fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
+    let kind_row = |label: &str, kind: AgentKind| MenuItem {
+        label: label.into(),
+        action: MenuAction::NewAgentOfKind {
+            worktree: worktree.clone(),
+            kind,
+            model: None,
+            effort: None,
+        },
+        destructive: false,
+    };
     app.overlay = Some(Overlay::Menu(ContextMenu {
         title: Some("New session".into()),
         items: vec![
-            MenuItem {
-                label: "Claude".into(),
-                action: MenuAction::NewAgentOfKind(worktree.clone(), AgentKind::Claude),
-                destructive: false,
-            },
-            MenuItem {
-                label: "Codex".into(),
-                action: MenuAction::NewAgentOfKind(worktree.clone(), AgentKind::Codex),
-                destructive: false,
-            },
-            MenuItem {
-                label: "Cursor".into(),
-                action: MenuAction::NewAgentOfKind(worktree.clone(), AgentKind::Cursor),
-                destructive: false,
-            },
+            kind_row("Claude", AgentKind::Claude),
+            kind_row("Codex", AgentKind::Codex),
+            kind_row("Cursor", AgentKind::Cursor),
             MenuItem {
                 label: "Terminal (shell)".into(),
                 action: MenuAction::NewTerminal(worktree),
@@ -1482,7 +1610,79 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
         at: None,
         hover: 0,
         area: ratatui::layout::Rect::default(),
+        parent: None,
     }));
+}
+
+/// Build the submenu a menu row expands into: the model list for a
+/// new-session kind row, or the effort list for a model row. Rows carry the
+/// full choice so Enter works the same at any depth; the row matching the
+/// configured default starts highlighted.
+fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
+    let sub = item.action.submenu()?;
+    let MenuAction::NewAgentOfKind {
+        worktree,
+        kind,
+        model,
+        ..
+    } = &item.action
+    else {
+        return None;
+    };
+    let cfg = crate::config::Config::load();
+    let (title, choices, configured) = match sub {
+        SubmenuKind::Models => (
+            format!("{} model", item.label),
+            crate::config::model_choices(*kind),
+            cfg.default_model(*kind),
+        ),
+        SubmenuKind::Efforts => (
+            format!("{} effort", kind_label(*kind)),
+            crate::config::effort_choices(*kind),
+            cfg.default_effort(*kind),
+        ),
+    };
+    let configured = configured.unwrap_or_else(|| "default".into());
+    let items: Vec<MenuItem> = choices
+        .iter()
+        .map(|choice| MenuItem {
+            label: if *choice == configured {
+                format!("{choice} ✓")
+            } else {
+                (*choice).to_string()
+            },
+            action: MenuAction::NewAgentOfKind {
+                worktree: worktree.clone(),
+                kind: *kind,
+                model: match sub {
+                    SubmenuKind::Models => Some((*choice).to_string()),
+                    SubmenuKind::Efforts => model.clone(),
+                },
+                effort: match sub {
+                    SubmenuKind::Models => None,
+                    SubmenuKind::Efforts => Some((*choice).to_string()),
+                },
+            },
+            destructive: false,
+        })
+        .collect();
+    let hover = choices.iter().position(|c| *c == configured).unwrap_or(0);
+    Some(ContextMenu {
+        title: Some(title),
+        items,
+        at: None,
+        hover,
+        area: ratatui::layout::Rect::default(),
+        parent: None,
+    })
+}
+
+fn kind_label(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::Claude => "Claude",
+        AgentKind::Codex => "Codex",
+        AgentKind::Cursor => "Cursor",
+    }
 }
 
 /// Step 1 of moving an agent: pick the destination — any other worktree of
@@ -1518,6 +1718,7 @@ fn open_move_agent_picker(app: &mut App, agent: AgentId) {
         at: None,
         hover: 0,
         area: ratatui::layout::Rect::default(),
+        parent: None,
     }));
 }
 
@@ -1545,6 +1746,11 @@ fn open_context_menu_for_selection(app: &mut App) {
                         destructive: false,
                     },
                 );
+                items.push(MenuItem {
+                    label: "Todos".into(),
+                    action: MenuAction::OpenTodos(TodoOwner::Project(p.id.clone())),
+                    destructive: false,
+                });
                 items.push(divider_menu_item(p));
                 items.push(MenuItem {
                     label: "Remove from list".into(),
@@ -1565,6 +1771,11 @@ fn open_context_menu_for_selection(app: &mut App) {
                     MenuItem {
                         label: "New terminal".into(),
                         action: MenuAction::NewTerminal(w.id.clone()),
+                        destructive: false,
+                    },
+                    MenuItem {
+                        label: "Todos".into(),
+                        action: MenuAction::OpenTodos(TodoOwner::Worktree(w.id.clone())),
                         destructive: false,
                     },
                     MenuItem {
@@ -1610,12 +1821,43 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 app.overlay = None;
             }
         }
+        Overlay::Metrics(view) => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('M') => app.overlay = None,
+            KeyCode::Char('j') | KeyCode::Down => {
+                view.selected = (view.selected + 1).min(view.rows.len().saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => view.selected = view.selected.saturating_sub(1),
+            KeyCode::Enter => {
+                // Nebula's own rows (daemon / this UI) carry no session.
+                if let Some(Some(sref)) = view.rows.get(view.selected).cloned() {
+                    app.overlay = None;
+                    open_session(app, sref, out);
+                }
+            }
+            _ => {}
+        },
         Overlay::Menu(menu) => match key.code {
-            KeyCode::Esc => app.overlay = None,
+            // Esc in a submenu backs out one level; at the top it closes.
+            KeyCode::Esc => match menu.parent.take() {
+                Some(parent) => *menu = *parent,
+                None => app.overlay = None,
+            },
             KeyCode::Char('j') | KeyCode::Down => {
                 menu.hover = (menu.hover + 1).min(menu.items.len() - 1)
             }
             KeyCode::Char('k') | KeyCode::Up => menu.hover = menu.hover.saturating_sub(1),
+            // → expands a row marked ▸ into its submenu; ← returns.
+            KeyCode::Char('l') | KeyCode::Right => {
+                if let Some(mut sub) = build_submenu(&menu.items[menu.hover]) {
+                    sub.parent = Some(Box::new(menu.clone()));
+                    *menu = sub;
+                }
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                if let Some(parent) = menu.parent.take() {
+                    *menu = *parent;
+                }
+            }
             KeyCode::Enter => {
                 let action = menu.items[menu.hover].action.clone();
                 app.overlay = None;
@@ -1932,6 +2174,130 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 _ => {}
             }
         }
+        Overlay::Todos(view) => {
+            // The CRUD keys need both the view (cursor/input) and the tree
+            // (rows) — resolve the key to a command first, then act, so the
+            // overlay borrow never overlaps the request plumbing.
+            enum TodoCmd {
+                Nothing,
+                Close,
+                Move(i64),
+                StartCreate,
+                StartEdit(TodoId, String),
+                CancelInput,
+                Create(String),
+                Update(TodoId, String),
+                Toggle(TodoId, bool),
+                Delete(TodoId),
+            }
+            // Row order matches the draw: tree order for this owner.
+            let rows: Vec<(TodoId, String, bool)> = app
+                .tree
+                .todos
+                .iter()
+                .filter(|t| t.owner == view.owner)
+                .map(|t| (t.id.clone(), t.text.clone(), t.done))
+                .collect();
+            let selected = view.selected.min(rows.len().saturating_sub(1));
+            view.selected = selected;
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let cmd = if let Some(input) = &mut view.input {
+                match key.code {
+                    KeyCode::Esc => TodoCmd::CancelInput,
+                    // Nothing typed = cancel; edits and adds both no-op.
+                    KeyCode::Enter => match (&input.editing, input.text.trim()) {
+                        (_, "") => TodoCmd::CancelInput,
+                        (Some(id), text) => TodoCmd::Update(id.clone(), text.to_string()),
+                        (None, text) => TodoCmd::Create(text.to_string()),
+                    },
+                    KeyCode::Backspace => {
+                        input.text.pop();
+                        TodoCmd::Nothing
+                    }
+                    KeyCode::Char('u') if ctrl => {
+                        input.text.clear();
+                        TodoCmd::Nothing
+                    }
+                    KeyCode::Char(c) if !ctrl => {
+                        input.text.push(c);
+                        TodoCmd::Nothing
+                    }
+                    _ => TodoCmd::Nothing,
+                }
+            } else {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => TodoCmd::Close,
+                    KeyCode::Char('j') | KeyCode::Down => TodoCmd::Move(1),
+                    KeyCode::Char('k') | KeyCode::Up => TodoCmd::Move(-1),
+                    // `o` mirrors the key that opened the modal; a/n too.
+                    KeyCode::Char('o') | KeyCode::Char('a') | KeyCode::Char('n') => {
+                        TodoCmd::StartCreate
+                    }
+                    KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('r') => {
+                        match rows.get(selected) {
+                            Some((id, text, _)) => TodoCmd::StartEdit(id.clone(), text.clone()),
+                            // Empty list: Enter starts the first note.
+                            None => TodoCmd::StartCreate,
+                        }
+                    }
+                    KeyCode::Char(' ') | KeyCode::Char('x') => match rows.get(selected) {
+                        Some((id, _, done)) => TodoCmd::Toggle(id.clone(), !done),
+                        None => TodoCmd::Nothing,
+                    },
+                    KeyCode::Char('d') | KeyCode::Backspace | KeyCode::Delete => {
+                        match rows.get(selected) {
+                            Some((id, _, _)) => TodoCmd::Delete(id.clone()),
+                            None => TodoCmd::Nothing,
+                        }
+                    }
+                    _ => TodoCmd::Nothing,
+                }
+            };
+            match cmd {
+                TodoCmd::Nothing => {}
+                TodoCmd::Close => app.overlay = None,
+                TodoCmd::Move(delta) => {
+                    let max = rows.len().saturating_sub(1) as i64;
+                    view.selected = (selected as i64 + delta).clamp(0, max) as usize;
+                }
+                TodoCmd::StartCreate => {
+                    view.input = Some(TodoInput {
+                        editing: None,
+                        text: String::new(),
+                    });
+                }
+                TodoCmd::StartEdit(id, text) => {
+                    view.input = Some(TodoInput {
+                        editing: Some(id),
+                        text,
+                    });
+                }
+                TodoCmd::CancelInput => view.input = None,
+                TodoCmd::Create(text) => {
+                    view.input = None;
+                    let owner = view.owner.clone();
+                    let req_id = app.alloc_req_id(PendingIntent::SelectCreatedTodo);
+                    out.push(ClientRequest::CreateTodo {
+                        req_id,
+                        owner,
+                        text,
+                    });
+                }
+                TodoCmd::Update(id, text) => {
+                    view.input = None;
+                    let req_id = app.alloc_req_id(PendingIntent::None);
+                    out.push(ClientRequest::UpdateTodo { req_id, id, text });
+                }
+                TodoCmd::Toggle(id, done) => {
+                    let req_id = app.alloc_req_id(PendingIntent::None);
+                    out.push(ClientRequest::SetTodoDone { req_id, id, done });
+                }
+                TodoCmd::Delete(id) => {
+                    let req_id = app.alloc_req_id(PendingIntent::None);
+                    out.push(ClientRequest::DeleteTodo { req_id, id });
+                }
+            }
+        }
     }
 }
 
@@ -1939,7 +2305,7 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
     let Some(Overlay::Settings(view)) = &app.overlay else {
         return;
     };
-    let last = crate::config::SETTINGS.len().saturating_sub(1);
+    let last = crate::config::settings_len().saturating_sub(1);
     let cmd = match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => SettingsCmd::Close,
         KeyCode::Char('j') | KeyCode::Down => SettingsCmd::Move((view.selected + 1).min(last)),
@@ -2028,7 +2394,16 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 base: None,
             });
         }
-        PromptKind::NewAgent { worktree, kind } => {
+        PromptKind::NewAgent {
+            worktree,
+            kind,
+            model,
+            effort,
+        } => {
+            // Accepting the generated default name opts the session into
+            // agent-driven auto-titling (`nebula rename` on first prompt);
+            // a typed name is the user's choice and stays.
+            let auto_title = value.is_empty();
             let name = if value.is_empty() {
                 app.default_session_name("agent")
             } else {
@@ -2040,6 +2415,9 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 worktree,
                 name,
                 kind,
+                model,
+                effort,
+                auto_title,
             });
         }
         PromptKind::RenameAgent { id } => {
@@ -2207,17 +2585,45 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 }));
             }
         }
-        MenuAction::NewAgentOfKind(worktree, kind) => {
+        MenuAction::NewAgentOfKind {
+            worktree,
+            kind,
+            model,
+            effort,
+        } => {
+            // Resolve the picker's choice against the configured defaults:
+            // an unexpanded submenu (None) and the explicit "default" row
+            // both take the setting; the setting's own "default" means
+            // "no flag" and reaches the daemon as None.
+            let cfg = crate::config::Config::load();
+            let resolve = |choice: Option<String>, configured: Option<String>| match choice {
+                None => configured,
+                Some(c) if c == "default" => configured,
+                some => some,
+            };
+            let model = resolve(model, cfg.default_model(kind));
+            let effort = resolve(effort, cfg.default_effort(kind));
             // Warm the CLI while the user types the name: the daemon
             // pre-spawns the session so CreateAgent adopts an already-booted
             // PTY. Fail-soft — a missing CLI just means a cold spawn later.
             out.push(ClientRequest::PrewarmAgent {
                 worktree: worktree.clone(),
                 kind,
+                model: model.clone(),
+                effort: effort.clone(),
             });
-            open_prompt(app, PromptKind::NewAgent { worktree, kind })
+            open_prompt(
+                app,
+                PromptKind::NewAgent {
+                    worktree,
+                    kind,
+                    model,
+                    effort,
+                },
+            )
         }
         MenuAction::NewWorktree(project) => open_prompt(app, PromptKind::NewWorktree { project }),
+        MenuAction::OpenTodos(owner) => open_todos_for_owner(app, owner),
         MenuAction::SetWorktreePinned(id, pinned) => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::SetWorktreePinned { req_id, id, pinned });
@@ -2261,7 +2667,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::LabelDivider(id, before) => {
             open_prompt(app, PromptKind::DividerLabel { id, before })
         }
-        MenuAction::ToggleArchived => app.show_archived = !app.show_archived,
+        MenuAction::ToggleArchived => toggle_archived(app, out),
     }
 }
 
@@ -2416,6 +2822,7 @@ fn restore_context(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// rather than keep showing the previous context's session.
 fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.sel_session = 0;
+    schedule_prewarm(app);
     let remembered = app
         .selected_worktree()
         .and_then(|w| app.last_session_for_worktree.get(&w.id).cloned());
@@ -2628,6 +3035,58 @@ fn jump_to_target(
     }
 }
 
+/// Land the panel selection on `sref`'s session and attach it — the metrics
+/// modal's Enter. The same walk as the palette's session jump, generalized
+/// to terminal tabs.
+fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    let worktree = match &sref {
+        SessionRef::Agent(id) => app
+            .tree
+            .agents
+            .iter()
+            .find(|a| &a.id == id)
+            .map(|a| a.worktree_id.clone()),
+        SessionRef::Terminal(id) => app
+            .tree
+            .terminals
+            .iter()
+            .find(|t| &t.id == id)
+            .map(|t| t.worktree_id.clone()),
+    };
+    let found = worktree.as_ref().is_some_and(|wid| {
+        app.tree
+            .worktrees
+            .iter()
+            .find(|w| &w.id == wid)
+            .map(|w| w.project_id.clone())
+            .is_some_and(|pid| select_project_row_by_id(app, &pid))
+    });
+    let wt_index = found
+        .then(|| {
+            app.visible_worktrees()
+                .iter()
+                .position(|w| Some(&w.id) == worktree.as_ref())
+        })
+        .flatten();
+    let Some(wt_index) = wt_index else {
+        app.flash = Some("session no longer exists".into());
+        return;
+    };
+    app.sel_worktree = wt_index;
+    let Some(index) = app
+        .visible_session_rows()
+        .iter()
+        .position(|r| r.sref() == sref)
+    else {
+        restore_session(app, out);
+        app.focus = Focus::Sessions;
+        app.flash = Some("session no longer exists".into());
+        return;
+    };
+    app.sel_session = index;
+    attach_selected(app, out);
+}
+
 fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
     let len = match app.focus {
         Focus::Projects => app.project_rows().len(),
@@ -2710,18 +3169,47 @@ fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
             session: existing.sref.clone(),
         });
     }
-    let area = app.term_area;
-    let (cols, rows) = if area.width >= 2 && area.height >= 2 {
-        (area.width, area.height)
-    } else {
-        (80, 24)
-    };
+    let (cols, rows) = pane_size(app);
     // Fresh screen, so any persisted selection would point at stale cells.
     app.term_selection = None;
     app.term = Some(AttachedTerm::new(sref.clone(), cols, rows));
     out.push(ClientRequest::Attach {
         session: sref,
         from_seq: None,
+        cols,
+        rows,
+    });
+}
+
+/// Terminal-pane grid for spawn/attach requests; the fallback keeps
+/// pre-first-draw requests from booting a 0×0 PTY.
+fn pane_size(app: &App) -> (u16, u16) {
+    let area = app.term_area;
+    if area.width >= 2 && area.height >= 2 {
+        (area.width, area.height)
+    } else {
+        (80, 24)
+    }
+}
+
+/// Arm the debounced session prewarm for the selected worktree; the main
+/// loop fires it once the selection has rested there (PREWARM_DEBOUNCE).
+fn schedule_prewarm(app: &mut App) {
+    app.pending_prewarm = app
+        .selected_worktree()
+        .map(|w| (w.id.clone(), std::time::Instant::now() + PREWARM_DEBOUNCE));
+}
+
+/// Send the armed worktree-sessions prewarm. Re-firing for an already-warm
+/// worktree is a cheap daemon-side no-op, so staleness needs no handling
+/// beyond the daemon skipping rows that no longer exist.
+fn fire_pending_prewarm(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let Some((worktree, _)) = app.pending_prewarm.take() else {
+        return;
+    };
+    let (cols, rows) = pane_size(app);
+    out.push(ClientRequest::PrewarmWorktreeSessions {
+        worktree,
         cols,
         rows,
     });
@@ -3159,6 +3647,52 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         }
         return;
     }
+    // Todo modal: the wheel moves the selection, a click on a row selects
+    // it, a click outside the modal closes; everything else is swallowed.
+    if let Some(Overlay::Todos(view)) = &mut app.overlay {
+        let count = app
+            .tree
+            .todos
+            .iter()
+            .filter(|t| t.owner == view.owner)
+            .count();
+        let max = count.saturating_sub(1) as i64;
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                view.selected = (view.selected as i64 - 1).clamp(0, max) as usize;
+                app.dirty = true;
+            }
+            MouseEventKind::ScrollDown => {
+                view.selected = (view.selected as i64 + 1).clamp(0, max) as usize;
+                app.dirty = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let list = view.list_area;
+                let inside_list = list.width > 0
+                    && mouse.column >= list.x
+                    && mouse.column < list.x + list.width
+                    && mouse.row >= list.y
+                    && mouse.row < list.y + list.height;
+                let area = view.area;
+                let inside_modal = mouse.column >= area.x
+                    && mouse.column < area.x + area.width
+                    && mouse.row >= area.y
+                    && mouse.row < area.y + area.height;
+                if inside_list {
+                    let start = view.window_start(list.height as usize);
+                    let index = start + (mouse.row - list.y) as usize;
+                    if index < count {
+                        view.selected = index;
+                    }
+                } else if !inside_modal {
+                    app.overlay = None;
+                }
+                app.dirty = true;
+            }
+            _ => {}
+        }
+        return;
+    }
     // Settings: click a row to select (or toggle if already selected),
     // click outside to close; everything else is swallowed.
     if matches!(&app.overlay, Some(Overlay::Settings(_))) {
@@ -3176,9 +3710,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 let inner_y = area.y.saturating_add(1);
                 if mouse.row >= inner_y {
                     let row = (mouse.row - inner_y) as usize;
-                    let n = crate::config::SETTINGS.len();
-                    let index = row / 2;
-                    if index < n && row < n * 2 {
+                    // Group headers and blanks aren't clickable; the shared
+                    // row map keeps this in step with the renderer.
+                    if let Some(crate::config::SettingsRow::Setting(index)) =
+                        crate::config::settings_rows().get(row).copied()
+                    {
                         if let Some(Overlay::Settings(view)) = &mut app.overlay {
                             view.selected = index;
                         }
@@ -3191,6 +3727,54 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 app.overlay = None;
             }
             app.dirty = true;
+        }
+        return;
+    }
+    // Metrics: the wheel moves the selection, a click on a row selects it
+    // (a click on the selected row opens it), a click outside closes;
+    // everything else is swallowed.
+    if let Some(Overlay::Metrics(view)) = &mut app.overlay {
+        let max = view.rows.len().saturating_sub(1);
+        let mut open: Option<SessionRef> = None;
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                view.selected = view.selected.saturating_sub(1);
+                app.dirty = true;
+            }
+            MouseEventKind::ScrollDown => {
+                view.selected = (view.selected + 1).min(max);
+                app.dirty = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let list = view.list_area;
+                let inside_list = list.width > 0
+                    && mouse.column >= list.x
+                    && mouse.column < list.x + list.width
+                    && mouse.row >= list.y
+                    && mouse.row < list.y + list.height;
+                let area = view.area;
+                let inside_modal = mouse.column >= area.x
+                    && mouse.column < area.x + area.width
+                    && mouse.row >= area.y
+                    && mouse.row < area.y + area.height;
+                if inside_list {
+                    let index = view.scroll + (mouse.row - list.y) as usize;
+                    if index < view.rows.len() {
+                        if view.selected == index {
+                            open = view.rows[index].clone();
+                        }
+                        view.selected = index;
+                    }
+                } else if !inside_modal {
+                    app.overlay = None;
+                }
+                app.dirty = true;
+            }
+            _ => {}
+        }
+        if let Some(sref) = open {
+            app.overlay = None;
+            open_session(app, sref, out);
         }
         return;
     }
@@ -3301,6 +3885,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         }
                         None => {}
                     }
+                }
+                Some(HitTarget::ArchivedHeader) => {
+                    app.focus = Focus::Sessions;
+                    toggle_archived(app, out);
                 }
                 Some(HitTarget::PanelBg(focus)) => {
                     // Empty projects list: left click opens the obvious
@@ -3535,17 +4123,22 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             worktrees,
             agents,
             terminals,
+            todos,
             ui_state,
         } => {
             app.tree.projects = projects;
             app.tree.worktrees = worktrees;
             app.tree.agents = agents;
             app.tree.terminals = terminals;
+            app.tree.todos = todos;
             if let Some(json) = ui_state {
                 restore_ui_state(app, &json);
             }
             clamp_selections(app);
             refresh_palette(app);
+            // Boot the restored worktree's sessions right away — the first
+            // thing the user does after launch is walk into one of them.
+            schedule_prewarm(app);
             app.dirty = true;
         }
         ServerEvent::Scrollback { session, data, .. } => {
@@ -3630,6 +4223,13 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         app.select_worktree_when_seen = Some(id);
                     }
                 }
+                (Some(PendingIntent::SelectCreatedTodo), Some(EntityId::Todo(id))) => {
+                    // Same idiom: land the modal's cursor now, or when the
+                    // upsert arrives.
+                    if !select_todo_by_id(app, &id) {
+                        app.select_todo_when_seen = Some(id);
+                    }
+                }
                 _ => {}
             }
             app.dirty = true;
@@ -3651,6 +4251,12 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     app.select_worktree_when_seen = None;
                 }
             }
+            // ...and the todo modal's cursor onto a todo we just created.
+            if let Some(todo_id) = app.select_todo_when_seen.clone() {
+                if select_todo_by_id(app, &todo_id) {
+                    app.select_todo_when_seen = None;
+                }
+            }
             refresh_palette(app);
             app.dirty = true;
         }
@@ -3661,6 +4267,16 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // neighbor — show that neighbor's session/context.
             reconcile_selection(app, before, out);
             refresh_palette(app);
+            app.dirty = true;
+        }
+        ServerEvent::Metrics { req_id, snapshot } => {
+            // Answered with Metrics, not Ack — clear the pending slot by hand.
+            app.pending.remove(&req_id);
+            if let Some(Overlay::Metrics(view)) = &mut app.overlay {
+                view.snapshot = Some(snapshot.clone());
+            }
+            // The footer's readout keeps the latest reading either way.
+            app.last_metrics = Some(snapshot);
             app.dirty = true;
         }
         ServerEvent::Error { req_id, message } => {
@@ -3742,6 +4358,31 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             Some(existing) => *existing = t,
             None => app.tree.terminals.push(t),
         },
+        Entity::Todo(t) => match app.tree.todos.iter_mut().find(|x| x.id == t.id) {
+            Some(existing) => *existing = t,
+            None => app.tree.todos.push(t),
+        },
+    }
+}
+
+/// Land the todo modal's cursor on `id`; false when the modal isn't open on
+/// that todo's owner or the todo hasn't arrived in the tree yet.
+fn select_todo_by_id(app: &mut App, id: &TodoId) -> bool {
+    let pos = match &app.overlay {
+        Some(Overlay::Todos(view)) => app
+            .tree
+            .todos
+            .iter()
+            .filter(|t| t.owner == view.owner)
+            .position(|t| &t.id == id),
+        _ => return false,
+    };
+    match (pos, &mut app.overlay) {
+        (Some(i), Some(Overlay::Todos(view))) => {
+            view.selected = i;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -3761,16 +4402,34 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
             app.tree
                 .terminals
                 .retain(|t| !wt_ids.contains(&t.worktree_id));
+            app.tree.todos.retain(|t| match &t.owner {
+                TodoOwner::Project(p) => p != id,
+                TodoOwner::Worktree(w) => !wt_ids.contains(w),
+            });
             app.tree.worktrees.retain(|w| &w.project_id != id);
             app.tree.projects.retain(|p| &p.id != id);
         }
         EntityId::Worktree(id) => {
             app.tree.agents.retain(|a| &a.worktree_id != id);
             app.tree.terminals.retain(|t| &t.worktree_id != id);
+            app.tree
+                .todos
+                .retain(|t| t.owner != TodoOwner::Worktree(id.clone()));
             app.tree.worktrees.retain(|w| &w.id != id);
         }
         EntityId::Agent(id) => app.tree.agents.retain(|a| &a.id != id),
         EntityId::Terminal(id) => app.tree.terminals.retain(|t| &t.id != id),
+        EntityId::Todo(id) => app.tree.todos.retain(|t| &t.id != id),
+    }
+    // A todo modal aimed at a vanished owner has nothing left to show.
+    if let Some(Overlay::Todos(view)) = &app.overlay {
+        let gone = match &view.owner {
+            TodoOwner::Project(id) => !app.tree.projects.iter().any(|p| &p.id == id),
+            TodoOwner::Worktree(id) => !app.tree.worktrees.iter().any(|w| &w.id == id),
+        };
+        if gone {
+            app.overlay = None;
+        }
     }
 }
 
@@ -4021,14 +4680,121 @@ mod tests {
                     name: "agent-1".into(),
                     status: AgentStatus::Fresh,
                     archived: false,
+                    archived_at: 0,
                     pinned: false,
                     kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
                 }),
             },
+        );
+    }
+
+    /// Resting the worktree selection arms the debounced prewarm; firing it
+    /// sends one PrewarmWorktreeSessions for that worktree and disarms.
+    #[test]
+    fn worktree_move_arms_prewarm_and_fire_sends_request() {
+        use nebula_core::{Entity, ProjectId, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w2".into()),
+                    project_id: ProjectId("p1".into()),
+                    path: "/tmp/demo-w2".into(),
+                    branch: "feature".into(),
+                    is_main: false,
+                    pinned: false,
+                    sort_order: 1,
+                }),
+            },
+        );
+        app.pending_prewarm = None;
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        move_selection(&mut app, 1, &mut out);
+        let (armed, _) = app.pending_prewarm.clone().expect("prewarm armed");
+        assert_eq!(armed, WorktreeId("w2".into()));
+
+        out.clear();
+        fire_pending_prewarm(&mut app, &mut out);
+        assert!(app.pending_prewarm.is_none(), "fires once, then disarms");
+        assert!(matches!(
+            out.as_slice(),
+            [ClientRequest::PrewarmWorktreeSessions { worktree, .. }]
+                if worktree == &WorktreeId("w2".into())
+        ));
+    }
+
+    /// The startup snapshot arms the prewarm for the restored worktree, so
+    /// its sessions boot before the user presses anything.
+    #[test]
+    fn snapshot_arms_prewarm_for_selected_worktree() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let tree = app.tree.clone();
+        let mut fresh = App::new();
+        assert!(fresh.pending_prewarm.is_none());
+        hse(
+            &mut fresh,
+            ServerEvent::Snapshot {
+                projects: tree.projects,
+                worktrees: tree.worktrees,
+                agents: tree.agents,
+                terminals: tree.terminals,
+                todos: tree.todos,
+                ui_state: None,
+            },
+        );
+        let (armed, _) = fresh.pending_prewarm.clone().expect("prewarm armed");
+        assert_eq!(armed, nebula_core::WorktreeId("w1".into()));
+    }
+
+    /// The footer's right edge shows live session counts and nebula's
+    /// total memory once a metrics reading arrives.
+    #[test]
+    fn footer_shows_session_counts_and_memory() {
+        use nebula_core::{MetricsSnapshot, SessionMetrics, TerminalId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            !buffer_text(&terminal).contains("proc"),
+            "no readout before the first reading"
+        );
+
+        app.client_rss_bytes = 100 * 1024 * 1024;
+        app.last_metrics = Some(MetricsSnapshot {
+            daemon_pid: 1,
+            daemon_rss_bytes: 200 * 1024 * 1024,
+            system_total_bytes: 0,
+            sessions: vec![
+                SessionMetrics {
+                    session: SessionRef::Agent(AgentId("a1".into())),
+                    pid: 10,
+                    rss_bytes: 700 * 1024 * 1024,
+                    procs: 3,
+                },
+                SessionMetrics {
+                    session: SessionRef::Terminal(TerminalId("t1".into())),
+                    pid: 11,
+                    rss_bytes: 24 * 1024 * 1024,
+                    procs: 2,
+                },
+            ],
+        });
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("1 agent · 1 term · 5 procs · 1.0 GB"),
+            "footer readout rendered:\n{text}"
         );
     }
 
@@ -4092,8 +4858,11 @@ mod tests {
                     name: "agent-2".into(),
                     status: AgentStatus::Fresh,
                     archived: false,
+                    archived_at: 0,
                     pinned: true,
                     kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
                     session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
@@ -4188,8 +4957,11 @@ mod tests {
                 name: id.into(),
                 status: AgentStatus::Finished,
                 archived: false,
+                archived_at: 0,
                 pinned,
                 kind: nebula_core::AgentKind::Claude,
+                model: None,
+                effort: None,
                 session_id: None,
                 sort_order: sort,
                 status_changed_at: changed_at,
@@ -4241,8 +5013,11 @@ mod tests {
                     name: "agent-2".into(),
                     status: AgentStatus::Fresh,
                     archived: false,
+                    archived_at: 0,
                     pinned: false,
                     kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
                     session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
@@ -4305,8 +5080,11 @@ mod tests {
                     name: "agent-2".into(),
                     status: AgentStatus::Fresh,
                     archived: false,
+                    archived_at: 0,
                     pinned: false,
                     kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
@@ -4476,68 +5254,250 @@ mod tests {
         assert!(!app.term_locked, "Ctrl+q clears the input lock");
     }
 
+    /// Picker/submenu tests resolve model/effort through `Config::load`, so
+    /// pin the config to an empty temp file to stay off the dev's real one.
+    fn with_default_config<T>(f: impl FnOnce() -> T) -> T {
+        let dir = tempfile::tempdir().unwrap();
+        crate::config::with_config_path(dir.path().join("config.json"), f)
+    }
+
     #[test]
     fn n_in_sessions_opens_agent_type_picker_then_prompt() {
-        let mut app = App::new();
-        seed_tree(&mut app);
-        app.focus = Focus::Sessions;
-        let mut out = Vec::new();
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
 
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
-            &mut out,
-        );
-        let Some(Overlay::Menu(menu)) = &app.overlay else {
-            panic!("expected agent-type picker, got {:?}", app.overlay);
-        };
-        assert_eq!(menu.title.as_deref(), Some("New session"));
-        assert_eq!(menu.items.len(), 4);
-        assert_eq!(menu.items[0].label, "Claude");
-        assert_eq!(menu.items[1].label, "Codex");
-        assert_eq!(menu.items[2].label, "Cursor");
-        assert_eq!(menu.items[3].label, "Terminal (shell)");
-        assert_eq!(menu.hover, 0, "Claude is the default");
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected agent-type picker, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("New session"));
+            assert_eq!(menu.items.len(), 4);
+            assert_eq!(menu.items[0].label, "Claude");
+            assert_eq!(menu.items[1].label, "Codex");
+            assert_eq!(menu.items[2].label, "Cursor");
+            assert_eq!(menu.items[3].label, "Terminal (shell)");
+            assert_eq!(menu.hover, 0, "Claude is the default");
 
-        // Enter on the default chains into the name prompt with kind=Claude,
-        // and fires the prewarm so the CLI boots while the user types.
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut out,
-        );
-        assert!(matches!(
-            out.last(),
-            Some(ClientRequest::PrewarmAgent {
-                kind: AgentKind::Claude,
-                ..
-            })
-        ));
-        let Some(Overlay::Prompt(p)) = &app.overlay else {
-            panic!("expected name prompt, got {:?}", app.overlay);
-        };
-        assert_eq!(p.title, "New agent");
-        assert_eq!(p.input, "", "name starts blank; the default is only a hint");
-        assert_eq!(p.label, "name (empty = agent-2)");
-        assert!(matches!(
-            &p.kind,
-            PromptKind::NewAgent {
-                kind: AgentKind::Claude,
-                ..
-            }
-        ));
+            // Enter on the default chains into the name prompt with
+            // kind=Claude, and fires the prewarm so the CLI boots while the
+            // user types. Nothing configured → no model/effort flags.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(matches!(
+                out.last(),
+                Some(ClientRequest::PrewarmAgent {
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    ..
+                })
+            ));
+            let Some(Overlay::Prompt(p)) = &app.overlay else {
+                panic!("expected name prompt, got {:?}", app.overlay);
+            };
+            assert_eq!(p.title, "New agent");
+            assert_eq!(p.input, "", "name starts blank; the default is only a hint");
+            assert_eq!(p.label, "name (empty = agent-2)");
+            assert!(matches!(
+                &p.kind,
+                PromptKind::NewAgent {
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    ..
+                }
+            ));
 
-        // Accepting the empty prompt falls back to the next free default name.
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut out,
-        );
-        assert!(app.overlay.is_none());
-        assert!(matches!(
-            out.last(),
-            Some(ClientRequest::CreateAgent { name, kind: AgentKind::Claude, .. }) if name == "agent-2"
-        ));
+            // Accepting the empty prompt falls back to the next free default
+            // name.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none());
+            assert!(matches!(
+                out.last(),
+                Some(ClientRequest::CreateAgent { name, kind: AgentKind::Claude, model: None, effort: None, .. }) if name == "agent-2"
+            ));
+        })
+    }
+
+    #[test]
+    fn picker_right_drills_into_model_then_effort_submenus() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected picker, got {:?}", app.overlay);
+            };
+            // Claude/Codex rows advertise a submenu (the ▸ affordance);
+            // Cursor and Terminal don't.
+            assert_eq!(menu.items[0].action.submenu(), Some(SubmenuKind::Models));
+            assert_eq!(menu.items[1].action.submenu(), Some(SubmenuKind::Models));
+            assert_eq!(menu.items[2].action.submenu(), None);
+            assert_eq!(menu.items[3].action.submenu(), None);
+
+            // → opens the model list; nothing configured, so the "default"
+            // row is checked and highlighted, and the parent is kept for ←.
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected model submenu, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("Claude model"));
+            assert_eq!(menu.items.len(), crate::config::CLAUDE_MODELS.len());
+            assert_eq!(menu.items[0].label, "default ✓");
+            assert_eq!(menu.items[2].label, "opus");
+            assert_eq!(menu.hover, 0);
+            assert!(menu.parent.is_some());
+            // Model rows drill further into the effort list…
+            assert_eq!(menu.items[2].action.submenu(), Some(SubmenuKind::Efforts));
+
+            // …so ↓↓ to opus, → again: efforts for that model.
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected effort submenu, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("Claude effort"));
+            assert_eq!(menu.items.len(), crate::config::CLAUDE_EFFORTS.len());
+            assert!(matches!(
+                &menu.items[3].action,
+                MenuAction::NewAgentOfKind { kind: AgentKind::Claude, model: Some(m), effort: Some(e), .. }
+                    if m == "opus" && e == "high"
+            ));
+            // Effort rows are leaves.
+            assert_eq!(menu.items[3].action.submenu(), None);
+
+            // ← backs out to the models; Esc also backs out one level, and
+            // only closes from the top.
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected model submenu after ←");
+            };
+            assert_eq!(menu.title.as_deref(), Some("Claude model"));
+            assert_eq!(menu.hover, 2, "← restores the parent's hover");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected root picker after Esc");
+            };
+            assert_eq!(menu.title.as_deref(), Some("New session"));
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none());
+            assert!(
+                !out.iter()
+                    .any(|r| matches!(r, ClientRequest::CreateAgent { .. })),
+                "browsing submenus must not create anything"
+            );
+        })
+    }
+
+    #[test]
+    fn picker_enter_on_effort_row_carries_model_and_effort() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+
+            // n → Codex row → models → gpt-5.5 → efforts → minimal → Enter.
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected codex model submenu");
+            };
+            assert_eq!(menu.title.as_deref(), Some("Codex model"));
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+
+            assert!(matches!(
+                out.last(),
+                Some(ClientRequest::PrewarmAgent {
+                    kind: AgentKind::Codex,
+                    model: Some(m),
+                    effort: Some(e),
+                    ..
+                }) if m == "gpt-5.5" && e == "minimal"
+            ));
+            let Some(Overlay::Prompt(p)) = &app.overlay else {
+                panic!("expected name prompt, got {:?}", app.overlay);
+            };
+            assert_eq!(p.title, "New agent (gpt-5.5 · minimal)");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(matches!(
+                out.last(),
+                Some(ClientRequest::CreateAgent {
+                    kind: AgentKind::Codex,
+                    model: Some(m),
+                    effort: Some(e),
+                    ..
+                }) if m == "gpt-5.5" && e == "minimal"
+            ));
+        })
+    }
+
+    #[test]
+    fn picker_resolves_configured_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"claude_model": "sonnet", "claude_effort": "max"}"#,
+        )
+        .unwrap();
+        crate::config::with_config_path(path, || {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+
+            // Enter straight on the Claude row: both settings apply.
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(matches!(
+                out.last(),
+                Some(ClientRequest::PrewarmAgent {
+                    kind: AgentKind::Claude,
+                    model: Some(m),
+                    effort: Some(e),
+                    ..
+                }) if m == "sonnet" && e == "max"
+            ));
+            let Some(Overlay::Prompt(p)) = &app.overlay else {
+                panic!("expected name prompt");
+            };
+            assert_eq!(p.title, "New agent (sonnet · max)");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+            // The model submenu highlights and checks the configured model,
+            // and its explicit "default" row resolves to the same setting.
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected model submenu");
+            };
+            assert_eq!(menu.items[3].label, "sonnet ✓");
+            assert_eq!(menu.hover, 3, "hover starts on the configured model");
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(matches!(
+                out.last(),
+                Some(ClientRequest::PrewarmAgent {
+                    model: Some(m),
+                    effort: Some(e),
+                    ..
+                }) if m == "sonnet" && e == "max"
+            ));
+        })
     }
 
     #[test]
@@ -4995,8 +5955,11 @@ mod tests {
                 name: name.into(),
                 status: AgentStatus::Fresh,
                 archived,
+                archived_at: 0,
                 pinned: false,
                 kind: nebula_core::AgentKind::Claude,
+                model: None,
+                effort: None,
                 session_id: None,
                 sort_order: sort,
                 status_changed_at: 0,
@@ -5052,6 +6015,111 @@ mod tests {
                 .any(|r| matches!(r, ClientRequest::Attach { .. })),
             "already-previewed session isn't re-attached"
         );
+    }
+
+    fn archived_agent(id: &str, name: &str, archived_at: i64, sort: i64) -> nebula_core::Entity {
+        use nebula_core::{Agent, AgentStatus, Entity, WorktreeId};
+        Entity::Agent(Agent {
+            id: AgentId(id.into()),
+            worktree_id: WorktreeId("w1".into()),
+            name: name.into(),
+            status: AgentStatus::Fresh,
+            archived: true,
+            archived_at,
+            pinned: false,
+            kind: nebula_core::AgentKind::Claude,
+            model: None,
+            effort: None,
+            session_id: None,
+            sort_order: sort,
+            status_changed_at: 0,
+            alive: false,
+        })
+    }
+
+    /// The ARCHIVED group lists the most recently archived session first;
+    /// never-stamped legacy rows (archived_at == 0) sink to the bottom.
+    #[test]
+    fn archived_group_orders_newest_first() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        for ev in [
+            archived_agent("old", "old", 100, 1),
+            archived_agent("newest", "newest", 300, 2),
+            archived_agent("mid", "mid", 200, 3),
+            archived_agent("legacy", "legacy", 0, 4),
+        ] {
+            hse(&mut app, ServerEvent::EntityUpserted { entity: ev });
+        }
+        app.show_archived = true;
+        let names: Vec<String> = app
+            .visible_session_rows()
+            .iter()
+            .filter(|r| r.is_archived_agent())
+            .map(|r| match r {
+                SessionRow::Agent(a) => a.name.clone(),
+                SessionRow::Terminal(_) => unreachable!(),
+            })
+            .collect();
+        assert_eq!(names, ["newest", "mid", "old", "legacy"]);
+    }
+
+    /// Collapsing the ARCHIVED group (A) while the cursor sits on an
+    /// archived row re-lands it on a surviving row instead of leaving it
+    /// dangling past the end of the list.
+    #[test]
+    fn collapsing_archived_relands_the_cursor() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: archived_agent("a9", "old-agent", 100, 9),
+            },
+        );
+        app.show_archived = true;
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert!(
+            app.selected_session_row()
+                .is_some_and(|r| r.is_archived_agent()),
+            "cursor sits on the archived row"
+        );
+
+        press(&mut app, KeyCode::Char('A'), KeyModifiers::SHIFT, &mut out);
+        assert!(!app.show_archived, "A collapses the group");
+        assert_eq!(
+            app.selected_session().map(|a| a.name),
+            Some("agent-1".into()),
+            "cursor lands on a surviving row"
+        );
+    }
+
+    /// Clicking the ARCHIVED header toggles the group open/closed, same as
+    /// the A key.
+    #[test]
+    fn clicking_the_archived_header_toggles_the_group() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        app.hits.push((
+            ratatui::layout::Rect::new(0, 5, 20, 1),
+            HitTarget::ArchivedHeader,
+        ));
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 1, 5),
+            &mut out,
+        );
+        assert!(app.show_archived, "click on the header expands");
+        assert_eq!(app.focus, Focus::Sessions);
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 1, 5),
+            &mut out,
+        );
+        assert!(!app.show_archived, "second click collapses");
     }
 
     #[test]
@@ -5692,8 +6760,11 @@ mod tests {
                     name: "agent-1".into(),
                     status: AgentStatus::Fresh,
                     archived: false,
+                    archived_at: 0,
                     pinned: false,
                     kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
@@ -7187,8 +8258,11 @@ mod tests {
                     name: "codex-1".into(),
                     status: AgentStatus::Fresh,
                     archived: false,
+                    archived_at: 0,
                     pinned: false,
                     kind: nebula_core::AgentKind::Codex,
+                    model: None,
+                    effort: None,
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
@@ -7205,8 +8279,11 @@ mod tests {
                     name: "old-1".into(),
                     status: AgentStatus::Terminated,
                     archived: true,
+                    archived_at: 0,
                     pinned: false,
                     kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
                     session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
@@ -7618,10 +8695,201 @@ mod tests {
             text.contains("Recent window"),
             "cycle setting rendered:\n{text}"
         );
+        for group in crate::config::SETTING_GROUPS {
+            assert!(text.contains(group.title), "group header rendered:\n{text}");
+        }
+        assert!(
+            text.contains("Enter in / search opens the session"),
+            "selected setting's hint shown in the footer:\n{text}"
+        );
         let Some(Overlay::Settings(view)) = &app.overlay else {
             panic!("settings closed");
         };
         assert!(view.area.width > 0, "draw writes hit-test area");
+    }
+
+    // ---- `M` metrics modal ----
+
+    #[test]
+    fn metrics_modal_opens_requests_and_renders() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('M'), KeyModifiers::SHIFT, &mut out);
+        assert!(matches!(app.overlay, Some(Overlay::Metrics(_))));
+
+        // The keypress itself fires the initial reading's request.
+        let req_id = match out.last() {
+            Some(ClientRequest::GetMetrics { req_id }) => *req_id,
+            other => panic!("expected GetMetrics, got {other:?}"),
+        };
+        hse(
+            &mut app,
+            ServerEvent::Metrics {
+                req_id,
+                snapshot: nebula_core::MetricsSnapshot {
+                    daemon_pid: 42,
+                    daemon_rss_bytes: 40 * 1024 * 1024,
+                    system_total_bytes: 32 * 1024 * 1024 * 1024,
+                    sessions: vec![nebula_core::SessionMetrics {
+                        session: SessionRef::Agent(AgentId("a1".into())),
+                        pid: 4321,
+                        rss_bytes: 1_610_612_736, // 1.5 GB
+                        procs: 3,
+                    }],
+                },
+            },
+        );
+        assert!(
+            app.pending.is_empty(),
+            "the Metrics reply must clear its pending slot"
+        );
+        let Some(Overlay::Metrics(view)) = &app.overlay else {
+            panic!("metrics closed");
+        };
+        assert!(view.snapshot.is_some());
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Memory"), "title rendered:\n{text}");
+        assert!(
+            text.contains("1 session · 3 procs"),
+            "claude rollup rendered:\n{text}"
+        );
+        assert!(
+            text.contains("agent-1 (claude)") && text.contains("demo/main"),
+            "session row joined with the tree:\n{text}"
+        );
+        assert!(text.contains("1.5 GB"), "subtree memory rendered:\n{text}");
+        assert!(
+            text.contains("nebula daemon") && text.contains("40 MB"),
+            "daemon row rendered:\n{text}"
+        );
+        assert!(
+            text.contains("% of 32 GB installed"),
+            "system share rendered:\n{text}"
+        );
+        let Some(Overlay::Metrics(view)) = &app.overlay else {
+            panic!("metrics closed");
+        };
+        assert!(view.area.width > 0, "draw writes the hit-test area back");
+
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn metrics_enter_opens_selected_session() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('M'), KeyModifiers::SHIFT, &mut out);
+        request_metrics(&mut app, &mut out);
+        let req_id = match out.last() {
+            Some(ClientRequest::GetMetrics { req_id }) => *req_id,
+            other => panic!("expected GetMetrics, got {other:?}"),
+        };
+        let snapshot = nebula_core::MetricsSnapshot {
+            daemon_pid: 42,
+            daemon_rss_bytes: 1024,
+            system_total_bytes: 0,
+            sessions: vec![nebula_core::SessionMetrics {
+                session: SessionRef::Agent(AgentId("a1".into())),
+                pid: 4321,
+                rss_bytes: 2048,
+                procs: 1,
+            }],
+        };
+        hse(
+            &mut app,
+            ServerEvent::Metrics {
+                req_id,
+                snapshot: snapshot.clone(),
+            },
+        );
+
+        // A draw writes the row order back into the view; Enter reads it.
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let Some(Overlay::Metrics(view)) = &app.overlay else {
+            panic!("metrics closed");
+        };
+        assert_eq!(view.rows.len(), 3, "session + daemon + ui rows");
+        assert_eq!(view.selected, 0, "cursor starts on the biggest session");
+
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "Enter closes the modal");
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked, "opened session locks input like an attach");
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        assert!(
+            out.iter().any(
+                |r| matches!(r, ClientRequest::Attach { session, .. } if *session == sref)
+            ),
+            "Enter attaches the selected session: {out:?}"
+        );
+        assert_eq!(
+            app.visible_session_rows().get(app.sel_session).map(|r| r.sref()),
+            Some(sref),
+            "the panel selection landed on the opened session"
+        );
+
+        // Reopen (Ctrl+q first — the attach locked input to the terminal);
+        // Enter on one of nebula's own rows (no session) is inert.
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL, &mut out);
+        press(&mut app, KeyCode::Char('M'), KeyModifiers::SHIFT, &mut out);
+        request_metrics(&mut app, &mut out);
+        let req_id = match out.last() {
+            Some(ClientRequest::GetMetrics { req_id }) => *req_id,
+            other => panic!("expected GetMetrics, got {other:?}"),
+        };
+        hse(&mut app, ServerEvent::Metrics { req_id, snapshot });
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Metrics(view)) = &app.overlay else {
+            panic!("metrics closed");
+        };
+        assert_eq!(view.selected, 2, "j walks down to the ui row");
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Metrics(view)) = &app.overlay else {
+            panic!("metrics closed");
+        };
+        assert_eq!(view.selected, 2, "selection does not run past the last row");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Metrics(_))),
+            "Enter on a nebula row keeps the modal open"
+        );
+    }
+
+    #[test]
+    fn metrics_reply_after_close_is_dropped() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('M'), KeyModifiers::SHIFT, &mut out);
+        let req_id = match out.last() {
+            Some(ClientRequest::GetMetrics { req_id }) => *req_id,
+            other => panic!("expected GetMetrics, got {other:?}"),
+        };
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "q closes the modal");
+        hse(
+            &mut app,
+            ServerEvent::Metrics {
+                req_id,
+                snapshot: nebula_core::MetricsSnapshot {
+                    daemon_pid: 42,
+                    daemon_rss_bytes: 0,
+                    system_total_bytes: 0,
+                    sessions: vec![],
+                },
+            },
+        );
+        assert!(app.overlay.is_none(), "late reply must not reopen the modal");
+        assert!(app.pending.is_empty(), "late reply still clears its slot");
     }
 
     // ---- `f` fuzzy file finder ----
@@ -8232,8 +9500,11 @@ mod tests {
                         name: name.into(),
                         status: AgentStatus::Fresh,
                         archived,
+                        archived_at: 0,
                         pinned: false,
                         kind: nebula_core::AgentKind::Claude,
+                        model: None,
+                        effort: None,
                         session_id: None,
                         sort_order: 1,
                         status_changed_at: 0,
@@ -8299,8 +9570,11 @@ mod tests {
             name: name.into(),
             status: AgentStatus::Fresh,
             archived,
+            archived_at: 0,
             pinned: false,
             kind: nebula_core::AgentKind::Claude,
+            model: None,
+            effort: None,
             session_id: None,
             sort_order: 1,
             status_changed_at: 0,

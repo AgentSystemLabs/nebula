@@ -24,7 +24,17 @@ enum Command {
         foreground: bool,
     },
     /// Ask a running daemon to shut down cleanly.
-    KillServer,
+    Kill,
+    /// Title this session (run from inside a nebula agent session; agents
+    /// use it to auto-title on the first prompt).
+    Rename {
+        /// The new title; multiple words need no quotes.
+        #[arg(required = true, num_args = 1..)]
+        title: Vec<String>,
+        /// Replace an existing title instead of only filling in a missing one.
+        #[arg(long)]
+        force: bool,
+    },
     /// Open nebula on a remote host over ssh (installs it there if missing).
     Ssh {
         /// ssh destination, passed verbatim (e.g. user@server).
@@ -53,7 +63,8 @@ fn main() -> Result<()> {
             init_daemon_logging(foreground)?;
             log_fatal(nebula_daemon::run_daemon(), nebula_core::paths::daemon_log_path())
         }
-        Some(Command::KillServer) => nebula_tui::run_kill_server(),
+        Some(Command::Kill) => nebula_tui::run_kill(),
+        Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),
         Some(Command::Ssh { host, path }) => ssh::run_ssh(&host, path.as_deref()),
         Some(Command::Upgrade { force }) => upgrade::run_upgrade(force),
         Some(Command::RawAttach { name }) => nebula_tui::run_raw_attach(&name),

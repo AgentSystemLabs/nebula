@@ -23,7 +23,9 @@ Worktrees are real git worktrees, created under `<repo>/../<repo-name>-worktrees
 
 An agent is a PTY running `claude`, `codex`, or `cursor-agent` in that worktree. Restart uses `--resume <session-id>` when one is stored.
 
-Persistence is SQLite at `~/.local/share/nebula/nebula.db`: projects, worktrees, agents (kind + CLI session id), last UI selection.
+Persistence is SQLite at `~/.local/share/nebula/nebula.db`: projects, worktrees, agents (kind + CLI session id), todos, last UI selection.
+
+Projects and worktrees each carry their own **todo list**: plain notes with a done flag, edited in the TUI's `o` modal (Projects panel → the project's high-level notes; elsewhere → the selected worktree's notes) and counted as a badge on the owning row.
 
 ## How the pieces talk
 
@@ -49,11 +51,15 @@ Persistence is SQLite at `~/.local/share/nebula/nebula.db`: projects, worktrees,
 
 **Status path (not MCP):** at spawn, Nebula writes managed hooks into the worktree (`.claude/settings.local.json`, `.codex/hooks.json`, or `.cursor/hooks.json`). Those hooks `curl` a loopback HTTP server with a per-boot bearer token. Events like `UserPromptSubmit`, `Stop`, `PermissionRequest`, `SubagentStart` feed a status machine that maps to the colored dots (running / finished / needs feedback / …). Stop is gated on active subagents so a turn is not marked done while workers are still going. Claude and Codex share one hooks dialect; Cursor speaks its own (camelCase events like `beforeSubmitPrompt`/`stop`, flat `{"command"}` entries, JSON replies on stdout), so its installer translates event names into the `hookEvent` query param and the receiver aliases its payload fields (`conversation_id` → session id, first `workspace_roots` entry → cwd). Cursor has no permission-request hook and runs with `--force`, so cursor agents report busy/idle but never needs-feedback.
 
+**Auto-title path (hooks again, still not MCP):** a session created with the default `agent-N` name carries a store-only `auto_title_pending` flag. While it's set, the daemon answers the Claude/Codex `UserPromptSubmit` hook POST with an instruction body instead of the usual discarded JSON — the installer's `UserPromptSubmit` command (alone among the hooks) pipes the response to stdout, which those CLIs add to the model's context. The instruction tells the agent to run `nebula rename <3-4 word title>` once; that subcommand resolves the agent from `NEBULA_AGENT_ID`, does a one-shot IPC `AutoRenameAgent`, and the daemon applies it only while the flag is still pending (atomic conditional update), so a user rename — which clears the flag — always wins and repeated attempts get a polite "already titled" error. Claude also gets a `Bash(nebula rename:*)` entry merged into `permissions.allow` so the command runs unprompted; Codex/Cursor already run with `--yolo`/`--force`. Cursor's hooks can't inject context, so it gets a managed, env-guarded `.cursor/rules/nebula-title.mdc` project rule carrying the same instruction — safe to fire repeatedly because the daemon-side flag is the arbiter.
+
+**Metrics path:** the memory modal (`Shift+M`) asks the daemon for one reading (`GetMetrics` → `Metrics`). The daemon runs a single machine-wide `ps` sweep and sums RSS over each live session's process subtree (the PTY child plus its descendants — an agent CLI fans out into workers and MCP servers), reporting itself separately since sessions are its own descendants. The TUI adds its own RSS client-side (it is not a daemon child) and re-polls every 2s while the modal is open.
+
 ## Crate layout
 
 | Crate | Role |
 |---|---|
-| `nebula` | Thin CLI: no args → TUI; `daemon`, `kill-server`, `upgrade`, `ssh` |
+| `nebula` | Thin CLI: no args → TUI; `daemon`, `kill`, `rename`, `upgrade`, `ssh` |
 | `nebula-core` | Shared protocol, entities, IDs, paths, codec |
 | `nebula-daemon` | PTYs, SQLite, git, hook receiver, status engine |
 | `nebula-tui` | ratatui UI, keyboard/mouse, attach/scrollback |

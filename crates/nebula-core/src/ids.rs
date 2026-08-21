@@ -35,3 +35,4 @@ id_newtype!(ProjectId);
 id_newtype!(WorktreeId);
 id_newtype!(AgentId);
 id_newtype!(TerminalId);
+id_newtype!(TodoId);

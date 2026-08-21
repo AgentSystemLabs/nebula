@@ -42,10 +42,15 @@ pub fn shutdown_daemon_if_idle() -> Result<ipc::IdleShutdown> {
     runtime()?.block_on(ipc::shutdown_if_idle())
 }
 
-/// `nebula kill-server`.
-pub fn run_kill_server() -> Result<()> {
+/// `nebula rename` — agent-side session titling (see `ipc::rename_current_agent`).
+pub fn run_rename(title: String, force: bool) -> Result<()> {
+    runtime()?.block_on(ipc::rename_current_agent(title, force))
+}
+
+/// `nebula kill`.
+pub fn run_kill() -> Result<()> {
     runtime()?.block_on(async {
-        if ipc::kill_server().await? {
+        if ipc::kill_daemon().await? {
             println!("nebula daemon shut down");
         } else {
             println!("no nebula daemon running");

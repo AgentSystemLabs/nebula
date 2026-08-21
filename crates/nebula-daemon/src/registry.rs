@@ -9,7 +9,7 @@ use crate::store::Store;
 use anyhow::{bail, Context, Result};
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Project, ProjectId, ServerEvent,
-    SessionRef, TerminalId, TerminalTab, Worktree, WorktreeId,
+    SessionRef, TerminalId, TerminalTab, Todo, TodoId, TodoOwner, Worktree, WorktreeId,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -33,6 +33,11 @@ const PREWARM_HOOK_BUFFER_CAP: usize = 64;
 struct PrewarmEntry {
     agent_id: AgentId,
     spawned_at: Instant,
+    /// Model/effort the warm CLI booted with; a CreateAgent asking for a
+    /// different spec can't adopt it (the CLI is already running the wrong
+    /// model), so the entry is discarded instead.
+    model: Option<String>,
+    effort: Option<String>,
     buffered_hooks: Vec<(HookEvent, Option<String>)>,
 }
 
@@ -48,7 +53,9 @@ pub struct Daemon {
     sessions: Mutex<HashMap<SessionRef, Arc<PtySession>>>,
     status_machines: Mutex<HashMap<AgentId, AgentStatusMachine>>,
     pub hook_env: HookEnv,
-    pub store: Store,
+    /// Shared with the hook HTTP server, which reads agent rows to decide
+    /// auto-title injection.
+    pub store: Arc<Store>,
     /// Entity/status deltas fanned out to every subscribed client.
     pub events: broadcast::Sender<ServerEvent>,
     pub shutdown: tokio_util::sync::CancellationToken,
@@ -60,10 +67,18 @@ pub struct Daemon {
     /// Cached `command -v` results per CLI so a missing binary doesn't get
     /// re-probed (login shell spawn) on every prewarm request.
     cli_probes: Mutex<HashMap<AgentKind, (bool, Instant)>>,
+    /// How many client connections are attached per session — a session
+    /// with attachments (and its whole worktree) is "in view" and exempt
+    /// from idle reaping.
+    attach_counts: Mutex<HashMap<SessionRef, usize>>,
+    /// When each live session was last "looked at": spawned, prewarmed,
+    /// attached, or covered by the in-view sweep refresh. The idle reaper
+    /// kills sessions whose stamp ages past `session_idle_timeout`.
+    session_interest: Mutex<HashMap<SessionRef, Instant>>,
 }
 
 impl Daemon {
-    pub fn new(store: Store, hook_env: HookEnv) -> Arc<Self> {
+    pub fn new(store: Arc<Store>, hook_env: HookEnv) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
@@ -75,6 +90,8 @@ impl Daemon {
             worktree_ops: tokio::sync::Mutex::new(()),
             prewarmed: Mutex::new(HashMap::new()),
             cli_probes: Mutex::new(HashMap::new()),
+            attach_counts: Mutex::new(HashMap::new()),
+            session_interest: Mutex::new(HashMap::new()),
         })
     }
 
@@ -184,7 +201,18 @@ impl Daemon {
         self.sessions.lock().unwrap().contains_key(sref)
     }
 
+    /// (session, child pid) for every live PTY — the metrics reading's input.
+    pub fn session_pids(&self) -> Vec<(SessionRef, u32)> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(sref, s)| s.child_pid.map(|pid| (sref.clone(), pid)))
+            .collect()
+    }
+
     pub fn remove_session(&self, sref: &SessionRef) -> Option<Arc<PtySession>> {
+        self.session_interest.lock().unwrap().remove(sref);
         self.sessions.lock().unwrap().remove(sref)
     }
 
@@ -197,6 +225,140 @@ impl Daemon {
     pub fn kill_all(&self) {
         for (_, s) in self.sessions.lock().unwrap().drain() {
             s.kill();
+        }
+    }
+
+    // ---- attach tracking & idle reaping ----
+
+    /// A client attached to `sref` (the server dedupes re-attaches per
+    /// connection). While any attachment exists, the session — and its
+    /// whole worktree — counts as "in view".
+    pub fn note_attached(&self, sref: &SessionRef) {
+        *self
+            .attach_counts
+            .lock()
+            .unwrap()
+            .entry(sref.clone())
+            .or_insert(0) += 1;
+        self.touch_session(sref);
+    }
+
+    /// A client detached from `sref` (or its connection dropped). Restamps
+    /// the session so the idle clock starts at "stopped looking", not at
+    /// spawn time.
+    pub fn note_detached(&self, sref: &SessionRef) {
+        let mut counts = self.attach_counts.lock().unwrap();
+        if let Some(n) = counts.get_mut(sref) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                counts.remove(sref);
+            }
+        }
+        drop(counts);
+        self.touch_session(sref);
+    }
+
+    /// Stamp `sref` as just-looked-at for the idle reaper.
+    fn touch_session(&self, sref: &SessionRef) {
+        self.session_interest
+            .lock()
+            .unwrap()
+            .insert(sref.clone(), Instant::now());
+    }
+
+    /// Kill idle sessions in worktrees no client is looking at, per
+    /// `session_idle_timeout` — this bounds what prewarming and
+    /// walked-away-from sessions cost. "In view" = the worktree holding any
+    /// attached session; in-view sessions get their stamps refreshed
+    /// instead, so the full timeout starts only when the user leaves.
+    /// Spared regardless of age: pinned agents (the user's "never kill
+    /// this" mark — a running schedule or background job is invisible to
+    /// the status machine), agents that are running or waiting on feedback,
+    /// terminals with a command running, and prewarm-pool sessions
+    /// (`reap_prewarmed` owns those). A reaped session revives on the next
+    /// attach or prewarm; agents resume their conversation.
+    pub fn reap_idle_sessions(self: &Arc<Self>) {
+        let Some(timeout) = crate::config::Config::load().session_idle_timeout() else {
+            return;
+        };
+        let sessions: Vec<(SessionRef, Arc<PtySession>)> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let attached: std::collections::HashSet<SessionRef> =
+            self.attach_counts.lock().unwrap().keys().cloned().collect();
+        let viewed_worktrees: std::collections::HashSet<WorktreeId> = attached
+            .iter()
+            .filter_map(|sref| self.session_worktree(sref))
+            .collect();
+        let now = Instant::now();
+        for (sref, session) in sessions {
+            // No store row = prewarm-pool session (or deleted mid-sweep).
+            let Some(worktree_id) = self.session_worktree(&sref) else {
+                continue;
+            };
+            if attached.contains(&sref) || viewed_worktrees.contains(&worktree_id) {
+                self.touch_session(&sref);
+                continue;
+            }
+            let age = {
+                let mut interest = self.session_interest.lock().unwrap();
+                // A missing stamp (session predating the map) starts aging now.
+                now.duration_since(*interest.entry(sref.clone()).or_insert(now))
+            };
+            if age < timeout {
+                continue;
+            }
+            let spared = match &sref {
+                SessionRef::Agent(id) => match self.store.get_agent(id).ok().flatten() {
+                    // Pinned = the user marked it worth keeping (schedules,
+                    // loops, long jobs the status can't see) — never reap.
+                    Some(agent) => {
+                        agent.pinned
+                            || matches!(
+                                agent.status,
+                                AgentStatus::Running | AgentStatus::NeedsFeedback
+                            )
+                    }
+                    // Row vanished mid-sweep: its delete kills the PTY anyway.
+                    None => true,
+                },
+                SessionRef::Terminal(_) => shell_has_children(&session),
+            };
+            if spared {
+                continue;
+            }
+            tracing::info!(session = ?sref, idle_secs = age.as_secs(), "reaping idle session");
+            self.kill_session(&sref);
+            let upsert = match &sref {
+                SessionRef::Agent(id) => self.agent_entity(id).map(Entity::Agent),
+                SessionRef::Terminal(id) => self.terminal_entity(id).map(Entity::Terminal),
+            };
+            if let Ok(entity) = upsert {
+                self.broadcast(ServerEvent::EntityUpserted { entity });
+            }
+        }
+    }
+
+    /// The worktree a session's row lives under; None when the row is gone
+    /// or never existed (prewarm pool).
+    fn session_worktree(&self, sref: &SessionRef) -> Option<WorktreeId> {
+        match sref {
+            SessionRef::Agent(id) => self
+                .store
+                .get_agent(id)
+                .ok()
+                .flatten()
+                .map(|a| a.worktree_id),
+            SessionRef::Terminal(id) => self
+                .store
+                .get_terminal(id)
+                .ok()
+                .flatten()
+                .map(|t| t.worktree_id),
         }
     }
 
@@ -218,6 +380,7 @@ impl Daemon {
             worktrees,
             agents,
             terminals,
+            todos: self.store.load_todos()?,
             ui_state: self.store.load_ui_state()?,
         })
     }
@@ -679,6 +842,9 @@ impl Daemon {
         worktree_id: &WorktreeId,
         name: &str,
         kind: AgentKind,
+        model: Option<String>,
+        effort: Option<String>,
+        auto_title: bool,
     ) -> Result<EntityId> {
         let worktree = self
             .store
@@ -687,7 +853,7 @@ impl Daemon {
         // A warm session for this (worktree, kind) hands over its PTY and
         // its pre-generated id — the CLI booted while the user typed the
         // name, so the create feels instant.
-        let adopted = self.take_prewarmed(worktree_id, kind);
+        let adopted = self.take_prewarmed(worktree_id, kind, &model, &effort);
         let agent = Agent {
             id: adopted
                 .as_ref()
@@ -701,14 +867,17 @@ impl Daemon {
             },
             status: AgentStatus::Fresh,
             archived: false,
+            archived_at: 0,
             pinned: false,
             kind,
+            model,
+            effort,
             session_id: None,
             sort_order: 0,
             status_changed_at: epoch_ms(),
             alive: false,
         };
-        self.store.insert_agent(&agent)?;
+        self.store.insert_agent_with_auto_title(&agent, auto_title)?;
         if adopted.is_none() {
             // Cold path: boot the CLI right away.
             self.spawn_agent_session(&agent, &worktree, 80, 24)?;
@@ -737,6 +906,8 @@ impl Daemon {
         self: &Arc<Self>,
         worktree_id: &WorktreeId,
         kind: AgentKind,
+        model: Option<String>,
+        effort: Option<String>,
     ) -> Result<()> {
         if !crate::config::Config::load().prewarm_agents {
             return Ok(());
@@ -744,15 +915,24 @@ impl Daemon {
         let Some(worktree) = self.store.get_worktree(worktree_id)? else {
             return Ok(());
         };
-        {
-            // One warm slot per key; keep a live one, replace a dead one.
+        let stale = {
+            // One warm slot per key; keep a live one with the same spec,
+            // replace a dead or wrong-spec one.
             let mut pool = self.prewarmed.lock().unwrap();
             if let Some(entry) = pool.get(&(worktree_id.clone(), kind)) {
-                if self.is_alive(&SessionRef::Agent(entry.agent_id.clone())) {
+                if self.is_alive(&SessionRef::Agent(entry.agent_id.clone()))
+                    && entry.model == model
+                    && entry.effort == effort
+                {
                     return Ok(());
                 }
-                pool.remove(&(worktree_id.clone(), kind));
+                pool.remove(&(worktree_id.clone(), kind))
+            } else {
+                None
             }
+        };
+        if let Some(old) = stale {
+            self.kill_session(&SessionRef::Agent(old.agent_id));
         }
         if !self.cli_available(kind).await {
             tracing::debug!(kind = kind.as_str(), "prewarm skipped: CLI not installed");
@@ -764,8 +944,11 @@ impl Daemon {
             name: "prewarm".into(),
             status: AgentStatus::Fresh,
             archived: false,
+            archived_at: 0,
             pinned: false,
             kind,
+            model: model.clone(),
+            effort: effort.clone(),
             session_id: None,
             sort_order: 0,
             status_changed_at: 0,
@@ -778,6 +961,8 @@ impl Daemon {
             PrewarmEntry {
                 agent_id: agent.id,
                 spawned_at: Instant::now(),
+                model,
+                effort,
                 buffered_hooks: Vec::new(),
             },
         );
@@ -789,17 +974,30 @@ impl Daemon {
         Ok(())
     }
 
-    /// Pop the warm entry for (worktree, kind) if its PTY is still running.
-    /// A dead entry (CLI missing/crashed while warm) is dropped so the
-    /// caller falls back to a cold spawn.
-    fn take_prewarmed(&self, worktree_id: &WorktreeId, kind: AgentKind) -> Option<PrewarmEntry> {
+    /// Pop the warm entry for (worktree, kind) if its PTY is still running
+    /// and it booted with the requested model/effort. A dead entry (CLI
+    /// missing/crashed while warm) is dropped, a wrong-spec one is killed;
+    /// either way the caller falls back to a cold spawn.
+    fn take_prewarmed(
+        &self,
+        worktree_id: &WorktreeId,
+        kind: AgentKind,
+        model: &Option<String>,
+        effort: &Option<String>,
+    ) -> Option<PrewarmEntry> {
         let entry = self
             .prewarmed
             .lock()
             .unwrap()
             .remove(&(worktree_id.clone(), kind))?;
-        self.is_alive(&SessionRef::Agent(entry.agent_id.clone()))
-            .then_some(entry)
+        if !self.is_alive(&SessionRef::Agent(entry.agent_id.clone())) {
+            return None;
+        }
+        if entry.model != *model || entry.effort != *effort {
+            self.kill_session(&SessionRef::Agent(entry.agent_id));
+            return None;
+        }
+        Some(entry)
     }
 
     /// Drop warm sessions that died or sat unclaimed past the max age
@@ -903,6 +1101,30 @@ impl Daemon {
             bail!("name is empty");
         }
         self.store.rename_agent(id, name.trim())?;
+        let agent = self.agent_entity(id)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Agent(agent),
+        });
+        Ok(())
+    }
+
+    /// Agent-initiated one-shot title (`nebula rename` inside the session's
+    /// CLI). Applies only while the auto-title is still pending; afterwards
+    /// it reports the standing title as an error so the CLI (and the model
+    /// reading its output) knows nothing changed.
+    pub fn auto_rename_agent(self: &Arc<Self>, id: &AgentId, name: &str) -> Result<()> {
+        let title = sanitize_title(name);
+        if title.is_empty() {
+            bail!("title is empty");
+        }
+        let agent = self.store.get_agent(id)?.context("agent not found")?;
+        if !self.store.rename_agent_if_auto_pending(id, &title)? {
+            bail!(
+                "session already has a title ({:?}); leaving it unchanged — a user-set \
+                 title is only replaced with `nebula rename --force`",
+                agent.name
+            );
+        }
         let agent = self.agent_entity(id)?;
         self.broadcast(ServerEvent::EntityUpserted {
             entity: Entity::Agent(agent),
@@ -1121,6 +1343,65 @@ impl Daemon {
         Ok(())
     }
 
+    // ---- todos ----
+
+    pub fn create_todo(self: &Arc<Self>, owner: &TodoOwner, text: &str) -> Result<EntityId> {
+        let text = text.trim();
+        if text.is_empty() {
+            bail!("todo text is empty");
+        }
+        match owner {
+            TodoOwner::Project(id) => {
+                self.store.get_project(id)?.context("project not found")?;
+            }
+            TodoOwner::Worktree(id) => {
+                self.store.get_worktree(id)?.context("worktree not found")?;
+            }
+        }
+        let todo = Todo {
+            id: TodoId::generate(),
+            owner: owner.clone(),
+            text: text.to_string(),
+            done: false,
+            sort_order: self.store.next_todo_sort_order(owner)?,
+        };
+        self.store.insert_todo(&todo)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Todo(todo.clone()),
+        });
+        Ok(EntityId::Todo(todo.id))
+    }
+
+    pub fn update_todo(self: &Arc<Self>, id: &TodoId, text: &str) -> Result<()> {
+        let text = text.trim();
+        if text.is_empty() {
+            bail!("todo text is empty");
+        }
+        self.store.set_todo_text(id, text)?;
+        let todo = self.store.get_todo(id)?.context("todo not found")?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Todo(todo),
+        });
+        Ok(())
+    }
+
+    pub fn set_todo_done(self: &Arc<Self>, id: &TodoId, done: bool) -> Result<()> {
+        self.store.set_todo_done(id, done)?;
+        let todo = self.store.get_todo(id)?.context("todo not found")?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Todo(todo),
+        });
+        Ok(())
+    }
+
+    pub fn delete_todo(self: &Arc<Self>, id: &TodoId) -> Result<()> {
+        self.store.delete_todo(id)?;
+        self.broadcast(ServerEvent::EntityRemoved {
+            id: EntityId::Todo(id.clone()),
+        });
+        Ok(())
+    }
+
     // ---- attach / spawn ----
 
     /// Get the live session for an entity, lazily (re)spawning its PTY when
@@ -1169,6 +1450,43 @@ impl Daemon {
         }
     }
 
+    /// Boot every dead, non-archived session under `worktree_id` (agents and
+    /// terminals) so a later Attach replays an already-running screen.
+    /// Already-alive sessions pass through ensure_session untouched; one
+    /// session failing to spawn (missing CLI, deleted checkout) is logged
+    /// and doesn't stop the rest.
+    pub fn prewarm_worktree_sessions(
+        self: &Arc<Self>,
+        worktree_id: &WorktreeId,
+        cols: u16,
+        rows: u16,
+    ) {
+        if !crate::config::Config::load().prewarm_sessions {
+            return;
+        }
+        let Ok((_, _, agents, terminals)) = self.store.load_tree() else {
+            return;
+        };
+        let srefs = agents
+            .iter()
+            .filter(|a| &a.worktree_id == worktree_id && !a.archived)
+            .map(|a| SessionRef::Agent(a.id.clone()))
+            .chain(
+                terminals
+                    .iter()
+                    .filter(|t| &t.worktree_id == worktree_id)
+                    .map(|t| SessionRef::Terminal(t.id.clone())),
+            );
+        for sref in srefs {
+            // The prewarm doubles as a "user is looking here" signal for
+            // the idle reaper, for alive sessions as much as fresh spawns.
+            self.touch_session(&sref);
+            if let Err(e) = self.ensure_session(&sref, cols, rows) {
+                tracing::debug!(session = ?sref, error = %e, "session prewarm failed");
+            }
+        }
+    }
+
     fn spawn_agent_session(
         self: &Arc<Self>,
         agent: &Agent,
@@ -1181,7 +1499,10 @@ impl Daemon {
         let install_result = match agent.kind {
             AgentKind::Claude => hooks::installer::install_claude_hooks(&worktree.path),
             AgentKind::Codex => hooks::installer::install_codex_hooks(&worktree.path),
-            AgentKind::Cursor => hooks::installer::install_cursor_hooks(&worktree.path),
+            // Cursor also gets the managed auto-title project rule — its
+            // hook dialect has no context-injection channel.
+            AgentKind::Cursor => hooks::installer::install_cursor_hooks(&worktree.path)
+                .and_then(|()| hooks::installer::install_cursor_title_rule(&worktree.path)),
         };
         if let Err(e) = install_result {
             tracing::warn!(error = %e, cwd = %worktree.path.display(), "hook install failed");
@@ -1192,6 +1513,8 @@ impl Daemon {
         let (program, args, resumed) = agent_spawn_command(
             agent.kind,
             agent.session_id.as_deref(),
+            agent.model.as_deref(),
+            agent.effort.as_deref(),
             cmd_override.as_deref(),
         );
         // Run the agent through the user's login+interactive shell so it sees
@@ -1258,6 +1581,13 @@ impl Daemon {
             if early_exit != Ok(true) {
                 return;
             }
+            // A deliberate kill looks identical to a failed resume from here:
+            // the agent may have been archived or deleted inside the window —
+            // never resurrect those.
+            match daemon.store.get_agent(&agent.id) {
+                Ok(Some(current)) if !current.archived => {}
+                _ => return,
+            }
             tracing::info!(agent = %agent.id, "resume failed fast — respawning fresh");
             let _ = daemon.store.set_agent_session_id(&agent.id, None);
             let mut fresh = agent.clone();
@@ -1297,6 +1627,7 @@ impl Daemon {
     }
 
     fn install_session(self: &Arc<Self>, session: Arc<PtySession>) {
+        self.touch_session(&session.sref);
         self.sessions
             .lock()
             .unwrap()
@@ -1328,6 +1659,9 @@ impl Daemon {
                                 _ => false,
                             }
                         };
+                        if was_registered {
+                            daemon.session_interest.lock().unwrap().remove(&sref);
+                        }
                         if !was_registered {
                             break;
                         }
@@ -1365,9 +1699,13 @@ impl Daemon {
 /// `codex resume <sid>` (subcommand, so resume args must lead). Codex and
 /// cursor always get their skip-permissions flag (`--yolo` / `--force`),
 /// appended after the resume args — same convention as Mission Control.
+/// Model/effort choices trail everything: `claude --model m --effort e`,
+/// `codex -m m -c model_reasoning_effort=e` (cursor has neither knob).
 fn agent_spawn_command(
     kind: AgentKind,
     session_id: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
     cmd_override: Option<&str>,
 ) -> (String, Vec<String>, bool) {
     if let Some(cmd) = cmd_override {
@@ -1390,7 +1728,43 @@ fn agent_spawn_command(
         AgentKind::Cursor => args.push("--force".to_string()),
         AgentKind::Claude => {}
     }
+    match kind {
+        AgentKind::Claude => {
+            if let Some(m) = model {
+                args.extend(["--model".to_string(), m.to_string()]);
+            }
+            if let Some(e) = effort {
+                args.extend(["--effort".to_string(), e.to_string()]);
+            }
+        }
+        AgentKind::Codex => {
+            if let Some(m) = model {
+                args.extend(["--model".to_string(), m.to_string()]);
+            }
+            if let Some(e) = effort {
+                args.extend(["-c".to_string(), format!("model_reasoning_effort={e}")]);
+            }
+        }
+        AgentKind::Cursor => {}
+    }
     (program, args, resumed)
+}
+
+/// Normalize an agent-supplied title: control characters become spaces,
+/// whitespace collapses, and over-long titles are cut — models occasionally
+/// hand over a whole sentence no matter what the instruction says.
+fn sanitize_title(raw: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut title = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.chars().count() > MAX_CHARS {
+        title = title.chars().take(MAX_CHARS).collect();
+        title.truncate(title.trim_end().len());
+    }
+    title
 }
 
 /// Canonicalize for path containment tests, falling back to the raw path
@@ -1398,6 +1772,24 @@ fn agent_spawn_command(
 /// symlinks (`/tmp` → `/private/tmp`) otherwise break `starts_with`.
 fn canonical_or_raw(path: &Path) -> std::path::PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Does this terminal's shell have any child processes (a command or job
+/// still running)? An unknown child pid or a failed probe counts as busy —
+/// never kill what can't be inspected.
+fn shell_has_children(session: &PtySession) -> bool {
+    let Some(pid) = session.child_pid else {
+        return true;
+    };
+    !matches!(
+        std::process::Command::new("pgrep")
+            .arg("-P")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status(),
+        Ok(status) if !status.success()
+    )
 }
 
 fn user_shell() -> String {
@@ -1436,22 +1828,22 @@ mod tests {
     fn spawn_command_per_kind_resume_shapes() {
         // Fresh sessions: bare CLI.
         assert_eq!(
-            agent_spawn_command(AgentKind::Claude, None, None),
+            agent_spawn_command(AgentKind::Claude, None, None, None, None),
             ("claude".into(), vec![], false)
         );
         // Codex/cursor always run in skip-permissions mode.
         assert_eq!(
-            agent_spawn_command(AgentKind::Codex, None, None),
+            agent_spawn_command(AgentKind::Codex, None, None, None, None),
             ("codex".into(), vec!["--yolo".to_string()], false)
         );
         // Cursor's agent CLI is `cursor-agent`, not `cursor` (the editor).
         assert_eq!(
-            agent_spawn_command(AgentKind::Cursor, None, None),
+            agent_spawn_command(AgentKind::Cursor, None, None, None, None),
             ("cursor-agent".into(), vec!["--force".to_string()], false)
         );
         // Claude resumes with a flag; codex with a subcommand (order matters).
         assert_eq!(
-            agent_spawn_command(AgentKind::Claude, Some("sid-1"), None),
+            agent_spawn_command(AgentKind::Claude, Some("sid-1"), None, None, None),
             (
                 "claude".into(),
                 vec!["--resume".to_string(), "sid-1".to_string()],
@@ -1460,7 +1852,7 @@ mod tests {
         );
         // Skip-permissions flags trail the resume args.
         assert_eq!(
-            agent_spawn_command(AgentKind::Codex, Some("sid-2"), None),
+            agent_spawn_command(AgentKind::Codex, Some("sid-2"), None, None, None),
             (
                 "codex".into(),
                 vec![
@@ -1472,7 +1864,7 @@ mod tests {
             )
         );
         assert_eq!(
-            agent_spawn_command(AgentKind::Cursor, Some("sid-3"), None),
+            agent_spawn_command(AgentKind::Cursor, Some("sid-3"), None, None, None),
             (
                 "cursor-agent".into(),
                 vec![
@@ -1485,11 +1877,77 @@ mod tests {
         );
         // Override wins for both kinds and never gets resume args.
         assert_eq!(
-            agent_spawn_command(AgentKind::Claude, Some("sid"), Some("/bin/sh -i")),
+            agent_spawn_command(AgentKind::Claude, Some("sid"), None, None, Some("/bin/sh -i")),
             ("/bin/sh".into(), vec!["-i".to_string()], false)
         );
         assert_eq!(
-            agent_spawn_command(AgentKind::Codex, Some("sid"), Some("/bin/sh")),
+            agent_spawn_command(AgentKind::Codex, Some("sid"), None, None, Some("/bin/sh")),
+            ("/bin/sh".into(), vec![], false)
+        );
+    }
+
+    #[test]
+    fn spawn_command_model_and_effort_flags() {
+        // Claude gets --model/--effort; either alone works.
+        assert_eq!(
+            agent_spawn_command(AgentKind::Claude, None, Some("opus"), Some("high"), None),
+            (
+                "claude".into(),
+                vec![
+                    "--model".to_string(),
+                    "opus".to_string(),
+                    "--effort".to_string(),
+                    "high".to_string()
+                ],
+                false
+            )
+        );
+        assert_eq!(
+            agent_spawn_command(AgentKind::Claude, None, None, Some("max"), None),
+            (
+                "claude".into(),
+                vec!["--effort".to_string(), "max".to_string()],
+                false
+            )
+        );
+        // Codex takes --model plus a config override for effort, after --yolo.
+        assert_eq!(
+            agent_spawn_command(AgentKind::Codex, None, Some("gpt-5.5"), Some("high"), None),
+            (
+                "codex".into(),
+                vec![
+                    "--yolo".to_string(),
+                    "--model".to_string(),
+                    "gpt-5.5".to_string(),
+                    "-c".to_string(),
+                    "model_reasoning_effort=high".to_string()
+                ],
+                false
+            )
+        );
+        // Resume keeps the model/effort flags (a fallback fresh spawn needs
+        // them, and the CLIs accept them alongside resume).
+        assert_eq!(
+            agent_spawn_command(AgentKind::Claude, Some("sid"), Some("sonnet"), None, None),
+            (
+                "claude".into(),
+                vec![
+                    "--resume".to_string(),
+                    "sid".to_string(),
+                    "--model".to_string(),
+                    "sonnet".to_string()
+                ],
+                true
+            )
+        );
+        // Cursor has no model/effort knobs — choices are ignored.
+        assert_eq!(
+            agent_spawn_command(AgentKind::Cursor, None, Some("m"), Some("e"), None),
+            ("cursor-agent".into(), vec!["--force".to_string()], false)
+        );
+        // Override still wins over everything.
+        assert_eq!(
+            agent_spawn_command(AgentKind::Claude, None, Some("opus"), None, Some("/bin/sh")),
             ("/bin/sh".into(), vec![], false)
         );
     }
@@ -1512,7 +1970,7 @@ mod tests {
     }
 
     fn test_daemon() -> Arc<Daemon> {
-        let store = Store::open_in_memory().unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
         Daemon::new(
             store,
             HookEnv {
@@ -1840,8 +2298,11 @@ mod tests {
                 name: id.into(),
                 status: AgentStatus::Running,
                 archived: false,
+                archived_at: 0,
                 pinned: false,
                 kind: AgentKind::Claude,
+                model: None,
+                effort: None,
                 session_id: session_id.map(str::to_string),
                 sort_order: 0,
                 status_changed_at: 0,
@@ -1885,6 +2346,100 @@ mod tests {
             .move_agent(&AgentId("a1".into()), &WorktreeId("feat".into()))
             .unwrap();
         assert!(rx.try_recv().is_err(), "no broadcast for a no-op move");
+    }
+
+    fn seed_pending_agent(daemon: &Daemon, id: &str, worktree: &str) {
+        daemon
+            .store
+            .insert_agent_with_auto_title(
+                &Agent {
+                    id: AgentId(id.into()),
+                    worktree_id: WorktreeId(worktree.into()),
+                    name: format!("{id}-default"),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    alive: false,
+                },
+                true,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn auto_rename_applies_once_and_defers_to_user_titles() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_pending_agent(&daemon, "a1", "root");
+        let mut rx = daemon.events.subscribe();
+
+        // First agent attempt lands, sanitized, and is broadcast.
+        daemon
+            .auto_rename_agent(&AgentId("a1".into()), "  Fix   Login\tRedirect  ")
+            .unwrap();
+        match rx.try_recv().unwrap() {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            } => assert_eq!(a.name, "Fix Login Redirect"),
+            other => panic!("expected agent upsert, got {other:?}"),
+        }
+
+        // A second attempt is declined with a settled, informative error.
+        let err = daemon
+            .auto_rename_agent(&AgentId("a1".into()), "Another Title")
+            .unwrap_err();
+        assert!(err.to_string().contains("already has a title"), "{err}");
+        assert_eq!(
+            daemon
+                .store
+                .get_agent(&AgentId("a1".into()))
+                .unwrap()
+                .unwrap()
+                .name,
+            "Fix Login Redirect"
+        );
+
+        // A user rename beats a pending auto-title: the CLI's later attempt
+        // must not clobber it.
+        seed_pending_agent(&daemon, "a2", "root");
+        daemon
+            .rename_agent(&AgentId("a2".into()), "my session")
+            .unwrap();
+        let err = daemon
+            .auto_rename_agent(&AgentId("a2".into()), "Model Title")
+            .unwrap_err();
+        assert!(err.to_string().contains("already has a title"), "{err}");
+
+        // Garbage titles are rejected outright.
+        assert!(daemon
+            .auto_rename_agent(&AgentId("a1".into()), " \u{7}\n ")
+            .is_err());
+        // Unknown agents report cleanly.
+        let err = daemon
+            .auto_rename_agent(&AgentId("ghost".into()), "Some Title")
+            .unwrap_err();
+        assert!(err.to_string().contains("agent not found"), "{err}");
+    }
+
+    #[test]
+    fn sanitize_title_collapses_and_caps() {
+        assert_eq!(
+            sanitize_title(" Fix   Login\u{7}Redirect \n"),
+            "Fix Login Redirect"
+        );
+        assert_eq!(sanitize_title("\u{1b}[31m"), "[31m");
+        assert_eq!(sanitize_title("   "), "");
+        let long = "word ".repeat(30);
+        assert!(sanitize_title(&long).chars().count() <= 60);
+        assert!(!sanitize_title(&long).ends_with(' '));
     }
 
     #[test]
@@ -1968,6 +2523,8 @@ mod tests {
             PrewarmEntry {
                 agent_id: AgentId("warm-1".into()),
                 spawned_at: Instant::now(),
+                model: None,
+                effort: None,
                 buffered_hooks: Vec::new(),
             },
         );
@@ -2018,7 +2575,7 @@ mod tests {
         // No live PTY backs the entry, so take() refuses it (create falls
         // back to a cold spawn) and reap clears it out.
         assert!(daemon
-            .take_prewarmed(&WorktreeId("w1".into()), AgentKind::Claude)
+            .take_prewarmed(&WorktreeId("w1".into()), AgentKind::Claude, &None, &None)
             .is_none());
         assert!(daemon.prewarmed.lock().unwrap().is_empty());
 
@@ -2027,6 +2584,8 @@ mod tests {
             PrewarmEntry {
                 agent_id: AgentId("warm-2".into()),
                 spawned_at: Instant::now(),
+                model: None,
+                effort: None,
                 buffered_hooks: Vec::new(),
             },
         );
@@ -2043,6 +2602,8 @@ mod tests {
                 PrewarmEntry {
                     agent_id: AgentId(id.into()),
                     spawned_at: Instant::now(),
+                    model: None,
+                    effort: None,
                     buffered_hooks: Vec::new(),
                 },
             );

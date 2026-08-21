@@ -3,6 +3,7 @@ pub mod crashlog;
 pub mod entities;
 pub mod host;
 pub mod ids;
+pub mod mem;
 pub mod paths;
 pub mod protocol;
 

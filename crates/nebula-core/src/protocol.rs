@@ -1,13 +1,14 @@
 use crate::entities::{
-    Agent, AgentKind, AgentStatus, Entity, EntityId, Project, TerminalTab, Worktree,
+    Agent, AgentKind, AgentStatus, Entity, EntityId, Project, TerminalTab, Todo, TodoOwner,
+    Worktree,
 };
-use crate::ids::{AgentId, ProjectId, TerminalId, WorktreeId};
+use crate::ids::{AgentId, ProjectId, TerminalId, TodoId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -109,6 +110,14 @@ pub enum ClientRequest {
         worktree: WorktreeId,
         name: String,
         kind: AgentKind,
+        /// Model the CLI launches with; None = the CLI's own default.
+        model: Option<String>,
+        /// Reasoning effort the CLI launches with; None = the CLI's own default.
+        effort: Option<String>,
+        /// True when the user accepted the generated default name, marking
+        /// the session eligible for one agent-driven auto-title (the CLI
+        /// runs `nebula rename` on its first prompt).
+        auto_title: bool,
     },
     /// Fire-and-forget: pre-spawn an agent CLI for this (worktree, kind) so
     /// the next CreateAgent adopts an already-booted session. Sent the
@@ -117,8 +126,35 @@ pub enum ClientRequest {
     PrewarmAgent {
         worktree: WorktreeId,
         kind: AgentKind,
+        /// Must match the CreateAgent that follows or the warm session is
+        /// discarded (a CLI booted with the wrong model can't be adopted).
+        model: Option<String>,
+        effort: Option<String>,
+    },
+    /// Fire-and-forget: pre-spawn every dead (non-archived) session under a
+    /// worktree so attaching later replays an already-booted screen instead
+    /// of watching a login shell + CLI boot. Sent once the worktree
+    /// selection has rested (debounced client-side); already-alive sessions
+    /// are untouched. No reply; a failed spawn degrades to today's lazy
+    /// spawn-on-attach.
+    PrewarmWorktreeSessions {
+        worktree: WorktreeId,
+        /// Pane size the sessions boot at, so the later Attach resizes to
+        /// the same grid and full-screen apps need no reflow.
+        cols: u16,
+        rows: u16,
     },
     RenameAgent {
+        req_id: u64,
+        id: AgentId,
+        name: String,
+    },
+    /// Agent-initiated one-shot title (`nebula rename` inside the session's
+    /// CLI). Applies only while the session still awaits its auto-title;
+    /// answered with Error (informational, not a fault) once a title —
+    /// user- or agent-set — already sticks, so a user rename is never
+    /// clobbered by a late or repeated agent attempt.
+    AutoRenameAgent {
         req_id: u64,
         id: AgentId,
         name: String,
@@ -160,6 +196,26 @@ pub enum ClientRequest {
         worktree: WorktreeId,
         name: Option<String>,
     },
+    CreateTodo {
+        req_id: u64,
+        owner: TodoOwner,
+        text: String,
+    },
+    /// Rewrite a todo's text.
+    UpdateTodo {
+        req_id: u64,
+        id: TodoId,
+        text: String,
+    },
+    SetTodoDone {
+        req_id: u64,
+        id: TodoId,
+        done: bool,
+    },
+    DeleteTodo {
+        req_id: u64,
+        id: TodoId,
+    },
     RenameTerminal {
         req_id: u64,
         id: TerminalId,
@@ -175,7 +231,39 @@ pub enum ClientRequest {
         json: String,
     },
 
+    /// One point-in-time memory reading — the daemon plus every live
+    /// session's process subtree. Answered by `ServerEvent::Metrics` with
+    /// the same req_id (not an Ack).
+    GetMetrics {
+        req_id: u64,
+    },
+
     Shutdown,
+}
+
+/// Memory usage of one live session: the PTY child plus every descendant
+/// (an agent CLI typically fans out into node workers, shells, MCP servers).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMetrics {
+    pub session: SessionRef,
+    /// OS pid of the PTY child (the subtree's root).
+    pub pid: u32,
+    /// Resident set size summed over the whole subtree, bytes.
+    pub rss_bytes: u64,
+    /// Live processes in the subtree, the root included.
+    pub procs: u32,
+}
+
+/// Daemon-side half of the metrics modal's data; the client stacks its own
+/// RSS on top. Session subtrees are daemon descendants, so `daemon_rss_bytes`
+/// counts the daemon process alone — the total stays double-count-free.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsSnapshot {
+    pub daemon_pid: u32,
+    pub daemon_rss_bytes: u64,
+    /// Physical memory installed on the machine, bytes; 0 = unknown.
+    pub system_total_bytes: u64,
+    pub sessions: Vec<SessionMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +280,7 @@ pub enum ServerEvent {
         worktrees: Vec<Worktree>,
         agents: Vec<Agent>,
         terminals: Vec<TerminalTab>,
+        todos: Vec<Todo>,
         ui_state: Option<String>,
     },
 
@@ -243,5 +332,11 @@ pub enum ServerEvent {
     KittyFlags {
         session: SessionRef,
         flags: u8,
+    },
+
+    /// Reply to `ClientRequest::GetMetrics`.
+    Metrics {
+        req_id: u64,
+        snapshot: MetricsSnapshot,
     },
 }

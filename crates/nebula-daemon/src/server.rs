@@ -91,6 +91,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         worktrees: vec![],
                         agents: vec![],
                         terminals: vec![],
+                        todos: vec![],
                         ui_state: None,
                     });
                     let _ = out_tx.send(snapshot).await;
@@ -141,7 +142,8 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                                 .await;
                             let _ = session.resize_with_jiggle(cols, rows);
 
-                            if let Some(old) = attached.remove(&sref) {
+                            let rebind = attached.remove(&sref);
+                            if let Some(old) = &rebind {
                                 old.abort();
                             }
                             let handle = tokio::spawn(forward_pty(
@@ -151,6 +153,11 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                                 out_tx.clone(),
                                 replay_end,
                             ));
+                            // Count this connection once even across
+                            // re-attaches to the same session.
+                            if rebind.is_none() {
+                                daemon.note_attached(&sref);
+                            }
                             attached.insert(sref, handle);
                         }
                         Err(e) => {
@@ -166,6 +173,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientRequest::Detach { session } => {
                     if let Some(h) = attached.remove(&session) {
                         h.abort();
+                        daemon.note_detached(&session);
                     }
                 }
                 ClientRequest::Input { session, data } => {
@@ -191,6 +199,21 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientRequest::SaveUiState { json } => {
                     let _ = daemon.store.save_ui_state(&json);
+                }
+                ClientRequest::GetMetrics { req_id } => {
+                    // A machine-wide `ps` sweep takes tens of ms; keep it off
+                    // the request loop so Input/Attach frames keep flowing.
+                    let pids = daemon.session_pids();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        let snapshot =
+                            tokio::task::spawn_blocking(move || crate::metrics::collect(pids))
+                                .await;
+                        if let Ok(snapshot) = snapshot {
+                            let _ =
+                                out_tx.send(ServerEvent::Metrics { req_id, snapshot }).await;
+                        }
+                    });
                 }
                 // ---- entity CRUD: run the op, reply Ack/Error ----
                 ClientRequest::AddProject {
@@ -291,30 +314,60 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     worktree,
                     name,
                     kind,
+                    model,
+                    effort,
+                    auto_title,
                 } => {
                     reply(
                         &out_tx,
                         req_id,
-                        daemon.create_agent(&worktree, &name, kind).map(Some),
+                        daemon
+                            .create_agent(&worktree, &name, kind, model, effort, auto_title)
+                            .map(Some),
                     )
                     .await;
                 }
-                ClientRequest::PrewarmAgent { worktree, kind } => {
+                ClientRequest::PrewarmAgent {
+                    worktree,
+                    kind,
+                    model,
+                    effort,
+                } => {
                     // Fire-and-forget: boot the CLI while the user is still
                     // typing the session name; CreateAgent adopts it. Runs
                     // off the request loop (the CLI probe can take a bit).
                     let daemon = daemon.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = daemon.prewarm_agent(&worktree, kind).await {
+                        if let Err(e) = daemon.prewarm_agent(&worktree, kind, model, effort).await {
                             tracing::debug!(error = %e, "prewarm failed");
                         }
                     });
+                }
+                ClientRequest::PrewarmWorktreeSessions {
+                    worktree,
+                    cols,
+                    rows,
+                } => {
+                    // Deliberately inline: an Attach for one of these
+                    // sessions is then ordered after it instead of racing it
+                    // (two concurrent ensure_session calls for the same sref
+                    // would double-spawn). Spawns are forkpty-fast; the
+                    // children boot in the background.
+                    daemon.prewarm_worktree_sessions(&worktree, cols, rows);
                 }
                 ClientRequest::RenameAgent { req_id, id, name } => {
                     reply(
                         &out_tx,
                         req_id,
                         daemon.rename_agent(&id, &name).map(|_| None),
+                    )
+                    .await;
+                }
+                ClientRequest::AutoRenameAgent { req_id, id, name } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.auto_rename_agent(&id, &name).map(|_| None),
                     )
                     .await;
                 }
@@ -362,6 +415,32 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     )
                     .await;
                 }
+                ClientRequest::CreateTodo {
+                    req_id,
+                    owner,
+                    text,
+                } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.create_todo(&owner, &text).map(Some),
+                    )
+                    .await;
+                }
+                ClientRequest::UpdateTodo { req_id, id, text } => {
+                    reply(&out_tx, req_id, daemon.update_todo(&id, &text).map(|_| None)).await;
+                }
+                ClientRequest::SetTodoDone { req_id, id, done } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.set_todo_done(&id, done).map(|_| None),
+                    )
+                    .await;
+                }
+                ClientRequest::DeleteTodo { req_id, id } => {
+                    reply(&out_tx, req_id, daemon.delete_todo(&id).map(|_| None)).await;
+                }
                 ClientRequest::RenameTerminal { req_id, id, name } => {
                     reply(
                         &out_tx,
@@ -379,8 +458,9 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     }
     .await;
 
-    for (_, h) in attached.drain() {
+    for (sref, h) in attached.drain() {
         h.abort();
+        daemon.note_detached(&sref);
     }
     drop(out_tx);
     let _ = writer_task.await;

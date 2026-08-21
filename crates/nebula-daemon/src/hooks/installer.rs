@@ -66,14 +66,28 @@ const CURSOR_EVENTS: &[(&str, &str)] = &[
 ];
 
 fn hook_command(endpoint: &str, event: &str) -> String {
+    // UserPromptSubmit passes the daemon's response body through to stdout:
+    // Claude Code (and Codex, same dialect) add a hook's stdout to the
+    // model's context, which is how the session auto-title instruction
+    // reaches the agent. The daemon keeps that body empty except when an
+    // instruction is due. Every other event stays fully silent.
+    let silence = if event == "UserPromptSubmit" {
+        "2>/dev/null"
+    } else {
+        ">/dev/null 2>&1"
+    };
     format!(
         "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then exit 0; fi; \
          curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
          -H \"Content-Type: application/json\" --data-binary @- \
          \"$NEBULA_API_URL/api/hooks/{endpoint}?agentId=$NEBULA_AGENT_ID&hookEvent={event}\" \
-         >/dev/null 2>&1 || true"
+         {silence} || true"
     )
 }
+
+/// Permission rule letting Claude Code run the auto-title command without a
+/// permission prompt (codex/cursor run with their skip-permissions flags).
+const CLAUDE_ALLOW_RENAME: &str = "Bash(nebula rename:*)";
 
 /// Cursor variant: the payload arrives on stdin like Claude's, but cursor
 /// expects a JSON response on stdout — `{"continue": true}` keeps gating
@@ -125,15 +139,50 @@ fn managed_group(endpoint: &str, event: &str, matcher: Option<&str>) -> Value {
 }
 
 /// Merge nebula's managed hooks for Claude Code into
-/// `<cwd>/.claude/settings.local.json`.
+/// `<cwd>/.claude/settings.local.json`, plus the permission rule that lets
+/// the auto-title `nebula rename` run unprompted.
 pub fn install_claude_hooks(cwd: &Path) -> Result<()> {
-    install_managed_hooks(
-        cwd,
-        ".claude",
-        "settings.local.json",
-        "claude",
-        CLAUDE_EVENTS,
-    )
+    let dir = cwd.join(".claude");
+    let path = dir.join("settings.local.json");
+    let mut root = load_hooks_root(&path)?;
+    let Some(root_obj) = root.as_object_mut() else {
+        bail!(
+            "{} is not a JSON object — refusing to modify it",
+            path.display()
+        );
+    };
+    merge_managed_hooks(root_obj, "claude", CLAUDE_EVENTS, &path)?;
+    ensure_permission_allow(root_obj, CLAUDE_ALLOW_RENAME, &path)?;
+    write_hooks_root(&dir, "settings.local.json", &root)
+}
+
+/// Idempotently add one entry to `permissions.allow`, preserving everything
+/// the user put there. Same abort-don't-clobber policy as the hook merge.
+fn ensure_permission_allow(
+    root_obj: &mut Map<String, Value>,
+    entry: &str,
+    path: &Path,
+) -> Result<()> {
+    let perms = root_obj
+        .entry("permissions")
+        .or_insert_with(|| json!({}));
+    let Some(perms_obj) = perms.as_object_mut() else {
+        bail!(
+            "\"permissions\" in {} is not an object — refusing to modify it",
+            path.display()
+        );
+    };
+    let allow = perms_obj.entry("allow").or_insert_with(|| json!([]));
+    let Some(allow_arr) = allow.as_array_mut() else {
+        bail!(
+            "permissions.allow in {} is not an array — refusing to modify it",
+            path.display()
+        );
+    };
+    if !allow_arr.iter().any(|v| v.as_str() == Some(entry)) {
+        allow_arr.push(json!(entry));
+    }
+    Ok(())
 }
 
 /// Merge nebula's managed hooks for Codex into `<cwd>/.codex/hooks.json`.
@@ -214,12 +263,15 @@ fn load_hooks_root(path: &Path) -> Result<Value> {
 }
 
 fn write_hooks_root(dir: &Path, file_name: &str, root: &Value) -> Result<()> {
+    write_text_atomic(dir, file_name, &serde_json::to_string_pretty(root)?)
+}
+
+fn write_text_atomic(dir: &Path, file_name: &str, text: &str) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     // Atomic write: tmp + rename.
     let tmp = dir.join(format!(".{file_name}.nebula-tmp"));
     let path = dir.join(file_name);
-    std::fs::write(&tmp, serde_json::to_string_pretty(root)?)
-        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("rename into {}", path.display()))?;
     Ok(())
 }
@@ -241,6 +293,18 @@ fn install_managed_hooks(
             path.display()
         );
     };
+    merge_managed_hooks(root_obj, endpoint, events, &path)?;
+    write_hooks_root(&dir, file_name, &root)
+}
+
+/// Strip-and-rebuild nebula's groups under each event key of a loaded
+/// Claude/Codex-dialect config, leaving user groups untouched.
+fn merge_managed_hooks(
+    root_obj: &mut Map<String, Value>,
+    endpoint: &str,
+    events: &[(&str, Option<&str>)],
+    path: &Path,
+) -> Result<()> {
     let hooks = root_obj.entry("hooks").or_insert_with(|| json!({}));
     let Some(hooks_obj) = hooks.as_object_mut() else {
         bail!(
@@ -262,9 +326,35 @@ fn install_managed_hooks(
         groups_arr.retain(|g| !is_nebula_group(g));
         groups_arr.push(managed_group(endpoint, event, *matcher));
     }
-
-    write_hooks_root(&dir, file_name, &root)
+    Ok(())
 }
+
+/// Cursor can't receive daemon-injected context (its hooks are gating-only,
+/// answering with their own JSON), so the auto-title instruction ships as a
+/// managed always-on project rule instead. The file is wholly nebula-owned
+/// (namespaced filename) and rewritten on every spawn. Firing outside
+/// nebula or on later prompts is harmless: the rule env-guards itself, and
+/// the daemon accepts at most one auto-title per session.
+pub fn install_cursor_title_rule(cwd: &Path) -> Result<()> {
+    let dir = cwd.join(".cursor").join("rules");
+    write_text_atomic(&dir, "nebula-title.mdc", CURSOR_TITLE_RULE)
+}
+
+const CURSOR_TITLE_RULE: &str = "---
+description: Nebula session auto-title (managed by nebula — edits are overwritten)
+alwaysApply: true
+---
+
+This rule applies only when the environment variable NEBULA_AGENT_ID is set
+(the session runs inside nebula). If it is unset, ignore this rule entirely.
+
+On the first user message of a new conversation, before addressing the
+request, run the shell command `nebula rename <title>` exactly once —
+replace <title> with 3-4 Title Case words describing the user's request,
+unquoted (example: `nebula rename Fix Login Redirect`). If the command
+reports the session is already titled, accept that and move on. Don't
+mention the rename to the user.
+";
 
 #[cfg(test)]
 mod tests {
@@ -295,6 +385,74 @@ mod tests {
         assert_eq!(notification[0]["matcher"], json!("permission_prompt"));
         let pre = &settings["hooks"]["PreToolUse"];
         assert_eq!(pre[0]["matcher"], json!("AskUserQuestion"));
+    }
+
+    #[test]
+    fn user_prompt_submit_command_pipes_response_to_stdout() {
+        // The daemon's UserPromptSubmit response body is the auto-title
+        // context injection — that one command must let stdout through
+        // (stderr still silenced); every other event stays fully silent.
+        let tmp = tempfile::tempdir().unwrap();
+        install_claude_hooks(tmp.path()).unwrap();
+        let settings = read_settings(tmp.path());
+        let submit = settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(submit.contains("2>/dev/null"), "stderr silenced: {submit}");
+        assert!(
+            !submit.contains(">/dev/null 2>&1"),
+            "stdout must pass through: {submit}"
+        );
+        let stop = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(stop.contains(">/dev/null 2>&1"), "stop stays silent: {stop}");
+    }
+
+    #[test]
+    fn claude_install_adds_rename_permission_idempotently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.local.json"),
+            serde_json::to_string(&json!({
+                "permissions": { "allow": ["Bash(ls:*)"], "deny": ["WebFetch"] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        install_claude_hooks(tmp.path()).unwrap();
+        install_claude_hooks(tmp.path()).unwrap();
+        let settings = read_settings(tmp.path());
+        let allow = settings["permissions"]["allow"].as_array().unwrap();
+        assert_eq!(allow[0], json!("Bash(ls:*)"), "user entry preserved first");
+        assert_eq!(
+            allow
+                .iter()
+                .filter(|v| v.as_str() == Some(CLAUDE_ALLOW_RENAME))
+                .count(),
+            1,
+            "exactly one nebula entry after reinstalls: {allow:?}"
+        );
+        assert_eq!(settings["permissions"]["deny"][0], json!("WebFetch"));
+    }
+
+    #[test]
+    fn cursor_title_rule_is_written_and_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_cursor_title_rule(tmp.path()).unwrap();
+        let path = tmp.path().join(".cursor/rules/nebula-title.mdc");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("alwaysApply: true"));
+        assert!(text.contains("nebula rename"));
+        assert!(text.contains("NEBULA_AGENT_ID"), "must be env-guarded");
+        // Wholly nebula-owned: a scribbled-on file is simply replaced.
+        std::fs::write(&path, "user scribbles").unwrap();
+        install_cursor_title_rule(tmp.path()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("nebula rename"));
     }
 
     #[test]

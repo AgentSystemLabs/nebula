@@ -31,17 +31,31 @@ impl TestEnv {
     }
 
     fn spawn_daemon_with_agent_cmd(&self, agent_cmd: &str) -> std::process::Child {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-            .args(["daemon", "--foreground"])
+        self.spawn_daemon_with(agent_cmd, &[])
+    }
+
+    fn spawn_daemon_with(&self, agent_cmd: &str, envs: &[(&str, &str)]) -> std::process::Child {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+        cmd.args(["daemon", "--foreground"])
             .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
             .env("NEBULA_DATA_DIR", self.tmp.path().join("data"))
             .env("SHELL", "/bin/sh")
             .env("NEBULA_AGENT_CMD", agent_cmd)
             .env("NEBULA_WORKTREE_SYNC_MS", "100") // fast external-worktree pickup
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap()
+            .stderr(std::process::Stdio::null());
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd.spawn().unwrap()
+    }
+
+    /// Write the daemon's `config.json` (read from `NEBULA_DATA_DIR`)
+    /// before boot.
+    fn write_config(&self, json: &str) {
+        let data = self.tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("config.json"), json).unwrap();
     }
 
     /// A committed git repo to act as the project.
@@ -273,6 +287,9 @@ async fn full_crud_attach_and_restart_persistence() {
             worktree: main_worktree.id.clone(),
             name: "agent-1".into(),
             kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
         },
     )
     .await
@@ -652,6 +669,9 @@ async fn hook_post_from_agent_pty_drives_status() {
             worktree: worktree.id.clone(),
             name: "hooked".into(),
             kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
         },
     )
     .await
@@ -902,6 +922,9 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
             worktree: main_worktree.id.clone(),
             name: "mover".into(),
             kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
         },
     )
     .await
@@ -1030,6 +1053,9 @@ async fn codex_hooks_install_and_drive_status() {
             worktree: worktree.id.clone(),
             name: "codexed".into(),
             kind: AgentKind::Codex,
+            model: None,
+            effort: None,
+            auto_title: false,
         },
     )
     .await
@@ -1603,6 +1629,8 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
         &ClientRequest::PrewarmAgent {
             worktree: worktree.id.clone(),
             kind: AgentKind::Claude,
+            model: None,
+            effort: None,
         },
     )
     .await
@@ -1617,6 +1645,9 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
             worktree: worktree.id.clone(),
             name: "warm-agent".into(),
             kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
         },
     )
     .await
@@ -1724,6 +1755,8 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
         &ClientRequest::PrewarmAgent {
             worktree: worktree.id.clone(),
             kind: AgentKind::Claude,
+            model: None,
+            effort: None,
         },
     )
     .await
@@ -1738,6 +1771,9 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
             worktree: worktree.id.clone(),
             name: "fallback-agent".into(),
             kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
         },
     )
     .await
@@ -1761,6 +1797,626 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
     wait_for_exit(&mut daemon);
 }
 
+/// `kill -0` liveness probe (also true for an unreaped zombie).
+fn pid_alive(pid: i32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+async fn wait_pid_dead(pid: i32, timeout: Duration, what: &str) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while pid_alive(pid) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what} (pid {pid}) still running after {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn create_agent_get_id(
+    c: &mut UnixStream,
+    worktree: &nebula_core::WorktreeId,
+    name: &str,
+    req_id: u64,
+) -> nebula_core::AgentId {
+    write_frame(
+        c,
+        &ClientRequest::CreateAgent {
+            req_id,
+            worktree: worktree.clone(),
+            name: name.into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(c, Duration::from_secs(5), |evs| {
+        find_ack(evs, req_id).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(id)),
+        ..
+    } = find_ack(&events, req_id).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    id.clone()
+}
+
+/// Poll a pidfile the fake agent writes on boot.
+async fn read_pidfile(path: &Path) -> i32 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            if let Ok(pid) = s.trim().parse() {
+                return pid;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pidfile {path:?} never appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Archiving or deleting an agent must kill its CLI process — sessions must
+/// not keep burning memory/CPU once the user has put them away.
+#[tokio::test]
+async fn archive_and_delete_kill_the_agent_process() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let pid_dir = env.tmp.path().join("pids");
+    std::fs::create_dir_all(&pid_dir).unwrap();
+    // Stand-in CLI: record the pid, then exec into a long sleep (same pid).
+    let script = env.tmp.path().join("agent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'/$NEBULA_AGENT_ID.pid\nexec sleep 600\n",
+            pid_dir.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    let a1 = create_agent_get_id(&mut c, &worktree.id, "to-archive", 2).await;
+    let a2 = create_agent_get_id(&mut c, &worktree.id, "to-delete", 3).await;
+    let pid1 = read_pidfile(&pid_dir.join(format!("{}.pid", a1.0))).await;
+    let pid2 = read_pidfile(&pid_dir.join(format!("{}.pid", a2.0))).await;
+    assert!(pid_alive(pid1) && pid_alive(pid2), "fake CLIs should be up");
+
+    // ---- archive kills the CLI and broadcasts archived + not-alive ----
+    write_frame(&mut c, &ClientRequest::ArchiveAgent { req_id: 4, id: a1.clone() })
+        .await
+        .unwrap();
+    // The Ack and the EntityUpserted broadcast race on the client stream —
+    // wait for both.
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 4).is_some()
+            && evs.iter().any(|e| {
+                matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                    if a.id == a1 && a.archived)
+            })
+    })
+    .await;
+    let archived = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            } if a.id == a1 && a.archived => Some(a.clone()),
+            _ => None,
+        })
+        .expect("archive upsert");
+    assert!(!archived.alive, "archived agent should not be alive: {archived:?}");
+    wait_pid_dead(pid1, Duration::from_secs(5), "archived agent CLI").await;
+    assert!(pid_alive(pid2), "the other agent must be untouched");
+
+    // ---- delete kills the CLI too ----
+    write_frame(&mut c, &ClientRequest::DeleteAgent { req_id: 5, id: a2.clone() })
+        .await
+        .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 5).is_some()
+            && evs
+                .iter()
+                .any(|e| matches!(e, ServerEvent::EntityRemoved { id: EntityId::Agent(id) } if *id == a2))
+    })
+    .await;
+    wait_pid_dead(pid2, Duration::from_secs(5), "deleted agent CLI").await;
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// A wedged CLI that ignores SIGHUP still gets cleared on archive: the kill
+/// watchdog SIGKILLs its whole process group (grandchildren included) after
+/// the grace period.
+#[tokio::test]
+async fn archive_sigkills_an_agent_that_ignores_sighup() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let dir = env.tmp.path().to_path_buf();
+    // HUP-immune stand-in with a background child; `trap '' HUP` is inherited
+    // by `sleep`, so neither dies from the polite signal alone.
+    let script = dir.join("stubborn-agent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "trap '' HUP\n",
+                "echo $$ > '{d}/agent.pid'\n",
+                "sleep 600 &\n",
+                "echo $! > '{d}/child.pid'\n",
+                "wait\n",
+            ),
+            d = dir.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: worktree.id.clone(),
+            name: "stubborn".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+    let shell_pid = read_pidfile(&dir.join("agent.pid")).await;
+    let child_pid = read_pidfile(&dir.join("child.pid")).await;
+
+    write_frame(&mut c, &ClientRequest::ArchiveAgent { req_id: 3, id: agent_id })
+        .await
+        .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 3).is_some()
+    })
+    .await;
+    // SIGHUP alone can't clear these; the ~3s watchdog escalation must.
+    wait_pid_dead(shell_pid, Duration::from_secs(10), "HUP-immune agent CLI").await;
+    wait_pid_dead(child_pid, Duration::from_secs(10), "agent CLI's grandchild").await;
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// One PrewarmWorktreeSessions must revive every dead session under the
+/// worktree — no Attach involved — so the TUI can boot a worktree's
+/// sessions the moment the user's selection rests on it. Archived agents
+/// stay dead.
+#[tokio::test]
+async fn prewarm_worktree_sessions_boots_dead_sessions() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    // One agent, one terminal, one archived agent — every PTY dies with the
+    // daemon below.
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: worktree.id.clone(),
+            name: "warmed".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateTerminal {
+            req_id: 3,
+            worktree: worktree.id.clone(),
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 3).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Terminal(term_id)),
+        ..
+    } = find_ack(&events, 3).unwrap()
+    else {
+        panic!("CreateTerminal failed: {events:#?}");
+    };
+    let term_id = term_id.clone();
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 4,
+            worktree: worktree.id.clone(),
+            name: "shelved".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 4).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(archived_id)),
+        ..
+    } = find_ack(&events, 4).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let archived_id = archived_id.clone();
+    write_frame(
+        &mut c,
+        &ClientRequest::ArchiveAgent {
+            req_id: 5,
+            id: archived_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 5).is_some()
+    })
+    .await;
+
+    // Restart: rows persist, every PTY is dead.
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+    let mut daemon2 = env.spawn_daemon();
+    let mut c2 = connect(&env.sock()).await;
+    handshake(&mut c2).await;
+    write_frame(&mut c2, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    let events = read_events_until(&mut c2, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+    let ServerEvent::Snapshot {
+        agents, terminals, ..
+    } = &events[0]
+    else {
+        panic!("expected snapshot");
+    };
+    assert!(agents.iter().all(|a| !a.alive), "agents dead after restart");
+    assert!(
+        terminals.iter().all(|t| !t.alive),
+        "terminals dead after restart"
+    );
+
+    // One prewarm revives the agent and the terminal (upserts flip alive)…
+    write_frame(
+        &mut c2,
+        &ClientRequest::PrewarmWorktreeSessions {
+            worktree: worktree.id.clone(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c2, Duration::from_secs(10), |evs| {
+        let agent_alive = evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.alive)
+        });
+        let term_alive = evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Terminal(t) }
+                if t.id == term_id && t.alive)
+        });
+        agent_alive && term_alive
+    })
+    .await;
+    // …and never touches the archived agent.
+    assert!(
+        !events.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == archived_id && a.alive)
+        }),
+        "archived agent stayed dead: {events:#?}"
+    );
+
+    write_frame(&mut c2, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut daemon2);
+}
+
+/// The idle reaper kills sessions in worktrees no client is looking at once
+/// they age past `session_idle_timeout` — but spares terminals with a
+/// command still running, and never touches an attached session no matter
+/// how long it idles. A reaped agent revives on the next attach.
+#[tokio::test]
+async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    env.write_config(r#"{"session_idle_timeout": "2s"}"#);
+    let mut daemon = env.spawn_daemon_with("/bin/sh", &[("NEBULA_IDLE_REAP_MS", "200")]);
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: worktree.id.clone(),
+            name: "idler".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateTerminal {
+            req_id: 3,
+            worktree: worktree.id.clone(),
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 3).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Terminal(term_id)),
+        ..
+    } = find_ack(&events, 3).unwrap()
+    else {
+        panic!("CreateTerminal failed: {events:#?}");
+    };
+    let term_id = term_id.clone();
+
+    // A pinned agent: idle and unwatched like the idler, but marked "never
+    // kill" (schedules and background jobs are invisible to the status
+    // machine, so pinning is the user's protection).
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 4,
+            worktree: worktree.id.clone(),
+            name: "keeper".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 4).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(pinned_id)),
+        ..
+    } = find_ack(&events, 4).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let pinned_id = pinned_id.clone();
+    write_frame(
+        &mut c,
+        &ClientRequest::SetAgentPinned {
+            req_id: 5,
+            id: pinned_id.clone(),
+            pinned: true,
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 5).is_some()
+    })
+    .await;
+
+    // Give the terminal a running command, then stop looking at anything.
+    let term_sref = SessionRef::Terminal(term_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: term_sref.clone(),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: term_sref.clone(),
+            data: b"sleep 30\n".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::Detach {
+            session: term_sref.clone(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // Unwatched: the idle agent is reaped after ~2s…
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && !a.alive)
+        })
+    })
+    .await;
+    // …while the terminal's sleep and the keeper's pin keep them alive.
+    let term_reaped = |evs: &[ServerEvent]| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Terminal(t) }
+                if t.id == term_id && !t.alive)
+        })
+    };
+    let pinned_reaped = |evs: &[ServerEvent]| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == pinned_id && !a.alive)
+        })
+    };
+    assert!(!term_reaped(&events), "busy terminal spared: {events:#?}");
+    assert!(!pinned_reaped(&events), "pinned agent spared: {events:#?}");
+
+    // Attaching revives the agent; an attached session then idles forever.
+    let agent_sref = SessionRef::Agent(agent_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: agent_sref.clone(),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.alive)
+        })
+    })
+    .await;
+    // Well past the 2s timeout with sweeps every 200ms.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    write_frame(
+        &mut c,
+        &ClientRequest::RenameAgent {
+            req_id: 6,
+            id: agent_id.clone(),
+            name: "still-here".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 6).is_some()
+    })
+    .await;
+    assert!(
+        !events.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && !a.alive)
+        }),
+        "attached agent never reaped: {events:#?}"
+    );
+    assert!(
+        !term_reaped(&events),
+        "in-view terminal spared: {events:#?}"
+    );
+    assert!(
+        !pinned_reaped(&events),
+        "pinned agent still spared: {events:#?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 fn wait_for_exit(daemon: &mut std::process::Child) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -1778,4 +2434,168 @@ fn wait_for_exit(daemon: &mut std::process::Child) {
             }
         }
     }
+}
+
+/// Poll the env dump the fake agent CLI writes on boot, returning the
+/// NEBULA_* variables the real CLI's hooks (and `nebula rename`) would see.
+async fn read_env_file(path: &Path) -> std::collections::HashMap<String, String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            let map: std::collections::HashMap<String, String> = s
+                .lines()
+                .filter_map(|l| l.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            if map.contains_key("NEBULA_API_URL") && map.contains_key("NEBULA_API_TOKEN") {
+                return map;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "agent env dump {path:?} never appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Raw HTTP POST to the daemon's hook receiver, standing in for the curl
+/// one-liner the installed hook runs; returns (status, body) — the body is
+/// what the hook would pipe into the CLI's stdout.
+async fn hook_post(port: u16, path_query: &str, token: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let payload = r#"{"session_id":"s1"}"#;
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let req = format!(
+        "POST {path_query} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let status: u16 = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+/// The whole auto-title loop over real processes: a default-named agent's
+/// UserPromptSubmit hook response carries the titling instruction, the
+/// `nebula rename` CLI (what the model runs) applies it exactly once and
+/// broadcasts the new name, and afterwards the instruction stops and a
+/// retitle attempt is declined without failing.
+#[tokio::test]
+async fn auto_title_instruction_and_rename_flow() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let env_dir = env.tmp.path().join("agent-env");
+    std::fs::create_dir_all(&env_dir).unwrap();
+    // Stand-in CLI: capture the NEBULA_* env its hooks would use, then park.
+    let script = env.tmp.path().join("agent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nenv | grep '^NEBULA_' > '{}'/$NEBULA_AGENT_ID.env\nexec sleep 600\n",
+            env_dir.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    // Created with the accepted default name → auto-title pending.
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: worktree.id.clone(),
+            name: "agent-1".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: true,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+
+    let agent_env = read_env_file(&env_dir.join(format!("{}.env", agent_id.0))).await;
+    let port: u16 = agent_env["NEBULA_API_URL"]
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let token = agent_env["NEBULA_API_TOKEN"].clone();
+    let submit_path = format!(
+        "/api/hooks/claude?agentId={}&hookEvent=UserPromptSubmit",
+        agent_id.0
+    );
+
+    // First prompt on the untitled session: instruction rides the response.
+    let (status, body) = hook_post(port, &submit_path, &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, nebula_daemon::hooks::AUTO_TITLE_INSTRUCTION);
+
+    // The model obeys — `nebula rename` runs with the session's env.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(["rename", "Fix", "Login", "Redirect"])
+        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+        .env("NEBULA_AGENT_ID", &agent_id.0)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "rename failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Fix Login Redirect"), "stdout: {stdout}");
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.name == "Fix Login Redirect")
+        })
+    })
+    .await;
+
+    // Titled now: the next prompt injects nothing.
+    let (status, body) = hook_post(port, &submit_path, &token).await;
+    assert_eq!((status, body.as_str()), (200, ""));
+
+    // A repeat attempt is declined as a settled answer (exit 0), not a fault.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(["rename", "Another", "Title"])
+        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+        .env("NEBULA_AGENT_ID", &agent_id.0)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "declined rename must exit 0: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("already has a title"), "stdout: {stdout}");
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
 }

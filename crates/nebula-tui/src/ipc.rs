@@ -3,7 +3,7 @@
 
 use anyhow::{bail, Context, Result};
 use nebula_core::codec::{read_frame, write_frame};
-use nebula_core::{paths, ClientRequest, ServerEvent, PROTOCOL_VERSION};
+use nebula_core::{paths, AgentId, ClientRequest, ServerEvent, PROTOCOL_VERSION};
 use std::time::Duration;
 use tokio::net::UnixStream;
 
@@ -95,7 +95,7 @@ async fn handshake(mut stream: UnixStream) -> Result<Connection> {
             daemon_protocol_version,
         }) => bail!(
             "daemon speaks protocol v{daemon_protocol_version}, this client v{PROTOCOL_VERSION} — \
-             run `nebula kill-server` and relaunch"
+             run `nebula kill` and relaunch"
         ),
         other => bail!("unexpected handshake reply: {other:?}"),
     }
@@ -138,13 +138,68 @@ pub fn split_connection(conn: Connection) -> IpcChannels {
     }
 }
 
+/// One-shot client for `nebula rename`, run from inside an agent session's
+/// CLI: resolve the agent from NEBULA_AGENT_ID and ask the daemon to title
+/// it. Never spawns a daemon — no daemon means no session worth titling.
+///
+/// Daemon-reported outcomes (renamed, or "already titled" on the non-force
+/// path) both print and exit 0: for the model running this, a declined
+/// auto-title is a settled answer, not a failure to retry.
+pub async fn rename_current_agent(title: String, force: bool) -> Result<()> {
+    let agent_id = std::env::var("NEBULA_AGENT_ID")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .context(
+            "NEBULA_AGENT_ID is not set — `nebula rename` only works from inside a \
+             nebula agent session",
+        )?;
+    let sock = paths::socket_path();
+    let Ok(stream) = try_connect(&sock).await else {
+        bail!("no nebula daemon is running — title unchanged");
+    };
+    let mut conn = handshake(stream).await?;
+    let req_id = 1u64;
+    let id = AgentId(agent_id);
+    let request = if force {
+        ClientRequest::RenameAgent {
+            req_id,
+            id,
+            name: title.clone(),
+        }
+    } else {
+        ClientRequest::AutoRenameAgent {
+            req_id,
+            id,
+            name: title.clone(),
+        }
+    };
+    write_frame(&mut conn.stream, &request).await?;
+    loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::Ack { req_id: r, .. }) if r == req_id => {
+                println!("session renamed to \"{title}\"");
+                return Ok(());
+            }
+            Some(ServerEvent::Error {
+                req_id: Some(r),
+                message,
+            }) if r == req_id => {
+                println!("nebula: {message}");
+                return Ok(());
+            }
+            Some(_) => continue,
+            None => bail!("daemon closed the connection before replying"),
+        }
+    }
+}
+
 /// Ask a running daemon to shut down. Ok(false) when none is running.
 ///
 /// A daemon on a different protocol version closes the socket right after
 /// the handshake, so `Shutdown` can never reach it — exactly the situation
-/// kill-server exists to fix. Fall back to SIGTERM via the pidfile, guarded
+/// `nebula kill` exists to fix. Fall back to SIGTERM via the pidfile, guarded
 /// by the daemon's flock so a stale pid is never signalled.
-pub async fn kill_server() -> Result<bool> {
+pub async fn kill_daemon() -> Result<bool> {
     let sock = paths::socket_path();
     if let Ok(stream) = try_connect(&sock).await {
         if let Ok(mut conn) = handshake(stream).await {
@@ -240,7 +295,7 @@ fn daemon_holds_pidfile_lock(path: &std::path::Path) -> bool {
 }
 
 /// Poll until the daemon releases its pidfile lock, so a relaunch right after
-/// kill-server can't race the old daemon's teardown.
+/// `nebula kill` can't race the old daemon's teardown.
 async fn wait_for_daemon_exit() {
     let path = paths::pidfile_path();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);

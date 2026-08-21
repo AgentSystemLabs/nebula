@@ -48,11 +48,11 @@ fn finish_daemon_handoff() {
         Ok(IdleShutdown::SessionsLive { count }) => {
             let plural = if count == 1 { "" } else { "s" };
             println!("note: the old daemon is still running with {count} live session{plural}.");
-            println!("      run 'nebula kill-server' to restart onto the new binary (stops all sessions).");
+            println!("      run 'nebula kill' to restart onto the new binary (stops all sessions).");
         }
         Ok(IdleShutdown::Skewed) | Err(_) => {
             println!("note: a daemon from a previous version may still be running.");
-            println!("      run 'nebula kill-server' to restart onto the new binary (stops all sessions).");
+            println!("      run 'nebula kill' to restart onto the new binary (stops all sessions).");
         }
     }
 }

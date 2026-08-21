@@ -1,0 +1,53 @@
+{
+  "hooks": {
+    "afterAgentResponse": [
+      {
+        "_mcManaged": true,
+        "command": "if [ -z \"$MC_TASK_ID\" ] || [ -z \"$MC_API_URL\" ]; then printf '{\"continue\":true}\\n'; exit 0; fi; cat | curl -sS -m 3 -X POST -H \"Authorization: Bearer $MC_API_TOKEN\" -H \"X-Mission-Control-Runtime: electron-local\" -H \"Content-Type: application/json\" --data-binary @- \"$MC_API_URL/api/hooks/cursor?taskId=$MC_TASK_ID&hookEvent=afterAgentResponse\" >/dev/null 2>&1 || true; printf '{\"continue\":true}\\n'"
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "_mcManaged": true,
+        "command": "if [ -z \"$MC_TASK_ID\" ] || [ -z \"$MC_API_URL\" ]; then printf '{\"continue\":true}\\n'; exit 0; fi; cat | curl -sS -m 3 -X POST -H \"Authorization: Bearer $MC_API_TOKEN\" -H \"X-Mission-Control-Runtime: electron-local\" -H \"Content-Type: application/json\" --data-binary @- \"$MC_API_URL/api/hooks/cursor?taskId=$MC_TASK_ID&hookEvent=beforeSubmitPrompt\" >/dev/null 2>&1 || true; printf '{\"continue\":true}\\n'"
+      },
+      {
+        "_nebulaManaged": true,
+        "command": "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then printf '{\"continue\": true}\\n'; exit 0; fi; curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- \"$NEBULA_API_URL/api/hooks/cursor?agentId=$NEBULA_AGENT_ID&hookEvent=UserPromptSubmit\" >/dev/null 2>&1 || true; printf '{\"continue\": true}\\n'"
+      }
+    ],
+    "sessionStart": [
+      {
+        "_mcManaged": true,
+        "command": "if [ -z \"$MC_TASK_ID\" ] || [ -z \"$MC_API_URL\" ]; then printf '{\"continue\":true}\\n'; exit 0; fi; cat | curl -sS -m 3 -X POST -H \"Authorization: Bearer $MC_API_TOKEN\" -H \"X-Mission-Control-Runtime: electron-local\" -H \"Content-Type: application/json\" --data-binary @- \"$MC_API_URL/api/hooks/cursor?taskId=$MC_TASK_ID&hookEvent=sessionStart\" >/dev/null 2>&1 || true; printf '{\"continue\":true}\\n'"
+      },
+      {
+        "_nebulaManaged": true,
+        "command": "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then printf '{\"continue\": true}\\n'; exit 0; fi; curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- \"$NEBULA_API_URL/api/hooks/cursor?agentId=$NEBULA_AGENT_ID&hookEvent=SessionStart\" >/dev/null 2>&1 || true; printf '{\"continue\": true}\\n'"
+      }
+    ],
+    "stop": [
+      {
+        "_mcManaged": true,
+        "command": "if [ -z \"$MC_TASK_ID\" ] || [ -z \"$MC_API_URL\" ]; then printf '{\"continue\":true}\\n'; exit 0; fi; cat | curl -sS -m 3 -X POST -H \"Authorization: Bearer $MC_API_TOKEN\" -H \"X-Mission-Control-Runtime: electron-local\" -H \"Content-Type: application/json\" --data-binary @- \"$MC_API_URL/api/hooks/cursor?taskId=$MC_TASK_ID&hookEvent=stop\" >/dev/null 2>&1 || true; printf '{\"continue\":true}\\n'"
+      },
+      {
+        "_nebulaManaged": true,
+        "command": "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then printf '{\"continue\": true}\\n'; exit 0; fi; curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- \"$NEBULA_API_URL/api/hooks/cursor?agentId=$NEBULA_AGENT_ID&hookEvent=Stop\" >/dev/null 2>&1 || true; printf '{\"continue\": true}\\n'"
+      }
+    ],
+    "subagentStart": [
+      {
+        "_nebulaManaged": true,
+        "command": "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then printf '{\"continue\": true}\\n'; exit 0; fi; curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- \"$NEBULA_API_URL/api/hooks/cursor?agentId=$NEBULA_AGENT_ID&hookEvent=SubagentStart\" >/dev/null 2>&1 || true; printf '{\"continue\": true}\\n'"
+      }
+    ],
+    "subagentStop": [
+      {
+        "_nebulaManaged": true,
+        "command": "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then printf '{\"continue\": true}\\n'; exit 0; fi; curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" -H \"Content-Type: application/json\" --data-binary @- \"$NEBULA_API_URL/api/hooks/cursor?agentId=$NEBULA_AGENT_ID&hookEvent=SubagentStop\" >/dev/null 2>&1 || true; printf '{\"continue\": true}\\n'"
+      }
+    ]
+  },
+  "version": 1
+}

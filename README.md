@@ -30,7 +30,7 @@ into `~/.local/bin` (override with `NEBULA_INSTALL_DIR`), falling back to
 Once installed, `nebula upgrade` runs that same script for you — no need to
 remember the URL. It refuses to clobber a local `cargo build` (pass `--force`
 if you mean it). Upgrading while a daemon is running is safe: sessions keep
-running on the old binary until you run `nebula kill-server` (which stops all
+running on the old binary until you run `nebula kill` (which stops all
 sessions) and relaunch.
 
 ## How it works
@@ -56,6 +56,16 @@ sessions) and relaunch.
   hooks preserved, rebuilt each spawn. Each hook is a fail-soft curl to the
   daemon's loopback HTTP endpoint, authenticated with a per-boot bearer token
   injected into the agent's environment only.
+- **Sessions title themselves.** Create a session with the default name and
+  the agent renames it after your first prompt — a 3-4 word title describing
+  the ask (e.g. `Fix Login Redirect`), via a new `nebula rename <title>`
+  command the CLI runs in its own turn (no extra API calls, no MCP server).
+  Claude Code and Codex get the instruction injected through the
+  `UserPromptSubmit` hook response (the daemon sends it only while the
+  session is untitled); Cursor gets a managed `.cursor/rules/nebula-title.mdc`
+  project rule instead, since its hooks can't inject context. Titling is
+  one-shot and never clobbers a name you typed or set with `r` — a late
+  agent attempt is politely declined. `nebula rename --force` overrides.
 - **Everything persists in SQLite** (`~/.local/share/nebula/nebula.db` or the
   platform equivalent): projects, worktrees, agents (with kind + CLI session
   ids), and your last selection.
@@ -90,6 +100,7 @@ Worktree and project rows roll up their children: red beats yellow beats green.
 | Any panel | `Shift+T` | new shell terminal in the selected worktree's directory (Projects panel: the repo root) |
 | Any panel | `m` or right-click | context menu |
 | Any panel | `z` | collapse sidebars (full-width terminal) |
+| Any panel | `Shift+M` | memory usage: RAM per agent/terminal process tree, nebula itself, and the machine-wide share; `↑/↓` + `Enter` opens the selected session |
 | Any panel | `?` | help overlay |
 | Terminal | anything | forwarded raw to the PTY |
 | Terminal | `Ctrl+q` | back to panels (also expands sidebars) |
@@ -104,7 +115,8 @@ selection: hold `Shift` while dragging (mouse capture bypass — same as tmux).
 nebula                    # launch the TUI (auto-starts the daemon)
 nebula daemon             # run the daemon (normally auto-spawned)
 nebula daemon --foreground  # daemon with logs to stderr, for debugging
-nebula kill-server        # stop the daemon and all sessions cleanly
+nebula kill               # stop the daemon and all sessions cleanly
+nebula rename <title>     # title the current session (agents run this; --force to retitle)
 nebula upgrade            # install the latest release (--force on a dev build)
 ```
 

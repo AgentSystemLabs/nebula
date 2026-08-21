@@ -7,6 +7,7 @@
 //! The settings overlay is the writer: it patches known keys and leaves
 //! any other JSON fields (including future daemon keys) untouched.
 
+use nebula_core::AgentKind;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -16,7 +17,38 @@ pub const DEFAULT_RECENT_WINDOW_MS: i64 = 30 * 60 * 1000;
 /// Values the settings overlay cycles through for `recent_window`.
 pub const RECENT_WINDOWS: &[&str] = &["off", "5m", "10m", "30m", "1h", "24h"];
 
-/// One row in the settings overlay, in display order.
+/// Values the settings overlay cycles through for `session_idle_timeout`
+/// (daemon-owned: how long unwatched idle sessions live before their PTY
+/// is reaped).
+pub const SESSION_IDLE_TIMEOUTS: &[&str] = &["off", "1m", "5m", "15m", "30m", "1h"];
+
+/// Model/effort choices for the new-session submenus and the settings
+/// overlay. "default" everywhere means "don't pass the flag — let the CLI
+/// pick" and is what the daemon sees as None.
+pub const CLAUDE_MODELS: &[&str] = &["default", "fable", "opus", "sonnet", "haiku"];
+pub const CLAUDE_EFFORTS: &[&str] = &["default", "low", "medium", "high", "xhigh", "max"];
+pub const CODEX_MODELS: &[&str] = &["default", "gpt-5.6-sol", "gpt-5.5"];
+pub const CODEX_EFFORTS: &[&str] = &["default", "minimal", "low", "medium", "high", "xhigh"];
+
+/// Model choices for a session kind; empty = no model submenu (Cursor).
+pub fn model_choices(kind: AgentKind) -> &'static [&'static str] {
+    match kind {
+        AgentKind::Claude => CLAUDE_MODELS,
+        AgentKind::Codex => CODEX_MODELS,
+        AgentKind::Cursor => &[],
+    }
+}
+
+/// Effort choices for a session kind; empty = no effort submenu (Cursor).
+pub fn effort_choices(kind: AgentKind) -> &'static [&'static str] {
+    match kind {
+        AgentKind::Claude => CLAUDE_EFFORTS,
+        AgentKind::Codex => CODEX_EFFORTS,
+        AgentKind::Cursor => &[],
+    }
+}
+
+/// One setting row in the overlay; rows live inside a [`SettingGroup`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SettingSpec {
     pub kind: SettingKind,
@@ -24,36 +56,133 @@ pub struct SettingSpec {
     pub hint: &'static str,
 }
 
+/// A titled section of the settings overlay, Help-menu style. Flat
+/// setting indices (selection, `Config::cycle`) run through the groups
+/// in declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingGroup {
+    pub title: &'static str,
+    pub settings: &'static [SettingSpec],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingKind {
     PaletteEnterAttaches,
     GitInitOnCreate,
     RecentWindow,
+    SessionIdleTimeout,
     Theme,
+    ClaudeModel,
+    ClaudeEffort,
+    CodexModel,
+    CodexEffort,
 }
 
-pub const SETTINGS: &[SettingSpec] = &[
-    SettingSpec {
-        kind: SettingKind::PaletteEnterAttaches,
-        label: "Search Enter attaches",
-        hint: "Enter in / search opens the session in the terminal",
+pub const SETTING_GROUPS: &[SettingGroup] = &[
+    SettingGroup {
+        title: "GENERAL",
+        settings: &[
+            SettingSpec {
+                kind: SettingKind::PaletteEnterAttaches,
+                label: "Search Enter attaches",
+                hint: "Enter in / search opens the session in the terminal",
+            },
+            SettingSpec {
+                kind: SettingKind::GitInitOnCreate,
+                label: "git init new projects",
+                hint: "When adding a missing directory, run git init in it",
+            },
+        ],
     },
-    SettingSpec {
-        kind: SettingKind::GitInitOnCreate,
-        label: "git init new projects",
-        hint: "When adding a missing directory, run git init in it",
+    SettingGroup {
+        title: "SESSIONS",
+        settings: &[
+            SettingSpec {
+                kind: SettingKind::RecentWindow,
+                label: "Recent window",
+                hint: "How long unpinned sessions stay in the RECENT group",
+            },
+            SettingSpec {
+                kind: SettingKind::SessionIdleTimeout,
+                label: "Idle session timeout",
+                hint: "Kill idle sessions in unviewed worktrees (pinned/busy spared; off disables)",
+            },
+        ],
     },
-    SettingSpec {
-        kind: SettingKind::RecentWindow,
-        label: "Recent window",
-        hint: "How long unpinned sessions stay in the RECENT group",
+    SettingGroup {
+        title: "APPEARANCE",
+        settings: &[SettingSpec {
+            kind: SettingKind::Theme,
+            label: "Color theme",
+            hint: "Accent colors used across the panels and overlays",
+        }],
     },
-    SettingSpec {
-        kind: SettingKind::Theme,
-        label: "Color theme",
-        hint: "Accent colors used across the panels and overlays",
+    SettingGroup {
+        title: "AGENT DEFAULTS",
+        settings: &[
+            SettingSpec {
+                kind: SettingKind::ClaudeModel,
+                label: "Claude model",
+                hint: "Default model for new Claude sessions (default = CLI's pick)",
+            },
+            SettingSpec {
+                kind: SettingKind::ClaudeEffort,
+                label: "Claude effort",
+                hint: "Default reasoning effort for new Claude sessions",
+            },
+            SettingSpec {
+                kind: SettingKind::CodexModel,
+                label: "Codex model",
+                hint: "Default model for new Codex sessions (default = CLI's pick)",
+            },
+            SettingSpec {
+                kind: SettingKind::CodexEffort,
+                label: "Codex effort",
+                hint: "Default reasoning effort for new Codex sessions",
+            },
+        ],
     },
 ];
+
+/// All settings in flat display order (the order selection indices use).
+pub fn settings() -> impl Iterator<Item = &'static SettingSpec> {
+    SETTING_GROUPS.iter().flat_map(|g| g.settings.iter())
+}
+
+pub fn settings_len() -> usize {
+    settings().count()
+}
+
+/// The setting at a flat display index, if any.
+pub fn setting_at(index: usize) -> Option<&'static SettingSpec> {
+    settings().nth(index)
+}
+
+/// One terminal row of the settings overlay body, in display order.
+/// Shared by the renderer and mouse hit-testing so they can't drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsRow {
+    Blank,
+    Header(&'static str),
+    /// Label + value line for the setting at this flat index.
+    Setting(usize),
+}
+
+pub fn settings_rows() -> Vec<SettingsRow> {
+    let mut rows = Vec::new();
+    let mut index = 0;
+    for (gi, group) in SETTING_GROUPS.iter().enumerate() {
+        if gi > 0 {
+            rows.push(SettingsRow::Blank);
+        }
+        rows.push(SettingsRow::Header(group.title));
+        for _ in group.settings {
+            rows.push(SettingsRow::Setting(index));
+            index += 1;
+        }
+    }
+    rows
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -71,9 +200,22 @@ pub struct Config {
     /// changed: "5m", "10m", "30m", "1h", "24h" (any `<n>m`/`<n>h` works).
     /// "off" disables the group. Malformed values fall back to 30m.
     pub recent_window: String,
+    /// How long an idle session in an unviewed worktree lives before the
+    /// daemon reaps its PTY: "1m", "5m", "15m", "30m", "1h"; "off"
+    /// disables. Owned by the daemon (which does the parsing and reaping);
+    /// the TUI writes it so the settings overlay can cycle it.
+    pub session_idle_timeout: String,
     /// Color theme name (see `theme::THEMES`). Unknown names fall back to
     /// the default theme.
     pub theme: String,
+    /// Default model/effort for new Claude / Codex sessions. "default"
+    /// means "don't pass the flag" (the CLI picks); any other value is
+    /// passed through verbatim, so hand-edited configs can name models the
+    /// pickers don't list.
+    pub claude_model: String,
+    pub claude_effort: String,
+    pub codex_model: String,
+    pub codex_effort: String,
 }
 
 impl Default for Config {
@@ -82,7 +224,12 @@ impl Default for Config {
             palette_enter_attaches: true,
             git_init_on_create: true,
             recent_window: "30m".into(),
+            session_idle_timeout: "5m".into(),
             theme: "default".into(),
+            claude_model: "default".into(),
+            claude_effort: "default".into(),
+            codex_model: "default".into(),
+            codex_effort: "default".into(),
         }
     }
 }
@@ -125,7 +272,18 @@ impl Config {
             "recent_window".into(),
             serde_json::json!(self.recent_window),
         );
+        obj.insert(
+            "session_idle_timeout".into(),
+            serde_json::json!(self.session_idle_timeout),
+        );
         obj.insert("theme".into(), serde_json::json!(self.theme));
+        obj.insert("claude_model".into(), serde_json::json!(self.claude_model));
+        obj.insert(
+            "claude_effort".into(),
+            serde_json::json!(self.claude_effort),
+        );
+        obj.insert("codex_model".into(), serde_json::json!(self.codex_model));
+        obj.insert("codex_effort".into(), serde_json::json!(self.codex_effort));
         let mut bytes = serde_json::to_vec_pretty(&root)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
         if !bytes.ends_with(b"\n") {
@@ -147,21 +305,49 @@ impl Config {
         crate::theme::Theme::by_name(&self.theme)
     }
 
+    /// The configured default model for new sessions of `kind`, as the
+    /// daemon wants it: None = "default" = don't pass the flag.
+    pub fn default_model(&self, kind: AgentKind) -> Option<String> {
+        let value = match kind {
+            AgentKind::Claude => &self.claude_model,
+            AgentKind::Codex => &self.codex_model,
+            AgentKind::Cursor => return None,
+        };
+        non_default(value)
+    }
+
+    /// The configured default effort for new sessions of `kind`;
+    /// None = "default" = don't pass the flag.
+    pub fn default_effort(&self, kind: AgentKind) -> Option<String> {
+        let value = match kind {
+            AgentKind::Claude => &self.claude_effort,
+            AgentKind::Codex => &self.codex_effort,
+            AgentKind::Cursor => return None,
+        };
+        non_default(value)
+    }
+
     pub fn value_label(&self, kind: SettingKind) -> String {
         match kind {
             SettingKind::PaletteEnterAttaches => on_off(self.palette_enter_attaches).into(),
             SettingKind::GitInitOnCreate => on_off(self.git_init_on_create).into(),
             SettingKind::RecentWindow => self.recent_window.clone(),
+            SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
             SettingKind::Theme => self.theme.clone(),
+            SettingKind::ClaudeModel => self.claude_model.clone(),
+            SettingKind::ClaudeEffort => self.claude_effort.clone(),
+            SettingKind::CodexModel => self.codex_model.clone(),
+            SettingKind::CodexEffort => self.codex_effort.clone(),
         }
     }
 
     /// `delta == 0` means activate (toggle a bool, cycle a choice forward).
     /// Non-zero delta cycles a choice; bools still toggle.
     pub fn cycle(&mut self, index: usize, delta: i32) {
-        let Some(spec) = SETTINGS.get(index) else {
+        let Some(spec) = setting_at(index) else {
             return;
         };
+        let step = if delta == 0 { 1 } else { delta };
         match spec.kind {
             SettingKind::PaletteEnterAttaches => {
                 self.palette_enter_attaches = !self.palette_enter_attaches;
@@ -170,15 +356,35 @@ impl Config {
                 self.git_init_on_create = !self.git_init_on_create;
             }
             SettingKind::RecentWindow => {
-                let step = if delta == 0 { 1 } else { delta };
                 self.recent_window = cycle_choice(&self.recent_window, RECENT_WINDOWS, step).into();
             }
+            SettingKind::SessionIdleTimeout => {
+                self.session_idle_timeout =
+                    cycle_choice(&self.session_idle_timeout, SESSION_IDLE_TIMEOUTS, step).into();
+            }
             SettingKind::Theme => {
-                let step = if delta == 0 { 1 } else { delta };
                 self.theme = cycle_choice(&self.theme, crate::theme::THEMES, step).into();
+            }
+            SettingKind::ClaudeModel => {
+                self.claude_model = cycle_choice(&self.claude_model, CLAUDE_MODELS, step).into();
+            }
+            SettingKind::ClaudeEffort => {
+                self.claude_effort = cycle_choice(&self.claude_effort, CLAUDE_EFFORTS, step).into();
+            }
+            SettingKind::CodexModel => {
+                self.codex_model = cycle_choice(&self.codex_model, CODEX_MODELS, step).into();
+            }
+            SettingKind::CodexEffort => {
+                self.codex_effort = cycle_choice(&self.codex_effort, CODEX_EFFORTS, step).into();
             }
         }
     }
+}
+
+/// "default" (or blank) → None; anything else passes through.
+fn non_default(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && !value.eq_ignore_ascii_case("default")).then(|| value.to_string())
 }
 
 fn on_off(v: bool) -> &'static str {
@@ -309,12 +515,31 @@ mod tests {
     }
 
     #[test]
+    fn session_idle_timeout_cycles_and_persists() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.session_idle_timeout, "5m");
+        let row = settings()
+            .position(|s| s.kind == SettingKind::SessionIdleTimeout)
+            .unwrap();
+        cfg.cycle(row, 1);
+        assert_eq!(cfg.session_idle_timeout, "15m");
+        cfg.cycle(row, -2);
+        assert_eq!(cfg.session_idle_timeout, "1m");
+        cfg.cycle(row, -1);
+        assert_eq!(cfg.session_idle_timeout, "off");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert_eq!(load_from(&path).session_idle_timeout, "off");
+    }
+
+    #[test]
     fn theme_cycles_through_presets_and_resolves() {
         let mut cfg = Config::default();
         assert_eq!(cfg.theme, "default");
         assert_eq!(cfg.theme(), crate::theme::Theme::default());
-        let theme_row = SETTINGS
-            .iter()
+        let theme_row = settings()
             .position(|s| s.kind == SettingKind::Theme)
             .unwrap();
         cfg.cycle(theme_row, 1);
@@ -326,6 +551,56 @@ mod tests {
         // resolve to the default palette rather than erroring.
         cfg.theme = "sparkle".into();
         assert_eq!(cfg.theme(), crate::theme::Theme::default());
+    }
+
+    #[test]
+    fn model_effort_defaults_resolve_and_cycle() {
+        let mut cfg = Config::default();
+        // "default" everywhere → no flags for any kind.
+        assert_eq!(cfg.default_model(AgentKind::Claude), None);
+        assert_eq!(cfg.default_effort(AgentKind::Claude), None);
+        assert_eq!(cfg.default_model(AgentKind::Codex), None);
+        assert_eq!(cfg.default_effort(AgentKind::Codex), None);
+
+        cfg.claude_model = "opus".into();
+        cfg.codex_effort = "high".into();
+        assert_eq!(cfg.default_model(AgentKind::Claude).as_deref(), Some("opus"));
+        assert_eq!(cfg.default_effort(AgentKind::Claude), None);
+        assert_eq!(cfg.default_model(AgentKind::Codex), None);
+        assert_eq!(cfg.default_effort(AgentKind::Codex).as_deref(), Some("high"));
+        // Cursor has no model/effort knobs regardless of settings.
+        assert_eq!(cfg.default_model(AgentKind::Cursor), None);
+        assert_eq!(cfg.default_effort(AgentKind::Cursor), None);
+
+        // The settings rows walk the same choice lists the submenus show.
+        let row = settings()
+            .position(|s| s.kind == SettingKind::ClaudeModel)
+            .unwrap();
+        cfg.claude_model = "default".into();
+        cfg.cycle(row, 1);
+        assert_eq!(cfg.claude_model, "fable");
+        cfg.cycle(row, -1);
+        assert_eq!(cfg.claude_model, "default");
+        let row = settings()
+            .position(|s| s.kind == SettingKind::CodexEffort)
+            .unwrap();
+        cfg.cycle(row, 0);
+        assert_eq!(cfg.codex_effort, "xhigh", "activate steps forward from high");
+    }
+
+    #[test]
+    fn save_persists_model_effort_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut cfg = Config::default();
+        cfg.claude_model = "sonnet".into();
+        cfg.codex_effort = "xhigh".into();
+        cfg.save_to(&path).unwrap();
+        let reread = load_from(&path);
+        assert_eq!(reread.claude_model, "sonnet");
+        assert_eq!(reread.claude_effort, "default");
+        assert_eq!(reread.codex_model, "default");
+        assert_eq!(reread.codex_effort, "xhigh");
     }
 
     #[test]
@@ -357,6 +632,31 @@ mod tests {
         assert_eq!(saved["git_init_on_create"], true);
         assert_eq!(saved["recent_window"], "1h");
         assert_eq!(saved["future_daemon_flag"], true);
+    }
+
+    #[test]
+    fn groups_cover_every_setting_once_and_rows_match() {
+        // Every SettingKind appears exactly once across the groups.
+        let mut kinds: Vec<SettingKind> = settings().map(|s| s.kind).collect();
+        assert_eq!(kinds.len(), settings_len());
+        kinds.dedup();
+        assert_eq!(kinds.len(), settings_len(), "a kind repeats across groups");
+
+        // The overlay rows walk the same flat order: one Setting(i) per
+        // index, in order, with a header starting each group.
+        let indices: Vec<usize> = settings_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                SettingsRow::Setting(i) => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(indices, (0..settings_len()).collect::<Vec<_>>());
+        let headers = settings_rows()
+            .into_iter()
+            .filter(|row| matches!(row, SettingsRow::Header(_)))
+            .count();
+        assert_eq!(headers, SETTING_GROUPS.len());
     }
 
     #[test]

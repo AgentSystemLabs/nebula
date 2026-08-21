@@ -213,7 +213,7 @@ impl Drop for TuiHarness {
         let _ = self.child.kill();
         // Stop the auto-spawned daemon and clean the short-lived dirs.
         let _ = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-            .arg("kill-server")
+            .arg("kill")
             .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
             .env("NEBULA_DATA_DIR", &self.data_dir)
             .stdout(std::process::Stdio::null())
@@ -493,6 +493,114 @@ fn tui_projects_worktrees_agents_navigation() {
             ),
         }
     }
+}
+
+#[test]
+fn tui_help_modal_grouped_keymap() {
+    let mut tui = TuiHarness::spawn();
+    tui.wait_for_text("No projects yet");
+
+    // The grouped two-column keymap: every section header on screen at
+    // once, including the todo hotkey (the old single list clipped its
+    // tail on short terminals).
+    tui.send(b"?");
+    tui.wait_for_text("NAVIGATE & SEARCH");
+    tui.wait_for_text("PROJECTS");
+    tui.wait_for_text("WORKTREES");
+    tui.wait_for_text("SESSIONS");
+    tui.wait_for_text("TERMINAL & MOUSE");
+    tui.wait_for_text("GENERAL");
+    tui.wait_for_text("todo notes for the worktree");
+    tui.wait_for_text("project-level todo notes");
+
+    tui.send(&[0x1b]); // Esc closes
+    tui.wait_for_gone("NAVIGATE & SEARCH");
+}
+
+#[test]
+fn tui_todo_modal_crud_and_badge() {
+    let mut tui = TuiHarness::spawn();
+    let repo = tui.make_repo("todo-proj");
+
+    tui.wait_for_text("No projects yet");
+    add_project(&mut tui, &repo, "todo-proj");
+    // The root worktree row must exist before o has a list to open.
+    tui.wait_for_text("⌂ root");
+
+    // ---- Projects focus: o opens the PROJECT's own list (no branch in
+    // the title — the trailing space keeps it from matching ".../main") ----
+    tui.send(b"o");
+    tui.wait_for_text("Todos — todo-proj ");
+    tui.wait_for_text("no todos yet");
+    tui.send(b"o"); // start the add input
+    tui.type_str("project level plan");
+    tui.send(b"\r");
+    tui.wait_for_text("☐ project level plan");
+    tui.send(b" "); // done — the project badge reads ✓1
+    tui.wait_for_text("✓ project level plan");
+    tui.send(&[0x1b]); // Esc closes
+    tui.wait_for_gone("Todos — todo-proj ");
+    tui.wait_for_text("✓1"); // project-row badge
+
+    // ---- Worktrees focus: o opens the WORKTREE's list — a separate,
+    // still-empty set of notes ----
+    tui.send(b"\r"); // Projects → Worktrees
+    tui.wait_for_text(FOOTER_WORKTREES);
+    tui.send(b"o");
+    tui.wait_for_text("Todos — todo-proj/main");
+    tui.wait_for_text("no todos yet");
+
+    // ---- create ----
+    tui.send(b"o"); // start the add input
+    tui.type_str("ship the feature");
+    tui.send(b"\r");
+    tui.wait_for_text("☐ ship the feature");
+    tui.wait_for_text("(1 open)");
+    tui.send(b"a"); // a second note, via the alternate add key
+    tui.type_str("write docs");
+    tui.send(b"\r");
+    tui.wait_for_text("☐ write docs");
+    tui.wait_for_text("(2 open)");
+
+    // ---- update: the cursor sits on the just-created note ----
+    tui.send(b"\r"); // edit "write docs" (prefilled)
+    tui.type_str(" tomorrow");
+    tui.send(b"\r");
+    tui.wait_for_text("☐ write docs tomorrow");
+
+    // ---- toggle done ----
+    tui.send(b" ");
+    tui.wait_for_text("✓ write docs tomorrow");
+    tui.wait_for_text("(1 open)");
+
+    // ---- the worktree row badge shows the open count ----
+    tui.send(&[0x1b]); // Esc closes the modal
+    tui.wait_for_gone("Todos — todo-proj/main");
+    tui.wait_for_text("☐1");
+
+    // ---- delete: k up to the open note, d removes it ----
+    tui.send(b"o");
+    tui.wait_for_text("Todos — todo-proj/main");
+    tui.send(b"k");
+    tui.wait_for_selected("☐ ship the feature");
+    tui.send(b"d");
+    tui.wait_for_gone("ship the feature");
+    tui.wait_for_text("(all 1 done)");
+
+    // ---- deleting the last worktree note empties only THIS list ----
+    tui.send(b"d");
+    tui.wait_for_text("no todos yet");
+    tui.send(&[0x1b]);
+    tui.wait_for_gone("Todos — todo-proj/main");
+
+    // ---- the project's own note survived untouched ----
+    tui.send(b"h"); // back to Projects focus
+    tui.wait_for_text(FOOTER_PROJECTS);
+    tui.send(b"o");
+    tui.wait_for_text("Todos — todo-proj ");
+    tui.wait_for_text("✓ project level plan");
+    tui.send(&[0x1b]);
+    tui.wait_for_gone("Todos — todo-proj ");
 }
 
 #[test]

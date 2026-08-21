@@ -131,15 +131,18 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 .as_deref()
                 .map(|t| t.chars().count() + 2)
                 .unwrap_or(0);
-            let width = (menu
+            let label_w = menu
                 .items
                 .iter()
                 .map(|i| i.label.chars().count())
                 .max()
-                .unwrap_or(8)
-                + 4)
-            .max(title_width + 2)
-            .min(f.area().width as usize) as u16;
+                .unwrap_or(8);
+            // Rows that expand into a submenu get a right-aligned ▸ in an
+            // extra column so the affordance is visible before hovering.
+            let any_submenu = menu.items.iter().any(|i| i.action.submenu().is_some());
+            let width = (label_w + 4 + if any_submenu { 2 } else { 0 })
+                .max(title_width + 2)
+                .min(f.area().width as usize) as u16;
             let height = menu.items.len() as u16 + 2;
             let area = match menu.at {
                 Some((ax, ay)) => {
@@ -182,10 +185,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 if i == menu.hover {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
-                f.render_widget(
-                    Paragraph::new(Span::styled(format!(" {} ", item.label), style)),
-                    row,
-                );
+                let text = if item.action.submenu().is_some() {
+                    format!(" {:<label_w$} ▸ ", item.label)
+                } else if any_submenu {
+                    format!(" {:<label_w$}   ", item.label)
+                } else {
+                    format!(" {} ", item.label)
+                };
+                f.render_widget(Paragraph::new(Span::styled(text, style)), row);
             }
             // Record the drawn area for click hit-testing.
             if let Some(Overlay::Menu(m)) = &mut app.overlay {
@@ -294,7 +301,91 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Paragraph::new(lines), inner);
         }
         Overlay::Help => {
-            let area = centered_rect(f.area(), 60, 35);
+            // Grouped keymap in two columns: reads by task instead of one
+            // giant list, and at ~24 rows it fits a stock terminal window
+            // (the old single list clipped its tail on short screens).
+            type HelpSection = (&'static str, &'static [(&'static str, &'static str)]);
+            const LEFT: &[HelpSection] = &[
+                (
+                    "NAVIGATE & SEARCH",
+                    &[
+                        ("Tab / ⇧Tab", "cycle focus between panels"),
+                        ("←↓↑→ / hjkl", "move focus / selection"),
+                        ("Enter", "drill in / attach session"),
+                        ("/", "fuzzy jump to anything"),
+                        ("^o / ^f", "jump pick: open / focus row"),
+                        ("f", "find file (^y copies path)"),
+                        ("F", "find in files (git grep)"),
+                        ("t", "file tree browser"),
+                    ],
+                ),
+                (
+                    "PROJECTS",
+                    &[
+                        ("n", "add project"),
+                        ("o", "project-level todo notes"),
+                        ("⇧J/K", "reorder project"),
+                        ("-", "divider below (Enter/r: label)"),
+                        ("d / ⌫", "remove from list"),
+                    ],
+                ),
+                (
+                    "WORKTREES",
+                    &[
+                        ("n", "new worktree"),
+                        ("o", "todo notes for the worktree"),
+                        ("g", "git diff (^r: mark reviewed ✓)"),
+                        ("p", "pin / unpin"),
+                        ("d / D", "delete one / delete all"),
+                    ],
+                ),
+            ];
+            const RIGHT: &[HelpSection] = &[
+                (
+                    "SESSIONS",
+                    &[
+                        ("n", "new agent (pick CLI kind)"),
+                        ("T", "new shell terminal"),
+                        ("Enter", "attach + lock input"),
+                        ("r", "rename agent / terminal"),
+                        ("p", "pin / unpin"),
+                        ("a / u", "archive / unarchive (A: show/hide)"),
+                        ("m", "context menu (right-click)"),
+                        ("d / D", "delete one / delete all"),
+                    ],
+                ),
+                (
+                    "TERMINAL & MOUSE",
+                    &[
+                        ("Enter / z", "lock input (z: full-screen)"),
+                        ("^q / ^]", "unlock, back to panels"),
+                        ("drag", "select + copy (2×click: word)"),
+                        ("⌥click", "open URL / file under cursor"),
+                        ("⇧drag", "select via your terminal"),
+                        ("drag border", "resize panels"),
+                    ],
+                ),
+                (
+                    "GENERAL",
+                    &[
+                        ("s", "settings"),
+                        ("M", "memory usage (nebula + agents)"),
+                        ("^u", "clear typed input"),
+                        ("q / ?", "quit / toggle this help"),
+                    ],
+                ),
+            ];
+            // Rows a column needs: each section is a header plus its
+            // entries, with a blank line between sections.
+            let rows = |sections: &[HelpSection]| -> u16 {
+                sections
+                    .iter()
+                    .map(|(_, entries)| entries.len() as u16 + 1)
+                    .sum::<u16>()
+                    + sections.len().saturating_sub(1) as u16
+            };
+            let height = rows(LEFT).max(rows(RIGHT)) + 2;
+            let area = centered_rect(f.area(), 92, height);
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -302,64 +393,49 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 .title(" Help ");
             let inner = block.inner(area);
             f.render_widget(block, area);
-            let dim = Style::default().fg(th.dim);
-            let lines: Vec<Line> = [
-                ("Tab / Shift+Tab", "cycle focus between panels"),
-                ("h/l or ←/→", "move focus left / right (Ctrl+←/→ too)"),
-                (
-                    "j/k or ↓/↑",
-                    "move selection (session rows preview in the pane)",
-                ),
-                ("Enter", "drill in; sessions/terminal pane: lock input"),
-                ("n", "new project / worktree / agent (per panel)"),
-                ("T", "new terminal in the worktree (projects panel: its root)"),
-                ("Shift+J/K", "move project up / down (⇧↑/↓ where supported)"),
-                ("-", "divider below project / remove selected divider"),
-                ("Enter or r", "on a divider: edit its label"),
-                ("r", "rename (sessions panel)"),
-                ("p", "pin / unpin worktree or agent (per panel)"),
-                ("a", "archive agent"),
-                ("u", "unarchive agent"),
-                ("d / ⌫", "delete (confirms first)"),
-                ("D", "delete ALL worktrees / sessions in the panel"),
-                ("A", "toggle archived agents"),
-                ("m / right-click", "context menu"),
-                ("g", "git diff of the selected worktree"),
-                ("Ctrl+r", "diff view: toggle reviewed ✓ on the file"),
-                ("f", "fuzzy find a file, Enter edits it in vim, Ctrl+y copies"),
-                ("F", "find in files (git grep), Enter edits the hit in vim"),
-                ("t", "file tree browser; Enter edits in the preview pane"),
-                ("/", "fuzzy search projects / worktrees / sessions"),
-                ("s", "settings (toggles write to config.json)"),
-                (
-                    "Ctrl+o / Ctrl+f",
-                    "search pick: open session / focus its row",
-                ),
-                ("Ctrl+u", "clear the typed input / filter in any overlay"),
-                ("Ctrl+q", "terminal input → back to panels (also Ctrl+])"),
-                ("drag", "select terminal text → copies to clipboard"),
-                ("double-click", "select the word under the cursor"),
-                ("⌥+click", "open the URL under the cursor"),
-                ("Shift+drag", "select text with your terminal"),
-                ("drag border", "resize the panels"),
-                ("q", "quit"),
-            ]
-            .iter()
-            .map(|(k, v)| {
-                Line::from(vec![
-                    Span::styled(format!(" {k:<16}"), Style::default().fg(th.accent)),
-                    Span::styled((*v).to_string(), dim),
-                ])
-            })
-            .collect();
-            f.render_widget(Paragraph::new(lines), inner);
+            let [left_a, right_a] =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .areas(inner);
+            let column = |sections: &[HelpSection], width: u16| -> Vec<Line> {
+                let mut lines = Vec::new();
+                for (i, (title, entries)) in sections.iter().enumerate() {
+                    if i > 0 {
+                        lines.push(Line::from(""));
+                    }
+                    lines.push(Line::from(Span::styled(
+                        format!(" {title}"),
+                        Style::default()
+                            .fg(th.muted)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    for (k, v) in *entries {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!(" {k:<13}"),
+                                Style::default().fg(th.accent),
+                            ),
+                            Span::styled(
+                                truncate(v, (width as usize).saturating_sub(15)),
+                                Style::default().fg(th.dim),
+                            ),
+                        ]));
+                    }
+                }
+                lines
+            };
+            f.render_widget(Paragraph::new(column(LEFT, left_a.width)), left_a);
+            f.render_widget(Paragraph::new(column(RIGHT, right_a.width)), right_a);
         }
         Overlay::Settings(view) => {
+            // Grouped like the Help overlay: titled sections instead of one
+            // flat list. Each setting is a single label+value row; the
+            // selected row's hint shows in the footer, which keeps the
+            // modal short enough for a stock terminal as settings grow.
             let cfg = crate::config::Config::load();
-            let n = crate::config::SETTINGS.len();
-            // 2 rows per setting (label + hint), then blank + hints + path.
-            let height = (n * 2 + 5) as u16;
-            let area = centered_rect(f.area(), 64, height);
+            let rows = crate::config::settings_rows();
+            // Body rows, then footer: blank + hint + keys + path.
+            let height = rows.len() as u16 + 4 + 2;
+            let area = centered_rect(f.area(), 80, height);
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -375,33 +451,289 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             let dim = Style::default().fg(th.dim);
             let mut lines: Vec<Line> = Vec::new();
-            for (i, spec) in crate::config::SETTINGS.iter().enumerate() {
-                let value = cfg.value_label(spec.kind);
-                let mut label_style = Style::default();
-                let mut value_style = Style::default().fg(th.accent);
-                if i == view.selected {
-                    label_style = label_style.add_modifier(Modifier::REVERSED);
-                    value_style = value_style.add_modifier(Modifier::REVERSED);
+            for row in &rows {
+                match row {
+                    crate::config::SettingsRow::Blank => lines.push(Line::from("")),
+                    crate::config::SettingsRow::Header(title) => {
+                        lines.push(Line::from(Span::styled(
+                            format!(" {title}"),
+                            Style::default()
+                                .fg(th.muted)
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                    }
+                    crate::config::SettingsRow::Setting(i) => {
+                        let spec = crate::config::setting_at(*i)
+                            .expect("settings_rows indexes the flat settings");
+                        let value = cfg.value_label(spec.kind);
+                        let mut label_style = Style::default();
+                        let mut value_style = Style::default().fg(th.accent);
+                        if *i == view.selected {
+                            label_style = label_style.add_modifier(Modifier::REVERSED);
+                            value_style = value_style.add_modifier(Modifier::REVERSED);
+                        }
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("   {:<28}", spec.label), label_style),
+                            Span::styled(format!("[{value}]"), value_style),
+                        ]));
+                    }
                 }
-                lines.push(Line::from(vec![
-                    Span::styled(format!(" {:<28}", spec.label), label_style),
-                    Span::styled(format!("[{value}]"), value_style),
-                ]));
-                lines.push(Line::from(Span::styled(format!("   {}", spec.hint), dim)));
             }
             lines.push(Line::from(""));
+            let hint = crate::config::setting_at(view.selected)
+                .map(|s| s.hint)
+                .unwrap_or("");
             lines.push(Line::from(Span::styled(
-                "Enter/Space: toggle   h/l: cycle   Esc: close",
+                truncate(&format!(" {hint}"), inner.width as usize),
+                dim,
+            )));
+            lines.push(Line::from(Span::styled(
+                " Enter/Space: toggle   h/l: cycle   Esc: close",
                 dim,
             )));
             let path = nebula_core::paths::config_path();
             lines.push(Line::from(Span::styled(
-                truncate(&path.display().to_string(), inner.width as usize),
+                truncate(&format!(" {}", path.display()), inner.width as usize),
                 dim,
             )));
             f.render_widget(Paragraph::new(lines), inner);
             if let Some(Overlay::Settings(v)) = &mut app.overlay {
                 v.area = area;
+            }
+        }
+        Overlay::Metrics(view) => {
+            // One row per live session (biggest first), then nebula's own
+            // two processes; above them, a rollup per agent kind so "how
+            // much is claude using?" reads off in one line.
+            struct Row {
+                name: String,
+                context: String,
+                pid: u32,
+                procs: u32,
+                bytes: u64,
+                /// None = one of nebula's own processes (not openable).
+                sref: Option<SessionRef>,
+            }
+            let mut rows: Vec<Row> = Vec::new();
+            // kind label → (session count, procs, bytes); BTreeMap for a
+            // stable claude / codex / cursor / shells order.
+            let mut kinds: std::collections::BTreeMap<&'static str, (u32, u32, u64)> =
+                std::collections::BTreeMap::new();
+            let mut sessions_total: u64 = 0;
+
+            // `project/branch` home of a worktree, for the WHERE column.
+            let wt_context = |wt_id: &nebula_core::WorktreeId| -> String {
+                app.tree
+                    .worktrees
+                    .iter()
+                    .find(|w| &w.id == wt_id)
+                    .map(|w| {
+                        let project = app
+                            .tree
+                            .projects
+                            .iter()
+                            .find(|p| p.id == w.project_id)
+                            .map(|p| p.name.as_str())
+                            .unwrap_or("?");
+                        format!("{project}/{}", w.branch)
+                    })
+                    .unwrap_or_default()
+            };
+
+            if let Some(snap) = &view.snapshot {
+                for m in &snap.sessions {
+                    let (name, context, kind) = match &m.session {
+                        SessionRef::Agent(id) => {
+                            let agent = app.tree.agents.iter().find(|a| &a.id == id);
+                            let name = agent
+                                .map(|a| format!("{} ({})", a.name, a.kind.as_str()))
+                                .unwrap_or_else(|| "(unknown agent)".into());
+                            let context = agent
+                                .map(|a| wt_context(&a.worktree_id))
+                                .unwrap_or_default();
+                            let kind =
+                                agent.map(|a| a.kind.as_str()).unwrap_or("agents");
+                            (name, context, kind)
+                        }
+                        SessionRef::Terminal(id) => {
+                            let term = app.tree.terminals.iter().find(|t| &t.id == id);
+                            let name = term
+                                .map(|t| t.name.clone())
+                                .unwrap_or_else(|| "(unknown terminal)".into());
+                            let context = term
+                                .map(|t| wt_context(&t.worktree_id))
+                                .unwrap_or_default();
+                            (name, context, "shells")
+                        }
+                    };
+                    let entry = kinds.entry(kind).or_default();
+                    entry.0 += 1;
+                    entry.1 += m.procs;
+                    entry.2 += m.rss_bytes;
+                    sessions_total += m.rss_bytes;
+                    rows.push(Row {
+                        name,
+                        context,
+                        pid: m.pid,
+                        procs: m.procs,
+                        bytes: m.rss_bytes,
+                        sref: Some(m.session.clone()),
+                    });
+                }
+                rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+                rows.push(Row {
+                    name: "nebula daemon".into(),
+                    context: String::new(),
+                    pid: snap.daemon_pid,
+                    procs: 1,
+                    bytes: snap.daemon_rss_bytes,
+                    sref: None,
+                });
+                rows.push(Row {
+                    name: "nebula ui (this window)".into(),
+                    context: String::new(),
+                    pid: std::process::id(),
+                    procs: 1,
+                    bytes: view.client_rss_bytes,
+                    sref: None,
+                });
+            }
+
+            // The cursor follows the session it was on across refresh
+            // re-sorts (sizes move rows around); nebula's own rows sit at
+            // fixed positions, so the index fallback covers them.
+            let prev = view.rows.get(view.selected).cloned().flatten();
+            let selected = prev
+                .and_then(|sref| rows.iter().position(|r| r.sref.as_ref() == Some(&sref)))
+                .unwrap_or(view.selected)
+                .min(rows.len().saturating_sub(1));
+
+            let dim = Style::default().fg(th.dim);
+            let header = Style::default().fg(th.muted).add_modifier(Modifier::BOLD);
+            let mem_style = Style::default().fg(th.accent);
+            let plural = |n: u32| if n == 1 { "" } else { "s" };
+
+            let mut lines: Vec<Line> = Vec::new();
+            let mut scroll = 0usize;
+            let mut shown = 0usize;
+            let mut rows_start = 0usize;
+            if let Some(snap) = &view.snapshot {
+                // Rollup: one line per agent kind, then nebula, then total.
+                for (kind, (n, procs, bytes)) in &kinds {
+                    let unit = if *kind == "shells" { "terminal" } else { "session" };
+                    let detail =
+                        format!("{n} {unit}{} · {procs} proc{}", plural(*n), plural(*procs));
+                    lines.push(Line::from(vec![
+                        Span::styled(format!(" {kind:<8} "), header),
+                        Span::styled(format!("{detail:<42}"), dim),
+                        Span::styled(format!("{:>9}", fmt_mem(*bytes)), mem_style),
+                    ]));
+                }
+                let nebula_bytes = snap.daemon_rss_bytes + view.client_rss_bytes;
+                lines.push(Line::from(vec![
+                    Span::styled(" nebula   ", header),
+                    Span::styled(format!("{:<42}", "daemon + this ui"), dim),
+                    Span::styled(format!("{:>9}", fmt_mem(nebula_bytes)), mem_style),
+                ]));
+                let total = sessions_total + nebula_bytes;
+                let note = if snap.system_total_bytes > 0 {
+                    format!(
+                        "{:.1}% of {} installed",
+                        100.0 * total as f64 / snap.system_total_bytes as f64,
+                        fmt_mem(snap.system_total_bytes)
+                    )
+                } else {
+                    String::new()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        " total    ",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("{note:<42}"), dim),
+                    Span::styled(
+                        format!("{:>9}", fmt_mem(total)),
+                        mem_style.add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        " {:<28} {:<15} {:>6} {:>5} {:>9}",
+                        "SESSION", "WHERE", "PID", "PROCS", "MEM"
+                    ),
+                    header,
+                )));
+                // Scrolled window over the rows; everything above stays put.
+                let space = f
+                    .area()
+                    .height
+                    .saturating_sub(lines.len() as u16 + 4) as usize;
+                shown = rows.len().min(16).min(space.max(3));
+                scroll = view.scroll.min(rows.len().saturating_sub(shown));
+                // Keep the cursor inside the window.
+                if selected < scroll {
+                    scroll = selected;
+                } else if shown > 0 && selected >= scroll + shown {
+                    scroll = selected + 1 - shown;
+                }
+                rows_start = lines.len();
+                for (i, row) in rows.iter().enumerate().skip(scroll).take(shown) {
+                    let name_style = if row.sref.is_none() { dim } else { Style::default() };
+                    let sel = |s: Style| {
+                        if i == selected {
+                            s.add_modifier(Modifier::REVERSED)
+                        } else {
+                            s
+                        }
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!(" {:<28} ", truncate(&row.name, 28)),
+                            sel(name_style),
+                        ),
+                        Span::styled(
+                            format!("{:<15} ", truncate(&row.context, 15)),
+                            sel(dim),
+                        ),
+                        Span::styled(format!("{:>6} {:>5} ", row.pid, row.procs), sel(dim)),
+                        Span::styled(format!("{:>9}", fmt_mem(row.bytes)), sel(mem_style)),
+                    ]));
+                }
+                if rows.len() > shown {
+                    lines.push(Line::from(Span::styled(
+                        format!(" {}-{} of {}", scroll + 1, scroll + shown, rows.len()),
+                        dim,
+                    )));
+                }
+            } else {
+                lines.push(Line::from(Span::styled(" measuring…", dim)));
+            }
+
+            let height = (lines.len() as u16 + 2).min(f.area().height.saturating_sub(2));
+            let area = centered_rect(f.area(), 74, height);
+            f.render_widget(Clear, area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(th.accent))
+                .title(Span::styled(
+                    " Memory ",
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                ));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            f.render_widget(Paragraph::new(lines), inner);
+            if let Some(Overlay::Metrics(v)) = &mut app.overlay {
+                v.area = area;
+                v.scroll = scroll;
+                v.selected = selected;
+                v.rows = rows.into_iter().map(|r| r.sref).collect();
+                v.list_area = Rect {
+                    x: inner.x,
+                    y: inner.y + rows_start as u16,
+                    width: inner.width,
+                    height: (shown as u16).min(inner.height.saturating_sub(rows_start as u16)),
+                };
             }
         }
         Overlay::Diff(view) => {
@@ -856,6 +1188,157 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 v.list_area = list_inner;
             }
         }
+        Overlay::Todos(view) => {
+            // Rows come straight from the tree, so daemon upserts (another
+            // client editing the same list) render live.
+            let todos: Vec<&nebula_core::Todo> = app
+                .tree
+                .todos
+                .iter()
+                .filter(|t| t.owner == view.owner)
+                .collect();
+            let total = todos.len();
+            let open = todos.iter().filter(|t| !t.done).count();
+            let selected = view.selected.min(total.saturating_sub(1));
+            let creating = view.input.as_ref().is_some_and(|i| i.editing.is_none());
+
+            let list_rows = (total + creating as usize).max(1);
+            // centered_rect caps to the frame; the max(5) only keeps clamp's
+            // bounds ordered on a tiny screen.
+            let height = (list_rows as u16)
+                .saturating_add(2)
+                .clamp(5, f.area().height.max(5));
+            let area = centered_rect(f.area(), 58, height);
+            f.render_widget(Clear, area);
+            let title = if total == 0 {
+                format!(" Todos — {} ", view.context)
+            } else if open > 0 {
+                format!(" Todos — {} ({open} open) ", view.context)
+            } else {
+                format!(" Todos — {} (all {total} done) ", view.context)
+            };
+            let hint = if view.input.is_some() {
+                " Enter: save  Esc: cancel "
+            } else {
+                " o: add  Enter: edit  Space: done  d: delete "
+            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(th.accent))
+                .title(Span::styled(
+                    truncate(&title, (area.width as usize).saturating_sub(2)),
+                    Style::default()
+                        .fg(th.accent)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .title_bottom(Line::from(Span::styled(
+                    hint,
+                    Style::default().fg(th.dim),
+                )));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            if total == 0 && !creating {
+                if let Some(row_area) = row_rect(inner, 0) {
+                    f.render_widget(
+                        Paragraph::new(Span::styled(
+                            "no todos yet — o adds one",
+                            Style::default().fg(th.dim),
+                        )),
+                        row_area,
+                    );
+                }
+            }
+            // Follow-window keeps the cursor visible; while adding, pin the
+            // window to the tail so the input row is always on screen.
+            let start = if creating {
+                list_rows.saturating_sub(inner.height as usize)
+            } else {
+                view.window_start(inner.height as usize)
+            };
+            let mut screen_row = 0usize;
+            for (i, todo) in todos.iter().enumerate().skip(start) {
+                let Some(row_area) = row_rect(inner, screen_row) else {
+                    break;
+                };
+                screen_row += 1;
+                let budget = (inner.width as usize).saturating_sub(2);
+                let editing_this =
+                    view.input.as_ref().and_then(|inp| inp.editing.as_ref()) == Some(&todo.id);
+                let spans = if editing_this {
+                    let text = view
+                        .input
+                        .as_ref()
+                        .map(|inp| inp.text.clone())
+                        .unwrap_or_default();
+                    // Long edits: show the tail so the cursor stays visible.
+                    let shown: String = if text.chars().count() > budget.saturating_sub(1) {
+                        let skip = text.chars().count() - budget.saturating_sub(2);
+                        format!("…{}", text.chars().skip(skip).collect::<String>())
+                    } else {
+                        text
+                    };
+                    vec![
+                        Span::styled("☐ ", Style::default().fg(th.warn)),
+                        Span::raw(shown),
+                        Span::styled("█", Style::default().fg(th.accent)),
+                    ]
+                } else if todo.done {
+                    vec![
+                        Span::styled("✓ ", Style::default().fg(th.ok)),
+                        Span::styled(
+                            truncate(&todo.text, budget),
+                            Style::default().fg(th.dim),
+                        ),
+                    ]
+                } else {
+                    vec![
+                        Span::styled("☐ ", Style::default().fg(th.warn)),
+                        Span::raw(truncate(&todo.text, budget)),
+                    ]
+                };
+                render_row(
+                    f,
+                    row_area,
+                    spans,
+                    i == selected && view.input.is_none(),
+                    true,
+                    th,
+                );
+            }
+            if creating {
+                if let Some(row_area) = row_rect(inner, screen_row) {
+                    let text = view
+                        .input
+                        .as_ref()
+                        .map(|inp| inp.text.clone())
+                        .unwrap_or_default();
+                    let budget = (inner.width as usize).saturating_sub(3);
+                    let shown: String = if text.chars().count() > budget {
+                        let skip = text.chars().count() - budget.saturating_sub(1);
+                        format!("…{}", text.chars().skip(skip).collect::<String>())
+                    } else {
+                        text
+                    };
+                    f.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled("+ ", Style::default().fg(th.accent)),
+                            Span::raw(shown),
+                            Span::styled("█", Style::default().fg(th.accent)),
+                        ])),
+                        row_area,
+                    );
+                }
+            }
+
+            // Write-back (draw works on a clone): rects for mouse
+            // hit-testing, plus the clamped cursor.
+            if let Some(Overlay::Todos(v)) = &mut app.overlay {
+                v.area = area;
+                v.list_area = inner;
+                v.selected = selected;
+            }
+        }
         Overlay::Tree(view) => {
             let area = centered_rect_pct(f.area(), 92, 90);
             f.render_widget(Clear, area);
@@ -1062,6 +1545,16 @@ fn panel_block(title: &str, focused: bool, th: Theme) -> Block<'_> {
     }
 }
 
+/// Todo-count row badge for a (open, total) pair: open notes as `☐n`, an
+/// all-done list as `✓n`; no todos, no badge.
+fn todo_badge((open, total): (usize, usize), th: Theme) -> Option<(String, Style)> {
+    match (open, total) {
+        (_, 0) => None,
+        (0, total) => Some((format!(" ✓{total}"), Style::default().fg(th.ok))),
+        (open, _) => Some((format!(" ☐{open}"), Style::default().fg(th.warn))),
+    }
+}
+
 fn status_dot(status: Option<AgentStatus>, th: Theme) -> Span<'static> {
     match status {
         Some(AgentStatus::Fresh) => Span::styled("● ", Style::default().fg(th.dim)),
@@ -1141,13 +1634,18 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Projects and their dividers are one selectable row list; the payload
     // pre-collects per-row display data to end the tree borrow.
-    let rows: Vec<(ProjectRow, String, Option<AgentStatus>)> = app
+    let rows: Vec<(ProjectRow, String, Option<AgentStatus>, (usize, usize))> = app
         .project_rows()
         .into_iter()
         .map(|row| match row {
             ProjectRow::Project(i) => {
                 let p = &app.tree.projects[i];
-                (row, p.name.clone(), app.project_rollup(&p.id))
+                (
+                    row,
+                    p.name.clone(),
+                    app.project_rollup(&p.id),
+                    app.todo_stats(&nebula_core::TodoOwner::Project(p.id.clone())),
+                )
             }
             ProjectRow::Divider { project, before } => {
                 let p = &app.tree.projects[project];
@@ -1157,19 +1655,32 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                     p.divider_label.clone()
                 }
                 .unwrap_or_default();
-                (row, label, None)
+                (row, label, None, (0, 0))
             }
         })
         .collect();
-    for (row_idx, (row, text, roll)) in rows.iter().enumerate() {
+    for (row_idx, (row, text, roll, todos)) in rows.iter().enumerate() {
         let Some(row_area) = row_rect(inner, row_idx) else {
             break;
         };
         let spans = match row {
-            ProjectRow::Project(_) => vec![
-                status_dot(*roll, th),
-                Span::raw(truncate(text, inner.width.saturating_sub(2) as usize)),
-            ],
+            ProjectRow::Project(_) => {
+                // Same todo-count badge as worktree rows: the project's own
+                // notes only (worktree notes badge on their worktree).
+                let todo_badge = todo_badge(*todos, th);
+                let badge_len = todo_badge.as_ref().map_or(0, |(s, _)| s.chars().count());
+                let mut spans = vec![
+                    status_dot(*roll, th),
+                    Span::raw(truncate(
+                        text,
+                        (inner.width as usize).saturating_sub(2 + badge_len),
+                    )),
+                ];
+                if let Some((text, style)) = todo_badge {
+                    spans.push(Span::styled(text, style));
+                }
+                spans
+            }
             ProjectRow::Divider { .. } => divider_spans(text, inner.width, th),
         };
         render_row(f, row_area, spans, row_idx == app.sel_project, focused, th);
@@ -1224,10 +1735,17 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let worktrees: Vec<(String, bool, Option<AgentStatus>)> = app
+    let worktrees: Vec<(String, bool, Option<AgentStatus>, (usize, usize))> = app
         .visible_worktrees()
         .iter()
-        .map(|w| (w.branch.clone(), w.is_main, app.worktree_rollup(&w.id)))
+        .map(|w| {
+            (
+                w.branch.clone(),
+                w.is_main,
+                app.worktree_rollup(&w.id),
+                app.todo_stats(&nebula_core::TodoOwner::Worktree(w.id.clone())),
+            )
+        })
         .collect();
     if worktrees.is_empty() {
         let hint = if app.tree.projects.is_empty() {
@@ -1262,16 +1780,19 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     if grouped {
         header(f, "PINNED".into(), &mut screen_row);
     }
-    for (i, (branch, is_main, roll)) in worktrees.iter().enumerate() {
+    for (i, (branch, is_main, roll, todos)) in worktrees.iter().enumerate() {
         if grouped && i == pinned_count {
             header(f, "UNPINNED".into(), &mut screen_row);
         }
         let Some(row_area) = row_rect(inner, screen_row) else {
             break;
         };
+        let todo_badge = todo_badge(*todos, th);
+        let badge_len = todo_badge.as_ref().map_or(0, |(s, _)| s.chars().count());
         let mut spans = vec![status_dot(*roll, th)];
         if *is_main {
-            let max = (inner.width as usize).saturating_sub(2 + ROOT_BADGE.chars().count());
+            let max = (inner.width as usize)
+                .saturating_sub(2 + ROOT_BADGE.chars().count() + badge_len);
             spans.push(Span::raw(truncate(branch, max)));
             spans.push(Span::styled(
                 ROOT_BADGE,
@@ -1280,8 +1801,11 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             spans.push(Span::raw(truncate(
                 branch,
-                inner.width.saturating_sub(2) as usize,
+                (inner.width as usize).saturating_sub(2 + badge_len),
             )));
+        }
+        if let Some((text, style)) = todo_badge {
+            spans.push(Span::styled(text, style));
         }
         render_row(f, row_area, spans, i == app.sel_worktree, focused, th);
         app.hits.push((row_area, HitTarget::Worktree(i)));
@@ -1395,8 +1919,19 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     }
     if archived_count > 0 {
         header(f, "─".repeat(inner.width as usize), &mut screen_row);
+        // Both header forms are click targets: a click expands/collapses
+        // the group, same as the A key.
+        let text = if app.show_archived {
+            format!("ARCHIVED ({archived_count}) (A to hide)")
+        } else {
+            format!("… {archived_count} archived (A to show)")
+        };
+        if let Some(r) = row_rect(inner, screen_row) {
+            f.render_widget(Paragraph::new(Span::styled(text, dim)), r);
+            app.hits.push((r, HitTarget::ArchivedHeader));
+            screen_row += 1;
+        }
         if app.show_archived {
-            header(f, format!("ARCHIVED ({archived_count})"), &mut screen_row);
             for (i, row) in rows
                 .iter()
                 .enumerate()
@@ -1408,12 +1943,6 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
                 draw_session_row(f, app, r, i, row, focused, inner.width);
                 screen_row += 1;
             }
-        } else {
-            header(
-                f,
-                format!("… {archived_count} archived (A to show)"),
-                &mut screen_row,
-            );
         }
     }
 
@@ -1701,6 +2230,20 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             "↑/↓: move  Enter/Space: toggle  h/l: cycle  Esc: close",
             Style::default().fg(th.dim),
         )
+    } else if let Some(Overlay::Todos(view)) = &app.overlay {
+        Span::styled(
+            if view.input.is_some() {
+                "type the note  Enter: save  Esc: cancel"
+            } else {
+                "o: add  Enter: edit  Space: toggle done  d: delete  Esc: close"
+            },
+            Style::default().fg(th.dim),
+        )
+    } else if matches!(&app.overlay, Some(Overlay::Metrics(_))) {
+        Span::styled(
+            "↑/↓: select  Enter: open session  Esc: close  (refreshes every 2s)",
+            Style::default().fg(th.dim),
+        )
     } else if app.overlay.is_some() {
         Span::styled(
             "Esc: close  Enter: confirm",
@@ -1720,10 +2263,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 Some(ProjectRow::Divider { .. }) => {
                     "Enter/r: label  d: delete divider  ⇧J/K: move  m: menu  ?: help"
                 }
-                _ => "n: add  d: remove  -: divider  ⇧J/K: move  /: search  m: menu  ?: help",
+                _ => "n: add  o: todos  d: remove  -: divider  ⇧J/K: move  /: search  m: menu  ?: help",
             },
             Focus::Worktrees => {
-                "n: new worktree  T: terminal  p: pin  d: delete  /: search  m: menu  ?: help"
+                "n: new worktree  o: todos  T: terminal  p: pin  d: delete  /: search  m: menu  ?: help"
             }
             Focus::Sessions => {
                 "↵: focus  n: agent  T: terminal  r: rename  p: pin  a: archive  d: del  m: menu  ?: help"
@@ -1750,7 +2293,57 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::raw("  │  "));
     }
     spans.push(hints);
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    // Right edge: live session/process counts and nebula's total memory
+    // footprint, fed by the footer metrics poll. The hints clip before the
+    // readout does.
+    let usage = footer_usage(app);
+    let right_w = usage
+        .as_ref()
+        .map(|s| s.chars().count() as u16 + 2)
+        .unwrap_or(0)
+        .min(area.width);
+    let left = Rect {
+        width: area.width.saturating_sub(right_w),
+        ..area
+    };
+    f.render_widget(Paragraph::new(Line::from(spans)), left);
+    if let Some(usage) = usage {
+        let right = Rect {
+            x: area.x + area.width.saturating_sub(right_w),
+            width: right_w,
+            ..area
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(usage, Style::default().fg(th.dim))))
+                .alignment(ratatui::layout::Alignment::Right),
+            right,
+        );
+    }
+}
+
+/// The footer's right-edge readout: live sessions, their process count,
+/// and nebula's total memory footprint (TUI + daemon + every session's
+/// process subtree). None until the first metrics reply arrives.
+fn footer_usage(app: &App) -> Option<String> {
+    let m = app.last_metrics.as_ref()?;
+    let agents = m
+        .sessions
+        .iter()
+        .filter(|s| matches!(s.session, SessionRef::Agent(_)))
+        .count();
+    let terms = m.sessions.len() - agents;
+    let procs: usize = m.sessions.iter().map(|s| s.procs as usize).sum();
+    let total = m.daemon_rss_bytes
+        + app.client_rss_bytes
+        + m.sessions.iter().map(|s| s.rss_bytes).sum::<u64>();
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    Some(format!(
+        "{agents} agent{} · {terms} term{} · {procs} proc{} · {}",
+        plural(agents),
+        plural(terms),
+        plural(procs),
+        fmt_mem(total)
+    ))
 }
 
 /// Style for one syntax-highlight token kind of the tree-browser preview
@@ -1812,6 +2405,25 @@ fn row_rect(inner: Rect, i: usize) -> Option<Rect> {
         width: inner.width,
         height: 1,
     })
+}
+
+/// Human-readable byte count for the metrics modal.
+fn fmt_mem(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= 10.0 * GB {
+        format!("{:.0} GB", b / GB)
+    } else if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.0} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
