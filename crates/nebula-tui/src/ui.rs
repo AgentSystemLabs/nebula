@@ -5,6 +5,7 @@ use crate::app::{
     App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, ProjectRow, SessionRow,
 };
 use crate::git_diff::{classify_diff_line, DiffLineKind};
+use crate::text_input::TextInput;
 use crate::theme::Theme;
 use nebula_core::{AgentStatus, SessionRef};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -275,7 +276,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // listing between the input and the hint; the dialog grows to
             // fit the listing (at least one row, for the empty message).
             let is_path = prompt.completes_paths();
-            let width = if is_path { 72 } else { 52 };
+            let width = if is_path { 72 } else { 56 };
             let list_h = if is_path {
                 prompt.dirs.len().clamp(1, 8) as u16
             } else {
@@ -309,33 +310,19 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 f.render_widget(Paragraph::new(Line::from(spans)), r);
             }
 
-            // Row 1: the input. Long paths show the tail so the cursor
-            // stays visible; the cursor dims while a listing row is
-            // highlighted (Enter takes the highlight, not the text).
+            // Row 1: the input. Long paths scroll under it around the
+            // caret; the caret dims while a listing row is highlighted
+            // (Enter takes the highlight, not the text).
             if let Some(r) = row_rect(inner, 1) {
-                let input_budget = inner.width.saturating_sub(3) as usize;
-                let shown_input: String = if prompt.input.chars().count() > input_budget {
-                    let skip = prompt.input.chars().count() - input_budget;
-                    format!(
-                        "…{}",
-                        prompt.input.chars().skip(skip + 1).collect::<String>()
-                    )
-                } else {
-                    prompt.input.clone()
-                };
+                let budget = inner.width.saturating_sub(2) as usize;
                 let cursor = if prompt.hover.is_some() {
                     th.dim
                 } else {
                     th.text
                 };
-                f.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::raw("> "),
-                        Span::styled(shown_input, Style::default().fg(th.text)),
-                        Span::styled("█", Style::default().fg(cursor)),
-                    ])),
-                    r,
-                );
+                let mut spans = vec![Span::raw("> ")];
+                spans.extend(input_spans(&prompt.input, budget, cursor, th));
+                f.render_widget(Paragraph::new(Line::from(spans)), r);
             }
 
             // The listing: one raised-fill row per directory, a ● on git
@@ -387,7 +374,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 let hint = if is_path {
                     "[Enter] add  [↓↑] pick  [→] open  [←] up  [Tab] complete  [Esc] cancel"
                 } else {
-                    "[Enter] ok   [Ctrl+u] clear   [Esc] cancel"
+                    "[Enter] ok  [⌥←→] word  [Ctrl+u] clear  [Esc] cancel"
                 };
                 f.render_widget(
                     Paragraph::new(Span::styled(hint, Style::default().fg(th.dim))),
@@ -438,6 +425,15 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         ("d / D", "delete one / delete all"),
                     ],
                 ),
+                (
+                    // Every typed field — names, filters, queries — is the
+                    // same line editor (text_input.rs).
+                    "TYPING IN A FIELD",
+                    &[
+                        ("←→ / ⌥←→", "move by character / by word"),
+                        ("^a^e ⌥⌫ ^u^k", "ends · del word · kill line"),
+                    ],
+                ),
             ];
             const RIGHT: &[HelpSection] = &[
                 (
@@ -472,7 +468,6 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         ("s", "settings"),
                         ("M", "memory usage (nebula + agents)"),
                         ("N", "nebula splash (any key returns)"),
-                        ("^u", "clear typed input"),
                         ("q / ?", "quit / toggle this help"),
                     ],
                 ),
@@ -857,14 +852,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             // First row: the always-on fuzzy filter input.
             if let Some(filter_area) = row_rect(files_inner, 0) {
-                let line = if view.filter.is_empty() {
-                    Line::from(Span::styled("type to filter…", Style::default().fg(th.dim)))
-                } else {
-                    Line::from(vec![
-                        Span::raw(view.filter.clone()),
-                        Span::styled("█", Style::default().fg(th.accent)),
-                    ])
-                };
+                let line = search_line(&view.filter, "type to filter…", filter_area, th);
                 f.render_widget(Paragraph::new(line), filter_area);
             }
             let list_inner = Rect {
@@ -1000,14 +988,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             // First row: the always-on fuzzy query input.
             if let Some(query_area) = row_rect(inner, 0) {
-                let line = if palette.query.is_empty() {
-                    Line::from(Span::styled("type to search…", Style::default().fg(th.dim)))
-                } else {
-                    Line::from(vec![
-                        Span::raw(palette.query.clone()),
-                        Span::styled("█", Style::default().fg(th.accent)),
-                    ])
-                };
+                let line = search_line(&palette.query, "type to search…", query_area, th);
                 f.render_widget(Paragraph::new(line), query_area);
             }
             let list_inner = Rect {
@@ -1092,14 +1073,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             // First row: the always-on fuzzy query input.
             if let Some(query_area) = row_rect(inner, 0) {
-                let line = if finder.query.is_empty() {
-                    Line::from(Span::styled("type to filter…", Style::default().fg(th.dim)))
-                } else {
-                    Line::from(vec![
-                        Span::raw(finder.query.clone()),
-                        Span::styled("█", Style::default().fg(th.accent)),
-                    ])
-                };
+                let line = search_line(&finder.query, "type to filter…", query_area, th);
                 f.render_widget(Paragraph::new(line), query_area);
             }
             let list_inner = Rect {
@@ -1180,14 +1154,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             // First row: the always-live grep query.
             if let Some(query_area) = row_rect(inner, 0) {
-                let line = if view.query.is_empty() {
-                    Line::from(Span::styled("type to search…", Style::default().fg(th.dim)))
-                } else {
-                    Line::from(vec![
-                        Span::raw(view.query.clone()),
-                        Span::styled("█", Style::default().fg(th.accent)),
-                    ])
-                };
+                let line = search_line(&view.query, "type to search…", query_area, th);
                 f.render_widget(Paragraph::new(line), query_area);
             }
             let list_inner = Rect {
@@ -1322,22 +1289,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
             if let Some(input) = &view.input {
                 if let Some(row_area) = row_rect(inner, total.saturating_sub(start)) {
-                    let budget = (inner.width as usize).saturating_sub(3);
-                    // Long inputs: show the tail so the cursor stays visible.
-                    let shown: String = if input.chars().count() > budget {
-                        let skip = input.chars().count() - budget.saturating_sub(1);
-                        format!("…{}", input.chars().skip(skip).collect::<String>())
-                    } else {
-                        input.clone()
-                    };
-                    f.render_widget(
-                        Paragraph::new(Line::from(vec![
-                            Span::styled("+ ", Style::default().fg(th.accent)),
-                            Span::raw(shown),
-                            Span::styled("█", Style::default().fg(th.accent)),
-                        ])),
-                        row_area,
-                    );
+                    let budget = (inner.width as usize).saturating_sub(2);
+                    let mut spans = vec![Span::styled("+ ", Style::default().fg(th.accent))];
+                    spans.extend(input_spans(input, budget, th.accent, th));
+                    f.render_widget(Paragraph::new(Line::from(spans)), row_area);
                 }
             }
 
@@ -1379,7 +1334,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 format!(" Notes — {} (all {total} done) ", view.context)
             };
             let hint = if view.input.is_some() {
-                " Enter: save  Esc: cancel "
+                " Enter: save  ⌥←→: word  Esc: cancel "
             } else {
                 " e: add  Enter: edit  Space: done  d: delete "
             };
@@ -1423,23 +1378,16 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 let editing_this =
                     view.input.as_ref().and_then(|inp| inp.editing.as_ref()) == Some(&note.id);
                 let spans = if editing_this {
-                    let text = view
-                        .input
-                        .as_ref()
-                        .map(|inp| inp.text.clone())
-                        .unwrap_or_default();
-                    // Long edits: show the tail so the cursor stays visible.
-                    let shown: String = if text.chars().count() > budget.saturating_sub(1) {
-                        let skip = text.chars().count() - budget.saturating_sub(2);
-                        format!("…{}", text.chars().skip(skip).collect::<String>())
-                    } else {
-                        text
-                    };
-                    vec![
-                        Span::styled("☐ ", Style::default().fg(th.warn)),
-                        Span::raw(shown),
-                        Span::styled("█", Style::default().fg(th.accent)),
-                    ]
+                    let mut spans = vec![Span::styled("☐ ", Style::default().fg(th.warn))];
+                    if let Some(inp) = &view.input {
+                        spans.extend(input_spans(
+                            &inp.text,
+                            budget.saturating_sub(1),
+                            th.accent,
+                            th,
+                        ));
+                    }
+                    spans
                 } else if note.done {
                     vec![
                         Span::styled("✓ ", Style::default().fg(th.ok)),
@@ -1462,26 +1410,12 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
             if creating {
                 if let Some(row_area) = row_rect(inner, screen_row) {
-                    let text = view
-                        .input
-                        .as_ref()
-                        .map(|inp| inp.text.clone())
-                        .unwrap_or_default();
-                    let budget = (inner.width as usize).saturating_sub(3);
-                    let shown: String = if text.chars().count() > budget {
-                        let skip = text.chars().count() - budget.saturating_sub(1);
-                        format!("…{}", text.chars().skip(skip).collect::<String>())
-                    } else {
-                        text
-                    };
-                    f.render_widget(
-                        Paragraph::new(Line::from(vec![
-                            Span::styled("+ ", Style::default().fg(th.accent)),
-                            Span::raw(shown),
-                            Span::styled("█", Style::default().fg(th.accent)),
-                        ])),
-                        row_area,
-                    );
+                    let budget = (inner.width as usize).saturating_sub(2);
+                    let mut spans = vec![Span::styled("+ ", Style::default().fg(th.accent))];
+                    if let Some(inp) = &view.input {
+                        spans.extend(input_spans(&inp.text, budget, th.accent, th));
+                    }
+                    f.render_widget(Paragraph::new(Line::from(spans)), row_area);
                 }
             }
 
@@ -1521,14 +1455,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             // First row: the always-on fuzzy filter input.
             if let Some(filter_area) = row_rect(tree_inner, 0) {
-                let line = if view.filter.is_empty() {
-                    Line::from(Span::styled("type to filter…", Style::default().fg(th.dim)))
-                } else {
-                    Line::from(vec![
-                        Span::raw(view.filter.clone()),
-                        Span::styled("█", Style::default().fg(th.accent)),
-                    ])
-                };
+                let line = search_line(&view.filter, "type to filter…", filter_area, th);
                 f.render_widget(Paragraph::new(line), filter_area);
             }
             let list_inner = Rect {
@@ -3026,6 +2953,74 @@ fn fuzzy_highlight_spans(shown: &str, positions: &[usize], th: Theme) -> Vec<Spa
     spans
 }
 
+/// Spans for a one-line text field: the value with a block cursor sitting
+/// where the caret is. Long values scroll under the field — the window
+/// keeps the caret near the middle, and a `…` marks each end that has text
+/// scrolled off it.
+///
+/// `cursor` colors the caret block; pass `th.dim` to park it (the prompt
+/// does that while a listing row, not the text, holds Enter).
+fn input_spans(input: &TextInput, budget: usize, cursor: Color, th: Theme) -> Vec<Span<'static>> {
+    let chars: Vec<char> = input.chars().collect();
+    let caret = input.cursor_chars();
+    let budget = budget.max(1);
+    // A caret parked past the last character needs one extra cell to sit in.
+    let total = chars.len() + usize::from(caret >= chars.len());
+    let start = if total <= budget {
+        0
+    } else {
+        caret.saturating_sub(budget / 2).min(total - budget)
+    };
+    let end = (start + budget).min(total);
+
+    let mut cells: Vec<(char, bool)> = (start..end)
+        .map(|i| (chars.get(i).copied().unwrap_or(' '), i == caret))
+        .collect();
+    // The window is centered on the caret, so an elided edge is never the
+    // caret's own cell.
+    if start > 0 {
+        if let Some(first) = cells.first_mut() {
+            first.0 = '…';
+        }
+    }
+    if end < total {
+        if let Some(last) = cells.last_mut() {
+            last.0 = '…';
+        }
+    }
+
+    let plain = Style::default().fg(th.text);
+    let block = Style::default().fg(th.on_accent).bg(cursor);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_is_caret = false;
+    for (c, is_caret) in cells {
+        if is_caret != run_is_caret && !run.is_empty() {
+            let style = if run_is_caret { block } else { plain };
+            spans.push(Span::styled(std::mem::take(&mut run), style));
+        }
+        run_is_caret = is_caret;
+        run.push(c);
+    }
+    if !run.is_empty() {
+        let style = if run_is_caret { block } else { plain };
+        spans.push(Span::styled(run, style));
+    }
+    spans
+}
+
+/// The always-live search row every fuzzy overlay shares: a dim placeholder
+/// until something is typed, then the field itself.
+fn search_line(input: &TextInput, placeholder: &str, area: Rect, th: Theme) -> Line<'static> {
+    if input.is_empty() {
+        return Line::from(Span::styled(
+            placeholder.to_string(),
+            Style::default().fg(th.dim),
+        ));
+    }
+    Line::from(input_spans(input, area.width as usize, th.accent, th))
+}
+
 /// The i-th single-height row inside `inner`, or None when it overflows.
 fn row_rect(inner: Rect, i: usize) -> Option<Rect> {
     rows_rect(inner, i, 1)
@@ -3078,11 +3073,67 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     const RAMP: [Color; 3] = [Color::Yellow, Color::Indexed(220), Color::Indexed(230)];
 
     fn colors(spans: &[Span]) -> Vec<Color> {
         spans.iter().map(|s| s.style.fg.unwrap()).collect()
+    }
+
+    /// Render an input the way the widgets do, marking the caret cell with
+    /// `[]` so placement is readable in an assertion.
+    fn rendered(input: &TextInput, budget: usize) -> String {
+        let th = Theme::default();
+        input_spans(input, budget, th.accent, th)
+            .iter()
+            .map(|s| {
+                if s.style.bg == Some(th.accent) {
+                    format!("[{}]", s.content)
+                } else {
+                    s.content.to_string()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn caret_sits_past_the_last_character_by_default() {
+        let input = TextInput::with_text("note");
+        assert_eq!(rendered(&input, 20), "note[ ]");
+    }
+
+    #[test]
+    fn caret_renders_in_place_mid_string() {
+        let mut input = TextInput::with_text("note");
+        for _ in 0..2 {
+            input.handle_key(&KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        }
+        assert_eq!(rendered(&input, 20), "no[t]e");
+    }
+
+    /// A value longer than the field scrolls under it, keeping the caret in
+    /// view with a `…` on whichever end is clipped.
+    #[test]
+    fn long_values_scroll_around_the_caret() {
+        let input = TextInput::with_text("abcdefghijklmnop");
+        // Caret at the end: the tail is shown, the head elided.
+        assert_eq!(rendered(&input, 8), "…klmnop[ ]");
+        let mut input = input;
+        input.handle_key(&KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        // Caret at the start: the head is shown, the tail elided.
+        assert_eq!(rendered(&input, 8), "[a]bcdefg…");
+    }
+
+    #[test]
+    fn empty_search_fields_show_their_placeholder() {
+        let th = Theme::default();
+        let area = Rect::new(0, 0, 20, 1);
+        let line = search_line(&TextInput::new(), "type to filter…", area, th);
+        assert_eq!(line.spans[0].content.as_ref(), "type to filter…");
+        let line = search_line(&TextInput::with_text("ab"), "type to filter…", area, th);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "ab ");
     }
 
     /// The sweep must recolor cells without ever changing what they spell.
