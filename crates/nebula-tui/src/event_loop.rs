@@ -25,6 +25,10 @@ use ratatui::Terminal;
 use std::io::{BufWriter, Stdout};
 use std::time::Duration;
 
+/// Rows the Sessions column scrolls per wheel notch — one pill's stride,
+/// so the list steps by whole rows instead of drifting half a pill.
+const SESSIONS_WHEEL_STEP: usize = 2;
+
 /// Redraw cap (~60fps). Output bursts coalesce into one frame; input events
 /// are still handled immediately between frames.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -3303,9 +3307,12 @@ fn select_project_row_by_id(app: &mut App, id: &nebula_core::ProjectId) -> bool 
 
 /// Land the panel selections on a `/` palette pick. A project or worktree
 /// pick moves the selection (restoring remembered child rows, like a manual
-/// switch). A session pick with `attach` opens it immediately, exactly like
-/// Enter on its row; without, it only lands on the row in the Sessions
-/// panel, previewing like ↑/↓ there. Targets are re-validated against the
+/// switch); a worktree pick then hands focus to its Sessions panel, since
+/// picking a worktree by name is a step towards one of its sessions, not
+/// an errand in the Worktrees column. A session pick with `attach` opens
+/// it immediately, exactly like Enter on its row; without, it only lands
+/// on the row in the Sessions panel, previewing like ↑/↓ there. Targets
+/// are re-validated against the
 /// tree — a pick can race a removal, in which case it flashes instead of
 /// jumping.
 fn jump_to_target(
@@ -3328,7 +3335,7 @@ fn jump_to_target(
         }
         PaletteTarget::Worktree(id) => {
             if app.selected_worktree().is_some_and(|w| w.id == id) {
-                app.focus = Focus::Worktrees;
+                app.focus = Focus::Sessions;
                 return;
             }
             let found = app
@@ -3347,7 +3354,7 @@ fn jump_to_target(
             };
             app.sel_worktree = index;
             restore_session(app, out);
-            app.focus = Focus::Worktrees;
+            app.focus = Focus::Sessions;
         }
         PaletteTarget::Session(id) => {
             let worktree = app
@@ -4487,11 +4494,29 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
-            let in_term = matches!(
-                app.hit_at(mouse.column, mouse.row),
-                Some(HitTarget::TerminalPane)
-            ) || app.collapsed;
-            if in_term {
+            let over = app.hit_at(mouse.column, mouse.row);
+            // The Sessions column scrolls under the wheel/trackpad — with
+            // the ARCHIVED group expanded its list routinely outgrows the
+            // panel. The offset moves without touching the selection; the
+            // draw clamps it to the content.
+            let over_sessions = !app.collapsed
+                && matches!(
+                    over,
+                    Some(
+                        HitTarget::Session(_)
+                            | HitTarget::ArchivedHeader
+                            | HitTarget::PanelBg(Focus::Sessions)
+                    )
+                );
+            let in_term = matches!(over, Some(HitTarget::TerminalPane)) || app.collapsed;
+            if over_sessions {
+                app.sessions_scroll = if up {
+                    app.sessions_scroll.saturating_sub(SESSIONS_WHEEL_STEP)
+                } else {
+                    app.sessions_scroll.saturating_add(SESSIONS_WHEEL_STEP)
+                };
+                app.dirty = true;
+            } else if in_term {
                 if let Some(term) = &mut app.term {
                     // Scrolling shifts the content under a (screen-anchored)
                     // selection highlight — drop it.
@@ -5235,6 +5260,20 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    /// (x, y) of the first cell of `needle` in the rendered buffer.
+    fn find_cell(terminal: &Terminal<TestBackend>, needle: &str) -> (u16, u16) {
+        let buffer = terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            let line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            if let Some(byte) = line.find(needle) {
+                return (line[..byte].chars().count() as u16, y);
+            }
+        }
+        panic!("{needle:?} is not on screen");
     }
 
     fn seed_tree(app: &mut App) {
@@ -7139,6 +7178,77 @@ mod tests {
             Some("agent-1".into()),
             "cursor lands on a surviving row"
         );
+    }
+
+    /// An ARCHIVED group taller than the panel scrolls: the wheel moves the
+    /// viewport without touching the cursor, and walking the cursor down
+    /// drags the viewport along so the selected row never falls off the
+    /// bottom edge.
+    #[test]
+    fn archived_list_scrolls_by_wheel_and_follows_the_cursor() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        for i in 0..20i64 {
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: archived_agent(
+                        &format!("z{i}"),
+                        &format!("archived-{i:02}"),
+                        1000 - i,
+                        i + 1,
+                    ),
+                },
+            );
+        }
+        app.show_archived = true;
+        app.focus = Focus::Sessions;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut out = Vec::new();
+
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("archived-00"), "list starts at the top: {text}");
+        assert!(!text.contains("archived-19"), "tail overflows: {text}");
+
+        // Wheel over the Sessions column: the list moves, the cursor stays.
+        for _ in 0..12 {
+            handle_mouse(&mut app, mev(MouseEventKind::ScrollDown, 50, 10), &mut out);
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        }
+        let text = buffer_text(&terminal);
+        assert!(text.contains("archived-19"), "wheel reaches the tail: {text}");
+        assert!(!text.contains("archived-00"), "top scrolled away: {text}");
+        assert_eq!(app.sel_session, 0, "the wheel never moves the cursor");
+
+        // Scrolling back up stops at the top instead of running away.
+        for _ in 0..40 {
+            handle_mouse(&mut app, mev(MouseEventKind::ScrollUp, 50, 10), &mut out);
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        }
+        assert_eq!(app.sessions_scroll, 0, "wheel-up clamps at the top");
+
+        // ↓ to the last archived row pulls the viewport down with it.
+        for _ in 0..20 {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(app.sel_session, 20, "cursor walks onto the last row");
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("archived-19"),
+            "the selected row is on screen: {text}"
+        );
+
+        // …and ↑ back to the first row pulls it back.
+        for _ in 0..20 {
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(app.sel_session, 0);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("agent-1"), "back at the top: {text}");
+        assert_eq!(app.sessions_scroll, 0);
     }
 
     /// Clicking the ARCHIVED header toggles the group open/closed, same as
@@ -9781,7 +9891,11 @@ mod tests {
         assert!(app.overlay.is_none());
         assert_eq!(app.selected_project().unwrap().name, "nebula");
         assert_eq!(app.selected_worktree().unwrap().branch, "feat-x");
-        assert_eq!(app.focus, Focus::Worktrees);
+        assert_eq!(
+            app.focus,
+            Focus::Sessions,
+            "a worktree pick lands in its Sessions panel, not the Worktrees column"
+        );
         assert!(!app.term_locked);
         assert!(
             !out.iter()
@@ -9867,6 +9981,89 @@ mod tests {
         );
         // Rects for mouse hit-testing were written back during the draw.
         assert!(palette(&app).list_area.width > 0);
+    }
+
+    /// A palette row wears the status its panel row wears: the session's
+    /// own, rolled up for its worktree and project. The status arrives
+    /// while the palette is open, so the rebuild must carry it through.
+    #[test]
+    fn palette_rows_take_their_status_color_and_sweep() {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        let th = crate::theme::Theme::default();
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a1".into()),
+                    worktree_id: nebula_core::WorktreeId("w1".into()),
+                    name: "agent-1".into(),
+                    status: AgentStatus::Running,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    alive: true,
+                }),
+            },
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+
+        // The one running agent lights its own row and both rollups.
+        for row in ["▪ demo", "▸ demo/main", "● demo/main/agent-1"] {
+            let (x, y) = find_cell(&terminal, row);
+            assert_eq!(
+                terminal.backend().buffer()[(x, y)].fg,
+                th.warn,
+                "{row:?} glyph reads running"
+            );
+        }
+        // ...and the leaf segment rides the running sweep, not plain text.
+        let (x, y) = find_cell(&terminal, "● demo/main/agent-1");
+        let buffer = terminal.backend().buffer();
+        let leaf_x = x + "● demo/main/".chars().count() as u16;
+        for i in 0.."agent-1".chars().count() as u16 {
+            let fg = buffer[(leaf_x + i, y)].fg;
+            assert!(
+                th.warn_sweep.contains(&fg),
+                "leaf cell {i} is on the sweep ramp, got {fg:?}"
+            );
+        }
+        // The dim parent path stays out of the sweep.
+        assert_eq!(buffer[(x + 2, y)].fg, th.dim, "parent path stays quiet");
+    }
+
+    /// Nothing live under a row: the glyph goes hollow and dim, mirroring
+    /// the panels' `○`.
+    #[test]
+    fn palette_rows_with_no_live_status_render_hollow() {
+        let th = crate::theme::Theme::default();
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.agents.clear();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("▫ demo"), "hollow project glyph:\n{text}");
+        assert!(
+            text.contains("▹ demo/main"),
+            "hollow worktree glyph:\n{text}"
+        );
+        // Row 0 sits under the selection fill, which lifts dim to muted;
+        // read the unselected worktree row for the resting shade.
+        let (x, y) = find_cell(&terminal, "▹ demo/main");
+        assert_eq!(terminal.backend().buffer()[(x, y)].fg, th.dim);
     }
 
     #[test]

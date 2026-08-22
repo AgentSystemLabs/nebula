@@ -1011,15 +1011,33 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     break;
                 };
                 let item = &palette.items[m.item];
-                // Kind indicator: a small colored glyph; the row text stays
-                // quiet (dim parent path, bright leaf) so the cyan-bold
-                // match highlight is the loudest thing in the list.
-                let (glyph, glyph_color) = match &item.target {
-                    PaletteTarget::Project(_) => ("▪ ", th.accent),
-                    PaletteTarget::Worktree(_) => ("▸ ", th.ok),
-                    PaletteTarget::Session(_) => ("● ", th.special),
+                // Kind lives in the glyph's shape; its color — and the
+                // hollow variant standing in for the panels' `○` — come
+                // from the same status the row carries in its panel, so a
+                // running session reads as running here too. The row text
+                // stays quiet (dim parent path, bright leaf) so the
+                // cyan-bold match highlight is the loudest thing in the
+                // list, and the leaf sweeps exactly like its panel row.
+                let (solid, hollow) = match &item.target {
+                    PaletteTarget::Project(_) => ("▪ ", "▫ "),
+                    PaletteTarget::Worktree(_) => ("▸ ", "▹ "),
+                    PaletteTarget::Session(_) => ("● ", "○ "),
                 };
-                let glyph_color = if item.archived { th.dim } else { glyph_color };
+                // Archived rows stay quiet even if their last status was
+                // live — the Sessions panel's `⊘` rule.
+                let status = if item.archived { None } else { item.status };
+                let (glyph, glyph_color) = if item.archived {
+                    ("⊘ ", th.dim)
+                } else {
+                    match status {
+                        Some(AgentStatus::Running) => (solid, th.warn),
+                        Some(AgentStatus::Finished) => (solid, th.ok),
+                        Some(AgentStatus::NeedsFeedback) => (solid, th.err),
+                        Some(AgentStatus::Terminated) => (solid, th.special),
+                        Some(AgentStatus::Fresh) => (solid, th.dim),
+                        Some(AgentStatus::Disconnected) | None => (hollow, th.dim),
+                    }
+                };
                 let budget = (list_inner.width as usize).saturating_sub(4);
                 let shown = truncate(&item.text, budget);
                 // Truncation puts `…` at the last char of `shown`; a match
@@ -1036,7 +1054,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     &m.positions[..]
                 };
                 let mut spans = vec![Span::styled(glyph, Style::default().fg(glyph_color))];
-                spans.extend(path_highlight_spans(&shown, positions, item.archived, th));
+                spans.extend(path_highlight_spans(
+                    &shown,
+                    positions,
+                    item.archived,
+                    sweep_ramp(status, th, app.animations),
+                    app.sweep_phase(),
+                    th,
+                ));
                 render_row(f, row_area, spans, i == palette.selected, true, th);
             }
 
@@ -1702,25 +1727,31 @@ fn sweep_ramp(status: Option<AgentStatus>, th: Theme, enabled: bool) -> Option<[
 /// wraps on a period a few cells longer than the text so each pass reads as
 /// a wipe with a beat between; `phase` advances one cell per frame.
 fn sweep_spans(text: &str, base: Style, ramp: [Color; 3], phase: usize) -> Vec<Span<'static>> {
-    // Off-text cells appended to the period: the pause between passes.
-    const GAP: usize = 4;
     let chars: Vec<char> = text.chars().collect();
     if chars.is_empty() {
         return Vec::new();
     }
-    let head = phase % (chars.len() + GAP);
+    let len = chars.len();
     chars
         .into_iter()
         .enumerate()
-        .map(|(i, c)| {
-            let style = match head.checked_sub(i) {
-                Some(0) => base.fg(ramp[2]).add_modifier(Modifier::BOLD),
-                Some(1) => base.fg(ramp[1]),
-                _ => base.fg(ramp[0]),
-            };
-            Span::styled(c.to_string(), style)
-        })
+        .map(|(i, c)| Span::styled(c.to_string(), sweep_style(base, ramp, phase, i, len)))
         .collect()
+}
+
+/// Off-text cells appended to the sweep period: the pause between passes.
+const SWEEP_GAP: usize = 4;
+
+/// The shade cell `index` of a `len`-cell sweeping run takes at `phase`.
+/// Split out of [`sweep_spans`] so the `/` palette can sweep a row's leaf
+/// segment on the same band while the rest of the row keeps its own styling.
+fn sweep_style(base: Style, ramp: [Color; 3], phase: usize, index: usize, len: usize) -> Style {
+    let head = phase % (len + SWEEP_GAP);
+    match head.checked_sub(index) {
+        Some(0) => base.fg(ramp[2]).add_modifier(Modifier::BOLD),
+        Some(1) => base.fg(ramp[1]),
+        _ => base.fg(ramp[0]),
+    }
 }
 
 /// The name spans for a status-bearing row: one plain span normally,
@@ -1902,13 +1933,13 @@ const PILL_RAIL_CAPS: (char, char) = ('▖', '▘');
 fn render_pill(
     f: &mut Frame,
     inner: Rect,
-    top: usize,
+    top: isize,
     mut spans: Vec<Span>,
     selected: bool,
     focused: bool,
     th: Theme,
 ) {
-    let Some(text_area) = rows_rect(inner, top + 1, 1) else {
+    let Some(text_area) = row_rect_at(inner, top + 1) else {
         return;
     };
     if selected {
@@ -1919,8 +1950,8 @@ fn render_pill(
         }
         let fill = if focused { th.sel_bg } else { th.sel_bg_dim };
         let rail = if focused { th.accent } else { th.dim };
-        let mut pad = |glyph: char, cap: char, row: usize| {
-            if let Some(r) = rows_rect(inner, row, 1) {
+        let mut pad = |glyph: char, cap: char, row: isize| {
+            if let Some(r) = row_rect_at(inner, row) {
                 f.render_widget(
                     Paragraph::new(Line::from(Span::styled(
                         glyph.to_string().repeat(inner.width as usize),
@@ -2164,7 +2195,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         render_pill(
             f,
             inner,
-            screen_row,
+            screen_row as isize,
             spans,
             i == app.sel_worktree,
             focused,
@@ -2182,6 +2213,28 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     app.hits.push((inner, HitTarget::PanelBg(Focus::Worktrees)));
+}
+
+/// One laid-out entry of the Sessions panel. Group headers and session
+/// rows share a single virtual-row layout, computed unbounded by the
+/// panel height, so the whole column can scroll as one list.
+enum SessionEntry {
+    Header(String),
+    /// The ARCHIVED group header, in whichever form the toggle is in.
+    ArchivedHeader(String),
+    /// Index into `visible_session_rows()`.
+    Row(usize),
+}
+
+impl SessionEntry {
+    /// Rows the entry occupies: a header one, a pill its 3-row cell (they
+    /// stack on a `PILL_H` stride, so neighboring pads overlap).
+    fn height(&self) -> usize {
+        match self {
+            SessionEntry::Row(_) => PILL_H as usize + 1,
+            _ => 1,
+        }
+    }
 }
 
 fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
@@ -2218,16 +2271,26 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         .count();
     let dim = Style::default().fg(th.dim);
 
-    let mut screen_row: usize = 0;
-    let header = |f: &mut Frame, text: String, screen_row: &mut usize| {
+    // ---- lay the column out in virtual rows ----
+    let mut layout: Vec<(usize, SessionEntry)> = Vec::new();
+    let mut vrow: usize = 0;
+    let header = |layout: &mut Vec<(usize, SessionEntry)>, vrow: &mut usize, e: SessionEntry| {
         // A blank row above every group after the first keeps the groups
         // scannable without drawing more chrome.
-        if *screen_row > 0 {
-            *screen_row += 1;
+        if *vrow > 0 {
+            *vrow += 1;
         }
-        if let Some(r) = row_rect(inner, *screen_row) {
-            f.render_widget(Paragraph::new(Span::styled(format!(" {text}"), dim)), r);
-            *screen_row += 1;
+        let h = e.height();
+        layout.push((*vrow, e));
+        *vrow += h;
+    };
+    let push_rows = |layout: &mut Vec<(usize, SessionEntry)>,
+                     vrow: &mut usize,
+                     start: usize,
+                     len: usize| {
+        for i in start..(start + len).min(rows.len()) {
+            layout.push((*vrow, SessionEntry::Row(i)));
+            *vrow += PILL_H as usize;
         }
     };
 
@@ -2235,84 +2298,108 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     // otherwise the list stays flat with no group header.
     let grouped = pinned_count > 0 || recent_count > 0;
     if pinned_count > 0 {
-        header(f, "PINNED".into(), &mut screen_row);
-        for (i, row) in rows.iter().enumerate().take(pinned_count) {
-            if row_rect(inner, screen_row + 1).is_none() {
-                break;
-            }
-            draw_session_row(f, app, inner, screen_row, i, row, focused);
-            screen_row += PILL_H as usize;
-        }
+        header(
+            &mut layout,
+            &mut vrow,
+            SessionEntry::Header("PINNED".into()),
+        );
+        push_rows(&mut layout, &mut vrow, 0, pinned_count);
     }
     if recent_count > 0 {
-        header(f, "RECENT".into(), &mut screen_row);
-        for (i, row) in rows
-            .iter()
-            .enumerate()
-            .skip(pinned_count)
-            .take(recent_count)
-        {
-            if row_rect(inner, screen_row + 1).is_none() {
-                break;
-            }
-            draw_session_row(f, app, inner, screen_row, i, row, focused);
-            screen_row += PILL_H as usize;
-        }
+        header(
+            &mut layout,
+            &mut vrow,
+            SessionEntry::Header("RECENT".into()),
+        );
+        push_rows(&mut layout, &mut vrow, pinned_count, recent_count);
     }
     if grouped && unpinned_count > 0 {
-        header(f, "UNPINNED".into(), &mut screen_row);
+        header(
+            &mut layout,
+            &mut vrow,
+            SessionEntry::Header("UNPINNED".into()),
+        );
     }
-    for (i, row) in rows
-        .iter()
-        .enumerate()
-        .skip(pinned_count + recent_count)
-        .take(unpinned_count)
-    {
-        if row_rect(inner, screen_row + 1).is_none() {
-            break;
-        }
-        draw_session_row(f, app, inner, screen_row, i, row, focused);
-        screen_row += PILL_H as usize;
-    }
+    push_rows(
+        &mut layout,
+        &mut vrow,
+        pinned_count + recent_count,
+        unpinned_count,
+    );
     if terminal_count > 0 {
-        header(f, "TERMINALS".into(), &mut screen_row);
-        for (i, row) in rows
-            .iter()
-            .enumerate()
-            .skip(active_count)
-            .take(terminal_count)
-        {
-            if row_rect(inner, screen_row + 1).is_none() {
-                break;
-            }
-            draw_session_row(f, app, inner, screen_row, i, row, focused);
-            screen_row += PILL_H as usize;
-        }
+        header(
+            &mut layout,
+            &mut vrow,
+            SessionEntry::Header("TERMINALS".into()),
+        );
+        push_rows(&mut layout, &mut vrow, active_count, terminal_count);
     }
     if archived_count > 0 {
-        if screen_row > 0 {
-            screen_row += 1;
-        }
-        // Both header forms are click targets: a click expands/collapses
-        // the group, same as the A key.
         let text = if app.show_archived {
             format!(" ARCHIVED · {archived_count} (A hides)")
         } else {
             format!(" … {archived_count} archived (A shows)")
         };
-        if let Some(r) = row_rect(inner, screen_row) {
-            f.render_widget(Paragraph::new(Span::styled(text, dim)), r);
-            app.hits.push((r, HitTarget::ArchivedHeader));
-            screen_row += 1;
-        }
+        header(&mut layout, &mut vrow, SessionEntry::ArchivedHeader(text));
         if app.show_archived {
-            for (i, row) in rows.iter().enumerate().skip(active_count + terminal_count) {
-                if row_rect(inner, screen_row + 1).is_none() {
-                    break;
-                }
-                draw_session_row(f, app, inner, screen_row, i, row, focused);
-                screen_row += PILL_H as usize;
+            let start = active_count + terminal_count;
+            push_rows(&mut layout, &mut vrow, start, rows.len().saturating_sub(start));
+        }
+    }
+
+    // ---- resolve the scroll offset ----
+    let view_h = inner.height as usize;
+    let content_h = layout.last().map_or(0, |(top, e)| top + e.height());
+    // The cursor pulls the viewport, but only on the frames where it
+    // actually moved — otherwise a wheel scroll would snap straight back.
+    let anchor = (app.sel_worktree, app.sel_session);
+    if app.sessions_anchor != Some(anchor) {
+        app.sessions_anchor = Some(anchor);
+        if let Some(pos) = layout
+            .iter()
+            .position(|(_, e)| matches!(e, SessionEntry::Row(i) if *i == app.sel_session))
+        {
+            let (top, entry) = &layout[pos];
+            // Scrolling up to the first row of a group brings that group's
+            // header along, so the cursor never sits under a bare edge.
+            let up_to = match pos.checked_sub(1).map(|p| &layout[p]) {
+                Some((h, SessionEntry::Header(_) | SessionEntry::ArchivedHeader(_))) => *h,
+                _ => *top,
+            };
+            let bottom = top + entry.height();
+            if up_to < app.sessions_scroll {
+                app.sessions_scroll = up_to;
+            } else if bottom > app.sessions_scroll + view_h {
+                app.sessions_scroll = bottom - view_h;
             }
+        }
+    }
+    // The wheel scrolls past the end freely; the clamp lands here so it
+    // can't run away from the list.
+    app.sessions_scroll = app.sessions_scroll.min(content_h.saturating_sub(view_h));
+    let scroll = app.sessions_scroll as isize;
+
+    // ---- draw ----
+    for (top, entry) in &layout {
+        let y = *top as isize - scroll;
+        if y >= view_h as isize {
+            break;
+        }
+        match entry {
+            SessionEntry::Header(text) => {
+                if let Some(r) = row_rect_at(inner, y) {
+                    f.render_widget(Paragraph::new(Span::styled(format!(" {text}"), dim)), r);
+                }
+            }
+            SessionEntry::ArchivedHeader(text) => {
+                // Both header forms are click targets: a click expands or
+                // collapses the group, same as the A key.
+                if let Some(r) = row_rect_at(inner, y) {
+                    f.render_widget(Paragraph::new(Span::styled(text.as_str(), dim)), r);
+                    app.hits.push((r, HitTarget::ArchivedHeader));
+                }
+            }
+            SessionEntry::Row(i) => draw_session_row(f, app, inner, y, *i, &rows[*i], focused),
         }
     }
 
@@ -2324,7 +2411,7 @@ fn draw_session_row(
     f: &mut Frame,
     app: &mut App,
     inner: Rect,
-    top: usize,
+    top: isize,
     index: usize,
     row: &SessionRow,
     focused: bool,
@@ -2387,7 +2474,7 @@ fn draw_session_row(
         }
     };
     render_pill(f, inner, top, spans, index == app.sel_session, focused, th);
-    if let Some(hit) = rows_rect(inner, top, PILL_H) {
+    if let Some(hit) = rows_rect_at(inner, top, PILL_H) {
         app.hits.push((hit, HitTarget::Session(index)));
     }
 }
@@ -2882,17 +2969,23 @@ fn token_style(kind: crate::syntax::TokenKind, th: Theme) -> Style {
 
 /// Palette row text: dim `parent/path/` prefix, normal leaf segment, with
 /// fuzzy-match chars lit accent-bold on top. Archived rows stay dim all
-/// the way through.
+/// the way through. With a `ramp`, the leaf segment — the entity's own
+/// name, the very text that sweeps in its panel row — rides the same
+/// left-to-right band; matched chars keep the accent highlight so the
+/// sweep never buries what the query hit.
 fn path_highlight_spans(
     shown: &str,
     positions: &[usize],
     archived: bool,
+    ramp: Option<[Color; 3]>,
+    phase: usize,
     th: Theme,
 ) -> Vec<Span<'static>> {
     let boundary = shown
         .rfind('/')
         .map(|b| shown[..=b].chars().count())
         .unwrap_or(0);
+    let leaf_len = shown.chars().count() - boundary;
     let hl = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
     let mut spans = Vec::new();
     let mut run = String::new();
@@ -2902,6 +2995,8 @@ fn path_highlight_spans(
             hl
         } else if archived || i < boundary {
             Style::default().fg(th.dim)
+        } else if let Some(ramp) = ramp {
+            sweep_style(Style::default(), ramp, phase, i - boundary, leaf_len)
         } else {
             Style::default().fg(th.text)
         };
@@ -3024,6 +3119,22 @@ fn search_line(input: &TextInput, placeholder: &str, area: Rect, th: Theme) -> L
 /// The i-th single-height row inside `inner`, or None when it overflows.
 fn row_rect(inner: Rect, i: usize) -> Option<Rect> {
     rows_rect(inner, i, 1)
+}
+
+/// [`row_rect`] for a row that may have scrolled off the top of the
+/// panel: negative indices land above it and draw nothing.
+fn row_rect_at(inner: Rect, i: isize) -> Option<Rect> {
+    rows_rect_at(inner, i, 1)
+}
+
+/// [`rows_rect`] for a scrolled rect: one straddling the panel top is
+/// clipped to the rows still on screen, one entirely above it is None.
+fn rows_rect_at(inner: Rect, i: isize, height: u16) -> Option<Rect> {
+    let visible = height as isize + i.min(0);
+    if visible <= 0 {
+        return None;
+    }
+    rows_rect(inner, i.max(0) as usize, visible as u16)
 }
 
 /// A rect `height` rows tall starting at the i-th row inside `inner`:

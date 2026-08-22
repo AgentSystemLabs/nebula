@@ -109,9 +109,11 @@ right-click) opens a context menu for whatever's selected.
   fresh session when the old one is gone).
 - **Status via agent-CLI hooks, not MCP.** At agent spawn, nebula merges
   managed hooks into the worktree's `.claude/settings.local.json` (Claude
-  Code), `.codex/hooks.json` (Codex; loads once the project is trusted and
-  the hooks approved on first run), or `.cursor/hooks.json` (Cursor CLI).
-  Groups are tagged `_nebulaManaged`, user
+  Code) or `.cursor/hooks.json` (Cursor CLI), and into `~/.codex/hooks.json`
+  (Codex — codex records hook approvals against the hook file's path, so a
+  per-worktree file would re-prompt forever; from its home, you approve
+  nebula's hooks once at codex's "Hooks need review" prompt and every later
+  worktree is silent). Groups are tagged `_nebulaManaged`, user
   hooks preserved, rebuilt each spawn. Each hook is a fail-soft curl to the
   daemon's loopback HTTP endpoint, authenticated with a per-boot bearer token
   injected into the agent's environment only.
@@ -120,9 +122,11 @@ right-click) opens a context menu for whatever's selected.
   the ask (e.g. `Fix Login Redirect`), via a new `nebula rename <title>`
   command the CLI runs in its own turn (no extra API calls, no MCP server).
   Claude Code and Codex get the instruction injected through the
-  `UserPromptSubmit` hook response (the daemon sends it only while the
-  session is untitled); Cursor gets a managed `.cursor/rules/nebula-title.mdc`
-  project rule instead, since its hooks can't inject context. Titling is
+  `UserPromptSubmit` hook response — as
+  `hookSpecificOutput.additionalContext`, the one envelope both read (the
+  daemon sends it only while the session is untitled); Cursor gets a
+  managed `.cursor/rules/nebula-title.mdc` project rule instead, since its
+  hooks can't inject context. Titling is
   one-shot and never clobbers a name you typed or set with `r` — a late
   agent attempt is politely declined. `nebula rename --force` overrides.
 - **Everything persists in SQLite** (`~/.local/share/nebula/nebula.db` or the

@@ -11,6 +11,9 @@
 //!   with no following Stop.
 //! - Hooks from a different Claude session in the same cwd are foreign and
 //!   must not drive status.
+//! - An `idle_prompt` notification is Claude reporting it is parked at the
+//!   input box with nothing in flight; it is what un-sticks a turn that
+//!   ended without a `Stop` (rejected prompt, escape mid-turn).
 
 use nebula_core::AgentStatus;
 use std::collections::HashMap;
@@ -211,10 +214,17 @@ impl AgentStatusMachine {
                 self.set_status(AgentStatus::NeedsFeedback, &mut effects);
             }
             HookEvent::Notification { notification_type } => {
-                // Idle-input reminders arrive on this same event and must NOT
-                // flip status — only real permission prompts count.
-                if notification_type.as_deref() == Some("permission_prompt") {
-                    self.set_status(AgentStatus::NeedsFeedback, &mut effects);
+                match notification_type.as_deref() {
+                    Some("permission_prompt") => {
+                        self.set_status(AgentStatus::NeedsFeedback, &mut effects)
+                    }
+                    // "Claude is waiting for your input". Claude fires this
+                    // only with nothing in flight and no dialog open, so it
+                    // means the turn really is over — see `mark_idle`.
+                    Some("idle_prompt") => self.mark_idle(&mut effects),
+                    // Every other notification type (auth, quota, nested
+                    // fleet sessions) is none of our business.
+                    _ => {}
                 }
             }
             HookEvent::PreToolUse { tool_name } => {
@@ -295,6 +305,35 @@ impl AgentStatusMachine {
         effects
     }
 
+    /// Claude reports itself idle at the input box. This is the only end-of-
+    /// turn signal that survives the paths where no `Stop` ever fires: the
+    /// user rejecting a permission prompt or an `AskUserQuestion`, or hitting
+    /// escape mid-turn. Without it those leave the agent pinned on red (or
+    /// yellow) until the next prompt, long after the CLI went quiet.
+    ///
+    /// Safe to trust as authoritative because Claude gates the notification
+    /// on an idle main loop AND an empty dialog stack — a permission prompt
+    /// still waiting on the user suppresses it, so this can't green out an
+    /// agent that genuinely needs feedback.
+    fn mark_idle(&mut self, effects: &mut Vec<Effect>) {
+        if !matches!(
+            self.status,
+            AgentStatus::Running | AgentStatus::NeedsFeedback
+        ) {
+            return;
+        }
+        // Anything still tracked is orphaned: the main loop can't be idle
+        // while it waits on a Task subagent.
+        self.subagents.clear();
+        self.stop_held = false;
+        self.drain_idle_since = None;
+        // Deliberately no `finished_at`: after this much idle time a
+        // SubagentStart is a post-turn helper, never a Stop that raced its
+        // own POST, so it must not heal back to running.
+        self.finished_at = None;
+        self.set_status(AgentStatus::Finished, effects);
+    }
+
     fn set_status(&mut self, status: AgentStatus, effects: &mut Vec<Effect>) {
         if self.status != status {
             self.status = status;
@@ -348,21 +387,135 @@ mod tests {
         assert_eq!(status_of(&fx), Some(AgentStatus::Running));
     }
 
-    #[test]
-    fn idle_notification_is_ignored() {
-        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
-        let now = t0();
-        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
-        m.handle(HookEvent::Stop, Some("s1"), now);
-        let fx = m.handle(
+    fn idle(m: &mut AgentStatusMachine, now: Instant) -> Vec<Effect> {
+        m.handle(
             HookEvent::Notification {
                 notification_type: Some("idle_prompt".into()),
             },
             Some("s1"),
             now,
-        );
-        assert!(fx.is_empty(), "idle reminder must not flip status: {fx:?}");
+        )
+    }
+
+    #[test]
+    fn idle_notification_is_a_noop_when_already_finished() {
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        m.handle(HookEvent::Stop, Some("s1"), now);
+        let fx = idle(&mut m, now);
+        assert!(fx.is_empty(), "already finished: {fx:?}");
         assert_eq!(m.status(), AgentStatus::Finished);
+    }
+
+    #[test]
+    fn idle_notification_clears_a_rejected_question() {
+        // The reported bug: AskUserQuestion goes red, the user rejects it,
+        // and the interrupted turn fires neither PostToolUse nor Stop.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        let fx = m.handle(
+            HookEvent::PreToolUse {
+                tool_name: Some("AskUserQuestion".into()),
+            },
+            Some("s1"),
+            now,
+        );
+        assert_eq!(status_of(&fx), Some(AgentStatus::NeedsFeedback));
+        let fx = idle(&mut m, now + Duration::from_secs(60));
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    #[test]
+    fn idle_notification_clears_a_stale_running_turn() {
+        // Escape mid-turn: no Stop ever arrives, so running would stick.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        let fx = idle(&mut m, now + Duration::from_secs(60));
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    #[test]
+    fn idle_notification_drops_held_stop_and_orphaned_subagents() {
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        m.handle(
+            HookEvent::SubagentStart {
+                subagent_id: Some("sub1".into()),
+            },
+            Some("s1"),
+            now,
+        );
+        m.handle(HookEvent::Stop, Some("s1"), now);
+        assert_eq!(m.status(), AgentStatus::Running, "stop held open");
+        let fx = idle(&mut m, now + Duration::from_secs(60));
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+        // A helper subagent afterwards must not heal it back to running.
+        let fx = m.handle(
+            HookEvent::SubagentStart {
+                subagent_id: Some("sub2".into()),
+            },
+            Some("s1"),
+            now + Duration::from_secs(61),
+        );
+        assert!(fx.is_empty(), "post-idle subagent must not heal: {fx:?}");
+        assert_eq!(m.status(), AgentStatus::Finished);
+    }
+
+    #[test]
+    fn idle_notification_leaves_fresh_and_dead_agents_alone() {
+        for start in [
+            AgentStatus::Fresh,
+            AgentStatus::Terminated,
+            AgentStatus::Disconnected,
+        ] {
+            let mut m = AgentStatusMachine::new(start, Some("s1".into()));
+            let fx = idle(&mut m, t0());
+            assert!(fx.is_empty(), "{start:?} must not be touched: {fx:?}");
+            assert_eq!(m.status(), start);
+        }
+    }
+
+    #[test]
+    fn foreign_idle_notification_is_ignored() {
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        m.handle(HookEvent::PermissionRequest, Some("s1"), now);
+        let fx = m.handle(
+            HookEvent::Notification {
+                notification_type: Some("idle_prompt".into()),
+            },
+            Some("someone-elses-claude"),
+            now,
+        );
+        assert!(fx.is_empty(), "foreign session: {fx:?}");
+        assert_eq!(m.status(), AgentStatus::NeedsFeedback);
+    }
+
+    #[test]
+    fn unknown_notification_types_are_ignored() {
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        for ty in [
+            "auth_success",
+            "agent_needs_input",
+            "quota_auto_resume_fired",
+        ] {
+            let fx = m.handle(
+                HookEvent::Notification {
+                    notification_type: Some(ty.into()),
+                },
+                Some("s1"),
+                now,
+            );
+            assert!(fx.is_empty(), "{ty} must not flip status: {fx:?}");
+        }
+        assert_eq!(m.status(), AgentStatus::Running);
     }
 
     #[test]

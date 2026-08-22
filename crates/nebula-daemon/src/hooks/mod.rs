@@ -21,14 +21,30 @@ use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 
-/// Injected into the agent's context (via UserPromptSubmit hook stdout)
-/// while its session still awaits an auto-title. Repeats on every prompt
-/// until a title sticks, then the daemon stops sending it.
-pub const AUTO_TITLE_INSTRUCTION: &str = "[nebula] This session is untitled. \
-Before addressing the user's request, run this shell command exactly once:\n\n  \
-nebula rename <title>\n\nReplace <title> with 3-4 Title Case words describing \
-the user's request, unquoted (example: nebula rename Fix Login Redirect). \
-Then continue with the request. Don't mention the rename to the user.";
+/// The auto-title instruction, in the one wording every channel that
+/// carries it uses: the UserPromptSubmit context injection (claude/codex)
+/// and cursor's always-on project rule. Repeats on every prompt until a
+/// title sticks, so it has to read sanely on a session that already has one.
+pub const AUTO_TITLE_INSTRUCTION: &str = "[nebula] Before addressing the \
+user's request, run this shell command exactly once:\n\n  nebula rename \
+<title>\n\nReplace <title> with 3-4 Title Case words describing the user's \
+request, unquoted (example: nebula rename Fix Login Redirect). If it reports \
+the session is already titled, accept that and move on. Then continue with \
+the request. Don't mention the rename to the user.";
+
+/// The instruction as a UserPromptSubmit hook's stdout. Codex only reads
+/// injected context out of this JSON envelope (its hook output schema is
+/// strict — bare text is discarded); Claude Code documents the same shape
+/// as the equivalent of bare text, so both CLIs share one body.
+pub fn auto_title_injection() -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": AUTO_TITLE_INSTRUCTION,
+        }
+    })
+    .to_string()
+}
 
 #[derive(Clone)]
 pub struct HookEnv {
@@ -269,7 +285,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, 200);
-        assert_eq!(body, AUTO_TITLE_INSTRUCTION);
+        // The instruction rides codex's strict JSON envelope, which claude
+        // reads as the documented equivalent of bare text.
+        assert_eq!(body, auto_title_injection());
+        assert!(body.contains("hookSpecificOutput"), "envelope: {body}");
+        assert!(body.contains("nebula rename"), "instruction: {body}");
         let delivery = rx.recv().await.unwrap();
         assert_eq!(delivery.agent_id.as_str(), "pending");
         assert_eq!(delivery.event, HookEvent::UserPromptSubmit);
@@ -282,7 +302,7 @@ mod tests {
             payload,
         )
         .await;
-        assert_eq!(body, AUTO_TITLE_INSTRUCTION);
+        assert_eq!(body, auto_title_injection());
 
         // Titled session: strictly empty — anything else would leak into
         // the model's context.
@@ -457,7 +477,7 @@ async fn receive_hook(
             .agent_auto_title_pending(&agent_id)
             .unwrap_or(false);
         let body = if inject {
-            AUTO_TITLE_INSTRUCTION.to_string()
+            auto_title_injection()
         } else {
             String::new()
         };

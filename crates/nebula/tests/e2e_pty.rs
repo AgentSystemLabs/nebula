@@ -1188,14 +1188,29 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
     wait_for_exit(&mut daemon);
 }
 
-/// Codex mirror of the claude hook test: a codex-kind agent gets
-/// `.codex/hooks.json` installed, and posts to `/api/hooks/codex` drive the
-/// same status machine (PermissionRequest is codex's native waiting signal).
+/// Codex mirror of the claude hook test: a codex-kind agent gets its hooks
+/// installed into codex's home (not the worktree — one trust approval has
+/// to cover every worktree), and posts to `/api/hooks/codex` drive the same
+/// status machine (PermissionRequest is codex's native waiting signal).
 #[tokio::test]
 async fn codex_hooks_install_and_drive_status() {
     let env = TestEnv::new();
     let repo = env.make_repo();
-    let mut daemon = env.spawn_daemon();
+    let codex_home = env.tmp.path().join("codex-home");
+    // A worktree copy from an older nebula, alongside a foreign managed
+    // group: the spawn must prune ours and leave theirs alone.
+    let stale = repo.join(".codex");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(
+        stale.join("hooks.json"),
+        r#"{"hooks":{"Stop":[
+            {"_nebulaManaged":true,"hooks":[{"type":"command",
+              "command":"curl $NEBULA_API_URL/api/hooks/codex?agentId=$NEBULA_AGENT_ID"}]},
+            {"_mcManaged":true,"hooks":[{"type":"command","command":"curl $MC_API_URL/x"}]}]}}"#,
+    )
+    .unwrap();
+    let mut daemon =
+        env.spawn_daemon_with("/bin/sh", &[("CODEX_HOME", codex_home.to_str().unwrap())]);
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
@@ -1267,10 +1282,10 @@ async fn codex_hooks_install_and_drive_status() {
     };
     let agent_id = agent_id.clone();
 
-    // Codex hooks were installed into the worktree — and only codex-shaped
+    // Codex hooks were installed into codex's home — and only codex-shaped
     // ones (no claude-specific Notification/AskUserQuestion groups).
-    let hooks_path = repo.join(".codex/hooks.json");
-    assert!(hooks_path.exists(), "codex hooks installed into worktree");
+    let hooks_path = codex_home.join("hooks.json");
+    assert!(hooks_path.exists(), "codex hooks installed into codex home");
     let hooks: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
     assert!(hooks["hooks"]["Stop"][0]["_nebulaManaged"]
@@ -1282,6 +1297,13 @@ async fn codex_hooks_install_and_drive_status() {
         .contains("/api/hooks/codex?"));
     assert!(hooks["hooks"].get("Notification").is_none());
     assert!(hooks["hooks"].get("PreToolUse").is_none());
+
+    // The stale worktree copy lost our group and kept the foreign one.
+    let stale_hooks: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(stale.join("hooks.json")).unwrap()).unwrap();
+    let stop = stale_hooks["hooks"]["Stop"].as_array().unwrap();
+    assert_eq!(stop.len(), 1, "only the foreign group survives: {stop:#?}");
+    assert!(stop[0]["_mcManaged"].as_bool().unwrap());
 
     // Drive the shell inside the agent PTY to POST codex hooks with its env.
     let sref = SessionRef::Agent(agent_id.clone());
@@ -2775,7 +2797,7 @@ async fn auto_title_instruction_and_rename_flow() {
     // First prompt on the untitled session: instruction rides the response.
     let (status, body) = hook_post(port, &submit_path, &token).await;
     assert_eq!(status, 200);
-    assert_eq!(body, nebula_daemon::hooks::AUTO_TITLE_INSTRUCTION);
+    assert_eq!(body, nebula_daemon::hooks::auto_title_injection());
 
     // The model obeys — `nebula rename` runs with the session's env.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))

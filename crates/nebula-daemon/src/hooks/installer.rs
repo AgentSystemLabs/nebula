@@ -1,6 +1,7 @@
-//! Managed-hook installation into a worktree's agent-CLI config:
-//! `.claude/settings.local.json` (Claude Code), `.codex/hooks.json`
-//! (Codex CLI), or `.cursor/hooks.json` (Cursor CLI).
+//! Managed-hook installation into the agent CLI's config:
+//! `<worktree>/.claude/settings.local.json` (Claude Code),
+//! `~/.codex/hooks.json` (Codex CLI), or `<worktree>/.cursor/hooks.json`
+//! (Cursor CLI).
 //!
 //! Claude and Codex share one hooks dialect (PascalCase event names, groups
 //! of `{"hooks": [{"type": "command", ...}]}`). Cursor speaks its own
@@ -20,14 +21,20 @@
 //!   `claude`/`codex`/`cursor-agent` outside nebula (no NEBULA_* in env →
 //!   exit 0).
 //!
-//! Codex caveat: project-local `.codex/hooks.json` only loads when the
-//! project is trusted, and codex asks once per hook on first run (approval
-//! recorded in `~/.codex/config.toml [hooks.state]`). Until approved, the
-//! agent simply reports no status — same degradation as a failed install.
+//! Codex caveat, and the reason its hooks are the one set that does NOT go
+//! in the worktree: codex gates every hook behind a startup "Hooks need
+//! review" prompt and records the approval in `~/.codex/config.toml
+//! [hooks.state]` under the hook FILE'S PATH. Project-local
+//! `.codex/hooks.json` therefore re-prompts in every fresh worktree — and
+//! an unanswered prompt means no hooks at all, so status stayed grey and no
+//! title was ever injected. Installing into `$CODEX_HOME/hooks.json`
+//! (default `~/.codex`) makes that path stable: the user trusts nebula's
+//! hooks once and every later worktree is silent. The commands stay
+//! env-guarded, so they remain inert in codex sessions outside nebula.
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// (hook event, optional matcher)
 const CLAUDE_EVENTS: &[(&str, Option<&str>)] = &[
@@ -35,7 +42,11 @@ const CLAUDE_EVENTS: &[(&str, Option<&str>)] = &[
     ("Stop", None),
     ("SessionStart", None),
     ("PermissionRequest", None),
-    ("Notification", Some("permission_prompt")),
+    // No matcher: Claude filters Notification hooks by notification_type
+    // before dispatch, and we need `idle_prompt` ("Claude is waiting for
+    // your input") as well as `permission_prompt` — it is the only signal
+    // that arrives when a turn ends without a Stop. See status.rs.
+    ("Notification", None),
     ("PreToolUse", Some("AskUserQuestion")),
     ("PostToolUse", Some("AskUserQuestion")),
     ("SubagentStart", None),
@@ -183,9 +194,54 @@ fn ensure_permission_allow(
     Ok(())
 }
 
-/// Merge nebula's managed hooks for Codex into `<cwd>/.codex/hooks.json`.
-pub fn install_codex_hooks(cwd: &Path) -> Result<()> {
-    install_managed_hooks(cwd, ".codex", "hooks.json", "codex", CODEX_EVENTS)
+/// Codex's home (`$CODEX_HOME`, else `~/.codex`) — where its hooks live so
+/// one trust approval covers every worktree. See the module header.
+pub fn codex_home() -> PathBuf {
+    match std::env::var("CODEX_HOME") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".codex"),
+    }
+}
+
+/// Merge nebula's managed hooks for Codex into `<codex_home>/hooks.json`.
+pub fn install_codex_hooks(codex_home: &Path) -> Result<()> {
+    install_managed_hooks(codex_home, "hooks.json", "codex", CODEX_EVENTS)
+}
+
+/// Drop the per-worktree `.codex/hooks.json` groups an older nebula wrote:
+/// left in place they are a second, never-trusted copy of the same hooks
+/// that codex would re-prompt for. Foreign groups (mission-control's) stay;
+/// a file left holding nothing at all is removed, and so is a `.codex`
+/// directory that existed only for it.
+pub fn prune_codex_worktree_hooks(cwd: &Path) -> Result<()> {
+    let dir = cwd.join(".codex");
+    let path = dir.join("hooks.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut root = load_hooks_root(&path)?;
+    let Some(hooks_obj) = root
+        .as_object_mut()
+        .and_then(|o| o.get_mut("hooks"))
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    let before = hooks_obj.len();
+    for (_, groups) in hooks_obj.iter_mut() {
+        if let Some(arr) = groups.as_array_mut() {
+            arr.retain(|g| !is_nebula_group(g));
+        }
+    }
+    hooks_obj.retain(|_, groups| groups.as_array().map(|a| !a.is_empty()).unwrap_or(true));
+    let emptied = hooks_obj.is_empty();
+    if emptied && before > 0 && root.as_object().map(|o| o.len()) == Some(1) {
+        std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        // Only ours to remove, and only while it holds nothing else.
+        let _ = std::fs::remove_dir(&dir);
+        return Ok(());
+    }
+    write_hooks_root(&dir, "hooks.json", &root)
 }
 
 /// Merge nebula's managed hooks for Cursor into `<cwd>/.cursor/hooks.json`,
@@ -274,13 +330,11 @@ fn write_text_atomic(dir: &Path, file_name: &str, text: &str) -> Result<()> {
 }
 
 fn install_managed_hooks(
-    cwd: &Path,
-    dir_name: &str,
+    dir: &Path,
     file_name: &str,
     endpoint: &str,
     events: &[(&str, Option<&str>)],
 ) -> Result<()> {
-    let dir = cwd.join(dir_name);
     let path = dir.join(file_name);
     let mut root = load_hooks_root(&path)?;
 
@@ -291,7 +345,7 @@ fn install_managed_hooks(
         );
     };
     merge_managed_hooks(root_obj, endpoint, events, &path)?;
-    write_hooks_root(&dir, file_name, &root)
+    write_hooks_root(dir, file_name, &root)
 }
 
 /// Strip-and-rebuild nebula's groups under each event key of a loaded
@@ -334,10 +388,15 @@ fn merge_managed_hooks(
 /// the daemon accepts at most one auto-title per session.
 pub fn install_cursor_title_rule(cwd: &Path) -> Result<()> {
     let dir = cwd.join(".cursor").join("rules");
-    write_text_atomic(&dir, "nebula-title.mdc", CURSOR_TITLE_RULE)
+    write_text_atomic(&dir, "nebula-title.mdc", &cursor_title_rule())
 }
 
-const CURSOR_TITLE_RULE: &str = "---
+/// Same instruction the injectable CLIs get, wrapped in cursor's rule
+/// frontmatter and an env guard (a project rule can't be switched off from
+/// the daemon's side the way an injection can).
+fn cursor_title_rule() -> String {
+    format!(
+        "---
 description: Nebula session auto-title (managed by nebula — edits are overwritten)
 alwaysApply: true
 ---
@@ -345,13 +404,13 @@ alwaysApply: true
 This rule applies only when the environment variable NEBULA_AGENT_ID is set
 (the session runs inside nebula). If it is unset, ignore this rule entirely.
 
-On the first user message of a new conversation, before addressing the
-request, run the shell command `nebula rename <title>` exactly once —
-replace <title> with 3-4 Title Case words describing the user's request,
-unquoted (example: `nebula rename Fix Login Redirect`). If the command
-reports the session is already titled, accept that and move on. Don't
-mention the rename to the user.
-";
+On the first user message of a new conversation:
+
+{}
+",
+        super::AUTO_TITLE_INSTRUCTION
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -378,8 +437,9 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("hookEvent=Stop"));
+        // Notification carries no matcher: idle_prompt has to reach us too.
         let notification = &settings["hooks"]["Notification"];
-        assert_eq!(notification[0]["matcher"], json!("permission_prompt"));
+        assert!(notification[0].get("matcher").is_none());
         let pre = &settings["hooks"]["PreToolUse"];
         assert_eq!(pre[0]["matcher"], json!("AskUserQuestion"));
     }
@@ -437,6 +497,119 @@ mod tests {
             "exactly one nebula entry after reinstalls: {allow:?}"
         );
         assert_eq!(settings["permissions"]["deny"][0], json!("WebFetch"));
+    }
+
+    /// Codex hooks land in its home dir, not the worktree — that stable
+    /// path is what keeps its trust prompt to a single approval.
+    #[test]
+    fn codex_installs_into_codex_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_codex_hooks(tmp.path()).unwrap();
+        let hooks = read_json(tmp.path(), "hooks.json");
+        let stop = &hooks["hooks"]["Stop"];
+        assert_eq!(stop.as_array().unwrap().len(), 1);
+        assert_eq!(stop[0]["_nebulaManaged"], json!(true));
+        let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("/api/hooks/codex?"), "codex endpoint: {cmd}");
+        assert!(cmd.contains("hookEvent=Stop"));
+        // Claude-only events must not leak into the codex file.
+        assert!(hooks["hooks"].get("Notification").is_none());
+        assert!(hooks["hooks"].get("PreToolUse").is_none());
+        assert!(hooks["hooks"].get("PostToolUse").is_none());
+        assert_eq!(
+            hooks["hooks"]["PermissionRequest"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        // UserPromptSubmit still lets the daemon's response through: that
+        // body is the auto-title injection.
+        let submit = hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(!submit.contains(">/dev/null 2>&1"), "stdout: {submit}");
+    }
+
+    #[test]
+    fn codex_home_prefers_env_over_home() {
+        // Serialised with the other env-reading test by running in one test.
+        let tmp = tempfile::tempdir().unwrap();
+        let saved = std::env::var("CODEX_HOME").ok();
+        std::env::set_var("CODEX_HOME", tmp.path());
+        assert_eq!(codex_home(), tmp.path());
+        std::env::set_var("CODEX_HOME", "");
+        assert_eq!(
+            codex_home(),
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".codex")
+        );
+        match saved {
+            Some(v) => std::env::set_var("CODEX_HOME", v),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+    }
+
+    /// Migration off the old per-worktree install: our groups go, foreign
+    /// ones stay, and a file left with nothing in it is removed outright.
+    #[test]
+    fn codex_worktree_hooks_are_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".codex");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("hooks.json"),
+            serde_json::to_string(&json!({
+                "hooks": {
+                    "Stop": [
+                        { "_nebulaManaged": true,
+                          "hooks": [{ "type": "command",
+                            "command": "curl $NEBULA_API_URL/api/hooks/codex?agentId=$NEBULA_AGENT_ID" }] },
+                        { "_mcManaged": true,
+                          "hooks": [{ "type": "command", "command": "curl $MC_API_URL/api/hooks/codex" }] }
+                    ],
+                    "UserPromptSubmit": [
+                        { "_nebulaManaged": true,
+                          "hooks": [{ "type": "command",
+                            "command": "curl $NEBULA_API_URL/api/hooks/codex?agentId=$NEBULA_AGENT_ID" }] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        prune_codex_worktree_hooks(tmp.path()).unwrap();
+        let hooks = read_json(tmp.path(), ".codex/hooks.json");
+        // Ours gone from both keys; the emptied key pruned; foreign kept.
+        assert!(hooks["hooks"].get("UserPromptSubmit").is_none());
+        let stop = hooks["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1);
+        assert_eq!(stop[0]["_mcManaged"], json!(true));
+
+        // Second worktree: the file was nebula's alone, so nothing is left
+        // behind — not the file, not the directory it needed.
+        let solo = tempfile::tempdir().unwrap();
+        let solo_dir = solo.path().join(".codex");
+        std::fs::create_dir_all(&solo_dir).unwrap();
+        std::fs::write(
+            solo_dir.join("hooks.json"),
+            serde_json::to_string(&json!({
+                "hooks": { "Stop": [
+                    { "_nebulaManaged": true,
+                      "hooks": [{ "type": "command",
+                        "command": "curl $NEBULA_API_URL/api/hooks/codex?agentId=$NEBULA_AGENT_ID" }] }
+                ] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        prune_codex_worktree_hooks(solo.path()).unwrap();
+        assert!(!solo_dir.join("hooks.json").exists());
+        assert!(!solo_dir.exists());
+
+        // Nothing to prune is not an error.
+        let bare = tempfile::tempdir().unwrap();
+        prune_codex_worktree_hooks(bare.path()).unwrap();
     }
 
     #[test]
@@ -536,35 +709,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_installs_into_missing_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        install_codex_hooks(tmp.path()).unwrap();
-        let hooks = read_json(tmp.path(), ".codex/hooks.json");
-        let stop = &hooks["hooks"]["Stop"];
-        assert_eq!(stop.as_array().unwrap().len(), 1);
-        assert_eq!(stop[0]["_nebulaManaged"], json!(true));
-        let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(cmd.contains("/api/hooks/codex?"), "codex endpoint: {cmd}");
-        assert!(cmd.contains("hookEvent=Stop"));
-        // Claude-only events must not leak into the codex file.
-        assert!(hooks["hooks"].get("Notification").is_none());
-        assert!(hooks["hooks"].get("PreToolUse").is_none());
-        assert!(hooks["hooks"].get("PostToolUse").is_none());
-        assert_eq!(
-            hooks["hooks"]["PermissionRequest"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
-    #[test]
     fn codex_preserves_foreign_managed_groups() {
-        // Mission Control also writes _mcManaged groups into the same file.
+        // Mission Control also writes _mcManaged groups into hook files.
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(".codex");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir).unwrap();
         std::fs::write(
             dir.join("hooks.json"),
             serde_json::to_string(&json!({
@@ -581,7 +730,7 @@ mod tests {
 
         install_codex_hooks(tmp.path()).unwrap();
         install_codex_hooks(tmp.path()).unwrap();
-        let hooks = read_json(tmp.path(), ".codex/hooks.json");
+        let hooks = read_json(tmp.path(), "hooks.json");
         let stop = hooks["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 2, "foreign managed group + nebula group");
         assert_eq!(stop[0]["_mcManaged"], json!(true));
@@ -591,11 +740,12 @@ mod tests {
     #[test]
     fn codex_corrupt_file_aborts_without_clobbering() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(".codex");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tmp.path();
         let original = "not json at all";
         std::fs::write(dir.join("hooks.json"), original).unwrap();
-        assert!(install_codex_hooks(tmp.path()).is_err());
+        assert!(install_codex_hooks(dir).is_err());
+        // A worktree copy in the same shape is left alone too.
+        assert!(prune_codex_worktree_hooks(dir).is_ok());
         let after = std::fs::read_to_string(dir.join("hooks.json")).unwrap();
         assert_eq!(after, original, "corrupt file must be left untouched");
     }
@@ -718,11 +868,12 @@ mod tests {
     #[test]
     fn per_kind_installs_do_not_interfere() {
         let tmp = tempfile::tempdir().unwrap();
+        let codex_dir = tempfile::tempdir().unwrap();
         install_claude_hooks(tmp.path()).unwrap();
-        install_codex_hooks(tmp.path()).unwrap();
+        install_codex_hooks(codex_dir.path()).unwrap();
         install_cursor_hooks(tmp.path()).unwrap();
         let claude = read_settings(tmp.path());
-        let codex = read_json(tmp.path(), ".codex/hooks.json");
+        let codex = read_json(codex_dir.path(), "hooks.json");
         let cursor = read_json(tmp.path(), ".cursor/hooks.json");
         assert!(claude["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()

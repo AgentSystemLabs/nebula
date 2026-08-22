@@ -577,6 +577,11 @@ pub struct PaletteItem {
     pub target: PaletteTarget,
     pub text: String,
     pub archived: bool,
+    /// The status this row's panel row would show: a rollup for projects
+    /// and worktrees, its own status for a session. Drives the glyph color
+    /// and the text sweep, so a running session reads as running in the
+    /// palette too. Refreshed by [`Palette::rebuild`] as upserts land.
+    pub status: Option<AgentStatus>,
 }
 
 /// One visible palette row: an index into `items` plus the char positions of
@@ -693,6 +698,7 @@ fn build_palette_items(tree: &Tree, show_archived: bool) -> Vec<PaletteItem> {
             target: PaletteTarget::Project(p.id.clone()),
             text: p.name.clone(),
             archived: false,
+            status: project_rollup(tree, &p.id),
         });
     }
     for p in &projects {
@@ -701,6 +707,7 @@ fn build_palette_items(tree: &Tree, show_archived: bool) -> Vec<PaletteItem> {
                 target: PaletteTarget::Worktree(w.id.clone()),
                 text: format!("{}/{}", p.name, w.branch),
                 archived: false,
+                status: worktree_rollup(tree, &w.id),
             });
         }
     }
@@ -714,6 +721,7 @@ fn build_palette_items(tree: &Tree, show_archived: bool) -> Vec<PaletteItem> {
                     target: PaletteTarget::Session(a.id.clone()),
                     text: format!("{}/{}/{}", p.name, w.branch, a.name),
                     archived: a.archived,
+                    status: Some(a.status),
                 });
             }
         }
@@ -1099,6 +1107,34 @@ impl SessionRow {
     }
 }
 
+/// Aggregate status for a worktree row: red > yellow > green > gray,
+/// archived agents excluded. Free-standing so the `/` palette can roll a
+/// row up straight from the tree, with no `App` in hand.
+pub fn worktree_rollup(tree: &Tree, worktree_id: &WorktreeId) -> Option<AgentStatus> {
+    rollup(
+        tree.agents
+            .iter()
+            .filter(|a| &a.worktree_id == worktree_id && !a.archived)
+            .map(|a| a.status),
+    )
+}
+
+/// The same aggregate over every worktree of a project.
+pub fn project_rollup(tree: &Tree, project_id: &ProjectId) -> Option<AgentStatus> {
+    let wt_ids: Vec<&WorktreeId> = tree
+        .worktrees
+        .iter()
+        .filter(|w| &w.project_id == project_id)
+        .map(|w| &w.id)
+        .collect();
+    rollup(
+        tree.agents
+            .iter()
+            .filter(|a| wt_ids.contains(&&a.worktree_id) && !a.archived)
+            .map(|a| a.status),
+    )
+}
+
 /// One selectable row in the Projects panel. The payload indexes
 /// `tree.projects`; a `Divider` is the separator hanging below that project
 /// — or, with `before`, the leading divider drawn above the whole list
@@ -1320,6 +1356,16 @@ pub struct App {
     pub sel_project: usize,
     pub sel_worktree: usize,
     pub sel_session: usize,
+    /// First visible row of the Sessions panel, in panel rows (not list
+    /// indices — group headers and pill pads take rows too). The wheel
+    /// moves it freely; the draw clamps it to the content height and
+    /// re-anchors it on the selected row whenever `sessions_anchor` shows
+    /// the selection moved (so arrows follow the cursor but the wheel
+    /// doesn't fight it).
+    pub sessions_scroll: usize,
+    /// `(sel_worktree, sel_session)` as of the last draw — the draw
+    /// re-anchors `sessions_scroll` only when this changes.
+    pub sessions_anchor: Option<(usize, usize)>,
     pub term: Option<AttachedTerm>,
     /// Input lock: keys forward to the attached PTY. Focusing the terminal
     /// pane alone (Tab / arrows) does NOT lock — Enter, a click, or `z` does.
@@ -1465,6 +1511,8 @@ impl App {
             sel_project: 0,
             sel_worktree: 0,
             sel_session: 0,
+            sessions_scroll: 0,
+            sessions_anchor: None,
             term: None,
             term_locked: false,
             conn: ConnState::Disconnected,
@@ -1916,30 +1964,11 @@ impl App {
     /// Aggregate status for a worktree row: red > yellow > green > gray,
     /// archived agents excluded.
     pub fn worktree_rollup(&self, worktree_id: &WorktreeId) -> Option<AgentStatus> {
-        rollup(
-            self.tree
-                .agents
-                .iter()
-                .filter(|a| &a.worktree_id == worktree_id && !a.archived)
-                .map(|a| a.status),
-        )
+        worktree_rollup(&self.tree, worktree_id)
     }
 
     pub fn project_rollup(&self, project_id: &ProjectId) -> Option<AgentStatus> {
-        let wt_ids: Vec<&WorktreeId> = self
-            .tree
-            .worktrees
-            .iter()
-            .filter(|w| &w.project_id == project_id)
-            .map(|w| &w.id)
-            .collect();
-        rollup(
-            self.tree
-                .agents
-                .iter()
-                .filter(|a| wt_ids.contains(&&a.worktree_id) && !a.archived)
-                .map(|a| a.status),
-        )
+        project_rollup(&self.tree, project_id)
     }
 
     pub fn hit_at(&self, x: u16, y: u16) -> Option<HitTarget> {

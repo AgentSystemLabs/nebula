@@ -1768,7 +1768,13 @@ impl Daemon {
         // updates", never blocks the spawn.
         let install_result = match agent.kind {
             AgentKind::Claude => hooks::installer::install_claude_hooks(&worktree.path),
-            AgentKind::Codex => hooks::installer::install_codex_hooks(&worktree.path),
+            // Codex's hooks live in its home, not the worktree, so one
+            // trust approval covers every worktree (see installer docs);
+            // any per-worktree copy an older nebula left is pruned.
+            AgentKind::Codex => {
+                hooks::installer::install_codex_hooks(&hooks::installer::codex_home())
+                    .and_then(|()| hooks::installer::prune_codex_worktree_hooks(&worktree.path))
+            }
             // Cursor also gets the managed auto-title project rule — its
             // hook dialect has no context-injection channel.
             AgentKind::Cursor => hooks::installer::install_cursor_hooks(&worktree.path)
