@@ -1,6 +1,7 @@
 //! TUI state: the Elm-ish Model.
 
 use crate::git_diff::DiffFile;
+use crate::text_input::TextInput;
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Note, NoteId, NoteOwner, Project, ProjectId,
     SessionRef, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
@@ -253,7 +254,7 @@ pub enum PromptKind {
 pub struct PromptDialog {
     pub title: String,
     pub label: String,
-    pub input: String,
+    pub input: TextInput,
     pub kind: PromptKind,
     /// Live directory listing under the input (path prompts only): the
     /// typed parent's subdirectories narrowed by the partial segment.
@@ -275,7 +276,7 @@ impl PromptDialog {
         let mut prompt = Self {
             title: title.into(),
             label: label.into(),
-            input: input.into(),
+            input: TextInput::with_text(input),
             kind,
             dirs: Vec::new(),
             hover: None,
@@ -327,7 +328,7 @@ impl PromptDialog {
             return;
         };
         let (parent, _) = crate::completion::split_input(&self.input);
-        self.input = format!("{parent}{}/", entry.name);
+        self.input.set_text(format!("{parent}{}/", entry.name));
         self.refresh_dirs();
     }
 
@@ -337,11 +338,12 @@ impl PromptDialog {
     pub fn ascend(&mut self) {
         let (parent, partial) = crate::completion::split_input(&self.input);
         if !partial.is_empty() {
-            self.input = parent.to_string();
+            let parent = parent.to_string();
+            self.input.set_text(parent);
             self.refresh_dirs();
             return;
         }
-        let mut path = self.input.clone();
+        let mut path = self.input.to_string();
         if path == "~/" {
             match Self::home() {
                 Some(home) => path = format!("{}/", home.display()),
@@ -354,7 +356,7 @@ impl PromptDialog {
         path.pop(); // the trailing '/'
         let cut = path.rfind('/').map(|i| i + 1).unwrap_or(0);
         path.truncate(cut);
-        self.input = path;
+        self.input.set_text(path);
         self.refresh_dirs();
     }
 
@@ -382,7 +384,7 @@ pub struct DiffView {
     pub branch: String,
     pub files: Vec<DiffFile>,
     /// Type-to-filter query over `files` paths; always live.
-    pub filter: String,
+    pub filter: TextInput,
     /// Visible rows: `files` narrowed by `filter`, best matches first
     /// (git order when the filter is empty); reviewed ✓ files always sink
     /// to the bottom.
@@ -426,7 +428,7 @@ impl DiffView {
             root,
             branch,
             files,
-            filter: String::new(),
+            filter: TextInput::new(),
             matches: Vec::new(),
             selected: 0,
             diff: String::new(),
@@ -590,7 +592,7 @@ pub struct PaletteMatch {
 pub struct Palette {
     pub items: Vec<PaletteItem>,
     /// Type-to-filter query over `items` texts; always live.
-    pub query: String,
+    pub query: TextInput,
     /// Visible rows: `items` narrowed by `query`, best matches first (build
     /// order when the query is empty).
     pub matches: Vec<PaletteMatch>,
@@ -611,7 +613,7 @@ impl Palette {
     pub fn new(tree: &Tree, show_archived: bool, enter_attaches: bool) -> Self {
         let mut palette = Self {
             items: build_palette_items(tree, show_archived),
-            query: String::new(),
+            query: TextInput::new(),
             matches: Vec::new(),
             selected: 0,
             enter_attaches,
@@ -740,7 +742,7 @@ pub struct FileFinder {
     /// Paths relative to `root`, in git listing order.
     pub files: Vec<String>,
     /// Type-to-filter query over `files`; always live.
-    pub query: String,
+    pub query: TextInput,
     /// Visible rows: `files` narrowed by `query`, best matches first
     /// (listing order when the query is empty).
     pub matches: Vec<FinderMatch>,
@@ -760,7 +762,7 @@ impl FileFinder {
             branch,
             editor,
             files,
-            query: String::new(),
+            query: TextInput::new(),
             matches: Vec::new(),
             selected: 0,
             area: Rect::default(),
@@ -811,7 +813,7 @@ pub struct GrepView {
     /// setting, default vim), captured at open time.
     pub editor: String,
     /// The search text; every edit re-runs the grep.
-    pub query: String,
+    pub query: TextInput,
     /// Current results, best-first in git grep order (path, then line).
     pub hits: Vec<crate::grep_search::GrepHit>,
     /// The search stopped at the result cap — the title says so.
@@ -833,7 +835,7 @@ impl GrepView {
             root,
             branch,
             editor,
-            query: String::new(),
+            query: TextInput::new(),
             hits: Vec::new(),
             truncated: false,
             error: None,
@@ -889,7 +891,7 @@ impl GrepView {
 pub struct NoteInput {
     /// None = creating a new note; Some = rewriting that note's text.
     pub editing: Option<NoteId>,
-    pub text: String,
+    pub text: TextInput,
 }
 
 /// Note notes modal (`o`) for one owner — a project (high-level notes) or
@@ -942,7 +944,7 @@ pub struct HostsView {
     pub selected: usize,
     /// Active "connect to a new destination" input (`a`), if any — typed as
     /// `user@host [dir]`, Enter connects like a `nebula ssh` invocation.
-    pub input: Option<String>,
+    pub input: Option<TextInput>,
     /// Whole modal rect, written back during draw so clicks outside close.
     pub area: Rect,
     /// Screen rect of the host rows, written back during draw so clicks can

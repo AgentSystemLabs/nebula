@@ -7,6 +7,7 @@ use crate::app::{
     PromptKind, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection,
     WorktreeRollback,
 };
+use crate::text_input::TextInput;
 use crate::tree_browser::TreeBrowser;
 use crate::vim_term::{VimEvent, VimTerm};
 use crate::{ipc, keys, ui};
@@ -495,6 +496,9 @@ fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientReques
                 vim.input(&data);
             }
         }
+        // An overlay with a live text field takes the paste: ⌘V into a note,
+        // a filter, or the ssh destination lands where the caret is.
+        Event::Paste(text) if paste_into_overlay(app, &text) => {}
         Event::Paste(text) => {
             if app.focus == Focus::Terminal && app.term_locked {
                 if let Some(term) = &app.term {
@@ -512,6 +516,55 @@ fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientReques
         Event::Resize(_, _) => app.dirty = true,
         _ => {}
     }
+}
+
+/// Route a bracketed paste into whatever text field the open overlay has
+/// live. Returns false when nothing is typing, so the paste falls through to
+/// the terminal pane.
+fn paste_into_overlay(app: &mut App, text: &str) -> bool {
+    let Some(overlay) = &mut app.overlay else {
+        return false;
+    };
+    match overlay {
+        Overlay::Prompt(prompt) => {
+            prompt.input.insert_str(text);
+            prompt.refresh_dirs();
+        }
+        Overlay::Palette(palette) => {
+            palette.query.insert_str(text);
+            palette.apply_filter();
+        }
+        Overlay::Files(finder) => {
+            finder.query.insert_str(text);
+            finder.apply_filter();
+        }
+        Overlay::Grep(view) => {
+            view.query.insert_str(text);
+            view.run_search();
+        }
+        Overlay::Tree(view) => {
+            view.filter.insert_str(text);
+            view.apply_filter();
+        }
+        Overlay::Diff(view) => {
+            view.filter.insert_str(text);
+            if view.apply_filter() {
+                crate::git_diff::load_selected_diff(view);
+            }
+        }
+        // These two only type while their add/edit input is open.
+        Overlay::Notes(view) => match &mut view.input {
+            Some(input) => input.text.insert_str(text),
+            None => return false,
+        },
+        Overlay::Hosts(view) => match &mut view.input {
+            Some(input) => input.insert_str(text),
+            None => return false,
+        },
+        _ => return false,
+    }
+    app.dirty = true;
+    true
 }
 
 fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
@@ -2029,7 +2082,6 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
             _ => {}
         },
         Overlay::Hosts(view) => {
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             // Typing a new destination (`a`): the input owns printable keys.
             if let Some(input) = &mut view.input {
                 match key.code {
@@ -2045,12 +2097,11 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                             app.should_quit = true;
                         }
                     }
-                    KeyCode::Backspace => {
-                        input.pop();
+                    // Everything else is the line editor's: arrows,
+                    // ⌥←/⌥→ by word, the readline chords (text_input).
+                    _ => {
+                        input.handle_key(&key);
                     }
-                    KeyCode::Char('u') if ctrl => input.clear(),
-                    KeyCode::Char(c) if !ctrl => input.push(c),
-                    _ => {}
                 }
                 return;
             }
@@ -2062,7 +2113,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 KeyCode::Char('k') | KeyCode::Up => view.selected = view.selected.saturating_sub(1),
                 // A destination the list doesn't have yet — typed here so an
                 // open nebula never needs a shell for `nebula ssh`.
-                KeyCode::Char('a') | KeyCode::Char('n') => view.input = Some(String::new()),
+                KeyCode::Char('a') | KeyCode::Char('n') => view.input = Some(TextInput::new()),
                 // Enter hands off: quit the TUI, then the binary execs a
                 // fresh `nebula ssh` at the entry (the daemon and its
                 // sessions stay up).
@@ -2156,7 +2207,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 // on the input row it submits the typed path as before.
                 let mut prompt = prompt.clone();
                 if let Some(path) = prompt.hovered_path() {
-                    prompt.input = path;
+                    prompt.input.set_text(path);
                 }
                 app.overlay = None;
                 submit_prompt(app, prompt, out);
@@ -2165,36 +2216,40 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                 let result = crate::completion::complete_path(&prompt.input, home.as_deref());
                 if let Some(completed) = result.completed {
-                    prompt.input = completed;
+                    prompt.input.set_text(completed);
                     prompt.refresh_dirs();
                 }
             }
             KeyCode::Down if prompt.completes_paths() => prompt.move_hover(1),
             KeyCode::Up if prompt.completes_paths() => prompt.move_hover(-1),
+            // ←/→ stay the path browser's dive/ascend here — the one
+            // prompt where they are already spoken for. Caret motion in a
+            // path is ⌥←/⌥→ (by segment), Ctrl+B/F, Home/End.
             KeyCode::Right if prompt.completes_paths() => {
                 if let Some(i) = prompt.hover {
                     prompt.dive(i);
                 }
             }
             KeyCode::Left if prompt.completes_paths() => prompt.ascend(),
-            KeyCode::Backspace => {
-                prompt.input.pop();
+            // The untouched "~/" prefill yields to an absolute (or
+            // re-typed tilde) path — no clearing required first.
+            KeyCode::Char(c)
+                if prompt.completes_paths()
+                    && prompt.input == "~/"
+                    && (c == '/' || c == '~')
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                prompt.input.set_text(c.to_string());
                 prompt.refresh_dirs();
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                prompt.input.clear();
-                prompt.refresh_dirs();
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // The untouched "~/" prefill yields to an absolute (or
-                // re-typed tilde) path — no clearing required first.
-                if prompt.completes_paths() && prompt.input == "~/" && (c == '/' || c == '~') {
-                    prompt.input.clear();
+            // Everything else is the line editor's (see text_input).
+            _ => {
+                if prompt.input.handle_key(&key).changed() {
+                    prompt.refresh_dirs();
                 }
-                prompt.input.push(c);
-                prompt.refresh_dirs();
             }
-            _ => {}
         },
         Overlay::Confirm(confirm) => match key.code {
             KeyCode::Esc | KeyCode::Char('n') => app.overlay = None,
@@ -2221,15 +2276,9 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 }
                 KeyCode::Esc => app.overlay = None,
                 KeyCode::Char('d') if ctrl => view.scroll_by(half),
-                // Ctrl+u clears an active filter (the app-wide clear-input
-                // key); only with nothing typed does it keep its scroll role.
-                KeyCode::Char('u') if ctrl && !view.filter.is_empty() => {
-                    view.filter.clear();
-                    if view.apply_filter() {
-                        crate::git_diff::load_selected_diff(view);
-                    }
-                }
-                KeyCode::Char('u') if ctrl => view.scroll_by(-half),
+                // Ctrl+u is the line editor's kill-to-start while something
+                // is typed; only with an empty filter does it scroll.
+                KeyCode::Char('u') if ctrl && view.filter.is_empty() => view.scroll_by(-half),
                 // Ctrl+r toggles the reviewed ✓ on the selected file —
                 // nebula-side bookkeeping only, no git state is touched.
                 // Reviewed files sink to the bottom; marking advances to the
@@ -2260,19 +2309,13 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 KeyCode::PageUp => view.scroll_by(-page),
                 KeyCode::Home => view.scroll = 0,
                 KeyCode::End => view.scroll = view.max_scroll(),
-                KeyCode::Backspace => {
-                    if view.filter.pop().is_some() && view.apply_filter() {
+                // Everything else feeds the always-on fuzzy filter, which
+                // edits like a terminal line (see text_input).
+                _ => {
+                    if view.filter.handle_key(&key).changed() && view.apply_filter() {
                         crate::git_diff::load_selected_diff(view);
                     }
                 }
-                // Everything printable feeds the always-on fuzzy filter.
-                KeyCode::Char(c) if !ctrl => {
-                    view.filter.push(c);
-                    if view.apply_filter() {
-                        crate::git_diff::load_selected_diff(view);
-                    }
-                }
-                _ => {}
             }
         }
         Overlay::Palette(palette) => {
@@ -2311,20 +2354,13 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                         jump_to_target(app, target, false, out);
                     }
                 }
-                KeyCode::Backspace => {
-                    if palette.query.pop().is_some() {
+                // Everything else edits the query like a terminal line
+                // (see text_input).
+                _ => {
+                    if palette.query.handle_key(&key).changed() {
                         palette.apply_filter();
                     }
                 }
-                KeyCode::Char('u') if ctrl => {
-                    palette.query.clear();
-                    palette.apply_filter();
-                }
-                KeyCode::Char(c) if !ctrl => {
-                    palette.query.push(c);
-                    palette.apply_filter();
-                }
-                _ => {}
             }
         }
         Overlay::Files(finder) => {
@@ -2358,20 +2394,13 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                         });
                     }
                 }
-                KeyCode::Backspace => {
-                    if finder.query.pop().is_some() {
+                // Everything else edits the query like a terminal line
+                // (see text_input).
+                _ => {
+                    if finder.query.handle_key(&key).changed() {
                         finder.apply_filter();
                     }
                 }
-                KeyCode::Char('u') if ctrl => {
-                    finder.query.clear();
-                    finder.apply_filter();
-                }
-                KeyCode::Char(c) if !ctrl => {
-                    finder.query.push(c);
-                    finder.apply_filter();
-                }
-                _ => {}
             }
         }
         Overlay::Grep(view) => {
@@ -2392,20 +2421,13 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 // Enter opens the hit in the editor modal; the overlay stays
                 // open underneath so quitting the editor returns here.
                 KeyCode::Enter => open_selected_hit_in_editor(app),
-                KeyCode::Backspace => {
-                    if view.query.pop().is_some() {
+                // Everything else edits the query like a terminal line
+                // (see text_input).
+                _ => {
+                    if view.query.handle_key(&key).changed() {
                         view.run_search();
                     }
                 }
-                KeyCode::Char('u') if ctrl => {
-                    view.query.clear();
-                    view.run_search();
-                }
-                KeyCode::Char(c) if !ctrl => {
-                    view.query.push(c);
-                    view.run_search();
-                }
-                _ => {}
             }
         }
         Overlay::Tree(view) => {
@@ -2424,13 +2446,9 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 // The preview scrolls on the diff-modal keys: ⇧↑/↓ lines,
                 // Ctrl+d/u half pages, PageUp/Down, Home/End.
                 KeyCode::Char('d') if ctrl => view.scroll_by(half),
-                // Ctrl+u clears an active filter (the app-wide clear-input
-                // key); only with nothing typed does it keep its scroll role.
-                KeyCode::Char('u') if ctrl && !view.filter.is_empty() => {
-                    view.filter.clear();
-                    view.apply_filter();
-                }
-                KeyCode::Char('u') if ctrl => view.scroll_by(-half),
+                // Ctrl+u is the line editor's kill-to-start while something
+                // is typed; only with an empty filter does it scroll.
+                KeyCode::Char('u') if ctrl && view.filter.is_empty() => view.scroll_by(-half),
                 KeyCode::Down if shift => view.scroll_by(1),
                 KeyCode::Up if shift => view.scroll_by(-1),
                 KeyCode::PageDown => view.scroll_by(page),
@@ -2465,17 +2483,13 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                         });
                     }
                 }
-                KeyCode::Backspace => {
-                    if view.filter.pop().is_some() {
+                // Everything else feeds the always-on fuzzy filter, which
+                // edits like a terminal line (see text_input).
+                _ => {
+                    if view.filter.handle_key(&key).changed() {
                         view.apply_filter();
                     }
                 }
-                // Everything printable feeds the always-on fuzzy filter.
-                KeyCode::Char(c) if !ctrl => {
-                    view.filter.push(c);
-                    view.apply_filter();
-                }
-                _ => {}
             }
         }
         Overlay::Notes(view) => {
@@ -2504,7 +2518,6 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 .collect();
             let selected = view.selected.min(rows.len().saturating_sub(1));
             view.selected = selected;
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             let cmd = if let Some(input) = &mut view.input {
                 match key.code {
                     KeyCode::Esc => NoteCmd::CancelInput,
@@ -2514,19 +2527,12 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                         (Some(id), text) => NoteCmd::Update(id.clone(), text.to_string()),
                         (None, text) => NoteCmd::Create(text.to_string()),
                     },
-                    KeyCode::Backspace => {
-                        input.text.pop();
+                    // Everything else is the line editor's: arrows, ⌥←/⌥→
+                    // by word, the readline chords (see text_input).
+                    _ => {
+                        input.text.handle_key(&key);
                         NoteCmd::Nothing
                     }
-                    KeyCode::Char('u') if ctrl => {
-                        input.text.clear();
-                        NoteCmd::Nothing
-                    }
-                    KeyCode::Char(c) if !ctrl => {
-                        input.text.push(c);
-                        NoteCmd::Nothing
-                    }
-                    _ => NoteCmd::Nothing,
                 }
             } else {
                 match key.code {
@@ -2568,13 +2574,15 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 NoteCmd::StartCreate => {
                     view.input = Some(NoteInput {
                         editing: None,
-                        text: String::new(),
+                        text: TextInput::new(),
                     });
                 }
                 NoteCmd::StartEdit(id, text) => {
                     view.input = Some(NoteInput {
                         editing: Some(id),
-                        text,
+                        // Cursor lands at the end, ready for ⌥← to step back
+                        // through the existing name.
+                        text: TextInput::with_text(text),
                     });
                 }
                 NoteCmd::CancelInput => view.input = None,
@@ -5400,6 +5408,124 @@ mod tests {
             "expected notes overlay, got {:?}",
             app.overlay
         );
+    }
+
+    /// Editing a note's text behaves like a terminal line: the caret starts
+    /// at the end, ⌥← (which macOS terminals send as ESC b) walks back a
+    /// word at a time, and typing lands at the caret instead of the tail.
+    #[test]
+    fn note_edit_takes_word_motion_and_inserts_at_the_caret() {
+        use crate::app::NoteView;
+        use nebula_core::{Note, NoteId, NoteOwner, ProjectId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let owner = NoteOwner::Project(ProjectId("p1".into()));
+        app.tree.notes.push(Note {
+            id: NoteId("t1".into()),
+            owner: owner.clone(),
+            text: "fix login redirect".into(),
+            done: false,
+            sort_order: 0,
+        });
+        app.overlay = Some(Overlay::Notes(NoteView::new(owner, "demo".into())));
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::ALT, &mut out);
+        }
+        for c in "the ".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        let Some(Overlay::Notes(view)) = &app.overlay else {
+            panic!("notes closed")
+        };
+        let input = view.input.as_ref().expect("still editing");
+        assert_eq!(input.text.as_str(), "fix the login redirect");
+
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(out.as_slice(), [ClientRequest::UpdateNote { text, .. }] if text == "fix the login redirect"),
+            "Enter saves the edited text, got {out:?}"
+        );
+    }
+
+    /// Backspace on a note being edited deletes a character; it must not
+    /// reach the list's "delete the selected note" binding, and at column 0
+    /// it does nothing at all.
+    #[test]
+    fn note_edit_swallows_backspace_instead_of_deleting_the_note() {
+        use crate::app::NoteView;
+        use nebula_core::{Note, NoteId, NoteOwner, ProjectId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let owner = NoteOwner::Project(ProjectId("p1".into()));
+        app.tree.notes.push(Note {
+            id: NoteId("t1".into()),
+            owner: owner.clone(),
+            text: "ab".into(),
+            done: false,
+            sort_order: 0,
+        });
+        app.overlay = Some(Overlay::Notes(NoteView::new(owner, "demo".into())));
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        out.clear();
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
+        }
+        let Some(Overlay::Notes(view)) = &app.overlay else {
+            panic!("notes closed")
+        };
+        assert_eq!(
+            view.input.as_ref().expect("still editing").text.as_str(),
+            ""
+        );
+        assert!(out.is_empty(), "no DeleteNote leaked out, got {out:?}");
+    }
+
+    /// The always-live search fields edit the same way — and ⌥←/⌥→ move the
+    /// caret rather than typing a literal "b"/"f" into the query.
+    #[test]
+    fn palette_query_edits_like_a_line_and_refilters() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        for c in "demo".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::ALT, &mut out);
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE, &mut out);
+        let matched = |app: &App| match &app.overlay {
+            Some(Overlay::Palette(p)) => p.matches.len(),
+            other => panic!("expected palette, got {other:?}"),
+        };
+        let Some(Overlay::Palette(p)) = &app.overlay else {
+            panic!("palette closed")
+        };
+        assert_eq!(p.query.as_str(), "xdemo", "⌥← moves, it does not type 'b'");
+        assert_eq!(matched(&app), 0, "the edit re-ran the filter");
+
+        // Ctrl+W kills the word back to an empty query, which matches all.
+        press(
+            &mut app,
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        press(
+            &mut app,
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        let Some(Overlay::Palette(p)) = &app.overlay else {
+            panic!("palette closed")
+        };
+        assert_eq!(p.query.as_str(), "");
+        assert!(matched(&app) > 0, "clearing the query restores every row");
     }
 
     /// Resting the worktree selection arms the debounced prewarm; firing it

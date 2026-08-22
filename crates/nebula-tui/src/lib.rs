@@ -13,6 +13,7 @@ pub mod raw_attach;
 pub mod review;
 pub mod splash;
 pub mod syntax;
+pub mod text_input;
 pub mod theme;
 pub mod tree_browser;
 pub mod ui;

@@ -4,6 +4,7 @@
 
 use crate::app::{DEFAULT_DIFF_FILES_W, MIN_DIFF_FILES_W, MIN_DIFF_PANE_W};
 use crate::syntax::{Highlighter, TokenKind};
+use crate::text_input::TextInput;
 use ratatui::layout::Rect;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -52,7 +53,7 @@ pub struct TreeBrowser {
     /// filter force-expands every hierarchy it keeps.
     pub expanded: Vec<bool>,
     /// Type-to-filter query over file paths; always live.
-    pub filter: String,
+    pub filter: TextInput,
     /// Total file (non-directory) count, for the title.
     pub file_count: usize,
     /// Files matching the filter, for the title.
@@ -105,7 +106,7 @@ impl TreeBrowser {
             nodes,
             top,
             expanded,
-            filter: String::new(),
+            filter: TextInput::new(),
             file_count,
             match_count: file_count,
             rows: Vec::new(),
