@@ -8,12 +8,12 @@ use crate::status::{AgentStatusMachine, Effect, HookEvent};
 use crate::store::Store;
 use anyhow::{bail, Context, Result};
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Project, ProjectId, ServerEvent,
-    SessionRef, TerminalId, TerminalTab, Note, NoteId, NoteOwner, Workspace, WorkspaceId, Worktree,
+    Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Note, NoteId, NoteOwner, Project,
+    ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree,
     WorktreeId,
 };
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -82,6 +82,11 @@ pub struct Daemon {
     /// attached, or covered by the in-view sweep refresh. The idle reaper
     /// kills sessions whose stamp ages past `session_idle_timeout`.
     session_interest: Mutex<HashMap<SessionRef, Instant>>,
+    /// Last hook-reported cwd per agent, recorded only for payloads that
+    /// passed the foreign-session gate. An agent that walks into a checkout
+    /// nebula hasn't adopted yet leaves its cwd here, so the worktree sync
+    /// can finish the re-home once the row exists.
+    last_cwd: Mutex<HashMap<AgentId, PathBuf>>,
 }
 
 impl Daemon {
@@ -99,6 +104,7 @@ impl Daemon {
             cli_probes: Mutex::new(HashMap::new()),
             attach_counts: Mutex::new(HashMap::new()),
             session_interest: Mutex::new(HashMap::new()),
+            last_cwd: Mutex::new(HashMap::new()),
         })
     }
 
@@ -940,7 +946,23 @@ impl Daemon {
     /// drops rows whose checkout vanished — except the main row and rows
     /// that still have sessions, which the user must delete deliberately.
     pub async fn sync_project_worktrees(self: &Arc<Self>, project: &Project) -> Result<()> {
-        let _ops = self.worktree_ops.lock().await;
+        let adopted = {
+            let _ops = self.worktree_ops.lock().await;
+            self.reconcile_project_worktrees(project).await?
+        };
+        // Outside the ops lock: the replay only touches agent rows, and a
+        // just-adopted checkout is exactly where a session that ran
+        // `git worktree add` itself already lives.
+        if adopted {
+            self.reparent_agents_by_last_cwd(project);
+        }
+        Ok(())
+    }
+
+    /// The reconcile half of `sync_project_worktrees`. Returns whether any
+    /// checkout was newly adopted.
+    async fn reconcile_project_worktrees(self: &Arc<Self>, project: &Project) -> Result<bool> {
+        let mut adopted = false;
         let entries = git::list_worktrees(&project.repo_path).await?;
         let (_, worktrees, agents, terminals) = self.store.load_tree()?;
         let ours: Vec<&Worktree> = worktrees
@@ -973,6 +995,7 @@ impl Daemon {
                 sort_order: 0,
             };
             self.store.insert_worktree(&worktree)?;
+            adopted = true;
             self.broadcast(ServerEvent::EntityUpserted {
                 entity: Entity::Worktree(worktree),
             });
@@ -991,7 +1014,7 @@ impl Daemon {
                 id: EntityId::Worktree(w.id.clone()),
             });
         }
-        Ok(())
+        Ok(adopted)
     }
 
     // ---- agents ----
@@ -1322,6 +1345,10 @@ impl Daemon {
         if was_alive {
             self.kill_session(&sref);
         }
+        // A deliberate move invalidates the remembered hook cwd: it still
+        // points at the old checkout, and the next worktree sync would
+        // replay it straight back over the user's choice.
+        self.last_cwd.lock().unwrap().remove(id);
         self.store.set_agent_worktree(id, worktree_id)?;
         if was_alive {
             if let Err(e) = self.spawn_agent_session(&agent, &target, 80, 24) {
@@ -1375,9 +1402,11 @@ impl Daemon {
         captures_session: bool,
     ) -> Result<()> {
         let Some(agent) = self.store.get_agent(agent_id)? else {
+            self.last_cwd.lock().unwrap().remove(agent_id);
             return Ok(());
         };
         if agent.archived {
+            self.last_cwd.lock().unwrap().remove(agent_id);
             return Ok(());
         }
         // Same foreign-session rule as the status machine: a payload from a
@@ -1390,10 +1419,25 @@ impl Daemon {
                 }
             }
         }
+        let cwd = canonical_or_raw(Path::new(cwd));
+        // Remembered even when it resolves to nothing: an agent that just ran
+        // `git worktree add` and stepped into the result reports a cwd nebula
+        // has no row for yet, and the worktree sync replays this to finish the
+        // re-home the moment that row is adopted.
+        self.last_cwd
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone(), cwd.clone());
+        self.reparent_agent_to_cwd(&agent, &cwd)
+    }
+
+    /// Move `agent`'s row under the worktree owning `cwd` when that is a
+    /// different worktree of the same project. `cwd` must already be
+    /// canonicalized.
+    fn reparent_agent_to_cwd(self: &Arc<Self>, agent: &Agent, cwd: &Path) -> Result<()> {
         let Some(current) = self.store.get_worktree(&agent.worktree_id)? else {
             return Ok(());
         };
-        let cwd = canonical_or_raw(Path::new(cwd));
         let (_, worktrees, _, _) = self.store.load_tree()?;
         // Deepest worktree of the same project containing cwd — nested
         // layouts (checkouts under the repo root) must not resolve to the
@@ -1410,15 +1454,53 @@ impl Daemon {
         if let Some((worktree, _)) = target {
             if worktree.id != agent.worktree_id {
                 tracing::info!(
-                    agent = %agent_id,
+                    agent = %agent.id,
                     from = %current.branch,
                     to = %worktree.branch,
                     "agent re-homed by hook cwd"
                 );
-                self.move_agent_row(agent_id, &worktree.id)?;
+                self.move_agent_row(&agent.id, &worktree.id)?;
             }
         }
         Ok(())
+    }
+
+    /// Replay remembered hook cwds for `project`'s agents. Runs after the
+    /// worktree sync adopts checkouts: a session that creates a worktree and
+    /// enters it reports the new cwd (often on the very next `Stop`) before
+    /// the row exists, and without this replay its row would sit under the
+    /// old checkout until the user's next prompt.
+    fn reparent_agents_by_last_cwd(self: &Arc<Self>, project: &Project) {
+        let known: Vec<(AgentId, PathBuf)> = {
+            let map = self.last_cwd.lock().unwrap();
+            map.iter().map(|(id, p)| (id.clone(), p.clone())).collect()
+        };
+        for (agent_id, cwd) in known {
+            let agent = match self.store.get_agent(&agent_id) {
+                Ok(Some(agent)) => agent,
+                Ok(None) => {
+                    self.last_cwd.lock().unwrap().remove(&agent_id);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id, error = %e, "cwd replay lookup failed");
+                    continue;
+                }
+            };
+            if agent.archived {
+                continue;
+            }
+            let in_project = matches!(
+                self.store.get_worktree(&agent.worktree_id),
+                Ok(Some(w)) if w.project_id == project.id
+            );
+            if !in_project {
+                continue;
+            }
+            if let Err(e) = self.reparent_agent_to_cwd(&agent, &cwd) {
+                tracing::warn!(agent = %agent_id, error = %e, "cwd replay reparent failed");
+            }
+        }
     }
 
     pub fn archive_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
@@ -1451,6 +1533,7 @@ impl Daemon {
 
     pub fn delete_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
         self.kill_session(&SessionRef::Agent(id.clone()));
+        self.last_cwd.lock().unwrap().remove(id);
         self.store.delete_agent(id)?;
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Agent(id.clone()),
@@ -2705,6 +2788,136 @@ mod tests {
         // cwd outside every worktree is ignored.
         daemon.reparent_agent_by_cwd(&AgentId("a1".into()), "/elsewhere", None, false);
         assert_eq!(agent_worktree(&daemon, "a1"), "feat");
+    }
+
+    /// Regression: a session that creates a worktree and steps into it
+    /// reports the new cwd *before* the sync has adopted a row for it (the
+    /// `Stop` hook fires long before the next 2s sync tick). The cwd must be
+    /// remembered and replayed on adoption, or the row sits under the old
+    /// checkout until the user's next prompt.
+    #[tokio::test]
+    async fn worktree_sync_replays_a_cwd_reported_before_adoption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+
+        let daemon = test_daemon();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId("p".into()),
+            name: "p".into(),
+            repo_path: repo.clone(),
+            sort_order: 0,
+            divider_after: false,
+            divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
+        };
+        daemon.store.insert_project(&project).unwrap();
+        seed_worktree(&daemon, "p", "root", &repo.to_string_lossy(), true);
+        seed_agent(&daemon, "a1", "root", Some("s1"));
+
+        // The agent creates a sibling worktree and walks into it. The hook
+        // lands first: no row exists yet, so nothing moves.
+        let feat = root.join("repo-worktrees").join("feat");
+        git_in(
+            &repo,
+            &["worktree", "add", &feat.to_string_lossy(), "-b", "feat"],
+        );
+        daemon.reparent_agent_by_cwd(
+            &AgentId("a1".into()),
+            &feat.to_string_lossy(),
+            Some("s1"),
+            false,
+        );
+        assert_eq!(agent_worktree(&daemon, "a1"), "root");
+
+        // The sync adopts the checkout and replays the remembered cwd.
+        daemon.sync_project_worktrees(&project).await.unwrap();
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        let adopted = worktrees
+            .iter()
+            .find(|w| w.branch == "feat")
+            .expect("feat worktree adopted");
+        assert_eq!(agent_worktree(&daemon, "a1"), adopted.id.to_string());
+
+        // A deliberate move back must survive the next adoption: the move
+        // drops the remembered cwd, so replaying it can't overrule the user.
+        daemon
+            .move_agent(&AgentId("a1".into()), &WorktreeId("root".into()))
+            .unwrap();
+        let other = root.join("repo-worktrees").join("other");
+        git_in(
+            &repo,
+            &["worktree", "add", &other.to_string_lossy(), "-b", "other"],
+        );
+        daemon.sync_project_worktrees(&project).await.unwrap();
+        assert_eq!(agent_worktree(&daemon, "a1"), "root");
+    }
+
+    /// The replay is scoped to the synced project and skips archived rows.
+    #[test]
+    fn cwd_replay_skips_other_projects_and_archived_agents() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p", "q"]);
+        seed_worktree(&daemon, "p", "p-root", "/nebula-test/p", true);
+        seed_worktree(&daemon, "q", "q-root", "/nebula-test/q", true);
+        seed_worktree(&daemon, "q", "q-feat", "/nebula-test/q-feat", false);
+        seed_agent(&daemon, "a1", "q-root", None);
+        seed_agent(&daemon, "a2", "q-root", None);
+
+        // Both agents report a cwd inside q-feat before it exists...
+        daemon
+            .store
+            .delete_worktree(&WorktreeId("q-feat".into()))
+            .unwrap();
+        daemon.reparent_agent_by_cwd(&AgentId("a1".into()), "/nebula-test/q-feat", None, false);
+        daemon.reparent_agent_by_cwd(&AgentId("a2".into()), "/nebula-test/q-feat", None, false);
+        seed_worktree(&daemon, "q", "q-feat", "/nebula-test/q-feat", false);
+
+        // ...but a replay for project p touches neither.
+        let p = daemon
+            .store
+            .get_project(&ProjectId("p".into()))
+            .unwrap()
+            .unwrap();
+        daemon.reparent_agents_by_last_cwd(&p);
+        assert_eq!(agent_worktree(&daemon, "a1"), "q-root");
+
+        // Archived agents stay put; live ones re-home.
+        daemon
+            .store
+            .set_agent_archived(&AgentId("a2".into()), true)
+            .unwrap();
+        let q = daemon
+            .store
+            .get_project(&ProjectId("q".into()))
+            .unwrap()
+            .unwrap();
+        daemon.reparent_agents_by_last_cwd(&q);
+        assert_eq!(agent_worktree(&daemon, "a1"), "q-feat");
+        assert_eq!(agent_worktree(&daemon, "a2"), "q-root");
+    }
+
+    fn git_in(repo: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]
