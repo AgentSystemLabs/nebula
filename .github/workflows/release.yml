@@ -3,6 +3,10 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Dry run: build the whole matrix on demand without publishing anything, so
+  # a cross-compile break is caught before a tag is cut (the release job below
+  # only runs for a tag push).
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -46,6 +50,7 @@ jobs:
 
   release:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4

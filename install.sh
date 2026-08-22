@@ -61,10 +61,19 @@ install_from_source() {
 main() {
     command -v curl >/dev/null 2>&1 || err "curl is required"
 
-    if target=$(detect_target) && install_from_release "$target"; then
-        installed="$INSTALL_DIR/nebula"
+    installed=""
+    if target=$(detect_target); then
+        if install_from_release "$target"; then
+            installed="$INSTALL_DIR/nebula"
+        else
+            reason="couldn't download nebula-$target from the latest release"
+        fi
     else
-        say "no prebuilt binary for this platform yet — falling back to cargo"
+        reason="no prebuilt binary for $(uname -s) $(uname -m)"
+    fi
+
+    if [ -z "$installed" ]; then
+        say "$reason — building from source instead"
         install_from_source
         installed="$HOME/.cargo/bin/nebula"
     fi

@@ -33,6 +33,65 @@ if you mean it). Upgrading while a daemon is running is safe: sessions keep
 running on the old binary until you run `nebula kill` (which stops all
 sessions) and relaunch.
 
+## Getting started
+
+You'll want at least one agent CLI on your `PATH` first — `claude`, `codex`,
+or `cursor-agent`. nebula spawns them; it doesn't ship them.
+
+**1. Add a repo.** nebula is project-first, and a project is just a git
+checkout:
+
+```
+nebula add ~/code/my-app       # or, from inside the repo: nebula add .
+```
+
+**2. Open the TUI.** A bare `nebula` launches it and auto-starts the daemon:
+
+```
+nebula
+```
+
+You get four columns, left to right: **Projects → Worktrees → Sessions →
+Terminal**. `Tab` / `Shift+Tab` (or `←` / `→`) move focus between columns,
+`j` / `k` move the selection inside one, and `Enter` drills in. With no
+projects yet you get the splash instead — press `n` to add one without
+leaving the TUI.
+
+**3. Choose where the agent runs.** Select your project, then a worktree. Every
+project starts with one worktree: the checkout itself. Press `n` in the
+Worktrees column to branch off into a real `git worktree` (created under
+`<repo>/../<repo-name>-worktrees/<branch>`). That's the point of the column —
+two agents in two worktrees edit two directories and never collide.
+
+**4. Start the agent.** With a worktree selected, press `n` in the Sessions
+column. A menu asks what to run — **Claude**, **Codex**, **Cursor**, or a
+plain **Terminal (shell)**. `→` on Claude or Codex drills into model and
+reasoning-effort submenus; `Enter` anywhere takes your configured defaults.
+Name it or accept the default, and nebula spawns the CLI in that worktree and
+drops you straight into it. Type your prompt as you normally would.
+
+**5. Leave — it keeps running.** `Ctrl+q` gets you out of the terminal and back
+to the panels. That's the key to remember: the agent doesn't care that you
+stopped watching. Press `q` to quit nebula entirely and the daemon still owns
+every PTY — come back with `nebula` an hour later and each session is where
+you left it, scrollback replayed.
+
+**6. Read the dots instead of the screens.** Once you're running more than one
+agent you stop reading terminals and start reading the Sessions column: ●
+yellow is mid-turn, ● green is done, ● red wants you (a permission prompt or
+a question). Projects and worktrees roll their children up, so a red dot on a
+collapsed project tells you where to look. Full table under
+[Status dots](#status-dots).
+
+**7. Let them name themselves.** Leave a new session on its default name and
+the agent retitles it after your first prompt — `Fix Login Redirect` rather
+than `agent-3`. Type a name yourself (or `r` to rename) and nebula never
+touches it.
+
+From there: `t` opens a shell in the selected worktree, `w` switches
+workspaces when one project list gets long, `?` lists every key, and `m` (or
+right-click) opens a context menu for whatever's selected.
+
 ## How it works
 
 - **Detached daemon (tmux-style).** A background `nebula` daemon owns every
@@ -107,6 +166,7 @@ Worktree and project rows roll up their children: red beats yellow beats green.
 | Any panel | `z` | collapse sidebars (full-width terminal) |
 | Any panel | `Shift+M` | memory usage: RAM per agent/terminal process tree, nebula itself, and the machine-wide share; `↑/↓` + `Enter` opens the selected session |
 | Any panel | `?` | help overlay |
+| Any panel | `q` / `Ctrl+c` | quit the TUI (sessions keep running) |
 | Terminal | anything | forwarded raw to the PTY |
 | Terminal | `Ctrl+q` | back to panels (also expands sidebars) |
 | Terminal | mouse wheel | scrollback (arrow keys on alt-screen apps) |
