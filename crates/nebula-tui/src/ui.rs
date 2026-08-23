@@ -21,8 +21,10 @@ pub const VIM_MODAL_PCT: (u16, u16) = (94, 92);
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits.clear();
 
+    // The bar gets a blank row above it so it breathes off the panel
+    // borders, matching the terminal's own padding below the last row.
     let [body, footer] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(f.area());
+        Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(f.area());
 
     if app.collapsed {
         draw_terminal(f, app, body);
@@ -441,8 +443,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     &[
                         ("n", "new agent (pick CLI kind)"),
                         ("t", "new shell terminal"),
-                        ("Enter", "attach + lock input"),
-                        ("r", "rename agent / terminal"),
+                        ("L", "attach a link (PR, doc, ticket)"),
+                        ("Enter", "attach session / open link"),
+                        ("r", "rename agent / edit link URL"),
                         ("p", "pin / unpin"),
                         ("a / u", "archive / unarchive (A: show/hide)"),
                         ("m", "context menu (right-click)"),
@@ -2240,7 +2243,13 @@ impl SessionEntry {
 fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Sessions;
-    let visible = app.visible_session_rows().len();
+    // The title's count is a session count: link rows are bookmarks, and
+    // counting them here would say "4 sessions" over a list of two.
+    let visible = app
+        .visible_session_rows()
+        .iter()
+        .filter(|r| r.as_link().is_none())
+        .count();
     let count = Some(visible).filter(|n| *n > 0 && !app.divider_focused());
     let inner = draw_column(f, area, "SESSIONS", count, focused, th);
 
@@ -2269,6 +2278,7 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .filter(|r| matches!(r, SessionRow::Terminal(_)))
         .count();
+    let link_count = rows.iter().filter(|r| r.as_link().is_some()).count();
     let dim = Style::default().fg(th.dim);
 
     // ---- lay the column out in virtual rows ----
@@ -2334,6 +2344,15 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         );
         push_rows(&mut layout, &mut vrow, active_count, terminal_count);
     }
+    if link_count > 0 {
+        header(&mut layout, &mut vrow, SessionEntry::Header("LINKS".into()));
+        push_rows(
+            &mut layout,
+            &mut vrow,
+            active_count + terminal_count,
+            link_count,
+        );
+    }
     if archived_count > 0 {
         let text = if app.show_archived {
             format!(" ARCHIVED · {archived_count} (A hides)")
@@ -2342,7 +2361,7 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         };
         header(&mut layout, &mut vrow, SessionEntry::ArchivedHeader(text));
         if app.show_archived {
-            let start = active_count + terminal_count;
+            let start = active_count + terminal_count + link_count;
             push_rows(&mut layout, &mut vrow, start, rows.len().saturating_sub(start));
         }
     }
@@ -2433,15 +2452,11 @@ fn draw_session_row(
             } else {
                 Style::default().fg(th.muted)
             };
-            // Non-default CLIs get a dim badge (same idiom as the worktree
-            // root row).
-            let badge = match a.kind {
-                nebula_core::AgentKind::Claude => None,
-                nebula_core::AgentKind::Codex => Some(" codex"),
-                nebula_core::AgentKind::Cursor => Some(" cursor"),
-            };
-            let name_max =
-                (width.saturating_sub(2) as usize).saturating_sub(badge.map_or(0, str::len));
+            // The CLI behind the session, as a dim trailing badge (same
+            // idiom as the worktree root row) — every kind, so the column
+            // reads as one consistent "name · harness" list.
+            let badge = format!(" {}", a.kind.as_str());
+            let name_max = (width.saturating_sub(2) as usize).saturating_sub(badge.len());
             // Archived rows stay quiet even if their last status was live.
             let ramp = if a.archived {
                 None
@@ -2455,9 +2470,7 @@ fn draw_session_row(
                 ramp,
                 app.sweep_phase(),
             ));
-            if let Some(badge) = badge {
-                spans.push(Span::styled(badge, Style::default().fg(th.dim)));
-            }
+            spans.push(Span::styled(badge, Style::default().fg(th.dim)));
             spans
         }
         SessionRow::Terminal(t) => {
@@ -2471,6 +2484,32 @@ fn draw_session_row(
                     Style::default().fg(th.muted),
                 ),
             ]
+        }
+        SessionRow::Link(l) => {
+            // Same shape as an agent row — glyph, name, dim trailing badge
+            // — so the column reads as one list. The arrow says "leaves
+            // nebula"; a pull request earns the accent, everything else is
+            // as quiet as a terminal row.
+            let pr = l.pull_request();
+            let badge = pr.map(|pr| format!(" {}", pr.badge()));
+            let badge_len = badge.as_ref().map_or(0, |b| b.chars().count());
+            let glyph_color = match pr {
+                Some(pr) if pr.is_open() => th.accent,
+                Some(_) => th.dim,
+                None => th.muted,
+            };
+            let label_max = (width.saturating_sub(2) as usize).saturating_sub(badge_len);
+            let mut spans = vec![
+                Span::styled("↗ ", Style::default().fg(glyph_color)),
+                Span::styled(
+                    truncate(&l.label(), label_max),
+                    Style::default().fg(th.muted),
+                ),
+            ];
+            if let Some(badge) = badge {
+                spans.push(Span::styled(badge, Style::default().fg(th.dim)));
+            }
+            spans
         }
     };
     render_pill(f, inner, top, spans, index == app.sel_session, focused, th);
@@ -2738,8 +2777,14 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
         spans.push(seg(&worktree.branch, app.focus == Focus::Worktrees));
         if let Some(session) = app.selected_session_row() {
             spans.push(sep());
+            // A link's crumb is its display label, not the raw URL — the
+            // crumb has 20 cells and "https://" would eat eight of them.
+            let name = match session.as_link() {
+                Some(link) => link.label(),
+                None => session.name().to_string(),
+            };
             spans.push(seg(
-                session.name(),
+                &name,
                 matches!(app.focus, Focus::Sessions | Focus::Terminal),
             ));
         }
@@ -2757,6 +2802,12 @@ fn editor_name(cmd: &str) -> &str {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    // `area` includes the blank padding row; the bar itself is its last row.
+    let area = Rect {
+        y: area.y + area.height.saturating_sub(1),
+        height: area.height.min(1),
+        ..area
+    };
     let th = app.theme;
     // The hint branches below build with `dim`; lift to muted at the end
     // so hints read as secondary, not disabled (flash/warn stays as-is).
@@ -2868,8 +2919,13 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Focus::Worktrees => {
                 "n: new worktree  e: notes  t: terminal  p: pin  d: delete  /: search  m: menu  ?: help"
             }
+            // A link row answers to a different set of verbs than a
+            // session does, so the hint follows the cursor into the group.
+            Focus::Sessions if app.selected_link().is_some() => {
+                "↵: open in browser  L: add link  r: edit URL  d: delete  m: menu  ?: help"
+            }
             Focus::Sessions => {
-                "↵: focus  n: agent  t: terminal  r: rename  p: pin  a: archive  d: del  m: menu  ?: help"
+                "↵: focus  n: agent  t: terminal  L: link  r: rename  a: archive  d: del  m: menu  ?: help"
             }
         };
         Span::styled(text, Style::default().fg(th.dim))

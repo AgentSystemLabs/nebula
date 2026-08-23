@@ -2,11 +2,12 @@
 
 use crate::app::{
     App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder, Focus,
-    GrepView, HitTarget, MenuAction, MenuItem, MetricsView, NoteInput, NoteView, Overlay, Palette,
-    PaletteTarget, PendingAction, PendingIntent, PointerShape, ProjectRow, PromptDialog,
+    GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, NoteInput, NoteView, Overlay,
+    Palette, PaletteTarget, PendingAction, PendingIntent, PointerShape, ProjectRow, PromptDialog,
     PromptKind, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection,
     WorktreeRollback,
 };
+use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
 use crate::tree_browser::TreeBrowser;
 use crate::vim_term::{VimEvent, VimTerm};
@@ -17,8 +18,8 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use nebula_core::{
-    AgentId, AgentKind, ClientRequest, EntityId, NoteId, NoteOwner, ServerEvent, SessionRef,
-    WorktreeId,
+    AgentId, AgentKind, ClientRequest, EntityId, LinkId, NoteId, NoteOwner, ServerEvent,
+    SessionRef, WorktreeId,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -49,6 +50,11 @@ const PREWARM_DEBOUNCE: Duration = Duration::from_millis(250);
 /// refreshed (a young session is a no-op, an aging one is recycled) before
 /// the reaper can empty it.
 const KEEPWARM_REFRESH: Duration = Duration::from_secs(4 * 60);
+
+/// How often the selected worktree's pull request is re-checked with `gh`.
+/// Far slower than the git badge: it costs a network round trip, and a PR
+/// being opened or merged is a thing that happens on human timescales.
+const PR_POLL: Duration = Duration::from_secs(3 * 60);
 
 /// While the metrics modal is open, how often a fresh memory reading is
 /// requested from the daemon.
@@ -157,6 +163,11 @@ async fn main_loop(
     let mut pointer_sent = PointerShape::default();
     let mut next_draw = tokio::time::Instant::now();
     let mut next_git_poll = tokio::time::Instant::now();
+    let mut next_pr_poll = tokio::time::Instant::now() + PR_POLL;
+    // Pull-request lookups run off the loop (they hit the network); answers
+    // come back here and land in `app.pull_requests`.
+    let (pr_tx, mut pr_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(WorktreeId, Option<PullRequest>)>();
     let mut next_metrics_poll = tokio::time::Instant::now();
     let mut next_splash_frame = tokio::time::Instant::now();
     let mut next_sweep_frame = tokio::time::Instant::now();
@@ -178,7 +189,7 @@ async fn main_loop(
             sync_pty_size(&mut app, &mut out);
             sync_vim_size(&mut app);
             // What the user sees selected, for RECENT-expiry re-anchoring.
-            app.drawn_session = app.selected_session_row().map(|r| r.sref());
+            app.drawn_session = app.selected_session_row().and_then(|r| r.sref());
         }
 
         // Wake when the next RECENT session ages out so the list regroups
@@ -194,6 +205,10 @@ async fn main_loop(
             // traffic can't starve the badge refresh.
             _ = tokio::time::sleep_until(next_git_poll) => {
                 refresh_git_changes(&mut app);
+                // Rides the git tick rather than the repaint, so walking the
+                // worktree list with j/k can't spawn a `gh` per row passed —
+                // only whatever the selection is resting on when it fires.
+                lookup_pull_request(&mut app, &pr_tx, false);
                 next_git_poll = tokio::time::Instant::now() + GIT_POLL;
             }
             // Metrics poll: always on for the footer's memory/session
@@ -232,7 +247,7 @@ async fn main_loop(
                     if let Some(i) = app
                         .visible_session_rows()
                         .iter()
-                        .position(|r| r.sref() == keep)
+                        .position(|r| r.sref().as_ref() == Some(&keep))
                     {
                         app.sel_session = i;
                     }
@@ -277,6 +292,19 @@ async fn main_loop(
                 // Never None: app.vim_tx keeps a sender alive.
                 if let Some(ev) = ev {
                     handle_vim_event(&mut app, ev);
+                }
+            }
+            // Re-check the selected worktree's pull request: one may have
+            // been opened, merged or closed on GitHub since we last asked.
+            _ = tokio::time::sleep_until(next_pr_poll) => {
+                lookup_pull_request(&mut app, &pr_tx, true);
+                next_pr_poll = tokio::time::Instant::now() + PR_POLL;
+            }
+            answer = pr_rx.recv() => {
+                // Never None: `pr_tx` lives as long as the loop.
+                if let Some((worktree, pr)) = answer {
+                    app.pr_inflight.remove(&worktree);
+                    app.dirty |= app.pull_requests.insert(worktree, pr.clone()) != Some(pr);
                 }
             }
         }
@@ -340,6 +368,38 @@ fn refresh_git_changes(app: &mut App) {
         app.git_changes = next;
         app.dirty = true;
     }
+}
+
+/// Ask `gh` for the selected worktree's pull request, off the loop. Skipped
+/// when an answer is already cached (unless `force`, the slow re-poll) or a
+/// lookup for that worktree is already in flight — a repaint must never
+/// stack `gh` processes. The reply arrives on `pr_tx`.
+fn lookup_pull_request(
+    app: &mut App,
+    pr_tx: &tokio::sync::mpsc::UnboundedSender<(WorktreeId, Option<PullRequest>)>,
+    force: bool,
+) {
+    let Some((id, path)) = app
+        .selected_worktree()
+        .map(|w| (w.id.clone(), w.path.clone()))
+    else {
+        return;
+    };
+    if (!force && app.pull_requests.contains_key(&id)) || app.pr_inflight.contains(&id) {
+        return;
+    }
+    // A checkout that isn't on disk (deleted outside nebula) has no branch
+    // for gh to resolve; don't spend a process finding that out.
+    if !path.is_dir() {
+        app.pull_requests.insert(id, None);
+        return;
+    }
+    app.pr_inflight.insert(id.clone());
+    let pr_tx = pr_tx.clone();
+    tokio::spawn(async move {
+        let pr = crate::pull_request::lookup(&path).await;
+        let _ = pr_tx.send((id, pr));
+    });
 }
 
 /// Fire one memory reading for the metrics modal: sample this client's own
@@ -782,6 +842,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 Some(SessionRow::Terminal(t)) => {
                     open_prompt(app, PromptKind::RenameTerminal { id: t.id })
                 }
+                Some(SessionRow::Link(l)) => edit_link(app, &l),
                 None => {}
             },
             Focus::Projects => {
@@ -801,6 +862,9 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     Some(SessionRow::Terminal(_)) => {
                         app.flash = Some("terminals can't be archived — d closes them".into());
                     }
+                    Some(SessionRow::Link(_)) => {
+                        app.flash = Some("links can't be archived — d deletes them".into());
+                    }
                     _ => {}
                 }
             }
@@ -809,6 +873,8 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             Focus::Sessions => {
                 if let Some(SessionRow::Terminal(_)) = app.selected_session_row() {
                     app.flash = Some("terminals can't be pinned".into());
+                } else if let Some(SessionRow::Link(_)) = app.selected_session_row() {
+                    app.flash = Some("links can't be pinned".into());
                 } else if let Some(a) = app.selected_session() {
                     if a.archived {
                         app.flash = Some("agent is archived — unarchive first (u)".into());
@@ -918,6 +984,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // t/T: new shell terminal, spawned in the worktree's directory.
         // (Cmd+T never reaches a TUI — the emulator opens its own tab.)
         KeyCode::Char('t') | KeyCode::Char('T') => create_terminal_for_context(app, out),
+        KeyCode::Char('L') => open_new_link_prompt(app),
         KeyCode::Char('z') => {
             if app.term.is_some() {
                 app.collapsed = true;
@@ -1025,6 +1092,21 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
                 .map(|w| w.name.clone())
                 .unwrap_or_default();
             ("Rename workspace".to_string(), "name".to_string(), current)
+        }
+        PromptKind::NewLink { .. } => (
+            "Add link".to_string(),
+            "URL (pull request, doc, ticket)".to_string(),
+            String::new(),
+        ),
+        PromptKind::EditLink { id } => {
+            let current = app
+                .tree
+                .links
+                .iter()
+                .find(|l| &l.id == id)
+                .map(|l| l.url.clone())
+                .unwrap_or_default();
+            ("Edit link".to_string(), "URL".to_string(), current)
         }
     };
     app.overlay = Some(Overlay::Prompt(PromptDialog::new(
@@ -1327,7 +1409,7 @@ fn open_selected_tree_file_in_editor(app: &mut App) {
 /// border). `sync_vim_size` trues it up after the real draw.
 fn vim_size_guess(app: &App) -> (u16, u16) {
     let frame_w = app.body_area.width;
-    let frame_h = app.body_area.height + 1; // + footer row
+    let frame_h = app.body_area.height + 2; // + footer row and its padding
     let cols = (frame_w * ui::VIM_MODAL_PCT.0 / 100)
         .saturating_sub(2)
         .max(2);
@@ -1480,6 +1562,26 @@ fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
     });
 }
 
+/// `L`: attach a URL to the worktree in context — the selected one, or the
+/// selected project's main checkout when the Projects panel has focus (the
+/// same rule `t` uses for terminals).
+fn open_new_link_prompt(app: &mut App) {
+    let worktree = match app.focus {
+        Focus::Projects => app.selected_project().and_then(|p| {
+            app.tree
+                .worktrees
+                .iter()
+                .find(|w| w.project_id == p.id && w.is_main)
+                .map(|w| w.id.clone())
+        }),
+        _ => app.selected_worktree().map(|w| w.id.clone()),
+    };
+    match worktree {
+        Some(worktree) => open_prompt(app, PromptKind::NewLink { worktree }),
+        None => app.flash = Some("select a project or worktree first".into()),
+    }
+}
+
 fn open_delete_confirm(app: &mut App) {
     match app.focus {
         Focus::Projects => {
@@ -1534,10 +1636,41 @@ fn open_delete_confirm(app: &mut App) {
                     action: PendingAction::CloseTerminal(t.id),
                 }));
             }
+            Some(SessionRow::Link(l)) => delete_link(app, &l),
             None => {}
         },
         Focus::Terminal => {}
     }
+}
+
+/// Edit the URL behind a link row. The detected pull request has no stored
+/// row to rewrite — it comes back from git on every lookup.
+fn edit_link(app: &mut App, row: &LinkRow) {
+    match row.id() {
+        Some(id) => open_prompt(app, PromptKind::EditLink { id: id.clone() }),
+        None => {
+            app.flash =
+                Some("the pull request link comes from git — L adds one you can edit".into())
+        }
+    }
+}
+
+/// Delete a link row, with the same confirm every other `d` gets. The
+/// detected pull request isn't ours to delete: it would be back on the next
+/// lookup.
+fn delete_link(app: &mut App, row: &LinkRow) {
+    let Some(id) = row.id() else {
+        app.flash = Some("the pull request link can't be deleted — it comes from git".into());
+        return;
+    };
+    app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+        title: "Delete link".into(),
+        message: format!(
+            "Delete link '{}'? Nothing it points at is touched.",
+            row.label()
+        ),
+        action: PendingAction::DeleteLink(id.clone()),
+    }));
 }
 
 /// Cap on itemized rows in the bulk-delete confirm; the rest collapse into
@@ -1607,6 +1740,15 @@ fn open_delete_all_confirm(app: &mut App) {
                 app.flash = Some("no sessions to delete".into());
                 return;
             }
+            // Links are bookmarks, not sessions: `D` never touches them.
+            let doomed: Vec<SessionRow> = doomed
+                .into_iter()
+                .filter(|r| r.as_link().is_none())
+                .collect();
+            if doomed.is_empty() {
+                app.flash = Some("no sessions to delete".into());
+                return;
+            }
             let names: Vec<String> = doomed.iter().map(|r| r.name().to_string()).collect();
             let mut agents = Vec::new();
             let mut terminals = Vec::new();
@@ -1614,6 +1756,7 @@ fn open_delete_all_confirm(app: &mut App) {
                 match row {
                     SessionRow::Agent(a) => agents.push(a.id),
                     SessionRow::Terminal(t) => terminals.push(t.id),
+                    SessionRow::Link(_) => unreachable!("filtered out above"),
                 }
             }
             app.overlay = Some(Overlay::Confirm(ConfirmDialog {
@@ -1628,6 +1771,29 @@ fn open_delete_all_confirm(app: &mut App) {
         }
         Focus::Projects | Focus::Terminal => {}
     }
+}
+
+/// Row menu for a link: open it, and — unless it's the pull request nebula
+/// found in git — edit or delete it.
+fn menu_items_for_link(row: &LinkRow) -> Vec<MenuItem> {
+    let mut items = vec![MenuItem {
+        label: "Open in browser".into(),
+        action: MenuAction::OpenLink(row.url().to_string()),
+        destructive: false,
+    }];
+    if let Some(id) = row.id() {
+        items.push(MenuItem {
+            label: "Edit URL".into(),
+            action: MenuAction::EditLink(id.clone()),
+            destructive: false,
+        });
+        items.push(MenuItem {
+            label: "Delete".into(),
+            action: MenuAction::DeleteLink(id.clone()),
+            destructive: true,
+        });
+    }
+    items
 }
 
 fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
@@ -1758,7 +1924,8 @@ fn open_menu(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
 
 /// Step 1 of new-session creation: pick which CLI the session runs — or a
 /// plain shell terminal. An agent kind chains into the name prompt via
-/// `MenuAction::NewAgentOfKind`; the terminal is created immediately.
+/// `MenuAction::NewAgentOfKind` — unless `skip_session_naming` is on, which
+/// creates it right there; the terminal is created immediately.
 /// Claude/Codex rows expand (→) into model and effort submenus; Enter
 /// anywhere takes the configured defaults for whatever wasn't drilled into.
 fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
@@ -2030,6 +2197,11 @@ fn open_context_menu_for_selection(app: &mut App) {
                         destructive: false,
                     },
                     MenuItem {
+                        label: "Add link".into(),
+                        action: MenuAction::NewLink(w.id.clone()),
+                        destructive: false,
+                    },
+                    MenuItem {
                         label: if w.pinned { "Unpin" } else { "Pin" }.into(),
                         action: MenuAction::SetWorktreePinned(w.id.clone(), !w.pinned),
                         destructive: false,
@@ -2048,6 +2220,7 @@ fn open_context_menu_for_selection(app: &mut App) {
         Focus::Sessions => match app.selected_session_row() {
             Some(SessionRow::Agent(a)) => open_menu(app, menu_items_for_session(&a), at),
             Some(SessionRow::Terminal(t)) => open_menu(app, menu_items_for_terminal(&t), at),
+            Some(SessionRow::Link(l)) => open_menu(app, menu_items_for_link(&l), at),
             None => {}
         },
         Focus::Terminal => {}
@@ -2721,32 +2894,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             kind,
             model,
             effort,
-        } => {
-            // Accepting the generated default name opts the session into
-            // agent-driven auto-titling (`nebula rename` on first prompt);
-            // a typed name is the user's choice and stays.
-            let auto_title = value.is_empty();
-            let name = if value.is_empty() {
-                app.default_session_name("agent")
-            } else {
-                value
-            };
-            let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
-            out.push(ClientRequest::CreateAgent {
-                req_id,
-                worktree: worktree.clone(),
-                name,
-                kind,
-                model,
-                effort,
-                auto_title,
-            });
-            // The create consumes (or, off-spec, discards) the worktree's
-            // warm Claude slot; refill it so the next create is instant too.
-            if kind == AgentKind::Claude {
-                out.push(default_claude_prewarm(worktree));
-            }
-        }
+        } => create_agent(app, worktree, kind, model, effort, value, out),
         PromptKind::RenameAgent { id } => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::RenameAgent {
@@ -2779,6 +2927,24 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 name: value,
             });
         }
+        PromptKind::NewLink { worktree } => {
+            // The new row lands at the end of LINKS; move the cursor there
+            // so the link the user just typed is the one under it.
+            let req_id = app.alloc_req_id(PendingIntent::SelectCreatedLink);
+            out.push(ClientRequest::CreateLink {
+                req_id,
+                worktree,
+                url: value,
+            });
+        }
+        PromptKind::EditLink { id } => {
+            let req_id = app.alloc_req_id(PendingIntent::None);
+            out.push(ClientRequest::UpdateLink {
+                req_id,
+                id,
+                url: value,
+            });
+        }
     }
 }
 
@@ -2802,6 +2968,10 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
             detach_if_attached(app, &SessionRef::Terminal(id.clone()), out);
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::CloseTerminal { req_id, id });
+        }
+        PendingAction::DeleteLink(id) => {
+            let req_id = app.alloc_req_id(PendingIntent::None);
+            out.push(ClientRequest::DeleteLink { req_id, id });
         }
         PendingAction::DeleteWorktree(id) => {
             // Optimistic: drop the rows now (the daemon deletes in the
@@ -2946,6 +3116,14 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             };
             let model = resolve(model, cfg.default_model(kind));
             let effort = resolve(effort, cfg.default_effort(kind));
+            // No name prompt means no typing window to warm through, so
+            // create straight from the picker: the standing default-spec
+            // warm slot gets adopted where it matches, and the refill
+            // behind the create re-warms it either way.
+            if cfg.skip_session_naming {
+                create_agent(app, worktree, kind, model, effort, String::new(), out);
+                return;
+            }
             // Warm the CLI while the user types the name: the daemon
             // pre-spawns the session so CreateAgent adopts an already-booted
             // PTY. Fail-soft — a missing CLI just means a cold spawn later.
@@ -2967,6 +3145,18 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         }
         MenuAction::NewWorktree(project) => open_prompt(app, PromptKind::NewWorktree { project }),
         MenuAction::OpenNotes(owner) => open_notes_for_owner(app, owner),
+        MenuAction::NewLink(worktree) => open_prompt(app, PromptKind::NewLink { worktree }),
+        MenuAction::OpenLink(url) => open_link(app, &url),
+        MenuAction::EditLink(id) => open_prompt(app, PromptKind::EditLink { id }),
+        MenuAction::DeleteLink(id) => {
+            if let Some(row) = app
+                .visible_links()
+                .into_iter()
+                .find(|l| l.id() == Some(&id))
+            {
+                delete_link(app, &row);
+            }
+        }
         MenuAction::SetWorktreePinned(id, pinned) => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::SetWorktreePinned { req_id, id, pinned });
@@ -3163,7 +3353,14 @@ fn remember_context(app: &mut App) {
     if let Some(pid) = app.selected_project().map(|p| p.id.clone()) {
         app.last_worktree_for_project.insert(pid, wid.clone());
     }
-    match app.selected_session_row().map(|r| r.sref()) {
+    let row = app.selected_session_row();
+    // A link row is not a session. Leaving the worktree with the cursor
+    // parked on one must not forget which session it was last on — that
+    // would blank the pane on the way back.
+    if row.as_ref().is_some_and(|r| r.as_link().is_some()) {
+        return;
+    }
+    match row.and_then(|r| r.sref()) {
         Some(sref) => {
             app.last_session_for_worktree.insert(wid, sref);
         }
@@ -3199,7 +3396,7 @@ fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
     let target = remembered.and_then(|sref| {
         app.visible_session_rows()
             .iter()
-            .position(|r| r.sref() == sref && !r.is_archived_agent())
+            .position(|r| r.sref().as_ref() == Some(&sref) && !r.is_archived_agent())
             .map(|i| (i, sref))
     });
     match target {
@@ -3230,7 +3427,7 @@ fn land_pending_selection(app: &mut App, out: &mut Vec<ClientRequest>) {
     if let Some(index) = app
         .visible_session_rows()
         .iter()
-        .position(|r| r.sref() == pending_sref)
+        .position(|r| r.sref().as_ref() == Some(&pending_sref))
     {
         app.sel_session = index;
         app.select_when_seen = None;
@@ -3258,7 +3455,7 @@ fn land_pending_selection(app: &mut App, out: &mut Vec<ClientRequest>) {
             if let Some(index) = app
                 .visible_session_rows()
                 .iter()
-                .position(|r| r.sref() == pending_sref)
+                .position(|r| r.sref().as_ref() == Some(&pending_sref))
             {
                 app.sel_session = index;
                 preview_selected(app, out);
@@ -3309,9 +3506,10 @@ fn select_project_row_by_id(app: &mut App, id: &nebula_core::ProjectId) -> bool 
 
 /// Land the panel selections on a `/` palette pick. A project or worktree
 /// pick moves the selection (restoring remembered child rows, like a manual
-/// switch); a worktree pick then hands focus to its Sessions panel, since
-/// picking a worktree by name is a step towards one of its sessions, not
-/// an errand in the Worktrees column. A session pick with `attach` opens
+/// switch), then hands focus one column right — a project pick lands in its
+/// Worktrees panel and a worktree pick in its Sessions panel, since picking
+/// either by name is a step towards one of its children, not an errand in
+/// the column it names. A session pick with `attach` opens
 /// it immediately, exactly like Enter on its row; without, it only lands
 /// on the row in the Sessions panel, previewing like ↑/↓ there. Targets
 /// are re-validated against the
@@ -3333,7 +3531,7 @@ fn jump_to_target(
             if changed {
                 restore_context(app, out);
             }
-            app.focus = Focus::Projects;
+            app.focus = Focus::Worktrees;
         }
         PaletteTarget::Worktree(id) => {
             if app.selected_worktree().is_some_and(|w| w.id == id) {
@@ -3449,7 +3647,7 @@ fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     let Some(index) = app
         .visible_session_rows()
         .iter()
-        .position(|r| r.sref() == sref)
+        .position(|r| r.sref().as_ref() == Some(&sref))
     else {
         restore_session(app, out);
         app.focus = Focus::Sessions;
@@ -3520,17 +3718,41 @@ fn preview_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
     if row.is_archived_agent() {
         return;
     }
-    attach(app, row.sref(), out);
+    // A link row has no session behind it: leave whatever was in the pane
+    // rather than blanking it while the cursor passes through the group.
+    let Some(sref) = row.sref() else {
+        return;
+    };
+    attach(app, sref, out);
 }
 
+/// Enter on the Sessions panel: attach the session under the cursor, or —
+/// on a link row — hand its URL to the browser and stay put.
 fn attach_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
     let rows = app.visible_session_rows();
     let Some(row) = rows.get(app.sel_session) else {
         return;
     };
-    attach(app, row.sref(), out);
+    let Some(sref) = row.sref() else {
+        if let Some(link) = row.as_link() {
+            open_link(app, link.url());
+        }
+        return;
+    };
+    attach(app, sref, out);
     app.focus = Focus::Terminal;
     app.term_locked = true;
+}
+
+/// Open a saved link in the browser, reporting either way — the browser
+/// comes up in front of the terminal, so a silent failure would read as
+/// "nebula did nothing".
+fn open_link(app: &mut App, url: &str) {
+    if open_url(url) {
+        app.flash = Some(format!("opened {}", crate::app::pretty_url(url)));
+    } else {
+        app.flash = Some(format!("couldn't open {url}"));
+    }
 }
 
 fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
@@ -3590,6 +3812,44 @@ fn fire_pending_prewarm(app: &mut App, out: &mut Vec<ClientRequest>) {
     // creating a session there adopts an already-booted CLI.
     out.push(default_claude_prewarm(worktree));
     app.next_keepwarm = Some(std::time::Instant::now() + KEEPWARM_REFRESH);
+}
+
+/// Ask the daemon for a new agent session and attach it once the Ack lands.
+/// An empty `name` takes the generated default (agent-1, …) and opts the
+/// session into agent-driven auto-titling (`nebula rename` on the first
+/// prompt) — that's what accepting an empty name prompt means, and what
+/// the `skip_session_naming` setting does without asking. A typed name is
+/// the user's choice and stays.
+fn create_agent(
+    app: &mut App,
+    worktree: WorktreeId,
+    kind: AgentKind,
+    model: Option<String>,
+    effort: Option<String>,
+    name: String,
+    out: &mut Vec<ClientRequest>,
+) {
+    let auto_title = name.is_empty();
+    let name = if auto_title {
+        app.default_session_name("agent")
+    } else {
+        name
+    };
+    let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
+    out.push(ClientRequest::CreateAgent {
+        req_id,
+        worktree: worktree.clone(),
+        name,
+        kind,
+        model,
+        effort,
+        auto_title,
+    });
+    // The create consumes (or, off-spec, discards) the worktree's warm
+    // Claude slot; refill it so the next create is instant too.
+    if kind == AgentKind::Claude {
+        out.push(default_claude_prewarm(worktree));
+    }
 }
 
 /// The one spec kept permanently warm: a Claude CLI at the configured
@@ -4400,12 +4660,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                             app.flash = Some("agent is archived — unarchive first (u)".into());
                         }
                         Some(row) => {
-                            let sref = row.sref();
+                            let key = row.click_key();
                             let now = std::time::Instant::now();
-                            // Double-click attaches; `last_session_click` was
-                            // consumed, so a third click starts over.
+                            // Double-click attaches (a link row opens in the
+                            // browser); `last_session_click` was consumed, so
+                            // a third click starts over.
                             let double = app.last_session_click.take().is_some_and(|(at, id)| {
-                                id == sref && now.duration_since(at) <= DOUBLE_CLICK
+                                id == key && now.duration_since(at) <= DOUBLE_CLICK
                             });
                             if double {
                                 attach_selected(app, out);
@@ -4413,7 +4674,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                                 // Single click selects the row and previews its
                                 // terminal (no focus/lock); Enter or a second
                                 // click commits.
-                                app.last_session_click = Some((now, sref));
+                                app.last_session_click = Some((now, key));
                                 app.focus = Focus::Sessions;
                                 preview_selected(app, out);
                             }
@@ -4626,6 +4887,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                                 action: MenuAction::NewTerminal(w.id.clone()),
                                 destructive: false,
                             },
+                            MenuItem {
+                                label: "Add link".into(),
+                                action: MenuAction::NewLink(w.id.clone()),
+                                destructive: false,
+                            },
                         ];
                         if !w.is_main {
                             items.push(MenuItem {
@@ -4647,6 +4913,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         Some(SessionRow::Terminal(t)) => {
                             open_menu_at(app, menu_items_for_terminal(&t), at)
                         }
+                        Some(SessionRow::Link(l)) => open_menu_at(app, menu_items_for_link(&l), at),
                         None => {}
                     }
                 }
@@ -4675,6 +4942,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                                     MenuItem {
                                         label: "New agent".into(),
                                         action: MenuAction::NewAgent(w.id.clone()),
+                                        destructive: false,
+                                    },
+                                    MenuItem {
+                                        label: "Add link".into(),
+                                        action: MenuAction::NewLink(w.id.clone()),
                                         destructive: false,
                                     },
                                     MenuItem {
@@ -4711,6 +4983,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             agents,
             terminals,
             notes,
+            links,
             ui_state,
         } => {
             app.tree.workspaces = workspaces;
@@ -4720,6 +4993,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.tree.agents = agents;
             app.tree.terminals = terminals;
             app.tree.notes = notes;
+            app.tree.links = links;
             if let Some(json) = ui_state {
                 restore_ui_state(app, &json);
             }
@@ -4771,7 +5045,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         } => {
             // A status flip can pull the agent into the RECENT group and
             // reorder the list; keep the selection on the same session.
-            let keep = app.selected_session_row().map(|r| r.sref());
+            let keep = app.selected_session_row().and_then(|r| r.sref());
             if let Some(a) = app.tree.agents.iter_mut().find(|a| a.id == agent) {
                 a.status = status;
                 a.status_changed_at = changed_at;
@@ -4781,7 +5055,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 if let Some(i) = app
                     .visible_session_rows()
                     .iter()
-                    .position(|r| r.sref() == keep)
+                    .position(|r| r.sref().as_ref() == Some(&keep))
                 {
                     app.sel_session = i;
                 }
@@ -4819,6 +5093,11 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         app.select_note_when_seen = Some(id);
                     }
                 }
+                (Some(PendingIntent::SelectCreatedLink), Some(EntityId::Link(id))) => {
+                    if !select_link_by_id(app, &id) {
+                        app.select_link_when_seen = Some(id);
+                    }
+                }
                 (Some(PendingIntent::OpenCreatedWorkspace), Some(EntityId::Workspace(id))) => {
                     // Switcher-created workspace: open it right away (the
                     // switch lands via ActiveWorkspaceChanged as usual).
@@ -4850,6 +5129,12 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             if let Some(note_id) = app.select_note_when_seen.clone() {
                 if select_note_by_id(app, &note_id) {
                     app.select_note_when_seen = None;
+                }
+            }
+            // ...and the panel cursor onto a link we just added.
+            if let Some(link_id) = app.select_link_when_seen.clone() {
+                if select_link_by_id(app, &link_id) {
+                    app.select_link_when_seen = None;
                 }
             }
             refresh_palette(app);
@@ -4979,6 +5264,27 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             Some(existing) => *existing = t,
             None => app.tree.notes.push(t),
         },
+        Entity::Link(l) => match app.tree.links.iter_mut().find(|x| x.id == l.id) {
+            Some(existing) => *existing = l,
+            None => app.tree.links.push(l),
+        },
+    }
+}
+
+/// Land the Sessions panel's cursor on the link row for `id`; false until
+/// its upsert has arrived (or when it belongs to another worktree).
+fn select_link_by_id(app: &mut App, id: &LinkId) -> bool {
+    let found = app
+        .visible_session_rows()
+        .iter()
+        .position(|r| r.as_link().and_then(|l| l.id()) == Some(id));
+    match found {
+        Some(i) => {
+            app.sel_session = i;
+            app.focus = Focus::Sessions;
+            true
+        }
+        None => false,
     }
 }
 
@@ -5029,6 +5335,8 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
                 NoteOwner::Project(p) => p != id,
                 NoteOwner::Worktree(w) => !wt_ids.contains(w),
             });
+            app.tree.links.retain(|l| !wt_ids.contains(&l.worktree_id));
+            app.pull_requests.retain(|w, _| !wt_ids.contains(w));
             app.tree.worktrees.retain(|w| &w.project_id != id);
             app.tree.projects.retain(|p| &p.id != id);
         }
@@ -5038,11 +5346,14 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
             app.tree
                 .notes
                 .retain(|t| t.owner != NoteOwner::Worktree(id.clone()));
+            app.tree.links.retain(|l| &l.worktree_id != id);
+            app.pull_requests.remove(id);
             app.tree.worktrees.retain(|w| &w.id != id);
         }
         EntityId::Agent(id) => app.tree.agents.retain(|a| &a.id != id),
         EntityId::Terminal(id) => app.tree.terminals.retain(|t| &t.id != id),
         EntityId::Note(id) => app.tree.notes.retain(|t| &t.id != id),
+        EntityId::Link(id) => app.tree.links.retain(|l| &l.id != id),
     }
     // A note modal aimed at a vanished owner has nothing left to show.
     if let Some(Overlay::Notes(view)) = &app.overlay {
@@ -5145,7 +5456,7 @@ fn selection_snapshot(app: &App) -> SelectionSnapshot {
         divider_chase: app.select_divider_when_seen.is_some(),
         worktree: app.selected_worktree().map(|w| w.id.clone()),
         session_archived: row.as_ref().is_some_and(|r| r.is_archived_agent()),
-        session: row.map(|r| r.sref()),
+        session: row.and_then(|r| r.sref()),
     }
 }
 
@@ -5197,9 +5508,10 @@ fn reconcile_selection(app: &mut App, before: SelectionSnapshot, out: &mut Vec<C
     }
     if let Some(sref) = &before.session {
         let rows = app.visible_session_rows();
-        if rows.get(app.sel_session).map(|r| r.sref()).as_ref() != Some(sref) {
+        if rows.get(app.sel_session).and_then(|r| r.sref()).as_ref() != Some(sref) {
             let found = rows.iter().position(|r| {
-                r.sref() == *sref && (before.session_archived || !r.is_archived_agent())
+                r.sref().as_ref() == Some(sref)
+                    && (before.session_archived || !r.is_archived_agent())
             });
             match found {
                 Some(i) => app.sel_session = i,
@@ -5496,6 +5808,170 @@ mod tests {
         }
     }
 
+    // ---- worktree links ----
+
+    /// `seed_tree` plus one saved link on w1, cursor parked on it.
+    fn seed_link(app: &mut App, url: &str) {
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Link(nebula_core::Link {
+                    id: LinkId("l1".into()),
+                    worktree_id: nebula_core::WorktreeId("w1".into()),
+                    url: url.into(),
+                    sort_order: 0,
+                }),
+            },
+        );
+        app.focus = Focus::Sessions;
+        app.sel_session = app
+            .visible_session_rows()
+            .iter()
+            .position(|r| r.as_link().is_some())
+            .expect("link row");
+    }
+
+    #[test]
+    fn l_adds_a_link_to_the_selected_worktree() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('L'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Prompt(p)) = &app.overlay else {
+            panic!("expected the add-link prompt, got {:?}", app.overlay);
+        };
+        assert_eq!(p.title, "Add link");
+        assert!(p.input.trim().is_empty(), "starts empty");
+
+        for c in "github.com/o/r/pull/7".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        // The daemon normalizes the URL; the client sends what was typed.
+        assert!(
+            out.iter().any(|r| matches!(
+                r,
+                ClientRequest::CreateLink { worktree, url, .. }
+                    if worktree.as_str() == "w1" && url == "github.com/o/r/pull/7"
+            )),
+            "expected CreateLink, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_link_opens_the_browser_instead_of_attaching() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_link(&mut app, "https://example.dev/spec");
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { .. })),
+            "a link row has no session to attach: {out:?}"
+        );
+        assert_eq!(app.focus, Focus::Sessions, "focus stays in the panel");
+        assert!(!app.term_locked);
+        assert_eq!(app.flash.as_deref(), Some("opened example.dev/spec"));
+    }
+
+    #[test]
+    fn r_edits_a_link_and_d_deletes_it() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_link(&mut app, "https://example.dev/spec");
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Prompt(p)) = &app.overlay else {
+            panic!("expected the edit-link prompt, got {:?}", app.overlay);
+        };
+        assert_eq!(p.title, "Edit link");
+        assert_eq!(p.input.trim(), "https://example.dev/spec", "prefilled");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Confirm(c)) if c.title == "Delete link"),
+            "expected the delete confirm, got {:?}",
+            app.overlay
+        );
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::DeleteLink { id, .. } if id.as_str() == "l1")),
+            "expected DeleteLink, got {out:?}"
+        );
+    }
+
+    /// The pull-request row comes back from git on every lookup, so editing
+    /// or deleting it would be a lie. Both say so instead.
+    #[test]
+    fn the_pull_request_row_cannot_be_edited_or_deleted() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.pull_requests.insert(
+            nebula_core::WorktreeId("w1".into()),
+            Some(crate::pull_request::PullRequest {
+                number: 7,
+                url: "https://github.com/o/r/pull/7".into(),
+                title: "Attach links".into(),
+                state: "OPEN".into(),
+                is_draft: false,
+            }),
+        );
+        app.focus = Focus::Sessions;
+        app.sel_session = app
+            .visible_session_rows()
+            .iter()
+            .position(|r| r.as_link().is_some())
+            .expect("pull-request row");
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "no confirm for a row we don't own");
+        assert!(
+            app.flash
+                .as_deref()
+                .is_some_and(|f| f.contains("can't be deleted")),
+            "got {:?}",
+            app.flash
+        );
+
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "nothing stored to edit");
+        // Enter still opens it — reading the PR is the whole point.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.flash.as_deref(), Some("opened github.com/o/r/pull/7"));
+        assert!(!out
+            .iter()
+            .any(|r| matches!(r, ClientRequest::DeleteLink { .. })));
+    }
+
+    /// Shift+D wipes the panel's sessions; links are bookmarks and survive.
+    #[test]
+    fn delete_all_sessions_leaves_links_alone() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_link(&mut app, "https://example.dev/spec");
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('D'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Confirm(c)) = &app.overlay else {
+            panic!("expected the bulk confirm, got {:?}", app.overlay);
+        };
+        assert!(
+            !c.message.contains("example.dev"),
+            "links are not up for deletion: {}",
+            c.message
+        );
+        let PendingAction::DeleteAllSessions { agents, terminals } = &c.action else {
+            panic!("wrong action: {:?}", c.action);
+        };
+        assert_eq!(agents.len(), 1);
+        assert!(terminals.is_empty());
+    }
+
     /// `e` opens the notes modal for the current selection.
     #[test]
     fn e_opens_notes_for_selection() {
@@ -5760,6 +6236,7 @@ mod tests {
                 agents: tree.agents,
                 terminals: tree.terminals,
                 notes: tree.notes,
+                links: tree.links,
                 ui_state: None,
             },
         );
@@ -5851,6 +6328,63 @@ mod tests {
             !text.contains("TERMINALS"),
             "terminals section is gone:\n{text}"
         );
+    }
+
+    /// Every session row names its harness in a dim badge after the title —
+    /// claude included, so the column doesn't read as "codex/cursor are the
+    /// odd ones out".
+    #[test]
+    fn session_rows_badge_their_harness() {
+        use nebula_core::{Agent, AgentKind, AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app); // agent-1, claude
+        for (i, kind) in [(2, AgentKind::Codex), (3, AgentKind::Cursor)] {
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(Agent {
+                        id: AgentId(format!("a{i}")),
+                        worktree_id: WorktreeId("w1".into()),
+                        name: format!("agent-{i}"),
+                        status: AgentStatus::Fresh,
+                        archived: false,
+                        archived_at: 0,
+                        pinned: false,
+                        kind,
+                        model: None,
+                        effort: None,
+                        session_id: None,
+                        sort_order: i,
+                        status_changed_at: 0,
+                        alive: true,
+                    }),
+                },
+            );
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        for (name, kind) in [
+            ("agent-1", "claude"),
+            ("agent-2", "codex"),
+            ("agent-3", "cursor"),
+        ] {
+            assert!(
+                text.contains(&format!("{name} {kind}")),
+                "{name} badged {kind}:\n{text}"
+            );
+        }
+
+        // The badge is dim, the name isn't — it has to read as secondary.
+        // (Checked on an unselected row: the selection bar brightens dim
+        // spans to muted.)
+        let th = app.theme;
+        let buffer = terminal.backend().buffer();
+        let (x, y) = find_cell(&terminal, "agent-2 codex");
+        assert_eq!(buffer[(x, y)].fg, th.muted, "name stays muted");
+        let badge_x = x + "agent-2 ".chars().count() as u16;
+        assert_eq!(buffer[(badge_x, y)].fg, th.dim, "badge is dim");
     }
 
     /// Pinning an agent splits the sessions panel into PINNED and UNPINNED
@@ -6446,6 +6980,103 @@ mod tests {
         })
     }
 
+    /// With `skip_session_naming` on, picking the kind is the whole flow:
+    /// no name prompt, the generated default name, and the same auto-title
+    /// opt-in that accepting an empty prompt gives.
+    #[test]
+    fn skip_session_naming_creates_straight_from_the_picker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"skip_session_naming": true}"#).unwrap();
+        crate::config::with_config_path(path, || {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(app.overlay, Some(Overlay::Menu(_))),
+                "kind picker still opens: {:?}",
+                app.overlay
+            );
+            assert!(out.is_empty(), "opening the picker sends nothing: {out:?}");
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "no name prompt: {:?}", app.overlay);
+            assert!(matches!(
+                &out[0],
+                ClientRequest::CreateAgent {
+                    name,
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    auto_title: true,
+                    ..
+                } if name == "agent-2"
+            ));
+            // Only the refill behind the create — the warm-while-typing
+            // prewarm has no typing to cover, so it never fires.
+            assert!(matches!(
+                out.last(),
+                Some(ClientRequest::PrewarmAgent {
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    ..
+                })
+            ));
+            assert_eq!(
+                out.iter()
+                    .filter(|r| matches!(r, ClientRequest::PrewarmAgent { .. }))
+                    .count(),
+                1,
+                "one prewarm, the refill: {out:?}"
+            );
+        })
+    }
+
+    /// The submenu picks still apply when the prompt is skipped: the model
+    /// row Enter lands on is what the create carries.
+    #[test]
+    fn skip_session_naming_keeps_the_submenu_model_pick() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"skip_session_naming": true}"#).unwrap();
+        crate::config::with_config_path(path, || {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            // → into Claude's model list, down to "opus", Enter.
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected model submenu, got {:?}", app.overlay);
+            };
+            let opus = menu
+                .items
+                .iter()
+                .position(|i| i.label.starts_with("opus"))
+                .expect("opus row");
+            for _ in 0..opus {
+                press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "no name prompt: {:?}", app.overlay);
+            assert!(matches!(
+                &out[0],
+                ClientRequest::CreateAgent {
+                    kind: AgentKind::Claude,
+                    model: Some(m),
+                    auto_title: true,
+                    ..
+                } if m == "opus"
+            ));
+        })
+    }
+
     #[test]
     fn picker_right_drills_into_model_then_effort_submenus() {
         with_default_config(|| {
@@ -6855,6 +7486,39 @@ mod tests {
     }
 
     #[test]
+    fn link_rows_render_under_a_links_header() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_link(&mut app, "https://example.dev/spec");
+        app.pull_requests.insert(
+            nebula_core::WorktreeId("w1".into()),
+            Some(crate::pull_request::PullRequest {
+                number: 7,
+                url: "https://github.com/o/r/pull/7".into(),
+                title: "Attach links".into(),
+                state: "OPEN".into(),
+                is_draft: false,
+            }),
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("LINKS"), "links header:\n{text}");
+        assert!(
+            text.contains("#7 Attach links"),
+            "pull request row:\n{text}"
+        );
+        assert!(
+            text.contains("example.dev/spec"),
+            "saved link row (scheme stripped):\n{text}"
+        );
+        // The panel's count is a session count; the two link rows don't
+        // inflate it.
+        assert!(text.contains("SESSIONS · 1"), "session count:\n{text}");
+    }
+
+    #[test]
     fn enter_on_terminal_row_attaches_it() {
         use nebula_core::TerminalId;
         let mut app = App::new();
@@ -7204,7 +7868,7 @@ mod tests {
             .filter(|r| r.is_archived_agent())
             .map(|r| match r {
                 SessionRow::Agent(a) => a.name.clone(),
-                SessionRow::Terminal(_) => unreachable!(),
+                SessionRow::Terminal(_) | SessionRow::Link(_) => unreachable!(),
             })
             .collect();
         assert_eq!(names, ["newest", "mid", "old", "legacy"]);
@@ -7620,7 +8284,7 @@ mod tests {
         // A stale first click, well outside the double-click window.
         app.last_session_click = Some((
             std::time::Instant::now() - Duration::from_millis(500),
-            SessionRef::Agent(AgentId("a1".into())),
+            crate::app::RowKey::Session(SessionRef::Agent(AgentId("a1".into()))),
         ));
         handle_mouse(
             &mut app,
@@ -9967,6 +10631,28 @@ mod tests {
     }
 
     #[test]
+    fn palette_enter_on_project_lands_in_its_worktrees_panel() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        app.focus = Focus::Projects;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        for c in "nebula".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+
+        assert!(app.overlay.is_none());
+        assert_eq!(app.selected_project().unwrap().name, "nebula");
+        assert_eq!(
+            app.focus,
+            Focus::Worktrees,
+            "a project pick lands in its Worktrees panel, not the Projects column"
+        );
+    }
+
+    #[test]
     fn palette_rebuilds_when_the_tree_changes_under_it() {
         use nebula_core::{Entity, EntityId, Project, ProjectId};
         let mut app = App::new();
@@ -10390,7 +11076,7 @@ mod tests {
         assert_eq!(
             app.visible_session_rows()
                 .get(app.sel_session)
-                .map(|r| r.sref()),
+                .and_then(|r| r.sref()),
             Some(sref),
             "the panel selection landed on the opened session"
         );

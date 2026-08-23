@@ -83,6 +83,14 @@ async fn serve() -> Result<()> {
         });
     }
 
+    // Learn which agent CLIs are installed before anyone asks, so a create
+    // that has to refuse ("codex was not found on your PATH") answers at once
+    // instead of stalling on a login-shell probe.
+    {
+        let daemon = daemon.clone();
+        tokio::spawn(async move { daemon.warm_cli_probes().await });
+    }
+
     // Deferred-finish recheck (held Stops drain to finished after grace).
     {
         let daemon = daemon.clone();

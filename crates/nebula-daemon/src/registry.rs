@@ -8,9 +8,9 @@ use crate::status::{AgentStatusMachine, Effect, HookEvent};
 use crate::store::Store;
 use anyhow::{bail, Context, Result};
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Note, NoteId, NoteOwner, Project,
-    ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree,
-    WorktreeId,
+    Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Link, LinkId, Note, NoteId,
+    NoteOwner, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Workspace,
+    WorkspaceId, Worktree, WorktreeId,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -401,6 +401,7 @@ impl Daemon {
             agents,
             terminals,
             notes: self.store.load_notes()?,
+            links: self.store.load_links()?,
             ui_state: self.store.load_ui_state()?,
         })
     }
@@ -1026,7 +1027,7 @@ impl Daemon {
 
     // ---- agents ----
 
-    pub fn create_agent(
+    pub async fn create_agent(
         self: &Arc<Self>,
         worktree_id: &WorktreeId,
         name: &str,
@@ -1043,6 +1044,13 @@ impl Daemon {
         // its pre-generated id — the CLI booted while the user typed the
         // name, so the create feels instant.
         let adopted = self.take_prewarmed(worktree_id, kind, &model, &effort);
+        // Only the cold path needs asking: an adopted warm session is proof
+        // the CLI runs. Without this, a missing CLI still "succeeds" — the
+        // login shell prints `command not found` into a PTY that dies at
+        // once, leaving a dead row that looks identical to a fresh one.
+        if adopted.is_none() && !self.cli_available_for_create(kind).await {
+            bail!("{}", cli_missing_message(kind));
+        }
         let agent = Agent {
             id: adopted
                 .as_ref()
@@ -1255,6 +1263,28 @@ impl Daemon {
                 }
             }
         }
+        self.probe_cli(kind).await
+    }
+
+    /// Fill the availability cache for every kind at boot, off the request
+    /// loop. Without it the first CreateAgent of a session pays a full
+    /// login-shell probe (~1s with a heavy ~/.zshrc) before it can answer.
+    pub async fn warm_cli_probes(self: &Arc<Self>) {
+        for kind in AgentKind::ALL {
+            self.cli_available(kind).await;
+        }
+    }
+
+    /// Same question, asked on behalf of a create the user just triggered.
+    /// A cached *hit* is trusted; a cached *miss* is re-probed, so someone who
+    /// installs the CLI and immediately retries isn't told for another minute
+    /// that it's missing. Misses are rare, so this costs nothing in practice.
+    async fn cli_available_for_create(&self, kind: AgentKind) -> bool {
+        self.cli_available(kind).await || self.probe_cli(kind).await
+    }
+
+    /// Uncached `command -v` through the user's login shell; caches the answer.
+    async fn probe_cli(&self, kind: AgentKind) -> bool {
         let check = format!("command -v '{}' >/dev/null 2>&1", kind.cli_program());
         let mut probe = tokio::process::Command::new(user_shell());
         probe
@@ -1679,6 +1709,44 @@ impl Daemon {
         Ok(())
     }
 
+    // ---- links ----
+
+    pub fn create_link(self: &Arc<Self>, worktree_id: &WorktreeId, url: &str) -> Result<EntityId> {
+        let url = normalize_url(url)?;
+        self.store
+            .get_worktree(worktree_id)?
+            .context("worktree not found")?;
+        let link = Link {
+            id: LinkId::generate(),
+            worktree_id: worktree_id.clone(),
+            url,
+            sort_order: self.store.next_link_sort_order(worktree_id)?,
+        };
+        self.store.insert_link(&link)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Link(link.clone()),
+        });
+        Ok(EntityId::Link(link.id))
+    }
+
+    pub fn update_link(self: &Arc<Self>, id: &LinkId, url: &str) -> Result<()> {
+        let url = normalize_url(url)?;
+        self.store.set_link_url(id, &url)?;
+        let link = self.store.get_link(id)?.context("link not found")?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Link(link),
+        });
+        Ok(())
+    }
+
+    pub fn delete_link(self: &Arc<Self>, id: &LinkId) -> Result<()> {
+        self.store.delete_link(id)?;
+        self.broadcast(ServerEvent::EntityRemoved {
+            id: EntityId::Link(id.clone()),
+        });
+        Ok(())
+    }
+
     // ---- attach / spawn ----
 
     /// Get the live session for an entity, lazily (re)spawning its PTY when
@@ -2075,8 +2143,55 @@ fn shell_has_children(session: &PtySession) -> bool {
     )
 }
 
+/// Canonical form of a user-typed link. Pasting a URL out of a browser is
+/// the common case, but people also type `github.com/o/r/pull/7`, so a
+/// scheme-less value gets https://. Anything else — another scheme, or no
+/// host at all — is refused rather than stored: the TUI hands these to
+/// `open(1)`, and only http(s) may ever reach it.
+fn normalize_url(url: &str) -> Result<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        bail!("link URL is empty");
+    }
+    if url.contains(char::is_whitespace) {
+        bail!("link URL contains whitespace");
+    }
+    let normalized = match url.split_once("://") {
+        Some(("http" | "https", _)) => url.to_string(),
+        Some((scheme, _)) => bail!("only http(s) links are supported (got {scheme}://)"),
+        // Scheme-less: a bare host is a URL people type; a bare word is not.
+        None => {
+            let host = url.split(['/', '?', '#']).next().unwrap_or_default();
+            if !host.contains('.') || host.starts_with('.') || host.ends_with('.') {
+                bail!("not a URL: {url}");
+            }
+            format!("https://{url}")
+        }
+    };
+    // Reject "https://" and friends: a scheme with nothing behind it.
+    if normalized
+        .split_once("://")
+        .is_none_or(|(_, rest)| rest.is_empty())
+    {
+        bail!("not a URL: {url}");
+    }
+    Ok(normalized)
+}
+
 fn user_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+}
+
+/// Why a create was refused when the agent CLI isn't installed. One line —
+/// the TUI shows it in the footer flash, which truncates. Unlike git (which
+/// the daemon runs with its own inherited PATH), agent CLIs are spawned
+/// through the user's login shell, so a fresh install is picked up on the
+/// next try with no daemon restart.
+fn cli_missing_message(kind: AgentKind) -> String {
+    format!(
+        "{} was not found on your PATH — install it, then try again.",
+        kind.cli_program()
+    )
 }
 
 /// Wrap `program args…` in a login + interactive shell (`$SHELL -l -i -c
@@ -2959,6 +3074,50 @@ mod tests {
             true,
         );
         assert_eq!(agent_worktree(&daemon, "a1"), "feat");
+    }
+
+    #[test]
+    fn normalize_url_adds_https_and_refuses_non_links() {
+        // Pasted URLs pass through untouched.
+        assert_eq!(
+            normalize_url("https://github.com/o/r/pull/7").unwrap(),
+            "https://github.com/o/r/pull/7"
+        );
+        assert_eq!(normalize_url("  http://x.dev  ").unwrap(), "http://x.dev");
+        // Typed hosts gain the scheme.
+        assert_eq!(
+            normalize_url("github.com/o/r/pull/7").unwrap(),
+            "https://github.com/o/r/pull/7"
+        );
+        // Anything that isn't an http(s) URL is refused, so `open(1)` can
+        // never be handed a scheme the user didn't intend.
+        for bad in [
+            "",
+            "   ",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "https://",
+            "just a note",
+            "notaurl",
+        ] {
+            assert!(normalize_url(bad).is_err(), "expected refusal: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn cli_missing_message_names_the_binary_not_the_kind() {
+        // Cursor ships its agent as `cursor-agent`; naming the kind would
+        // send the user off to install the wrong thing.
+        assert!(cli_missing_message(AgentKind::Cursor).starts_with("cursor-agent was not found"));
+        assert!(cli_missing_message(AgentKind::Claude).starts_with("claude was not found"));
+        assert!(cli_missing_message(AgentKind::Codex).starts_with("codex was not found"));
+        // No "restart nebula": agent CLIs are spawned through the user's
+        // login shell, so a fresh install is picked up on the next try.
+        for kind in AgentKind::ALL {
+            let msg = cli_missing_message(kind);
+            assert!(msg.contains("try again"), "{msg}");
+            assert!(!msg.contains("restart"), "{msg}");
+        }
     }
 
     #[test]

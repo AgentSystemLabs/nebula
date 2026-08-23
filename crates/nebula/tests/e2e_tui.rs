@@ -39,6 +39,13 @@ struct TuiHarness {
 
 impl TuiHarness {
     fn spawn() -> Self {
+        Self::spawn_with_env(&[])
+    }
+
+    /// `spawn`, plus environment overrides for the TUI process — used to put
+    /// a stub `gh` on PATH so the pull-request row can be driven without a
+    /// GitHub account.
+    fn spawn_with_env(extra_env: &[(&str, String)]) -> Self {
         // Socket paths must stay under SUN_LEN (~104 bytes) — keep the
         // runtime dir short. Tests share one process, so a per-harness
         // sequence keeps each test on its own daemon.
@@ -71,6 +78,9 @@ impl TuiHarness {
         // reverse/bold attrs wait_for_selected relies on.
         cmd.env_remove("NO_COLOR");
         cmd.env_remove("FORCE_COLOR");
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
         cmd.cwd(repos.path());
         let child = pty.slave.spawn_command(cmd).unwrap();
         drop(pty.slave);
@@ -608,6 +618,102 @@ fn tui_note_modal_crud_and_badge() {
     tui.wait_for_text("✓ project level plan");
     tui.send(&[0x1b]);
     tui.wait_for_gone("Notes — note-proj ");
+}
+
+/// Links live in the Sessions panel's own LINKS group: `L` adds one from
+/// any panel, `r` edits it, Enter would open it, `d` removes it. The
+/// pull-request row is not exercised here — the test repo has no remote,
+/// so `gh` (installed or not) reports no PR.
+#[test]
+fn tui_link_crud_in_sessions_panel() {
+    let mut tui = TuiHarness::spawn();
+    let repo = tui.make_repo("link-proj");
+
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "link-proj");
+    // The root worktree row must exist before a link has an owner.
+    tui.wait_for_text("⌂ root");
+
+    // ---- create: L prompts, the URL lands in a LINKS group ----
+    tui.send(b"L");
+    tui.wait_for_text("Add link");
+    tui.type_str("https://example.dev/spec");
+    tui.send(b"\r");
+    tui.wait_for_text("LINKS");
+    // Rows show the URL without the scheme.
+    tui.wait_for_text("example.dev/spec");
+    // The cursor followed the new row into the Sessions panel.
+    tui.wait_for_selected("example.dev/spec");
+
+    // ---- update: r prefills the URL, so typing appends to it ----
+    tui.send(b"r");
+    tui.wait_for_text("Edit link");
+    tui.type_str("/v2");
+    tui.send(b"\r");
+    tui.wait_for_text("example.dev/spec/v2");
+
+    // ---- a second link: both list under the one header ----
+    tui.send(b"L");
+    tui.wait_for_text("Add link");
+    // Typed without a scheme — the daemon normalizes it to https://.
+    // Short on purpose: the Sessions panel truncates long rows.
+    tui.type_str("docs.dev/design");
+    tui.send(b"\r");
+    tui.wait_for_text("docs.dev/design");
+
+    // ---- delete: d confirms, y removes the row ----
+    tui.send(b"d");
+    tui.wait_for_text("Delete link");
+    tui.send(b"y");
+    tui.wait_for_sessions_row_gone("docs.dev/design");
+    // The other link is untouched.
+    tui.wait_for_text("example.dev/spec/v2");
+}
+
+/// The pull request nebula finds on the branch leads the LINKS group. A
+/// stub `gh` on PATH stands in for GitHub: the real one is asked for exactly
+/// this JSON (`gh pr view --json number,url,title,state,isDraft`).
+#[test]
+fn tui_pull_request_row_leads_the_links_group() {
+    let stub_bin = tempfile::tempdir().unwrap();
+    let gh = stub_bin.path().join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/sh\nprintf '%s' '{\"isDraft\":false,\"number\":7,\"state\":\"OPEN\",\"title\":\"Attach links\",\"url\":\"https://github.com/o/r/pull/7\"}'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        stub_bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let mut tui = TuiHarness::spawn_with_env(&[("PATH", path)]);
+    let repo = tui.make_repo("pr-proj");
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "pr-proj");
+    tui.wait_for_text("⌂ root");
+
+    // The lookup rides the git poll, so the row shows up on its own.
+    tui.wait_for_text("LINKS");
+    tui.wait_for_text("#7 Attach links");
+
+    // It is not a stored row: d says so instead of opening a confirm.
+    tui.send(b"\r"); // Projects → Worktrees
+    tui.wait_for_text(FOOTER_WORKTREES);
+    tui.send(b"\r"); // Worktrees → Sessions
+    tui.wait_for_selected("#7 Attach links");
+    tui.send(b"d");
+    tui.wait_for_text("can't be deleted");
+
+    // A link the user adds lands under it.
+    tui.send(b"L");
+    tui.wait_for_text("Add link");
+    tui.type_str("example.dev/spec");
+    tui.send(b"\r");
+    tui.wait_for_text("example.dev/spec");
+    tui.wait_for_text("#7 Attach links");
 }
 
 #[test]

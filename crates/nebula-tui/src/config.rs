@@ -75,6 +75,7 @@ pub enum SettingKind {
     PaletteEnterAttaches,
     GitInitOnCreate,
     Editor,
+    SkipSessionNaming,
     RecentWindow,
     SessionIdleTimeout,
     Theme,
@@ -110,6 +111,11 @@ pub const SETTING_GROUPS: &[SettingGroup] = &[
     SettingGroup {
         title: "SESSIONS",
         settings: &[
+            SettingSpec {
+                kind: SettingKind::SkipSessionNaming,
+                label: "Skip session naming",
+                hint: "New agents skip the name prompt and take the auto-title the agent sets",
+            },
             SettingSpec {
                 kind: SettingKind::RecentWindow,
                 label: "Recent window",
@@ -228,6 +234,12 @@ pub struct Config {
     /// `NEBULA_EDITOR` env var overrides it for the process; see
     /// [`Config::editor_command`].
     pub editor: String,
+    /// Create new agent sessions straight from the kind picker, with no
+    /// name prompt: the session takes the generated default name and is
+    /// opted into agent-driven auto-titling, exactly as accepting an empty
+    /// prompt does. Off by default — naming a session is the deliberate
+    /// choice, and skipping it is opting out of that.
+    pub skip_session_naming: bool,
     /// How long a session stays in the RECENT group after its status last
     /// changed: "5m", "10m", "30m", "1h", "24h" (any `<n>m`/`<n>h` works).
     /// "off" disables the group. Malformed values fall back to 30m.
@@ -263,6 +275,7 @@ impl Default for Config {
             palette_enter_attaches: true,
             git_init_on_create: true,
             editor: "vim".into(),
+            skip_session_naming: false,
             recent_window: "30m".into(),
             session_idle_timeout: "5m".into(),
             theme: "default".into(),
@@ -311,6 +324,10 @@ impl Config {
             serde_json::json!(self.git_init_on_create),
         );
         obj.insert("editor".into(), serde_json::json!(self.editor));
+        obj.insert(
+            "skip_session_naming".into(),
+            serde_json::json!(self.skip_session_naming),
+        );
         obj.insert(
             "recent_window".into(),
             serde_json::json!(self.recent_window),
@@ -383,6 +400,7 @@ impl Config {
             SettingKind::PaletteEnterAttaches => on_off(self.palette_enter_attaches).into(),
             SettingKind::GitInitOnCreate => on_off(self.git_init_on_create).into(),
             SettingKind::Editor => self.editor.clone(),
+            SettingKind::SkipSessionNaming => on_off(self.skip_session_naming).into(),
             SettingKind::RecentWindow => self.recent_window.clone(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
             SettingKind::Theme => self.theme.clone(),
@@ -411,6 +429,9 @@ impl Config {
             }
             SettingKind::Editor => {
                 self.editor = cycle_choice(&self.editor, EDITORS, step).into();
+            }
+            SettingKind::SkipSessionNaming => {
+                self.skip_session_naming = !self.skip_session_naming;
             }
             SettingKind::RecentWindow => {
                 self.recent_window = cycle_choice(&self.recent_window, RECENT_WINDOWS, step).into();
@@ -545,6 +566,30 @@ mod tests {
         let cfg: Config = serde_json::from_str(r#"{"git_init_on_create": false}"#).unwrap();
         assert!(cfg.palette_enter_attaches);
         assert!(!cfg.git_init_on_create);
+    }
+
+    #[test]
+    fn skip_session_naming_defaults_off_toggles_and_persists() {
+        assert!(
+            !Config::default().skip_session_naming,
+            "naming is the default; skipping it is opt-in"
+        );
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.skip_session_naming);
+
+        let mut cfg = Config::default();
+        let row = settings()
+            .position(|s| s.kind == SettingKind::SkipSessionNaming)
+            .unwrap();
+        assert_eq!(cfg.value_label(SettingKind::SkipSessionNaming), "off");
+        cfg.cycle(row, 0);
+        assert!(cfg.skip_session_naming);
+        assert_eq!(cfg.value_label(SettingKind::SkipSessionNaming), "on");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).skip_session_naming);
     }
 
     #[test]

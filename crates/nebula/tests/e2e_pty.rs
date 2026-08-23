@@ -50,6 +50,35 @@ impl TestEnv {
         cmd.spawn().unwrap()
     }
 
+    /// Daemon with no `NEBULA_AGENT_CMD` override, so agent spawns take the
+    /// real login-shell path, and `$SHELL` set to `shell`. Lets a test decide
+    /// what the daemon can find on PATH.
+    fn spawn_daemon_with_shell(&self, shell: &Path) -> std::process::Child {
+        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args(["daemon", "--foreground"])
+            .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
+            .env("NEBULA_DATA_DIR", self.tmp.path().join("data"))
+            .env("SHELL", shell)
+            .env_remove("NEBULA_AGENT_CMD")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// A `$SHELL` that answers `-l -i -c` but sees no agent CLI on PATH.
+    fn blind_shell(&self) -> PathBuf {
+        let path = self.tmp.path().join("blind-shell.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nPATH=/usr/bin:/bin\nexport PATH\nexec /bin/sh -c \"$4\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     /// Write the daemon's `config.json` (read from `NEBULA_DATA_DIR`)
     /// before boot.
     fn write_config(&self, json: &str) {
@@ -2013,6 +2042,152 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
 }
 
 /// `kill -0` liveness probe (also true for an unreaped zombie).
+/// An agent CLI that isn't installed must be refused up front. Before this
+/// check the create "succeeded": the login shell printed `command not found`
+/// into a PTY that died at once, leaving a dead session row indistinguishable
+/// from a fresh one.
+#[tokio::test]
+async fn create_agent_refuses_when_the_cli_is_not_installed() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let shell = env.blind_shell();
+    let mut daemon = env.spawn_daemon_with_shell(&shell);
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    for (req_id, kind, want) in [
+        (10u64, AgentKind::Claude, "claude"),
+        (11, AgentKind::Codex, "codex"),
+        // Cursor's binary is `cursor-agent`; the message must name that, not
+        // the kind, or the user goes looking for the wrong thing to install.
+        (12, AgentKind::Cursor, "cursor-agent"),
+    ] {
+        write_frame(
+            &mut c,
+            &ClientRequest::CreateAgent {
+                req_id,
+                worktree: worktree.id.clone(),
+                name: format!("agent-{req_id}"),
+                kind,
+                model: None,
+                effort: None,
+                auto_title: false,
+            },
+        )
+        .await
+        .unwrap();
+        let events = read_events_until(&mut c, Duration::from_secs(20), |evs| {
+            evs.iter().any(|e| {
+                matches!(e, ServerEvent::Error { req_id: Some(r), .. } if *r == req_id)
+                    || matches!(e, ServerEvent::Ack { req_id: r, .. } if *r == req_id)
+            })
+        })
+        .await;
+        let message = events
+            .iter()
+            .find_map(|e| match e {
+                ServerEvent::Error {
+                    req_id: Some(r),
+                    message,
+                } if *r == req_id => Some(message.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{kind:?} create must be refused, got: {events:#?}"));
+        assert!(
+            message.starts_with(&format!("{want} was not found on your PATH")),
+            "{kind:?}: {message}"
+        );
+    }
+
+    // And no half-created rows left behind in the Sessions column.
+    write_frame(&mut c, &ClientRequest::Subscribe).await.unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+    let agents = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::Snapshot { agents, .. } => Some(agents.clone()),
+            _ => None,
+        })
+        .expect("snapshot");
+    assert!(agents.is_empty(), "refused creates left rows: {agents:#?}");
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// The mirror of the refusal: when the CLI *is* on the login shell's PATH the
+/// check must stay out of the way — guards against the probe being so strict
+/// (or so slow) that it blocks legitimate creates.
+#[tokio::test]
+async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+
+    // A stub `claude` that just sits there, reachable only via this shell.
+    let bin = env.tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let stub = bin.join("claude");
+    std::fs::write(&stub, "#!/bin/sh\nsleep 60\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let shell = env.tmp.path().join("seeing-shell.sh");
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nPATH={}:/usr/bin:/bin\nexport PATH\nexec /bin/sh -c \"$4\"\n",
+            bin.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut daemon = env.spawn_daemon_with_shell(&shell);
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 7,
+            worktree: worktree.id.clone(),
+            name: "real-agent".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(20), |evs| {
+        find_ack(evs, 7).is_some()
+            || evs
+                .iter()
+                .any(|e| matches!(e, ServerEvent::Error { req_id: Some(7), .. }))
+    })
+    .await;
+    assert!(
+        matches!(
+            find_ack(&events, 7),
+            Some(ServerEvent::Ack {
+                created: Some(EntityId::Agent(_)),
+                ..
+            })
+        ),
+        "an installed CLI must still create: {events:#?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 fn pid_alive(pid: i32) -> bool {
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])

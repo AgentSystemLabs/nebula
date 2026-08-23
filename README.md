@@ -163,6 +163,8 @@ Worktree and project rows roll up their children: red beats yellow beats green.
 | Projects / Worktrees | `e` | notes for the selected project / worktree |
 | Sessions | `n` | new session (agent or shell terminal) |
 | Sessions | `r`, `a`, `u`, `d`, `A` | rename, archive, unarchive, delete, toggle archived |
+| Any panel | `L` | attach a link (pull request, doc, ticket) to the selected worktree — it lands in the Sessions panel's LINKS group, above any open pull request nebula finds with `gh` |
+| Sessions | `Enter` / `r` / `d` on a link | open it in the browser / edit its URL / delete it (the detected pull request opens but can't be edited or deleted) |
 | Any panel | `t` | new shell terminal in the selected worktree's directory (Projects panel: the repo root) |
 | Any panel | `w` | workspace switcher: `Enter` opens, `n`/`r`/`d` create/rename/delete (the open workspace shows bottom-left; `/` and the panels scope to it) |
 | Any panel | `h` | ssh hosts: every `nebula ssh` destination, newest first. `Enter`/click reconnects (quits this TUI and execs a fresh `nebula ssh` — local sessions keep running), `a` types a new `user@host [dir]`, `d` removes |

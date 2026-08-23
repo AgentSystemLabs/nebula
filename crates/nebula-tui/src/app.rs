@@ -1,10 +1,11 @@
 //! TUI state: the Elm-ish Model.
 
 use crate::git_diff::DiffFile;
+use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Note, NoteId, NoteOwner, Project, ProjectId,
-    SessionRef, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
+    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Note, NoteId, NoteOwner, Project,
+    ProjectId, SessionRef, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
 };
 use ratatui::layout::Rect;
 use std::collections::HashMap;
@@ -97,6 +98,12 @@ pub enum MenuAction {
     NewWorktree(ProjectId),
     /// Open the note modal for this owner (project or worktree).
     OpenNotes(NoteOwner),
+    /// Attach a URL to this worktree (prompts for it).
+    NewLink(WorktreeId),
+    /// Hand a link row's URL to the browser.
+    OpenLink(String),
+    EditLink(LinkId),
+    DeleteLink(LinkId),
     SetWorktreePinned(WorktreeId, bool),
     DeleteWorktree(WorktreeId),
     AddProject,
@@ -207,6 +214,7 @@ pub enum PendingAction {
         terminals: Vec<TerminalId>,
     },
     RemoveProject(ProjectId),
+    DeleteLink(LinkId),
     Quit,
 }
 
@@ -247,6 +255,14 @@ pub enum PromptKind {
     NewWorkspace,
     RenameWorkspace {
         id: WorkspaceId,
+    },
+    /// Pin a URL to this worktree.
+    NewLink {
+        worktree: WorktreeId,
+    },
+    /// Rewrite a pinned link's URL.
+    EditLink {
+        id: LinkId,
     },
 }
 
@@ -1065,6 +1081,8 @@ pub enum PendingIntent {
     SelectCreatedWorktree,
     /// Move the note modal's cursor onto the created note.
     SelectCreatedNote,
+    /// Move the Sessions panel's cursor onto the link just created.
+    SelectCreatedLink,
     /// Open the workspace this Ack just created (switcher's "New workspace…"
     /// flow: creating from there means you want to be in it).
     OpenCreatedWorkspace,
@@ -1079,12 +1097,73 @@ pub enum ConnState {
     Disconnected,
 }
 
+/// One row of the Sessions panel's LINKS group: a URL the user pinned to
+/// the worktree, or the pull request nebula found on its branch.
+#[derive(Debug, Clone)]
+pub enum LinkRow {
+    /// Discovered by `gh pr view`, backed by nothing in the store — so it
+    /// can be opened but not edited or deleted.
+    PullRequest(PullRequest),
+    /// A saved link. `pr` is set when this link's URL *is* the detected
+    /// pull request: the row then shows the PR's title and badge instead of
+    /// a bare URL, and stays editable — it is still the user's own row.
+    Saved { link: Link, pr: Option<PullRequest> },
+}
+
+impl LinkRow {
+    pub fn url(&self) -> &str {
+        match self {
+            LinkRow::PullRequest(pr) => &pr.url,
+            LinkRow::Saved { link, .. } => &link.url,
+        }
+    }
+
+    /// The stored link behind the row; None for the detected pull request,
+    /// which is what makes it un-editable and un-deletable.
+    pub fn id(&self) -> Option<&LinkId> {
+        match self {
+            LinkRow::PullRequest(_) => None,
+            LinkRow::Saved { link, .. } => Some(&link.id),
+        }
+    }
+
+    /// The pull request this row stands for, however it got here.
+    pub fn pull_request(&self) -> Option<&PullRequest> {
+        match self {
+            LinkRow::PullRequest(pr) => Some(pr),
+            LinkRow::Saved { pr, .. } => pr.as_ref(),
+        }
+    }
+
+    /// Row text: a pull request reads as `#42 title`, anything else as its
+    /// URL with the noise (scheme, `www.`, trailing slash) stripped.
+    pub fn label(&self) -> String {
+        match self.pull_request() {
+            Some(pr) if !pr.title.is_empty() => format!("#{} {}", pr.number, pr.title),
+            Some(pr) => format!("#{}", pr.number),
+            None => pretty_url(self.url()),
+        }
+    }
+}
+
+/// A URL as a person reads it: no scheme, no `www.`, no trailing slash.
+/// Purely cosmetic — the full URL is what gets opened.
+pub fn pretty_url(url: &str) -> String {
+    let bare = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let bare = bare.strip_prefix("www.").unwrap_or(bare);
+    bare.strip_suffix('/').unwrap_or(bare).to_string()
+}
+
 /// One row in the Sessions panel: agents (pinned / recent / unpinned), then
-/// shell terminals, then archived agents.
+/// shell terminals, then the worktree's links, then archived agents.
 #[derive(Debug, Clone)]
 pub enum SessionRow {
     Agent(Agent),
     Terminal(TerminalTab),
+    Link(LinkRow),
 }
 
 impl SessionRow {
@@ -1092,19 +1171,48 @@ impl SessionRow {
         match self {
             SessionRow::Agent(a) => &a.name,
             SessionRow::Terminal(t) => &t.name,
+            SessionRow::Link(l) => l.url(),
         }
     }
 
-    pub fn sref(&self) -> SessionRef {
+    /// The attachable session behind the row. Link rows have none — they
+    /// open a browser, not a PTY.
+    pub fn sref(&self) -> Option<SessionRef> {
         match self {
-            SessionRow::Agent(a) => SessionRef::Agent(a.id.clone()),
-            SessionRow::Terminal(t) => SessionRef::Terminal(t.id.clone()),
+            SessionRow::Agent(a) => Some(SessionRef::Agent(a.id.clone())),
+            SessionRow::Terminal(t) => Some(SessionRef::Terminal(t.id.clone())),
+            SessionRow::Link(_) => None,
         }
     }
 
     pub fn is_archived_agent(&self) -> bool {
         matches!(self, SessionRow::Agent(a) if a.archived)
     }
+
+    pub fn as_link(&self) -> Option<&LinkRow> {
+        match self {
+            SessionRow::Link(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// Identity for double-click tracking: distinct per row, and stable
+    /// across the repaints between the two clicks.
+    pub fn click_key(&self) -> RowKey {
+        match self.sref() {
+            Some(sref) => RowKey::Session(sref),
+            None => RowKey::Link(self.name().to_string()),
+        }
+    }
+}
+
+/// What a click landed on, for the double-click window. Sessions are their
+/// own reference; a link has none (the pull-request row isn't even stored),
+/// so its URL is the identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowKey {
+    Session(SessionRef),
+    Link(String),
 }
 
 /// Aggregate status for a worktree row: red > yellow > green > gray,
@@ -1191,6 +1299,7 @@ pub struct Tree {
     pub agents: Vec<Agent>,
     pub terminals: Vec<TerminalTab>,
     pub notes: Vec<Note>,
+    pub links: Vec<Link>,
 }
 
 impl Tree {
@@ -1397,6 +1506,9 @@ pub struct App {
     pub select_worktree_when_seen: Option<WorktreeId>,
     /// Note created by us, awaiting its upsert to land the modal's cursor.
     pub select_note_when_seen: Option<NoteId>,
+    /// Link created by us, awaiting its upsert to land the panel cursor on
+    /// the new row.
+    pub select_link_when_seen: Option<LinkId>,
     /// Last selected worktree per project — switching back to a project
     /// returns to the worktree the user left it on.
     pub last_worktree_for_project: HashMap<ProjectId, WorktreeId>,
@@ -1419,7 +1531,7 @@ pub struct App {
     pub last_term_click: Option<(std::time::Instant, (u16, u16))>,
     /// Last left-click on a session row (time + session), for double-click
     /// attach detection (a single click only selects the row).
-    pub last_session_click: Option<(std::time::Instant, SessionRef)>,
+    pub last_session_click: Option<(std::time::Instant, RowKey)>,
     /// URLs detected on the visible screen during the last draw; hit-tested
     /// on ⌥click and underlined by the renderer.
     pub term_links: Vec<crate::links::TermLink>,
@@ -1472,6 +1584,15 @@ pub struct App {
     /// the inner `None` means the checkout wasn't readable. The event loop
     /// refreshes it on a slow poll and before drawing a changed selection.
     pub git_changes: Option<(WorktreeId, Option<usize>)>,
+    /// What `gh pr view` last said about each worktree's branch: `Some(pr)`
+    /// when one exists, `None` when the lookup came back empty (no PR, no
+    /// `gh`, no remote). A missing key means "not looked up yet" and is
+    /// what triggers a lookup; the answers are refreshed on a slow poll,
+    /// since opening a PR is a thing that happens outside nebula.
+    pub pull_requests: HashMap<WorktreeId, Option<PullRequest>>,
+    /// Worktrees with a lookup in flight, so a repaint can't stack a second
+    /// `gh` process on the first.
+    pub pr_inflight: std::collections::HashSet<WorktreeId>,
     /// Latest daemon metrics reading (daemon + per-session process trees),
     /// for the footer's memory/session readout. Refreshed on a slow poll;
     /// the metrics modal shares the same replies at a faster cadence.
@@ -1531,6 +1652,7 @@ impl App {
             select_divider_when_seen: None,
             select_worktree_when_seen: None,
             select_note_when_seen: None,
+            select_link_when_seen: None,
             last_worktree_for_project: HashMap::new(),
             last_session_for_worktree: HashMap::new(),
             pending_prewarm: None,
@@ -1556,6 +1678,8 @@ impl App {
             vim_tx: None,
             vim_generation: 0,
             git_changes: None,
+            pull_requests: HashMap::new(),
+            pr_inflight: std::collections::HashSet::new(),
             last_metrics: None,
             client_rss_bytes: 0,
             splash_epoch: std::time::Instant::now(),
@@ -1735,8 +1859,57 @@ impl App {
                 .into_iter()
                 .map(SessionRow::Terminal),
         );
+        rows.extend(self.visible_links().into_iter().map(SessionRow::Link));
         rows.extend(agents[active..].iter().cloned().map(SessionRow::Agent));
         rows
+    }
+
+    /// The selected worktree's LINKS group: the pull request on its branch
+    /// first (however it got there), then the saved links in list order.
+    /// A saved link that *is* the pull request is shown once, as the
+    /// pull-request row — a duplicate would just be the same destination
+    /// twice.
+    pub fn visible_links(&self) -> Vec<LinkRow> {
+        let worktrees = self.visible_worktrees();
+        let Some(wt) = worktrees.get(self.sel_worktree) else {
+            return vec![];
+        };
+        let saved: Vec<&Link> = self
+            .tree
+            .links
+            .iter()
+            .filter(|l| l.worktree_id == wt.id)
+            .collect();
+        let pr = self.pull_requests.get(&wt.id).cloned().flatten();
+        let matched = pr
+            .as_ref()
+            .and_then(|p| saved.iter().position(|l| l.url == p.url));
+        let mut rows: Vec<LinkRow> = Vec::new();
+        match (&pr, matched) {
+            (Some(pr), Some(i)) => rows.push(LinkRow::Saved {
+                link: saved[i].clone(),
+                pr: Some(pr.clone()),
+            }),
+            (Some(pr), None) => rows.push(LinkRow::PullRequest(pr.clone())),
+            (None, _) => {}
+        }
+        for (i, link) in saved.iter().enumerate() {
+            if Some(i) != matched {
+                rows.push(LinkRow::Saved {
+                    link: (*link).clone(),
+                    pr: None,
+                });
+            }
+        }
+        rows
+    }
+
+    /// The link row under the cursor, when the cursor is on one.
+    pub fn selected_link(&self) -> Option<LinkRow> {
+        match self.selected_session_row() {
+            Some(SessionRow::Link(l)) => Some(l),
+            _ => None,
+        }
     }
 
     pub fn selected_session_row(&self) -> Option<SessionRow> {
@@ -1989,6 +2162,176 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- worktree links ----
+
+    fn link_app() -> (App, WorktreeId) {
+        let mut app = App::new();
+        let project_id = ProjectId("p1".into());
+        let worktree_id = WorktreeId("w1".into());
+        app.tree.projects.push(Project {
+            workspace_id: Default::default(),
+            id: project_id.clone(),
+            name: "demo".into(),
+            repo_path: "/tmp/demo".into(),
+            sort_order: 0,
+            divider_after: false,
+            divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
+        });
+        app.tree.worktrees.push(Worktree {
+            id: worktree_id.clone(),
+            project_id,
+            path: "/tmp/demo".into(),
+            branch: "main".into(),
+            is_main: true,
+            pinned: false,
+            sort_order: 0,
+        });
+        (app, worktree_id)
+    }
+
+    fn link(id: &str, worktree: &WorktreeId, url: &str, sort_order: i64) -> Link {
+        Link {
+            id: LinkId(id.into()),
+            worktree_id: worktree.clone(),
+            url: url.into(),
+            sort_order,
+        }
+    }
+
+    fn pr(url: &str) -> PullRequest {
+        PullRequest {
+            number: 7,
+            url: url.into(),
+            title: "Attach links".into(),
+            state: "OPEN".into(),
+            is_draft: false,
+        }
+    }
+
+    #[test]
+    fn saved_links_list_in_order_under_the_pull_request() {
+        let (mut app, wt) = link_app();
+        app.tree
+            .links
+            .push(link("l1", &wt, "https://a.dev/spec", 0));
+        app.tree
+            .links
+            .push(link("l2", &wt, "https://b.dev/issue", 1));
+        // Another worktree's links never leak into this list.
+        app.tree
+            .links
+            .push(link("l3", &WorktreeId("other".into()), "https://c.dev", 0));
+
+        let rows = app.visible_links();
+        let urls: Vec<&str> = rows.iter().map(|l| l.url()).collect();
+        assert_eq!(urls, ["https://a.dev/spec", "https://b.dev/issue"]);
+
+        app.pull_requests
+            .insert(wt, Some(pr("https://github.com/o/r/pull/7")));
+        let rows = app.visible_links();
+        assert_eq!(
+            rows[0].url(),
+            "https://github.com/o/r/pull/7",
+            "the pull request leads the list"
+        );
+        assert_eq!(rows[0].label(), "#7 Attach links");
+        assert!(rows[0].id().is_none(), "it is not a stored row");
+        assert_eq!(rows.len(), 3);
+    }
+
+    /// A link the user pasted before nebula found the PR is the same
+    /// destination: it shows once, as the pull-request row, and stays
+    /// deletable because it is still the user's own row.
+    #[test]
+    fn a_saved_link_matching_the_pull_request_is_shown_once() {
+        let (mut app, wt) = link_app();
+        let url = "https://github.com/o/r/pull/7";
+        app.tree
+            .links
+            .push(link("l1", &wt, "https://a.dev/spec", 0));
+        app.tree.links.push(link("l2", &wt, url, 1));
+        app.pull_requests.insert(wt, Some(pr(url)));
+
+        let rows = app.visible_links();
+        assert_eq!(rows.len(), 2, "no duplicate row for the same URL");
+        assert_eq!(rows[0].url(), url);
+        assert_eq!(rows[0].label(), "#7 Attach links", "shown as the PR");
+        assert_eq!(
+            rows[0].id().map(|id| id.as_str()),
+            Some("l2"),
+            "still the stored row, so it can be edited and deleted"
+        );
+        assert_eq!(rows[1].url(), "https://a.dev/spec");
+    }
+
+    #[test]
+    fn links_sit_between_terminals_and_archived_sessions() {
+        let (mut app, wt) = link_app();
+        app.tree.agents.push(Agent {
+            id: AgentId("a1".into()),
+            worktree_id: wt.clone(),
+            name: "live".into(),
+            status: AgentStatus::Fresh,
+            archived: false,
+            archived_at: 0,
+            pinned: false,
+            status_changed_at: 0,
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            session_id: None,
+            sort_order: 0,
+            alive: true,
+        });
+        app.tree.agents.push(Agent {
+            id: AgentId("a2".into()),
+            name: "old".into(),
+            archived: true,
+            ..app.tree.agents[0].clone()
+        });
+        app.tree.terminals.push(TerminalTab {
+            id: TerminalId("t1".into()),
+            worktree_id: wt.clone(),
+            name: "shell".into(),
+            sort_order: 0,
+            alive: true,
+        });
+        app.tree
+            .links
+            .push(link("l1", &wt, "https://a.dev/spec", 0));
+        app.show_archived = true;
+
+        let rows = app.visible_session_rows();
+        let names: Vec<&str> = rows.iter().map(|r| r.name()).collect();
+        assert_eq!(names, ["live", "shell", "https://a.dev/spec", "old"]);
+    }
+
+    #[test]
+    fn link_rows_have_no_session_to_attach() {
+        let (mut app, wt) = link_app();
+        app.tree
+            .links
+            .push(link("l1", &wt, "https://a.dev/spec", 0));
+        let rows = app.visible_session_rows();
+        assert!(rows[0].sref().is_none(), "a link is not attachable");
+        assert!(!rows[0].is_archived_agent());
+        assert_eq!(
+            rows[0].click_key(),
+            RowKey::Link("https://a.dev/spec".into())
+        );
+    }
+
+    #[test]
+    fn pretty_url_strips_the_parts_nobody_reads() {
+        assert_eq!(pretty_url("https://www.example.com/a/b"), "example.com/a/b");
+        assert_eq!(pretty_url("http://x.dev/"), "x.dev");
+        assert_eq!(pretty_url("https://x.dev"), "x.dev");
+        // Not a URL shape we produce, but the function must not panic.
+        assert_eq!(pretty_url(""), "");
+    }
 
     /// Codex (ratatui inline viewport) inserts chat history by scrolling a
     /// TOP-ANCHORED DECSTBM region, which stock vt100 discards instead of

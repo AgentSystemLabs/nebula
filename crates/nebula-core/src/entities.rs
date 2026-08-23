@@ -1,4 +1,4 @@
-use crate::ids::{AgentId, ProjectId, TerminalId, NoteId, WorkspaceId, WorktreeId};
+use crate::ids::{AgentId, LinkId, ProjectId, TerminalId, NoteId, WorkspaceId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -55,6 +55,10 @@ pub enum AgentKind {
 }
 
 impl AgentKind {
+    /// Every kind, for callers that must cover all of them (menus, the
+    /// boot-time CLI probe warm) and should fail to compile if one is added.
+    pub const ALL: [AgentKind; 3] = [AgentKind::Claude, AgentKind::Codex, AgentKind::Cursor];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
@@ -191,6 +195,21 @@ pub struct Note {
     pub sort_order: i64,
 }
 
+/// A URL pinned to a worktree — the pull request, the ticket, the design
+/// doc for whatever that checkout is for. Nebula never fetches these; they
+/// are bookmarks the user opens in a browser from the Sessions panel. The
+/// open pull request shown above them is discovered from git, not stored
+/// here (see the TUI's `PullRequest`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Link {
+    pub id: LinkId,
+    pub worktree_id: WorktreeId,
+    /// Always http(s) — normalized on the way in, so opening one can never
+    /// hand the OS a scheme the user didn't intend.
+    pub url: String,
+    pub sort_order: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Entity {
     Workspace(Workspace),
@@ -199,6 +218,7 @@ pub enum Entity {
     Agent(Agent),
     Terminal(TerminalTab),
     Note(Note),
+    Link(Link),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -209,4 +229,5 @@ pub enum EntityId {
     Agent(AgentId),
     Terminal(TerminalId),
     Note(NoteId),
+    Link(LinkId),
 }

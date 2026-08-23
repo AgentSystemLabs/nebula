@@ -94,6 +94,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         agents: vec![],
                         terminals: vec![],
                         notes: vec![],
+                        links: vec![],
                         ui_state: None,
                     });
                     let _ = out_tx.send(snapshot).await;
@@ -344,6 +345,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         req_id,
                         daemon
                             .create_agent(&worktree, &name, kind, model, effort, auto_title)
+                            .await
                             .map(Some),
                     )
                     .await;
@@ -461,6 +463,24 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientRequest::DeleteNote { req_id, id } => {
                     reply(&out_tx, req_id, daemon.delete_note(&id).map(|_| None)).await;
+                }
+                ClientRequest::CreateLink {
+                    req_id,
+                    worktree,
+                    url,
+                } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.create_link(&worktree, &url).map(Some),
+                    )
+                    .await;
+                }
+                ClientRequest::UpdateLink { req_id, id, url } => {
+                    reply(&out_tx, req_id, daemon.update_link(&id, &url).map(|_| None)).await;
+                }
+                ClientRequest::DeleteLink { req_id, id } => {
+                    reply(&out_tx, req_id, daemon.delete_link(&id).map(|_| None)).await;
                 }
                 ClientRequest::RenameTerminal { req_id, id, name } => {
                     reply(

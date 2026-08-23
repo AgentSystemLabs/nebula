@@ -4,8 +4,9 @@
 
 use anyhow::{Context, Result};
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Note, NoteId, NoteOwner, Project, ProjectId,
-    TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId, DEFAULT_WORKSPACE_ID,
+    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Note, NoteId, NoteOwner, Project,
+    ProjectId, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
+    DEFAULT_WORKSPACE_ID,
 };
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
@@ -172,6 +173,18 @@ const MIGRATIONS: &[&str] = &[
     // 15: todos are now "notes" everywhere — rename the table to match.
     "
     ALTER TABLE todos RENAME TO notes;
+    ",
+    // 16: per-worktree links — pull requests, tickets, docs. Worktree-only
+    // (unlike notes): a link describes the branch's work, and a project's
+    // links would be the same for every checkout.
+    "
+    CREATE TABLE links (
+      id          TEXT PRIMARY KEY,
+      worktree_id TEXT NOT NULL REFERENCES worktrees(id) ON DELETE CASCADE,
+      url         TEXT NOT NULL,
+      sort_order  INTEGER NOT NULL DEFAULT 0,
+      created_at  INTEGER NOT NULL
+    );
     ",
 ];
 
@@ -720,6 +733,77 @@ impl Store {
         Ok(notes)
     }
 
+    // ---- links ----
+
+    pub fn insert_link(&self, l: &Link) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO links (id, worktree_id, url, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                l.id.as_str(),
+                l.worktree_id.as_str(),
+                l.url,
+                l.sort_order,
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Sort slot for a new link: after everything else on its worktree.
+    pub fn next_link_sort_order(&self, worktree_id: &WorktreeId) -> Result<i64> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM links WHERE worktree_id = ?1",
+            params![worktree_id.as_str()],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn set_link_url(&self, id: &LinkId, url: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE links SET url = ?2 WHERE id = ?1",
+            params![id.as_str(), url],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_link(&self, id: &LinkId) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM links WHERE id = ?1", params![id.as_str()])?;
+        Ok(())
+    }
+
+    pub fn get_link(&self, id: &LinkId) -> Result<Option<Link>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id, worktree_id, url, sort_order FROM links WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id.as_str()])?;
+        Ok(rows.next()?.map(|r| Link {
+            id: LinkId(r.get::<_, String>(0).unwrap()),
+            worktree_id: WorktreeId(r.get::<_, String>(1).unwrap()),
+            url: r.get(2).unwrap(),
+            sort_order: r.get(3).unwrap(),
+        }))
+    }
+
+    /// Every link, in per-worktree list order.
+    pub fn load_links(&self) -> Result<Vec<Link>> {
+        let conn = self.conn.lock().unwrap();
+        let links = conn
+            .prepare("SELECT id, worktree_id, url, sort_order FROM links ORDER BY worktree_id, sort_order, created_at")?
+            .query_map([], |r| {
+                Ok(Link {
+                    id: LinkId(r.get(0)?),
+                    worktree_id: WorktreeId(r.get(1)?),
+                    url: r.get(2)?,
+                    sort_order: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(links)
+    }
+
     // ---- point lookups ----
 
     pub fn get_project(&self, id: &ProjectId) -> Result<Option<Project>> {
@@ -1060,6 +1144,60 @@ mod tests {
         store.insert_note(&note).unwrap();
         store.delete_project(&project.id).unwrap();
         assert!(store.load_notes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn link_crud_roundtrip_and_cascade() {
+        let store = Store::open_in_memory().unwrap();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId::generate(),
+            name: "demo".into(),
+            repo_path: "/tmp/demo".into(),
+            sort_order: 0,
+            divider_after: false,
+            divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
+        };
+        store.insert_project(&project).unwrap();
+        let worktree = Worktree {
+            id: WorktreeId::generate(),
+            project_id: project.id.clone(),
+            path: "/tmp/demo".into(),
+            branch: "main".into(),
+            is_main: true,
+            pinned: false,
+            sort_order: 0,
+        };
+        store.insert_worktree(&worktree).unwrap();
+
+        assert_eq!(store.next_link_sort_order(&worktree.id).unwrap(), 0);
+        let link = Link {
+            id: LinkId::generate(),
+            worktree_id: worktree.id.clone(),
+            url: "https://github.com/o/r/pull/7".into(),
+            sort_order: store.next_link_sort_order(&worktree.id).unwrap(),
+        };
+        store.insert_link(&link).unwrap();
+        assert_eq!(store.next_link_sort_order(&worktree.id).unwrap(), 1);
+
+        store
+            .set_link_url(&link.id, "https://example.dev/spec")
+            .unwrap();
+        let read = store.get_link(&link.id).unwrap().unwrap();
+        assert_eq!(read.url, "https://example.dev/spec");
+        assert_eq!(read.worktree_id, worktree.id);
+        assert_eq!(store.load_links().unwrap().len(), 1);
+
+        store.delete_link(&link.id).unwrap();
+        assert!(store.get_link(&link.id).unwrap().is_none());
+
+        // Links hang off the worktree: deleting the project cascades
+        // through it, same as notes.
+        store.insert_link(&link).unwrap();
+        store.delete_project(&project.id).unwrap();
+        assert!(store.load_links().unwrap().is_empty());
     }
 
     /// Real upgrade path: a v9 database (notes still worktree-only) picks

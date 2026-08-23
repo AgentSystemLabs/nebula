@@ -1,14 +1,14 @@
 use crate::entities::{
-    Agent, AgentKind, AgentStatus, Entity, EntityId, Project, TerminalTab, Note, NoteOwner,
+    Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Project, TerminalTab, Note, NoteOwner,
     Workspace, Worktree,
 };
-use crate::ids::{AgentId, ProjectId, TerminalId, NoteId, WorkspaceId, WorktreeId};
+use crate::ids::{AgentId, LinkId, ProjectId, TerminalId, NoteId, WorkspaceId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -241,6 +241,24 @@ pub enum ClientRequest {
         req_id: u64,
         id: NoteId,
     },
+    /// Pin a URL to a worktree. `url` is normalized daemon-side (a bare
+    /// `github.com/...` gains an https:// scheme) and refused if it can't be
+    /// made into an http(s) URL.
+    CreateLink {
+        req_id: u64,
+        worktree: WorktreeId,
+        url: String,
+    },
+    /// Rewrite a link's URL (same normalization as CreateLink).
+    UpdateLink {
+        req_id: u64,
+        id: LinkId,
+        url: String,
+    },
+    DeleteLink {
+        req_id: u64,
+        id: LinkId,
+    },
     RenameTerminal {
         req_id: u64,
         id: TerminalId,
@@ -309,6 +327,7 @@ pub enum ServerEvent {
         agents: Vec<Agent>,
         terminals: Vec<TerminalTab>,
         notes: Vec<Note>,
+        links: Vec<Link>,
         ui_state: Option<String>,
     },
 
