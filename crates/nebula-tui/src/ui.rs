@@ -18,6 +18,10 @@ use ratatui::Frame;
 /// Shared with the event loop's pre-draw PTY size guess.
 pub const VIM_MODAL_PCT: (u16, u16) = (94, 92);
 
+/// Columns the tree-browser preview must keep for the file text itself
+/// before a line-number gutter is worth drawing.
+const MIN_PREVIEW_TEXT_W: usize = 16;
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits.clear();
 
@@ -1571,19 +1575,31 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
             f.render_widget(block, preview_a);
             if !editing {
+                // Line-number gutter, for real file contents only —
+                // directory listings and placeholders have no lines to
+                // number. Dropped entirely when the pane is too narrow to
+                // leave room for the code itself.
+                let num_w = view.preview_line_count.to_string().len().max(2);
+                let gutter = view.preview_is_file
+                    && (preview_inner.width as usize) > num_w + 1 + MIN_PREVIEW_TEXT_W;
                 let lines: Vec<Line> = view
                     .preview_lines
                     .iter()
+                    .enumerate()
                     .skip(scroll as usize)
                     .take(preview_inner.height as usize)
-                    .map(|runs| {
-                        Line::from(
-                            runs.iter()
-                                .map(|(kind, text)| {
-                                    Span::styled(text.clone(), token_style(*kind, th))
-                                })
-                                .collect::<Vec<_>>(),
-                        )
+                    .map(|(i, runs)| {
+                        let mut spans = Vec::with_capacity(runs.len() + 1);
+                        if gutter {
+                            spans.push(Span::styled(
+                                format!("{:>num_w$} ", i + 1),
+                                Style::default().fg(th.edge),
+                            ));
+                        }
+                        spans.extend(runs.iter().map(|(kind, text)| {
+                            Span::styled(text.clone(), token_style(*kind, th))
+                        }));
+                        Line::from(spans)
                     })
                     .collect();
                 f.render_widget(Paragraph::new(lines), preview_inner);
@@ -2294,15 +2310,13 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         layout.push((*vrow, e));
         *vrow += h;
     };
-    let push_rows = |layout: &mut Vec<(usize, SessionEntry)>,
-                     vrow: &mut usize,
-                     start: usize,
-                     len: usize| {
-        for i in start..(start + len).min(rows.len()) {
-            layout.push((*vrow, SessionEntry::Row(i)));
-            *vrow += PILL_H as usize;
-        }
-    };
+    let push_rows =
+        |layout: &mut Vec<(usize, SessionEntry)>, vrow: &mut usize, start: usize, len: usize| {
+            for i in start..(start + len).min(rows.len()) {
+                layout.push((*vrow, SessionEntry::Row(i)));
+                *vrow += PILL_H as usize;
+            }
+        };
 
     // Group headers only appear once something is pinned or recent;
     // otherwise the list stays flat with no group header.
@@ -2362,7 +2376,12 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         header(&mut layout, &mut vrow, SessionEntry::ArchivedHeader(text));
         if app.show_archived {
             let start = active_count + terminal_count + link_count;
-            push_rows(&mut layout, &mut vrow, start, rows.len().saturating_sub(start));
+            push_rows(
+                &mut layout,
+                &mut vrow,
+                start,
+                rows.len().saturating_sub(start),
+            );
         }
     }
 

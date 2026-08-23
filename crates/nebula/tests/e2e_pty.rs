@@ -2102,9 +2102,12 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
     }
 
     // And no half-created rows left behind in the Sessions column.
-    write_frame(&mut c, &ClientRequest::Subscribe).await.unwrap();
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
     let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
     .await;
     let agents = events
@@ -2168,9 +2171,15 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
     .unwrap();
     let events = read_events_until(&mut c, Duration::from_secs(20), |evs| {
         find_ack(evs, 7).is_some()
-            || evs
-                .iter()
-                .any(|e| matches!(e, ServerEvent::Error { req_id: Some(7), .. }))
+            || evs.iter().any(|e| {
+                matches!(
+                    e,
+                    ServerEvent::Error {
+                        req_id: Some(7),
+                        ..
+                    }
+                )
+            })
     })
     .await;
     assert!(

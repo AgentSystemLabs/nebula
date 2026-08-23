@@ -7934,7 +7934,10 @@ mod tests {
 
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("archived-00"), "list starts at the top: {text}");
+        assert!(
+            text.contains("archived-00"),
+            "list starts at the top: {text}"
+        );
         assert!(!text.contains("archived-19"), "tail overflows: {text}");
 
         // Wheel over the Sessions column: the list moves, the cursor stays.
@@ -7943,7 +7946,10 @@ mod tests {
             terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         }
         let text = buffer_text(&terminal);
-        assert!(text.contains("archived-19"), "wheel reaches the tail: {text}");
+        assert!(
+            text.contains("archived-19"),
+            "wheel reaches the tail: {text}"
+        );
         assert!(!text.contains("archived-00"), "top scrolled away: {text}");
         assert_eq!(app.sel_session, 0, "the wheel never moves the cursor");
 
@@ -11459,6 +11465,43 @@ mod tests {
         assert!(v.area.width > 0, "draw writes hit-test area");
         assert!(v.list_area.height > 0, "draw writes list area");
         assert!(v.view_height > 0, "draw writes preview page size");
+    }
+
+    #[test]
+    fn file_preview_gets_a_line_number_gutter_but_listings_dont() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "one\ntwo\nthree\n").unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
+        for c in ['l', 'i', 'b'] {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(tree_rows(&app), vec!["src", "src/lib.rs"]);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        for (n, line) in [(1, "one"), (2, "two"), (3, "three")] {
+            assert!(
+                text.contains(&format!(" {n} {line}")),
+                "file preview numbers its lines:\n{text}"
+            );
+        }
+
+        // A directory's child listing isn't file content — no gutter.
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        assert_eq!(tree_view(&app).selected_node().unwrap().path, "src");
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("lib.rs"), "listing rendered:\n{text}");
+        assert!(
+            !text.contains(" 1 lib.rs"),
+            "directory listings stay unnumbered:\n{text}"
+        );
     }
 
     #[test]

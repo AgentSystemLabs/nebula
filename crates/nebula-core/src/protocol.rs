@@ -1,8 +1,8 @@
 use crate::entities::{
-    Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Project, TerminalTab, Note, NoteOwner,
+    Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Note, NoteOwner, Project, TerminalTab,
     Workspace, Worktree,
 };
-use crate::ids::{AgentId, LinkId, ProjectId, TerminalId, NoteId, WorkspaceId, WorktreeId};
+use crate::ids::{AgentId, LinkId, NoteId, ProjectId, TerminalId, WorkspaceId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

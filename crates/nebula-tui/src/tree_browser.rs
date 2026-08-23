@@ -74,6 +74,9 @@ pub struct TreeBrowser {
     pub preview_lines: Vec<Vec<(TokenKind, String)>>,
     /// Cached line count of `preview`, for scroll clamping.
     pub preview_line_count: usize,
+    /// Whether `preview` is real file contents — the case that earns a
+    /// line-number gutter. False for directory listings and placeholders.
+    pub preview_is_file: bool,
     /// Top visible preview line.
     pub scroll: u16,
     /// Inner height of the preview pane, written back during draw (the
@@ -115,6 +118,7 @@ impl TreeBrowser {
             preview: String::new(),
             preview_lines: Vec::new(),
             preview_line_count: 0,
+            preview_is_file: false,
             scroll: 0,
             view_height: 0,
             list_area: Rect::default(),
@@ -376,6 +380,7 @@ impl TreeBrowser {
             Some(path) => Highlighter::for_path(path),
             None => Highlighter::plain(),
         };
+        self.preview_is_file = highlight_path.is_some();
         self.preview_lines = text.lines().map(|l| hl.line(l)).collect();
         self.preview_line_count = self.preview_lines.len();
         self.preview = text;
