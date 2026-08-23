@@ -851,9 +851,11 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 toggle_archived(app, out);
             }
         }
-        // Workspace switcher: pick which workspace is open.
+        // Workspace switcher: pick which workspace is open. The focus
+        // guard keeps `w` out of an unlocked terminal pane — but under the
+        // splash there is no pane on screen, so it always opens there.
         KeyCode::Char('w') => {
-            if app.focus != Focus::Terminal {
+            if app.focus != Focus::Terminal || app.splash_showing() {
                 open_workspace_picker(app);
             }
         }
@@ -5412,6 +5414,66 @@ mod tests {
             panic!("expected add-project prompt, got {:?}", app.overlay);
         };
         assert_eq!(p.kind, crate::app::PromptKind::AddProject);
+    }
+
+    /// The splash hides the panels, so the footer drops the panel keymap
+    /// for the handful of keys that still fire under it — and in preview,
+    /// for the only one there is.
+    #[test]
+    fn splash_footer_lists_only_keys_that_work() {
+        let mut app = App::new();
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("n/o: add project"), "{text}");
+        assert!(text.contains("w: workspaces"), "{text}");
+        assert!(text.contains("q: quit"), "{text}");
+        for dead in [
+            "e: notes",
+            "d: remove",
+            "-: divider",
+            "m: menu",
+            "/: search",
+        ] {
+            assert!(
+                !text.contains(dead),
+                "{dead} does nothing on the splash: {text}"
+            );
+        }
+
+        // Preview over a populated tree: the next key only dismisses.
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('N'), KeyModifiers::SHIFT, &mut out);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("any key: back to panels"), "{text}");
+        assert!(!text.contains("n/o: add project"), "{text}");
+
+        // Panels back, panel keymap back.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("m: menu"));
+    }
+
+    /// `w` is one of the splash's advertised keys, so it opens the
+    /// workspace picker from any focus while the splash is up — including
+    /// the terminal focus its guard normally excludes.
+    #[test]
+    fn w_opens_workspace_picker_from_any_focus_under_splash() {
+        let mut app = App::new();
+        app.tree.workspaces.push(nebula_core::Workspace {
+            id: "default".to_string().into(),
+            name: "default".into(),
+        });
+        app.focus = Focus::Terminal;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.is_workspace_picker()),
+            "expected the workspace picker, got {:?}",
+            app.overlay
+        );
     }
 
     /// `o` opens the add-project prompt regardless of focus or tree state —

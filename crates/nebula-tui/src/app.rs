@@ -1565,15 +1565,20 @@ impl App {
         }
     }
 
+    /// The splash is what the body is showing: nothing in the tree yet
+    /// (first run) or summoned with N, and the panels aren't collapsed
+    /// away. True whether it's animating or drawn as a still frame, so the
+    /// footer can key its hints off it.
+    pub fn splash_showing(&self) -> bool {
+        !self.collapsed && (!self.tree.has_visible_projects() || self.splash_preview)
+    }
+
     /// The animated splash is on screen and should be ticking: nothing in
     /// the tree yet (first run) or summoned with N, panels not collapsed,
     /// no editor modal covering the body, animations enabled (off, the
     /// splash still draws — as a still frame).
     pub fn splash_active(&self) -> bool {
-        self.animations
-            && (!self.tree.has_visible_projects() || self.splash_preview)
-            && !self.collapsed
-            && self.vim.is_none()
+        self.animations && self.splash_showing() && self.vim.is_none()
     }
 
     /// Some sidebar row is showing a running (yellow) or needs-feedback

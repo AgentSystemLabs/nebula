@@ -39,7 +39,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // empty panels, so the whole body becomes the animated nebula splash
     // until the first project lands. N summons the same splash as a
     // dismissable preview.
-    if !app.tree.has_visible_projects() || app.splash_preview {
+    if app.splash_showing() {
         crate::splash::draw_splash(f, app, body);
         draw_footer(f, app, footer);
         draw_overlay(f, app);
@@ -2837,6 +2837,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         )
     } else if app.overlay.is_some() {
         Span::styled("Esc: close  Enter: confirm", Style::default().fg(th.dim))
+    } else if app.splash_showing() {
+        // The splash covers the panels, so every panel hotkey is dead here.
+        // List only what actually fires — and in preview, that's one thing:
+        // the next key dismisses it (q included).
+        Span::styled(
+            if app.splash_preview {
+                "any key: back to panels"
+            } else {
+                "n/o: add project  w: workspaces  h: ssh host  s: settings  ?: help  q: quit"
+            },
+            Style::default().fg(th.dim),
+        )
     } else {
         let text = match app.focus {
             Focus::Terminal if app.term.as_ref().is_some_and(|t| t.exited) => {
