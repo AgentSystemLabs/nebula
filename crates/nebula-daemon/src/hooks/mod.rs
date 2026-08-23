@@ -172,6 +172,93 @@ fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Claude/Codex route: the UserPromptSubmit hook command pipes this
+/// response's body to stdout, so it must be empty or the injected
+/// instruction — never diagnostic JSON.
+async fn receive_injectable_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(true, state, query, headers, body).await
+}
+
+/// Cursor route: every hook command answers cursor with its own gating JSON
+/// and discards this body, so the `{"ok": ...}` diagnostics stay.
+async fn receive_plain_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(false, state, query, headers, body).await
+}
+
+async fn receive_hook(
+    inject_capable: bool,
+    state: Arc<HookServerState>,
+    query: HookQuery,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    // On this path the response body reaches the model's context, so every
+    // outcome (auth failure included) must answer with empty-or-instruction.
+    let injectable = inject_capable && query.hook_event == "UserPromptSubmit";
+    let quiet_or = |status: StatusCode, diag: &str| {
+        let body = if injectable {
+            String::new()
+        } else {
+            diag.to_string()
+        };
+        (status, body)
+    };
+
+    let authorized = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|presented| presented.as_bytes().ct_eq(state.token.as_bytes()).into())
+        .unwrap_or(false);
+    if !authorized {
+        return quiet_or(StatusCode::UNAUTHORIZED, r#"{"ok": false}"#);
+    }
+
+    // Parse failures still 200 — never fault a hook.
+    let payload: HookPayload = serde_json::from_str(&body).unwrap_or_default();
+    let Some(event) = parse_event(&query.hook_event, &payload) else {
+        return quiet_or(StatusCode::OK, r#"{"ok": false}"#);
+    };
+    let agent_id = AgentId(query.agent_id.clone());
+    tracing::debug!(agent = %agent_id, event = ?event, "hook received");
+    let _ = state
+        .tx
+        .send(HookDelivery {
+            agent_id: agent_id.clone(),
+            event,
+            session_id: payload.session_id(),
+            cwd: payload.cwd(),
+        })
+        .await;
+
+    if injectable {
+        // Prompt submitted on a still-untitled session: hand the CLI the
+        // titling instruction. Unknown ids (prewarm, stale env) and store
+        // errors degrade to no injection.
+        let inject = state
+            .store
+            .agent_auto_title_pending(&agent_id)
+            .unwrap_or(false);
+        let body = if inject {
+            AUTO_TITLE_INSTRUCTION.to_string()
+        } else {
+            String::new()
+        };
+        return (StatusCode::OK, body);
+    }
+    (StatusCode::OK, r#"{"ok": true}"#.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,91 +463,4 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
     }
-}
-
-/// Claude/Codex route: the UserPromptSubmit hook command pipes this
-/// response's body to stdout, so it must be empty or the injected
-/// instruction — never diagnostic JSON.
-async fn receive_injectable_hook(
-    State(state): State<Arc<HookServerState>>,
-    Query(query): Query<HookQuery>,
-    headers: HeaderMap,
-    body: String,
-) -> (StatusCode, String) {
-    receive_hook(true, state, query, headers, body).await
-}
-
-/// Cursor route: every hook command answers cursor with its own gating JSON
-/// and discards this body, so the `{"ok": ...}` diagnostics stay.
-async fn receive_plain_hook(
-    State(state): State<Arc<HookServerState>>,
-    Query(query): Query<HookQuery>,
-    headers: HeaderMap,
-    body: String,
-) -> (StatusCode, String) {
-    receive_hook(false, state, query, headers, body).await
-}
-
-async fn receive_hook(
-    inject_capable: bool,
-    state: Arc<HookServerState>,
-    query: HookQuery,
-    headers: HeaderMap,
-    body: String,
-) -> (StatusCode, String) {
-    // On this path the response body reaches the model's context, so every
-    // outcome (auth failure included) must answer with empty-or-instruction.
-    let injectable = inject_capable && query.hook_event == "UserPromptSubmit";
-    let quiet_or = |status: StatusCode, diag: &str| {
-        let body = if injectable {
-            String::new()
-        } else {
-            diag.to_string()
-        };
-        (status, body)
-    };
-
-    let authorized = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|presented| presented.as_bytes().ct_eq(state.token.as_bytes()).into())
-        .unwrap_or(false);
-    if !authorized {
-        return quiet_or(StatusCode::UNAUTHORIZED, r#"{"ok": false}"#);
-    }
-
-    // Parse failures still 200 — never fault a hook.
-    let payload: HookPayload = serde_json::from_str(&body).unwrap_or_default();
-    let Some(event) = parse_event(&query.hook_event, &payload) else {
-        return quiet_or(StatusCode::OK, r#"{"ok": false}"#);
-    };
-    let agent_id = AgentId(query.agent_id.clone());
-    tracing::debug!(agent = %agent_id, event = ?event, "hook received");
-    let _ = state
-        .tx
-        .send(HookDelivery {
-            agent_id: agent_id.clone(),
-            event,
-            session_id: payload.session_id(),
-            cwd: payload.cwd(),
-        })
-        .await;
-
-    if injectable {
-        // Prompt submitted on a still-untitled session: hand the CLI the
-        // titling instruction. Unknown ids (prewarm, stale env) and store
-        // errors degrade to no injection.
-        let inject = state
-            .store
-            .agent_auto_title_pending(&agent_id)
-            .unwrap_or(false);
-        let body = if inject {
-            AUTO_TITLE_INSTRUCTION.to_string()
-        } else {
-            String::new()
-        };
-        return (StatusCode::OK, body);
-    }
-    (StatusCode::OK, r#"{"ok": true}"#.to_string())
 }
