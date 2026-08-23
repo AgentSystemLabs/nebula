@@ -525,9 +525,16 @@ impl Daemon {
                 git::init(path).await?;
             }
         }
-        let toplevel = git::repo_toplevel(path)
-            .await
-            .with_context(|| format!("{} is not a git repository", path.display()))?;
+        // "not a git repository" is the right explanation only when git ran and
+        // said no — if git itself is missing, that message blames the wrong
+        // thing, so let git.rs's own diagnosis through untouched.
+        let toplevel = git::repo_toplevel(path).await.map_err(|e| {
+            if git::is_missing(&e) {
+                e
+            } else {
+                e.context(format!("{} is not a git repository", path.display()))
+            }
+        })?;
         // New projects land in whichever workspace is open; the same repo
         // may be added to any number of workspaces, just not twice to one.
         let workspace_id = self.store.active_workspace_id()?;

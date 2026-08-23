@@ -2,9 +2,33 @@
 //! libgit2's worktree support lags git's, these are rare user-initiated ops,
 //! and git's stderr is the best error message we could show.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
+
+/// Shown when the `git` binary itself is missing. Every other git failure
+/// carries git's own stderr; this one git never gets to print, so spelling out
+/// the fix is on us — otherwise the user sees "No such file or directory" and
+/// blames the directory they just picked. Kept to one line: the TUI shows it
+/// in the footer flash, which truncates.
+pub const GIT_MISSING: &str =
+    "git was not found on your PATH — nebula needs it. Install git (https://git-scm.com/downloads), then restart nebula.";
+
+/// True when `err` came from `git` being absent, so callers can pass the
+/// message through instead of layering their own (wrong) explanation on top.
+pub fn is_missing(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| c.to_string() == GIT_MISSING)
+}
+
+/// `git` never even started. NotFound means the binary isn't installed — the
+/// one git failure with no stderr to quote, so the explanation has to be ours.
+fn spawn_err(e: std::io::Error) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        anyhow!(GIT_MISSING)
+    } else {
+        anyhow::Error::new(e).context("run git")
+    }
+}
 
 async fn git(repo: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
@@ -13,7 +37,7 @@ async fn git(repo: &Path, args: &[&str]) -> Result<String> {
         .args(args)
         .output()
         .await
-        .context("run git")?;
+        .map_err(spawn_err)?;
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
@@ -185,6 +209,35 @@ mod tests {
         git(dir, &["commit", "--allow-empty", "-m", "init"])
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn missing_git_binary_explains_the_install() {
+        let err = spawn_err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file or directory (os error 2)",
+        ));
+        assert!(is_missing(&err), "{err:#}");
+        assert!(err.to_string().contains("Install git"));
+        // Still recognized once a caller layers its own context on top.
+        assert!(is_missing(&err.context("open /some/dir")));
+    }
+
+    #[test]
+    fn other_spawn_failures_are_not_reported_as_missing_git() {
+        let err = spawn_err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Permission denied (os error 13)",
+        ));
+        assert!(!is_missing(&err), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn git_errors_are_not_reported_as_missing_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A real git that says "not a repository" must keep saying so.
+        let err = repo_toplevel(tmp.path()).await.unwrap_err();
+        assert!(!is_missing(&err), "{err:#}");
     }
 
     #[tokio::test]
