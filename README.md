@@ -1,8 +1,8 @@
 # nebula
 
-A fast, low-memory terminal multiplexer for managing Claude Code agents across
-projects and git worktrees. Think tmux ergonomics with a mission-control-style
-agent manager — entirely inside your terminal.
+A fast, low-memory terminal multiplexer for managing Claude Code, Codex, and
+Cursor agents across projects and git worktrees. Think tmux ergonomics with a
+mission-control-style agent manager — entirely inside your terminal.
 
 ```
 ┌ Projects ─┬ Worktrees ─┬ Sessions ────┬ Terminal ──────────────────────┐
