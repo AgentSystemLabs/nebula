@@ -26,7 +26,7 @@ const FOOTER_SESSIONS: &str = "n: agent";
 /// Terminal pane focused but NOT input-locked (attached session).
 const FOOTER_TERMINAL_FOCUSED: &str = "Enter: type into terminal";
 /// Terminal pane input-locked: keys forward to the PTY.
-const FOOTER_TERMINAL_LOCKED: &str = "Ctrl+q: panels";
+const FOOTER_TERMINAL_LOCKED: &str = "^q: panels";
 
 struct TuiHarness {
     writer: Box<dyn Write + Send>,

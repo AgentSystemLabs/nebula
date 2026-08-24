@@ -1,7 +1,7 @@
 //! TUI state: the Elm-ish Model.
 
 use crate::git_diff::DiffFile;
-use crate::pull_request::PullRequest;
+use crate::pull_request::{OpenPr, PrDetail, PullRequest};
 use crate::text_input::TextInput;
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Note, NoteId, NoteOwner, Project,
@@ -103,6 +103,10 @@ pub enum MenuAction {
     NewLink(WorktreeId),
     /// Hand a link row's URL to the browser.
     OpenLink(String),
+    /// Read the selected open pull request's diff in the diff modal. Carries
+    /// no id: the row is the selection, and the fetch reads it back off the
+    /// cursor the same way `g` does.
+    ViewPrDiff,
     EditLink(LinkId),
     DeleteLink(LinkId),
     SetWorktreePinned(WorktreeId, bool),
@@ -434,6 +438,13 @@ pub struct DiffView {
     pub files_drag: Option<i32>,
     /// Whether the repo has a commit; picks the diff command.
     pub head_ok: bool,
+    /// Per-file diff text when this view is showing something git can't be
+    /// asked for file by file — a pull request, whose whole diff arrives in
+    /// one `gh pr diff`. `None` is the ordinary worktree view, which shells
+    /// out per file. Its presence also turns OFF reviewed-mark persistence:
+    /// marks are stored under the worktree path and pruned when that path
+    /// isn't a directory, and a pull request has no path of its own.
+    pub prefetched: Option<HashMap<String, String>>,
     /// Reviewed ✓ marks: file path → fingerprint of the approved diff text.
     /// Nebula-side bookkeeping only (persisted via `review::store_marks`);
     /// never stages or otherwise touches git state.
@@ -461,6 +472,7 @@ impl DiffView {
             files_width: DEFAULT_DIFF_FILES_W,
             files_drag: None,
             head_ok,
+            prefetched: None,
             reviewed: HashMap::new(),
             head_key: String::new(),
         };
@@ -586,6 +598,10 @@ pub enum PaletteTarget {
     Project(ProjectId),
     Worktree(WorktreeId),
     Session(AgentId),
+    /// An open pull request on some project's repo, addressed by URL — the
+    /// only identity it has, since nothing about a PR is stored. Picking it
+    /// opens a browser instead of moving any panel cursor.
+    PullRequest(String),
 }
 
 /// One searchable row of the `/` palette. `text` is both the string the
@@ -636,9 +652,14 @@ pub struct Palette {
 }
 
 impl Palette {
-    pub fn new(tree: &Tree, show_archived: bool, enter_attaches: bool) -> Self {
+    pub fn new(
+        tree: &Tree,
+        show_archived: bool,
+        enter_attaches: bool,
+        open_prs: &HashMap<ProjectId, OpenPrs>,
+    ) -> Self {
         let mut palette = Self {
-            items: build_palette_items(tree, show_archived),
+            items: build_palette_items(tree, show_archived, open_prs),
             query: TextInput::new(),
             matches: Vec::new(),
             selected: 0,
@@ -655,9 +676,14 @@ impl Palette {
     /// upserts every few seconds, and a rebuild must not yank the user's
     /// ↑/↓ position to the top. The selection follows its target's row;
     /// only a vanished target falls back to the best match.
-    pub fn rebuild(&mut self, tree: &Tree, show_archived: bool) {
+    pub fn rebuild(
+        &mut self,
+        tree: &Tree,
+        show_archived: bool,
+        open_prs: &HashMap<ProjectId, OpenPrs>,
+    ) {
         let keep = self.selected_target().cloned();
-        self.items = build_palette_items(tree, show_archived);
+        self.items = build_palette_items(tree, show_archived, open_prs);
         self.apply_filter();
         if let Some(target) = keep {
             if let Some(row) = self
@@ -704,10 +730,15 @@ impl Palette {
 }
 
 /// Every jumpable entity: projects in tree order, then each project's
-/// worktrees, then each worktree's sessions. Archived sessions appear only
-/// when the archived toggle is on (the Sessions panel rule). Scoped to the
-/// open workspace — `/` never searches across other workspaces.
-fn build_palette_items(tree: &Tree, show_archived: bool) -> Vec<PaletteItem> {
+/// worktrees, then each worktree's sessions, then the open pull requests
+/// nebula has fetched for each project. Archived sessions appear only when
+/// the archived toggle is on (the Sessions panel rule). Scoped to the open
+/// workspace — `/` never searches across other workspaces.
+fn build_palette_items(
+    tree: &Tree,
+    show_archived: bool,
+    open_prs: &HashMap<ProjectId, OpenPrs>,
+) -> Vec<PaletteItem> {
     let projects: Vec<&Project> = tree
         .projects
         .iter()
@@ -745,6 +776,23 @@ fn build_palette_items(tree: &Tree, show_archived: bool) -> Vec<PaletteItem> {
                     status: Some(a.status),
                 });
             }
+        }
+    }
+    // Pull requests go last so a query that also matches a session still
+    // lands on the session first — the panels are what `/` is mostly for.
+    // Only projects whose list has actually been fetched contribute; the
+    // rest simply have nothing to offer yet.
+    for p in &projects {
+        let Some(open) = open_prs.get(&p.id) else {
+            continue;
+        };
+        for pr in &open.list {
+            items.push(PaletteItem {
+                target: PaletteTarget::PullRequest(pr.url.clone()),
+                text: format!("{}/{}", p.name, pr.label()),
+                archived: false,
+                status: None,
+            });
         }
     }
     items
@@ -1570,6 +1618,39 @@ impl PointerShape {
     }
 }
 
+/// What `gh pr list` last said about one project's open pull requests, and
+/// the timer deciding when to ask again. Held per project rather than
+/// refetched per repaint because every answer is a `gh` process and a
+/// GitHub API call, and the list changes on the order of minutes.
+#[derive(Debug, Clone)]
+pub struct OpenPrs {
+    /// Open pull requests, in `gh`'s order (newest first).
+    pub list: Vec<OpenPr>,
+    /// When this answer landed. Switching projects pulls the next lookup
+    /// forward, but never past this plus [`OPEN_PRS_MIN_AGE`] — otherwise
+    /// bouncing between two projects would spend an API call per keystroke.
+    pub at: std::time::Instant,
+    /// When the next lookup is due, and the step that produced that
+    /// deadline: a steady beat once a repo has proved it has pull requests,
+    /// a doubling backoff while it hasn't.
+    pub due: std::time::Instant,
+    pub step: std::time::Duration,
+}
+
+/// What a debounced pull-request detail fetch needs: which PR, and the
+/// checkout to run `gh` from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPrDetail {
+    pub url: String,
+    pub number: u64,
+    pub dir: PathBuf,
+}
+
+/// How recently a project's open-PR list may have been fetched and still be
+/// refetched on arrival. Walking the project list must not turn into one
+/// API call per row visited.
+pub const OPEN_PRS_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct App {
     pub tree: Tree,
     pub focus: Focus,
@@ -1588,6 +1669,14 @@ pub struct App {
     /// `(sel_worktree, sel_session)` as of the last draw — the draw
     /// re-anchors `sessions_scroll` only when this changes.
     pub sessions_anchor: Option<(usize, usize)>,
+    /// First visible row of the Worktrees panel, in panel rows. Same
+    /// contract as `sessions_scroll`: the wheel moves it freely, the draw
+    /// clamps it and re-anchors on the cursor when `worktrees_anchor` shows
+    /// the selection moved. A project with a long open-PR list routinely
+    /// outgrows the column.
+    pub worktrees_scroll: usize,
+    /// `(sel_project, sel_worktree)` as of the last draw.
+    pub worktrees_anchor: Option<(usize, usize)>,
     pub term: Option<AttachedTerm>,
     /// Input lock: keys forward to the attached PTY. Focusing the terminal
     /// pane alone (Tab / arrows) does NOT lock — Enter, a click, or `z` does.
@@ -1725,6 +1814,40 @@ pub struct App {
     /// Switching into a worktree drops its entry, so arriving somewhere
     /// always asks again promptly.
     pub pr_recheck: HashMap<WorktreeId, (std::time::Instant, std::time::Duration)>,
+    /// What `gh pr list` last said about each project's open pull requests
+    /// — the group at the bottom of the Worktrees panel. A missing key
+    /// means "never asked"; only the selected project is ever asked, so a
+    /// workspace of thirty projects still costs one call per refresh.
+    pub open_prs: HashMap<ProjectId, OpenPrs>,
+    /// Projects with a list lookup in flight, so a repaint can't stack a
+    /// second `gh` on the first.
+    pub open_prs_inflight: std::collections::HashSet<ProjectId>,
+    /// Bodies and conversations of the pull requests the cursor has rested
+    /// on, keyed by URL. A second API call on top of the list, so it is
+    /// fetched only for the row actually being read and kept for the whole
+    /// session — a pull request's description doesn't change while you read
+    /// it, and its comments ride the list's own refresh.
+    pub pr_detail: HashMap<String, PrDetail>,
+    /// Pull requests whose detail is in flight, and ones `gh` couldn't
+    /// answer for — the pane says "couldn't reach gh" rather than spinning
+    /// on a request that already came back empty.
+    pub pr_detail_inflight: std::collections::HashSet<String>,
+    pub pr_detail_failed: std::collections::HashSet<String>,
+    /// Debounced detail fetch: the pull request under the cursor and when
+    /// its lookup is due. Re-armed on every move, so walking a list of a
+    /// hundred rows fetches only the ones actually paused on.
+    pub pending_pr_detail: Option<(PendingPrDetail, std::time::Instant)>,
+    /// Top visible line of the pull-request preview pane, and the pane's
+    /// total line count as of the last draw (for clamping).
+    pub pr_preview_scroll: u16,
+    pub pr_preview_lines: usize,
+    /// The pull request whose full diff is being fetched, if any — one at a
+    /// time, so mashing the key can't spawn a `gh pr diff` per press.
+    pub pr_diff_inflight: Option<u64>,
+    /// Where a finished `gh pr diff` is sent back to the loop; the main loop
+    /// installs it at startup (the `vim_tx` precedent). Key handlers can
+    /// therefore start a network fetch without the loop's channels in hand.
+    pub pr_diff_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, String, Option<String>)>>,
     /// Latest daemon metrics reading (daemon + per-session process trees),
     /// for the footer's memory/session readout. Refreshed on a slow poll;
     /// the metrics modal shares the same replies at a faster cadence.
@@ -1766,6 +1889,8 @@ impl App {
             sel_session: 0,
             sessions_scroll: 0,
             sessions_anchor: None,
+            worktrees_scroll: 0,
+            worktrees_anchor: None,
             term: None,
             term_locked: false,
             conn: ConnState::Disconnected,
@@ -1816,6 +1941,16 @@ impl App {
             pr_seen: HashMap::new(),
             pr_inflight: std::collections::HashSet::new(),
             pr_recheck: HashMap::new(),
+            open_prs: HashMap::new(),
+            open_prs_inflight: std::collections::HashSet::new(),
+            pr_detail: HashMap::new(),
+            pr_detail_inflight: std::collections::HashSet::new(),
+            pr_detail_failed: std::collections::HashSet::new(),
+            pending_pr_detail: None,
+            pr_preview_scroll: 0,
+            pr_preview_lines: 0,
+            pr_diff_inflight: None,
+            pr_diff_tx: None,
             last_metrics: None,
             client_rss_bytes: 0,
             splash_epoch: std::time::Instant::now(),
@@ -2133,6 +2268,36 @@ impl App {
         rows
     }
 
+    /// The selected project's open pull requests — the group under the
+    /// checkouts. Empty until the first `gh pr list` answers (or when the
+    /// repo genuinely has none).
+    pub fn visible_open_prs(&self) -> &[OpenPr] {
+        self.selected_project()
+            .and_then(|p| self.open_prs.get(&p.id))
+            .map(|o| o.list.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// How many rows the Worktrees panel has: the project's checkouts, then
+    /// the pull requests still open on its repo. `sel_worktree` indexes that
+    /// combined list, and because the checkouts come first every existing
+    /// "index into `visible_worktrees()`" stays exactly right — a cursor
+    /// parked on a pull request simply has no selected worktree, which is
+    /// the truth about it.
+    pub fn worktree_row_count(&self) -> usize {
+        self.visible_worktrees().len() + self.visible_open_prs().len()
+    }
+
+    /// The open pull request under the Worktrees cursor, when it's on one.
+    /// Mutually exclusive with [`App::selected_worktree`] — the checkouts
+    /// occupy the rows below the pull requests.
+    pub fn selected_worktree_pr(&self) -> Option<&OpenPr> {
+        let i = self
+            .sel_worktree
+            .checked_sub(self.visible_worktrees().len())?;
+        self.visible_open_prs().get(i)
+    }
+
     /// (pinned, unpinned) worktree counts for the selected project.
     pub fn worktree_group_counts(&self) -> (usize, usize) {
         let Some(project) = self.selected_project() else {
@@ -2285,6 +2450,41 @@ impl App {
             Some((due, _)) => std::time::Instant::now() >= *due,
             None => true,
         }
+    }
+
+    /// Whether `gh pr list` should be run for this project now: not while
+    /// an answer is in flight, and not before the timer the last answer
+    /// armed. A project nebula has never asked about is always due.
+    pub fn open_prs_lookup_due(&self, project: &ProjectId) -> bool {
+        if self.open_prs_inflight.contains(project) {
+            return false;
+        }
+        match self.open_prs.get(project) {
+            Some(open) => std::time::Instant::now() >= open.due,
+            None => true,
+        }
+    }
+
+    /// Furthest the pull-request preview may scroll: its last line pinned
+    /// to the bottom of the pane. Zero while the preview fits, so a wheel
+    /// flick on a short PR does nothing instead of scrolling it off screen.
+    pub fn pr_preview_max_scroll(&self) -> u16 {
+        (self.pr_preview_lines as u16).saturating_sub(self.term_area.height.max(1))
+    }
+
+    /// Delay until the debounced pull-request detail fetch is due. None when
+    /// the cursor isn't resting on a pull request that still needs one.
+    pub fn pr_detail_delay(&self) -> Option<std::time::Duration> {
+        let (_, at) = self.pending_pr_detail.as_ref()?;
+        Some(at.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// The body and conversation behind the open-PR row under the cursor:
+    /// `Some(Some(_))` once fetched, `Some(None)` while it's still coming
+    /// (or came back empty), `None` when the cursor isn't on one at all.
+    pub fn selected_pr_detail(&self) -> Option<Option<&PrDetail>> {
+        let pr = self.selected_worktree_pr()?;
+        Some(self.pr_detail.get(&pr.url))
     }
 
     /// Delay until the standing keep-warm re-send is due. None when disarmed.

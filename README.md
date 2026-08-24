@@ -65,6 +65,15 @@ Worktrees column to branch off into a real `git worktree` (created under
 `<repo>/../<repo-name>-worktrees/<branch>`). That's the point of the column —
 two agents in two worktrees edit two directories and never collide.
 
+Under the checkouts, an `OPEN PRS` group lists every pull request still open on
+the repo, fetched with `gh` when you open the project and refreshed on a slow
+timer — one `gh pr list` per project, so a repo with a hundred open PRs still
+costs one API call. Rest the cursor on one and the right-hand pane reads it to
+you: description, stats and the whole conversation, without leaving nebula.
+`g` opens its diff in the same viewer your worktree diffs use, `Enter` (or a
+double-click) opens it in the browser, and `/` finds it by title. Only the row
+you actually stop on is fetched, and each one is fetched once.
+
 **4. Start the agent.** With a worktree selected, press `n` in the Sessions
 column. A menu asks what to run — **Claude**, **Codex**, **Cursor**, or a
 plain **Terminal (shell)**. `→` on Claude or Codex drills into model and
@@ -103,7 +112,8 @@ The panels aren't the only view. With a worktree selected, from any panel:
   a live fuzzy filter. `Ctrl+r` marks a file reviewed ✓ and sinks it to the
   bottom — nebula-side bookkeeping only, no git state is touched — and every
   mark clears itself when HEAD moves or the file changes again, so what's left
-  unticked is genuinely what you haven't read.
+  unticked is genuinely what you haven't read. On an open-PR row the same key
+  shows that pull request's diff instead, fetched whole with `gh pr diff`.
 - **`f` — find file.** Fuzzy finder over the worktree. `Enter` opens the file
   in an editor modal (vim by default; the `editor` setting or `NEBULA_EDITOR`
   picks another), `Ctrl+y` copies the path — ready to paste into an agent.
@@ -226,6 +236,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Sessions | `n` | new session (agent or shell terminal) |
 | Sessions | `r`, `a`, `u`, `d`, `A` | rename, archive, unarchive, delete, toggle archived |
 | Any panel | `Shift+D` | delete every row of the focused panel (confirm lists the casualties) |
+| Worktrees | `Enter` / `g` on an open PR | open it in the browser / show its diff; the pane reads the PR while the cursor rests on it (`PgUp/PgDn` scrolls) |
 | Any panel | `g` | git diff for the selected worktree: filter, `↑↓` files, `Shift+↑↓`/`PgUp/PgDn`/`Ctrl+d/u` scroll, `Ctrl+r` marks a file reviewed ✓ |
 | Any panel | `Shift+G` | open the selected repo's page on its git host — the `origin` remote (`git@github.com:o/r.git`, `ssh://`, `https://`) turned into a browsable URL, credentials stripped |
 | Any panel | `f` / `F` / `b` | find file / find in files (`git grep`) / file tree browser, all scoped to the selected worktree — `Enter` opens the file in an editor modal (at the matched line, for `F`); in `f` and `b`, `Ctrl+y` copies the path |

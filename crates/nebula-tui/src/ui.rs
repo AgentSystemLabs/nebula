@@ -1194,12 +1194,19 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     PaletteTarget::Project(_) => ("▪ ", "▫ "),
                     PaletteTarget::Worktree(_) => ("▸ ", "▹ "),
                     PaletteTarget::Session(_) => ("● ", "○ "),
+                    // The panels' "leaves nebula" arrow: a pull request row
+                    // opens a browser, it doesn't move a cursor.
+                    PaletteTarget::PullRequest(_) => ("↗ ", "↗ "),
                 };
                 // Archived rows stay quiet even if their last status was
                 // live — the Sessions panel's `⊘` rule.
                 let status = if item.archived { None } else { item.status };
                 let (glyph, glyph_color) = if item.archived {
                     ("⊘ ", th.dim)
+                } else if matches!(item.target, PaletteTarget::PullRequest(_)) {
+                    // No status to carry: an open pull request wears the
+                    // same accent its Worktrees-panel row does.
+                    (solid, th.accent)
                 } else {
                     match status {
                         Some(AgentStatus::Running) => (solid, th.warn),
@@ -2332,9 +2339,32 @@ fn divider_spans(label: &str, width: u16, th: Theme) -> Vec<Span<'static>> {
     ]
 }
 
+/// One laid-out entry of the Worktrees panel. Checkout rows and pull-request
+/// rows share a single virtual-row layout, computed unbounded by the panel
+/// height, so a project with a long open-PR list scrolls as one column.
+enum WorktreeEntry {
+    Header(String),
+    /// Index into `visible_worktree_rows()`.
+    Row(usize),
+}
+
+impl WorktreeEntry {
+    /// Rows the entry occupies: a header one, a pill its 3-row cell (they
+    /// stack on a `PILL_H` stride, so neighboring pads overlap).
+    fn height(&self) -> usize {
+        match self {
+            WorktreeEntry::Row(_) => PILL_H as usize + 1,
+            _ => 1,
+        }
+    }
+}
+
 fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Worktrees;
+    // The title's count stays a worktree count: the open-PR rows below are
+    // links out of nebula, and counting them here would say "9 worktrees"
+    // over a list of two checkouts.
     let wt_count = app.visible_worktrees().len();
     let count = Some(wt_count).filter(|n| *n > 0 && !app.divider_focused());
     let inner = draw_column(f, area, "WORKTREES", count, focused, th);
@@ -2358,7 +2388,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             )
         })
         .collect();
-    if worktrees.is_empty() {
+    let prs = app.visible_open_prs().to_vec();
+    if worktrees.is_empty() && prs.is_empty() {
         if app.tree.has_visible_projects() {
             f.render_widget(
                 Paragraph::new(Line::from(vec![
@@ -2372,77 +2403,172 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // The main checkout renders as `branch ⌂ root` (dim badge — the branch
-    // is live, the badge marks root-ness) with a rule separating it from the
-    // true worktrees below, so rows after it sit one screen line lower.
-    const ROOT_BADGE: &str = " ⌂ root";
     // Group headers only appear once something is pinned; otherwise the
     // list stays flat (same idiom as the sessions panel).
     let (pinned_count, _) = app.worktree_group_counts();
     let grouped = pinned_count > 0;
     let dim = Style::default().fg(th.dim);
-    let mut screen_row = 0usize;
-    let header = |f: &mut Frame, text: String, screen_row: &mut usize| {
-        if let Some(r) = row_rect(inner, *screen_row) {
-            f.render_widget(Paragraph::new(Span::styled(format!(" {text}"), dim)), r);
-            *screen_row += 1;
+
+    // ---- lay the column out in virtual rows ----
+    let mut layout: Vec<(usize, WorktreeEntry)> = Vec::new();
+    let mut vrow: usize = 0;
+    let header = |layout: &mut Vec<(usize, WorktreeEntry)>, vrow: &mut usize, text: String| {
+        // A blank row above every group after the first keeps the groups
+        // scannable without drawing more chrome.
+        if *vrow > 0 {
+            *vrow += 1;
         }
+        let e = WorktreeEntry::Header(text);
+        let h = e.height();
+        layout.push((*vrow, e));
+        *vrow += h;
     };
     if grouped {
-        header(f, "PINNED".into(), &mut screen_row);
+        header(&mut layout, &mut vrow, "PINNED".into());
     }
-    for (i, (branch, is_main, roll, notes)) in worktrees.iter().enumerate() {
+    for i in 0..worktrees.len() {
         if grouped && i == pinned_count {
-            header(f, "UNPINNED".into(), &mut screen_row);
+            header(&mut layout, &mut vrow, "UNPINNED".into());
         }
-        if row_rect(inner, screen_row + 1).is_none() {
-            break;
-        }
-        let note_badge = note_badge(*notes, th);
-        let badge_len = note_badge.as_ref().map_or(0, |(s, _)| s.chars().count());
-        let ramp = sweep_ramp(*roll, th, app.animations);
-        let mut spans = vec![status_dot(*roll, th)];
-        if *is_main {
-            let max =
-                (inner.width as usize).saturating_sub(2 + ROOT_BADGE.chars().count() + badge_len);
-            spans.extend(status_name_spans(
-                truncate(branch, max),
-                Style::default(),
-                ramp,
-                app.sweep_phase(),
-            ));
-            spans.push(Span::styled(ROOT_BADGE, Style::default().fg(th.dim)));
-        } else {
-            spans.extend(status_name_spans(
-                truncate(branch, (inner.width as usize).saturating_sub(2 + badge_len)),
-                Style::default(),
-                ramp,
-                app.sweep_phase(),
-            ));
-        }
-        if let Some((text, style)) = note_badge {
-            spans.push(Span::styled(text, style));
-        }
-        render_pill(
-            f,
-            inner,
-            screen_row as isize,
-            spans,
-            i == app.sel_worktree,
-            focused,
-            th,
-        );
-        if let Some(hit) = rows_rect(inner, screen_row, PILL_H) {
-            app.hits.push((hit, HitTarget::Worktree(i)));
-        }
-        screen_row += PILL_H as usize;
+        layout.push((vrow, WorktreeEntry::Row(i)));
+        vrow += PILL_H as usize;
         // An extra quiet row separates the main checkout from the true
         // worktrees below; group headers take over once something is
         // pinned.
-        if !grouped && *is_main && worktrees.len() > 1 {
-            screen_row += 1;
+        if !grouped && worktrees[i].1 && worktrees.len() > 1 {
+            vrow += 1;
         }
     }
+    if !prs.is_empty() {
+        // A list cut off at the fetch cap says so rather than passing
+        // itself off as the whole set.
+        let more = if prs.len() >= crate::pull_request::LIST_LIMIT {
+            "+"
+        } else {
+            ""
+        };
+        header(
+            &mut layout,
+            &mut vrow,
+            format!("OPEN PRS · {}{more}", prs.len()),
+        );
+        for i in 0..prs.len() {
+            layout.push((vrow, WorktreeEntry::Row(worktrees.len() + i)));
+            vrow += PILL_H as usize;
+        }
+    }
+
+    // ---- resolve the scroll offset ----
+    let view_h = inner.height as usize;
+    let content_h = layout.last().map_or(0, |(top, e)| top + e.height());
+    // The cursor pulls the viewport, but only on the frames where it
+    // actually moved — otherwise a wheel scroll would snap straight back.
+    // The project is part of the anchor so switching projects re-homes the
+    // column even when the row index happens to be unchanged.
+    let anchor = (app.sel_project, app.sel_worktree);
+    if app.worktrees_anchor != Some(anchor) {
+        app.worktrees_anchor = Some(anchor);
+        if let Some(pos) = layout
+            .iter()
+            .position(|(_, e)| matches!(e, WorktreeEntry::Row(i) if *i == app.sel_worktree))
+        {
+            let (top, entry) = &layout[pos];
+            // Scrolling up to the first row of a group brings that group's
+            // header along, so the cursor never sits under a bare edge.
+            let up_to = match pos.checked_sub(1).map(|p| &layout[p]) {
+                Some((h, WorktreeEntry::Header(_))) => *h,
+                _ => *top,
+            };
+            let bottom = top + entry.height();
+            if up_to < app.worktrees_scroll {
+                app.worktrees_scroll = up_to;
+            } else if bottom > app.worktrees_scroll + view_h {
+                app.worktrees_scroll = bottom - view_h;
+            }
+        }
+    }
+    // The wheel scrolls past the end freely; the clamp lands here so it
+    // can't run away from the list.
+    app.worktrees_scroll = app.worktrees_scroll.min(content_h.saturating_sub(view_h));
+    let scroll = app.worktrees_scroll as isize;
+
+    // ---- draw ----
+    // The main checkout renders as `branch ⌂ root` (dim badge — the branch
+    // is live, the badge marks root-ness).
+    const ROOT_BADGE: &str = " ⌂ root";
+    for (top, entry) in &layout {
+        let y = *top as isize - scroll;
+        if y >= view_h as isize {
+            break;
+        }
+        match entry {
+            WorktreeEntry::Header(text) => {
+                if let Some(r) = row_rect_at(inner, y) {
+                    f.render_widget(Paragraph::new(Span::styled(format!(" {text}"), dim)), r);
+                }
+            }
+            WorktreeEntry::Row(i) if *i < worktrees.len() => {
+                let (branch, is_main, roll, notes) = &worktrees[*i];
+                let note_badge = note_badge(*notes, th);
+                let badge_len = note_badge.as_ref().map_or(0, |(s, _)| s.chars().count());
+                let ramp = sweep_ramp(*roll, th, app.animations);
+                let mut spans = vec![status_dot(*roll, th)];
+                if *is_main {
+                    let max = (inner.width as usize)
+                        .saturating_sub(2 + ROOT_BADGE.chars().count() + badge_len);
+                    spans.extend(status_name_spans(
+                        truncate(branch, max),
+                        Style::default(),
+                        ramp,
+                        app.sweep_phase(),
+                    ));
+                    spans.push(Span::styled(ROOT_BADGE, Style::default().fg(th.dim)));
+                } else {
+                    spans.extend(status_name_spans(
+                        truncate(branch, (inner.width as usize).saturating_sub(2 + badge_len)),
+                        Style::default(),
+                        ramp,
+                        app.sweep_phase(),
+                    ));
+                }
+                if let Some((text, style)) = note_badge {
+                    spans.push(Span::styled(text, style));
+                }
+                render_pill(f, inner, y, spans, *i == app.sel_worktree, focused, th);
+                if let Some(hit) = rows_rect_at(inner, y, PILL_H) {
+                    app.hits.push((hit, HitTarget::Worktree(*i)));
+                }
+            }
+            WorktreeEntry::Row(i) => {
+                // A pull request reads like the Sessions panel's link rows —
+                // the arrow says "leaves nebula". The group header already
+                // says these are open, so only a draft earns a badge; in a
+                // column this narrow the width is better spent on the title.
+                let pr = &prs[*i - worktrees.len()];
+                let badge = pr.is_draft.then(|| format!(" {}", pr.badge()));
+                let badge_len = badge.as_ref().map_or(0, |b| b.chars().count());
+                let label_max = (inner.width as usize)
+                    .saturating_sub(3)
+                    .saturating_sub(badge_len);
+                let mut spans = vec![
+                    Span::styled("↗ ", Style::default().fg(th.accent)),
+                    Span::styled(
+                        truncate(&pr.label(), label_max),
+                        Style::default().fg(th.muted),
+                    ),
+                ];
+                if let Some(badge) = badge {
+                    spans.push(Span::styled(badge, Style::default().fg(th.dim)));
+                }
+                render_pill(f, inner, y, spans, *i == app.sel_worktree, focused, th);
+                if let Some(hit) = rows_rect_at(inner, y, PILL_H) {
+                    app.hits.push((hit, HitTarget::Worktree(*i)));
+                }
+            }
+        }
+    }
+
+    // Panel background (registered last so rows win the hit-test).
     app.hits.push((inner, HitTarget::PanelBg(Focus::Worktrees)));
 }
 
@@ -2774,12 +2900,112 @@ fn draw_session_row(
     }
 }
 
+/// The pull-request reading pane. Replaces the session view while the
+/// Worktrees cursor rests on an open-PR row: headline, description, then
+/// the conversation, scrolled by `pr_preview_scroll`.
+///
+/// The line count is written back to `app.pr_preview_lines` so the scroll
+/// handlers know how far down they may go — the pane is the only thing that
+/// knows how wide the prose wrapped.
+fn draw_pr_preview(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
+    let th = app.theme;
+    let Some(pr) = app.selected_worktree_pr().cloned() else {
+        return;
+    };
+    let detail = app.pr_detail.get(&pr.url).cloned();
+    let failed = app.pr_detail_failed.contains(&pr.url);
+
+    let left = vec![
+        Span::styled(" · ".to_string(), Style::default().fg(th.dim)),
+        Span::styled(format!("#{}", pr.number), Style::default().fg(th.muted)),
+    ];
+    // The right-hand tag is the pane's state word, the same slot the PTY
+    // view uses for "exited" / "scroll N" / "INPUT". A loaded PR needs none:
+    // its state is the first thing in the body.
+    let right = match (&detail, failed) {
+        (Some(_), _) => None,
+        (None, true) => Some(Span::styled(
+            "unavailable".to_string(),
+            Style::default().fg(th.err).add_modifier(Modifier::BOLD),
+        )),
+        (None, false) => Some(Span::styled(
+            "loading…".to_string(),
+            Style::default().fg(th.dim),
+        )),
+    };
+    let inner = titled_frame(f, area, "PULL REQUEST", left, right, focused, th);
+    let inner = Rect {
+        x: inner.x + 1,
+        width: inner.width.saturating_sub(1),
+        ..inner
+    };
+    app.term_area = inner;
+    app.hits.push((inner, HitTarget::TerminalPane));
+    // Nothing in this pane is a PTY, so the link/file scanners have nothing
+    // to find — clear them or ⌥click would still hit last frame's hits.
+    app.term_links = Vec::new();
+    app.term_file_links = Vec::new();
+
+    // The placeholders wrap through the same helper the body does: the pane
+    // is as narrow as the user drags it, and ratatui clips an overwide line
+    // rather than folding it.
+    let placeholder = |message: &str| {
+        let w = (inner.width as usize).saturating_sub(2).max(20);
+        let row = |text: &str, style: Style| Line::from(Span::styled(format!(" {text}"), style));
+        let mut lines = vec![Line::from("")];
+        lines.extend(
+            crate::pr_preview::wrap(&pr.label(), w)
+                .iter()
+                .map(|t| row(t, Style::default().fg(th.muted))),
+        );
+        lines.push(Line::from(""));
+        lines.extend(
+            crate::pr_preview::wrap(message, w)
+                .iter()
+                .map(|t| row(t, Style::default().fg(th.dim))),
+        );
+        lines
+    };
+    let lines: Vec<Line> = match (&detail, failed) {
+        (Some(detail), _) => crate::pr_preview::lines(detail, inner.width as usize, th),
+        (None, true) => placeholder(&format!(
+                "couldn't read this pull request — is `gh` installed and logged in?                  {} still opens it in the browser.",
+            key_hint(app, Action::Activate)
+        )),
+        (None, false) => placeholder("reading it…"),
+    };
+    app.pr_preview_lines = lines.len();
+    // Clamp here rather than in the handlers: the pane is what knows how
+    // many rows the prose wrapped to, and a narrower window can strand the
+    // offset past the end.
+    let max = (lines.len() as u16).saturating_sub(inner.height.max(1));
+    let scroll = app.pr_preview_scroll.min(max);
+    app.pr_preview_scroll = scroll;
+    let shown: Vec<Line> = lines.into_iter().skip(scroll as usize).collect();
+    f.render_widget(Paragraph::new(shown), inner);
+}
+
 /// Borderless terminal frame: a header row (`TERMINAL · session` plus a
 /// right-aligned state tag), a thin rule, then the content area. The
 /// header carries the focus signal like the sidebar columns do.
 fn terminal_frame(
     f: &mut Frame,
     area: Rect,
+    left: Vec<Span<'static>>,
+    right: Option<Span<'static>>,
+    focused: bool,
+    th: Theme,
+) -> Rect {
+    titled_frame(f, area, "TERMINAL", left, right, focused, th)
+}
+
+/// The same frame under another name, for the pane's other tenants — the
+/// pull-request reader borrows the whole right-hand column, and calling it
+/// TERMINAL while it shows prose would be a lie.
+fn titled_frame(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
     left: Vec<Span<'static>>,
     right: Option<Span<'static>>,
     focused: bool,
@@ -2793,7 +3019,7 @@ fn terminal_frame(
     // Row 0 is a blank spacer so the header sits on the same screen row
     // as the sidebar column titles (`draw_column` does the same).
     if let Some(r) = row_rect(area, 1) {
-        let mut spans = vec![Span::styled("  TERMINAL".to_string(), header_style)];
+        let mut spans = vec![Span::styled(format!("  {title}"), header_style)];
         spans.extend(left);
         f.render_widget(Paragraph::new(Line::from(spans)), r);
         if let Some(tag) = right {
@@ -2849,6 +3075,15 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         app.term_file_links = Vec::new();
         return;
     }
+    // The Worktrees cursor is resting on an open pull request: the pane
+    // reads it. The attachment underneath stays live — walking down into
+    // the OPEN PRS group and back must not churn detach/attach — exactly
+    // like the divider case above.
+    if app.selected_worktree_pr().is_some() {
+        draw_pr_preview(f, app, area, focused);
+        return;
+    }
+
     // Name the attached session in the header so it's clear what you're
     // looking at (and typing into) even with the sidebars collapsed.
     let mut left = Vec::new();
@@ -3216,6 +3451,16 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                     k(Action::Help)
                 ),
             },
+            // An open-PR row answers to a different set of verbs than a
+            // checkout does, so the hint follows the cursor into the group.
+            Focus::Worktrees if app.selected_worktree_pr().is_some() => format!(
+                "{}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: search  {}: menu  {}: help",
+                k(Action::Activate),
+                k(Action::GitDiff),
+                k(Action::Palette),
+                k(Action::ContextMenu),
+                k(Action::Help)
+            ),
             Focus::Worktrees => format!(
                 "{}: new worktree  {}: notes  {}: terminal  {}: pin  {}: delete  {}: search  {}: menu  {}: help",
                 k(Action::New),

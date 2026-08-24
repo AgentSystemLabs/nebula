@@ -4,7 +4,7 @@ use crate::app::{
     App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder, Focus,
     GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, NoteInput, NoteView, Overlay,
     Palette, PaletteTarget, PendingAction, PendingIntent, PointerShape, ProjectRow, PromptDialog,
-    PromptKind, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection,
+    PromptKind, RowKey, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection,
     WorktreeRollback,
 };
 use crate::pull_request::PullRequest;
@@ -29,6 +29,10 @@ use std::time::Duration;
 /// Rows the Sessions column scrolls per wheel notch — one pill's stride,
 /// so the list steps by whole rows instead of drifting half a pill.
 const SESSIONS_WHEEL_STEP: usize = 2;
+
+/// Wheel step for the pull-request reading pane, in lines. Prose wants a
+/// bigger bite than a session list of two-row pills.
+const PR_PREVIEW_WHEEL_STEP: u16 = 3;
 
 /// Redraw cap (~60fps). Output bursts coalesce into one frame; input events
 /// are still handled immediately between frames.
@@ -70,6 +74,25 @@ const PR_RECHECK_MAX: Duration = Duration::from_secs(3 * 60);
 /// unread-comment badge runs at, and the cost of one `gh` a minute for the
 /// one checkout the cursor is resting on.
 const PR_REFRESH: Duration = Duration::from_secs(60);
+
+/// How often the selected *project's* open-pull-request list is re-asked
+/// once a repo has proved it has any, and how a repo that answers empty (or
+/// can't answer at all) backs off. One `gh pr list` is one API call however
+/// many pull requests come back, and only the selected project is ever
+/// asked — but a workspace left open all day would still add up, so the
+/// steady beat is minutes, not seconds. Arriving at a project pulls the
+/// next lookup forward, floored by `OPEN_PRS_MIN_AGE` so walking the
+/// project list can't spend a call per row.
+const OPEN_PRS_REFRESH: Duration = Duration::from_secs(3 * 60);
+const OPEN_PRS_RECHECK_MIN: Duration = Duration::from_secs(30);
+const OPEN_PRS_RECHECK_MAX: Duration = Duration::from_secs(10 * 60);
+
+/// How long the Worktrees cursor must rest on an open-PR row before its
+/// description and conversation are fetched. Long enough that arrowing
+/// through a hundred rows spends nothing, short enough that stopping to
+/// read one feels immediate. Answers are cached for the session, so this is
+/// paid at most once per pull request.
+const PR_DETAIL_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// While the metrics modal is open, how often a fresh memory reading is
 /// requested from the daemon.
@@ -192,6 +215,19 @@ async fn main_loop(
     // come back here and land in `app.pull_requests`.
     let (pr_tx, mut pr_rx) =
         tokio::sync::mpsc::unbounded_channel::<(WorktreeId, Option<PullRequest>)>();
+    // The selected project's open-pull-request list, on the same off-loop
+    // footing. `None` is "couldn't ask", which keeps the last good list.
+    let (prs_tx, mut prs_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        nebula_core::ProjectId,
+        Option<Vec<crate::pull_request::OpenPr>>,
+    )>();
+    // One pull request's body and conversation, for the preview pane.
+    let (detail_tx, mut detail_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, Option<crate::pull_request::PrDetail>)>();
+    // A whole `gh pr diff`, which opens the diff modal when it lands.
+    let (prdiff_tx, mut prdiff_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(u64, String, Option<String>)>();
+    app.pr_diff_tx = Some(prdiff_tx);
     let mut next_metrics_poll = tokio::time::Instant::now();
     let mut next_splash_frame = tokio::time::Instant::now();
     let mut next_sweep_frame = tokio::time::Instant::now();
@@ -234,6 +270,7 @@ async fn main_loop(
                 // worktree list with j/k can't spawn a `gh` per row passed —
                 // only whatever the selection is resting on when it fires.
                 lookup_pull_request(&mut app, &pr_tx);
+                lookup_open_prs(&mut app, &prs_tx);
                 next_git_poll = tokio::time::Instant::now() + GIT_POLL;
             }
             // Metrics poll: always on for the footer's memory/session
@@ -334,6 +371,34 @@ async fn main_loop(
                     app.pr_inflight.remove(&worktree);
                     note_pr_answer(&mut app, &worktree, pr.is_some());
                     app.dirty |= app.pull_requests.insert(worktree, pr.clone()) != Some(pr);
+                }
+            }
+            answer = prs_rx.recv() => {
+                // Never None: `prs_tx` lives as long as the loop.
+                if let Some((project, list)) = answer {
+                    note_open_prs_answer(&mut app, project, list);
+                    refresh_palette(&mut app);
+                }
+            }
+            // The hover debounce: the cursor has rested on a pull request
+            // long enough to mean it.
+            _ = tokio::time::sleep(app.pr_detail_delay().unwrap_or(Duration::MAX)),
+                if app.pr_detail_delay().is_some() => {
+                lookup_pr_detail(&mut app, &detail_tx);
+            }
+            answer = detail_rx.recv() => {
+                if let Some((url, detail)) = answer {
+                    app.pr_detail_inflight.remove(&url);
+                    match detail {
+                        Some(detail) => { app.pr_detail.insert(url, detail); }
+                        None => { app.pr_detail_failed.insert(url); }
+                    }
+                    app.dirty = true;
+                }
+            }
+            answer = prdiff_rx.recv() => {
+                if let Some((number, title, diff)) = answer {
+                    open_pr_diff_view(&mut app, number, title, diff);
                 }
             }
         }
@@ -449,6 +514,219 @@ fn note_pr_answer(app: &mut App, worktree: &WorktreeId, found: bool) {
     };
     app.pr_recheck
         .insert(worktree.clone(), (std::time::Instant::now() + step, step));
+}
+
+/// Ask `gh` for every pull request open on the selected project's repo, off
+/// the loop. Only the selected project is ever asked — the group only shows
+/// for the project on screen, and a workspace of thirty repos must not cost
+/// thirty API calls a beat. Skipped while one is in flight and until the
+/// timer the last answer armed. The reply arrives on `prs_tx`.
+fn lookup_open_prs(
+    app: &mut App,
+    prs_tx: &tokio::sync::mpsc::UnboundedSender<(
+        nebula_core::ProjectId,
+        Option<Vec<crate::pull_request::OpenPr>>,
+    )>,
+) {
+    let Some((id, path)) = app
+        .selected_project()
+        .map(|p| (p.id.clone(), p.repo_path.clone()))
+    else {
+        return;
+    };
+    if !app.open_prs_lookup_due(&id) {
+        return;
+    }
+    // A repo that isn't on disk has nothing for `gh` to resolve against;
+    // don't spend a process finding that out, but let the backoff run — the
+    // checkout can come back (an unmounted volume, a restored directory).
+    if !path.is_dir() {
+        note_open_prs_answer(app, id, None);
+        return;
+    }
+    app.open_prs_inflight.insert(id.clone());
+    let prs_tx = prs_tx.clone();
+    tokio::spawn(async move {
+        let list = crate::pull_request::list(&path).await;
+        let _ = prs_tx.send((id, list));
+    });
+}
+
+/// Record what a list lookup came back with, and arm the next one. A repo
+/// with pull requests open settles onto the steady `OPEN_PRS_REFRESH` beat;
+/// an empty answer — or one `gh` couldn't give at all — arms the next
+/// attempt a backoff step further out, so a repo with no PRs (or a machine
+/// with no `gh`) settles at `OPEN_PRS_RECHECK_MAX` instead of asking all
+/// day. A failed call keeps whatever list was already on screen: one flaky
+/// network round trip is no reason to blank the group.
+fn note_open_prs_answer(
+    app: &mut App,
+    project: nebula_core::ProjectId,
+    list: Option<Vec<crate::pull_request::OpenPr>>,
+) {
+    app.open_prs_inflight.remove(&project);
+    let previous = app.open_prs.get(&project);
+    let found = list.as_ref().is_some_and(|l| !l.is_empty());
+    let step = if found {
+        OPEN_PRS_REFRESH
+    } else {
+        match previous {
+            Some(open) => (open.step * 2).min(OPEN_PRS_RECHECK_MAX),
+            None => OPEN_PRS_RECHECK_MIN,
+        }
+    };
+    let now = std::time::Instant::now();
+    let list = match list {
+        Some(list) => list,
+        None => previous.map(|o| o.list.clone()).unwrap_or_default(),
+    };
+    app.dirty |= previous.map(|o| &o.list) != Some(&list);
+    app.open_prs.insert(
+        project,
+        crate::app::OpenPrs {
+            list,
+            at: now,
+            due: now + step,
+            step,
+        },
+    );
+}
+
+/// Arm (or disarm) the debounced fetch of the pull request under the
+/// Worktrees cursor. Called wherever that cursor moves. A PR already
+/// fetched, already in flight, or already known to be unanswerable arms
+/// nothing — the pane has something to show either way, and re-asking would
+/// spend an API call on a row the user is only passing through.
+fn schedule_pr_detail(app: &mut App) {
+    let pending = app.selected_worktree_pr().and_then(|pr| {
+        let url = pr.url.clone();
+        if app.pr_detail.contains_key(&url)
+            || app.pr_detail_inflight.contains(&url)
+            || app.pr_detail_failed.contains(&url)
+        {
+            return None;
+        }
+        let dir = app.selected_project().map(|p| p.repo_path.clone())?;
+        Some(crate::app::PendingPrDetail {
+            url,
+            number: pr.number,
+            dir,
+        })
+    });
+    // Landing on a different row resets the scroll: the pane is showing
+    // something else now.
+    app.pr_preview_scroll = 0;
+    app.pending_pr_detail = pending.map(|p| (p, std::time::Instant::now() + PR_DETAIL_DEBOUNCE));
+}
+
+/// Fire the debounced fetch. Disarms first, so a `gh` that never answers
+/// can't re-fire on every loop turn.
+fn lookup_pr_detail(
+    app: &mut App,
+    detail_tx: &tokio::sync::mpsc::UnboundedSender<(String, Option<crate::pull_request::PrDetail>)>,
+) {
+    let Some((pending, _)) = app.pending_pr_detail.take() else {
+        return;
+    };
+    if !pending.dir.is_dir() {
+        app.pr_detail_failed.insert(pending.url);
+        app.dirty = true;
+        return;
+    }
+    app.pr_detail_inflight.insert(pending.url.clone());
+    let detail_tx = detail_tx.clone();
+    tokio::spawn(async move {
+        let detail = crate::pull_request::detail(&pending.dir, pending.number).await;
+        let _ = detail_tx.send((pending.url, detail));
+    });
+}
+
+/// `g` on an open-PR row: fetch the whole pull request diff off the loop and
+/// open the ordinary diff modal on it when it lands. One `gh pr diff` gets
+/// every file at once, which is why this view carries its diffs with it
+/// instead of shelling out per file the way the worktree view does.
+fn request_pr_diff(app: &mut App) {
+    let Some((number, title)) = app.selected_worktree_pr().map(|pr| (pr.number, pr.label())) else {
+        return;
+    };
+    if app.pr_diff_inflight == Some(number) {
+        app.flash = Some(format!("still fetching the diff for #{number}…"));
+        return;
+    }
+    let Some(dir) = app.selected_project().map(|p| p.repo_path.clone()) else {
+        return;
+    };
+    if !dir.is_dir() {
+        app.flash = Some(format!("repo path missing on disk: {}", dir.display()));
+        return;
+    }
+    let Some(prdiff_tx) = app.pr_diff_tx.clone() else {
+        return; // never: the loop installs it at startup
+    };
+    app.pr_diff_inflight = Some(number);
+    app.flash = Some(format!("fetching the diff for #{number}…"));
+    app.dirty = true;
+    tokio::spawn(async move {
+        let diff = crate::pull_request::diff(&dir, number).await;
+        let _ = prdiff_tx.send((number, title, diff));
+    });
+}
+
+/// Land a fetched pull-request diff in the diff modal. The files come from
+/// splitting the unified diff rather than from `git status`, and every
+/// entry is marked `M` — a pull request's own diff already renders the
+/// add/delete headers, and porcelain codes would be an invention.
+fn open_pr_diff_view(app: &mut App, number: u64, title: String, diff: Option<String>) {
+    if app.pr_diff_inflight == Some(number) {
+        app.pr_diff_inflight = None;
+    }
+    let Some(diff) = diff else {
+        app.flash = Some(format!(
+            "couldn't read the diff for #{number} — is `gh` set up?"
+        ));
+        return;
+    };
+    let chunks = crate::pull_request::split_unified_diff(&diff);
+    if chunks.is_empty() {
+        app.flash = Some(format!("#{number} changes no files"));
+        return;
+    }
+    let files = chunks
+        .iter()
+        .map(|(path, _)| crate::git_diff::DiffFile {
+            path: path.clone(),
+            orig_path: None,
+            xy: ['M', ' '],
+        })
+        .collect();
+    // `root` is only ever used to shell out at git, which a prefetched view
+    // never does — but the reviewed-mark store keys on it, so it stays the
+    // repo path rather than something invented.
+    let root = app
+        .selected_project()
+        .map(|p| p.repo_path.clone())
+        .unwrap_or_default();
+    let mut view = DiffView::new(root, title, files, true);
+    view.prefetched = Some(chunks.into_iter().collect());
+    view.files_width = app.diff_files_width;
+    crate::git_diff::load_selected_diff(&mut view);
+    app.overlay = Some(Overlay::Diff(view));
+    app.flash = None;
+    app.dirty = true;
+}
+
+/// Arm the selected project for a prompt open-pull-request lookup: arriving
+/// at a project is exactly when the user wants to know what's still open on
+/// it. Floored at `OPEN_PRS_MIN_AGE` past the last answer, so bouncing
+/// between two projects re-reads the cache instead of spending an API call
+/// per switch.
+fn schedule_open_prs_lookup(app: &mut App) {
+    let Some(id) = app.selected_project().map(|p| p.id.clone()) else {
+        return;
+    };
+    if let Some(open) = app.open_prs.get_mut(&id) {
+        open.due = open.due.min(open.at + crate::app::OPEN_PRS_MIN_AGE);
+    }
 }
 
 /// Arm the selected worktree for a prompt pull-request lookup: switching
@@ -768,6 +1046,26 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         return;
     }
 
+    // Reading a pull request in the pane: the diff modal's scroll keys work
+    // here too. Page/Home/End only — shift+↑/↓ already move a project, and
+    // ↑/↓ have to keep walking the PR list itself.
+    if app.selected_worktree_pr().is_some() && app.focus == Focus::Worktrees {
+        let page = app.term_area.height.max(1);
+        let max = app.pr_preview_max_scroll();
+        let scrolled = match key.code {
+            KeyCode::PageDown => Some(app.pr_preview_scroll.saturating_add(page).min(max)),
+            KeyCode::PageUp => Some(app.pr_preview_scroll.saturating_sub(page)),
+            KeyCode::Home => Some(0),
+            KeyCode::End => Some(max),
+            _ => None,
+        };
+        if let Some(to) = scrolled {
+            app.dirty |= app.pr_preview_scroll != to;
+            app.pr_preview_scroll = to;
+            return;
+        }
+    }
+
     // Panel focus: every key here is a rebindable action (see keymap.rs),
     // so the dispatch is a table lookup rather than a KeyCode match — an
     // unbound press simply falls through.
@@ -871,7 +1169,12 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 }
                 _ => app.focus = Focus::Worktrees,
             },
-            Focus::Worktrees => app.focus = Focus::Sessions,
+            // An open-PR row leads out of nebula, so Enter hands it to the
+            // browser and stays put; a checkout hands focus one column right.
+            Focus::Worktrees => match app.selected_worktree_pr().map(|pr| pr.url.clone()) {
+                Some(url) => open_link(app, &url, out),
+                None => app.focus = Focus::Sessions,
+            },
             Focus::Sessions => attach_selected(app, out),
             Focus::Terminal => {
                 // Lock input into an already-focused live pane.
@@ -999,6 +1302,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     &app.tree,
                     app.show_archived,
                     crate::config::Config::load().palette_enter_attaches,
+                    &app.open_prs,
                 )));
             }
         }
@@ -1037,6 +1341,9 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // lists the casualties).
         Action::DeleteAll => open_delete_all_confirm(app),
         Action::ContextMenu => open_context_menu_for_selection(app),
+        // On an open-PR row `g` reads that pull request's diff off GitHub
+        // instead of the checkout's — same modal, different source.
+        Action::GitDiff if app.selected_worktree_pr().is_some() => request_pr_diff(app),
         Action::GitDiff => open_diff_view(app),
         Action::OpenRepo => open_repo_in_browser(app),
         // AddProject adds a project from ANY panel — unlike New it never
@@ -3509,6 +3816,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::OpenNotes(owner) => open_notes_for_owner(app, owner),
         MenuAction::NewLink(worktree) => open_prompt(app, PromptKind::NewLink { worktree }),
         MenuAction::OpenLink(url) => open_link(app, &url, out),
+        MenuAction::ViewPrDiff => request_pr_diff(app),
         MenuAction::EditLink(id) => open_prompt(app, PromptKind::EditLink { id }),
         MenuAction::DeleteLink(id) => {
             if let Some(row) = app
@@ -3736,6 +4044,8 @@ fn remember_context(app: &mut App) {
 /// main checkout otherwise), then re-show that worktree's session.
 fn restore_context(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.sel_worktree = 0;
+    schedule_open_prs_lookup(app);
+    schedule_pr_detail(app);
     if let Some(pid) = app.selected_project().map(|p| p.id.clone()) {
         if let Some(wid) = app.last_worktree_for_project.get(&pid).cloned() {
             if let Some(i) = app.visible_worktrees().iter().position(|w| w.id == wid) {
@@ -3966,6 +4276,11 @@ fn jump_to_target(
                 preview_selected(app, out);
             }
         }
+        // A pull request isn't in any panel — picking it hands the URL to
+        // the browser and leaves every cursor where it was. Enter opens it
+        // whether or not the "Enter attaches" setting is on: there is no
+        // second, quieter thing for it to do.
+        PaletteTarget::PullRequest(url) => open_link(app, &url, out),
     }
 }
 
@@ -4024,7 +4339,7 @@ fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
 fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
     let len = match app.focus {
         Focus::Projects => app.project_rows().len(),
-        Focus::Worktrees => app.visible_worktrees().len(),
+        Focus::Worktrees => app.worktree_row_count(),
         Focus::Sessions => app.visible_session_rows().len(),
         Focus::Terminal => return,
     };
@@ -4060,7 +4375,13 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
             app.select_worktree_when_seen = None;
             remember_context(app);
             app.sel_worktree = new;
-            restore_session(app, out);
+            // Stepping onto an open-PR row is not a worktree switch: it has
+            // no sessions to restore and nothing to attach, so the pane is
+            // left exactly as it was — the project-divider precedent.
+            if app.selected_worktree().is_some() {
+                restore_session(app, out);
+            }
+            schedule_pr_detail(app);
         }
         Focus::Sessions => {
             app.sel_session = new;
@@ -5084,9 +5405,34 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         app.select_worktree_when_seen = None;
                         remember_context(app);
                         app.sel_worktree = i;
-                        restore_session(app, out);
+                        // An open-PR row has no sessions of its own; leave
+                        // the pane alone (see move_selection).
+                        if app.selected_worktree().is_some() {
+                            restore_session(app, out);
+                        }
+                        schedule_pr_detail(app);
                     }
                     app.focus = Focus::Worktrees;
+                    // A second click on a pull request opens it — the same
+                    // double-click-to-activate the Sessions panel's link
+                    // rows use, so one stray click never launches a browser.
+                    // Landing anywhere else breaks the chain, or a click
+                    // away and back would read as a double-click.
+                    match app.selected_worktree_pr().map(|pr| pr.url.clone()) {
+                        Some(url) => {
+                            let key = RowKey::Link(url.clone());
+                            let now = std::time::Instant::now();
+                            let double = app.last_session_click.take().is_some_and(|(at, id)| {
+                                id == key && now.duration_since(at) <= DOUBLE_CLICK
+                            });
+                            if double {
+                                open_link(app, &url, out);
+                            } else {
+                                app.last_session_click = Some((now, key));
+                            }
+                        }
+                        None => app.last_session_click = None,
+                    }
                 }
                 Some(HitTarget::Session(i)) => {
                     app.sel_session = i;
@@ -5207,12 +5553,38 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                             | HitTarget::PanelBg(Focus::Sessions)
                     )
                 );
+            // The Worktrees column scrolls the same way: a project with a
+            // long open-PR list outgrows the panel just as readily.
+            let over_worktrees = !app.collapsed
+                && matches!(
+                    over,
+                    Some(HitTarget::Worktree(_) | HitTarget::PanelBg(Focus::Worktrees))
+                );
             let in_term = matches!(over, Some(HitTarget::TerminalPane)) || app.collapsed;
-            if over_sessions {
+            if over_worktrees {
+                app.worktrees_scroll = if up {
+                    app.worktrees_scroll.saturating_sub(SESSIONS_WHEEL_STEP)
+                } else {
+                    app.worktrees_scroll.saturating_add(SESSIONS_WHEEL_STEP)
+                };
+                app.dirty = true;
+            } else if over_sessions {
                 app.sessions_scroll = if up {
                     app.sessions_scroll.saturating_sub(SESSIONS_WHEEL_STEP)
                 } else {
                     app.sessions_scroll.saturating_add(SESSIONS_WHEEL_STEP)
+                };
+                app.dirty = true;
+            } else if in_term && app.selected_worktree_pr().is_some() {
+                // The pane is showing a pull request, not a session: the
+                // wheel reads it rather than reaching the PTY underneath.
+                let max = app.pr_preview_max_scroll();
+                app.pr_preview_scroll = if up {
+                    app.pr_preview_scroll.saturating_sub(PR_PREVIEW_WHEEL_STEP)
+                } else {
+                    app.pr_preview_scroll
+                        .saturating_add(PR_PREVIEW_WHEEL_STEP)
+                        .min(max)
                 };
                 app.dirty = true;
             } else if in_term {
@@ -5311,7 +5683,21 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     app.sel_worktree = i;
                     app.sel_session = 0;
                     app.focus = Focus::Worktrees;
-                    if let Some(w) = app.selected_worktree() {
+                    if let Some(pr) = app.selected_worktree_pr() {
+                        let items = vec![
+                            MenuItem {
+                                label: "Open in browser".into(),
+                                action: MenuAction::OpenLink(pr.url.clone()),
+                                destructive: false,
+                            },
+                            MenuItem {
+                                label: "View diff".into(),
+                                action: MenuAction::ViewPrDiff,
+                                destructive: false,
+                            },
+                        ];
+                        open_menu_at(app, items, at);
+                    } else if let Some(w) = app.selected_worktree() {
                         let mut items = vec![
                             MenuItem {
                                 label: "New agent".into(),
@@ -5857,7 +6243,7 @@ fn restore_worktree_rows(app: &mut App, rollback: WorktreeRollback) {
 /// new entities) so its rows never go stale under the user's cursor.
 fn refresh_palette(app: &mut App) {
     if let Some(Overlay::Palette(palette)) = &mut app.overlay {
-        palette.rebuild(&app.tree, app.show_archived);
+        palette.rebuild(&app.tree, app.show_archived, &app.open_prs);
     }
 }
 
@@ -5982,7 +6368,7 @@ fn clamp_selections(app: &mut App) {
     if app.sel_project >= project_rows {
         app.sel_project = project_rows.saturating_sub(1);
     }
-    let wt_len = app.visible_worktrees().len();
+    let wt_len = app.worktree_row_count();
     if app.sel_worktree >= wt_len {
         app.sel_worktree = wt_len.saturating_sub(1);
     }
@@ -6342,6 +6728,545 @@ mod tests {
             out.iter()
                 .any(|r| matches!(r, ClientRequest::DeleteLink { id, .. } if id.as_str() == "l1")),
             "expected DeleteLink, got {out:?}"
+        );
+    }
+
+    /// Seed the selected project's open-pull-request list, as though a
+    /// `gh pr list` had just answered.
+    fn seed_open_prs(app: &mut App, prs: &[(u64, &str)]) {
+        let id = app.selected_project().expect("a project").id.clone();
+        let now = std::time::Instant::now();
+        app.open_prs.insert(
+            id,
+            crate::app::OpenPrs {
+                list: prs
+                    .iter()
+                    .map(|(number, title)| crate::pull_request::OpenPr {
+                        number: *number,
+                        title: (*title).into(),
+                        url: format!("https://github.com/o/r/pull/{number}"),
+                        is_draft: false,
+                    })
+                    .collect(),
+                at: now,
+                due: now + OPEN_PRS_REFRESH,
+                step: OPEN_PRS_REFRESH,
+            },
+        );
+    }
+
+    /// The open pull requests take the rows *after* the checkouts, which is
+    /// what lets every "index into visible_worktrees()" in the app stay
+    /// correct: a cursor on a PR row simply has no selected worktree.
+    #[test]
+    fn open_prs_take_the_rows_below_the_worktrees() {
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 / w1(main) / a1
+        assert_eq!(app.worktree_row_count(), 1, "no list fetched yet");
+        seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Number the lines")]);
+        assert_eq!(app.worktree_row_count(), 3);
+
+        assert!(app.selected_worktree().is_some(), "row 0 is the checkout");
+        assert!(app.selected_worktree_pr().is_none());
+
+        app.sel_worktree = 1;
+        assert!(app.selected_worktree().is_none(), "row 1 is a pull request");
+        assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+        app.sel_worktree = 2;
+        assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(9));
+    }
+
+    /// Enter on an open-PR row hands it to the browser and stays put — and
+    /// walking into the group must not detach the session on screen: a pull
+    /// request has no sessions of its own, so the pane keeps the checkout's.
+    #[test]
+    fn enter_on_an_open_pr_row_opens_the_browser_without_disturbing_the_pane() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        app.term = Some(AttachedTerm::new(a1.clone(), 40, 10));
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.sel_worktree, 1, "walked into the OPEN PRS group");
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::Detach { .. })),
+            "the pane is left alone: {out:?}"
+        );
+        assert!(app.term.is_some());
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.flash.as_deref(), Some("opened github.com/o/r/pull/7"));
+        assert_eq!(app.focus, Focus::Worktrees, "Enter stays in the panel");
+
+        // Back onto the checkout, Enter still hands focus one column right.
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.focus, Focus::Sessions);
+    }
+
+    /// A second click on a pull request opens it; one click only selects —
+    /// the Sessions panel's link-row rule, so a stray click in the column
+    /// never launches a browser.
+    #[test]
+    fn double_clicking_an_open_pr_row_opens_it() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        let mut out = Vec::new();
+        app.hits.push((
+            ratatui::layout::Rect::new(0, 0, 20, 2),
+            HitTarget::Worktree(1),
+        ));
+        let click = |app: &mut App, out: &mut Vec<ClientRequest>| {
+            handle_mouse(
+                app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 1,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                out,
+            )
+        };
+
+        click(&mut app, &mut out);
+        assert_eq!(app.sel_worktree, 1);
+        assert_eq!(app.focus, Focus::Worktrees);
+        assert!(app.flash.is_none(), "one click only selects");
+
+        click(&mut app, &mut out);
+        assert_eq!(app.flash.as_deref(), Some("opened github.com/o/r/pull/7"));
+
+        // A click on the checkout in between breaks the chain: clicking away
+        // and back is two first clicks, not a double-click.
+        app.flash = None;
+        app.hits.push((
+            ratatui::layout::Rect::new(0, 4, 20, 2),
+            HitTarget::Worktree(0),
+        ));
+        let click_at = |app: &mut App, row: u16, out: &mut Vec<ClientRequest>| {
+            handle_mouse(
+                app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 1,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                out,
+            )
+        };
+        click_at(&mut app, 0, &mut out);
+        click_at(&mut app, 4, &mut out);
+        click_at(&mut app, 0, &mut out);
+        assert!(app.flash.is_none(), "got {:?}", app.flash);
+    }
+
+    /// A repo with nothing open backs off instead of asking every beat, and
+    /// a call `gh` couldn't answer keeps whatever list was already on screen
+    /// — one flaky round trip is no reason to blank the group.
+    #[test]
+    fn the_open_pr_list_backs_off_when_empty_and_survives_a_failed_call() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let pid = app.selected_project().expect("a project").id.clone();
+
+        note_open_prs_answer(&mut app, pid.clone(), Some(vec![]));
+        assert_eq!(app.open_prs[&pid].step, OPEN_PRS_RECHECK_MIN);
+        note_open_prs_answer(&mut app, pid.clone(), Some(vec![]));
+        assert_eq!(app.open_prs[&pid].step, OPEN_PRS_RECHECK_MIN * 2);
+
+        let found = vec![crate::pull_request::OpenPr {
+            number: 7,
+            title: "Attach links".into(),
+            url: "https://github.com/o/r/pull/7".into(),
+            is_draft: false,
+        }];
+        note_open_prs_answer(&mut app, pid.clone(), Some(found.clone()));
+        assert_eq!(
+            app.open_prs[&pid].step, OPEN_PRS_REFRESH,
+            "a repo with pull requests settles onto the steady beat"
+        );
+        assert_eq!(app.visible_open_prs().len(), 1);
+
+        note_open_prs_answer(&mut app, pid.clone(), None);
+        assert_eq!(
+            app.open_prs[&pid].list, found,
+            "a failed call keeps the last good list"
+        );
+        assert!(app.open_prs[&pid].step > OPEN_PRS_REFRESH, "but backs off");
+    }
+
+    /// Arriving at a project asks again promptly — but never more often than
+    /// `OPEN_PRS_MIN_AGE`, so bouncing between two projects re-reads the
+    /// cache instead of spending an API call per switch.
+    #[test]
+    fn arriving_at_a_project_re_asks_but_not_faster_than_the_floor() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let pid = app.selected_project().expect("a project").id.clone();
+        note_open_prs_answer(&mut app, pid.clone(), Some(vec![]));
+
+        schedule_open_prs_lookup(&mut app);
+        assert!(
+            !app.open_prs_lookup_due(&pid),
+            "the answer is seconds old: the floor holds the next call off"
+        );
+
+        // An answer older than the floor is re-asked the moment we arrive.
+        let stale = std::time::Instant::now() - crate::app::OPEN_PRS_MIN_AGE * 2;
+        app.open_prs.get_mut(&pid).unwrap().at = stale;
+        schedule_open_prs_lookup(&mut app);
+        assert!(app.open_prs_lookup_due(&pid));
+
+        // An in-flight call is never doubled up on.
+        app.open_prs_inflight.insert(pid.clone());
+        assert!(!app.open_prs_lookup_due(&pid));
+    }
+
+    /// The group renders under the checkouts, headed by its own count, and
+    /// a list cut off at the fetch cap says so rather than passing itself
+    /// off as the whole set.
+    #[test]
+    fn the_open_pr_group_renders_under_the_worktrees() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Number lines")]);
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("OPEN PRS · 2"), "group header:\n{text}");
+        assert!(text.contains("#7 Attach links"), "PR row:\n{text}");
+        let (_, main_y) = find_cell(&terminal, "main");
+        let (_, pr_y) = find_cell(&terminal, "#7");
+        assert!(pr_y > main_y, "pull requests sit below the checkouts");
+
+        // A full page is reported as "100+": the cap is ours, not GitHub's.
+        let many: Vec<(u64, &str)> = (0..crate::pull_request::LIST_LIMIT as u64)
+            .map(|n| (n + 1, "wide"))
+            .collect();
+        seed_open_prs(&mut app, &many);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_text(&terminal).contains("OPEN PRS · 100+"),
+            "a capped list says so:\n{}",
+            buffer_text(&terminal)
+        );
+    }
+
+    /// `/` searches pull requests by title alongside everything else, and
+    /// Enter on one opens the browser instead of moving any panel cursor.
+    #[test]
+    fn the_palette_finds_open_prs_by_title_and_opens_them() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links to worktrees")]);
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        for c in "attach".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        {
+            let p = palette(&app);
+            assert_eq!(
+                p.items[p.matches[0].item].text, "demo/#7 Attach links to worktrees",
+                "the project prefixes it, like every other row"
+            );
+        }
+        // Enter opens it whether or not "Enter attaches" is on — there is no
+        // second, quieter thing a pull request can do.
+        set_enter_attaches(&mut app, false);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "the palette closes");
+        assert_eq!(app.flash.as_deref(), Some("opened github.com/o/r/pull/7"));
+        assert_eq!(app.sel_worktree, 0, "no panel cursor moved");
+        assert_eq!(app.focus, Focus::Worktrees);
+    }
+
+    fn a_detail(
+        number: u64,
+        body: &str,
+        comments: Vec<crate::pull_request::PrComment>,
+    ) -> crate::pull_request::PrDetail {
+        crate::pull_request::PrDetail {
+            number,
+            url: format!("https://github.com/o/r/pull/{number}"),
+            title: "Attach links".into(),
+            state: "OPEN".into(),
+            is_draft: false,
+            author: "webdevcody".into(),
+            base: "main".into(),
+            head: "feat/links".into(),
+            additions: 106,
+            deletions: 4,
+            changed_files: 2,
+            body: body.into(),
+            comments,
+        }
+    }
+
+    /// Resting on a pull request arms a debounced fetch; one already known
+    /// (cached, in flight, or already refused) arms nothing, so walking a
+    /// long list costs no API calls at all.
+    #[test]
+    fn hovering_a_pr_row_arms_one_debounced_detail_fetch() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Number lines")]);
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+
+        assert!(app.pending_pr_detail.is_none(), "the checkout arms nothing");
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        let (pending, _) = app.pending_pr_detail.clone().expect("armed on #7");
+        assert_eq!(pending.number, 7);
+        assert_eq!(pending.url, "https://github.com/o/r/pull/7");
+        assert!(
+            app.pr_detail_delay()
+                .is_some_and(|d| d <= PR_DETAIL_DEBOUNCE),
+            "and it is a delay, not an immediate fetch"
+        );
+
+        // Already read: nothing to fetch, and the pane has it in hand.
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            app.pending_pr_detail.as_ref().map(|(p, _)| p.number),
+            Some(9)
+        );
+        app.pr_detail.insert(
+            "https://github.com/o/r/pull/9".into(),
+            a_detail(9, "hi", vec![]),
+        );
+        schedule_pr_detail(&mut app);
+        assert!(app.pending_pr_detail.is_none(), "cached: nothing to ask");
+
+        // One `gh` already said no: don't keep asking on every pass.
+        app.pr_detail_failed
+            .insert("https://github.com/o/r/pull/7".into());
+        app.sel_worktree = 1;
+        schedule_pr_detail(&mut app);
+        assert!(app.pending_pr_detail.is_none(), "refused: nothing to ask");
+
+        // Back on a checkout, the debounce is disarmed entirely.
+        app.pr_detail_failed.clear();
+        app.sel_worktree = 0;
+        schedule_pr_detail(&mut app);
+        assert!(app.pending_pr_detail.is_none());
+    }
+
+    /// The pane reads the pull request while the cursor rests on it — and
+    /// the session underneath stays attached, so stepping back is instant.
+    #[test]
+    fn the_pane_reads_the_pull_request_under_the_cursor() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        app.term = Some(AttachedTerm::new(a1.clone(), 40, 10));
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 1;
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("PULL REQUEST"), "pane retitles:\n{text}");
+        assert!(text.contains("reading it…"), "loading state:\n{text}");
+        assert!(app.term.is_some(), "the session stays attached underneath");
+
+        app.pr_detail.insert(
+            "https://github.com/o/r/pull/7".into(),
+            a_detail(
+                7,
+                "Pins a PR to the worktree.",
+                vec![crate::pull_request::PrComment {
+                    author: "kate".into(),
+                    at: "2026-08-20T19:55:42Z".into(),
+                    review_state: "APPROVED".into(),
+                    body: "ship it".into(),
+                }],
+            ),
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("#7 Attach links"), "{text}");
+        assert!(text.contains("+106 -4 · 2 files"), "{text}");
+        assert!(text.contains("Pins a PR to the worktree."), "{text}");
+        assert!(text.contains("kate approved"), "{text}");
+        assert!(
+            !text.contains("reading it…"),
+            "loading state clears:\n{text}"
+        );
+
+        // Back on the checkout the pane is a terminal again — the PR row
+        // stays in the Worktrees column, but its body leaves the pane.
+        app.sel_worktree = 0;
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("TERMINAL · agent-1"), "{text}");
+        assert!(!text.contains("Pins a PR to the worktree."), "{text}");
+        assert!(!text.contains("+106 -4"), "{text}");
+    }
+
+    /// A pull request `gh` couldn't read says so rather than sitting on
+    /// "reading it…" forever.
+    #[test]
+    fn an_unreadable_pull_request_says_so_in_the_pane() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 1;
+        app.pr_detail_failed
+            .insert("https://github.com/o/r/pull/7".into());
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("unavailable"), "{text}");
+        assert!(text.contains("couldn't read this pull request"), "{text}");
+    }
+
+    /// PgDn/PgUp/Home/End page the preview, clamped to its real length —
+    /// the pane writes the line count back on every draw.
+    #[test]
+    fn the_preview_pages_and_clamps_to_its_length() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 1;
+        let body = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.pr_detail.insert(
+            "https://github.com/o/r/pull/7".into(),
+            a_detail(7, &body, vec![]),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(app.pr_preview_lines > 200, "the body wrapped long");
+
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::PageDown, KeyModifiers::NONE, &mut out);
+        let paged = app.pr_preview_scroll;
+        assert!(paged > 0, "PgDn moved");
+        press(&mut app, KeyCode::End, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.pr_preview_scroll, app.pr_preview_max_scroll());
+        press(&mut app, KeyCode::PageDown, KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            app.pr_preview_scroll,
+            app.pr_preview_max_scroll(),
+            "the end is the end"
+        );
+        press(&mut app, KeyCode::Home, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.pr_preview_scroll, 0);
+        assert!(out.is_empty(), "reading a PR sends the daemon nothing");
+
+        // Moving to another row starts its preview at the top.
+        app.pr_preview_scroll = paged;
+        app.sel_worktree = 0;
+        schedule_pr_detail(&mut app);
+        assert_eq!(app.pr_preview_scroll, 0);
+    }
+
+    /// `g` on a pull-request row opens the ordinary diff modal on the
+    /// fetched diff — file list from the diff itself, and switching files
+    /// reads the text already in hand rather than shelling out at git.
+    #[test]
+    fn the_fetched_pr_diff_opens_in_the_diff_modal() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        app.sel_worktree = 1;
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/src/b.rs b/src/b.rs
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -1 +1 @@
+-x
++y
+";
+        app.pr_diff_inflight = Some(7);
+        open_pr_diff_view(&mut app, 7, "#7 Attach links".into(), Some(diff.into()));
+        assert!(app.pr_diff_inflight.is_none(), "the fetch is done");
+        let Some(Overlay::Diff(view)) = &app.overlay else {
+            panic!("expected the diff modal, got {:?}", app.overlay);
+        };
+        assert_eq!(view.branch, "#7 Attach links", "the PR titles the modal");
+        assert_eq!(
+            view.files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/a.rs", "src/b.rs"]
+        );
+        assert!(
+            view.diff.contains("+new"),
+            "first file's diff: {}",
+            view.diff
+        );
+
+        // Selecting the second file reads the prefetched chunk — no repo is
+        // touched (seed_tree's /tmp/demo isn't even a git checkout).
+        let Some(Overlay::Diff(view)) = &mut app.overlay else {
+            unreachable!()
+        };
+        view.select(1);
+        crate::git_diff::load_selected_diff(view);
+        assert!(
+            view.diff.contains("+y"),
+            "second file's diff: {}",
+            view.diff
+        );
+        assert!(!view.diff.contains("+new"), "chunks don't bleed");
+    }
+
+    /// A diff `gh` couldn't fetch flashes and leaves the modal shut, and a
+    /// second `g` while one is already in flight doesn't stack a request.
+    #[test]
+    fn a_failed_pr_diff_flashes_instead_of_opening() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        app.sel_worktree = 1;
+
+        app.pr_diff_inflight = Some(7);
+        open_pr_diff_view(&mut app, 7, "#7 Attach links".into(), None);
+        assert!(app.overlay.is_none());
+        assert!(
+            app.flash
+                .as_deref()
+                .is_some_and(|f| f.contains("couldn't read the diff for #7")),
+            "got {:?}",
+            app.flash
+        );
+
+        // An empty diff is not a modal with no rows in it.
+        open_pr_diff_view(&mut app, 7, "#7".into(), Some(String::new()));
+        assert!(app.overlay.is_none());
+        assert_eq!(app.flash.as_deref(), Some("#7 changes no files"));
+
+        // Mashing the key while one is in flight is a nudge, not a request.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.pr_diff_tx = Some(tx);
+        app.pr_diff_inflight = Some(7);
+        request_pr_diff(&mut app);
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("still fetching the diff for #7…")
         );
     }
 
@@ -13768,7 +14693,7 @@ mod tests {
         assert_eq!(app.project_rows().len(), 1, "only demo has a row");
         assert_eq!(app.tree.visible_project_count(), 1);
 
-        let palette = Palette::new(&app.tree, true, false);
+        let palette = Palette::new(&app.tree, true, false, &app.open_prs);
         assert!(
             !palette.items.is_empty() && palette.items.iter().all(|i| !i.text.contains("secret")),
             "palette must not search other workspaces: {:?}",
@@ -13791,7 +14716,12 @@ mod tests {
         assert!(text.contains("demo"), "{text}");
         assert!(!text.contains("secret"), "{text}");
 
-        app.overlay = Some(Overlay::Palette(Palette::new(&app.tree, false, false)));
+        app.overlay = Some(Overlay::Palette(Palette::new(
+            &app.tree,
+            false,
+            false,
+            &app.open_prs,
+        )));
         let mut out = Vec::new();
         handle_server_event(
             &mut app,

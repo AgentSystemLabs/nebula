@@ -11,6 +11,7 @@ pub mod ipc;
 pub mod keymap;
 pub mod keys;
 pub mod links;
+pub mod pr_preview;
 pub mod pull_request;
 pub mod raw_attach;
 pub mod remote;
