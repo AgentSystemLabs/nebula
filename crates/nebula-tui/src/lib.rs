@@ -13,6 +13,7 @@ pub mod keys;
 pub mod links;
 pub mod pull_request;
 pub mod raw_attach;
+pub mod remote;
 pub mod review;
 pub mod splash;
 pub mod syntax;

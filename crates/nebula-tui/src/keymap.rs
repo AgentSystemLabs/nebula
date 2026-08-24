@@ -67,6 +67,7 @@ pub enum Action {
     ToggleDivider,
     Pin,
     GitDiff,
+    OpenRepo,
     Notes,
     // sessions
     NewTerminal,
@@ -254,6 +255,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["g"],
+    },
+    ActionSpec {
+        action: Action::OpenRepo,
+        id: "open_repo",
+        label: "Open repo in browser",
+        hint: "Send the selected repo's git remote (GitHub, GitLab, …) to your browser",
+        group: "PROJECTS & WORKTREES",
+        scope: Scope::Global,
+        defaults: &["shift+g"],
     },
     ActionSpec {
         action: Action::Notes,

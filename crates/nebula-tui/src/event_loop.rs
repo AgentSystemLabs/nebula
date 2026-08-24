@@ -1038,6 +1038,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::DeleteAll => open_delete_all_confirm(app),
         Action::ContextMenu => open_context_menu_for_selection(app),
         Action::GitDiff => open_diff_view(app),
+        Action::OpenRepo => open_repo_in_browser(app),
         // AddProject adds a project from ANY panel — unlike New it never
         // changes meaning with focus, matching the "open a repo" instinct.
         Action::AddProject => open_prompt(app, PromptKind::AddProject),
@@ -1198,6 +1199,30 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
     app.overlay = Some(Overlay::Prompt(PromptDialog::new(
         title, label, input, kind,
     )));
+}
+
+/// Open the selected repo's page on its git host (`G`). Any worktree
+/// answers, since every checkout of a project shares one remote — so the
+/// cursor's worktree decides, falling back to the project's own clone when
+/// it has no worktrees yet or the one selected is gone from disk.
+fn open_repo_in_browser(app: &mut App) {
+    let root = app
+        .selected_worktree()
+        .map(|w| w.path.clone())
+        .filter(|path| path.is_dir())
+        .or_else(|| app.selected_project().map(|p| p.repo_path.clone()));
+    let Some(root) = root else {
+        app.flash = Some("select a project or worktree first".into());
+        return;
+    };
+    match crate::remote::repo_url(&root) {
+        // Not open_link: this is a repo page, never a PR row to mark read.
+        Ok(url) if open_url(&url) => {
+            app.flash = Some(format!("opened {}", crate::app::pretty_url(&url)))
+        }
+        Ok(url) => app.flash = Some(format!("couldn't open {url}")),
+        Err(msg) => app.flash = Some(msg),
+    }
 }
 
 fn open_diff_view(app: &mut App) {
@@ -10712,6 +10737,37 @@ mod tests {
             "{:?}",
             app.flash
         );
+    }
+
+    /// `G` turns the checkout's remote into a page and hands it to the
+    /// browser (`open_url` is a no-op under test, so the flash is the
+    /// observable half).
+    #[test]
+    fn shift_g_opens_the_repos_remote_in_the_browser() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", "git@github.com:o/r.git"],
+        );
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('G'), KeyModifiers::SHIFT, &mut out);
+        assert_eq!(app.flash.as_deref(), Some("opened github.com/o/r"));
+        assert!(app.overlay.is_none(), "the browser is the whole feature");
+        assert!(out.is_empty(), "nothing to tell the daemon about");
+    }
+
+    #[test]
+    fn shift_g_without_a_remote_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('G'), KeyModifiers::SHIFT, &mut out);
+        assert_eq!(app.flash.as_deref(), Some("no git remote on this repo"));
     }
 
     /// The badge cache follows the checkout: dirty counts (staged, unstaged

@@ -440,6 +440,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[New]), "new worktree"),
                         (Act(&[Notes]), "notes for the worktree"),
                         (Act(&[GitDiff]), "git diff (^r: mark reviewed ✓)"),
+                        (Act(&[OpenRepo]), "open the repo on GitHub"),
                         (Act(&[Pin]), "pin / unpin"),
                         (Act(&[Delete, DeleteAll]), "delete one / delete all"),
                     ],
