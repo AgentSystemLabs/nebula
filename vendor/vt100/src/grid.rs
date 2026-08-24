@@ -76,7 +76,7 @@ impl Grid {
 
         self.size = size;
         for row in &mut self.rows {
-            row.resize(size.cols, crate::cell::Cell::default());
+            row.resize(size.cols, crate::Cell::new());
         }
         self.rows.resize(usize::from(size.rows), self.new_row());
 
@@ -90,6 +90,13 @@ impl Grid {
         self.row_clamp_top(false);
         self.row_clamp_bottom(false);
         self.col_clamp();
+
+        if self.saved_pos.row > self.size.rows - 1 {
+            self.saved_pos.row = self.size.rows - 1;
+        }
+        if self.saved_pos.col > self.size.cols - 1 {
+            self.saved_pos.col = self.size.cols - 1;
+        }
     }
 
     pub fn pos(&self) -> Pos {
@@ -122,7 +129,18 @@ impl Grid {
         self.scrollback
             .iter()
             .skip(scrollback_len - self.scrollback_offset)
-            .chain(self.rows.iter().take(rows_len - self.scrollback_offset))
+            // when scrollback_offset > rows_len (e.g. rows = 3,
+            // scrollback_len = 10, offset = 9) the skip(10 - 9)
+            // will take 9 rows instead of 3. we need to set
+            // the upper bound to rows_len (e.g. 3)
+            .take(rows_len)
+            // same for rows_len - scrollback_offset (e.g. 3 - 9).
+            // it'll panic with overflow. we have to saturate the subtraction.
+            .chain(
+                self.rows
+                    .iter()
+                    .take(rows_len.saturating_sub(self.scrollback_offset)),
+            )
     }
 
     pub fn drawing_rows(&self) -> impl Iterator<Item = &crate::row::Row> {
@@ -156,18 +174,15 @@ impl Grid {
             .unwrap()
     }
 
-    pub fn visible_cell(&self, pos: Pos) -> Option<&crate::cell::Cell> {
+    pub fn visible_cell(&self, pos: Pos) -> Option<&crate::Cell> {
         self.visible_row(pos.row).and_then(|r| r.get(pos.col))
     }
 
-    pub fn drawing_cell(&self, pos: Pos) -> Option<&crate::cell::Cell> {
+    pub fn drawing_cell(&self, pos: Pos) -> Option<&crate::Cell> {
         self.drawing_row(pos.row).and_then(|r| r.get(pos.col))
     }
 
-    pub fn drawing_cell_mut(
-        &mut self,
-        pos: Pos,
-    ) -> Option<&mut crate::cell::Cell> {
+    pub fn drawing_cell_mut(&mut self, pos: Pos) -> Option<&mut crate::Cell> {
         self.drawing_row_mut(pos.row)
             .and_then(|r| r.get_mut(pos.col))
     }
@@ -203,8 +218,8 @@ impl Grid {
         &self,
         contents: &mut Vec<u8>,
     ) -> crate::attrs::Attrs {
-        crate::term::ClearAttrs::default().write_buf(contents);
-        crate::term::ClearScreen::default().write_buf(contents);
+        crate::term::ClearAttrs.write_buf(contents);
+        crate::term::ClearScreen.write_buf(contents);
 
         let mut prev_attrs = crate::attrs::Attrs::default();
         let mut prev_pos = Pos::default();
@@ -421,10 +436,10 @@ impl Grid {
                     end_cell
                         .attrs()
                         .write_escape_code_diff(contents, &prev_attrs);
-                    crate::term::SaveCursor::default().write_buf(contents);
-                    crate::term::Backspace::default().write_buf(contents);
+                    crate::term::SaveCursor.write_buf(contents);
+                    crate::term::Backspace.write_buf(contents);
                     crate::term::EraseChar::new(1).write_buf(contents);
-                    crate::term::RestoreCursor::default().write_buf(contents);
+                    crate::term::RestoreCursor.write_buf(contents);
                     prev_attrs
                         .write_escape_code_diff(contents, end_cell.attrs());
                 }
@@ -499,7 +514,7 @@ impl Grid {
             if wide {
                 row.get_mut(pos.col).unwrap().set_wide_continuation(false);
             }
-            row.insert(pos.col, crate::cell::Cell::default());
+            row.insert(pos.col, crate::Cell::new());
             if wide {
                 row.get_mut(pos.col).unwrap().set_wide_continuation(true);
             }
@@ -514,7 +529,7 @@ impl Grid {
         for _ in 0..(count.min(size.cols - pos.col)) {
             row.remove(pos.col);
         }
-        row.resize(size.cols, crate::cell::Cell::default());
+        row.resize(size.cols, crate::Cell::new());
     }
 
     pub fn erase_cells(&mut self, count: u16, attrs: crate::attrs::Attrs) {
@@ -596,7 +611,7 @@ impl Grid {
     }
 
     // NEBULA PATCH: no longer used by scroll_up; kept to minimize the diff
-    // from upstream 0.15.2.
+    // from upstream 0.16.2.
     #[allow(dead_code)]
     fn scroll_region_active(&self) -> bool {
         self.scroll_top != 0 || self.scroll_bottom != self.size.rows - 1
@@ -635,11 +650,7 @@ impl Grid {
         let in_scroll_region = self.in_scroll_region();
         // need to account for clamping by both row_clamp_top and by
         // saturating_sub
-        let extra_lines = if count > self.pos.row {
-            count - self.pos.row
-        } else {
-            0
-        };
+        let extra_lines = count.saturating_sub(self.pos.row);
         self.pos.row = self.pos.row.saturating_sub(count);
         let lines = self.row_clamp_top(in_scroll_region);
         self.scroll_down(lines + extra_lines);

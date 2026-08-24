@@ -9,6 +9,7 @@
 
 use nebula_core::AgentKind;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Fallback for `recent_window` when the value is missing or malformed.
@@ -53,7 +54,7 @@ pub fn effort_choices(kind: AgentKind) -> &'static [&'static str] {
     }
 }
 
-/// One setting row in the overlay; rows live inside a [`SettingGroup`].
+/// One setting row in the overlay; rows live inside a [`SettingsTab`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SettingSpec {
     pub kind: SettingKind,
@@ -61,13 +62,22 @@ pub struct SettingSpec {
     pub hint: &'static str,
 }
 
-/// A titled section of the settings overlay, Help-menu style. Flat
-/// setting indices (selection, `Config::cycle`) run through the groups
-/// in declaration order.
+/// What a tab shows. Ordinary tabs are a list of value settings; the
+/// Hotkeys tab is generated from [`crate::keymap::ACTIONS`] instead, so a
+/// new action shows up there without being declared twice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SettingGroup {
+pub enum TabBody {
+    Values(&'static [SettingSpec]),
+    Hotkeys,
+}
+
+/// One tab of the settings overlay. Selection indices are per-tab: within
+/// a `Values` tab they index its settings, within `Hotkeys` they index
+/// `keymap::ACTIONS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingsTab {
     pub title: &'static str,
-    pub settings: &'static [SettingSpec],
+    pub body: TabBody,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,10 +97,13 @@ pub enum SettingKind {
     CodexEffort,
 }
 
-pub const SETTING_GROUPS: &[SettingGroup] = &[
-    SettingGroup {
-        title: "GENERAL",
-        settings: &[
+/// The tab strip, left to right. Ordered by how often a setting gets
+/// touched, with Hotkeys last because it is the biggest and the least
+/// casual.
+pub const SETTINGS_TABS: &[SettingsTab] = &[
+    SettingsTab {
+        title: "General",
+        body: TabBody::Values(&[
             SettingSpec {
                 kind: SettingKind::PaletteEnterAttaches,
                 label: "Search Enter attaches",
@@ -106,11 +119,11 @@ pub const SETTING_GROUPS: &[SettingGroup] = &[
                 label: "File editor",
                 hint: "Editor f/b/F and ⌥click launch (NEBULA_EDITOR overrides)",
             },
-        ],
+        ]),
     },
-    SettingGroup {
-        title: "SESSIONS",
-        settings: &[
+    SettingsTab {
+        title: "Sessions",
+        body: TabBody::Values(&[
             SettingSpec {
                 kind: SettingKind::SkipSessionNaming,
                 label: "Skip session naming",
@@ -126,11 +139,11 @@ pub const SETTING_GROUPS: &[SettingGroup] = &[
                 label: "Idle session timeout",
                 hint: "Kill idle sessions in unviewed worktrees (pinned/busy spared; off disables)",
             },
-        ],
+        ]),
     },
-    SettingGroup {
-        title: "APPEARANCE",
-        settings: &[
+    SettingsTab {
+        title: "Appearance",
+        body: TabBody::Values(&[
             SettingSpec {
                 kind: SettingKind::Theme,
                 label: "Color theme",
@@ -146,11 +159,11 @@ pub const SETTING_GROUPS: &[SettingGroup] = &[
                 label: "Focused panel tint",
                 hint: "Faint accent-colored background on the focused panel",
             },
-        ],
+        ]),
     },
-    SettingGroup {
-        title: "AGENT DEFAULTS",
-        settings: &[
+    SettingsTab {
+        title: "Agents",
+        body: TabBody::Values(&[
             SettingSpec {
                 kind: SettingKind::ClaudeModel,
                 label: "Claude model",
@@ -171,22 +184,79 @@ pub const SETTING_GROUPS: &[SettingGroup] = &[
                 label: "Codex effort",
                 hint: "Default reasoning effort for new Codex sessions",
             },
-        ],
+        ]),
+    },
+    SettingsTab {
+        title: "Hotkeys",
+        body: TabBody::Hotkeys,
     },
 ];
 
-/// All settings in flat display order (the order selection indices use).
-pub fn settings() -> impl Iterator<Item = &'static SettingSpec> {
-    SETTING_GROUPS.iter().flat_map(|g| g.settings.iter())
+/// Index of the Hotkeys tab, which the overlay special-cases.
+pub fn hotkeys_tab() -> usize {
+    SETTINGS_TABS
+        .iter()
+        .position(|t| t.body == TabBody::Hotkeys)
+        .expect("SETTINGS_TABS declares a Hotkeys tab")
 }
 
-pub fn settings_len() -> usize {
-    settings().count()
+pub fn tab_count() -> usize {
+    SETTINGS_TABS.len()
 }
 
-/// The setting at a flat display index, if any.
-pub fn setting_at(index: usize) -> Option<&'static SettingSpec> {
-    settings().nth(index)
+/// The value settings of a tab; empty for the Hotkeys tab.
+pub fn tab_settings(tab: usize) -> &'static [SettingSpec] {
+    match SETTINGS_TABS.get(tab).map(|t| t.body) {
+        Some(TabBody::Values(settings)) => settings,
+        _ => &[],
+    }
+}
+
+/// How many selectable rows a tab holds.
+pub fn tab_len(tab: usize) -> usize {
+    match SETTINGS_TABS.get(tab).map(|t| t.body) {
+        Some(TabBody::Values(settings)) => settings.len(),
+        Some(TabBody::Hotkeys) => crate::keymap::ACTIONS.len(),
+        None => 0,
+    }
+}
+
+/// The value setting at a tab-local index, if the tab has one there.
+pub fn setting_at(tab: usize, index: usize) -> Option<&'static SettingSpec> {
+    tab_settings(tab).get(index)
+}
+
+/// Where a setting lives, as `(tab, row)`. The overlay addresses settings
+/// by position, so anything that wants to talk about one by name — tests,
+/// and anything that ever jumps the cursor to a named setting — goes
+/// through here rather than hardcoding an index.
+pub fn locate(kind: SettingKind) -> Option<(usize, usize)> {
+    SETTINGS_TABS.iter().enumerate().find_map(|(t, tab)| {
+        match tab.body {
+            TabBody::Values(settings) => settings.iter().position(|s| s.kind == kind),
+            TabBody::Hotkeys => None,
+        }
+        .map(|i| (t, i))
+    })
+}
+
+/// Every value setting, tab by tab, for coverage checks.
+pub fn all_settings() -> impl Iterator<Item = (usize, usize, &'static SettingSpec)> {
+    SETTINGS_TABS.iter().enumerate().flat_map(|(t, tab)| {
+        tab_settings(t).iter().enumerate().map(move |(i, s)| {
+            let _ = tab;
+            (t, i, s)
+        })
+    })
+}
+
+/// The one-line hint under the selected row, whatever kind of row it is.
+pub fn hint_at(tab: usize, index: usize) -> &'static str {
+    match SETTINGS_TABS.get(tab).map(|t| t.body) {
+        Some(TabBody::Values(settings)) => settings.get(index).map(|s| s.hint).unwrap_or(""),
+        Some(TabBody::Hotkeys) => crate::keymap::spec_at(index).map(|s| s.hint).unwrap_or(""),
+        None => "",
+    }
 }
 
 /// One terminal row of the settings overlay body, in display order.
@@ -195,24 +265,45 @@ pub fn setting_at(index: usize) -> Option<&'static SettingSpec> {
 pub enum SettingsRow {
     Blank,
     Header(&'static str),
-    /// Label + value line for the setting at this flat index.
+    /// Label + value line for the value setting at this tab-local index.
     Setting(usize),
+    /// Label + chord list for `keymap::ACTIONS[index]`.
+    Hotkey(usize),
 }
 
-pub fn settings_rows() -> Vec<SettingsRow> {
-    let mut rows = Vec::new();
-    let mut index = 0;
-    for (gi, group) in SETTING_GROUPS.iter().enumerate() {
-        if gi > 0 {
-            rows.push(SettingsRow::Blank);
-        }
-        rows.push(SettingsRow::Header(group.title));
-        for _ in group.settings {
-            rows.push(SettingsRow::Setting(index));
-            index += 1;
+impl SettingsRow {
+    /// The tab-local selection index this row stands for, if it's one the
+    /// cursor can land on.
+    pub fn index(self) -> Option<usize> {
+        match self {
+            SettingsRow::Setting(i) | SettingsRow::Hotkey(i) => Some(i),
+            _ => None,
         }
     }
-    rows
+}
+
+pub fn settings_rows(tab: usize) -> Vec<SettingsRow> {
+    match SETTINGS_TABS.get(tab).map(|t| t.body) {
+        Some(TabBody::Values(settings)) => (0..settings.len()).map(SettingsRow::Setting).collect(),
+        Some(TabBody::Hotkeys) => {
+            // The action table is already grouped; emit a header whenever
+            // the group name changes.
+            let mut rows = Vec::new();
+            let mut group: Option<&'static str> = None;
+            for (i, spec) in crate::keymap::ACTIONS.iter().enumerate() {
+                if group != Some(spec.group) {
+                    if group.is_some() {
+                        rows.push(SettingsRow::Blank);
+                    }
+                    rows.push(SettingsRow::Header(spec.group));
+                    group = Some(spec.group);
+                }
+                rows.push(SettingsRow::Hotkey(i));
+            }
+            rows
+        }
+        None => Vec::new(),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -267,6 +358,12 @@ pub struct Config {
     pub claude_effort: String,
     pub codex_model: String,
     pub codex_effort: String,
+    /// Hotkey overrides, keyed by `keymap::ActionSpec::id`; the value is a
+    /// comma-separated chord list (`"j, down"`), and an empty string means
+    /// deliberately unbound. Only rows that differ from the defaults are
+    /// written, so the file stays small and new defaults reach existing
+    /// installs. See [`crate::keymap`].
+    pub keybindings: BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -285,6 +382,7 @@ impl Default for Config {
             claude_effort: "default".into(),
             codex_model: "default".into(),
             codex_effort: "default".into(),
+            keybindings: BTreeMap::new(),
         }
     }
 }
@@ -346,6 +444,7 @@ impl Config {
         );
         obj.insert("codex_model".into(), serde_json::json!(self.codex_model));
         obj.insert("codex_effort".into(), serde_json::json!(self.codex_effort));
+        obj.insert("keybindings".into(), serde_json::json!(self.keybindings));
         let mut bytes = serde_json::to_vec_pretty(&root)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
         if !bytes.ends_with(b"\n") {
@@ -395,6 +494,12 @@ impl Config {
         non_default(value)
     }
 
+    /// Hotkeys as the event loop dispatches them: defaults with this
+    /// config's overrides applied.
+    pub fn keymap(&self) -> crate::keymap::Keymap {
+        crate::keymap::Keymap::from_overrides(&self.keybindings)
+    }
+
     pub fn value_label(&self, kind: SettingKind) -> String {
         match kind {
             SettingKind::PaletteEnterAttaches => on_off(self.palette_enter_attaches).into(),
@@ -414,9 +519,10 @@ impl Config {
     }
 
     /// `delta == 0` means activate (toggle a bool, cycle a choice forward).
-    /// Non-zero delta cycles a choice; bools still toggle.
-    pub fn cycle(&mut self, index: usize, delta: i32) {
-        let Some(spec) = setting_at(index) else {
+    /// Non-zero delta cycles a choice; bools still toggle. `index` is
+    /// tab-local — the Hotkeys tab has no cyclable values and no-ops here.
+    pub fn cycle(&mut self, tab: usize, index: usize, delta: i32) {
+        let Some(spec) = setting_at(tab, index) else {
             return;
         };
         let step = if delta == 0 { 1 } else { delta };
@@ -551,6 +657,7 @@ pub fn with_config_path<T>(path: PathBuf, f: impl FnOnce() -> T) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keymap::Keymap;
 
     #[test]
     fn defaults_enter_attaches() {
@@ -578,11 +685,9 @@ mod tests {
         assert!(!cfg.skip_session_naming);
 
         let mut cfg = Config::default();
-        let row = settings()
-            .position(|s| s.kind == SettingKind::SkipSessionNaming)
-            .unwrap();
+        let (tab, row) = locate(SettingKind::SkipSessionNaming).unwrap();
         assert_eq!(cfg.value_label(SettingKind::SkipSessionNaming), "off");
-        cfg.cycle(row, 0);
+        cfg.cycle(tab, row, 0);
         assert!(cfg.skip_session_naming);
         assert_eq!(cfg.value_label(SettingKind::SkipSessionNaming), "on");
 
@@ -618,21 +723,20 @@ mod tests {
     #[test]
     fn cycle_toggles_bools_and_walks_recent_window() {
         let mut cfg = Config::default();
+        let (t, r) = locate(SettingKind::PaletteEnterAttaches).unwrap();
         assert!(cfg.palette_enter_attaches);
-        cfg.cycle(0, 0);
+        cfg.cycle(t, r, 0);
         assert!(!cfg.palette_enter_attaches);
-        cfg.cycle(0, 1);
+        cfg.cycle(t, r, 1);
         assert!(cfg.palette_enter_attaches);
 
         assert_eq!(cfg.recent_window, "30m");
-        let row = settings()
-            .position(|s| s.kind == SettingKind::RecentWindow)
-            .unwrap();
-        cfg.cycle(row, 0);
+        let (t, r) = locate(SettingKind::RecentWindow).unwrap();
+        cfg.cycle(t, r, 0);
         assert_eq!(cfg.recent_window, "1h");
-        cfg.cycle(row, -1);
+        cfg.cycle(t, r, -1);
         assert_eq!(cfg.recent_window, "30m");
-        cfg.cycle(row, -1);
+        cfg.cycle(t, r, -1);
         assert_eq!(cfg.recent_window, "10m");
     }
 
@@ -640,16 +744,14 @@ mod tests {
     fn editor_defaults_cycles_and_persists() {
         let mut cfg = Config::default();
         assert_eq!(cfg.editor, "vim");
-        let row = settings()
-            .position(|s| s.kind == SettingKind::Editor)
-            .unwrap();
-        cfg.cycle(row, 1);
+        let (tab, row) = locate(SettingKind::Editor).unwrap();
+        cfg.cycle(tab, row, 1);
         assert_eq!(cfg.editor, "nvim");
-        cfg.cycle(row, -1);
+        cfg.cycle(tab, row, -1);
         assert_eq!(cfg.editor, "vim");
         // Hand-edited commands the picker doesn't list cycle from the start.
         cfg.editor = "kak".into();
-        cfg.cycle(row, 1);
+        cfg.cycle(tab, row, 1);
         assert_eq!(cfg.editor, "nvim");
 
         cfg.editor = "nvim".into();
@@ -674,14 +776,12 @@ mod tests {
     fn session_idle_timeout_cycles_and_persists() {
         let mut cfg = Config::default();
         assert_eq!(cfg.session_idle_timeout, "5m");
-        let row = settings()
-            .position(|s| s.kind == SettingKind::SessionIdleTimeout)
-            .unwrap();
-        cfg.cycle(row, 1);
+        let (tab, row) = locate(SettingKind::SessionIdleTimeout).unwrap();
+        cfg.cycle(tab, row, 1);
         assert_eq!(cfg.session_idle_timeout, "15m");
-        cfg.cycle(row, -2);
+        cfg.cycle(tab, row, -2);
         assert_eq!(cfg.session_idle_timeout, "1m");
-        cfg.cycle(row, -1);
+        cfg.cycle(tab, row, -1);
         assert_eq!(cfg.session_idle_timeout, "off");
 
         let dir = tempfile::tempdir().unwrap();
@@ -695,13 +795,11 @@ mod tests {
         let mut cfg = Config::default();
         assert_eq!(cfg.theme, "default");
         assert_eq!(cfg.theme(), crate::theme::Theme::default());
-        let theme_row = settings()
-            .position(|s| s.kind == SettingKind::Theme)
-            .unwrap();
-        cfg.cycle(theme_row, 1);
+        let (tab, theme_row) = locate(SettingKind::Theme).unwrap();
+        cfg.cycle(tab, theme_row, 1);
         assert_eq!(cfg.theme, "ocean");
         assert_ne!(cfg.theme(), crate::theme::Theme::default());
-        cfg.cycle(theme_row, -1);
+        cfg.cycle(tab, theme_row, -1);
         assert_eq!(cfg.theme, "default");
         // Unknown names (hand-edited config) cycle from the start and
         // resolve to the default palette rather than erroring.
@@ -713,10 +811,8 @@ mod tests {
     fn animations_default_on_toggle_and_persist() {
         let mut cfg = Config::default();
         assert!(cfg.animations);
-        let row = settings()
-            .position(|s| s.kind == SettingKind::Animations)
-            .unwrap();
-        cfg.cycle(row, 0);
+        let (tab, row) = locate(SettingKind::Animations).unwrap();
+        cfg.cycle(tab, row, 0);
         assert!(!cfg.animations);
 
         let dir = tempfile::tempdir().unwrap();
@@ -732,10 +828,8 @@ mod tests {
     fn focus_tint_default_off_toggle_and_persist() {
         let mut cfg = Config::default();
         assert!(!cfg.focus_tint);
-        let row = settings()
-            .position(|s| s.kind == SettingKind::FocusTint)
-            .unwrap();
-        cfg.cycle(row, 0);
+        let (tab, row) = locate(SettingKind::FocusTint).unwrap();
+        cfg.cycle(tab, row, 0);
         assert!(cfg.focus_tint);
 
         let dir = tempfile::tempdir().unwrap();
@@ -773,18 +867,14 @@ mod tests {
         assert_eq!(cfg.default_effort(AgentKind::Cursor), None);
 
         // The settings rows walk the same choice lists the submenus show.
-        let row = settings()
-            .position(|s| s.kind == SettingKind::ClaudeModel)
-            .unwrap();
+        let (tab, row) = locate(SettingKind::ClaudeModel).unwrap();
         cfg.claude_model = "default".into();
-        cfg.cycle(row, 1);
+        cfg.cycle(tab, row, 1);
         assert_eq!(cfg.claude_model, "fable");
-        cfg.cycle(row, -1);
+        cfg.cycle(tab, row, -1);
         assert_eq!(cfg.claude_model, "default");
-        let row = settings()
-            .position(|s| s.kind == SettingKind::CodexEffort)
-            .unwrap();
-        cfg.cycle(row, 0);
+        let (tab, row) = locate(SettingKind::CodexEffort).unwrap();
+        cfg.cycle(tab, row, 0);
         assert_eq!(
             cfg.codex_effort, "xhigh",
             "activate steps forward from high"
@@ -838,28 +928,81 @@ mod tests {
     }
 
     #[test]
-    fn groups_cover_every_setting_once_and_rows_match() {
-        // Every SettingKind appears exactly once across the groups.
-        let mut kinds: Vec<SettingKind> = settings().map(|s| s.kind).collect();
-        assert_eq!(kinds.len(), settings_len());
+    fn tabs_cover_every_setting_once_and_rows_match() {
+        // Every SettingKind appears exactly once across the tabs.
+        let mut kinds: Vec<SettingKind> = all_settings().map(|(_, _, s)| s.kind).collect();
+        let total = kinds.len();
+        kinds.sort_by_key(|k| format!("{k:?}"));
         kinds.dedup();
-        assert_eq!(kinds.len(), settings_len(), "a kind repeats across groups");
+        assert_eq!(kinds.len(), total, "a kind repeats across tabs");
 
-        // The overlay rows walk the same flat order: one Setting(i) per
-        // index, in order, with a header starting each group.
-        let indices: Vec<usize> = settings_rows()
-            .into_iter()
-            .filter_map(|row| match row {
-                SettingsRow::Setting(i) => Some(i),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(indices, (0..settings_len()).collect::<Vec<_>>());
-        let headers = settings_rows()
-            .into_iter()
-            .filter(|row| matches!(row, SettingsRow::Header(_)))
-            .count();
-        assert_eq!(headers, SETTING_GROUPS.len());
+        // Each tab's rows walk its own index space, in order.
+        for (t, tab) in SETTINGS_TABS.iter().enumerate() {
+            let indices: Vec<usize> = settings_rows(t)
+                .into_iter()
+                .filter_map(|row| row.index())
+                .collect();
+            assert_eq!(
+                indices,
+                (0..tab_len(t)).collect::<Vec<_>>(),
+                "{} rows",
+                tab.title
+            );
+        }
+
+        // Value tabs are a bare list; only Hotkeys carries headers.
+        for (t, tab) in SETTINGS_TABS.iter().enumerate() {
+            let headers = settings_rows(t)
+                .into_iter()
+                .filter(|row| matches!(row, SettingsRow::Header(_)))
+                .count();
+            match tab.body {
+                TabBody::Values(_) => assert_eq!(headers, 0, "{}", tab.title),
+                TabBody::Hotkeys => assert!(headers > 0, "hotkeys tab groups its rows"),
+            }
+        }
+    }
+
+    #[test]
+    fn every_tab_holds_something() {
+        assert!(tab_count() >= 2);
+        for (t, tab) in SETTINGS_TABS.iter().enumerate() {
+            assert!(tab_len(t) > 0, "{} is empty", tab.title);
+            assert!(!tab.title.is_empty());
+        }
+        assert_eq!(tab_len(hotkeys_tab()), crate::keymap::ACTIONS.len());
+    }
+
+    #[test]
+    fn keybindings_round_trip_through_the_config_file() {
+        let mut cfg = Config::default();
+        assert!(cfg.keybindings.is_empty(), "no overrides out of the box");
+        let mut keymap = cfg.keymap();
+        let quit = crate::keymap::index_of(crate::keymap::Action::Quit).unwrap();
+        keymap.bind(quit, crate::keymap::KeyChord::parse("f9").unwrap(), false);
+        cfg.keybindings = keymap.overrides();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let reloaded = load_from(&path);
+        assert_eq!(
+            reloaded.keybindings.get("quit").map(String::as_str),
+            Some("f9")
+        );
+        assert_eq!(
+            reloaded.keymap().lookup(
+                crate::keymap::Scope::Global,
+                &crate::keymap::KeyChord::parse("f9").unwrap()
+            ),
+            Some(crate::keymap::Action::Quit)
+        );
+        // A config predating the key still gets the full default keymap.
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            old.keymap().label(crate::keymap::Action::Quit),
+            Keymap::default().label(crate::keymap::Action::Quit)
+        );
     }
 
     #[test]

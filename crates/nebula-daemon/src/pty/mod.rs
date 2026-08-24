@@ -1,9 +1,11 @@
 pub mod kitty;
+pub mod progress;
 pub mod ring;
 
 use anyhow::{Context, Result};
 use nebula_core::SessionRef;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use progress::ProgressScanner;
 use ring::ScrollbackRing;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -37,6 +39,12 @@ pub enum PtyEvent {
     KittyFlags {
         flags: u8,
     },
+    /// The child's OSC 9;4 progress state flipped. For agent CLIs this is a
+    /// busy/idle edge the status machine trusts — notably it is the *only*
+    /// end-of-turn signal after the user cancels, which fires no hook.
+    Progress {
+        busy: bool,
+    },
 }
 
 enum ReaderMsg {
@@ -59,6 +67,8 @@ pub struct PtySession {
     last_size: Mutex<(u16, u16)>,
     /// Kitty keyboard negotiation state, fed by the pump from live output.
     kitty: Mutex<kitty::KittyScanner>,
+    /// OSC 9;4 busy/idle tracking, likewise fed from live output.
+    progress: Mutex<ProgressScanner>,
 }
 
 pub struct SpawnSpec {
@@ -119,6 +129,7 @@ impl PtySession {
             events,
             last_size: Mutex::new((spec.cols, spec.rows)),
             kitty: Mutex::new(kitty::KittyScanner::new()),
+            progress: Mutex::new(ProgressScanner::new()),
         });
 
         let (tx, rx) = mpsc::channel::<ReaderMsg>(READER_CHANNEL_BOUND);
@@ -221,6 +232,12 @@ impl PtySession {
     pub fn kitty_flags(&self) -> u8 {
         self.kitty.lock().unwrap().flags()
     }
+
+    /// The child's advertised OSC 9;4 busy state, or `None` if it never
+    /// advertised one (a CLI without a progress bar, or one not started yet).
+    pub fn progress_busy(&self) -> Option<bool> {
+        self.progress.lock().unwrap().busy()
+    }
 }
 
 /// PTY reads are blocking → dedicated thread per session. After EOF it reaps
@@ -271,6 +288,7 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
                 tracing::warn!(error = %e, "kitty/DA reply write failed");
             }
         }
+        let busy_edge = session.progress.lock().unwrap().feed(pending);
         let seq = session.ring.lock().unwrap().append(pending);
         let _ = session.events.send(PtyEvent::Output {
             seq,
@@ -279,6 +297,10 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
         if let Some(flags) = actions.flags_changed {
             tracing::debug!(session = ?session.sref, flags, "child kitty flags changed");
             let _ = session.events.send(PtyEvent::KittyFlags { flags });
+        }
+        if let Some(busy) = busy_edge {
+            tracing::debug!(session = ?session.sref, busy, "child progress state changed");
+            let _ = session.events.send(PtyEvent::Progress { busy });
         }
     };
 

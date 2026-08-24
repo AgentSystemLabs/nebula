@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Note, NoteId, NoteOwner, Project,
+    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Note, NoteId, NoteOwner, PrSeen, Project,
     ProjectId, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
     DEFAULT_WORKSPACE_ID,
 };
@@ -184,6 +184,17 @@ const MIGRATIONS: &[&str] = &[
       url         TEXT NOT NULL,
       sort_order  INTEGER NOT NULL DEFAULT 0,
       created_at  INTEGER NOT NULL
+    );
+    ",
+    // 17: how far the user has read into a pull request's conversation.
+    // Keyed by URL rather than worktree — the PR is the thing that grows
+    // comments, it outlives the checkout, and the same one can be pinned to
+    // more than one of them.
+    "
+    CREATE TABLE pr_seen (
+      url      TEXT PRIMARY KEY,
+      marker   TEXT NOT NULL,
+      seen_at  INTEGER NOT NULL
     );
     ",
 ];
@@ -804,6 +815,34 @@ impl Store {
         Ok(links)
     }
 
+    // ---- pull-request read marks ----
+
+    /// Remember that this pull request's conversation has been read up to
+    /// `marker`. Idempotent, and an empty marker is a real answer: it says
+    /// the PR was opened while nobody had posted on it yet.
+    pub fn mark_pr_seen(&self, url: &str, marker: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO pr_seen (url, marker, seen_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(url) DO UPDATE SET marker = excluded.marker, seen_at = excluded.seen_at",
+            params![url, marker, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_pr_seen(&self) -> Result<Vec<PrSeen>> {
+        let conn = self.conn.lock().unwrap();
+        let seen = conn
+            .prepare("SELECT url, marker FROM pr_seen")?
+            .query_map([], |r| {
+                Ok(PrSeen {
+                    url: r.get(0)?,
+                    marker: r.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(seen)
+    }
+
     // ---- point lookups ----
 
     pub fn get_project(&self, id: &ProjectId) -> Result<Option<Project>> {
@@ -1144,6 +1183,32 @@ mod tests {
         store.insert_note(&note).unwrap();
         store.delete_project(&project.id).unwrap();
         assert!(store.load_notes().unwrap().is_empty());
+    }
+
+    /// Read marks are keyed by PR URL and outlive the worktree they were
+    /// noticed on, so they live in their own table with no foreign key: no
+    /// row here is ever cascaded away by a checkout being deleted.
+    #[test]
+    fn pr_seen_marks_roundtrip_and_overwrite() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.load_pr_seen().unwrap().is_empty());
+
+        let url = "https://github.com/o/r/pull/7";
+        store.mark_pr_seen(url, "2024-04-25T19:55:42Z").unwrap();
+        let seen = store.load_pr_seen().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].url, url);
+        assert_eq!(seen[0].marker, "2024-04-25T19:55:42Z");
+
+        // Opening it again moves the mark rather than adding a second row.
+        store.mark_pr_seen(url, "2024-04-27T09:00:00Z").unwrap();
+        let seen = store.load_pr_seen().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].marker, "2024-04-27T09:00:00Z");
+
+        // An empty marker is a real answer: opened, nobody had posted yet.
+        store.mark_pr_seen(url, "").unwrap();
+        assert_eq!(store.load_pr_seen().unwrap()[0].marker, "");
     }
 
     #[test]

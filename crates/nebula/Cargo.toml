@@ -23,4 +23,4 @@ tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
 portable-pty = "0.9"
-vt100 = "0.15"
+vt100 = "0.16"

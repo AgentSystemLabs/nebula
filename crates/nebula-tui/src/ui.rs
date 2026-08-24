@@ -5,6 +5,7 @@ use crate::app::{
     App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, ProjectRow, SessionRow,
 };
 use crate::git_diff::{classify_diff_line, DiffLineKind};
+use crate::keymap::Action;
 use crate::text_input::TextInput;
 use crate::theme::Theme;
 use nebula_core::{AgentStatus, SessionRef};
@@ -396,39 +397,51 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // Grouped keymap in two columns: reads by task instead of one
             // giant list, and at ~24 rows it fits a stock terminal window
             // (the old single list clipped its tail on short screens).
-            type HelpSection = (&'static str, &'static [(&'static str, &'static str)]);
+            // Key columns come from the live keymap, not hardcoded text:
+            // every one of these is rebindable in Settings → Hotkeys, and
+            // help that lies about that is worse than no help. Literals
+            // are for keys that belong to an overlay rather than the
+            // panels, which is why they aren't rebindable.
+            use crate::keymap::Action::*;
+            enum HelpKeys {
+                Lit(&'static str),
+                Act(&'static [crate::keymap::Action]),
+            }
+            use HelpKeys::{Act, Lit};
+            type HelpSection = (&'static str, &'static [(HelpKeys, &'static str)]);
             const LEFT: &[HelpSection] = &[
                 (
                     "NAVIGATE & SEARCH",
                     &[
-                        ("Tab / ⇧Tab", "cycle focus between panels"),
-                        ("←↓↑→ / jkl", "move focus / selection"),
-                        ("Enter", "drill in / attach session"),
-                        ("/", "fuzzy jump to anything"),
-                        ("^o / ^f", "jump pick: open / focus row"),
-                        ("f", "find file (^y copies path)"),
-                        ("F", "find in files (git grep)"),
-                        ("b", "file tree browser"),
+                        (Act(&[FocusNext, FocusPrev]), "cycle focus between panels"),
+                        (Act(&[FocusLeft, FocusRight]), "move focus left / right"),
+                        (Act(&[MoveDown, MoveUp]), "move selection"),
+                        (Act(&[Activate]), "drill in / attach session"),
+                        (Act(&[Palette]), "fuzzy jump to anything"),
+                        (Lit("^o / ^f"), "jump pick: open / focus row"),
+                        (Act(&[FindFile]), "find file (^y copies path)"),
+                        (Act(&[Grep]), "find in files (git grep)"),
+                        (Act(&[TreeBrowser]), "file tree browser"),
                     ],
                 ),
                 (
                     "PROJECTS",
                     &[
-                        ("n / o", "add project (o: from anywhere)"),
-                        ("e", "project-level notes"),
-                        ("⇧J/K", "reorder project"),
-                        ("-", "divider below (Enter/r: label)"),
-                        ("d / ⌫", "remove from list"),
+                        (Act(&[New, AddProject]), "add project (2nd: from anywhere)"),
+                        (Act(&[Notes]), "project-level notes"),
+                        (Act(&[MoveProjectDown, MoveProjectUp]), "reorder project"),
+                        (Act(&[ToggleDivider]), "divider below (Enter/r: label)"),
+                        (Act(&[Delete]), "remove from list"),
                     ],
                 ),
                 (
                     "WORKTREES",
                     &[
-                        ("n", "new worktree"),
-                        ("e", "notes for the worktree"),
-                        ("g", "git diff (^r: mark reviewed ✓)"),
-                        ("p", "pin / unpin"),
-                        ("d / D", "delete one / delete all"),
+                        (Act(&[New]), "new worktree"),
+                        (Act(&[Notes]), "notes for the worktree"),
+                        (Act(&[GitDiff]), "git diff (^r: mark reviewed ✓)"),
+                        (Act(&[Pin]), "pin / unpin"),
+                        (Act(&[Delete, DeleteAll]), "delete one / delete all"),
                     ],
                 ),
                 (
@@ -436,8 +449,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     // same line editor (text_input.rs).
                     "TYPING IN A FIELD",
                     &[
-                        ("←→ / ⌥←→", "move by character / by word"),
-                        ("^a^e ⌥⌫ ^u^k", "ends · del word · kill line"),
+                        (Lit("←→ / ⌥←→"), "move by character / by word"),
+                        (Lit("^a^e ⌥⌫ ^u^k"), "ends · del word · kill line"),
                     ],
                 ),
             ];
@@ -445,40 +458,55 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 (
                     "SESSIONS",
                     &[
-                        ("n", "new agent (pick CLI kind)"),
-                        ("t", "new shell terminal"),
-                        ("L", "attach a link (PR, doc, ticket)"),
-                        ("Enter", "attach session / open link"),
-                        ("r", "rename agent / edit link URL"),
-                        ("p", "pin / unpin"),
-                        ("a / u", "archive / unarchive (A: show/hide)"),
-                        ("m", "context menu (right-click)"),
-                        ("d / D", "delete one / delete all"),
+                        (Act(&[New]), "new agent (pick CLI kind)"),
+                        (Act(&[NewTerminal]), "new shell terminal"),
+                        (Act(&[NewLink]), "attach a link (PR, doc, ticket)"),
+                        (Act(&[Activate]), "attach session / open link"),
+                        (Act(&[Rename]), "rename agent / edit link URL"),
+                        (Act(&[Pin]), "pin / unpin"),
+                        (
+                            Act(&[Archive, Unarchive, ToggleArchived]),
+                            "archive / unarchive / show",
+                        ),
+                        (Act(&[ContextMenu]), "context menu (right-click)"),
+                        (Act(&[Delete, DeleteAll]), "delete one / delete all"),
                     ],
                 ),
                 (
                     "TERMINAL & MOUSE",
                     &[
-                        ("Enter / z", "lock input (z: full-screen)"),
-                        ("^q / ^]", "unlock, back to panels"),
-                        ("drag", "select + copy (2×click: word)"),
-                        ("⌥click", "open URL / file under cursor"),
-                        ("⇧drag", "select via your terminal"),
-                        ("drag border", "resize panels"),
+                        (Act(&[Activate, Zoom]), "lock input (2nd: full-screen)"),
+                        (Act(&[UnlockTerminal]), "unlock, back to panels"),
+                        (Lit("drag"), "select + copy (2×click: word)"),
+                        (Lit("⌥click"), "open URL / file under cursor"),
+                        (Lit("⇧drag"), "select via your terminal"),
+                        (Lit("drag border"), "resize panels"),
                     ],
                 ),
                 (
                     "GENERAL",
                     &[
-                        ("w", "workspaces: switch (n/r/d manage)"),
-                        ("h", "ssh hosts: connect (a: new, d: del)"),
-                        ("s", "settings"),
-                        ("M", "memory usage (nebula + agents)"),
-                        ("N", "nebula splash (any key returns)"),
-                        ("q / ?", "quit / toggle this help"),
+                        (Act(&[Workspaces]), "workspaces: switch (n/r/d manage)"),
+                        (Act(&[Hosts]), "ssh hosts: connect (a: new, d: del)"),
+                        (Act(&[Settings]), "settings (Hotkeys tab rebinds these)"),
+                        (Act(&[Metrics]), "memory usage (nebula + agents)"),
+                        (Act(&[Splash]), "nebula splash (any key returns)"),
+                        (Act(&[Quit, Help]), "quit / toggle this help"),
                     ],
                 ),
             ];
+            // What to print in the key column: a literal, or every chord
+            // each action currently answers to.
+            let keys_of = |k: &HelpKeys| -> String {
+                match k {
+                    Lit(s) => (*s).to_string(),
+                    Act(actions) => actions
+                        .iter()
+                        .map(|a| app.keymap.label(*a))
+                        .collect::<Vec<_>>()
+                        .join(" / "),
+                }
+            };
             // Rows a column needs: each section is a header plus its
             // entries, with a blank line between sections.
             let rows = |sections: &[HelpSection]| -> u16 {
@@ -512,10 +540,15 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
                     )));
                     for (k, v) in *entries {
+                        // Rebindable chords vary in width, so the key
+                        // column is padded to a fixed 14 and clipped there
+                        // — an exotic binding can't shove the descriptions
+                        // out of alignment.
+                        let keys = truncate(&keys_of(k), 14);
                         lines.push(Line::from(vec![
-                            Span::styled(format!(" {k:<13}"), Style::default().fg(th.accent)),
+                            Span::styled(format!(" {keys:<14}"), Style::default().fg(th.accent)),
                             Span::styled(
-                                truncate(v, (width as usize).saturating_sub(15)),
+                                truncate(v, (width as usize).saturating_sub(16)),
                                 Style::default().fg(th.dim),
                             ),
                         ]));
@@ -527,15 +560,19 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Paragraph::new(column(RIGHT, right_a.width)), right_a);
         }
         Overlay::Settings(view) => {
-            // Grouped like the Help overlay: titled sections instead of one
-            // flat list. Each setting is a single label+value row; the
-            // selected row's hint shows in the footer, which keeps the
-            // modal short enough for a stock terminal as settings grow.
+            // A tab strip over a scrolling list. Splitting the settings by
+            // tab is what keeps the modal short enough for a stock 24-row
+            // terminal now that the Hotkeys tab alone is forty rows.
             let cfg = crate::config::Config::load();
-            let rows = crate::config::settings_rows();
-            // Body rows, then footer: blank + hint + keys + path.
-            let height = rows.len() as u16 + 4 + 2;
-            let area = centered_rect(f.area(), 80, height);
+            let tab = view.tab;
+            let rows = crate::config::settings_rows(tab);
+            // Rows the modal spends on anything but settings: the tab
+            // strip and its rule above the body, and a blank + hint +
+            // keys + config path below it.
+            const CHROME: u16 = 2 + 4;
+            let want = rows.len() as u16 + CHROME + 2;
+            let height = want.min(f.area().height.saturating_sub(2)).max(CHROME + 3);
+            let area = centered_rect(f.area(), 84, height);
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -549,8 +586,51 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(block, area);
 
             let dim = Style::default().fg(th.dim);
-            let mut lines: Vec<Line> = Vec::new();
-            for row in &rows {
+            let capturing = view.capturing();
+
+            // ---- tab strip ----
+            let mut strip: Vec<Span> = Vec::new();
+            let mut hits: Vec<(u16, u16)> = Vec::new();
+            let mut x = inner.x;
+            for (i, t) in crate::config::SETTINGS_TABS.iter().enumerate() {
+                strip.push(Span::raw(" "));
+                x += 1;
+                let label = format!(" {} ", t.title);
+                let mut style = Style::default().fg(th.dim);
+                if i == tab {
+                    style = Style::default()
+                        .fg(th.accent)
+                        .bg(th.sel_bg)
+                        .add_modifier(Modifier::BOLD);
+                    // Cursor parked on the strip: brighten the active tab
+                    // so ←/→ visibly belong to it.
+                    if view.on_tabs {
+                        style = style.add_modifier(Modifier::REVERSED);
+                    }
+                }
+                let w = label.chars().count() as u16;
+                hits.push((x, x + w));
+                x += w;
+                strip.push(Span::styled(label, style));
+            }
+            let mut lines: Vec<Line> = vec![
+                Line::from(strip),
+                Line::from(Span::styled(
+                    "─".repeat(inner.width as usize),
+                    Style::default().fg(th.muted),
+                )),
+            ];
+
+            // ---- body ----
+            let body_h = inner.height.saturating_sub(CHROME).max(1) as usize;
+            // Same stateless follow-window the panels use, in row space:
+            // the selected row stays on screen without any scroll state.
+            let sel_row = rows
+                .iter()
+                .position(|r| r.index() == Some(view.selected))
+                .unwrap_or(0);
+            let first_row = (sel_row + 1).saturating_sub(body_h);
+            for row in rows.iter().skip(first_row).take(body_h) {
                 match row {
                     crate::config::SettingsRow::Blank => lines.push(Line::from("")),
                     crate::config::SettingsRow::Header(title) => {
@@ -560,12 +640,13 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         )));
                     }
                     crate::config::SettingsRow::Setting(i) => {
-                        let spec = crate::config::setting_at(*i)
-                            .expect("settings_rows indexes the flat settings");
+                        let spec = crate::config::setting_at(tab, *i)
+                            .expect("settings_rows indexes this tab's settings");
                         let value = cfg.value_label(spec.kind);
+                        let selected = *i == view.selected && !view.on_tabs;
                         let mut label_style = Style::default();
                         let mut value_style = Style::default().fg(th.accent);
-                        if *i == view.selected {
+                        if selected {
                             label_style = label_style.bg(th.sel_bg).add_modifier(Modifier::BOLD);
                             value_style = value_style.bg(th.sel_bg).add_modifier(Modifier::BOLD);
                         }
@@ -574,18 +655,93 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             Span::styled(format!("[{value}]"), value_style),
                         ]));
                     }
+                    crate::config::SettingsRow::Hotkey(i) => {
+                        let spec = crate::keymap::spec_at(*i)
+                            .expect("settings_rows indexes the action table");
+                        let selected = *i == view.selected && !view.on_tabs;
+                        let value = if selected && capturing {
+                            "press a key…".to_string()
+                        } else {
+                            app.keymap.display_at(*i)
+                        };
+                        let reach = app.keymap.reach_at(*i);
+                        let ambiguous = app.keymap.is_ambiguous(*i);
+                        let mut label_style = Style::default();
+                        let mut value_style =
+                            Style::default().fg(if reach.is_fine() && !ambiguous {
+                                th.accent
+                            } else {
+                                th.warn
+                            });
+                        if selected {
+                            label_style = label_style.bg(th.sel_bg).add_modifier(Modifier::BOLD);
+                            value_style = value_style.bg(th.sel_bg).add_modifier(Modifier::BOLD);
+                        }
+                        // A row the host terminal probably can't deliver
+                        // says so on the row, not only when you bind it.
+                        let flag = match (ambiguous, reach) {
+                            (true, _) | (_, crate::keymap::Reach::Blocked) => "✗",
+                            (_, crate::keymap::Reach::Risky) => "⚠",
+                            _ => " ",
+                        };
+                        // No brackets here, unlike the value tabs: `^]` is
+                        // a bindable chord and `[^q ^]]` is unreadable.
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("   {:<28}", spec.label), label_style),
+                            Span::styled(format!("{value:<18}"), value_style),
+                            Span::styled(flag.to_string(), Style::default().fg(th.warn)),
+                        ]));
+                    }
                 }
             }
+            for _ in lines.len()..(body_h + 2) {
+                lines.push(Line::from(""));
+            }
+
+            // ---- footer: notice or hint, then the keys, then the file ----
             lines.push(Line::from(""));
-            let hint = crate::config::setting_at(view.selected)
-                .map(|s| s.hint)
-                .unwrap_or("");
+            match &view.notice {
+                Some((text, level)) => lines.push(Line::from(Span::styled(
+                    truncate(&format!(" {text}"), inner.width as usize),
+                    match level {
+                        crate::app::NoticeLevel::Warn => Style::default().fg(th.warn),
+                        crate::app::NoticeLevel::Info => Style::default().fg(th.muted),
+                    },
+                ))),
+                None => {
+                    // A row the config file has double-booked explains
+                    // itself in place of its usual hint — that's the more
+                    // urgent thing to say about it.
+                    let shadowed = view
+                        .is_hotkeys()
+                        .then(|| app.keymap.shadowed_by(view.selected))
+                        .filter(|names| !names.is_empty());
+                    match shadowed {
+                        Some(names) => lines.push(Line::from(Span::styled(
+                            truncate(
+                                &format!(
+                                    " ✗ this key also belongs to {} — whichever is listed first wins",
+                                    names.join(", ")
+                                ),
+                                inner.width as usize,
+                            ),
+                            Style::default().fg(th.warn),
+                        ))),
+                        None => {
+                            let hint = crate::config::hint_at(tab, view.selected);
+                            lines.push(Line::from(Span::styled(
+                                truncate(&format!(" {hint}"), inner.width as usize),
+                                dim,
+                            )));
+                        }
+                    }
+                }
+            }
             lines.push(Line::from(Span::styled(
-                truncate(&format!(" {hint}"), inner.width as usize),
-                dim,
-            )));
-            lines.push(Line::from(Span::styled(
-                " Enter/Space: toggle   h/l: cycle   Esc: close",
+                truncate(
+                    &format!(" {}", settings_keys_hint(&view)),
+                    inner.width as usize,
+                ),
                 dim,
             )));
             let path = nebula_core::paths::config_path();
@@ -596,6 +752,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Paragraph::new(lines), inner);
             if let Some(Overlay::Settings(v)) = &mut app.overlay {
                 v.area = area;
+                v.tab_hits = hits;
+                v.first_row = first_row;
+                v.body_area = Rect {
+                    x: inner.x,
+                    y: inner.y + 2,
+                    width: inner.width,
+                    height: body_h as u16,
+                };
             }
         }
         Overlay::Metrics(view) => {
@@ -1620,6 +1784,35 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
     }
 }
 
+/// An action's primary chord, for a footer hint. Unbound reads as `—`,
+/// which is the truth: that verb has no key right now.
+fn key_hint(app: &App, action: crate::keymap::Action) -> String {
+    app.keymap
+        .first(action)
+        .map(|c| c.display())
+        .unwrap_or_else(|| "—".into())
+}
+
+/// The keys line at the bottom of the settings overlay. It changes with
+/// what the cursor is on, because the three places it can be — the tab
+/// strip, a value row, a hotkey row — take genuinely different keys, and a
+/// single union of all of them would read as noise.
+fn settings_keys_hint(view: &crate::app::SettingsView) -> &'static str {
+    if view.capturing() {
+        return "press the key you want   Esc: cancel";
+    }
+    if view.capture.is_some() {
+        return "Enter: reassign it here   Esc: leave it where it is";
+    }
+    if view.on_tabs {
+        return "←/→: tab   ↓: into the list   1-9: jump   Esc: close";
+    }
+    if view.is_hotkeys() {
+        return "Enter: rebind  a: add a key  ⌫: default  x: unbind  Tab: next tab  ↑ at top: tabs";
+    }
+    "↑/↓: move  Enter/Space: toggle  ←/→: cycle  Tab: next tab  ↑ at top: tabs"
+}
+
 fn centered_rect(frame: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(frame.width);
     let height = height.min(frame.height);
@@ -1784,6 +1977,24 @@ fn status_name_spans(
     match ramp {
         Some(ramp) => sweep_spans(&name, base, ramp, phase),
         None => vec![Span::styled(name, base)],
+    }
+}
+
+/// Columns a session name must keep before the "23m ago" label is worth
+/// the space it costs. Below this the label drops and the name gets it all.
+const MIN_SESSION_NAME_W: usize = 8;
+
+/// " 23m ago" for the sessions list, or empty for a session that has never
+/// run. Reads the raw status stamp rather than the sort key, so a session
+/// that has been working for an hour says "1h ago" — when you last spoke to
+/// it — instead of a permanent "just now".
+fn ago_badge(status_changed_at: i64) -> String {
+    if status_changed_at <= 0 {
+        return String::new();
+    }
+    match crate::hosts::ago_label(crate::app::now_ms() - status_changed_at) {
+        s if s.is_empty() => s,
+        s => format!(" {s}"),
     }
 }
 
@@ -2473,9 +2684,21 @@ fn draw_session_row(
             };
             // The CLI behind the session, as a dim trailing badge (same
             // idiom as the worktree root row) — every kind, so the column
-            // reads as one consistent "name · harness" list.
+            // reads as one consistent "name · when · harness" list.
             let badge = format!(" {}", a.kind.as_str());
-            let name_max = (width.saturating_sub(2) as usize).saturating_sub(badge.len());
+            // How long since this session last did anything, sat between
+            // the name and the harness. The list is sorted on this stamp,
+            // so the label is what makes the order legible.
+            let ago = ago_badge(a.status_changed_at);
+            // 3 = the pill's selection marker plus the status dot, both of
+            // which render ahead of the name.
+            let free = (width.saturating_sub(3) as usize).saturating_sub(badge.chars().count());
+            // A narrow panel spends its columns on the name: the ago label
+            // drops out entirely rather than squeezing the title to nothing.
+            let (ago, name_max) = match free.checked_sub(ago.chars().count()) {
+                Some(rest) if rest >= MIN_SESSION_NAME_W => (ago, rest),
+                _ => (String::new(), free),
+            };
             // Archived rows stay quiet even if their last status was live.
             let ramp = if a.archived {
                 None
@@ -2489,6 +2712,9 @@ fn draw_session_row(
                 ramp,
                 app.sweep_phase(),
             ));
+            if !ago.is_empty() {
+                spans.push(Span::styled(ago, Style::default().fg(th.dim)));
+            }
             spans.push(Span::styled(badge, Style::default().fg(th.dim)));
             spans
         }
@@ -2499,25 +2725,35 @@ fn draw_session_row(
             vec![
                 Span::styled("❯ ", Style::default().fg(glyph_color)),
                 Span::styled(
-                    truncate(&t.name, width.saturating_sub(2) as usize),
+                    truncate(&t.name, width.saturating_sub(3) as usize),
                     Style::default().fg(th.muted),
                 ),
             ]
         }
         SessionRow::Link(l) => {
-            // Same shape as an agent row — glyph, name, dim trailing badge
-            // — so the column reads as one list. The arrow says "leaves
-            // nebula"; a pull request earns the accent, everything else is
-            // as quiet as a terminal row.
+            // Same shape as an agent row — glyph, name, trailing badge — so
+            // the column reads as one list. The arrow says "leaves nebula";
+            // a pull request earns the accent, everything else is as quiet
+            // as a terminal row.
+            //
+            // The badge slot is normally the dim state word, but comments
+            // that landed since the row was last opened take it over and go
+            // loud: an unread count is the one thing here worth walking
+            // over to look at, and the state is already in the glyph.
             let pr = l.pull_request();
-            let badge = pr.map(|pr| format!(" {}", pr.badge()));
-            let badge_len = badge.as_ref().map_or(0, |b| b.chars().count());
+            let unseen = l.unseen_comments(&app.pr_seen);
+            let badge = match pr {
+                Some(_) if unseen > 0 => Some((format!(" {unseen} new"), th.warn)),
+                Some(pr) => Some((format!(" {}", pr.badge()), th.dim)),
+                None => None,
+            };
+            let badge_len = badge.as_ref().map_or(0, |(b, _)| b.chars().count());
             let glyph_color = match pr {
                 Some(pr) if pr.is_open() => th.accent,
                 Some(_) => th.dim,
                 None => th.muted,
             };
-            let label_max = (width.saturating_sub(2) as usize).saturating_sub(badge_len);
+            let label_max = (width.saturating_sub(3) as usize).saturating_sub(badge_len);
             let mut spans = vec![
                 Span::styled("↗ ", Style::default().fg(glyph_color)),
                 Span::styled(
@@ -2525,8 +2761,8 @@ fn draw_session_row(
                     Style::default().fg(th.muted),
                 ),
             ];
-            if let Some(badge) = badge {
-                spans.push(Span::styled(badge, Style::default().fg(th.dim)));
+            if let Some((badge, color)) = badge {
+                spans.push(Span::styled(badge, Style::default().fg(color)));
             }
             spans
         }
@@ -2874,7 +3110,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         )
     } else if matches!(&app.overlay, Some(Overlay::Settings(_))) {
         Span::styled(
-            "↑/↓: move  Enter/Space: toggle  h/l: cycle  Esc: close",
+            match &app.overlay {
+                Some(Overlay::Settings(view)) => settings_keys_hint(view),
+                _ => "",
+            },
             Style::default().fg(th.dim),
         )
     } else if let Some(Overlay::Notes(view)) = &app.overlay {
@@ -2913,39 +3152,103 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         // the next key dismisses it (q included).
         Span::styled(
             if app.splash_preview {
-                "any key: back to panels"
+                "any key: back to panels".to_string()
             } else {
-                "n/o: add project  w: workspaces  h: ssh host  s: settings  ?: help  q: quit"
+                let k = |a| key_hint(app, a);
+                format!(
+                    "{}/{}: add project  {}: workspaces  {}: ssh host  {}: settings  {}: help  {}: quit",
+                    k(Action::New),
+                    k(Action::AddProject),
+                    k(Action::Workspaces),
+                    k(Action::Hosts),
+                    k(Action::Settings),
+                    k(Action::Help),
+                    k(Action::Quit),
+                )
             },
             Style::default().fg(th.dim),
         )
     } else {
+        // Spelled from the live keymap for the same reason the Help
+        // overlay is: these are the first place a rebound key would start
+        // lying.
+        let k = |a| key_hint(app, a);
         let text = match app.focus {
             Focus::Terminal if app.term.as_ref().is_some_and(|t| t.exited) => {
-                "session exited — Esc: back to sessions"
+                "session exited — Esc: back to sessions".to_string()
             }
-            Focus::Terminal if app.term_locked => {
-                "Ctrl+q: panels  drag: select+copy  ⌥click: open link"
-            }
-            Focus::Terminal if app.term.is_some() => "Enter: type into terminal  ←: sessions",
-            Focus::Terminal => "select a session and press Enter to attach",
+            Focus::Terminal if app.term_locked => format!(
+                "{}: panels  drag: select+copy  ⌥click: open link",
+                app.keymap
+                    .first(Action::UnlockTerminal)
+                    .map(|c| c.display())
+                    .unwrap_or_else(|| "^q".into()),
+            ),
+            Focus::Terminal if app.term.is_some() => format!(
+                "{}: type into terminal  {}: sessions",
+                k(Action::Activate),
+                k(Action::FocusLeft)
+            ),
+            Focus::Terminal => "select a session and press Enter to attach".to_string(),
             Focus::Projects => match app.selected_project_row() {
-                Some(ProjectRow::Divider { .. }) => {
-                    "Enter/r: label  d: delete divider  ⇧J/K: move  m: menu  ?: help"
-                }
-                _ => "n/o: add  e: notes  d: remove  -: divider  ⇧J/K: move  /: search  m: menu  ?: help",
+                Some(ProjectRow::Divider { .. }) => format!(
+                    "{}/{}: label  {}: delete divider  {}/{}: move  {}: menu  {}: help",
+                    k(Action::Activate),
+                    k(Action::Rename),
+                    k(Action::Delete),
+                    k(Action::MoveProjectDown),
+                    k(Action::MoveProjectUp),
+                    k(Action::ContextMenu),
+                    k(Action::Help)
+                ),
+                _ => format!(
+                    "{}/{}: add  {}: notes  {}: remove  {}: divider  {}/{}: move  {}: search  {}: menu  {}: help",
+                    k(Action::New),
+                    k(Action::AddProject),
+                    k(Action::Notes),
+                    k(Action::Delete),
+                    k(Action::ToggleDivider),
+                    k(Action::MoveProjectDown),
+                    k(Action::MoveProjectUp),
+                    k(Action::Palette),
+                    k(Action::ContextMenu),
+                    k(Action::Help)
+                ),
             },
-            Focus::Worktrees => {
-                "n: new worktree  e: notes  t: terminal  p: pin  d: delete  /: search  m: menu  ?: help"
-            }
+            Focus::Worktrees => format!(
+                "{}: new worktree  {}: notes  {}: terminal  {}: pin  {}: delete  {}: search  {}: menu  {}: help",
+                k(Action::New),
+                k(Action::Notes),
+                k(Action::NewTerminal),
+                k(Action::Pin),
+                k(Action::Delete),
+                k(Action::Palette),
+                k(Action::ContextMenu),
+                k(Action::Help)
+            ),
             // A link row answers to a different set of verbs than a
             // session does, so the hint follows the cursor into the group.
-            Focus::Sessions if app.selected_link().is_some() => {
-                "↵: open in browser  L: add link  r: edit URL  d: delete  m: menu  ?: help"
-            }
-            Focus::Sessions => {
-                "↵: focus  n: agent  t: terminal  L: link  r: rename  a: archive  d: del  m: menu  ?: help"
-            }
+            Focus::Sessions if app.selected_link().is_some() => format!(
+                "{}: open in browser  {}: add link  {}: edit URL  {}: delete  {}: menu  {}: help",
+                k(Action::Activate),
+                k(Action::NewLink),
+                k(Action::Rename),
+                k(Action::Delete),
+                k(Action::ContextMenu),
+                k(Action::Help)
+            ),
+            Focus::Sessions => format!(
+                "{}: focus  {}: agent  {}: terminal  {}: link  {}: rename  {}: archive  {}: del  {}: menu  {}: help",
+                k(Action::Activate),
+                k(Action::New),
+                k(Action::NewTerminal),
+                k(Action::NewLink),
+                k(Action::Rename),
+                k(Action::Archive),
+                k(Action::Delete),
+                k(Action::ContextMenu),
+                k(Action::Help)
+            ),
         };
         Span::styled(text, Style::default().fg(th.dim))
     };

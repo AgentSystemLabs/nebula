@@ -163,7 +163,7 @@ impl VimTerm {
         }
         self.cols = cols;
         self.rows = rows;
-        self.parser.set_size(rows, cols);
+        self.parser.screen_mut().set_size(rows, cols);
         let _ = self.master.resize(PtySize {
             rows,
             cols,

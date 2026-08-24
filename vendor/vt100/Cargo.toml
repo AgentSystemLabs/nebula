@@ -1,23 +1,23 @@
-# Vendored from crates.io vt100 0.15.2 (MIT, https://github.com/doy/vt100-rust)
+# Vendored from crates.io vt100 0.16.2 (MIT, https://github.com/doy/vt100-rust)
 # with one Nebula patch — see src/grid.rs `scroll_up`: lines scrolled out of a
 # TOP-ANCHORED DECSTBM region on the primary screen are pushed into scrollback
 # (upstream discards them). Ratatui inline-viewport apps (codex) insert chat
 # history that way, and real terminals keep those lines; without the patch the
 # TUI's codex scrollback stays empty. Wired in via [patch.crates-io] in the
-# workspace Cargo.toml. Dev-dependencies dropped; version must stay 0.15.2 so
-# the patch satisfies the crates' `vt100 = "0.15"` requirement.
+# workspace Cargo.toml. Dev-dependencies dropped; version must stay 0.16.2 so
+# the patch satisfies the crates' `vt100 = "0.16"` requirement.
 
 [package]
 edition = "2021"
+rust-version = "1.70"
 name = "vt100"
-version = "0.15.2"
+version = "0.16.2"
 authors = ["Jesse Luehrs <doy@tozt.net>"]
 description = "Library for parsing terminal data (Nebula-patched)"
 license = "MIT"
 repository = "https://github.com/doy/vt100-rust"
 
 [dependencies]
-itoa = "1.0.5"
-log = "0.4.17"
-unicode-width = "0.1.10"
-vte = "0.11.0"
+itoa = "1.0.15"
+unicode-width = "0.2.1"
+vte = "0.15.0"

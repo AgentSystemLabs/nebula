@@ -50,8 +50,9 @@ pub enum HitTarget {
     Splitter(usize),
 }
 
-/// Default widths of the Projects / Worktrees / Sessions panels.
-pub const DEFAULT_PANEL_WIDTHS: [u16; 3] = [20, 22, 26];
+/// Default widths of the Projects / Worktrees / Sessions panels. Sessions
+/// is the widest because its rows carry the most: name, "23m ago", harness.
+pub const DEFAULT_PANEL_WIDTHS: [u16; 3] = [20, 22, 32];
 /// A panel can't be dragged narrower than this.
 pub const MIN_PANEL_W: u16 = 10;
 /// The terminal pane always keeps at least this much width.
@@ -236,6 +237,10 @@ pub enum PromptKind {
     },
     NewWorktree {
         project: ProjectId,
+        /// Random `<adj>-<noun>-<verb>` name minted when the prompt
+        /// opened; shown in the label and used when Enter arrives on an
+        /// empty input, so the name offered is the name created.
+        suggestion: String,
     },
     NewAgent {
         worktree: WorktreeId,
@@ -994,21 +999,84 @@ impl HostsView {
     }
 }
 
+/// A live rebind in the Hotkeys tab: the overlay is holding still, waiting
+/// for the user to press the key they want.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotkeyCapture {
+    /// Index into [`crate::keymap::ACTIONS`].
+    pub action: usize,
+    /// Add the chord as an alternate instead of replacing the row's list.
+    pub add: bool,
+    /// A chord captured but held back because another action in the same
+    /// scope already answers to it: Enter takes it anyway (and the other
+    /// action loses it), Esc backs out. The `Vec` is the losers, for the
+    /// warning text.
+    pub pending: Option<(crate::keymap::KeyChord, Vec<usize>)>,
+}
+
+/// How loudly the line under the settings body is speaking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeLevel {
+    Info,
+    Warn,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SettingsView {
+    /// Index into [`crate::config::SETTINGS_TABS`].
+    pub tab: usize,
+    /// Cursor row *within the current tab*.
     pub selected: usize,
+    /// The tab strip itself has the cursor: ←/→ walk the tabs, ↓ drops
+    /// back into the list. Stepping up off the top row is what puts it
+    /// here, so arrows can steer tabs without ever fighting the ←/→ that
+    /// cycles a setting's value.
+    pub on_tabs: bool,
     /// Set during draw for click hit-testing.
     pub area: Rect,
+    /// Screen x-range of each tab label, written during draw so clicks on
+    /// the strip land on the right tab.
+    pub tab_hits: Vec<(u16, u16)>,
+    /// Body rect and the first body row visible in it, written during draw
+    /// so click hit-testing agrees with what's actually on screen.
+    pub body_area: Rect,
+    pub first_row: usize,
+    /// Set while the Hotkeys tab is waiting for a key press.
+    pub capture: Option<HotkeyCapture>,
+    /// Transient line under the body: duplicate warnings, host-terminal
+    /// warnings, "reset to default".
+    pub notice: Option<(String, NoticeLevel)>,
 }
 
 impl SettingsView {
-    /// `selected` is the remembered cursor row (`App::settings_selected`),
-    /// clamped in case the settings list ever shrinks between builds.
-    pub fn new(selected: usize) -> Self {
+    /// `tab`/`selected` are the remembered cursor position
+    /// (`App::settings_tab` / `App::settings_selected`), clamped in case
+    /// the lists shrank between builds.
+    pub fn new(tab: usize, selected: usize) -> Self {
+        let tab = tab.min(crate::config::tab_count().saturating_sub(1));
         Self {
-            selected: selected.min(crate::config::settings_len().saturating_sub(1)),
-            area: Rect::default(),
+            tab,
+            selected: selected.min(crate::config::tab_len(tab).saturating_sub(1)),
+            ..Self::default()
         }
+    }
+
+    /// True while a key press should be captured as a binding rather than
+    /// steering the overlay.
+    pub fn capturing(&self) -> bool {
+        self.capture.as_ref().is_some_and(|c| c.pending.is_none())
+    }
+
+    pub fn is_hotkeys(&self) -> bool {
+        self.tab == crate::config::hotkeys_tab()
+    }
+
+    pub fn warn(&mut self, text: impl Into<String>) {
+        self.notice = Some((text.into(), NoticeLevel::Warn));
+    }
+
+    pub fn info(&mut self, text: impl Into<String>) {
+        self.notice = Some((text.into(), NoticeLevel::Info));
     }
 }
 
@@ -1135,6 +1203,16 @@ impl LinkRow {
         }
     }
 
+    /// Comments and reviews other people left on this row's pull request
+    /// since it was last opened from nebula. Zero for a row that isn't a
+    /// pull request — nothing else has a conversation to fall behind on.
+    pub fn unseen_comments(&self, seen: &HashMap<String, String>) -> usize {
+        match self.pull_request() {
+            Some(pr) => pr.unseen(seen.get(&pr.url).map(String::as_str)),
+            None => 0,
+        }
+    }
+
     /// Row text: a pull request reads as `#42 title`, anything else as its
     /// URL with the noise (scheme, `www.`, trailing slash) stripped.
     pub fn label(&self) -> String {
@@ -1187,6 +1265,15 @@ impl SessionRow {
 
     pub fn is_archived_agent(&self) -> bool {
         matches!(self, SessionRow::Agent(a) if a.archived)
+    }
+
+    /// Raw last-interaction stamp, or 0 for rows that carry no "23m ago"
+    /// label (terminals, links, sessions that have never run).
+    pub fn last_interaction_at(&self) -> i64 {
+        match self {
+            SessionRow::Agent(a) => a.status_changed_at,
+            SessionRow::Terminal(_) | SessionRow::Link(_) => 0,
+        }
     }
 
     pub fn as_link(&self) -> Option<&LinkRow> {
@@ -1261,6 +1348,32 @@ impl ProjectRow {
             ProjectRow::Project(i) | ProjectRow::Divider { project: i, .. } => *i,
         }
     }
+}
+
+/// A session that is mid-turn or blocked on the user. These head the
+/// RECENT group and never age out of it — the whole point of the group is
+/// to keep what needs attention in view.
+pub fn is_active_status(s: AgentStatus) -> bool {
+    matches!(s, AgentStatus::Running | AgentStatus::NeedsFeedback)
+}
+
+/// Epoch ms of the last interaction with a session — the stamp the sessions
+/// list sorts on and renders as "23m ago". A working session counts as
+/// interacting *now*: it is producing output as you look at it, so it holds
+/// the top of the list however long the turn has taken. 0 = never run.
+pub fn last_interaction_ms(a: &Agent, now: i64) -> i64 {
+    if is_active_status(a.status) {
+        now
+    } else {
+        a.status_changed_at
+    }
+}
+
+/// Sort key for "most recently interacted with, first". Applied with a
+/// stable sort, so never-run sessions (stamp 0) fall to the bottom of their
+/// group in tree order.
+fn recency_key(a: &Agent, now: i64) -> std::cmp::Reverse<i64> {
+    std::cmp::Reverse(last_interaction_ms(a, now))
 }
 
 /// Priority-ordered aggregate: needs-feedback > running > finished > fresh.
@@ -1369,7 +1482,7 @@ impl AttachedTerm {
 
     pub fn set_scroll(&mut self, scroll: usize) {
         self.scroll = scroll;
-        self.parser.set_scrollback(scroll);
+        self.parser.screen_mut().set_scrollback(scroll);
     }
 }
 
@@ -1543,8 +1656,15 @@ pub struct App {
     pub panel_widths: [u16; 3],
     /// File-list width of the diff modal, remembered across opens.
     pub diff_files_width: u16,
-    /// Cursor row of the settings modal, remembered across opens.
-    pub settings_selected: usize,
+    /// Selected tab of the settings modal, remembered across opens.
+    pub settings_tab: usize,
+    /// Cursor row of the settings modal, one per tab, remembered across
+    /// opens so switching tabs and coming back lands where you left.
+    pub settings_selected: Vec<usize>,
+    /// Hotkeys as the panels dispatch them: `config.keymap()`, cached here
+    /// because a keymap lookup happens on every single key press. The
+    /// event loop refreshes it at startup and whenever a binding changes.
+    pub keymap: crate::keymap::Keymap,
     /// In-progress splitter drag, if any.
     pub splitter_drag: Option<SplitterDrag>,
     /// Main-screen splitter under the mouse (a drag counts), highlighting
@@ -1586,13 +1706,25 @@ pub struct App {
     pub git_changes: Option<(WorktreeId, Option<usize>)>,
     /// What `gh pr view` last said about each worktree's branch: `Some(pr)`
     /// when one exists, `None` when the lookup came back empty (no PR, no
-    /// `gh`, no remote). A missing key means "not looked up yet" and is
-    /// what triggers a lookup; the answers are refreshed on a slow poll,
-    /// since opening a PR is a thing that happens outside nebula.
+    /// `gh`, no remote). A missing key means "not looked up yet". An empty
+    /// answer is re-asked on a backing-off timer (`pr_recheck`), since the
+    /// PR a session opens appears well after the first lookup; a found one
+    /// is final.
     pub pull_requests: HashMap<WorktreeId, Option<PullRequest>>,
+    /// How far the user has read into each pull request's conversation,
+    /// keyed by PR URL — the daemon's `pr_seen` rows, plus whatever this
+    /// session has marked since. What's newer than the mark is what the
+    /// row's unread badge counts.
+    pub pr_seen: HashMap<String, String>,
     /// Worktrees with a lookup in flight, so a repaint can't stack a second
     /// `gh` process on the first.
     pub pr_inflight: std::collections::HashSet<WorktreeId>,
+    /// When to ask `gh` about a worktree again, and the step that produced
+    /// that deadline: a steady beat once its pull request is known (so the
+    /// unread-comment count keeps up), a doubling backoff while it isn't.
+    /// Switching into a worktree drops its entry, so arriving somewhere
+    /// always asks again promptly.
+    pub pr_recheck: HashMap<WorktreeId, (std::time::Instant, std::time::Duration)>,
     /// Latest daemon metrics reading (daemon + per-session process trees),
     /// for the footer's memory/session readout. Refreshed on a slow poll;
     /// the metrics modal shares the same replies at a faster cadence.
@@ -1664,7 +1796,9 @@ impl App {
             term_file_links: Vec::new(),
             panel_widths: DEFAULT_PANEL_WIDTHS,
             diff_files_width: DEFAULT_DIFF_FILES_W,
-            settings_selected: 0,
+            settings_tab: 0,
+            settings_selected: vec![0; crate::config::tab_count()],
+            keymap: crate::keymap::Keymap::default(),
             splitter_drag: None,
             hover_splitter: None,
             pointer_shape: PointerShape::default(),
@@ -1679,13 +1813,34 @@ impl App {
             vim_generation: 0,
             git_changes: None,
             pull_requests: HashMap::new(),
+            pr_seen: HashMap::new(),
             pr_inflight: std::collections::HashSet::new(),
+            pr_recheck: HashMap::new(),
             last_metrics: None,
             client_rss_bytes: 0,
             splash_epoch: std::time::Instant::now(),
             splash_preview: false,
             animations: true,
             focus_tint: false,
+        }
+    }
+
+    /// Remembered cursor row for a settings tab, clamped to what that tab
+    /// currently holds.
+    pub fn settings_row(&self, tab: usize) -> usize {
+        self.settings_selected
+            .get(tab)
+            .copied()
+            .unwrap_or(0)
+            .min(crate::config::tab_len(tab).saturating_sub(1))
+    }
+
+    pub fn remember_settings_row(&mut self, tab: usize, row: usize) {
+        if self.settings_selected.len() < crate::config::tab_count() {
+            self.settings_selected.resize(crate::config::tab_count(), 0);
+        }
+        if let Some(slot) = self.settings_selected.get_mut(tab) {
+            *slot = row;
         }
     }
 
@@ -1998,48 +2153,51 @@ impl App {
         (pinned, unpinned)
     }
 
-    /// An unpinned, unarchived agent whose status changed within the
-    /// configured window sorts into the RECENT group. Pinned agents never
-    /// join it — PINNED always stays on top.
+    /// An unpinned, unarchived agent sorts into the RECENT group when it is
+    /// still working (running / needs-feedback, however long that has taken)
+    /// or when its status changed within the configured window. Pinned
+    /// agents never join it — PINNED always stays on top, and `off` still
+    /// collapses the group entirely.
     pub fn is_recent(&self, a: &Agent) -> bool {
         !a.pinned
             && !a.archived
             && self.recent_window_ms > 0
-            && a.status_changed_at > 0
-            && now_ms().saturating_sub(a.status_changed_at) < self.recent_window_ms
+            && (is_active_status(a.status)
+                || (a.status_changed_at > 0
+                    && now_ms().saturating_sub(a.status_changed_at) < self.recent_window_ms))
     }
 
     /// Session rows for the selected worktree: pinned agents, then RECENT
-    /// (status changed within the window), then the remaining unpinned,
-    /// then (when shown) archived agents.
+    /// (whatever is working or changed status within the window), then the
+    /// remaining unpinned, then (when shown) archived agents.
+    ///
+    /// Every group is ordered by last interaction, newest first, so the
+    /// session you just ran surfaces at the top of its group and the list
+    /// reads as a history of what you have been doing. Working sessions
+    /// count as interacting now, which keeps them heading RECENT however
+    /// long the turn has taken.
     pub fn visible_sessions(&self) -> Vec<Agent> {
         let worktrees = self.visible_worktrees();
         let Some(wt) = worktrees.get(self.sel_worktree) else {
             return vec![];
         };
-        let mut rows: Vec<Agent> = self
-            .tree
-            .agents
-            .iter()
-            .filter(|a| a.worktree_id == wt.id && !a.archived && a.pinned)
-            .cloned()
-            .collect();
-        rows.extend(
-            self.tree
+        let now = now_ms();
+        // Stable throughout, so ties — never-run rows especially, which all
+        // stamp 0 — keep tree order instead of shuffling between frames.
+        let collect = |keep: &dyn Fn(&Agent) -> bool| {
+            let mut group: Vec<Agent> = self
+                .tree
                 .agents
                 .iter()
-                .filter(|a| a.worktree_id == wt.id && self.is_recent(a))
-                .cloned(),
-        );
-        rows.extend(
-            self.tree
-                .agents
-                .iter()
-                .filter(|a| {
-                    a.worktree_id == wt.id && !a.archived && !a.pinned && !self.is_recent(a)
-                })
-                .cloned(),
-        );
+                .filter(|a| a.worktree_id == wt.id && keep(a))
+                .cloned()
+                .collect();
+            group.sort_by_key(|a| recency_key(a, now));
+            group
+        };
+        let mut rows = collect(&|a| !a.archived && a.pinned);
+        rows.extend(collect(&|a| self.is_recent(a)));
+        rows.extend(collect(&|a| !a.archived && !a.pinned && !self.is_recent(a)));
         if self.show_archived {
             let mut archived: Vec<Agent> = self
                 .tree
@@ -2091,7 +2249,9 @@ impl App {
 
     /// Delay until the next visible RECENT session ages out of the window,
     /// so the event loop can wake up and regroup. None when nothing is
-    /// pending expiry.
+    /// pending expiry. Working sessions are excluded — they hold their place
+    /// in RECENT past the window, so their deadline is already behind us and
+    /// would otherwise wake the loop on every pass.
     pub fn next_recent_expiry(&self) -> Option<std::time::Duration> {
         let worktrees = self.visible_worktrees();
         let wt = worktrees.get(self.sel_worktree)?;
@@ -2099,7 +2259,7 @@ impl App {
         self.tree
             .agents
             .iter()
-            .filter(|a| a.worktree_id == wt.id && self.is_recent(a))
+            .filter(|a| a.worktree_id == wt.id && self.is_recent(a) && !is_active_status(a.status))
             .map(|a| (a.status_changed_at + self.recent_window_ms - now).max(0) as u64)
             .min()
             .map(std::time::Duration::from_millis)
@@ -2110,6 +2270,21 @@ impl App {
     pub fn prewarm_delay(&self) -> Option<std::time::Duration> {
         let (_, at) = self.pending_prewarm.as_ref()?;
         Some(at.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// Whether `gh` should be asked about this worktree now: not while an
+    /// answer is in flight, and not before the timer the last answer armed.
+    /// A found PR no longer retires the worktree — the PR doesn't change,
+    /// but its conversation does, and the unread badge is only as fresh as
+    /// the last poll.
+    pub fn pr_lookup_due(&self, worktree: &WorktreeId) -> bool {
+        if self.pr_inflight.contains(worktree) {
+            return false;
+        }
+        match self.pr_recheck.get(worktree) {
+            Some((due, _)) => std::time::Instant::now() >= *due,
+            None => true,
+        }
     }
 
     /// Delay until the standing keep-warm re-send is due. None when disarmed.
@@ -2208,6 +2383,7 @@ mod tests {
             title: "Attach links".into(),
             state: "OPEN".into(),
             is_draft: false,
+            activity: Vec::new(),
         }
     }
 

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -274,6 +274,13 @@ pub enum ClientRequest {
         json: String,
     },
 
+    /// Fire-and-forget: the user just opened this pull request, so
+    /// everything up to `marker` has now been read.
+    MarkPrSeen {
+        url: String,
+        marker: String,
+    },
+
     /// One point-in-time memory reading — the daemon plus every live
     /// session's process subtree. Answered by `ServerEvent::Metrics` with
     /// the same req_id (not an Ack).
@@ -282,6 +289,18 @@ pub enum ClientRequest {
     },
 
     Shutdown,
+}
+
+/// How much of a pull request's conversation the user had already seen the
+/// last time they opened it. `marker` is the newest thing anyone else had
+/// posted at that moment, as GitHub's RFC 3339 stamp — those sort
+/// lexicographically, so "arrived since" is a string compare and nebula
+/// never has to consult a clock. Empty means the PR was opened while its
+/// conversation was still empty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrSeen {
+    pub url: String,
+    pub marker: String,
 }
 
 /// Memory usage of one live session: the PTY child plus every descendant
@@ -328,6 +347,8 @@ pub enum ServerEvent {
         terminals: Vec<TerminalTab>,
         notes: Vec<Note>,
         links: Vec<Link>,
+        /// How far the user has read into each pull request they've opened.
+        pr_seen: Vec<PrSeen>,
         ui_state: Option<String>,
     },
 

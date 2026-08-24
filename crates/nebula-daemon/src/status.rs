@@ -14,6 +14,10 @@
 //! - An `idle_prompt` notification is Claude reporting it is parked at the
 //!   input box with nothing in flight; it is what un-sticks a turn that
 //!   ended without a `Stop` (rejected prompt, escape mid-turn).
+//! - `Progress` is the same end-of-turn news read straight off the PTY
+//!   (OSC 9;4, see `pty::progress`). It is the only signal that survives a
+//!   user cancel — no hook fires at all there, and Claude suppresses
+//!   `idle_prompt` precisely because the user just touched the keyboard.
 
 use nebula_core::AgentStatus;
 use std::collections::HashMap;
@@ -50,6 +54,11 @@ pub enum HookEvent {
     /// Synthetic: the agent's PTY died.
     SessionEnded {
         exit_code: Option<i32>,
+    },
+    /// Synthetic: the CLI's OSC 9;4 progress state flipped. `busy: false` is
+    /// end-of-turn — including the cancel that fires no hook.
+    Progress {
+        busy: bool,
     },
 }
 
@@ -256,6 +265,43 @@ impl AgentStatusMachine {
             }
             HookEvent::SubagentStop { subagent_id } => {
                 self.subagents.stop(subagent_id);
+            }
+            HookEvent::Progress { busy } => {
+                if busy {
+                    // A turn started. Normally `UserPromptSubmit` already
+                    // said so; this also catches turns nebula never saw a
+                    // prompt for (a resumed session, a scheduled wake-up).
+                    // Deliberately narrow: it must not talk over a pending
+                    // permission prompt (which holds progress at *busy*
+                    // anyway, so no edge arrives) or revive a dead agent.
+                    if matches!(self.status, AgentStatus::Fresh | AgentStatus::Finished) {
+                        self.stop_held = false;
+                        self.drain_idle_since = None;
+                        self.finished_at = None;
+                        self.set_status(AgentStatus::Running, &mut effects);
+                    }
+                } else if matches!(
+                    self.status,
+                    AgentStatus::Running | AgentStatus::NeedsFeedback
+                ) {
+                    // The CLI cleared its progress bar: the turn is over,
+                    // however it ended. Same bookkeeping as `Stop`, so a
+                    // real Stop arriving either side of this is a no-op and
+                    // the subagent drain hold still applies.
+                    self.subagents.prune_expired(now);
+                    if self.subagents.is_empty() {
+                        self.stop_held = false;
+                        self.finished_at = Some(now);
+                        self.set_status(AgentStatus::Finished, &mut effects);
+                    } else {
+                        self.stop_held = true;
+                        self.drain_idle_since = None;
+                        self.set_status(AgentStatus::Running, &mut effects);
+                    }
+                }
+                // Fresh / Terminated / Disconnected are left alone: a CLI
+                // clears its progress bar on startup and on exit too, and
+                // neither is a finished turn.
             }
             HookEvent::SessionEnded { exit_code } => {
                 // Dead process: laggard subagent POSTs must never resurrect it.
@@ -582,6 +628,158 @@ mod tests {
         );
         assert!(fx.is_empty(), "must stay finished: {fx:?}");
         assert_eq!(m.status(), AgentStatus::Finished);
+    }
+
+    fn progress(m: &mut AgentStatusMachine, busy: bool, now: Instant) -> Vec<Effect> {
+        m.handle(HookEvent::Progress { busy }, None, now)
+    }
+
+    #[test]
+    fn progress_idle_finishes_a_cancelled_turn() {
+        // The reported bug: the user hits escape. Claude Code fires no Stop
+        // for an interrupted turn and never sends `idle_prompt` either (it
+        // suppresses that when the user has just touched the keyboard), so
+        // the only news is the progress bar clearing.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        progress(&mut m, true, now);
+        assert_eq!(m.status(), AgentStatus::Running);
+        let fx = progress(&mut m, false, now + Duration::from_secs(8));
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    #[test]
+    fn progress_idle_clears_a_rejected_permission_prompt() {
+        // Escaping out of a permission prompt: same story, from red.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        m.handle(HookEvent::PermissionRequest, Some("s1"), now);
+        assert_eq!(m.status(), AgentStatus::NeedsFeedback);
+        let fx = progress(&mut m, false, now + Duration::from_secs(5));
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    #[test]
+    fn progress_idle_leaves_fresh_and_dead_agents_alone() {
+        // Every CLI clears its progress bar at startup and again on exit;
+        // neither is a finished turn.
+        for start in [
+            AgentStatus::Fresh,
+            AgentStatus::Finished,
+            AgentStatus::Terminated,
+            AgentStatus::Disconnected,
+        ] {
+            let mut m = AgentStatusMachine::new(start, Some("s1".into()));
+            let fx = progress(&mut m, false, t0());
+            assert!(fx.is_empty(), "{start:?} must not be touched: {fx:?}");
+            assert_eq!(m.status(), start);
+        }
+    }
+
+    #[test]
+    fn progress_busy_starts_a_turn_but_never_talks_over_feedback() {
+        // A turn nebula saw no prompt for (resumed session, scheduled wake).
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, Some("s1".into()));
+        let now = t0();
+        let fx = progress(&mut m, true, now);
+        assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+
+        // …but a pending question outranks it, and the dead stay dead.
+        for start in [
+            AgentStatus::NeedsFeedback,
+            AgentStatus::Terminated,
+            AgentStatus::Disconnected,
+        ] {
+            let mut m = AgentStatusMachine::new(start, Some("s1".into()));
+            let fx = progress(&mut m, true, now);
+            assert!(fx.is_empty(), "{start:?} must not be touched: {fx:?}");
+            assert_eq!(m.status(), start);
+        }
+    }
+
+    #[test]
+    fn progress_idle_respects_the_subagent_drain_hold() {
+        // The progress bar clears when the *main loop* parks, which on a
+        // normal turn end beats the Stop hook's HTTP round-trip. It must not
+        // finish out from under still-running subagents.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        m.handle(
+            HookEvent::SubagentStart {
+                subagent_id: Some("sub1".into()),
+            },
+            Some("s1"),
+            now,
+        );
+        let fx = progress(&mut m, false, now + Duration::from_secs(5));
+        assert_eq!(status_of(&fx), None, "stays running — no transition");
+        assert_eq!(m.status(), AgentStatus::Running);
+        // The Stop that follows a beat later agrees, and the drain still owns
+        // the promotion.
+        let fx = m.handle(HookEvent::Stop, Some("s1"), now + Duration::from_secs(5));
+        assert!(fx.is_empty());
+        m.handle(
+            HookEvent::SubagentStop {
+                subagent_id: Some("sub1".into()),
+            },
+            Some("s1"),
+            now + Duration::from_secs(6),
+        );
+        let fx = m.tick(now + Duration::from_secs(7));
+        assert!(fx.is_empty(), "grace not elapsed yet");
+        let fx = m.tick(now + Duration::from_secs(7) + DRAIN_GRACE);
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    #[test]
+    fn progress_idle_preserves_the_subagent_race_heal() {
+        // Progress clears just before the Stop hook lands. Both stamp
+        // `finished_at`, so a subagent POST that raced the Stop still heals —
+        // unlike `mark_idle`, which deliberately blocks healing.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        progress(&mut m, false, now + Duration::from_secs(10));
+        m.handle(HookEvent::Stop, Some("s1"), now + Duration::from_secs(10));
+        assert_eq!(m.status(), AgentStatus::Finished);
+        let fx = m.handle(
+            HookEvent::SubagentStart {
+                subagent_id: Some("sub1".into()),
+            },
+            Some("s1"),
+            now + Duration::from_secs(12),
+        );
+        assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+    }
+
+    #[test]
+    fn progress_edges_across_a_whole_turn_settle_on_finished() {
+        // The captured Claude Code 2.1.241 sequence, hooks and all.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        progress(&mut m, false, now); // startup, parked at the input box
+        assert_eq!(m.status(), AgentStatus::Fresh);
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        progress(&mut m, true, now);
+        m.handle(
+            HookEvent::PermissionRequest,
+            Some("s1"),
+            now + Duration::from_secs(3),
+        );
+        assert_eq!(m.status(), AgentStatus::NeedsFeedback);
+        // Approving does not move the progress bar — it never left "busy".
+        m.handle(
+            HookEvent::PostToolUse {
+                tool_name: Some("Bash".into()),
+            },
+            Some("s1"),
+            now + Duration::from_secs(19),
+        );
+        let fx = progress(&mut m, false, now + Duration::from_secs(20));
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
     }
 
     #[test]

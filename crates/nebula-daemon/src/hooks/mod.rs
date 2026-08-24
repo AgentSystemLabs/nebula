@@ -184,9 +184,9 @@ pub async fn start_hook_server(
 }
 
 fn generate_token() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -357,6 +357,45 @@ mod tests {
         assert_eq!((status, body.as_str()), (401, ""));
     }
 
+    #[tokio::test]
+    async fn bash_tool_use_carries_cwd_but_subagent_traffic_does_not() {
+        let store = seeded_store();
+        let (env, mut rx) = start_hook_server(store).await.unwrap();
+
+        // The mid-turn position signal: a Bash call that just `cd`ed into a
+        // fresh worktree, long before the turn's Stop.
+        let (status, _) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=titled&hookEvent=PostToolUse",
+            &env.token,
+            r#"{"session_id":"s1","tool_name":"Bash","cwd":"/w/feat"}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let delivery = rx.recv().await.unwrap();
+        assert_eq!(delivery.cwd.as_deref(), Some("/w/feat"));
+        assert_eq!(
+            delivery.event,
+            HookEvent::PostToolUse {
+                tool_name: Some("Bash".into())
+            }
+        );
+
+        // Same event from a Task subagent (claude stamps `agent_id` on
+        // subagent tool traffic): the status delivery still flows, but the
+        // cwd is dropped so an isolated subagent can't re-home the row.
+        let (status, _) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=titled&hookEvent=PostToolUse",
+            &env.token,
+            r#"{"session_id":"s1","tool_name":"Bash","cwd":"/w/scratch","agent_id":"sub-1"}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let delivery = rx.recv().await.unwrap();
+        assert!(delivery.cwd.is_none(), "subagent cwd: {:?}", delivery.cwd);
+    }
+
     #[test]
     fn payload_parses_cwd_and_tolerates_unknown_fields() {
         let payload: HookPayload = serde_json::from_str(
@@ -458,13 +497,18 @@ async fn receive_hook(
     };
     let agent_id = AgentId(query.agent_id.clone());
     tracing::debug!(agent = %agent_id, event = ?event, "hook received");
+    // A subagent's tool traffic reports the payload's cwd too, but that is
+    // the Task's position, not the session's — an isolated subagent working
+    // in a scratch checkout must never drag the row out from under the
+    // conversation. Only foreground payloads carry a cwd onward.
+    let cwd = payload.cwd().filter(|_| payload.subagent_id().is_none());
     let _ = state
         .tx
         .send(HookDelivery {
             agent_id: agent_id.clone(),
             event,
             session_id: payload.session_id(),
-            cwd: payload.cwd(),
+            cwd,
         })
         .await;
 

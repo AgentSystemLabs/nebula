@@ -95,6 +95,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         terminals: vec![],
                         notes: vec![],
                         links: vec![],
+                        pr_seen: vec![],
                         ui_state: None,
                     });
                     let _ = out_tx.send(snapshot).await;
@@ -202,6 +203,9 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientRequest::SaveUiState { json } => {
                     let _ = daemon.store.save_ui_state(&json);
+                }
+                ClientRequest::MarkPrSeen { url, marker } => {
+                    let _ = daemon.store.mark_pr_seen(&url, &marker);
                 }
                 ClientRequest::GetMetrics { req_id } => {
                     // A machine-wide `ps` sweep takes tens of ms; keep it off
@@ -566,6 +570,9 @@ async fn forward_pty(
                     break;
                 }
             }
+            // Daemon-side only: the progress edge drives the status machine
+            // and reaches clients as a StatusChanged, not as session output.
+            Ok(PtyEvent::Progress { .. }) => {}
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                 // Catch up from the ring. If the missed bytes are still
                 // retained, send them as a plain Output continuation so the

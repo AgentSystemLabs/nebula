@@ -104,30 +104,37 @@ impl BufWrite for ClearAttrs {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum Intensity {
+    Normal,
+    Bold,
+    Dim,
+}
+
 #[derive(Default, Debug)]
 #[must_use = "this struct does nothing unless you call write_buf"]
 pub struct Attrs {
-    fgcolor: Option<crate::attrs::Color>,
-    bgcolor: Option<crate::attrs::Color>,
-    bold: Option<bool>,
+    fgcolor: Option<crate::Color>,
+    bgcolor: Option<crate::Color>,
+    intensity: Option<Intensity>,
     italic: Option<bool>,
     underline: Option<bool>,
     inverse: Option<bool>,
 }
 
 impl Attrs {
-    pub fn fgcolor(mut self, fgcolor: crate::attrs::Color) -> Self {
+    pub fn fgcolor(mut self, fgcolor: crate::Color) -> Self {
         self.fgcolor = Some(fgcolor);
         self
     }
 
-    pub fn bgcolor(mut self, bgcolor: crate::attrs::Color) -> Self {
+    pub fn bgcolor(mut self, bgcolor: crate::Color) -> Self {
         self.bgcolor = Some(bgcolor);
         self
     }
 
-    pub fn bold(mut self, bold: bool) -> Self {
-        self.bold = Some(bold);
+    pub fn intensity(mut self, intensity: Intensity) -> Self {
+        self.intensity = Some(intensity);
         self
     }
 
@@ -153,7 +160,7 @@ impl BufWrite for Attrs {
     fn write_buf(&self, buf: &mut Vec<u8>) {
         if self.fgcolor.is_none()
             && self.bgcolor.is_none()
-            && self.bold.is_none()
+            && self.intensity.is_none()
             && self.italic.is_none()
             && self.underline.is_none()
             && self.inverse.is_none()
@@ -165,22 +172,22 @@ impl BufWrite for Attrs {
         let mut first = true;
 
         macro_rules! write_param {
-            ($i:expr) => {
+            ($i:expr) => {{
                 if first {
                     first = false;
                 } else {
                     buf.push(b';');
                 }
                 extend_itoa(buf, $i);
-            };
+            }};
         }
 
         if let Some(fgcolor) = self.fgcolor {
             match fgcolor {
-                crate::attrs::Color::Default => {
+                crate::Color::Default => {
                     write_param!(39);
                 }
-                crate::attrs::Color::Idx(i) => {
+                crate::Color::Idx(i) => {
                     if i < 8 {
                         write_param!(i + 30);
                     } else if i < 16 {
@@ -191,7 +198,7 @@ impl BufWrite for Attrs {
                         write_param!(i);
                     }
                 }
-                crate::attrs::Color::Rgb(r, g, b) => {
+                crate::Color::Rgb(r, g, b) => {
                     write_param!(38);
                     write_param!(2);
                     write_param!(r);
@@ -203,10 +210,10 @@ impl BufWrite for Attrs {
 
         if let Some(bgcolor) = self.bgcolor {
             match bgcolor {
-                crate::attrs::Color::Default => {
+                crate::Color::Default => {
                     write_param!(49);
                 }
-                crate::attrs::Color::Idx(i) => {
+                crate::Color::Idx(i) => {
                     if i < 8 {
                         write_param!(i + 40);
                     } else if i < 16 {
@@ -217,7 +224,7 @@ impl BufWrite for Attrs {
                         write_param!(i);
                     }
                 }
-                crate::attrs::Color::Rgb(r, g, b) => {
+                crate::Color::Rgb(r, g, b) => {
                     write_param!(48);
                     write_param!(2);
                     write_param!(r);
@@ -227,11 +234,11 @@ impl BufWrite for Attrs {
             }
         }
 
-        if let Some(bold) = self.bold {
-            if bold {
-                write_param!(1);
-            } else {
-                write_param!(22);
+        if let Some(intensity) = self.intensity {
+            match intensity {
+                Intensity::Normal => write_param!(22),
+                Intensity::Bold => write_param!(1),
+                Intensity::Dim => write_param!(2),
             }
         }
 
@@ -365,81 +372,13 @@ impl MoveFromTo {
 impl BufWrite for MoveFromTo {
     fn write_buf(&self, buf: &mut Vec<u8>) {
         if self.to.row == self.from.row + 1 && self.to.col == 0 {
-            crate::term::Crlf::default().write_buf(buf);
+            crate::term::Crlf.write_buf(buf);
         } else if self.from.row == self.to.row && self.from.col < self.to.col
         {
             crate::term::MoveRight::new(self.to.col - self.from.col)
                 .write_buf(buf);
         } else if self.to != self.from {
             crate::term::MoveTo::new(self.to).write_buf(buf);
-        }
-    }
-}
-
-#[derive(Default, Debug)]
-#[must_use = "this struct does nothing unless you call write_buf"]
-pub struct AudibleBell;
-
-impl BufWrite for AudibleBell {
-    fn write_buf(&self, buf: &mut Vec<u8>) {
-        buf.push(b'\x07');
-    }
-}
-
-#[derive(Default, Debug)]
-#[must_use = "this struct does nothing unless you call write_buf"]
-pub struct VisualBell;
-
-impl BufWrite for VisualBell {
-    fn write_buf(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(b"\x1bg");
-    }
-}
-
-#[must_use = "this struct does nothing unless you call write_buf"]
-pub struct ChangeTitle<'a> {
-    icon_name: &'a str,
-    title: &'a str,
-    prev_icon_name: &'a str,
-    prev_title: &'a str,
-}
-
-impl<'a> ChangeTitle<'a> {
-    pub fn new(
-        icon_name: &'a str,
-        title: &'a str,
-        prev_icon_name: &'a str,
-        prev_title: &'a str,
-    ) -> Self {
-        Self {
-            icon_name,
-            title,
-            prev_icon_name,
-            prev_title,
-        }
-    }
-}
-
-impl<'a> BufWrite for ChangeTitle<'a> {
-    fn write_buf(&self, buf: &mut Vec<u8>) {
-        if self.icon_name == self.title
-            && (self.icon_name != self.prev_icon_name
-                || self.title != self.prev_title)
-        {
-            buf.extend_from_slice(b"\x1b]0;");
-            buf.extend_from_slice(self.icon_name.as_bytes());
-            buf.push(b'\x07');
-        } else {
-            if self.icon_name != self.prev_icon_name {
-                buf.extend_from_slice(b"\x1b]1;");
-                buf.extend_from_slice(self.icon_name.as_bytes());
-                buf.push(b'\x07');
-            }
-            if self.title != self.prev_title {
-                buf.extend_from_slice(b"\x1b]2;");
-                buf.extend_from_slice(self.title.as_bytes());
-                buf.push(b'\x07');
-            }
         }
     }
 }
@@ -513,14 +452,14 @@ impl BufWrite for BracketedPaste {
 #[derive(Default, Debug)]
 #[must_use = "this struct does nothing unless you call write_buf"]
 pub struct MouseProtocolMode {
-    mode: crate::screen::MouseProtocolMode,
-    prev: crate::screen::MouseProtocolMode,
+    mode: crate::MouseProtocolMode,
+    prev: crate::MouseProtocolMode,
 }
 
 impl MouseProtocolMode {
     pub fn new(
-        mode: crate::screen::MouseProtocolMode,
-        prev: crate::screen::MouseProtocolMode,
+        mode: crate::MouseProtocolMode,
+        prev: crate::MouseProtocolMode,
     ) -> Self {
         Self { mode, prev }
     }
@@ -533,31 +472,31 @@ impl BufWrite for MouseProtocolMode {
         }
 
         match self.mode {
-            crate::screen::MouseProtocolMode::None => match self.prev {
-                crate::screen::MouseProtocolMode::None => {}
-                crate::screen::MouseProtocolMode::Press => {
+            crate::MouseProtocolMode::None => match self.prev {
+                crate::MouseProtocolMode::None => {}
+                crate::MouseProtocolMode::Press => {
                     buf.extend_from_slice(b"\x1b[?9l");
                 }
-                crate::screen::MouseProtocolMode::PressRelease => {
+                crate::MouseProtocolMode::PressRelease => {
                     buf.extend_from_slice(b"\x1b[?1000l");
                 }
-                crate::screen::MouseProtocolMode::ButtonMotion => {
+                crate::MouseProtocolMode::ButtonMotion => {
                     buf.extend_from_slice(b"\x1b[?1002l");
                 }
-                crate::screen::MouseProtocolMode::AnyMotion => {
+                crate::MouseProtocolMode::AnyMotion => {
                     buf.extend_from_slice(b"\x1b[?1003l");
                 }
             },
-            crate::screen::MouseProtocolMode::Press => {
+            crate::MouseProtocolMode::Press => {
                 buf.extend_from_slice(b"\x1b[?9h");
             }
-            crate::screen::MouseProtocolMode::PressRelease => {
+            crate::MouseProtocolMode::PressRelease => {
                 buf.extend_from_slice(b"\x1b[?1000h");
             }
-            crate::screen::MouseProtocolMode::ButtonMotion => {
+            crate::MouseProtocolMode::ButtonMotion => {
                 buf.extend_from_slice(b"\x1b[?1002h");
             }
-            crate::screen::MouseProtocolMode::AnyMotion => {
+            crate::MouseProtocolMode::AnyMotion => {
                 buf.extend_from_slice(b"\x1b[?1003h");
             }
         }
@@ -567,14 +506,14 @@ impl BufWrite for MouseProtocolMode {
 #[derive(Default, Debug)]
 #[must_use = "this struct does nothing unless you call write_buf"]
 pub struct MouseProtocolEncoding {
-    encoding: crate::screen::MouseProtocolEncoding,
-    prev: crate::screen::MouseProtocolEncoding,
+    encoding: crate::MouseProtocolEncoding,
+    prev: crate::MouseProtocolEncoding,
 }
 
 impl MouseProtocolEncoding {
     pub fn new(
-        encoding: crate::screen::MouseProtocolEncoding,
-        prev: crate::screen::MouseProtocolEncoding,
+        encoding: crate::MouseProtocolEncoding,
+        prev: crate::MouseProtocolEncoding,
     ) -> Self {
         Self { encoding, prev }
     }
@@ -587,21 +526,19 @@ impl BufWrite for MouseProtocolEncoding {
         }
 
         match self.encoding {
-            crate::screen::MouseProtocolEncoding::Default => {
-                match self.prev {
-                    crate::screen::MouseProtocolEncoding::Default => {}
-                    crate::screen::MouseProtocolEncoding::Utf8 => {
-                        buf.extend_from_slice(b"\x1b[?1005l");
-                    }
-                    crate::screen::MouseProtocolEncoding::Sgr => {
-                        buf.extend_from_slice(b"\x1b[?1006l");
-                    }
+            crate::MouseProtocolEncoding::Default => match self.prev {
+                crate::MouseProtocolEncoding::Default => {}
+                crate::MouseProtocolEncoding::Utf8 => {
+                    buf.extend_from_slice(b"\x1b[?1005l");
                 }
-            }
-            crate::screen::MouseProtocolEncoding::Utf8 => {
+                crate::MouseProtocolEncoding::Sgr => {
+                    buf.extend_from_slice(b"\x1b[?1006l");
+                }
+            },
+            crate::MouseProtocolEncoding::Utf8 => {
                 buf.extend_from_slice(b"\x1b[?1005h");
             }
-            crate::screen::MouseProtocolEncoding::Sgr => {
+            crate::MouseProtocolEncoding::Sgr => {
                 buf.extend_from_slice(b"\x1b[?1006h");
             }
         }

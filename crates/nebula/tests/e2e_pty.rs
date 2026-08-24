@@ -863,6 +863,84 @@ async fn hook_post_from_agent_pty_drives_status() {
 /// posts a hook whose payload reports a cwd inside another worktree of the
 /// same project (claude entered a worktree it created mid-conversation) —
 /// the daemon re-homes the agent row there and broadcasts the upsert.
+/// The cancel path. Claude Code fires NO hook when the user interrupts a
+/// turn — `Stop` is documented not to run on a user interrupt, and the
+/// `idle_prompt` notification that normally rescues a hookless turn end is
+/// suppressed precisely because the user just pressed a key. What it does
+/// still do is clear its OSC 9;4 progress bar, so nebula reads busy/idle
+/// straight off the PTY. This drives the whole path — raw bytes out of the
+/// child, through the pump's scanner, into the status machine — with no HTTP
+/// hook involved at all.
+#[tokio::test]
+async fn pty_progress_sequence_drives_status_without_any_hook() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let agent_id = create_agent_get_id(&mut c, &worktree.id, "cancelled", 2).await;
+
+    let sref = SessionRef::Agent(agent_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 120,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Have the shell in the agent PTY emit exactly what Claude Code emits.
+    // The command text is echoed back by the tty, which is the point: only
+    // the real escape bytes may move the status, never a mention of them.
+    // `\ddd` octal, not `\e` — POSIX printf, so this works under dash too.
+    let emit = |state: &str| format!("printf '\\033]9;4;{state};\\007'\n").into_bytes();
+
+    // Turn starts: progress goes indeterminate → running.
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: emit("3"),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Running, .. }
+                if *agent == agent_id)
+        })
+    })
+    .await;
+
+    // User hits escape: the progress bar clears, and nothing else happens.
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: emit("0"),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Finished, .. }
+                if *agent == agent_id)
+        })
+    })
+    .await;
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 #[tokio::test]
 async fn hook_cwd_rehomes_agent_to_other_worktree() {
     let env = TestEnv::new();

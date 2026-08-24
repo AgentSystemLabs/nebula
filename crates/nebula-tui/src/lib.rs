@@ -1,4 +1,5 @@
 pub mod app;
+pub mod branch_name;
 pub mod completion;
 pub mod config;
 pub mod event_loop;
@@ -7,6 +8,7 @@ pub mod git_diff;
 pub mod grep_search;
 pub mod hosts;
 pub mod ipc;
+pub mod keymap;
 pub mod keys;
 pub mod links;
 pub mod pull_request;

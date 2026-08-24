@@ -402,6 +402,7 @@ impl Daemon {
             terminals,
             notes: self.store.load_notes()?,
             links: self.store.load_links()?,
+            pr_seen: self.store.load_pr_seen()?,
             ui_state: self.store.load_ui_state()?,
         })
     }
@@ -2035,8 +2036,29 @@ impl Daemon {
                         }
                         break;
                     }
+                    // The CLI's own busy/idle bit, read off its output. It is
+                    // the only end-of-turn news after a user cancel: Claude
+                    // Code fires no Stop for an interrupted turn, and
+                    // suppresses the idle notification because the user just
+                    // pressed a key. See `pty::progress`.
+                    Ok(PtyEvent::Progress { busy }) => {
+                        if let SessionRef::Agent(id) = &sref {
+                            daemon.apply_hook_event(id, HookEvent::Progress { busy }, None);
+                        }
+                    }
                     Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // A fire-hosing child can push progress edges off the
+                        // broadcast queue. The scanner itself never lags, so
+                        // reconcile from its current reading rather than
+                        // leaving the status stuck on a dropped edge.
+                        if let (SessionRef::Agent(id), Some(busy)) =
+                            (&sref, session.progress_busy())
+                        {
+                            daemon.apply_hook_event(id, HookEvent::Progress { busy }, None);
+                        }
+                        continue;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }

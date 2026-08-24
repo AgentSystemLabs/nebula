@@ -2,14 +2,14 @@ use crate::term::BufWrite as _;
 
 #[derive(Clone, Debug)]
 pub struct Row {
-    cells: Vec<crate::cell::Cell>,
+    cells: Vec<crate::Cell>,
     wrapped: bool,
 }
 
 impl Row {
     pub fn new(cols: u16) -> Self {
         Self {
-            cells: vec![crate::cell::Cell::default(); usize::from(cols)],
+            cells: vec![crate::Cell::new(); usize::from(cols)],
             wrapped: false,
         }
     }
@@ -29,19 +29,19 @@ impl Row {
         self.wrapped = false;
     }
 
-    fn cells(&self) -> impl Iterator<Item = &crate::cell::Cell> {
+    fn cells(&self) -> impl Iterator<Item = &crate::Cell> {
         self.cells.iter()
     }
 
-    pub fn get(&self, col: u16) -> Option<&crate::cell::Cell> {
+    pub fn get(&self, col: u16) -> Option<&crate::Cell> {
         self.cells.get(usize::from(col))
     }
 
-    pub fn get_mut(&mut self, col: u16) -> Option<&mut crate::cell::Cell> {
+    pub fn get_mut(&mut self, col: u16) -> Option<&mut crate::Cell> {
         self.cells.get_mut(usize::from(col))
     }
 
-    pub fn insert(&mut self, i: u16, cell: crate::cell::Cell) {
+    pub fn insert(&mut self, i: u16, cell: crate::Cell) {
         self.cells.insert(usize::from(i), cell);
         self.wrapped = false;
     }
@@ -70,7 +70,7 @@ impl Row {
         }
     }
 
-    pub fn resize(&mut self, len: u16, cell: crate::cell::Cell) {
+    pub fn resize(&mut self, len: u16, cell: crate::Cell) {
         self.cells.resize(usize::from(len), cell);
         self.wrapped = false;
     }
@@ -125,7 +125,7 @@ impl Row {
                 }
                 prev_col += col - prev_col;
 
-                contents.push_str(&cell.contents());
+                contents.push_str(cell.contents());
                 prev_col += if cell.is_wide() { 2 } else { 1 };
             }
         }
@@ -145,7 +145,7 @@ impl Row {
         prev_attrs: Option<crate::attrs::Attrs>,
     ) -> (crate::grid::Pos, crate::attrs::Attrs) {
         let mut prev_was_wide = false;
-        let default_cell = crate::cell::Cell::default();
+        let default_cell = crate::Cell::new();
 
         let mut prev_pos = prev_pos.unwrap_or_else(|| {
             if wrapping {
@@ -167,7 +167,7 @@ impl Row {
                 prev_attrs = *default_attrs;
             }
             contents.push(b' ');
-            crate::term::Backspace::default().write_buf(contents);
+            crate::term::Backspace.write_buf(contents);
             crate::term::EraseChar::new(1).write_buf(contents);
             prev_pos = crate::grid::Pos { row, col: 0 };
         }
@@ -203,8 +203,7 @@ impl Row {
                             );
                         } else {
                             contents.extend(b" ");
-                            crate::term::Backspace::default()
-                                .write_buf(contents);
+                            crate::term::Backspace.write_buf(contents);
                         }
                     } else {
                         crate::term::MoveFromTo::new(prev_pos, new_pos)
@@ -262,7 +261,7 @@ impl Row {
                     );
                 } else {
                     contents.extend(b" ");
-                    crate::term::Backspace::default().write_buf(contents);
+                    crate::term::Backspace.write_buf(contents);
                 }
             } else {
                 crate::term::MoveFromTo::new(prev_pos, new_pos)
@@ -273,7 +272,7 @@ impl Row {
                 attrs.write_escape_code_diff(contents, &prev_attrs);
                 prev_attrs = *attrs;
             }
-            crate::term::ClearRowForward::default().write_buf(contents);
+            crate::term::ClearRowForward.write_buf(contents);
         }
 
         (prev_pos, prev_attrs)
@@ -313,15 +312,15 @@ impl Row {
             }
             let mut cell_contents = prev_first_cell.contents();
             let need_erase = if cell_contents.is_empty() {
-                cell_contents = " ".to_string();
+                cell_contents = " ";
                 true
             } else {
                 false
             };
             contents.extend(cell_contents.as_bytes());
-            crate::term::Backspace::default().write_buf(contents);
+            crate::term::Backspace.write_buf(contents);
             if prev_first_cell.is_wide() {
-                crate::term::Backspace::default().write_buf(contents);
+                crate::term::Backspace.write_buf(contents);
             }
             if need_erase {
                 crate::term::EraseChar::new(1).write_buf(contents);
@@ -361,8 +360,7 @@ impl Row {
                             );
                         } else {
                             contents.extend(b" ");
-                            crate::term::Backspace::default()
-                                .write_buf(contents);
+                            crate::term::Backspace.write_buf(contents);
                         }
                     } else {
                         crate::term::MoveFromTo::new(prev_pos, new_pos)
@@ -419,7 +417,7 @@ impl Row {
                     );
                 } else {
                     contents.extend(b" ");
-                    crate::term::Backspace::default().write_buf(contents);
+                    crate::term::Backspace.write_buf(contents);
                 }
             } else {
                 crate::term::MoveFromTo::new(prev_pos, new_pos)
@@ -430,7 +428,7 @@ impl Row {
                 attrs.write_escape_code_diff(contents, &prev_attrs);
                 prev_attrs = *attrs;
             }
-            crate::term::ClearRowForward::default().write_buf(contents);
+            crate::term::ClearRowForward.write_buf(contents);
         }
 
         // if this row is going from wrapped to not wrapped, we need to erase

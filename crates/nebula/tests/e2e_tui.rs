@@ -261,7 +261,7 @@ fn screen_to_text(screen: &vt100::Screen) -> String {
 /// starts with a fresh DB, so the panels are at their default widths).
 fn sessions_panel_contains(screen: &vt100::Screen, needle: &str) -> bool {
     const SESSIONS_X: u16 = 20 + 22;
-    const SESSIONS_W: u16 = 26;
+    const SESSIONS_W: u16 = 32;
     let (rows, cols) = screen.size();
     let right = SESSIONS_X.saturating_add(SESSIONS_W).min(cols);
     for row in 0..rows {
@@ -634,8 +634,8 @@ fn tui_link_crud_in_sessions_panel() {
     // The root worktree row must exist before a link has an owner.
     tui.wait_for_text("⌂ root");
 
-    // ---- create: L prompts, the URL lands in a LINKS group ----
-    tui.send(b"L");
+    // ---- create: l prompts, the URL lands in a LINKS group ----
+    tui.send(b"l");
     tui.wait_for_text("Add link");
     tui.type_str("https://example.dev/spec");
     tui.send(b"\r");
@@ -653,7 +653,7 @@ fn tui_link_crud_in_sessions_panel() {
     tui.wait_for_text("example.dev/spec/v2");
 
     // ---- a second link: both list under the one header ----
-    tui.send(b"L");
+    tui.send(b"l");
     tui.wait_for_text("Add link");
     // Typed without a scheme — the daemon normalizes it to https://.
     // Short on purpose: the Sessions panel truncates long rows.
@@ -708,7 +708,7 @@ fn tui_pull_request_row_leads_the_links_group() {
     tui.wait_for_text("can't be deleted");
 
     // A link the user adds lands under it.
-    tui.send(b"L");
+    tui.send(b"l");
     tui.wait_for_text("Add link");
     tui.type_str("example.dev/spec");
     tui.send(b"\r");

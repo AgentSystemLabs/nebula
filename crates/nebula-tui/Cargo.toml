@@ -13,10 +13,10 @@ tokio = { workspace = true, features = ["io-std"] }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
-tui-term = "0.2"
-vt100 = "0.15"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "all-widgets", "layout-cache", "macros", "underline-color"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+tui-term = "0.3"
+vt100 = "0.16"
 portable-pty = "0.9"
 futures = "0.3"
 
