@@ -1,0 +1,618 @@
+# Nebula Memory
+
+Work log written by the `nebula-memory` skill. Newest first. Read this before starting a task; append
+after finishing one. See `.claude/skills/nebula-memory/SKILL.md` for the entry format and the rules
+about what is worth recording.
+
+> **Provenance.** Everything dated 2026-08-04 through 2026-08-24 is a backfill, reconstructed on
+> 2026-08-24 from the 152 session transcripts in `~/.claude/projects/…-nebula/`, `git log`, and the
+> verified notes in that project's `memory/` directory. Prompts are quoted from the transcripts, and
+> every file and symbol named below was confirmed to still exist. The **Did** lines are grounded in
+> commits and code; where a session's outcome could not be verified it was left out rather than guessed.
+> Entries written from here on are first-hand. The ~300-line pruning rule in the skill applies to
+> ongoing appends — this backfill is deliberately over it.
+
+## Entries
+
+### Project Memory System — 2026-08-24
+
+**Asked:** "update claude.md to invoke a skill called nebula-memory which has instructions on how an
+agent should summarize the original request, how we fixed or implemnted it, and any gotchya you ran
+into along the way. update the claude.md to instruct agents to read the memory.md file that the skill
+updates …" — then: "go through all previous sessions for this project and invoke the nebula-memory
+skill starting with oldest last so we can document how we grew this project."
+
+**Did:** Created `CLAUDE.md` (none existed — only an empty `CLAUDE.local.md`), the
+`.claude/skills/nebula-memory/` skill, and this file. Backfilled the entries below.
+
+**Gotchas:**
+- Real user prompts are recoverable from the transcripts by filtering `type=="user"` **and**
+  `promptSource=="typed"` **and** `origin.kind=="human"`. Without that filter you get 8544 tool-result
+  records instead of 258 prompts.
+- ~12 sessions in this project's transcript dir are not nebula work at all — they are Cartastrophe game
+  sessions and one-off test prompts that happened to run from this cwd. Filter by content, not by directory.
+
+### Sessions Ordered By Last Interaction — 2026-08-24
+
+**Asked:** "order the sessions by last interaction date, also display a time last interacted next to the
+session title to right but left of harness name, so the workflow is a session runs goes to top of list,
+if anything else iteracts it would go top. when displaying the last interaction time just show '23m ago…'"
+Follow-up: "commit and push, then release with good change log with detials on what changed, make release
+skill when done to follow these steps." Related earlier ask (2c58d9c1): running / awaiting-feedback
+sessions always pin to the top of the Recent list.
+
+**Did:** Sessions sort by last-interaction timestamp with a relative age label; released as `c340baf`
+(v0.2.0).
+
+### Rebindable Hotkeys And Settings Tabs — 2026-08-24
+
+**Asked:** "in the settings add a top tabs which a user can use arrows or tabs to navigate though.
+challenge my prompt, pick the best user experience. make good tab categories for where to put settings.
+now I need you to add in a setting for hotkeys, allow a user to customize ANY HOTKEY in the application…"
+
+**Did:** New `crates/nebula-tui/src/keymap.rs` holds the rebindable key table; settings overlay grew
+tabs. Landed in `87d2b24` alongside the cancel-status fix.
+
+**Gotchas:**
+- The user explicitly invited pushback ("challenge my prompt") — this is a standing preference on UX
+  asks, not a one-off.
+
+### Worktree Names With Spaces, Random Branch Names — 2026-08-24
+
+**Asked:** "when I create a worktree name, allow a user to type in spaces in the worktree name but you
+must convert the spaces to hyphens. also allow a user to just enter on the branch which will pick a
+random branch name using three words combined such as yellow-fox-jumps <adj>-<noun>-<verb>"
+
+**Did:** Added `crates/nebula-tui/src/branch_name.rs` for the `<adj>-<noun>-<verb>` generator; the
+worktree name field slugifies spaces to hyphens.
+
+### PR Links And New-Comment Counts — 2026-08-23 → 08-24
+
+**Asked:** "I noticed that one of my sessions created a pull request but that link was not auto detected,
+I think when I switch to a worktree you should run a background process to check if any pull request are
+open and show them as links…" Then: "if possible, track how many NEW comments were added since the last
+click on a pull request link, it would be nice to see when others have left comments…"
+
+**Did:** `crates/nebula-tui/src/pull_request.rs` plus a `pr_seen` read-marker map on `App`
+(`app.rs:1718`). Links pin to a worktree; commit `44bd270`.
+
+**Gotchas:**
+- `gh pr view --json comments,reviews`: `comments[]` has **`viewerDidAuthor`**, `reviews[]` does **not** —
+  telling your own reviews apart needs `gh api user --jq .login`. Inline per-line review comments aren't
+  exposed as a `--json` field at all; counting review submissions is the cheap approximation.
+- Both timestamps are RFC 3339 UTC, which sorts **lexicographically in chronological order**. `pr_seen`
+  stores the newest stamp seen at open time, so "newer than X" is a string compare — no clock, no date
+  parsing, and no `chrono`/`time` dependency added to a deliberately dep-light workspace. Empty string
+  works as the sentinel because every real stamp sorts above it.
+
+### Cancelling Claude Left The Status Stuck — 2026-08-23
+
+**Asked:** "I noticed that when I cancel Claude code, it never actually changed the status back to green
+from that yellow animation. Can you debug and fix this?"
+
+**Did:** Added `crates/nebula-daemon/src/pty/progress.rs`, which scans the PTY byte stream for OSC 9;4
+progress edges; the pump emits `PtyEvent::Progress` and `status.rs` treats "progress cleared" as a
+synthetic `Stop` (same subagent-drain bookkeeping), but only from Running/NeedsFeedback.
+
+**Gotchas:**
+- Esc-cancelling a Claude turn fires **no hook at all**. `Stop` is documented not to run on user
+  interrupt, and the `idle_prompt` Notification that normally rescues a hookless turn end is suppressed
+  because Claude gates it on 60s quiet **AND** the user not having touched the keyboard — pressing Esc
+  *is* touching it. Verified against Claude Code 2.1.241 with a `pty.fork` harness; only
+  `UserPromptSubmit` then `SessionEnd` ever fired.
+- The window **title** is unusable as a busy/idle signal — during a permission prompt it shows idle (`✳`)
+  while the OSC 9;4 progress state correctly stays busy (`3`). Trust the progress state, never the title,
+  or you will green out an agent that is waiting on the user.
+- Codex and cursor-agent emit no OSC 9;4 at all, so this path is inert for them.
+
+### Shared Working Tree Is Raced By Other Sessions — 2026-08-23
+
+**Asked:** (no prompt — surfaced mid-task) A `git stash push -m hotkey-wip` + pop cycle from **another**
+Claude session reverted and then restored every uncommitted file mid-edit, and the pop left three
+duplicated `activity:` fields in `event_loop.rs` test fixtures.
+
+**Did:** Nothing to commit — recorded as a working rule.
+
+**Gotchas:**
+- The user runs nebula's own agents against this repo, so the main tree is routinely mid-refactor from
+  someone else. A `cargo check`/`cargo test` failure often has nothing to do with your change — check
+  whether the failing symbols belong to unrelated in-flight work before blaming your own edit.
+- Re-verify your edits are still on disk after any unexplained state change. Never `git stash pop` or
+  `git checkout` the shared tree on your own judgment.
+- A self-contained new module can be checked in isolation with `rustc --test --edition 2021 <file>` when
+  the crate as a whole won't build.
+
+### MIT License And Dependency Audit — 2026-08-23
+
+**Asked:** "change to MIT license" — then, separately: "is https://ratatui.rs/ used on this project? what
+third party lib do we use?" and "verify we are on the latest version of all of these, and also verify they
+are all MIT license or able to be used on this MIT tui I'm making."
+
+**Did:** Added `LICENSE` (MIT) and audited workspace dependency licenses.
+
+### Releases So The Installer Stops Falling Back To Cargo — 2026-08-22
+
+**Asked:** "no prebuilt binary for this platform yet — falling back to cargo... fix. also update readme to
+walk user how to use this"
+
+**Did:** Cut real GitHub releases with binaries (`bcaa104`, then `4ddcc7e` v0.1.1, `0c178e2` v0.1.2) so
+`install.sh` finds an artifact instead of building from source.
+
+**Gotchas:**
+- Two `gh` accounts are logged in and **`codyseibert` is the active one, with only READ** on
+  `AgentSystemLabs/nebula` — `gh pr create` fails with "must be a collaborator (createPullRequest)".
+  `webdevcody` is the admin. Run `gh auth switch --hostname github.com --user webdevcody` before any
+  write API call. `git push` is unaffected: it goes over SSH, not the gh token.
+
+### Codex Hooks Moved To ~/.codex — 2026-08-22
+
+**Asked:** (follow-on from the Aug 14 codex work — codex sessions still weren't reporting status)
+
+**Did:** `22f1b24` moved codex's hooks to `$CODEX_HOME/hooks.json` and started trusting `idle_prompt`.
+
+**Gotchas:**
+- Codex gates hooks behind a trust modal keyed by the **hook file's absolute path**, recorded in
+  `~/.codex/config.toml` under `[hooks.state."<abs path>:<snake_case event>:<group idx>:<hook idx>"]` as
+  `trusted_hash = "sha256:…"` — **not** a plain sha256 of the command string, so don't try to precompute
+  it. A project-local `.codex/hooks.json` therefore re-prompts in every new worktree, and an unanswered
+  prompt means the hooks never run at all. `$CODEX_HOME/hooks.json` is a stable path → one approval
+  covers everything.
+- Codex discards raw stdout from hooks. Context injection only works through
+  `{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"…"}}`. Claude Code
+  accepts that same envelope, so one response body serves both.
+- `codex exec` **does** run hooks once trusted, so it's a fast harness — but it can't answer the trust
+  modal, so grant trust first with one interactive run.
+
+### Real Line Editing In Typed Fields — 2026-08-22
+
+**Asked:** (session ran on branch `fixing-input-ux`, merged as PR #1)
+
+**Did:** `cd07baa` gave every typed field real terminal line-editing.
+
+### Workspaces And The o/t/e Hotkey Remap — 2026-08-21
+
+**Asked:** "add the ability to do a nebula workspace add <name> and then later nebula workspace open
+<workspace_name>, then all projects will scoped to that workspace. make sure the / fuzzy find doesn't
+search over all workspaces. also include a workspace list and workspace delete and workspace rename…"
+Separately, on keys: "right now I often press o to open a new project accidently and that opens the
+notes… on the nebula landing screen… my first instinct was to press o to open a new project" →
+"change the new terminal hotkey to t, and change the todos to instead just be e hotkey for not(e)s,
+refactor the language so instead of it being todos it's just notes."
+
+**Did:** `77a87ca` (workspaces, respawn moved agents, o/t/b remap) and `4bea626` (todos → notes, ssh host
+picker, note badge glyph).
+
+**Gotchas:**
+- A workspace is **just a grouping of projects** — the same project may belong to several. An early
+  version refused to add a project that already existed in another workspace; the user rejected that
+  ("we should be able to add any projects to any workspaces").
+- The user twice asked for the key-combo hints to be rendered at the bottom of a modal rather than behind
+  submenus ("nah I'd rather it just show r and d in the bottom of the workspace panel like we do for the
+  notes, we should need all these sub menus"). Follow the notes-modal pattern for any new modal.
+
+### e2e Daemon-Boot Failures Have Two Different Causes — 2026-08-21 → 08-23
+
+**Asked:** (no prompt — both surfaced while verifying other work)
+
+**Did:** Nothing to commit. Both are environmental, and telling them apart saves hours.
+
+**Gotchas:**
+- **Cold-exec flake.** All 16 `e2e_pty` tests fail with `daemon socket never appeared`. First exec of a
+  freshly relinked `target/debug/nebula` can stall for seconds on macOS signature validation, so the test
+  panics at its 5s deadline, `TempDir` drop deletes the runtime dir, and the late daemon logs
+  `FATAL bind …/daemon.sock: No such file or directory`. Fingerprint: orphaned
+  `$TMPDIR/.tmp*/data/state/daemon.log` files. **Just rerun** — it passes clean the second time.
+- **Orphaned daemons.** Same generic error, but **no `daemon.log` is written at all** and reruns don't
+  help — a test that passes in the full suite fails alone, seemingly at random. Cause: dozens of stray
+  `nebula daemon --foreground` processes from past runs, each holding watchers/fds. Check with
+  `ps aux | grep -c "[n]ebula daemon"`; anything in the dozens means orphans.
+- Reaping orphans is safe **except for the live one** — read `/tmp/nebula-501/daemon.pid` (or
+  `$NEBULA_RUNTIME_DIR/daemon.pid`) and exclude it, or you kill the nebula session you are running inside.
+  Ask before bulk-killing: it's the user's machine and other live sessions may be in play.
+
+### Restyle, Focus Wash, And The Screenshot Harness — 2026-08-20 → 08-21
+
+**Asked:** A run of visual passes: "would it be possible to space out the items in the projects worktrees
+and sessions lists? like to make them feel like larger buttons, also visual hieachy…", "when a list panel
+is in focus, render a themed gradient that comes up from the bottom, but very subtle…" → "the bottom focus
+gradient looks like shit... let's think of a differnt indicator… maybe just make the entire panel a very
+lightly colored (like 10% opactiy) theme color", and "when a session is running (when it's yellow status
+or red), make the text animate with colors… it should be a sweeping animation."
+
+**Did:** `d704da7` (borderless columns, raised-fill selection, quiet chrome) plus the animation pass, with
+a settings toggle to disable animations for CPU.
+
+**Gotchas (recipe for screenshotting the TUI with demo data):**
+- Isolate with `NEBULA_RUNTIME_DIR=/tmp/<short>` (SUN_LEN!) and `NEBULA_DATA_DIR=<scratch>/demo/data`.
+  Never touch the real daemon — and note the daemon **detaches and outlives the tmux server**, so
+  `kill $(cat $NEBULA_RUNTIME_DIR/daemon.pid)` when done.
+- **Set `NEBULA_AGENT_CMD` even if you never create an agent** — the warm-slot prewarm launches a real
+  `claude` on its own (shows as "1 agent · ~600MB" with zero agent rows in the DB). `/bin/cat` works.
+- **One Bash call per drive**: the sandbox kills the private tmux server when the tool call ends, so
+  new-session, send-keys, captures and kill-server must all happen in a single call. Send one key per
+  call with 0.3–1s sleeps — batched keystrokes concatenate into the name prompt.
+- `tmux capture-pane -epN` — **without `-N`** tmux trims trailing styled spaces and any background fill on
+  the rightmost pane silently vanishes from the capture.
+- Color and animation checks don't need PNGs: `capture-pane -ep` keeps SGR escapes; decode with
+  `LC_ALL=C sed 's/\x1b\[/¶/g'` and grep for `38;5;N`, capturing 2–3 frames ~350ms apart to prove motion.
+- Chrome headless gets SIGKILLed on this Mac and charmbracelet freeze wrecks the cell grid — use a small
+  pillow grid renderer instead.
+
+### Sessions Auto-Rename Themselves — 2026-08-20
+
+**Asked:** "add some type of hook into nebula and ability for claude to automatically rename the session,
+update the system prompt to use the skill to tell nebula to rename the session after the initial prompt
+was submitted, we should be able to creat a title between 3-4 words that describe the ask of the promp…"
+
+**Did:** A `UserPromptSubmit` hook injects an instruction telling the agent to run `nebula rename <title>`.
+Later extended to codex ("it doesn't seem lke when I send a prompt to codex it updates the session title…
+look into how we do it for claude code and replicate that behavior").
+
+**Gotchas:**
+- This is why every session in this repo issues a `nebula rename` before doing anything. It is injected
+  context, not something the user typed — don't mistake it for part of the request.
+
+### Cursor's Hooks Are Not Claude-Shaped — 2026-08-20
+
+**Asked:** "cursor doesn't seem to update the status of the wortree or sessions when it is running, debug
+and fix, verify it has hooks, if not, then setup some type of skill that is injected to cursor as a system
+prompt or something so that it knows how to phone home to nebula to update the status"
+
+**Did:** `install_cursor_hooks` in `hooks/installer.rs:260` is its own writer (plus a migration purge of
+nebula groups under every key), and the installer maps cursor event names onto Claude-equivalent
+`hookEvent` query values so `parse_event` stays single-dialect. `HookPayload` in `hooks/mod.rs` grew
+aliases.
+
+**Gotchas:**
+- The installer originally assumed "same hooks JSON shape across all three CLIs". Cursor **silently
+  ignored** the PascalCase Claude-shaped groups, so no status ever phoned home — no error, just nothing.
+- Cursor's dialect: camelCase events (`sessionStart`, `beforeSubmitPrompt`, `stop`, `subagentStart/Stop`,
+  `sessionEnd`), **flat** `{"command": …}` entries (no nested `hooks` array, no `type`), and a required
+  top-level `"version": 1`. Hooks must print `{"continue": true}` to stdout or gating events degrade.
+- Payloads carry `session_id` == `conversation_id` (the `--resume` chatId), have **no `cwd`** (use
+  `workspace_roots[0]`), and subagent hooks use `subagent_id`, not `agent_id`.
+- `beforeSubmitPrompt` and `stop` fire **only in interactive TUI mode**. A `-p` print-mode test fires only
+  sessionStart / tool hooks / afterAgentThought / sessionEnd — **never conclude hooks are broken from a
+  `-p` test**. To drive one interactively: pipe timed keystrokes through
+  `script -q /dev/null cursor-agent --force --trust`.
+
+### Idle Session Reaping And Metrics — 2026-08-20
+
+**Asked:** "right now when a user opens a session, it takes some time I think for nebula to connect maybe
+to the server and actually show the terminal... can we find a way to prefetch these connections…" → "add
+logic to auto suspend or kill claude sessions that are not in focus…" → then the user pushed back on their
+own idea: "I'm concerned now because some claude sessions might have schedules or long running jobs and I
+don't want them killed.... is the latest change potentially breaking that requirement?" → "ok for now
+never reap pinned sessions, also make this entire reap process a setting configurstion to just turn it
+off." Alongside: "add some type of metrics modal which will show the overal usage of nebula combined with
+all the other terminals open, including memory usage for individual and overall."
+
+**Did:** `e11f838` — idle reaping, metrics tracking, memory stats in the footer.
+
+**Gotchas:**
+- **Pinned sessions are never reaped**, and reaping is switchable off entirely. That constraint came from
+  the user realizing mid-feature that agents may be running long jobs — treat it as load-bearing.
+
+### The Daemon Needs Its Own Session, Not Just A Process Group — 2026-08-20
+
+**Asked:** "sometimes nebula will enter this state when I try to start a new claude terminal, it just
+keeps writing strange tokens and the entire app is broken basically, I can't interact, it just happened
+in a previous session I tried to open"
+
+**Did:** `4502575`. `spawn_daemon` in `crates/nebula-tui/src/ipc.rs` now calls `setsid()` in `pre_exec`
+instead of only creating a new process group, so the daemon holds **no controlling terminal** and nothing
+it spawns can reach the user's terminal through `/dev/tty`. The `zsh -l -i -c "command -v claude"` CLI
+probe in `nebula-daemon/src/registry.rs` also `setsid()`s (so even a `--foreground` daemon can't have the
+probe shell steal a tty) and gained `.kill_on_drop(true)` — previously a hung probe leaked the child
+forever when the 5s timeout dropped the future.
+
+**Gotchas:**
+- The garbage tokens were a **shell job-control fight over the controlling terminal**, not a rendering or
+  vt100 bug. A new process group is not enough; it must be a new *session*.
+- With no controlling tty, zsh's `/dev/tty` open fails and it skips job-control init entirely — that's the
+  mechanism, and it's why the fix is one call in the right place.
+
+### `zsh: killed` Is A Stale Code Signature, Not A Rust Bug — 2026-08-20
+
+**Asked:** "debug why when I run nebula if fails … `nebula upgrade` → `zsh: killed nebula upgrade` …
+`nebula` → `zsh: killed nebula`" Same thread: "nebula fails when I try to run it, give me hte proper
+commands I should run locally to use the latest built version" → "make that into a single script and maybe
+a makefile" → "rename kill-server to just kill, do that everywhere kill-server is too verbose."
+
+**Did:** Added the `Makefile` for the local dev loop and renamed `kill-server` → `kill`.
+
+**Gotchas:**
+- The crash report says `SIGKILL (Code Signature Invalid)` / `Taskgated Invalid Signature` **even though
+  `codesign -vv ~/.cargo/bin/nebula` reports valid on disk**. Cause: `cargo install --path` rewrote the
+  binary **in place (same inode)** while the kernel held a cached signing blob for that vnode, so every
+  later exec was killed.
+- Fix is to refresh the inode, not the code:
+  `cp ~/.cargo/bin/nebula ~/.cargo/bin/nebula.new && mv -f ~/.cargo/bin/nebula.new ~/.cargo/bin/nebula`.
+  Identical bytes on a fresh inode exec fine.
+- Confirm before debugging anything else: `~/Library/Logs/DiagnosticReports/nebula-*.ips`.
+- A lingering `nebula daemon` from the old inode keeps running **old code**. `nebula kill` is the user's
+  call — it stops live sessions.
+
+### In-TUI File Tooling — 2026-08-19
+
+**Asked:** Four asks in one evening: "when a user presses f show a fuzzy file finder…", "add the ability
+for a user to press a hotkey to show a find in files search, basically it should run grep over the code
+base… when a user presses enter it should show a vim terminal to allow editing that file, that vim
+terminal must be a modal inside this app", "when claude code prints file paths, I want to be able to do a
+option click… to actually open that file directly inside a file viewer (vim) inside nebula", and "add a
+hotkey for t which shows a full tree browser modal with a view of the file content on the right…" →
+refined to "in the file preview, it should be syntax highlighted, also when I select the file, it
+shouldn't open a new vim modal, the right panel should just focus and let editing with vim."
+
+**Did:** `998901f` (file finder, grep overlay, path links, in-TUI editor via
+`crates/nebula-tui/src/vim_term.rs`) and `7ebc264` (tree browser with live filter and syntax preview).
+Later `6787999` numbered the lines in file previews but not directory listings. The editor command is
+configurable — the user asked for neovim support explicitly.
+
+### Crash Logging — 2026-08-19
+
+**Asked:** "make sure all errors in nebula are logged into a .log file somewhere so that I can debug when
+it crashes. so far i've seen nebula randomly close out and crash twice now when trying to create a new
+claude session, but I'm not sure how to debug"
+
+**Did:** `71e62c7` — panic logging for both the TUI and the daemon.
+
+**Gotchas:**
+- Worth knowing that the "random crashes on new claude session" the user was chasing here were most likely
+  the two separate problems diagnosed the next day: the stale code signature and the controlling-terminal
+  fight. Crash logging is what made both findable.
+
+### nebula ssh And Remote Hosts — 2026-08-19 → 08-21
+
+**Asked:** "add a way for someone to launch nebula from the cli into a remote ssh. assume ssh keys already
+allow access to the remachine. so something like nebula ssh HOST and when we get into the machine it
+should install nebula if it doesn't already exist on the machine (remote exec of a script)…" Later: "add a
+built in way so that nebula remembers the hosts you've recently done `nebula ssh` with so that a user can
+press h to view all the hosts…"
+
+**Did:** `8ddad36` (remote hosts, user config with settings overlay, fuzzy diff filtering) and the host
+picker in `4bea626`.
+
+**Gotchas:**
+- The user also had to enable inbound ssh on this laptop to test it, and explicitly asked to confirm it
+  was **local-network only, nothing from the public internet**. Don't widen that.
+
+### Sessions Re-Home Into The Worktree They Create — 2026-08-18 → 08-24
+
+**Asked:** "sometimes I'll be on the main root worktree and I'll start a session, and inside that session
+I'll prompt it to do the work inside a worktree, which claude or codex will then create the worktree. if
+possible, when this happens I want to move the session out of that main worktree root and move it to…"
+Later, twice more: "there is a strange bug where … after I manually move a session to that work tree, at
+some point in the future that original session seems to switch back to whatever worktree it originally
+was…" and "the session takes a while before it is moved into the worktree… is there a way to make
+automatically move…"
+
+**Did:** `7570387` re-homes an agent row by hook-reported cwd. The cwd probe is the
+`("PostToolUse", Some("Bash|EnterWorktree|ExitWorktree"))` matcher in `hooks/installer.rs`.
+
+**Gotchas:**
+- Claude uses its own **EnterWorktree** tool, not `git worktree add`. That creates a **locked** worktree
+  at `<repo>/.claude/worktrees/<name>` on branch `worktree-<name>`.
+- A Bash `cd` to a directory **outside the session's workspace root is silently reset** ("Shell cwd was
+  reset to …") and the hook cwd never changes. So nebula's own sibling layout
+  (`<repo>/../<repo>-worktrees/<branch>`, `git.rs` `worktree_dir`) is unreachable by cwd-following — only
+  checkouts *inside* the repo re-home.
+- Before the `EnterWorktree` matcher existed, the row only moved at the turn's `Stop` — measured **~34s
+  late**, which is exactly the "takes a while" the user reported.
+- **Hooks are snapshotted at session start**, so any hook-set change only reaches newly spawned sessions.
+
+### Cmd+P Never Reaches The Agent In Terminal.app — 2026-08-18
+
+**Asked:** "when I try command + p in a claude session, it just pastes the pi character and recommends I
+run /setup-terminal which I already have, can you figure out if maybe command + p is not properly being
+sent to the claude session? this is inside a terminal.app I'm running nebula. this works perfectly fine…"
+
+**Did:** No code change — diagnosed as not-a-nebula-bug and gave remedies.
+
+**Gotchas:**
+- Terminal.app **never encodes Cmd into pty bytes** (⌘P is File→Print at the menu layer). The press
+  arrives as Option+P's character `π`. Nebula's chain was verified sound end to end: kitty probe in
+  `event_loop.rs` setup_terminal → legacy encoder swallows SUPER (`keys.rs` `encode_legacy`) → kitty
+  re-encode would have sent `\x1b[112;9u`.
+- Agent PTYs get `TERM=xterm-256color` (`pty/mod.rs`) but inherit the **daemon's** `TERM_PROGRAM`, so
+  `/terminal-setup` run inside nebula detects whatever terminal the daemon was first spawned from, not
+  the one currently attached.
+- Remedy given: `/model` opens the same picker, or bind `ctrl+p` → `chat:modelPicker` in
+  `~/.claude/keybindings.json`.
+
+### Wheel Scrollback Vs Claude's Alt Screen — 2026-08-18 → 08-21
+
+**Asked:** "when I scroll on my mouse wheel know (or track pad), it doesn't seem to scroll back in the
+terminal session output, it instead just switches my previous entered prompts in the input" — and again
+later: "…it instead it says 'Scroll wheel is sending arrow keys · use PgUp/PgDn to scroll' and it just
+keeps showing previous prompts I'm using, how do I fix that"
+
+**Did:** `handle_mouse` in `event_loop.rs` (see `mouse_protocol_mode` at `event_loop.rs:5199`) now
+forwards a real SGR wheel report (`\x1b[<64;col;rowM` / 65) at the 1-based pane cell whenever
+`screen.mouse_protocol_mode() != None`; arrow synthesis remains only for mouseless alt-screen apps
+(plain vim/less).
+
+**Gotchas:**
+- Claude Code 2.1.x renders its main UI on the alternate screen and enables mouse tracking
+  `?1000h ?1002h ?1003h ?1006h` **in the same write as** `?1049h`, so a vt100 replay sees both or neither.
+- The old arrow-synthesis fallback is what triggered Claude's own `arrow-burst` detector and that warning
+  banner. Check the child's mouse protocol mode in the vendored vt100 before assuming arrows are right.
+
+### Optimistic Worktree Deletes And Stale Locks — 2026-08-18
+
+**Asked:** "add some type of background task for deleting worktrees, I notice when i try to delete a
+worktree, it often freezes up for a bit until it finally removes the worktree, I'd like it to do
+optimistic client updates for when it's deleted and rollback if it fails…" Plus: "I'm trying to delete a
+worktree and it says 'cannot remove a locked working tree, lock reason: claude session
+menu-enable-level'. when I try to delete a worktree, it should force kill and remove any locked sessions…"
+
+**Did:** `d214366` — deletes are optimistic with rollback, and stale session locks are force-unlocked.
+
+**Gotchas:**
+- The lock is not nebula's; Claude's EnterWorktree creates locked worktrees, so `git worktree remove`
+  refuses until the lock is cleared.
+
+### Codex And Cursor As Agent Kinds — 2026-08-14 → 08-15
+
+**Asked:** "add support for codex as well, so when a try to load up a new session using the n hotkey, show
+a modal that let's me pick codex or claude, make sure the codex setup has the proper hooks or whatever
+else instlaled like we do in claude so that the status indicators can properly reflect the state of th…"
+Then: "also add support for cursor cli as a session option" and "run codex with --yolo mode on codex
+sessions, same with cursor if it has a type of yolo flag see how we do it on mission-control."
+
+**Did:** `AgentKind` + a picker modal (`5092684`, `986f505`), cursor-agent as a third kind (`f5ed97d`),
+permissions always skipped for both (`89f9860`).
+
+**Gotchas:**
+- `claude` takes `--model <alias>` and `--effort <low|…|max>`; `codex` takes `-m/--model` but effort only
+  via `-c model_reasoning_effort=<…>`; `cursor-agent` has no model/effort knobs. Pick lists are hardcoded
+  in `crates/nebula-tui/src/config.rs` (`CLAUDE_MODELS`, `CODEX_MODELS`) — "default" always means
+  "pass no flag".
+- Cursor has no PermissionRequest hook and nebula runs `cursor-agent --force`, so cursor agents report
+  busy/idle but **never** needs-feedback. That is expected, not a bug.
+
+### Vendored vt100 So Codex Scrollback Works — 2026-08-14
+
+**Asked:** "scrolling back using codex doesn't work, but claude works fine, debug and fix"
+
+**Did:** Vendored vt100 0.15.2 into `vendor/vt100` with a one-line semantic change and wired it via
+`[patch.crates-io]` in the root `Cargo.toml`, so both `nebula-tui` and `tui-term` pick it up
+(`d1d1a50`). Two regression tests in `app.rs` — one replays a codex-style region scroll, and it also
+fails if anyone drops the `[patch.crates-io]` wiring.
+
+**Gotchas:**
+- The bug was in the parser, not in nebula's scroll handling. Codex is a ratatui **inline-viewport** app:
+  it inserts history by setting a top-anchored DECSTBM scroll region (`ESC[1;{viewport_top}r`) and
+  scrolling inside it. Stock vt100 0.15.2 **discards** any line scrolled out while a scroll region is
+  active (`grid.rs`, `scroll_up`), so codex's scrollback stayed empty. Real terminals keep top-anchored
+  region scrolls — which is why codex scrolls fine *outside* nebula.
+- `vendor/vt100` is a **patched fork**. Do not upgrade or re-vendor it without re-applying this change.
+- Full-screen apps are unaffected: the alternate screen's grid is created with zero scrollback capacity.
+
+### Agents Spawn Through A Login Shell — 2026-08-14
+
+**Asked:** "it seems like new sessions don't use my ~/.zshrc, verify the do on load"
+
+**Did:** `1344cd6` — agents and terminals spawn through a login shell.
+
+**Gotchas:**
+- This wrap is why `NEBULA_AGENT_CMD` also has to *skip* it: without that, `~/.zprofile` resets PATH and
+  the **real** `claude` CLI launches instead of a test stub.
+
+### Terminals Removed, Then Brought Back — 2026-08-09 → 08-20
+
+**Asked:** "remove the terminal section from the session list, I decided I don't care about terminals as
+we can just use claude code to run terminal commands directly" — reversed 11 days later: "add a way to
+create a new terminal already in the pwd of the worktree or root, figure out a good key binding for this
+as cmd + t will open a new ghostty terminal if I'm using ghostty to run nebula" (`c318eedb`).
+
+**Did:** Removed, then re-added on its own hotkey (`t` after the Aug 21 remap).
+
+**Gotchas:**
+- Recorded because the removal reads like a settled decision in the Aug 9 history and is **not** one.
+  Don't cite it as precedent.
+
+### Worktree Watcher And Selection Memory — 2026-08-05
+
+**Asked:** "verify we have some type of directory watcher on .worktrees or the github worktrees so that
+when a new worktree is created from an agent or manually it'll update the worktrees list automatically.
+right now i created a worktree and it did not show up in that list until i restarted nebula" — then:
+"change of plans, we should remember the last agent that was selected for that project so that if i
+switch between projects it'll automatically just show the last selected worktree & agent…"
+
+**Did:** `91c29c0` (auto-sync + selection restore) and `02bb5a3` (refresh branches on external checkouts).
+
+### Project Dividers And Shift+J/K Reordering — 2026-08-05
+
+**Asked:** "add a way to put dividers between projects, also a way to hold shift and move projects up and
+down in regards to their order in the list so that I can group projects together" — then, after the first
+attempt only swapped neighbours: "when I do shift j and k, it doesn't seem to move projects under
+dividers, it just swaps projects, you must treat a divider as something I can move a project under or
+above separate" and, escalating, "I should be able to move a project into any fucking divider I want."
+
+**Did:** `98dc681` — reordering treats dividers as real positions, and dividers are labelable and movable.
+
+**Gotchas:**
+- Shift+↑/↓ is **undeliverable in Terminal.app**: `keyMappings.plist` has entries for `$F702`/`$F703`
+  (Shift+←/→) but **none** for `$F700`/`$F701`, so Terminal drops the shift and sends a plain arrow.
+  Shift+J/K works everywhere because crossterm tags uppercase chars with SHIFT.
+- "Move" has to mean move-across-groups, not swap-with-neighbour. The first implementation satisfied the
+  literal words and not the request.
+
+### Install Script And The Org Slug — 2026-08-05
+
+**Asked:** "if I wanted to provide one command for anyone to install or update this cli tool, what's the
+best way? a .sh script in the repo? I don't want to use some third party registery at this point" →
+"do the curl approach and put in the readme" → "why did you make the readme say webdevcody,,, this is part
+of the agentsystemlabs org"
+
+**Did:** `install.sh` + README one-liner (`95ac3da`), then `nebula upgrade` (`1c87c06`).
+
+**Gotchas:**
+- The repo slug is **`AgentSystemLabs/nebula`**, never `webdevcody/<repo>`. It is hardcoded in
+  `install.sh` (`REPO=`) and the README. Assume other repos under `~/Workspace/AgentSystemLabs/` are
+  org repos too.
+
+### iTerm Swallowed Option+Delete — 2026-08-05
+
+**Asked:** "when I have a session focused, option + delete doesn't seem to work to backspace by words when
+I have nebula opened in iterm, fix"
+
+**Did:** Fixed outside the codebase — set left Option → Esc+ in iTerm's Default profile.
+
+**Gotchas:**
+- iTerm2 3.5.10 in kitty mode only reports Option as the alt modifier when the profile's Option key is
+  **Esc+** (`Option Key Sends` = 2). With "Normal" (the user's old setting) Option+Delete arrives as a
+  plain Backspace and word-delete silently breaks.
+- iTerm must **not** be running when editing its plist or it clobbers the write on quit. Its quit-confirm
+  dialog can't be dismissed via osascript without accessibility permission — SIGTERM works and skips the
+  pref flush.
+
+### The Focus-Key Odyssey → Ctrl+Q — 2026-08-04
+
+**Asked:** "make cmd arrow change focus of the panels, require an enter of the session panel to focus lock
+into it" — which turned into a long elimination, punctuated by "I'm not even using ghostty you fuck" and
+ended by "fuck it go back to control + q, also shift drag doesn't do shit. fix it".
+
+**Did:** Ctrl+Q is the unlock/escape hatch. Fallbacks kept: Ctrl+] / Ctrl+Esc / Ctrl+←. Shift-drag was
+replaced with app-side plain drag-selection in the terminal pane (REVERSED overlay for highlight, text via
+vt100 `contents_between`, `pbcopy` on mouse-up).
+
+**Gotchas:**
+- **The user runs Terminal.app**, not Ghostty, despite Ghostty being installed. Terminal.app fails the
+  kitty-keyboard probe, so Cmd-modified keys and Ctrl+Esc never reach the app there.
+- Everything else was eliminated for a reason: Cmd+arrows (no kitty protocol), Ctrl+arrows (Mission
+  Control), Ctrl+Esc / Option+Esc (undeliverable), Ctrl+]: vetoed on feel, double-Esc: implemented then
+  reverted because Claude Code owns Esc, Shift+arrows and Ctrl+G/T: Claude Code binds them. **Ctrl+Q is
+  settled — don't relitigate it**; the user's Cmd+Q-adjacency worry lost to familiarity.
+- crossterm collapses a same-read `\x1b\x1b` pair into **one** Esc event (escaped-escape rule), which is
+  what made double-Esc unworkable.
+- "Shift+drag selects text" is a lie in Terminal.app — there's no mouse-reporting bypass there, unlike
+  Ghostty/iTerm.
+- The user runs `nebula` via a `~/.cargo/bin` symlink to `target/release` — **rebuild release and restart
+  the TUI** before testing keybinding changes, or you are testing a stale process.
+
+### Bootstrap: Daemon/TUI Split — 2026-08-04
+
+**Asked:** "I want to build out a cli tool which is performant, uses very little memory, but kind of acts
+like a multi plexer to allow creating new terminal windows (similar to ghostty). the main things I need to
+include, like the peak user experience I'm going for is. left side panel for project, then if you c…"
+
+**Did:** `47037e8`. Cargo workspace `crates/{nebula-core,nebula-daemon,nebula-tui,nebula}` shipping one
+binary. A detached tmux-style daemon owns the PTYs (portable-pty, 1MB byte-ring scrollback with seq
+numbers); the TUI attaches over a unix socket with length-prefixed MessagePack (`nebula-core/src/codec.rs`).
+
+**Gotchas (locked decisions — user-approved, don't relitigate):**
+- **No server-side VT grid.** Attach replays the ring into the client's vt100 parser plus a SIGWINCH
+  resize-jiggle.
+- **tui-term is a renderer only**, kept behind `nebula-tui/src/ui.rs` as a swap point.
+- **Status comes from agent hooks, not MCP** — MCP was proven unreliable in ../mission-control. Managed
+  hooks are merged into the worktree's settings and curl a loopback axum server with a per-boot bearer
+  token. Keep the logic in the pure `AgentStatusMachine` (`nebula-daemon/src/status.rs`, unit-tested with
+  injected clocks) and **never trust a bare `Stop`**.
+- Kitty keyboard protocol passthrough (`nebula-daemon/src/pty/kitty.rs`) is what makes Cmd/Option combos
+  and Shift+Enter reach Claude Code at all.
+- **Unix socket paths must stay short** — SUN_LEN is ~104 bytes, so a long `NEBULA_RUNTIME_DIR` breaks
+  `bind()`. This bites the test harnesses and the screenshot harness constantly.
+- Ideas were borrowed from ../mission-control, but **all code is written fresh** — that was a hard user
+  requirement.
