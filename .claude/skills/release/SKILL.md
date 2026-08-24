@@ -10,51 +10,66 @@ push is your job; everything after it is CI's, except the changelog, which CI ge
 
 Work through the steps in order. Do not skip the green gate.
 
-## 1. Preflight — is this tree even yours?
+## 1. Preflight — assume you are not alone in this tree
 
-**Other agents edit this repo concurrently.** A `git status` from two minutes ago is not evidence about
-now. Run it again immediately before you stage:
+**Other agents edit this repo concurrently, and they will fight you for the index.** All three of these
+happened while cutting v0.3.0:
+
+- Files you never opened turn up modified mid-task (`git status` from two minutes ago proves nothing).
+- `git add` silently captures *their* half-finished edits to a file you also touched — the staged diff
+  came back 66 lines when the change under review was 56.
+- The index gets reset out from under a staged commit, so `git commit` reports "no changes added".
+- A `git worktree` you created gets pruned away underneath you.
+
+So do not stage in the shared index at all. **Do the entire release in a private worktree on a branch,
+and push that branch to `main`.** The shared working tree is never touched, and nothing another agent
+does can corrupt what you are about to tag.
 
 ```bash
-git status --short
+git fetch origin
+W=<scratchpad>/release
+git worktree add -b release-vX.Y.Z "$W" origin/main
 ```
 
-Compare against the files you actually touched. Anything else — a crate you never opened, a
-`.swp` file — belongs to somebody else's in-flight work.
+Then bring your change in by *content*, file by file, checking each one as you go:
 
-- **Never `git add -A` or `git commit -a`.** Stage your paths by name, always.
-- **Never stash** to get a clean tree. You will race the other session and lose their work.
-- If their edits break the build (a half-renamed enum variant, a function that doesn't exist yet),
-  that is *expected* and is not yours to fix. Go to step 2's worktree path.
+```bash
+git -C <repo> diff -- <file>     # read it: is every hunk yours?
+cp <repo>/<file> "$W"/<file>
+```
 
-Read `.claude/MEMORY.md` for anything recorded about the subsystem you're releasing.
+For a file where your change is tangled with someone else's, extract only your hunks
+(`git diff -- <file> > all.patch`, keep your `@@` blocks, `git apply` them onto the pristine copy) and
+re-read the result. Read `.claude/MEMORY.md` for anything recorded about the subsystem you're releasing.
 
 ## 2. Green gate — the tag must point at code that compiles
 
-```bash
-cargo test --workspace
-```
-
-If the shared tree is polluted by another session, that command tells you nothing about *your* commit.
-Verify the staged snapshot in isolation instead:
+In the worktree, with a **separate `CARGO_TARGET_DIR`** (sharing the main one with a concurrently
+building session makes both of you thrash fingerprints and rebuild from scratch):
 
 ```bash
-git add <your paths>
-W=<scratchpad>/verify
-git worktree add --detach "$W" HEAD
-git diff --cached --binary > "$W/staged.patch"
-(cd "$W" && git apply staged.patch && rm staged.patch)
 (cd "$W" && CARGO_TARGET_DIR=<scratchpad>/vtarget cargo test --workspace)
 ```
 
-Use a **separate `CARGO_TARGET_DIR`**. Sharing the main one with a concurrently-building session makes
-both of you thrash fingerprints and rebuild from scratch every time. Cold deps cost a few minutes; the
-thrash costs more. Clean up with `git worktree remove --force "$W"` when done.
-
-Do not release on a build you did not watch pass. "The errors were all from the other session" is a
+Do not release on a build you did not watch pass. "Those errors were all from the other session" is a
 guess until a green run proves it.
 
-## 3. Commit the work
+**When a test fails, prove whose fault it is before you decide.** Check out `origin/main` in the same
+worktree and run that same test: if it fails there too, it is pre-existing and not a release blocker —
+say so in your report rather than silently ignoring it. Two known-environmental patterns in this repo:
+
+- *Every* `e2e_tui`/`e2e_pty` test failing with "daemon did not come up … daemon.log: No such file or
+  directory" is orphan-daemon starvation. Dozens of stale `target/debug/nebula daemon --foreground`
+  processes accumulate over days and starve new test daemons. Check with
+  `pgrep -f "target/debug/nebula daemon" | wc -l`.
+- A single `e2e_tui` timeout waiting for footer text is usually a stale expectation in
+  `crates/nebula/tests/e2e_tui.rs` (e.g. `FOOTER_TERMINAL_LOCKED = "Ctrl+q: panels"` while the footer
+  renders `^q: panels`), not a regression.
+
+## 3. Commit the work — inside the worktree
+
+Every `git add` / `git commit` from here on runs with `cd "$W"`, on the release branch. The worktree has
+its own index, so nothing another agent does can reset it mid-commit.
 
 One commit for the change, in the repo's voice: a subject line that says what a *user* now gets, not
 what the diff did. Look at `git log --oneline -10` and match it — "Rebindable keys, a settings overlay,
@@ -90,17 +105,26 @@ git commit -m "Release v0.3.0"
 Pre-1.0 convention, from the existing tags: a new user-facing feature is a **minor** bump
 (`0.2.0` → `0.3.0`); fixes and polish alone are a **patch** (`0.1.1` → `0.1.2`).
 
-## 5. Push, then tag
+## 5. Push the branch *to* main, then tag
 
-Push the branch first. A tag whose commit isn't on the remote produces a release built from nothing.
+You are on a release branch, not on `main` — and you must not try to fast-forward the shared `main`,
+because its working tree belongs to another agent. Push the branch onto the remote `main` instead, and
+confirm the diff is only your work first:
 
 ```bash
-git push origin main
-git tag v0.3.0
-git push origin v0.3.0
+git fetch origin
+git diff --stat origin/main release-vX.Y.Z   # nothing here should be someone else's
+git push origin release-vX.Y.Z:main
+git tag vX.Y.Z <release commit>
+git push origin vX.Y.Z
 ```
 
-`git push` goes over SSH and is unaffected by which `gh` account is active.
+Push the branch before the tag. A tag whose commit isn't on the remote produces a release built from
+nothing. `git push` goes over SSH and is unaffected by which `gh` account is active.
+
+**Tell the user their local `main` is now behind `origin/main`.** You could not move it, so their next
+`git pull` (or the other agent's push) has to reconcile. Keep the release branch around as a local
+handle to the commits until they do.
 
 ## 6. Watch the build
 

@@ -14,6 +14,34 @@ about what is worth recording.
 
 ## Entries
 
+### Shift+G Opens The Repo's Git Host, Released As v0.3.0 — 2026-08-24
+
+**Asked:** "is there a release skill in this repo?", then "commit and push and do another release", then
+"make a skill called release which kicks in and does these similar steps the next time someone asks".
+
+**Did:** Released **v0.3.0** — `c553409`, tag pushed, all four binaries attached. Feature commit
+`b00ce46` adds `crates/nebula-tui/src/remote.rs` (`repo_url`, `web_url`) plus `open_repo_in_browser`
+in `event_loop.rs`, bound to `Action::OpenRepo` / `shift+g`. `ef56fca` checks in `CLAUDE.md`,
+`.claude/MEMORY.md`, and the new `.claude/skills/release/SKILL.md`.
+
+**Gotchas:**
+- **Another agent was editing the same tree the entire time**, mid-way through a `--workspace` feature:
+  `protocol.rs`, `registry.rs`, `server.rs`, `app.rs`, `ipc.rs`, `main.rs`, `e2e_pty.rs` all turned
+  modified while this task ran. It bit three separate ways — (a) `git add` on `event_loop.rs` captured
+  **66 lines when the reviewed change was 56**, silently dragging in their
+  `run_app(workspace: Option<String>)`; (b) the shared index was **reset out from under a staged
+  commit**, so `git commit` answered "no changes added to commit"; (c) a `git worktree add` under the
+  scratchpad was **pruned away while in use**. What worked: do the whole release in a private worktree
+  on its own branch and `git push origin <branch>:main`. **Never `git add` in the shared tree.**
+- Local `main` stays behind `origin/main` after that push — it is checked out and dirty, so it can't be
+  fast-forwarded. Say so explicitly; the next `git pull` has to reconcile.
+- `e2e_tui::tui_projects_worktrees_agents_navigation` **fails at `origin/main` too**:
+  `FOOTER_TERMINAL_LOCKED = "Ctrl+q: panels"` (`crates/nebula/tests/e2e_tui.rs:29`) while the footer now
+  renders `^q: panels`. Introduced by `87d2b24` and shipped red in v0.2.0 — not a regression, still
+  unfixed. Always re-run a failing test against `origin/main` before blaming your own diff.
+- `.github/workflows/release.yml` publishes with `generate_release_notes: true`, which is a bare commit
+  list, not a changelog. `gh release edit vX.Y.Z --notes "…"` afterwards is the step that makes it one.
+
 ### Project Memory System — 2026-08-24
 
 **Asked:** "update claude.md to invoke a skill called nebula-memory which has instructions on how an
@@ -139,10 +167,11 @@ walk user how to use this"
 `install.sh` finds an artifact instead of building from source.
 
 **Gotchas:**
-- Two `gh` accounts are logged in and **`codyseibert` is the active one, with only READ** on
-  `AgentSystemLabs/nebula` — `gh pr create` fails with "must be a collaborator (createPullRequest)".
-  `webdevcody` is the admin. Run `gh auth switch --hostname github.com --user webdevcody` before any
-  write API call. `git push` is unaffected: it goes over SSH, not the gh token.
+- Two `gh` accounts are logged in. `webdevcody` is the admin; `codyseibert` has only READ on
+  `AgentSystemLabs/nebula` and fails write calls with "must be a collaborator (createPullRequest)".
+  **As of 2026-08-24 `webdevcody` is the active account** (it was `codyseibert` on 08-22, so check
+  rather than assume): `gh auth status`, and `gh auth switch --hostname github.com --user webdevcody`
+  if it has drifted back. `git push` is unaffected either way: it goes over SSH, not the gh token.
 
 ### Codex Hooks Moved To ~/.codex — 2026-08-22
 
@@ -209,6 +238,10 @@ picker, note badge glyph).
 - Reaping orphans is safe **except for the live one** — read `/tmp/nebula-501/daemon.pid` (or
   `$NEBULA_RUNTIME_DIR/daemon.pid`) and exclude it, or you kill the nebula session you are running inside.
   Ask before bulk-killing: it's the user's machine and other live sessions may be in play.
+- **`kill` on those orphans is refused by the auto-mode permission classifier** (2026-08-24), even
+  filtered to processes older than six hours. Don't burn turns retrying it — instead prove the failure
+  is environmental by re-running the same test against `origin/main` in a scratch worktree, and report
+  the orphan count to the user so they can reap them.
 
 ### Restyle, Focus Wash, And The Screenshot Harness — 2026-08-20 → 08-21
 
