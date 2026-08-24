@@ -70,6 +70,6 @@ Worktrees also carry a **link list**: URLs pinned to a checkout — the pull req
 | `nebula-daemon` | PTYs, SQLite, git, hook receiver, status engine |
 | `nebula-tui` | ratatui UI, keyboard/mouse, attach/scrollback |
 
-The TUI also has extras on top of the multiplexer: git diff viewer, grep, a vim-like terminal overlay, fuzzy finders — those are client-side. The daemon is the source of truth for sessions and the tree.
+The TUI also has extras on top of the multiplexer: git diff viewer, file preview, grep, a vim-like terminal overlay, fuzzy finders — those are client-side. The daemon is the source of truth for sessions and the tree.
 
 **Mental model:** tmux, but the “windows” are agent CLIs bound to git worktrees, and the sidebar is a mission-control view of which agents are working, waiting, or dead.
