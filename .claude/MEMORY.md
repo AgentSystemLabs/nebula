@@ -14,6 +14,97 @@ about what is worth recording.
 
 ## Entries
 
+### Reading A Pull Request And Its Diff Inside Nebula — 2026-08-24
+
+**Asked:** "is it possible so that when I hover over a PR i nthe open pr list, it'll show the contents of
+the PR directly in nebula for me to read? also the ability to just view the git diff of that PR directly
+in nebula?" (follow-on to the OPEN PRS group below.)
+
+**Did:** Hover (cursor rests on an open-PR row) → the terminal pane becomes a reader: headline, state,
+`+adds -dels · N files`, description, then the whole conversation. New
+`crates/nebula-tui/src/pr_preview.rs` (`wrap`, `fit`, `lines`) builds it as a flat `Vec<Line>` so
+scrolling is a slice. Fetch is `pull_request::detail()` (`gh pr view <n> --json …`), debounced
+`PR_DETAIL_DEBOUNCE = 300ms` via `schedule_pr_detail`/`lookup_pr_detail`, cached per URL for the
+session. `g` on a PR row runs `pull_request::diff()` (`gh pr diff <n>`), `split_unified_diff()` cuts it
+per file, and `open_pr_diff_view` opens the **existing** `DiffView` on it via a new
+`DiffView::prefetched: Option<HashMap<String,String>>` that `git_diff::load_selected_diff` reads instead
+of shelling out. `ui::terminal_frame` now delegates to `titled_frame(title, …)` so the pane can be
+called PULL REQUEST.
+
+**Gotchas:**
+- **`draw_terminal` returning early on a PR row is the whole trick** — the attachment underneath stays
+  live, so walking into the OPEN PRS group and back never churns detach/attach. Exact copy of the
+  `divider_focused()` branch three lines above it. Do not try to "clear" the terminal for this.
+- **ratatui silently clips an overwide `Line`, taking the rest of the row with it.** A header row built
+  from spans (state · author · base ← head) blew past the pane at width 24 and the test
+  `no_rendered_line_overflows_the_pane` is what caught it. Everything the preview emits now goes through
+  `wrap` (prose) or `fit` (span rows); `fit` drops whole segments from the end, then ellipsises.
+- Reviewed ✓ marks are **deliberately not persisted** for a PR diff: `review::store_marks` prunes any
+  key that isn't a directory on disk (`store.worktrees.retain(|root, _| Path::new(root).is_dir())`), and
+  a pull request has no path. In-session marks still sink files to the bottom, which is the useful half.
+- `shift+up`/`shift+down` are already `move_project_up/down`, so the preview scrolls on
+  **PgUp/PgDn/Home/End** (+ wheel) only — handled as raw `KeyCode`s *before* the keymap lookup in
+  `handle_key`, since those chords are unbound at panel scope.
+- Key handlers can't reach the loop's channels, so the `gh pr diff` sender lives on
+  `App::pr_diff_tx` — the `vim_tx` precedent. Without it `request_pr_diff` silently no-ops (which is
+  also why its test installs a channel by hand).
+- `gh pr view --json` field names verified live: `author`/`baseRefName`/`headRefName`/`additions`/
+  `deletions`/`changedFiles`/`body`, comments carry `createdAt`, reviews carry `submittedAt` + `state`.
+  Reviews with **no `submittedAt`** are your own pending draft — drop them.
+- `split_unified_diff` takes the path from `+++ b/…` when present and falls back to the `diff --git`
+  header, because a **deleted** file's `+++` is `/dev/null` and a **rename**'s two halves differ. The
+  invariant worth keeping: every input line lands in exactly one chunk (asserted in the unit test, and
+  verified against real `gh pr diff -R cli/cli` output).
+- A `gh` that can't answer is remembered in `pr_detail_failed` — without it the pane re-asks on every
+  pass and sits on "reading it…" forever.
+
+### Open Pull Requests Under The Worktrees List — 2026-08-24
+
+**Asked:** "when a user opens a project, it should try to fetch all open pull requests and display those
+on the bottom of the worktrees list, so a user can easily see which pull requsts are still open and enter
+or click into them to open in browser. make sure you make this efficient as gh might have rate limits,
+and some projects might have a LOT of opened pull requests, also make sure a user can easily fuzzy find
+(/) to those pull requests by title which when opened will open the browser instead of trying to switch
+to a session or worktree, etc"
+
+**Did:** New `OpenPr` + `list()` + `parse_list()` in `crates/nebula-tui/src/pull_request.rs`
+(`gh pr list --state open --limit 100 --json number,url,title,isDraft`, `LIST_LIMIT = 100`). Cached per
+project as `App::open_prs: HashMap<ProjectId, OpenPrs>` with `open_prs_inflight`; driven from
+`lookup_open_prs`/`note_open_prs_answer`/`schedule_open_prs_lookup` in `event_loop.rs`, riding the
+existing `GIT_POLL` tick. `draw_worktrees` in `ui.rs` was rewritten from a straight-line renderer into a
+`WorktreeEntry` virtual-row layout with a follow-window (`worktrees_scroll`/`worktrees_anchor`, wheel
+support) mirroring `draw_sessions`, and grew an `OPEN PRS · N` group. `PaletteTarget::PullRequest(url)`
+makes them fuzzy-findable; `jump_to_target` opens the browser instead of moving a cursor.
+
+**Gotchas:**
+- **The whole design hinges on PR rows sorting *after* the checkouts.** `sel_worktree` now indexes the
+  combined list, so every existing `visible_worktrees().iter().position(...)` (there are ~8 of them, in
+  `restore_context`, `reconcile_selection`, `jump_to_target`, `select_worktree_by_id`, the saved UI
+  state) stays correct untouched, and `selected_worktree()` returns `None` on a PR row for free — which
+  is what makes `p`/`d`/`e`/`n` silently no-op there instead of acting on the wrong worktree. Only
+  `move_selection` and `clamp_selections` needed the new `worktree_row_count()`.
+- `restore_session` must NOT run when the cursor lands on a PR row — it detaches the terminal when
+  `selected_worktree()` is None, so arrowing into the group would blank the pane. Guarded in both
+  `move_selection` and the left-click handler. The Sessions panel does go empty there; that's the
+  project-divider precedent (`divider_focused()`), not a bug.
+- **`gh pr list` returns a bare JSON array**, not an object — `parse_list` takes `as_array()`, unlike
+  `parse` which reads fields off a map. Verified against `gh pr list -R cli/cli`.
+- `Some(vec![])` (repo genuinely has nothing open) and `None` (no `gh`, no remote, timeout) must stay
+  distinct: `None` keeps the last good list on screen rather than blanking the group over one flaky
+  round trip. Both back off, `OPEN_PRS_RECHECK_MIN` 30s → `OPEN_PRS_RECHECK_MAX` 10min; a non-empty
+  answer settles on `OPEN_PRS_REFRESH` 3min.
+- Rate-limit floor: `schedule_open_prs_lookup` pulls the deadline in to `at + OPEN_PRS_MIN_AGE` (30s)
+  instead of clearing the entry the way `schedule_pr_lookup` does for worktrees — otherwise bouncing
+  between two projects spends an API call per switch.
+- The double-click chain (`app.last_session_click`) is shared with the Sessions panel's link rows. A
+  click on a *checkout* row has to clear it, or click-PR → click-worktree → click-PR reads as a
+  double-click and launches the browser.
+- `open_url` short-circuits to `true` under `cfg!(test)`, so Enter/double-click paths are safe to test
+  end-to-end — assert on `app.flash == "opened github.com/o/r/pull/7"`.
+- The two `clippy::type_complexity` warnings in `ui.rs` (2316, 2446) pre-date this work — the worktrees
+  tuple annotation is unchanged from HEAD. `e2e_tui::tui_projects_worktrees_agents_navigation`, recorded
+  below as failing at origin/main, **now passes** (6/6 green).
+
 ### Shift+G Opens The Repo's Git Host, Released As v0.3.0 — 2026-08-24
 
 **Asked:** "is there a release skill in this repo?", then "commit and push and do another release", then
@@ -35,10 +126,12 @@ in `event_loop.rs`, bound to `Action::OpenRepo` / `shift+g`. `ef56fca` checks in
   on its own branch and `git push origin <branch>:main`. **Never `git add` in the shared tree.**
 - Local `main` stays behind `origin/main` after that push — it is checked out and dirty, so it can't be
   fast-forwarded. Say so explicitly; the next `git pull` has to reconcile.
-- `e2e_tui::tui_projects_worktrees_agents_navigation` **fails at `origin/main` too**:
-  `FOOTER_TERMINAL_LOCKED = "Ctrl+q: panels"` (`crates/nebula/tests/e2e_tui.rs:29`) while the footer now
-  renders `^q: panels`. Introduced by `87d2b24` and shipped red in v0.2.0 — not a regression, still
-  unfixed. Always re-run a failing test against `origin/main` before blaming your own diff.
+- `e2e_tui::tui_projects_worktrees_agents_navigation` **failed at `origin/main` too**:
+  `FOOTER_TERMINAL_LOCKED = "Ctrl+q: panels"` (`crates/nebula/tests/e2e_tui.rs:29`) while the footer
+  renders `^q: panels`. Introduced by `87d2b24`, shipped red in v0.2.0 and v0.3.0; **the constant is
+  fixed in v0.4.0.** Always re-run a failing test against `origin/main` before blaming your own diff —
+  and note the converse trap: it passed in the *shared* working tree the whole time, because another
+  session had already patched the constant there. A green shared tree is not evidence about `main`.
 - `.github/workflows/release.yml` publishes with `generate_release_notes: true`, which is a bare commit
   list, not a changelog. `gh release edit vX.Y.Z --notes "…"` afterwards is the step that makes it one.
 
