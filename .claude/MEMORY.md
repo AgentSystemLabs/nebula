@@ -14,6 +14,24 @@ about what is worth recording.
 
 ## Entries
 
+### Release v0.8.0 — A Clean Base Needs No Merge — 2026-08-25
+
+**Asked:** "ok pull in latest from origin/main then and merge into this work them commit push and make
+the next release"
+
+**Did:** Nothing to pull — local `main` already tracked `origin/main` at `8beee5a` (the shared tree was
+reconciled between releases), so no merge was needed and the release skill's plain recipe applied:
+worktree cut from `origin/main`, the six dirty files copied in by content, `274ece8` (feature), `db718af`
+(memory), `199011c` (bump to 0.8.0, tagged `v0.8.0`). 624 tests green, all 4 matrix targets built, notes
+rewritten. Shipped the draggable Workspaces column, the ttyd `fontSize` refit, and the `make dev` /
+`make browser` isolated dev instance — each already has its own entry above.
+
+**Gotchas:**
+- Nothing bit us. Worth recording only as the contrast to [Release v0.7.0]: the copy-files-into-a-worktree
+  recipe is safe **exactly when** `git rev-list --left-right --count HEAD...origin/main` reads `0 0`.
+  Check that before choosing between copying and merging — it is the one-line test for which of the two
+  release paths you are on.
+
 ### `nebula browser` Terminal Stopped ~24 Columns Short — 2026-08-25
 
 **Asked:** "when running nebula browser, there is a bunch of empty space in the right side of the terminal
@@ -247,9 +265,11 @@ span; left-click opens `open_workspace_picker`. 8 unit tests + e2e updated; READ
   against local `main`, and only ever carry hunks you can name. A 30-line python hunk picker
   (split `diff -u` on `@@`, keep by index, `patch -p0`) plus the residual-hunk count check
   (18 total − 6 kept = 12 left) is the whole verification.
-- Local `main` in the shared tree is now three releases behind (`026b64c` vs `c920b72`), and its dirty
-  files are all content that is now merged. The user's cleanup is `git checkout -- .` then
-  `git pull --ff-only` — not something to run for them from a session.
+- ~~Local `main` is three releases behind; the cleanup is `git checkout -- .` then
+  `git pull --ff-only`.~~ **Superseded 2026-08-25 (v0.8.0):** the shared tree has since been
+  reconciled and local `main` tracks `origin/main` again. Never run `git checkout -- .` there on the
+  strength of this note — check whether the dirty files are actually merged content first, because
+  after a release they are usually the *next* release's work.
 
 ### A Freshly Added Project Selects Itself — 2026-08-25
 
