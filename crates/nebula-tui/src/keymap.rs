@@ -188,7 +188,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::Palette,
         id: "palette",
         label: "Fuzzy jump",
-        hint: "Search every project, worktree and session at once",
+        hint: "Search every workspace, project, worktree and session at once",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["/"],

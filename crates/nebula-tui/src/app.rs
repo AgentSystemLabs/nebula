@@ -670,6 +670,9 @@ impl DiffView {
 /// What a `/` palette row jumps to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteTarget {
+    /// A whole workspace: picking it switches this instance to it, the
+    /// same as the `w` switcher's Enter.
+    Workspace(WorkspaceId),
     Project(ProjectId),
     Worktree(WorktreeId),
     Session(AgentId),
@@ -681,9 +684,11 @@ pub enum PaletteTarget {
 
 /// One searchable row of the `/` palette. `text` is both the string the
 /// fuzzy filter runs over and the string rendered after the kind badge, so
-/// match highlighting always lines up: `name` for projects,
-/// `project/branch` for worktrees, `project/branch/name` for sessions —
-/// letting a query narrow by parent context.
+/// match highlighting always lines up. Every row carries its full path
+/// from the workspace down — `workspace` for workspaces,
+/// `workspace/project` for projects, `workspace/project/branch` for
+/// worktrees, `workspace/project/branch/name` for sessions — so a query
+/// can narrow by any ancestor, a workspace name included.
 #[derive(Debug, Clone)]
 pub struct PaletteItem {
     pub target: PaletteTarget,
@@ -704,7 +709,8 @@ pub struct PaletteMatch {
     pub positions: Vec<usize>,
 }
 
-/// Fuzzy-search palette over every project, worktree, and session (`/`).
+/// Fuzzy-search palette over every workspace, project, worktree, and
+/// session (`/`), across all workspaces — not just the open one.
 #[derive(Debug, Clone)]
 pub struct Palette {
     pub items: Vec<PaletteItem>,
@@ -804,73 +810,121 @@ impl Palette {
     }
 }
 
-/// Every jumpable entity: projects in tree order, then each project's
-/// worktrees, then each worktree's sessions, then the open pull requests
-/// nebula has fetched for each project. Archived sessions appear only when
-/// the archived toggle is on (the Sessions panel rule). Scoped to the open
-/// workspace — `/` never searches across other workspaces.
+/// Every jumpable entity, across every workspace: the workspaces
+/// themselves, then each one's projects in tree order, then their
+/// worktrees, then their sessions, then the open pull requests nebula has
+/// fetched. Archived sessions appear only when the archived toggle is on
+/// (the Sessions panel rule).
+///
+/// The open workspace comes first, so with an empty query `/` still opens
+/// on what's on screen; the rest follow in tree order. Every row's text is
+/// prefixed with its workspace, which is both what keeps the paths
+/// unambiguous once two workspaces can hold the same project name and what
+/// lets a query cross over (`/` then the other workspace's name).
 fn build_palette_items(
     tree: &Tree,
     show_archived: bool,
     open_prs: &HashMap<ProjectId, OpenPrs>,
 ) -> Vec<PaletteItem> {
-    let projects: Vec<&Project> = tree
-        .projects
-        .iter()
-        .filter(|p| tree.in_active_workspace(p))
-        .collect();
     let mut items = Vec::new();
-    for p in &projects {
-        items.push(PaletteItem {
-            target: PaletteTarget::Project(p.id.clone()),
-            text: p.name.clone(),
-            archived: false,
-            status: project_rollup(tree, &p.id),
-        });
-    }
-    for p in &projects {
-        for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
+    for id in palette_workspace_order(tree) {
+        // A project can outlive knowledge of its workspace — its upsert can
+        // land before the workspace's, and a workspace can go while a stale
+        // project row is still in the tree. Such a project still belongs in
+        // `/` (vanishing from the find-anything tool is the worst failure
+        // it has); it just has no name to path it under, and no row of its
+        // own to jump to.
+        let workspace = tree.workspaces.iter().find(|w| w.id == id);
+        if let Some(ws) = workspace {
             items.push(PaletteItem {
-                target: PaletteTarget::Worktree(w.id.clone()),
-                text: format!("{}/{}", p.name, w.branch),
+                target: PaletteTarget::Workspace(ws.id.clone()),
+                text: ws.name.clone(),
                 archived: false,
-                status: worktree_rollup(tree, &w.id),
+                status: workspace_rollup(tree, &ws.id),
             });
         }
-    }
-    for p in &projects {
-        for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
-            for a in tree.agents.iter().filter(|a| a.worktree_id == w.id) {
-                if a.archived && !show_archived {
-                    continue;
-                }
+        let at = match workspace {
+            Some(ws) => format!("{}/", ws.name),
+            None => String::new(),
+        };
+        let projects: Vec<&Project> = tree
+            .projects
+            .iter()
+            .filter(|p| p.workspace_id == id)
+            .collect();
+        // Within a workspace the kinds stay grouped project → worktree →
+        // session, so a bare query still ranks the shallowest match first.
+        for p in &projects {
+            items.push(PaletteItem {
+                target: PaletteTarget::Project(p.id.clone()),
+                text: format!("{at}{}", p.name),
+                archived: false,
+                status: project_rollup(tree, &p.id),
+            });
+        }
+        for p in &projects {
+            for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
                 items.push(PaletteItem {
-                    target: PaletteTarget::Session(a.id.clone()),
-                    text: format!("{}/{}/{}", p.name, w.branch, a.name),
-                    archived: a.archived,
-                    status: Some(a.status),
+                    target: PaletteTarget::Worktree(w.id.clone()),
+                    text: format!("{at}{}/{}", p.name, w.branch),
+                    archived: false,
+                    status: worktree_rollup(tree, &w.id),
+                });
+            }
+        }
+        for p in &projects {
+            for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
+                for a in tree.agents.iter().filter(|a| a.worktree_id == w.id) {
+                    if a.archived && !show_archived {
+                        continue;
+                    }
+                    items.push(PaletteItem {
+                        target: PaletteTarget::Session(a.id.clone()),
+                        text: format!("{at}{}/{}/{}", p.name, w.branch, a.name),
+                        archived: a.archived,
+                        status: Some(a.status),
+                    });
+                }
+            }
+        }
+        // Pull requests go last so a query that also matches a session
+        // still lands on the session first — the panels are what `/` is
+        // mostly for. Only projects whose list has actually been fetched
+        // contribute; the rest simply have nothing to offer yet.
+        for p in &projects {
+            let Some(open) = open_prs.get(&p.id) else {
+                continue;
+            };
+            for pr in &open.list {
+                items.push(PaletteItem {
+                    target: PaletteTarget::PullRequest(pr.url.clone()),
+                    text: format!("{at}{}/{}", p.name, pr.label()),
+                    archived: false,
+                    status: None,
                 });
             }
         }
     }
-    // Pull requests go last so a query that also matches a session still
-    // lands on the session first — the panels are what `/` is mostly for.
-    // Only projects whose list has actually been fetched contribute; the
-    // rest simply have nothing to offer yet.
-    for p in &projects {
-        let Some(open) = open_prs.get(&p.id) else {
-            continue;
-        };
-        for pr in &open.list {
-            items.push(PaletteItem {
-                target: PaletteTarget::PullRequest(pr.url.clone()),
-                text: format!("{}/{}", p.name, pr.label()),
-                archived: false,
-                status: None,
-            });
+    items
+}
+
+/// The workspaces `/` walks, in row order: the open one first (so an empty
+/// query opens on what's already on screen), then the rest in tree order,
+/// then any workspace only a project still refers to — see the orphan note
+/// in [`build_palette_items`].
+fn palette_workspace_order(tree: &Tree) -> Vec<WorkspaceId> {
+    let mut order = vec![tree.active_workspace.clone()];
+    let ids = tree
+        .workspaces
+        .iter()
+        .map(|w| w.id.clone())
+        .chain(tree.projects.iter().map(|p| p.workspace_id.clone()));
+    for id in ids {
+        if !order.contains(&id) {
+            order.push(id);
         }
     }
-    items
+    order
 }
 
 /// One visible row of the file finder: an index into `files` plus the char
@@ -1568,10 +1622,11 @@ fn rollup(statuses: impl Iterator<Item = AgentStatus>) -> Option<AgentStatus> {
 }
 
 /// Client-side mirror of the entity tree. `projects` holds EVERY workspace's
-/// projects; the view layer scopes to `active_workspace` (see
-/// [`App::project_rows`] and [`build_palette_items`]), so a workspace switch
-/// is a pure re-filter — no refetch, and background workspaces keep
-/// receiving status updates.
+/// projects; the panels scope to `active_workspace` (see
+/// [`App::project_rows`]), so a workspace switch is a pure re-filter — no
+/// refetch, and background workspaces keep receiving status updates. The
+/// `/` palette deliberately doesn't scope: it searches the whole tree (see
+/// [`build_palette_items`]), which is the same data either way.
 #[derive(Debug, Clone, Default)]
 pub struct Tree {
     pub workspaces: Vec<Workspace>,
@@ -1677,10 +1732,6 @@ pub struct UiState {
     /// Panel widths (projects, worktrees, sessions); absent in older blobs.
     #[serde(default)]
     pub panel_widths: Option<[u16; 3]>,
-    /// Whether the Workspaces column is shown (`Shift+W`); absent in older
-    /// blobs, which means shown.
-    #[serde(default)]
-    pub show_workspaces: Option<bool>,
     /// Dragged width of the Workspaces column; absent in older blobs.
     #[serde(default)]
     pub workspaces_w: Option<u16>,
@@ -1835,8 +1886,10 @@ pub struct App {
     pub show_archived: bool,
     /// Sidebars collapsed (z) — terminal takes the full width.
     pub collapsed: bool,
-    /// Workspaces column shown at the left edge (`Shift+W` toggles). The
-    /// three panels sit to its right; see `splitter_x`.
+    /// Workspaces column shown at the left edge. The three panels sit to
+    /// its right; see `splitter_x`. Mirrors the `show_workspaces` setting,
+    /// which both `Shift+W` and the Appearance tab write — this field is
+    /// the live copy, the config file is where it persists.
     pub show_workspaces: bool,
     pub next_req_id: u64,
     pub pending: HashMap<u64, PendingIntent>,

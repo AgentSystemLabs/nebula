@@ -114,12 +114,13 @@ terminals and start reading the Sessions column. Full table under [Status dots](
 your first prompt — `Fix Login Redirect` rather than `agent-3`. Type a name yourself (or `r` to rename)
 and nebula never touches it.
 
-From there: `t` opens a shell in the selected worktree, `/` fuzzy-jumps to any project, worktree,
-session or open pull request by name, `w` switches this window's workspace when one project list gets
-long (each nebula instance keeps its own — run two, on two workspaces, side by side) and `Shift+W`
-shows or hides the Workspaces column to the left of Projects, where every workspace carries the rolled-up
-status of the agents under it, `s` opens settings, `?` lists every key, and `m` (or right-click) opens a
-context menu for whatever's selected.
+From there: `t` opens a shell in the selected worktree, `/` fuzzy-jumps to any workspace, project,
+worktree, session or open pull request by name — across every workspace, not just the open one, so
+picking a hit somewhere else switches you there on the way — `w` switches this window's workspace when
+one project list gets long (each nebula instance keeps its own — run two, on two workspaces, side by
+side) and `Shift+W` shows or hides the Workspaces column to the left of Projects, where every workspace
+carries the rolled-up status of the agents under it, `s` opens settings, `?` lists every key, and `m`
+(or right-click) opens a context menu for whatever's selected.
 
 ## Status dots
 
@@ -193,8 +194,9 @@ The panels aren't the only view. With a worktree selected, from any panel:
   revives on the next attach with its conversation resumed.
 - **Settings live in one JSON file** (`config.json`, beside the database), read fresh on each use by both
   the daemon and the TUI, so hand edits apply without a restart. `s` opens the settings overlay over the
-  same file: color theme, animations, focused-panel tint, editor, default model and reasoning effort per
-  agent CLI, the RECENT window, the idle timeout, and whether new sessions stop to ask for a name.
+  same file: color theme, animations, focused-panel tint, whether the Workspaces column is shown,
+  editor, default model and reasoning effort per agent CLI, the RECENT window, the idle timeout, and
+  whether new sessions stop to ask for a name.
 - **Every panel key is rebindable.** The overlay's Hotkeys tab lists every action and what it answers to,
   and writes overrides into the same file (`"keybindings": {"git_diff": "ctrl+g, g"}`); an empty value
   unbinds. Because nebula is always a guest inside Terminal.app / Ghostty / tmux, the tab says at bind
@@ -216,7 +218,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Panels | `Tab`/`Shift+Tab`, `h/l` or `←/→`, `j/k` | move focus / selection |
 | Panels | `Ctrl+→` | cross into the terminal pane without attaching (plain `l`/`→` stops at Sessions) |
 | Panels | `Enter` | drill in; on a session: attach |
-| Any panel | `/` | fuzzy jump across every project, worktree and session (`Ctrl+n/p` move, `Ctrl+o` opens the hit, `Ctrl+f` just lands the selection on it) |
+| Any panel | `/` | fuzzy jump across every workspace, project, worktree and session — in *every* workspace, each row pathed `workspace/project/branch/session`, so typing another workspace's name jumps you into it (`Ctrl+n/p` move, `Ctrl+o` opens the hit, `Ctrl+f` just lands the selection on it) |
 | Projects | `n` / `d` | add project / remove from list |
 | Any panel | `o` | add ("open") a project — same prompt as `n`, from any focus |
 | Add project | type + `Tab`, `↓↑` / `→` / `←` | browse for the repo: type to filter (bash-style Tab completion), arrows pick a directory, `→` steps in, `←` steps up, `Enter` adds the highlighted (or typed) path; `●` marks git repos |
@@ -238,8 +240,8 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Any panel | `Shift+L` | attach a link (pull request, doc, ticket) to the selected worktree — it lands in the Sessions panel's LINKS group, above any open pull request nebula finds with `gh` |
 | Sessions | `Enter` / `r` / `d` on a link | open it in the browser / edit its URL / delete it (the detected pull request opens but can't be edited or deleted) |
 | Any panel | `t` | new shell terminal in the selected worktree's directory (Projects panel: the repo root) |
-| Any panel | `w` or click the `◇ workspace` nameplate bottom-left | workspace switcher: `Enter` opens, `n`/`r`/`d` create/rename/delete (`/` and the panels scope to the open workspace). Per window — switching here leaves your other nebula instances on the workspace you left them on |
-| Any panel | `Shift+W` | show / hide the Workspaces column at the left edge: every workspace with the rolled-up status of the agents under it (plus a count of the ones running), so a run in a workspace you don't have open still shows at the top level |
+| Any panel | `w` or click the `◇ workspace` nameplate bottom-left | workspace switcher: `Enter` opens, `n`/`r`/`d` create/rename/delete (the panels scope to the open workspace; `/` doesn't, and switches for you). Per window — switching here leaves your other nebula instances on the workspace you left them on |
+| Any panel | `Shift+W` | show / hide the Workspaces column at the left edge: every workspace with the rolled-up status of the agents under it (plus a count of the ones running), so a run in a workspace you don't have open still shows at the top level. The choice is remembered — it's the `Workspaces column` setting, also in Settings → Appearance |
 | Workspaces | `↑/↓`, `Enter`, `n`/`r`/`d`, `m` | the cursor is the open workspace, so `↑/↓` switches; `Enter` steps into Projects; create / rename / delete the open one (delete refuses a non-empty workspace); `m` or right-click lists the same verbs |
 | Any panel | `Shift+H` | ssh hosts: every `nebula ssh` destination, newest first. `Enter`/click reconnects (quits this TUI and execs a fresh `nebula ssh` — local sessions keep running), `a` types a new `user@host [dir]`, `d` removes |
 | Any panel | `m` or right-click | context menu |

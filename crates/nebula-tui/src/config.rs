@@ -97,6 +97,7 @@ pub enum SettingKind {
     Theme,
     Animations,
     FocusTint,
+    ShowWorkspaces,
     ClaudeModel,
     ClaudeEffort,
     CodexModel,
@@ -164,6 +165,11 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::FocusTint,
                 label: "Focused panel tint",
                 hint: "Faint accent-colored background on the focused panel",
+            },
+            SettingSpec {
+                kind: SettingKind::ShowWorkspaces,
+                label: "Workspaces column",
+                hint: "Show the Workspaces column at the left edge (Shift+W toggles)",
             },
         ]),
     },
@@ -356,6 +362,12 @@ pub struct Config {
     /// Faint accent-tinted background fill on the focused panel. Off by
     /// default — it's a taste call, not everyone wants the extra color.
     pub focus_tint: bool,
+    /// Whether the Workspaces column is drawn at the left edge. This is
+    /// the column's only home: `Shift+W` writes it here as it toggles, so
+    /// a hidden column stays hidden across restarts — and a crash or a
+    /// closed browser tab can't lose the choice the way the daemon's
+    /// save-on-quit UI blob would.
+    pub show_workspaces: bool,
     /// Default model/effort for new Claude / Codex sessions. "default"
     /// means "don't pass the flag" (the CLI picks); any other value is
     /// passed through verbatim, so hand-edited configs can name models the
@@ -384,6 +396,7 @@ impl Default for Config {
             theme: "default".into(),
             animations: true,
             focus_tint: false,
+            show_workspaces: true,
             claude_model: "default".into(),
             claude_effort: "default".into(),
             codex_model: "default".into(),
@@ -401,6 +414,17 @@ impl Config {
     /// Patch this config's known keys into the JSON file, preserving any
     /// other fields already there.
     pub fn save(&self) -> std::io::Result<()> {
+        // A test that reaches a save without pinning the path would write
+        // the dev's own settings file (and `NEBULA_DATA_DIR` only moves it
+        // to their dev instance's, which is no better). Saves hang off
+        // ordinary keystrokes now — `Shift+W` is one — so make the miss
+        // loud instead of leaving it to be noticed in a diff later.
+        #[cfg(test)]
+        assert!(
+            CONFIG_PATH_OVERRIDE.with(|p| p.borrow().is_some()),
+            "Config::save() in a test without a path override — wrap the \
+             test body in config::with_config_path (or with_default_config)"
+        );
         self.save_to(&settings_path())
     }
 
@@ -443,6 +467,10 @@ impl Config {
         obj.insert("theme".into(), serde_json::json!(self.theme));
         obj.insert("animations".into(), serde_json::json!(self.animations));
         obj.insert("focus_tint".into(), serde_json::json!(self.focus_tint));
+        obj.insert(
+            "show_workspaces".into(),
+            serde_json::json!(self.show_workspaces),
+        );
         obj.insert("claude_model".into(), serde_json::json!(self.claude_model));
         obj.insert(
             "claude_effort".into(),
@@ -517,6 +545,7 @@ impl Config {
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
             SettingKind::FocusTint => on_off(self.focus_tint).into(),
+            SettingKind::ShowWorkspaces => on_off(self.show_workspaces).into(),
             SettingKind::ClaudeModel => self.claude_model.clone(),
             SettingKind::ClaudeEffort => self.claude_effort.clone(),
             SettingKind::CodexModel => self.codex_model.clone(),
@@ -560,6 +589,9 @@ impl Config {
             }
             SettingKind::FocusTint => {
                 self.focus_tint = !self.focus_tint;
+            }
+            SettingKind::ShowWorkspaces => {
+                self.show_workspaces = !self.show_workspaces;
             }
             SettingKind::ClaudeModel => {
                 self.claude_model = cycle_choice(&self.claude_model, CLAUDE_MODELS, step).into();
@@ -828,6 +860,23 @@ mod tests {
         // A config predating the key keeps animations on.
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(cfg.animations);
+    }
+
+    #[test]
+    fn show_workspaces_default_on_toggle_and_persist() {
+        let mut cfg = Config::default();
+        assert!(cfg.show_workspaces);
+        let (tab, row) = locate(SettingKind::ShowWorkspaces).unwrap();
+        cfg.cycle(tab, row, 0);
+        assert!(!cfg.show_workspaces);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(!load_from(&path).show_workspaces);
+        // A config predating the key leaves the column shown.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.show_workspaces);
     }
 
     #[test]

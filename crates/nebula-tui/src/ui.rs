@@ -1273,6 +1273,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 // cyan-bold match highlight is the loudest thing in the
                 // list, and the leaf sweeps exactly like its panel row.
                 let (solid, hollow) = match &item.target {
+                    // The status bar's workspace glyph, so a `/` row and
+                    // the "◇ name" readout name the same thing.
+                    PaletteTarget::Workspace(_) => ("◆ ", "◇ "),
                     PaletteTarget::Project(_) => ("▪ ", "▫ "),
                     PaletteTarget::Worktree(_) => ("▸ ", "▹ "),
                     PaletteTarget::Session(_) => ("● ", "○ "),
