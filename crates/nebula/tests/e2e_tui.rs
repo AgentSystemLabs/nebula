@@ -635,8 +635,8 @@ fn tui_link_crud_in_sessions_panel() {
     // The root worktree row must exist before a link has an owner.
     tui.wait_for_text("⌂ root");
 
-    // ---- create: l prompts, the URL lands in a LINKS group ----
-    tui.send(b"l");
+    // ---- create: Shift+L prompts, the URL lands in a LINKS group ----
+    tui.send(b"L");
     tui.wait_for_text("Add link");
     tui.type_str("https://example.dev/spec");
     tui.send(b"\r");
@@ -654,7 +654,7 @@ fn tui_link_crud_in_sessions_panel() {
     tui.wait_for_text("example.dev/spec/v2");
 
     // ---- a second link: both list under the one header ----
-    tui.send(b"l");
+    tui.send(b"L");
     tui.wait_for_text("Add link");
     // Typed without a scheme — the daemon normalizes it to https://.
     // Short on purpose: the Sessions panel truncates long rows.
@@ -709,7 +709,7 @@ fn tui_pull_request_row_leads_the_links_group() {
     tui.wait_for_text("can't be deleted");
 
     // A link the user adds lands under it.
-    tui.send(b"l");
+    tui.send(b"L");
     tui.wait_for_text("Add link");
     tui.type_str("example.dev/spec");
     tui.send(b"\r");

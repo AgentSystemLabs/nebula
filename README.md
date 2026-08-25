@@ -31,7 +31,7 @@ three, every time, and read the screens.
 
 nebula replaces that with a tree and a color:
 
-- **Every project, worktree and agent in one list.** Four columns, `j`/`k` to move, `Enter` to drill in.
+- **Every project, worktree and agent in one list.** Four columns, `h`/`j`/`k`/`l` to move, `Enter` to drill in.
 - **A dot per session that says what it's doing.** ● yellow is mid-turn, ● green is done, ● red wants
   you. Parents roll up their children, so a red dot on a collapsed project tells you exactly where to
   look without opening anything.
@@ -77,7 +77,8 @@ nebula
 ```
 
 Four columns, left to right: **Projects → Worktrees → Sessions → Terminal**. `Tab` / `Shift+Tab` (or
-`←` / `→`) move focus between columns, `j` / `k` move the selection inside one, and `Enter` drills in.
+`h` / `l`, or `←` / `→`) move focus between columns, `j` / `k` move the selection inside one, and `Enter`
+drills in.
 With no projects yet you get the splash instead — press `n` to add one without leaving the TUI.
 
 **3. Choose where the agent runs.** Select your project, then a worktree. Every project starts with one:
@@ -210,8 +211,8 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 
 | Context | Key | Action |
 |---|---|---|
-| Panels | `Tab`/`Shift+Tab`, `←/→`, `j/k` | move focus / selection |
-| Panels | `Ctrl+→` | cross into the terminal pane without attaching (plain `→` stops at Sessions) |
+| Panels | `Tab`/`Shift+Tab`, `h/l` or `←/→`, `j/k` | move focus / selection |
+| Panels | `Ctrl+→` | cross into the terminal pane without attaching (plain `l`/`→` stops at Sessions) |
 | Panels | `Enter` | drill in; on a session: attach |
 | Any panel | `/` | fuzzy jump across every project, worktree and session (`Ctrl+n/p` move, `Ctrl+o` opens the hit, `Ctrl+f` just lands the selection on it) |
 | Projects | `n` / `d` | add project / remove from list |
@@ -232,11 +233,11 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Any panel | `g` | git diff for the selected worktree: filter, `↑↓` files, `Shift+↑↓`/`PgUp/PgDn`/`Ctrl+d/u` scroll, `Ctrl+r` marks a file reviewed ✓ |
 | Any panel | `Shift+G` | open the selected repo's page on its git host — the `origin` remote (`git@github.com:o/r.git`, `ssh://`, `https://`) turned into a browsable URL, credentials stripped |
 | Any panel | `f` / `F` / `b` | find file / find in files (`git grep`) / file tree browser, all scoped to the selected worktree — `Enter` opens the file in an editor modal (at the matched line, for `F`); in `f` and `b`, `Ctrl+y` copies the path |
-| Any panel | `l` | attach a link (pull request, doc, ticket) to the selected worktree — it lands in the Sessions panel's LINKS group, above any open pull request nebula finds with `gh` |
+| Any panel | `Shift+L` | attach a link (pull request, doc, ticket) to the selected worktree — it lands in the Sessions panel's LINKS group, above any open pull request nebula finds with `gh` |
 | Sessions | `Enter` / `r` / `d` on a link | open it in the browser / edit its URL / delete it (the detected pull request opens but can't be edited or deleted) |
 | Any panel | `t` | new shell terminal in the selected worktree's directory (Projects panel: the repo root) |
 | Any panel | `w` | workspace switcher: `Enter` opens, `n`/`r`/`d` create/rename/delete (the open workspace shows bottom-left; `/` and the panels scope to it). Per window — switching here leaves your other nebula instances on the workspace you left them on |
-| Any panel | `h` | ssh hosts: every `nebula ssh` destination, newest first. `Enter`/click reconnects (quits this TUI and execs a fresh `nebula ssh` — local sessions keep running), `a` types a new `user@host [dir]`, `d` removes |
+| Any panel | `Shift+H` | ssh hosts: every `nebula ssh` destination, newest first. `Enter`/click reconnects (quits this TUI and execs a fresh `nebula ssh` — local sessions keep running), `a` types a new `user@host [dir]`, `d` removes |
 | Any panel | `m` or right-click | context menu |
 | Any panel | `z` | full-screen terminal: collapse the sidebars and lock input into the attached session |
 | Any panel | `s` | settings overlay (theme, editor, agent defaults, timeouts) — its Hotkeys tab rebinds every key in this table |

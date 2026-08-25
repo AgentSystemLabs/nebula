@@ -136,7 +136,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         hint: "Move focus one panel left (stops at projects)",
         group: "NAVIGATE",
         scope: Scope::Global,
-        defaults: &["left"],
+        defaults: &["h", "left"],
     },
     ActionSpec {
         action: Action::FocusRight,
@@ -145,7 +145,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         hint: "Move focus one panel right (stops at sessions — Enter enters the pane)",
         group: "NAVIGATE",
         scope: Scope::Global,
-        defaults: &["right"],
+        defaults: &["l", "right"],
     },
     ActionSpec {
         action: Action::FocusTerminal,
@@ -291,7 +291,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         hint: "Pin a PR, doc or ticket URL alongside the sessions",
         group: "SESSIONS",
         scope: Scope::Global,
-        defaults: &["l"],
+        defaults: &["shift+l"],
     },
     ActionSpec {
         action: Action::Rename,
@@ -420,7 +420,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         hint: "Connect to a saved ssh host (restarts nebula over ssh)",
         group: "GENERAL",
         scope: Scope::Global,
-        defaults: &["h"],
+        defaults: &["shift+h"],
     },
     ActionSpec {
         action: Action::Settings,
