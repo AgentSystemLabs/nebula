@@ -290,10 +290,22 @@ overrides the configured editor. Overrides for tests/parallel instances: `NEBULA
 
 ## Building
 
+Build from source when you want a local development binary instead of the latest release:
+
 ```sh
+git clone https://github.com/AgentSystemLabs/nebula.git
+cd nebula
 cargo build --release     # → target/release/nebula (~4 MB)
+```
+
+For day-to-day development, run the test suite before opening a pull request:
+
+```sh
 cargo test                # unit + end-to-end suite (spawns real daemons/PTYs)
 ```
+
+You can also install your local release build onto your `PATH` with `make install` (defaults to
+`~/.cargo/bin/nebula`).
 
 Workspace layout: `nebula-core` (shared protocol/entities), `nebula-daemon` (PTYs, SQLite, hook receiver,
 status engine), `nebula-tui` (ratatui client), `nebula` (the binary). `vendor/vt100` is a patched copy of
