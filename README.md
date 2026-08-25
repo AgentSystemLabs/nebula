@@ -275,7 +275,7 @@ nebula workspace list           # list workspaces; * marks the one new instances
 nebula workspace rename <a> <b> # rename a workspace
 nebula workspace delete <name>  # delete an empty workspace
 nebula ssh <host> [dir]   # open nebula on a remote machine over ssh (installs it there if
-                          # missing); destinations are remembered for the TUI's `h` picker
+                          # missing); destinations are remembered for the TUI's `Shift+H` picker
 nebula upgrade            # install the latest release (--force on a dev build)
 ```
 
