@@ -26,6 +26,11 @@ pub const DEFAULT_PORT: u16 = 7681;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// ttyd's own default font size, passed back to it explicitly to buy a second
+/// fit. See `ttyd_args` — the value is deliberately the default, so the tab
+/// looks exactly as it always did; only the column count changes.
+const FONT_SIZE: u16 = 13;
+
 const MISSING_TTYD: &str = "\
 nebula browser needs ttyd, and it is not on your PATH.
 
@@ -88,6 +93,19 @@ fn ttyd_args(port: u16) -> Vec<String> {
         "127.0.0.1".into(),
         "-p".into(),
         port.to_string(),
+        // Makes the grid reach the right edge of the window. ttyd's page
+        // fits the terminal to the window immediately after `Terminal.open`,
+        // while xterm is still on its DOM renderer, whose cell width is the
+        // measured character advance (7.83px at this size). It then swaps in
+        // the WebGL renderer, which floors that to a whole pixel (7px) and
+        // does *not* re-fit — so the grid keeps the ~10% narrower column
+        // count and paints ~24 columns short of the edge. ttyd re-runs the
+        // fit whenever it applies a client option whose name starts with
+        // `font`, and by then the real renderer is in place, so naming the
+        // font size — even at ttyd's own default — is what closes the gap.
+        // Keep this ahead of `--`, and keep a `font*` option in the list.
+        "-t".into(),
+        format!("fontSize={FONT_SIZE}"),
         // Stop option parsing: everything after this is the command to run.
         "--".into(),
     ]
@@ -164,6 +182,19 @@ mod tests {
         // Without the terminator, getopt permutation could read the served
         // binary's path as a ttyd flag.
         assert_eq!(ttyd_args(DEFAULT_PORT).last().unwrap(), "--");
+    }
+
+    #[test]
+    fn a_font_client_option_is_passed_so_ttyd_refits_after_the_renderer_swap() {
+        // Load-bearing, and it looks like a no-op: the value is ttyd's own
+        // default. Dropping it costs ~24 columns off the right of the window.
+        let args = ttyd_args(DEFAULT_PORT);
+        let opt = args.iter().position(|a| a == "-t").expect("passes -t");
+        assert_eq!(args[opt + 1], format!("fontSize={FONT_SIZE}"));
+        // ttyd only re-fits for options *named* `font…`, and only if the
+        // option reaches it as an option rather than as the served command.
+        assert!(args[opt + 1].starts_with("font"));
+        assert!(opt + 1 < args.iter().position(|a| a == "--").unwrap());
     }
 
     #[test]

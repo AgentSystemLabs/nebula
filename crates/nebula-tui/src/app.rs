@@ -55,18 +55,20 @@ pub enum HitTarget {
     PanelBg(Focus),
     TerminalPane,
     /// Draggable vertical boundary between panels, left to right:
-    /// 0 = projects|worktrees, 1 = worktrees|sessions, 2 = sessions|terminal.
+    /// 0 = workspaces|projects (only while the column is shown),
+    /// 1 = projects|worktrees, 2 = worktrees|sessions, 3 = sessions|terminal.
     Splitter(usize),
 }
 
 /// Default widths of the Projects / Worktrees / Sessions panels. Sessions
 /// is the widest because its rows carry the most: name, "23m ago", harness.
 pub const DEFAULT_PANEL_WIDTHS: [u16; 3] = [20, 22, 32];
-/// Width of the Workspaces column when it's shown. Fixed rather than
-/// draggable: the persisted `panel_widths` blob is a `[u16; 3]`, and a
-/// fourth splitter would either break every saved layout or need a second
-/// schema. Names longer than this truncate, as project names do.
-pub const WORKSPACES_PANEL_W: u16 = 18;
+/// Starting width of the Workspaces column. It's draggable like the three
+/// panels to its right, but persisted separately (`UiState::workspaces_w`)
+/// rather than as a fourth slot in the `[u16; 3]` `panel_widths` blob, so
+/// older saved layouts keep loading. Names longer than the column truncate,
+/// as project names do.
+pub const DEFAULT_WORKSPACES_PANEL_W: u16 = 18;
 /// A panel can't be dragged narrower than this.
 pub const MIN_PANEL_W: u16 = 10;
 /// The terminal pane always keeps at least this much width.
@@ -1679,6 +1681,9 @@ pub struct UiState {
     /// blobs, which means shown.
     #[serde(default)]
     pub show_workspaces: Option<bool>,
+    /// Dragged width of the Workspaces column; absent in older blobs.
+    #[serde(default)]
+    pub workspaces_w: Option<u16>,
     /// Diff modal file-list width; absent in older blobs.
     #[serde(default)]
     pub diff_files_width: Option<u16>,
@@ -1831,7 +1836,7 @@ pub struct App {
     /// Sidebars collapsed (z) — terminal takes the full width.
     pub collapsed: bool,
     /// Workspaces column shown at the left edge (`Shift+W` toggles). The
-    /// three draggable panels sit to its right; see `splitter_x`.
+    /// three panels sit to its right; see `splitter_x`.
     pub show_workspaces: bool,
     pub next_req_id: u64,
     pub pending: HashMap<u64, PendingIntent>,
@@ -1886,6 +1891,9 @@ pub struct App {
     /// Widths of the Projects / Worktrees / Sessions panels; the terminal
     /// pane takes the remainder.
     pub panel_widths: [u16; 3],
+    /// Width of the Workspaces column when it's shown. Kept out of
+    /// `panel_widths` so old persisted layouts still deserialize.
+    pub workspaces_w: u16,
     /// File-list width of the diff modal, remembered across opens.
     pub diff_files_width: u16,
     /// Selected tab of the settings modal, remembered across opens.
@@ -2066,6 +2074,7 @@ impl App {
             term_links: Vec::new(),
             term_file_links: Vec::new(),
             panel_widths: DEFAULT_PANEL_WIDTHS,
+            workspaces_w: DEFAULT_WORKSPACES_PANEL_W,
             diff_files_width: DEFAULT_DIFF_FILES_W,
             settings_tab: 0,
             settings_selected: vec![0; crate::config::tab_count()],
@@ -2163,27 +2172,52 @@ impl App {
         (self.splash_epoch.elapsed().as_millis() / SWEEP_FRAME.as_millis()) as usize
     }
 
-    /// Columns the Workspaces panel takes at the left edge: its fixed width
-    /// when shown, nothing when hidden. Every screen-x computation for the
-    /// three draggable panels starts here.
+    /// Columns the Workspaces panel takes at the left edge: its dragged
+    /// width when shown, nothing when hidden. Every screen-x computation for
+    /// the three panels to its right starts here.
     pub fn workspaces_panel_w(&self) -> u16 {
         if self.show_workspaces {
-            WORKSPACES_PANEL_W
+            self.workspaces_w
         } else {
             0
         }
     }
 
+    /// The splitters that exist right now, left to right. The Workspaces
+    /// boundary (0) only exists while its column is shown; the three panel
+    /// boundaries (1..=3) always do.
+    pub fn splitter_indices(&self) -> std::ops::Range<usize> {
+        if self.show_workspaces {
+            0..4
+        } else {
+            1..4
+        }
+    }
+
     /// Screen x of splitter `idx` — the column where the panel to its right
-    /// starts (the Workspaces column, then a prefix sum of panel widths).
+    /// starts. 0 is the Workspaces column's right edge; 1..=3 add a prefix
+    /// sum of the panel widths on top of it.
     pub fn splitter_x(&self, idx: usize) -> u16 {
-        self.workspaces_panel_w() + self.panel_widths[..=idx].iter().sum::<u16>()
+        self.workspaces_panel_w() + self.panel_widths[..idx].iter().sum::<u16>()
     }
 
     /// Move splitter `idx` so its boundary lands at `boundary_x`, clamped so
     /// the panel keeps `MIN_PANEL_W` and the terminal pane keeps `MIN_TERM_W`.
     pub fn set_splitter(&mut self, idx: usize, boundary_x: i32, body_w: u16) {
+        let want = boundary_x.max(0) as u16;
+        // Splitter 0 is the Workspaces column's own right edge: it starts at
+        // x=0, so the boundary IS its width, and everything to its right
+        // keeps the width it has.
+        if idx == 0 {
+            let fixed_right: u16 = self.panel_widths.iter().sum();
+            let max = body_w.saturating_sub(fixed_right + MIN_TERM_W);
+            if max >= MIN_PANEL_W {
+                self.workspaces_w = want.clamp(MIN_PANEL_W, max);
+            }
+            return;
+        }
         // The Workspaces column is spoken for before any panel is sized.
+        let idx = idx - 1;
         let offset = self.workspaces_panel_w();
         let body_w = body_w.saturating_sub(offset);
         let left: u16 = self.panel_widths[..idx].iter().sum();
@@ -2192,15 +2226,20 @@ impl App {
         if max < MIN_PANEL_W {
             return; // terminal too small to honor the minimums
         }
-        let want = boundary_x.max(0) as u16;
         self.panel_widths[idx] = want.saturating_sub(offset + left).clamp(MIN_PANEL_W, max);
     }
 
     /// Re-fit panel widths to the current body width, shrinking the rightmost
     /// panel first, each floored at `MIN_PANEL_W`. Keeps the terminal pane at
     /// `MIN_TERM_W` whenever the screen allows it at all. The Workspaces
-    /// column, when shown, comes off the top of the budget.
+    /// column, when shown, comes off the top of the budget — and gives way
+    /// first, since a width dragged out on a wide screen must not squeeze
+    /// three panels plus the pane off a narrow one.
     pub fn normalize_panel_widths(&mut self, body_w: u16) {
+        if self.show_workspaces {
+            let max = body_w.saturating_sub(3 * MIN_PANEL_W + MIN_TERM_W);
+            self.workspaces_w = self.workspaces_w.clamp(MIN_PANEL_W, max.max(MIN_PANEL_W));
+        }
         let budget = body_w
             .saturating_sub(self.workspaces_panel_w())
             .saturating_sub(MIN_TERM_W);

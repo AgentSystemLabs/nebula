@@ -56,9 +56,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     app.body_area = body;
     app.normalize_panel_widths(body.width);
-    // The Workspaces column (Shift+W) leads the sidebar at a fixed width —
-    // zero when hidden; the three draggable panels and the terminal pane
-    // share what's left. `splitter_x` knows about the offset.
+    // The Workspaces column (Shift+W) leads the sidebar — zero wide when
+    // hidden; the three panels and the terminal pane share what's left.
+    // `splitter_x` knows about the offset.
     let [workspaces_a, panels_a] = Layout::horizontal([
         Constraint::Length(app.workspaces_panel_w()),
         Constraint::Min(0),
@@ -74,7 +74,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     // Splitter grab zones: the two touching border cells at each panel
     // boundary. Registered first so they win `hit_at`'s first-match scan.
-    for i in 0..3 {
+    for i in app.splitter_indices() {
         let x = app.splitter_x(i);
         app.hits.push((
             Rect {
@@ -1942,7 +1942,7 @@ fn draw_splitter_grips(buf: &mut ratatui::buffer::Buffer, app: &App, body: Rect)
     }
     let th = app.theme;
     let mid = body.y + body.height / 2;
-    for i in 0..3 {
+    for i in app.splitter_indices() {
         // The rule column: the left panel's `Borders::RIGHT` cell, one
         // short of the boundary where the next panel starts.
         let x = app.splitter_x(i).saturating_sub(1);
@@ -4332,7 +4332,8 @@ mod tests {
     }
 
     /// Each grip sits on its rule column (one left of the boundary), three
-    /// cells centered vertically: muted at rest, accent under hover.
+    /// cells centered vertically: muted at rest, accent under hover. All
+    /// four boundaries get one while the Workspaces column is shown.
     #[test]
     fn splitter_grips_center_on_the_rules() {
         let th = Theme::default();
@@ -4341,7 +4342,8 @@ mod tests {
         let mut buf = ratatui::buffer::Buffer::empty(body);
         draw_splitter_grips(&mut buf, &app, body);
         let mid = body.height / 2; // 17
-        for i in 0..3 {
+        assert_eq!(app.splitter_indices(), 0..4);
+        for i in app.splitter_indices() {
             let x = app.splitter_x(i) - 1;
             for y in mid - 1..=mid + 1 {
                 let cell = buf.cell((x, y)).unwrap();
@@ -4352,14 +4354,27 @@ mod tests {
             assert_eq!(buf.cell((x, mid + 2)).unwrap().symbol(), " ");
         }
 
-        // Hover lights only that splitter's grip.
-        app.hover_splitter = Some(1);
+        // Hover lights only that splitter's grip — including the
+        // Workspaces column's own edge.
+        app.hover_splitter = Some(0);
         draw_splitter_grips(&mut buf, &app, body);
         assert_eq!(
-            buf.cell((app.splitter_x(1) - 1, mid)).unwrap().fg,
+            buf.cell((app.splitter_x(0) - 1, mid)).unwrap().fg,
             th.accent
         );
-        assert_eq!(buf.cell((app.splitter_x(0) - 1, mid)).unwrap().fg, th.muted);
+        assert_eq!(buf.cell((app.splitter_x(1) - 1, mid)).unwrap().fg, th.muted);
+
+        // Hiding the column drops its grip; the rest keep theirs.
+        app.show_workspaces = false;
+        app.hover_splitter = None;
+        let mut buf = ratatui::buffer::Buffer::empty(body);
+        draw_splitter_grips(&mut buf, &app, body);
+        assert_eq!(
+            buf.cell((app.splitter_x(1) - 1, mid)).unwrap().symbol(),
+            "┃"
+        );
+        assert_eq!(buf.cell((17, mid)).unwrap().symbol(), " ");
+        app.show_workspaces = true;
 
         // A body too short for a grip plus breathing space draws nothing.
         let tiny = Rect::new(0, 0, 120, 6);

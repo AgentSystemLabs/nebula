@@ -885,6 +885,7 @@ fn ui_state_json(app: &App) -> String {
         collapsed: app.collapsed,
         panel_widths: Some(app.panel_widths),
         show_workspaces: Some(app.show_workspaces),
+        workspaces_w: Some(app.workspaces_w),
         diff_files_width: Some(app.diff_files_width),
     };
     serde_json::to_string(&state).unwrap_or_else(|_| "{}".into())
@@ -943,6 +944,9 @@ fn restore_ui_state(app: &mut App, json: &str) {
         // Coarse sanity clamp; normalize_panel_widths re-fits to the actual
         // screen on the next draw.
         app.panel_widths = w.map(|v| v.clamp(crate::app::MIN_PANEL_W, 300));
+    }
+    if let Some(w) = state.workspaces_w {
+        app.workspaces_w = w.clamp(crate::app::MIN_PANEL_W, 300);
     }
     if let Some(w) = state.diff_files_width {
         // Coarse sanity clamp; the draw re-caps it to the actual modal width.
@@ -11309,13 +11313,15 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     /// Mirror ui::draw's splitter registration for a 120x35 body with the
-    /// default panel widths (splitters at x = 20, 42, 68). The Workspaces
-    /// column is hidden so those x's hold; its offset has its own test
-    /// (`splitters_shift_right_by_the_workspaces_column`).
+    /// default panel widths (splitters 1..=3 at x = 20, 42, 68). The
+    /// Workspaces column is hidden so those x's hold and splitter 0 is
+    /// absent; the shown case has its own tests
+    /// (`splitters_shift_right_by_the_workspaces_column`,
+    /// `workspaces_column_drags_like_the_other_panels`).
     fn seed_splitters(app: &mut App) {
         app.show_workspaces = false;
         app.body_area = ratatui::layout::Rect::new(0, 0, 120, 35);
-        for i in 0..3 {
+        for i in app.splitter_indices() {
             let x = app.splitter_x(i);
             app.hits.push((
                 ratatui::layout::Rect::new(x - 1, 0, 2, 35),
@@ -11403,7 +11409,7 @@ diff --git a/src/b.rs b/src/b.rs
         );
         assert!(app
             .splitter_drag
-            .is_some_and(|d| d.idx == 0 && d.grab_offset == 0));
+            .is_some_and(|d| d.idx == 1 && d.grab_offset == 0));
         assert!(
             app.term_selection.is_none(),
             "splitter grab must not arm a terminal selection"
@@ -11496,7 +11502,7 @@ diff --git a/src/b.rs b/src/b.rs
         app.dirty = false;
         handle_mouse(&mut app, mev(MouseEventKind::Moved, 20, 5), &mut out);
         assert_eq!(app.pointer_shape, PointerShape::ColResize);
-        assert_eq!(app.hover_splitter, Some(0));
+        assert_eq!(app.hover_splitter, Some(1));
         assert!(app.dirty, "hover change repaints the grip");
 
         // Hover away: back to default, grip resting.
@@ -11533,7 +11539,7 @@ diff --git a/src/b.rs b/src/b.rs
             &mut out,
         );
         assert_eq!(app.pointer_shape, PointerShape::ColResize);
-        assert_eq!(app.hover_splitter, Some(0));
+        assert_eq!(app.hover_splitter, Some(1));
     }
 
     #[test]
@@ -11577,19 +11583,23 @@ diff --git a/src/b.rs b/src/b.rs
     fn ui_state_roundtrip_includes_panel_widths() {
         let mut app = App::new();
         app.panel_widths = [33, 44, 55];
+        app.workspaces_w = 26;
         let json = ui_state_json(&app);
 
         let mut restored = App::new();
         restore_ui_state(&mut restored, &json);
         assert_eq!(restored.panel_widths, [33, 44, 55]);
+        assert_eq!(restored.workspaces_w, 26);
 
-        // Old blobs without the field keep the defaults.
+        // Old blobs without the fields keep the defaults — the Workspaces
+        // width lives outside the `[u16; 3]` blob for exactly this reason.
         let mut legacy = App::new();
         restore_ui_state(
             &mut legacy,
             r#"{"project":null,"worktree":null,"session_agent":null,"show_archived":false,"collapsed":false}"#,
         );
         assert_eq!(legacy.panel_widths, crate::app::DEFAULT_PANEL_WIDTHS);
+        assert_eq!(legacy.workspaces_w, crate::app::DEFAULT_WORKSPACES_PANEL_W);
     }
 
     fn project(
@@ -16067,20 +16077,23 @@ diff --git a/src/b.rs b/src/b.rs
         assert!(app.overlay.is_none(), "the hints aren't a button");
     }
 
-    /// The three draggable panels start where the Workspaces column ends:
-    /// splitter x's, drag targets and the width budget all carry the offset,
-    /// and drop it when the column is hidden.
+    /// The three panels start where the Workspaces column ends: splitter
+    /// x's, drag targets and the width budget all carry the offset, and drop
+    /// it when the column is hidden. Splitter 0 is the column's own edge, so
+    /// only 1..=3 exist once it's gone.
     #[test]
     fn splitters_shift_right_by_the_workspaces_column() {
-        use crate::app::{DEFAULT_PANEL_WIDTHS, WORKSPACES_PANEL_W};
+        use crate::app::{DEFAULT_PANEL_WIDTHS, DEFAULT_WORKSPACES_PANEL_W as WS_W};
         let mut app = App::new();
         assert!(app.show_workspaces);
-        assert_eq!(app.splitter_x(0), WORKSPACES_PANEL_W + 20);
-        assert_eq!(app.splitter_x(2), WORKSPACES_PANEL_W + 74);
+        assert_eq!(app.splitter_indices(), 0..4);
+        assert_eq!(app.splitter_x(0), WS_W);
+        assert_eq!(app.splitter_x(1), WS_W + 20);
+        assert_eq!(app.splitter_x(3), WS_W + 74);
 
-        // Dragging the first boundary to screen x=45 leaves Projects 27
-        // wide: the 18 columns ahead of it aren't its to keep.
-        app.set_splitter(0, 45, 160);
+        // Dragging the projects|worktrees boundary to screen x=45 leaves
+        // Projects 27 wide: the 18 columns ahead of it aren't its to keep.
+        app.set_splitter(1, 45, 160);
         assert_eq!(app.panel_widths[0], 27);
 
         // A 100-wide body: the column comes off the top of the budget
@@ -16090,15 +16103,82 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(app.panel_widths, [20, 22, 20]);
 
         app.show_workspaces = false;
-        assert_eq!(app.splitter_x(0), 20);
+        assert_eq!(app.splitter_indices(), 1..4);
+        assert_eq!(app.splitter_x(1), 20);
         app.panel_widths = DEFAULT_PANEL_WIDTHS;
         app.normalize_panel_widths(100);
         assert_eq!(
             app.panel_widths, DEFAULT_PANEL_WIDTHS,
             "80 columns fit them all"
         );
-        app.set_splitter(0, 45, 160);
+        app.set_splitter(1, 45, 160);
         assert_eq!(app.panel_widths[0], 45);
+    }
+
+    /// The Workspaces column resizes by the same grab-and-drag as the rest:
+    /// splitter 0 sits on its right edge, the boundary x IS its width, and
+    /// the panels behind it keep theirs.
+    #[test]
+    fn workspaces_column_drags_like_the_other_panels() {
+        use crate::app::{
+            DEFAULT_PANEL_WIDTHS, DEFAULT_WORKSPACES_PANEL_W as WS_W, MIN_PANEL_W, MIN_TERM_W,
+        };
+        let mut app = App::new();
+        app.body_area = ratatui::layout::Rect::new(0, 0, 120, 35);
+        for i in app.splitter_indices() {
+            let x = app.splitter_x(i);
+            app.hits.push((
+                ratatui::layout::Rect::new(x - 1, 0, 2, 35),
+                HitTarget::Splitter(i),
+            ));
+        }
+        let mut out = Vec::new();
+
+        // Grab the column's edge (x = 18) and pull it right to 24.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), WS_W, 5),
+            &mut out,
+        );
+        assert!(app.splitter_drag.is_some_and(|d| d.idx == 0));
+        assert_eq!(app.hover_splitter, Some(0));
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 24, 5),
+            &mut out,
+        );
+        assert_eq!(app.workspaces_w, 24);
+        assert_eq!(app.panel_widths, DEFAULT_PANEL_WIDTHS, "panels stay put");
+        assert_eq!(app.splitter_x(1), 44, "the panels behind it slide over");
+
+        // Far left floors at the panel minimum; far right leaves the
+        // terminal pane its own minimum.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 0, 5),
+            &mut out,
+        );
+        assert_eq!(app.workspaces_w, MIN_PANEL_W);
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 200, 5),
+            &mut out,
+        );
+        assert_eq!(app.splitter_x(3), app.body_area.width - MIN_TERM_W);
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Up(MouseButton::Left), 200, 5),
+            &mut out,
+        );
+        assert!(app.splitter_drag.is_none());
+        assert!(out.is_empty(), "no requests from a splitter drag");
+
+        // A width dragged out on a wide screen gives way first when the
+        // body shrinks, rather than squeezing the panels off it.
+        app.workspaces_w = 60;
+        app.normalize_panel_widths(90);
+        assert_eq!(app.workspaces_w, 90 - 3 * MIN_PANEL_W - MIN_TERM_W);
     }
 
     /// Tab / Shift+Tab / ← walk through the column only while it's shown.
