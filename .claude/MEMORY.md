@@ -14,6 +14,31 @@ about what is worth recording.
 
 ## Entries
 
+### Release v0.5.0 — 2026-08-25
+
+**Asked:** "commit push and tag a new release 0.5.0 version"
+
+**Did:** Followed `.claude/skills/release/SKILL.md` in a private worktree. Two commits landed on `main`:
+the already-finished-but-uncommitted pill-rail fix + `assets/screenshot.png` (17320c5), then the version
+bump to 0.5.0 (1018bdf, tagged `v0.5.0`). All 4 release-matrix targets built and the notes were rewritten
+by hand.
+
+**Gotchas:**
+- **`origin/main` moved out from under the release mid-task** — PR #12 (`worktree-hl-panel-nav`) merged
+  while this was running, touching `event_loop.rs` and `.claude/MEMORY.md`, the same two files the
+  uncommitted release content touched. The skill's "bring files in by content" step means literally
+  that: a blind `cp` of the shared tree's modified file over the fresh `origin/main` copy would have
+  silently reverted the merged PR. `git diff -- <file> > x.patch` then `git apply --check x.patch` against
+  the fresh worktree file proved whether it was safe — `event_loop.rs` and `ui.rs` applied clean (my hunk
+  didn't overlap their edits), `.claude/MEMORY.md` did not (both added an entry right after `## Entries`)
+  and needed a manual insert instead of `git apply`.
+- **The uncommitted changes in the shared tree were not scratch work** — they were a finished bugfix
+  from a prior session, already written up in `.claude/MEMORY.md` (the "Black Notches" entry) and never
+  committed. Worth reading the diff and the existing memory entry before assuming uncommitted files are
+  someone's mid-task state to leave alone.
+- Local `main` in the shared tree is now behind `origin/main` by both PR #12 and this release — its next
+  `git pull` needs to fast-forward through both.
+
 ### Black Notches At The Selected Pill's Corners (Issue #6) — 2026-08-24
 
 **Asked:** "try to fix this style issue, see attached image https://github.com/AgentSystemLabs/nebula/issues/6"
