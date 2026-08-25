@@ -66,7 +66,7 @@ pathed `workspace/project/branch/session`. `jump_to_target` switches workspace f
 - `TestBackend` renders the palette rows, so a failing palette assertion prints the whole modal — that
   dump is the fastest way to eyeball glyphs and paths (`◇ client` / `▫ client/secret`).
 
-### Release v0.8.0 — A Clean Base Needs No Merge — 2026-08-25
+### Releases v0.8.0 And v0.9.0 — A Clean Base Needs No Merge — 2026-08-25
 
 **Asked:** "ok pull in latest from origin/main then and merge into this work them commit push and make
 the next release"
@@ -78,11 +78,21 @@ worktree cut from `origin/main`, the six dirty files copied in by content, `274e
 rewritten. Shipped the draggable Workspaces column, the ttyd `fontSize` refit, and the `make dev` /
 `make browser` isolated dev instance — each already has its own entry above.
 
+**Then v0.9.0**, asked as "commit and push and do another release" — same clean path, same recipe: base
+read `0 0`, seven dirty files copied in, `2730e9f` (feature), `7ddee41` (memory), `12554d1` (bump to
+0.9.0, tagged `v0.9.0`). 629 tests green, all 4 matrix targets built, notes rewritten. Shipped the
+persistent Workspaces column and the cross-workspace `/` palette (entry above).
+
 **Gotchas:**
 - Nothing bit us. Worth recording only as the contrast to [Release v0.7.0]: the copy-files-into-a-worktree
   recipe is safe **exactly when** `git rev-list --left-right --count HEAD...origin/main` reads `0 0`.
   Check that before choosing between copying and merging — it is the one-line test for which of the two
   release paths you are on.
+- Two clean releases in a row now. The shared tree is left dirty-but-identical after each one (the
+  release worktree does the committing, `main` never moves locally), so the reconcile the user needs is
+  `git reset --hard origin/main`, not a merge — `origin/main` is a strict superset of what their working
+  copy holds. Say that explicitly; a plain `git pull` on top of those identical-but-uncommitted files
+  just stalls.
 
 ### `nebula browser` Terminal Stopped ~24 Columns Short — 2026-08-25
 
