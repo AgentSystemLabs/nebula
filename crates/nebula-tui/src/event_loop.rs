@@ -5025,18 +5025,25 @@ fn select_word_at(app: &mut App, cell: (u16, u16)) {
     copy_selection(app);
 }
 
-/// Copy to the system clipboard via pbcopy (this tool targets macOS).
+/// Copy to the system clipboard.
+/// macOS: pbcopy. Linux: wl-copy on Wayland, xclip (or xsel) on X11.
 fn copy_to_clipboard(text: &str) -> bool {
     // Unit tests exercise the selection flow; don't clobber the developer's
     // real clipboard from `cargo test`.
     if cfg!(test) {
         return true;
     }
-    #[cfg(target_os = "macos")]
-    {
-        use std::io::Write as _;
-        use std::process::{Command, Stdio};
-        let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() else {
+
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let copy_via = |cmd: &str, args: &[&str]| -> bool {
+        let Ok(mut child) = Command::new(cmd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
             return false;
         };
         let wrote = child
@@ -5044,11 +5051,23 @@ fn copy_to_clipboard(text: &str) -> bool {
             .take()
             .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
         wrote && child.wait().is_ok_and(|status| status.success())
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        return copy_via("pbcopy", &[]);
     }
+
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = text;
-        false
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            return copy_via("wl-copy", &[]);
+        }
+        // X11: prefer xclip, fall back to xsel
+        if copy_via("xclip", &["-selection", "clipboard"]) {
+            return true;
+        }
+        copy_via("xsel", &["--clipboard", "--input"])
     }
 }
 
