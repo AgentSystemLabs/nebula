@@ -11,7 +11,7 @@ exclude = ["vendor/vt100"]
 vt100 = { path = "vendor/vt100" }
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 
