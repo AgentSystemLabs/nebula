@@ -25,7 +25,8 @@ const FOOTER_WORKTREES: &str = "n: new worktree";
 const FOOTER_SESSIONS: &str = "n: agent";
 /// Terminal pane focused but NOT input-locked (attached session).
 const FOOTER_TERMINAL_FOCUSED: &str = "Enter: type into terminal";
-/// Terminal pane input-locked: keys forward to the PTY.
+/// Terminal pane input-locked: keys forward to the PTY. The footer spells
+/// chords the compact way `KeyChord::display` does — `^q`, not `Ctrl+q`.
 const FOOTER_TERMINAL_LOCKED: &str = "^q: panels";
 
 struct TuiHarness {

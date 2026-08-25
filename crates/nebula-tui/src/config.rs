@@ -33,7 +33,13 @@ pub const EDITORS: &[&str] = &["vim", "nvim", "nano", "emacs", "hx"];
 /// pick" and is what the daemon sees as None.
 pub const CLAUDE_MODELS: &[&str] = &["default", "fable", "opus", "sonnet", "haiku"];
 pub const CLAUDE_EFFORTS: &[&str] = &["default", "low", "medium", "high", "xhigh", "max"];
-pub const CODEX_MODELS: &[&str] = &["default", "gpt-5.6-sol", "gpt-5.5"];
+pub const CODEX_MODELS: &[&str] = &[
+    "default",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+];
 pub const CODEX_EFFORTS: &[&str] = &["default", "minimal", "low", "medium", "high", "xhigh"];
 
 /// Model choices for a session kind; empty = no model submenu (Cursor).

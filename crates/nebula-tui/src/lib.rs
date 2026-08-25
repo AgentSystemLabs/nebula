@@ -37,8 +37,11 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 /// binary crate stays a thin arg-parser. `Some(entry)` means the user picked
 /// a recent ssh host — the terminal is restored and the caller should exec
 /// `nebula ssh` at it.
-pub fn run_tui() -> Result<Option<hosts::HostEntry>> {
-    runtime()?.block_on(event_loop::run_app())
+///
+/// `workspace` is `--workspace <name>`: which workspace this instance opens
+/// into, independent of any other instance already running.
+pub fn run_tui(workspace: Option<String>) -> Result<Option<hosts::HostEntry>> {
+    runtime()?.block_on(event_loop::run_app(workspace))
 }
 
 /// Phase-2 throwaway raw-mode client (`nebula _raw-attach`).

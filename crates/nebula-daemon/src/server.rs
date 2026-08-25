@@ -2,10 +2,10 @@
 //! attach/forward plumbing.
 
 use crate::pty::PtyEvent;
-use crate::registry::Daemon;
+use crate::registry::{CreateAgentSpec, Daemon};
 use anyhow::Result;
 use nebula_core::codec::{read_frame, write_frame};
-use nebula_core::{ClientRequest, ServerEvent, SessionRef, PROTOCOL_VERSION};
+use nebula_core::{ClientRequest, ServerEvent, SessionRef, WorkspaceId, PROTOCOL_VERSION};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -54,6 +54,15 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     // Per-connection attach state: forward-task handles keyed by session.
     let mut attached: HashMap<SessionRef, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut handshaken = false;
+    // Which workspace THIS client is scoped to. Per-connection on purpose:
+    // two nebula instances are two independent views, so one switching
+    // workspaces must not move the other. Pinned at Subscribe to whatever
+    // the client was handed to boot into, because "the current default" is
+    // not a stable answer — another instance switching moves it, and a
+    // client that read it once must not silently follow. `None` outlives
+    // Subscribe only for connections that never subscribe: the one-shot
+    // `nebula add`, whose workspace genuinely is the current default.
+    let mut workspace: Option<WorkspaceId> = None;
 
     let result: Result<()> = async {
         while let Some(req) = read_frame::<ClientRequest, _>(&mut reader).await? {
@@ -98,6 +107,17 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         pr_seen: vec![],
                         ui_state: None,
                     });
+                    // Scope this client to the workspace it is being shown.
+                    // First Subscribe only — a re-subscribe must not undo a
+                    // switch the client made in between.
+                    if workspace.is_none() {
+                        if let ServerEvent::Snapshot {
+                            active_workspace, ..
+                        } = &snapshot
+                        {
+                            workspace = Some(active_workspace.clone());
+                        }
+                    }
                     let _ = out_tx.send(snapshot).await;
                     let mut rx = daemon.events.subscribe();
                     let tx = out_tx.clone();
@@ -237,7 +257,14 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     .await;
                 }
                 ClientRequest::OpenWorkspace { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.open_workspace(&id).map(|_| None)).await;
+                    // Scope this connection, and leave the pick behind as the
+                    // default a fresh client boots into. A workspace that
+                    // doesn't exist scopes nothing.
+                    let result = daemon.set_default_workspace(&id);
+                    if result.is_ok() {
+                        workspace = Some(id);
+                    }
+                    reply(&out_tx, req_id, result.map(|_| None)).await;
                 }
                 ClientRequest::AddProject {
                     req_id,
@@ -249,7 +276,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         &out_tx,
                         req_id,
                         daemon
-                            .add_project(&path, name, create_missing)
+                            .add_project(&path, name, create_missing, workspace.clone())
                             .await
                             .map(Some),
                     )
@@ -343,16 +370,42 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     model,
                     effort,
                     auto_title,
+                    cloud_prompt,
                 } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon
-                            .create_agent(&worktree, &name, kind, model, effort, auto_title)
-                            .await
-                            .map(Some),
-                    )
-                    .await;
+                    let is_cloud = cloud_prompt.is_some();
+                    let result = daemon
+                        .create_agent(CreateAgentSpec {
+                            worktree: worktree.clone(),
+                            name,
+                            kind,
+                            model,
+                            effort,
+                            auto_title,
+                            cloud_prompt,
+                        })
+                        .await;
+                    if is_cloud {
+                        match &result {
+                            Ok(nebula_core::EntityId::Agent(agent)) => tracing::info!(
+                                req_id,
+                                agent = %agent,
+                                kind = kind.as_str(),
+                                worktree = %worktree,
+                                launch_mode = "cloud",
+                                "agent session spawned"
+                            ),
+                            Err(error) => tracing::warn!(
+                                req_id,
+                                error = %error,
+                                kind = kind.as_str(),
+                                worktree = %worktree,
+                                launch_mode = "cloud",
+                                "agent session spawn failed"
+                            ),
+                            Ok(_) => unreachable!("CreateAgent returned a non-agent id"),
+                        }
+                    }
+                    reply(&out_tx, req_id, result.map(Some)).await;
                 }
                 ClientRequest::PrewarmAgent {
                     worktree,

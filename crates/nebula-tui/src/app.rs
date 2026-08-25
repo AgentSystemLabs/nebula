@@ -90,6 +90,9 @@ pub enum MenuAction {
         kind: AgentKind,
         model: Option<String>,
         effort: Option<String>,
+        /// One-shot launch modifier for Claude. The task itself is collected
+        /// after the optional name prompt and crosses IPC only on create.
+        cloud: bool,
     },
     /// Shell terminal in the worktree's directory; created immediately with
     /// a default name (no prompt), renameable later.
@@ -199,6 +202,42 @@ impl ContextMenu {
             _ => None,
         }
     }
+
+    /// Cloud mode is a root new-session-picker modifier, not another agent
+    /// kind. Returning Some only while the Claude row itself is highlighted
+    /// keeps Tab free everywhere else (including model/effort submenus).
+    pub fn hovered_claude_cloud(&self) -> Option<bool> {
+        if self.parent.is_some() || self.title.as_deref() != Some("New session") {
+            return None;
+        }
+        match &self.items.get(self.hover)?.action {
+            MenuAction::NewAgentOfKind {
+                kind: AgentKind::Claude,
+                cloud,
+                ..
+            } => Some(*cloud),
+            _ => None,
+        }
+    }
+
+    /// Toggle the highlighted Claude row and keep the state visible in the
+    /// label. False means Tab did not belong to this menu/row.
+    pub fn toggle_hovered_claude_cloud(&mut self) -> bool {
+        if self.hovered_claude_cloud().is_none() {
+            return false;
+        }
+        let item = &mut self.items[self.hover];
+        let MenuAction::NewAgentOfKind { cloud, .. } = &mut item.action else {
+            unreachable!("hovered_claude_cloud checked the action")
+        };
+        *cloud = !*cloud;
+        item.label = if *cloud {
+            "Claude · cloud".into()
+        } else {
+            "Claude".into()
+        };
+        true
+    }
 }
 
 /// Destructive action waiting behind a confirmation.
@@ -251,6 +290,16 @@ pub enum PromptKind {
         kind: AgentKind,
         /// Resolved launch options (picker choice or configured default);
         /// None = the CLI's own default.
+        model: Option<String>,
+        effort: Option<String>,
+        cloud: bool,
+    },
+    /// Final task input for a one-shot `claude --cloud <task>` launch. Kept
+    /// separate from the name prompt so Enter still submits names normally,
+    /// while Shift+Enter can insert task newlines here.
+    ClaudeCloudTask {
+        worktree: WorktreeId,
+        name: String,
         model: Option<String>,
         effort: Option<String>,
     },
@@ -314,6 +363,11 @@ impl PromptDialog {
     /// Does Tab complete filesystem paths in this prompt?
     pub fn completes_paths(&self) -> bool {
         matches!(self.kind, PromptKind::AddProject)
+    }
+
+    /// The Claude Cloud task is the only prompt with a multi-row editor.
+    pub fn is_multiline(&self) -> bool {
+        matches!(self.kind, PromptKind::ClaudeCloudTask { .. })
     }
 
     fn home() -> Option<std::path::PathBuf> {
@@ -1193,6 +1247,12 @@ pub struct WorktreeRollback {
 pub enum PendingIntent {
     /// Attach the created session and focus the terminal.
     AttachCreated,
+    /// Attach on success; on failure, reopen the exact Cloud task so a
+    /// transient daemon/CLI error never makes the user retype it.
+    AttachCreatedWithCloudRetry {
+        kind: PromptKind,
+        task: String,
+    },
     /// Select the created worktree in the Worktrees panel.
     SelectCreatedWorktree,
     /// Move the note modal's cursor onto the created note.
@@ -1453,7 +1513,9 @@ fn rollup(statuses: impl Iterator<Item = AgentStatus>) -> Option<AgentStatus> {
 #[derive(Debug, Clone, Default)]
 pub struct Tree {
     pub workspaces: Vec<Workspace>,
-    /// The open workspace (daemon-global; every client shows the same one).
+    /// The workspace THIS instance is showing. Client-local: the daemon
+    /// hands over the last-opened one at boot, and after that every nebula
+    /// window scopes itself — switching here moves no one else.
     pub active_workspace: WorkspaceId,
     pub projects: Vec<Project>,
     pub worktrees: Vec<Worktree>,
@@ -1698,6 +1760,10 @@ pub struct App {
     pub collapsed: bool,
     pub next_req_id: u64,
     pub pending: HashMap<u64, PendingIntent>,
+    /// `nebula --workspace <name>`: the workspace this instance was asked
+    /// to open into, held until the first snapshot arrives with the names
+    /// to resolve it against. Taken there — it applies once, at boot.
+    pub startup_workspace: Option<String>,
     /// Session created by us, awaiting its upsert to fix the selection.
     pub select_when_seen: Option<SessionRef>,
     /// A divider we asked to move, awaiting the upsert that lands it on
@@ -1905,6 +1971,7 @@ impl App {
             collapsed: false,
             next_req_id: 1,
             pending: HashMap::new(),
+            startup_workspace: None,
             select_when_seen: None,
             select_divider_when_seen: None,
             select_worktree_when_seen: None,

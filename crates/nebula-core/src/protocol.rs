@@ -8,10 +8,15 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
+
+/// Cloud tasks ultimately cross an OS argv boundary (twice: the login
+/// shell's `-c` string and Claude's own argv). Leave ample room for shell
+/// quoting expansion and the rest of the environment on every platform.
+pub const MAX_CLOUD_PROMPT_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SessionRef {
@@ -56,8 +61,8 @@ pub enum ClientRequest {
         name: String,
     },
     /// Delete a workspace. Refused while it still holds projects, or when it
-    /// is the last workspace. Deleting the open workspace opens another one
-    /// first (broadcast as ActiveWorkspaceChanged).
+    /// is the last workspace. Clients still scoped to it fall back to a
+    /// surviving one when its EntityRemoved lands.
     RemoveWorkspace {
         req_id: u64,
         id: WorkspaceId,
@@ -67,12 +72,17 @@ pub enum ClientRequest {
         id: WorkspaceId,
         name: String,
     },
-    /// Make this the open workspace — daemon-global state, persisted and
-    /// broadcast to every client as ActiveWorkspaceChanged.
+    /// Scope THIS connection to `id`, and remember it as the workspace a
+    /// fresh client opens into. Deliberately not broadcast: two nebula
+    /// instances are two views, and switching in one must not drag the
+    /// other along with it.
     OpenWorkspace {
         req_id: u64,
         id: WorkspaceId,
     },
+    /// Add a project to the workspace this connection is scoped to (see
+    /// OpenWorkspace) — the remembered default for a connection that never
+    /// scoped itself, which is every one-shot `nebula add`.
     AddProject {
         req_id: u64,
         path: PathBuf,
@@ -141,6 +151,10 @@ pub enum ClientRequest {
         /// the session eligible for one agent-driven auto-title (the CLI
         /// runs `nebula rename` on its first prompt).
         auto_title: bool,
+        /// One-shot task for a fresh `claude --cloud <task>` launch. This is
+        /// deliberately request-only: prompts are not persisted with Agent.
+        #[serde(default)]
+        cloud_prompt: Option<String>,
     },
     /// Fire-and-forget: pre-spawn an agent CLI for this (worktree, kind) so
     /// the next CreateAgent adopts an already-booted session. Sent the
@@ -339,7 +353,9 @@ pub enum ServerEvent {
     },
     Snapshot {
         workspaces: Vec<Workspace>,
-        /// The open workspace clients scope their project lists to.
+        /// The workspace to scope this client's project lists to: the
+        /// last one opened anywhere, which is only ever a starting point —
+        /// each client owns its scope from here (see OpenWorkspace).
         active_workspace: WorkspaceId,
         projects: Vec<Project>,
         worktrees: Vec<Worktree>,
@@ -367,11 +383,6 @@ pub enum ServerEvent {
     },
     EntityRemoved {
         id: EntityId,
-    },
-    /// A different workspace was opened (`nebula workspace open`, or the
-    /// TUI's switcher — daemon-global, so every client follows).
-    ActiveWorkspaceChanged {
-        id: WorkspaceId,
     },
     StatusChanged {
         agent: AgentId,

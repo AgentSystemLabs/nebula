@@ -14,6 +14,111 @@ about what is worth recording.
 
 ## Entries
 
+### The Version Nameplate In The Footer's Left Edge — 2026-08-24
+
+**Asked:** "display the version number of nebula in the bottom bar somewhere, I think bottom left should
+say nebula vx.y.z"
+
+**Did:** `draw_footer` (`crates/nebula-tui/src/ui.rs`) now splices `nebula v{env!("CARGO_PKG_VERSION")}`
++ `"  ·  "` in at span index 1 (after the leading pad, ahead of `◇ workspace`), styled `th.dim`. The
+splice happens **after** `left` is computed, not where the workspace span is pushed, because the decision
+needs the width the usage readout left behind: it is skipped when `app.flash.is_some()` **and** the spans
+already measure wider than `left.width`. New unit test
+`footer_shows_the_nebula_version_but_never_truncates_a_flash` covers both branches. `nebula --version`
+(clap, `crates/nebula/src/main.rs:10`) reads the same workspace version, so the two agree by construction.
+
+**Gotchas:**
+- **The footer's left edge is a fixed column budget and it was already full.** The nameplate costs 18
+  columns (`nebula v0.2.0` + separator) and everything downstream of it — workspace, hostname, conn,
+  breadcrumb, hints/flash — just shifts right and clips off the end. Anything else added here pays the
+  same toll.
+- **A clipped flash is a broken feature, a clipped hint list is not.** The e2e
+  `tui_pull_request_row_leads_the_links_group` caught this: at `COLS = 120` the bar rendered
+  `… #7 Attach links    the pull request link c` — the flash lost `an't be deleted`. Hint lists are
+  ordered by importance and truncate harmlessly; flashes are sentences. Hence the flash-only yield rather
+  than a blanket "only if it all fits", which on a 120-col terminal would have hidden the version almost
+  always.
+- That failure looked like a flake at first — it passed alone and `tui_link_crud_in_sessions_panel` failed
+  alongside it once, then didn't. Only `tui_pull_request_row_leads_the_links_group` was real. The panic
+  message's `--- screen ---` dump is what identifies it: read the rendered footer line, don't rerun blind.
+- `splash_footer_lists_only_keys_that_work` (`event_loop.rs`) asserts `m: menu` reaches the bar and was
+  sized at exactly `TestBackend::new(140, 30)` — 18 columns of nameplate pushed `m: menu  ?: help` off.
+  Bumped to 160. Any future footer addition trips this test first; it is a width canary, not a key bug.
+- This tree's `Cargo.toml` is still `0.2.0` while `origin/main` is `0.4.0` (see the v0.4.0 entry below), so
+  a binary built here reads **nebula v0.2.0**. That is the built version, not a bug in the readout.
+
+### Retiring Closed Pull Requests From The OPEN PRS Group — 2026-08-24
+
+**Asked:** "when a pr is closed, we should periodically check from github to see if we should remove from
+our list, also maje sure draft prs are included in that list we show" — ambiguous between the OPEN PRS
+group and the worktree's own PR row in LINKS; the user picked **the OPEN PRS group** when asked.
+
+**Did:** `OPEN_PRS_REFRESH` 3min → **60s** in `crates/nebula-tui/src/event_loop.rs` (that beat *is* the
+pruning mechanism — `--state open` stops returning a merged/closed PR, so nothing tracks closures
+separately). `note_open_prs_answer` gained an `out: &mut Vec<ClientRequest>` 4th arg and now calls two
+new helpers: `reconcile_open_pr_cursor` (follows the cursor's PR across a reorder by URL; on retirement
+clamps to the nearest surviving row, `restore_session`s if that's a checkout, and flashes
+`#N is no longer open`) and `forget_retired_prs` (retains `pr_detail` / `pr_detail_failed` to URLs still
+in some project's list). New `PrDetail::is_open()` + `drop_retired_pr` retire a row the instant the
+hover-detail fetch comes back `MERGED`/`CLOSED`, ahead of the next list. Drafts needed **no code change**
+— verified live that `gh pr list --state open` returns them (24 of 75 on `cli/cli`) — so the work there
+was a doc note on `list()` and two regression tests. 5 new tests; workspace suite 598 green, clippy
+unchanged (3 pre-existing warnings).
+
+**Gotchas:**
+- **`schedule_pr_detail` zeroes `app.pr_preview_scroll`.** Calling it unconditionally from the cursor
+  reconcile meant every 60s refresh yanked a reader back to the top of the PR conversation they were
+  halfway down. It is now called only on the branch where the row actually went away. Any new caller on
+  a *timer* path has the same trap.
+- Capture the cursor's PR **before** mutating `app.open_prs`, and follow it by **URL, not index** —
+  `gh pr list` is newest-first, so anyone opening a PR reshuffles every row below it and an index-based
+  cursor silently lands on a different pull request.
+- The reconcile is inherently scoped to what's on screen: `visible_open_prs()` reads the *selected*
+  project, so a late answer for a different project finds the cursor's URL unchanged and no-ops. No
+  project-id comparison needed.
+- Retiring the row the cursor is on is jarring without the flash — the pane just jumps. `app.flash`
+  turns it into an explanation, and it's the one place both the list refresh and the detail-driven
+  eviction funnel through.
+- `note_open_prs_answer` is also called from `lookup_open_prs`'s not-a-directory branch, so `out` had to
+  be threaded through that too (and into the git-poll tick's call).
+- `gh pr list --state open` includes drafts by construction — do not "fix" a missing draft by adding a
+  filter. If drafts ever go missing the bug is downstream, in `parse_list` or the `is_draft` badge at
+  `ui.rs:2615`.
+
+### Released v0.4.0 From A Tree Two Sessions Were Writing To — 2026-08-24
+
+**Asked:** "commit and push and do a release" (the open-PR reading pane + PR diff work below).
+
+**Did:** **v0.4.0** — `1ac59a3`, tag pushed, all four binaries attached, changelog replaced. Three
+commits: `cca5fbb` (feature), `684d562` (memory), `1ac59a3` (version bump). Local `main` is still at
+`c340baf` (v0.2.0) and two releases behind `origin/main`.
+
+**Gotchas:**
+- **The shared tree held two agents' unfinished features at once** — a Claude Cloud launch flow and
+  per-instance workspaces — tangled into `app.rs`, `ui.rs`, `event_loop.rs`, `lib.rs`, `README.md`. What
+  worked: diff the *working tree* against `origin/main` per file, split into hunks, classify each one,
+  and apply only mine onto the pristine copy. Scripts worth rebuilding:
+  `hunks.py <old> <new>` (list hunks with a preview), `show.py <old> <new> 3,7` (dump specific ones),
+  `pick.py <old> <new> <out> 0,2,6` (apply a subset with `patch -p0`, which tolerates the wrong line
+  numbers a filtered patch carries). Residual-hunk count after picking is the check: it must equal the
+  number you classified as theirs.
+- **A hunk is not a semantic unit.** Two of mine had another session's line inside them — a
+  `switch_workspace(...)` call adjacent to a `Palette::new` signature change, and a whole test of theirs
+  (`palette_query_terms_match_independently_across_a_space`, which used *my* `seed_open_prs` helper to
+  test *their* fuzzy change) sitting next to my test block. Both compiled fine in the shared tree and
+  only failed in the isolated build. **The green gate is the only thing that catches this** — grepping
+  the staged diff for their identifiers (`cloud`, `startup_workspace`, `switch_workspace`,
+  `is_multiline`) afterwards is a cheap second check and found nothing left.
+- **`README.md` had been rewritten wholesale** by the other session (243-line hunk). Hunk surgery was
+  hopeless; re-applying my three edits by hand onto `origin/main`'s copy took two minutes.
+- **A green shared tree is not evidence about `main`.** `e2e_tui::tui_projects_worktrees_agents_navigation`
+  passed locally the whole time because someone else had already fixed `FOOTER_TERMINAL_LOCKED` there —
+  at `origin/main` it was still red, as it had been since v0.2.0. I had "corrected" the memory entry
+  below to say it was fixed; that was wrong, and it is fixed properly now (in `e2e_tui.rs`, shipped in
+  v0.4.0). Always run the doubted test in a **detached worktree at `origin/main`**.
+- Use a separate `CARGO_TARGET_DIR` for the release worktree (`$SP/vtarget`). Sharing the main one with
+  a concurrently building session makes both thrash fingerprints.
+
 ### Reading A Pull Request And Its Diff Inside Nebula — 2026-08-24
 
 **Asked:** "is it possible so that when I hover over a PR i nthe open pr list, it'll show the contents of
@@ -58,6 +163,34 @@ called PULL REQUEST.
 - A `gh` that can't answer is remembered in `pr_detail_failed` — without it the pane re-asks on every
   pass and sits on "reading it…" forever.
 
+### Space In A Fuzzy Query Is An AND, Not A Char — 2026-08-24
+
+**Asked:** "I want the / fuzzy finder to be more fuzzy, like I should be able to type neb #10 and it
+would have displayed the pr that had the #10 in it, right now it shows nothing if I type \"neb #10\""
+
+**Did:** `crates/nebula-tui/src/fuzzy.rs::fuzzy_match` now splits the query on whitespace and requires
+every term to subsequence-match the candidate *independently* — fzf's extended-search AND. The
+best-of-starts greedy pass moved into a new `match_term(term, cand)`; `fuzzy_match` sums the term scores
+and unions their positions. `rank`'s empty-query guard became
+`query.split_whitespace().next().is_none()`. One matcher change covers all four call sites (`/` palette,
+diff-view file filter, `f` file finder, `tree_browser.rs:300`). 8 unit tests in `fuzzy.rs` plus
+`event_loop.rs::palette_query_terms_match_independently_across_a_space`; workspace suite 578 green.
+
+**Gotchas:**
+- The bug was never in the palette — it was one line of matcher semantics. `neb #10` against
+  `nebula/#10 Credit…` failed because the greedy pass demanded a *literal space* between `neb` and
+  `#10`, and the only space in that row sits after the `#10`. Nothing about the palette, the PR rows,
+  or `TextInput` was wrong; `KeyCode::Char(' ')` reaches `palette.query` fine via the catch-all at
+  `text_input.rs:183`.
+- Terms match independently, so their spans can **overlap and arrive out of order** (`"ne neb"` yields
+  `[0,1,2,0,1]`). `positions` feeds `ui.rs::fuzzy_highlight_spans`, which wants one ascending run —
+  sort + dedup before returning or the highlight breaks.
+- Whitespace-only queries needed their own guard in `rank`. `"  "` is not `is_empty()`, so it fell into
+  the scoring path where every candidate scores 0 and the length tiebreak silently **re-sorted the whole
+  list shortest-first** — a query that says nothing must not reorder anything.
+- The three clippy warnings on `nebula-tui` (`ui.rs:2316`, `ui.rs:2446`, `config.rs:895`) are
+  pre-existing, not from this change.
+
 ### Open Pull Requests Under The Worktrees List — 2026-08-24
 
 **Asked:** "when a user opens a project, it should try to fetch all open pull requests and display those
@@ -92,7 +225,8 @@ makes them fuzzy-findable; `jump_to_target` opens the browser instead of moving 
 - `Some(vec![])` (repo genuinely has nothing open) and `None` (no `gh`, no remote, timeout) must stay
   distinct: `None` keeps the last good list on screen rather than blanking the group over one flaky
   round trip. Both back off, `OPEN_PRS_RECHECK_MIN` 30s → `OPEN_PRS_RECHECK_MAX` 10min; a non-empty
-  answer settles on `OPEN_PRS_REFRESH` 3min.
+  answer settles on `OPEN_PRS_REFRESH` — **60s as of the retirement entry above, not the 3min this
+  entry originally shipped**.
 - Rate-limit floor: `schedule_open_prs_lookup` pulls the deadline in to `at + OPEN_PRS_MIN_AGE` (30s)
   instead of clearing the entry the way `schedule_pr_lookup` does for worktrees — otherwise bouncing
   between two projects spends an API call per switch.
@@ -104,6 +238,81 @@ makes them fuzzy-findable; `jump_to_target` opens the browser instead of moving 
 - The two `clippy::type_complexity` warnings in `ui.rs` (2316, 2446) pre-date this work — the worktrees
   tuple annotation is unchanged from HEAD. `e2e_tui::tui_projects_worktrees_agents_navigation`, recorded
   below as failing at origin/main, **now passes** (6/6 green).
+
+### Claude Cloud Launch From The Session Picker — 2026-08-24
+
+**Asked:** "ok add in an option so a user can press tab when hovered over the claude option in the new
+session harness selection modal, and when they press tab, it should toggle claude cloud which will mean
+now when they press enter, it'll show 1 more dialog prompt so a user can type their prompt and then invoke
+claude using the --cloud argument, then that will launch claude with --cloud and their prompt, make sure
+the prompt word wraps and allows a user to read multiple lines when they are prompting."
+
+**Did:** `ContextMenu::toggle_hovered_claude_cloud` in `crates/nebula-tui/src/app.rs` and the menu key
+path in `event_loop.rs` make `Tab` toggle `Claude · cloud`; Cloud bypasses the bare-Claude prewarm and
+opens `PromptKind::ClaudeCloudTask`, a wrapped multi-row editor rendered by
+`ui.rs::multiline_input_lines` (`Shift+Enter` or legacy-terminal-safe `Ctrl+J` inserts a hard line).
+`ClientRequest::CreateAgent` carries
+a request-only `cloud_prompt` across protocol v24; `registry.rs::claude_cloud_spawn_command` launches a
+fresh `claude --cloud=<task>` and validates the task before persistence. Failed requests reopen the
+populated editor, failed synchronous spawns roll back the agent row, and server logs include request and
+launch metadata without the task. README documents the flow. Full workspace suite: 563 tests green.
+
+**Gotchas:**
+- A Cloud create must never adopt or refill the normal Claude warm slot: that PTY already started bare
+  and cannot retroactively receive `--cloud` plus the task.
+- Claude 2.1.241 declares `--cloud [description|session_id|url]` as an optional-value flag. Bind the task
+  as one `--cloud=<task>` argv item; passing a dash-prefixed task as the next item can turn it into a
+  different Claude option.
+- The login-shell wrapper puts the task in both its `-c` string and Claude's argv. TUI and daemon both
+  reject NUL and tasks over 16 KiB before inserting a row, and shell quoting prevents injection, but the
+  task can still be visible to local process inspection — do not put secrets in it.
+- The Cloud task is intentionally request-only, not persisted on `Agent`: a later restart follows the
+  established local Claude resume/fresh path. Only a synchronous create error retains the in-memory
+  draft and reopens it for retry.
+
+### Workspaces Are Per Instance, Not Daemon-Global — 2026-08-24
+
+**Asked:** "when I load up 2 separate nebula instances, they both seem to switch workspaces when one
+does... this isn't how it should work, each new nebula instance can point to a different workspace (or
+even point to a separate host - verify that is possible)" Then: "please verify that this issue won't
+happen again when I'm doing development" and "update nebula-memory as well after you've confirmed this
+is fixed."
+
+**Did:** The open workspace was daemon-global: `store.set_active_workspace` plus a
+`ServerEvent::ActiveWorkspaceChanged` broadcast every client applied. Deleted that event outright
+(PROTOCOL_VERSION **22 → 23**) and moved the scope onto the connection — `handle_client` in
+`crates/nebula-daemon/src/server.rs` holds `workspace: Option<WorkspaceId>`, `OpenWorkspace` sets it,
+and `add_project` takes it as a new 4th arg. `registry.rs::open_workspace` became
+`set_default_workspace` (persists, notifies nobody). TUI-side, `switch_workspace` and
+`reseat_deleted_workspace` in `event_loop.rs` replaced the removed `ActiveWorkspaceChanged` arm, and
+`apply_startup_workspace` lands the new `nebula --workspace <name>` flag on the first snapshot.
+Separate hosts already worked and needed no change (see gotchas).
+
+**Gotchas:**
+- **Per-connection state alone is not enough; it has to be pinned at `Subscribe`.** The first cut left
+  `workspace = None` until a client switched, falling back to the store default — so instance B, which
+  had never touched its workspace, silently followed A's switch on its next `AddProject`. "The current
+  default" is not a stable answer once anyone can move it. `e2e_pty::workspace_scope_is_per_connection`
+  is the test that caught it; it fails on the None-fallback version.
+- `None` still has to survive for connections that **never** subscribe — that is the one-shot
+  `nebula add`, whose workspace genuinely is the current default. Don't default it at connect time.
+- `apply_startup_workspace` must run **before** `restore_ui_state` in the Snapshot arm: the restored
+  project id only resolves against the workspace actually on screen.
+- Semantics that changed and are now documented: **`nebula workspace open <name>` no longer switches a
+  running TUI.** It sets where the *next* instance boots. Aiming one live window is `nebula --workspace
+  <name>`. Removing the broadcast is exactly the reported bug, so there was no way to keep both.
+- **Separate hosts already work and are fully independent** — `nebula ssh HOST` (`crates/nebula/src/ssh.rs`)
+  `exec`s `ssh -t` and runs a whole remote nebula with its own daemon, socket and SQLite. Two local
+  instances against different daemons also work via `NEBULA_RUNTIME_DIR` + `NEBULA_DATA_DIR`. Note the
+  TUI's `h` picker is a *handoff*: it quits the local TUI and execs over it rather than opening a second
+  window.
+- `crates/nebula/tests/e2e_tui.rs`'s `FOOTER_TERMINAL_LOCKED` had been stale since `87d2b24` — it
+  expected `"Ctrl+q: panels"` while `KeyChord::display()` renders `^q`. Six e2e_tui tests were failing on
+  main for that alone; fixed to `"^q: panels"`. If e2e_tui fails on a footer string, suspect the constant
+  before the code.
+- Verified live, not just by unit test: two TUIs in one tmux server against an isolated daemon
+  (`NEBULA_RUNTIME_DIR=/tmp/nbws`, short for SUN_LEN). Pane 0 pressed `w j Enter` → footer `◇ client`
+  showing its project; pane 1 stayed `◇ default` showing its own. Full suite: 553 tests green.
 
 ### Shift+G Opens The Repo's Git Host, Released As v0.3.0 — 2026-08-24
 
@@ -126,12 +335,11 @@ in `event_loop.rs`, bound to `Action::OpenRepo` / `shift+g`. `ef56fca` checks in
   on its own branch and `git push origin <branch>:main`. **Never `git add` in the shared tree.**
 - Local `main` stays behind `origin/main` after that push — it is checked out and dirty, so it can't be
   fast-forwarded. Say so explicitly; the next `git pull` has to reconcile.
-- `e2e_tui::tui_projects_worktrees_agents_navigation` **failed at `origin/main` too**:
+- `e2e_tui::tui_projects_worktrees_agents_navigation` **failed at `origin/main` too** at the time:
   `FOOTER_TERMINAL_LOCKED = "Ctrl+q: panels"` (`crates/nebula/tests/e2e_tui.rs:29`) while the footer
-  renders `^q: panels`. Introduced by `87d2b24`, shipped red in v0.2.0 and v0.3.0; **the constant is
-  fixed in v0.4.0.** Always re-run a failing test against `origin/main` before blaming your own diff —
-  and note the converse trap: it passed in the *shared* working tree the whole time, because another
-  session had already patched the constant there. A green shared tree is not evidence about `main`.
+  rendered `^q: panels`. Introduced by `87d2b24` and shipped red in v0.2.0. **Fixed since — the whole
+  e2e_tui suite is 6/6 green as of 2026-08-24.** The standing lesson: always re-run a failing test
+  against `origin/main` before blaming your own diff.
 - `.github/workflows/release.yml` publishes with `generate_release_notes: true`, which is a bare commit
   list, not a changelog. `gh release edit vX.Y.Z --notes "…"` afterwards is the step that makes it one.
 
@@ -324,17 +532,25 @@ picker, note badge glyph).
   panics at its 5s deadline, `TempDir` drop deletes the runtime dir, and the late daemon logs
   `FATAL bind …/daemon.sock: No such file or directory`. Fingerprint: orphaned
   `$TMPDIR/.tmp*/data/state/daemon.log` files. **Just rerun** — it passes clean the second time.
-- **Orphaned daemons.** Same generic error, but **no `daemon.log` is written at all** and reruns don't
-  help — a test that passes in the full suite fails alone, seemingly at random. Cause: dozens of stray
-  `nebula daemon --foreground` processes from past runs, each holding watchers/fds. Check with
-  `ps aux | grep -c "[n]ebula daemon"`; anything in the dozens means orphans.
-- Reaping orphans is safe **except for the live one** — read `/tmp/nebula-501/daemon.pid` (or
-  `$NEBULA_RUNTIME_DIR/daemon.pid`) and exclude it, or you kill the nebula session you are running inside.
-  Ask before bulk-killing: it's the user's machine and other live sessions may be in play.
-- **`kill` on those orphans is refused by the auto-mode permission classifier** (2026-08-24), even
-  filtered to processes older than six hours. Don't burn turns retrying it — instead prove the failure
-  is environmental by re-running the same test against `origin/main` in a scratch worktree, and report
-  the orphan count to the user so they can reap them.
+- **Orphaned daemons — leak fixed at the source 2026-08-24.** Same generic error, but **no `daemon.log`
+  is written at all** and reruns don't help; a test that passes in the full suite fails alone, seemingly
+  at random. Cause: dozens of stray `nebula daemon --foreground` processes, each holding watchers/fds.
+  The leak was `e2e_pty.rs`'s `TestEnv` having **no `Drop`** — a test that panicked before its closing
+  `Shutdown` dropped the `std::process::Child` without killing it, and the daemon detaches and outlives
+  the whole `cargo test` run. `DaemonProc` (a `Deref`/`DerefMut` newtype around the `Child`, defined just
+  above `connect()`) now SIGTERMs on drop, so panicking tests clean up. `e2e_tui.rs`'s `TuiHarness`
+  always had its own `Drop`. Nothing should accumulate any more — **62 had piled up before this**, so a
+  machine that predates the fix may still need one reap.
+- Diagnosing a suspected orphan pile: `ps -eo pid,command | grep -c "[n]ebula daemon"`. Anything past a
+  couple means leftovers. Reaping is safe **except for the live one** — filter to `target/debug/nebula
+  daemon` (test daemons) and exclude `$(cat /tmp/nebula-501/daemon.pid)`, which is the
+  `~/.cargo/bin/nebula daemon` running the session you are inside. Ask before bulk-killing: it's the
+  user's machine and other agents' e2e runs may be in flight.
+- `DaemonProc::drop` sends **SIGTERM, not SIGKILL** — the daemon's handler runs the same clean shutdown
+  as `ClientRequest::Shutdown` and takes its PTY children with it; SIGKILL would orphan those instead.
+  It also `try_wait()`s first: `Child::kill()` on an already-reaped child errors rather than signalling
+  whatever now owns that recycled pid, but the check keeps the intent obvious. Drop only runs because
+  the workspace has no `panic = "abort"` profile — verify that before relying on a drop guard here.
 
 ### Restyle, Focus Wash, And The Screenshot Harness — 2026-08-20 → 08-21
 

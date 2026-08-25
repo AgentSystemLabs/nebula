@@ -19,7 +19,7 @@ use crossterm::event::{
 use futures::StreamExt;
 use nebula_core::{
     AgentId, AgentKind, ClientRequest, EntityId, LinkId, NoteId, NoteOwner, ServerEvent,
-    SessionRef, WorktreeId,
+    SessionRef, WorkspaceId, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -79,11 +79,17 @@ const PR_REFRESH: Duration = Duration::from_secs(60);
 /// once a repo has proved it has any, and how a repo that answers empty (or
 /// can't answer at all) backs off. One `gh pr list` is one API call however
 /// many pull requests come back, and only the selected project is ever
-/// asked — but a workspace left open all day would still add up, so the
-/// steady beat is minutes, not seconds. Arriving at a project pulls the
-/// next lookup forward, floored by `OPEN_PRS_MIN_AGE` so walking the
-/// project list can't spend a call per row.
-const OPEN_PRS_REFRESH: Duration = Duration::from_secs(3 * 60);
+/// asked — sixty an hour against GitHub's five thousand, the same beat the
+/// selected worktree's own PR already runs at.
+///
+/// This beat is the whole pruning mechanism: `--state open` stops returning
+/// a pull request the moment it is merged or closed, so a row that should
+/// no longer be there is gone within one refresh — which is why it is a
+/// minute rather than the several a pure "what's open?" readout could
+/// afford. Arriving at a project pulls the next lookup forward, floored by
+/// `OPEN_PRS_MIN_AGE` so walking the project list can't spend a call per
+/// row.
+const OPEN_PRS_REFRESH: Duration = Duration::from_secs(60);
 const OPEN_PRS_RECHECK_MIN: Duration = Duration::from_secs(30);
 const OPEN_PRS_RECHECK_MAX: Duration = Duration::from_secs(10 * 60);
 
@@ -121,13 +127,17 @@ const SWEEP_FRAME: Duration = crate::app::SWEEP_FRAME;
 
 /// `Some(entry)` = quit via the hosts picker: the caller should exec
 /// `nebula ssh` at it now that the terminal is restored.
-pub async fn run_app() -> Result<Option<crate::hosts::HostEntry>> {
+///
+/// `workspace` is `nebula --workspace <name>`: the workspace to open this
+/// instance into, whatever the last one opened elsewhere was. Resolved
+/// against the first snapshot, since names are the daemon's to map.
+pub async fn run_app(workspace: Option<String>) -> Result<Option<crate::hosts::HostEntry>> {
     let conn = ipc::connect_or_spawn().await?;
     let mut channels = ipc::split_connection(conn);
     channels.tx.send(ClientRequest::Subscribe).await?;
 
     let mut terminal = setup_terminal()?;
-    let result = main_loop(&mut terminal, &mut channels).await;
+    let result = main_loop(&mut terminal, &mut channels, workspace).await;
     restore_terminal();
     result
 }
@@ -195,9 +205,11 @@ pub fn restore_terminal() {
 async fn main_loop(
     terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
     channels: &mut ipc::IpcChannels,
+    startup_workspace: Option<String>,
 ) -> Result<Option<crate::hosts::HostEntry>> {
     let mut app = App::new();
     app.conn = ConnState::Connected;
+    app.startup_workspace = startup_workspace;
     let cfg = crate::config::Config::load();
     app.recent_window_ms = cfg.recent_window_ms();
     app.theme = cfg.theme();
@@ -270,7 +282,7 @@ async fn main_loop(
                 // worktree list with j/k can't spawn a `gh` per row passed —
                 // only whatever the selection is resting on when it fires.
                 lookup_pull_request(&mut app, &pr_tx);
-                lookup_open_prs(&mut app, &prs_tx);
+                lookup_open_prs(&mut app, &prs_tx, &mut out);
                 next_git_poll = tokio::time::Instant::now() + GIT_POLL;
             }
             // Metrics poll: always on for the footer's memory/session
@@ -376,7 +388,7 @@ async fn main_loop(
             answer = prs_rx.recv() => {
                 // Never None: `prs_tx` lives as long as the loop.
                 if let Some((project, list)) = answer {
-                    note_open_prs_answer(&mut app, project, list);
+                    note_open_prs_answer(&mut app, project, list, &mut out);
                     refresh_palette(&mut app);
                 }
             }
@@ -390,7 +402,17 @@ async fn main_loop(
                 if let Some((url, detail)) = answer {
                     app.pr_detail_inflight.remove(&url);
                     match detail {
-                        Some(detail) => { app.pr_detail.insert(url, detail); }
+                        Some(detail) => {
+                            // GitHub's answer about this one pull request is
+                            // the authoritative one: if it has been merged or
+                            // closed since the list was fetched, the row goes
+                            // now rather than at the next refresh.
+                            let retired = !detail.is_open();
+                            app.pr_detail.insert(url.clone(), detail);
+                            if retired {
+                                drop_retired_pr(&mut app, &url, &mut out);
+                            }
+                        }
                         None => { app.pr_detail_failed.insert(url); }
                     }
                     app.dirty = true;
@@ -527,6 +549,7 @@ fn lookup_open_prs(
         nebula_core::ProjectId,
         Option<Vec<crate::pull_request::OpenPr>>,
     )>,
+    out: &mut Vec<ClientRequest>,
 ) {
     let Some((id, path)) = app
         .selected_project()
@@ -541,7 +564,7 @@ fn lookup_open_prs(
     // don't spend a process finding that out, but let the backoff run — the
     // checkout can come back (an unmounted volume, a restored directory).
     if !path.is_dir() {
-        note_open_prs_answer(app, id, None);
+        note_open_prs_answer(app, id, None, out);
         return;
     }
     app.open_prs_inflight.insert(id.clone());
@@ -563,7 +586,12 @@ fn note_open_prs_answer(
     app: &mut App,
     project: nebula_core::ProjectId,
     list: Option<Vec<crate::pull_request::OpenPr>>,
+    out: &mut Vec<ClientRequest>,
 ) {
+    // Which pull request the cursor is resting on, before the list under it
+    // changes. A refresh that retires a merged PR must not slide the
+    // selection onto whatever row inherits its index.
+    let cursor = app.selected_worktree_pr().cloned();
     app.open_prs_inflight.remove(&project);
     let previous = app.open_prs.get(&project);
     let found = list.as_ref().is_some_and(|l| !l.is_empty());
@@ -590,6 +618,95 @@ fn note_open_prs_answer(
             step,
         },
     );
+    forget_retired_prs(app);
+    reconcile_open_pr_cursor(app, cursor, out);
+}
+
+/// Follow the Worktrees cursor across a change to the open-pull-request
+/// list. Three cases, and the row count moved under all of them:
+///
+/// * the cursor wasn't on a pull request — nothing to do;
+/// * its pull request is still open — keep the cursor on *it*, wherever the
+///   new list put it, rather than on whatever now holds its old index;
+/// * its pull request has been merged or closed — the row is gone, so the
+///   cursor lands on the nearest surviving one, and if that is a checkout
+///   the pane has to be given that checkout's session (the same
+///   `restore_session` an arrow key would have run). Without it the PTY
+///   underneath — deliberately left attached while the cursor is in the PR
+///   group — would keep showing a session that belongs to a different
+///   worktree.
+fn reconcile_open_pr_cursor(
+    app: &mut App,
+    was: Option<crate::pull_request::OpenPr>,
+    out: &mut Vec<ClientRequest>,
+) {
+    let Some(was) = was else {
+        return;
+    };
+    let checkouts = app.visible_worktrees().len();
+    match app
+        .visible_open_prs()
+        .iter()
+        .position(|pr| pr.url == was.url)
+    {
+        // Same pull request, possibly at a new index. Nothing is re-armed:
+        // `schedule_pr_detail` zeroes `pr_preview_scroll`, and a refresh
+        // landing every minute must not yank a reader back to the top of a
+        // conversation they're halfway down.
+        Some(i) => app.sel_worktree = checkouts + i,
+        None => {
+            let rows = app.worktree_row_count();
+            if app.sel_worktree >= rows {
+                app.sel_worktree = rows.saturating_sub(1);
+            }
+            if app.selected_worktree().is_some() {
+                restore_session(app, out);
+            }
+            // The pane is showing something else now: rewind it and fetch
+            // whatever the cursor landed on. Say why, too — a row that
+            // evaporates mid-read is otherwise just the cursor jumping.
+            schedule_pr_detail(app);
+            app.flash = Some(format!("#{} is no longer open", was.number));
+            app.dirty = true;
+        }
+    }
+}
+
+/// Forget the description and conversation of every pull request that is no
+/// longer open anywhere. `pr_detail` is a session cache — deliberately, a
+/// PR's body doesn't change while you read it — so without this a workspace
+/// left running for a week accumulates the full text of every pull request
+/// that has since been merged, and `pr_detail_failed` keeps refusing to
+/// re-ask about numbers that have long stopped being on screen.
+fn forget_retired_prs(app: &mut App) {
+    let live: std::collections::HashSet<String> = app
+        .open_prs
+        .values()
+        .flat_map(|o| o.list.iter().map(|pr| pr.url.clone()))
+        .collect();
+    app.pr_detail.retain(|url, _| live.contains(url));
+    app.pr_detail_failed.retain(|url| live.contains(url));
+}
+
+/// Retire one pull request from every project's list ahead of the next
+/// `gh pr list`, because GitHub has just told us — in the detail fetched
+/// for the row the cursor is resting on — that it is merged or closed.
+/// The list refresh would catch it within the minute anyway; this is for
+/// the case where the user is looking straight at it.
+fn drop_retired_pr(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
+    let cursor = app.selected_worktree_pr().cloned();
+    let mut removed = false;
+    for open in app.open_prs.values_mut() {
+        let before = open.list.len();
+        open.list.retain(|pr| pr.url != url);
+        removed |= open.list.len() != before;
+    }
+    if !removed {
+        return;
+    }
+    reconcile_open_pr_cursor(app, cursor, out);
+    refresh_palette(app);
+    app.dirty = true;
 }
 
 /// Arm (or disarm) the debounced fetch of the pull request under the
@@ -772,6 +889,46 @@ fn ui_state_json(app: &App) -> String {
     serde_json::to_string(&state).unwrap_or_else(|_| "{}".into())
 }
 
+/// Land `nebula --workspace <name>` on the first snapshot: names only mean
+/// anything once the workspace list is here. An unknown name flashes and
+/// leaves the instance on the daemon's default rather than booting into
+/// nothing. Applies once — a later snapshot is not a fresh launch.
+fn apply_startup_workspace(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let Some(name) = app.startup_workspace.take() else {
+        return;
+    };
+    match app
+        .tree
+        .workspaces
+        .iter()
+        .find(|w| w.name == name)
+        .map(|w| w.id.clone())
+    {
+        Some(id) => {
+            // Not switch_workspace: there is no context to remember yet, and
+            // the tree it would restore into is the one being installed.
+            // Telling the daemon still matters — it scopes AddProject.
+            if app.tree.active_workspace != id {
+                app.tree.active_workspace = id.clone();
+                let req_id = app.alloc_req_id(PendingIntent::None);
+                out.push(ClientRequest::OpenWorkspace { req_id, id });
+            }
+        }
+        None => {
+            let names: Vec<&str> = app
+                .tree
+                .workspaces
+                .iter()
+                .map(|w| w.name.as_str())
+                .collect();
+            app.flash = Some(format!(
+                "no workspace named '{name}' (have: {})",
+                names.join(", ")
+            ));
+        }
+    }
+}
+
 fn restore_ui_state(app: &mut App, json: &str) {
     use crate::app::UiState;
     let Ok(state) = serde_json::from_str::<UiState>(json) else {
@@ -928,7 +1085,11 @@ fn paste_into_overlay(app: &mut App, text: &str) -> bool {
     };
     match overlay {
         Overlay::Prompt(prompt) => {
-            prompt.input.insert_str(text);
+            if prompt.is_multiline() {
+                prompt.input.insert_multiline_str(text);
+            } else {
+                prompt.input.insert_str(text);
+            }
             prompt.refresh_dirs();
         }
         Overlay::Palette(palette) => {
@@ -1452,6 +1613,11 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
                 String::new(),
             )
         }
+        PromptKind::ClaudeCloudTask { .. } => (
+            "Claude Cloud task".to_string(),
+            "what should Claude do?".to_string(),
+            String::new(),
+        ),
         PromptKind::RenameAgent { id } => {
             let current = app
                 .tree
@@ -2354,6 +2520,7 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
             kind,
             model: None,
             effort: None,
+            cloud: false,
         },
         destructive: false,
     };
@@ -2386,6 +2553,7 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
         worktree,
         kind,
         model,
+        cloud,
         ..
     } = &item.action
     else {
@@ -2394,7 +2562,7 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
     let cfg = crate::config::Config::load();
     let (title, choices, configured) = match sub {
         SubmenuKind::Models => (
-            format!("{} model", item.label),
+            format!("{} model", kind_label(*kind)),
             crate::config::model_choices(*kind),
             cfg.default_model(*kind),
         ),
@@ -2424,6 +2592,7 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
                     SubmenuKind::Models => None,
                     SubmenuKind::Efforts => Some((*choice).to_string()),
                 },
+                cloud: *cloud,
             },
             destructive: false,
         })
@@ -2484,9 +2653,9 @@ fn open_move_agent_picker(app: &mut App, agent: AgentId) {
     }));
 }
 
-/// Workspace switcher (`w`): pick which workspace is open. The active one is
-/// checked and starts highlighted; Enter asks the daemon to open the pick
-/// (the switch lands via ActiveWorkspaceChanged, so every client follows).
+/// Workspace switcher (`w`): pick which workspace this instance shows. The
+/// active one is checked and starts highlighted; Enter switches here and
+/// here only — another nebula window on another workspace stays put.
 /// Management verbs are keys with footer hints, the notes-modal pattern:
 /// n creates (and opens) a workspace, r renames the hovered one, d deletes
 /// it. The list refreshes in place as workspace deltas arrive.
@@ -2540,6 +2709,50 @@ fn open_workspace_picker(app: &mut App) {
 /// marker) changed under it, keeping the cursor row. The notes modal gets
 /// this for free by reading the tree at draw time; the menu's rows are
 /// snapshots, so refresh them here.
+/// Show `id` in THIS instance. Everything visible re-filters; the selection
+/// lands on the new workspace's first project with its remembered
+/// worktree/session brought back.
+///
+/// The daemon is told, but only so it can scope this connection's future
+/// `AddProject` and remember where a fresh instance should boot — it
+/// broadcasts nothing, which is the whole point: another nebula window
+/// stays on the workspace its user left it on.
+fn switch_workspace(app: &mut App, id: WorkspaceId, out: &mut Vec<ClientRequest>) {
+    if app.tree.active_workspace == id {
+        return;
+    }
+    remember_context(app);
+    app.tree.active_workspace = id.clone();
+    app.sel_project = 0;
+    restore_context(app, out);
+    clamp_selections(app);
+    refresh_palette(app);
+    // An open switcher keeps its ✓ on the now-open workspace.
+    refresh_workspace_picker(app);
+    let req_id = app.alloc_req_id(PendingIntent::None);
+    out.push(ClientRequest::OpenWorkspace { req_id, id });
+    app.dirty = true;
+}
+
+/// Re-scope after a workspace disappeared from under us — deleted from
+/// another instance, or from `nebula workspace delete`. The daemon refuses
+/// to delete a non-empty workspace, so there is nothing on screen to lose;
+/// it's the scope itself that has to move somewhere real.
+fn reseat_deleted_workspace(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if app
+        .tree
+        .workspaces
+        .iter()
+        .any(|w| w.id == app.tree.active_workspace)
+    {
+        return;
+    }
+    let Some(fallback) = app.tree.workspaces.first().map(|w| w.id.clone()) else {
+        return; // never expected: the daemon refuses to delete the last one
+    };
+    switch_workspace(app, fallback, out);
+}
+
 fn refresh_workspace_picker(app: &mut App) {
     let Some(Overlay::Menu(menu)) = &app.overlay else {
         return;
@@ -2755,6 +2968,9 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                     *menu = *parent;
                 }
             }
+            // The root picker's Claude row owns Tab as a launch-mode
+            // toggle. Submenus and every other menu leave it untouched.
+            KeyCode::Tab if menu.toggle_hovered_claude_cloud() => {}
             // Workspace-switcher verbs (footer-hinted, the notes-modal
             // pattern): n creates a workspace (opened on Ack), r renames
             // the hovered one, d deletes it — no confirm, the daemon only
@@ -2790,6 +3006,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                     PromptKind::NewAgent {
                         worktree,
                         kind: AgentKind::Claude,
+                        cloud: false,
                         ..
                     } => Some(worktree.clone()),
                     _ => None,
@@ -2798,6 +3015,16 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 if let Some(worktree) = restore {
                     out.push(default_claude_prewarm(worktree));
                 }
+            }
+            KeyCode::Char('j')
+                if prompt.is_multiline() && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                prompt.input.insert_char('\n');
+            }
+            KeyCode::Enter
+                if prompt.is_multiline() && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                prompt.input.insert_char('\n');
             }
             KeyCode::Enter => {
                 // Enter on a highlighted listing row adds that directory;
@@ -3503,6 +3730,27 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
         });
         return;
     }
+    // A cloud session cannot start without its task. Keep the multiline
+    // dialog open on validation so the user can correct it in place.
+    if prompt.is_multiline() {
+        let error = if value.is_empty() {
+            Some("Claude Cloud needs a task".to_string())
+        } else if value.contains('\0') {
+            Some("Claude Cloud task cannot contain NUL bytes".to_string())
+        } else if value.len() > MAX_CLOUD_PROMPT_BYTES {
+            Some(format!(
+                "Claude Cloud task is too long (max {} KiB)",
+                MAX_CLOUD_PROMPT_BYTES / 1024
+            ))
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            app.flash = Some(error);
+            app.overlay = Some(Overlay::Prompt(prompt));
+            return;
+        }
+    }
     // An empty agent name falls back to the next free default (agent-1, …),
     // an empty worktree name to the random branch the prompt offered.
     if value.is_empty()
@@ -3563,7 +3811,50 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             kind,
             model,
             effort,
-        } => create_agent(app, worktree, kind, model, effort, value, out),
+            cloud,
+        } => {
+            if cloud {
+                open_prompt(
+                    app,
+                    PromptKind::ClaudeCloudTask {
+                        worktree,
+                        name: value,
+                        model,
+                        effort,
+                    },
+                );
+            } else {
+                create_agent(
+                    app,
+                    AgentLaunchDraft {
+                        worktree,
+                        kind,
+                        model,
+                        effort,
+                        name: value,
+                        cloud_prompt: None,
+                    },
+                    out,
+                );
+            }
+        }
+        PromptKind::ClaudeCloudTask {
+            worktree,
+            name,
+            model,
+            effort,
+        } => create_agent(
+            app,
+            AgentLaunchDraft {
+                worktree,
+                kind: AgentKind::Claude,
+                model,
+                effort,
+                name,
+                cloud_prompt: Some(value),
+            },
+            out,
+        ),
         PromptKind::RenameAgent { id } => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::RenameAgent {
@@ -3772,6 +4063,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             kind,
             model,
             effort,
+            cloud,
         } => {
             // Resolve the picker's choice against the configured defaults:
             // an unexpanded submenu (None) and the explicit "default" row
@@ -3790,18 +4082,43 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             // warm slot gets adopted where it matches, and the refill
             // behind the create re-warms it either way.
             if cfg.skip_session_naming {
-                create_agent(app, worktree, kind, model, effort, String::new(), out);
+                if cloud {
+                    open_prompt(
+                        app,
+                        PromptKind::ClaudeCloudTask {
+                            worktree,
+                            name: String::new(),
+                            model,
+                            effort,
+                        },
+                    );
+                } else {
+                    create_agent(
+                        app,
+                        AgentLaunchDraft {
+                            worktree,
+                            kind,
+                            model,
+                            effort,
+                            name: String::new(),
+                            cloud_prompt: None,
+                        },
+                        out,
+                    );
+                }
                 return;
             }
             // Warm the CLI while the user types the name: the daemon
             // pre-spawns the session so CreateAgent adopts an already-booted
             // PTY. Fail-soft — a missing CLI just means a cold spawn later.
-            out.push(ClientRequest::PrewarmAgent {
-                worktree: worktree.clone(),
-                kind,
-                model: model.clone(),
-                effort: effort.clone(),
-            });
+            if !cloud {
+                out.push(ClientRequest::PrewarmAgent {
+                    worktree: worktree.clone(),
+                    kind,
+                    model: model.clone(),
+                    effort: effort.clone(),
+                });
+            }
             open_prompt(
                 app,
                 PromptKind::NewAgent {
@@ -3809,6 +4126,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     kind,
                     model,
                     effort,
+                    cloud,
                 },
             )
         }
@@ -3841,13 +4159,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             }
         }
         MenuAction::AddProject => open_prompt(app, PromptKind::AddProject),
-        MenuAction::OpenWorkspace(id) => {
-            // The switch itself lands when ActiveWorkspaceChanged arrives.
-            if id != app.tree.active_workspace {
-                let req_id = app.alloc_req_id(PendingIntent::None);
-                out.push(ClientRequest::OpenWorkspace { req_id, id });
-            }
-        }
+        MenuAction::OpenWorkspace(id) => switch_workspace(app, id, out),
         MenuAction::RemoveProject(id) => {
             if let Some(p) = app.tree.projects.iter().find(|p| p.id == id).cloned() {
                 app.overlay = Some(Overlay::Confirm(ConfirmDialog {
@@ -4532,22 +4844,44 @@ fn fire_pending_prewarm(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// prompt) — that's what accepting an empty name prompt means, and what
 /// the `skip_session_naming` setting does without asking. A typed name is
 /// the user's choice and stays.
-fn create_agent(
-    app: &mut App,
+struct AgentLaunchDraft {
     worktree: WorktreeId,
     kind: AgentKind,
     model: Option<String>,
     effort: Option<String>,
     name: String,
-    out: &mut Vec<ClientRequest>,
-) {
+    cloud_prompt: Option<String>,
+}
+
+fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequest>) {
+    let AgentLaunchDraft {
+        worktree,
+        kind,
+        model,
+        effort,
+        name,
+        cloud_prompt,
+    } = draft;
+    let intent = match &cloud_prompt {
+        Some(task) => PendingIntent::AttachCreatedWithCloudRetry {
+            kind: PromptKind::ClaudeCloudTask {
+                worktree: worktree.clone(),
+                name: name.clone(),
+                model: model.clone(),
+                effort: effort.clone(),
+            },
+            task: task.clone(),
+        },
+        None => PendingIntent::AttachCreated,
+    };
     let auto_title = name.is_empty();
     let name = if auto_title {
         app.default_session_name("agent")
     } else {
         name
     };
-    let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
+    let req_id = app.alloc_req_id(intent);
+    let cloud = cloud_prompt.is_some();
     out.push(ClientRequest::CreateAgent {
         req_id,
         worktree: worktree.clone(),
@@ -4556,10 +4890,11 @@ fn create_agent(
         model,
         effort,
         auto_title,
+        cloud_prompt,
     });
     // The create consumes (or, off-spec, discards) the worktree's warm
     // Claude slot; refill it so the next create is instant too.
-    if kind == AgentKind::Claude {
+    if kind == AgentKind::Claude && !cloud {
         out.push(default_claude_prewarm(worktree));
     }
 }
@@ -5818,6 +6153,10 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.tree.notes = notes;
             app.tree.links = links;
             app.pr_seen = pr_seen.into_iter().map(|s| (s.url, s.marker)).collect();
+            // `--workspace <name>` overrides the daemon's last-opened one.
+            // Before the UI-state restore, whose remembered project only
+            // resolves against the workspace actually on screen.
+            apply_startup_workspace(app, out);
             if let Some(json) = ui_state {
                 restore_ui_state(app, &json);
             }
@@ -5887,7 +6226,13 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         }
         ServerEvent::Ack { req_id, created } => {
             match (app.pending.remove(&req_id), created) {
-                (Some(PendingIntent::AttachCreated), Some(id)) => {
+                (
+                    Some(
+                        PendingIntent::AttachCreated
+                        | PendingIntent::AttachCreatedWithCloudRetry { .. },
+                    ),
+                    Some(id),
+                ) => {
                     let sref = match id {
                         EntityId::Agent(id) => Some(SessionRef::Agent(id)),
                         EntityId::Terminal(id) => Some(SessionRef::Terminal(id)),
@@ -5923,10 +6268,8 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     }
                 }
                 (Some(PendingIntent::OpenCreatedWorkspace), Some(EntityId::Workspace(id))) => {
-                    // Switcher-created workspace: open it right away (the
-                    // switch lands via ActiveWorkspaceChanged as usual).
-                    let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::OpenWorkspace { req_id, id });
+                    // Switcher-created workspace: show it right away.
+                    switch_workspace(app, id, out);
                 }
                 _ => {}
             }
@@ -5971,25 +6314,11 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // The cursor that was on the removed row now sits on its
             // neighbor — show that neighbor's session/context.
             reconcile_selection(app, before, out);
+            // ...and if what went was the workspace we were scoped to, land
+            // somewhere that still exists.
+            reseat_deleted_workspace(app, out);
             refresh_palette(app);
             refresh_workspace_picker(app);
-            app.dirty = true;
-        }
-        ServerEvent::ActiveWorkspaceChanged { id } => {
-            // A different workspace was opened — here, via the CLI, or by
-            // another client; daemon-global either way. Everything visible
-            // re-filters; selections land on the new workspace's first
-            // project with its remembered worktree/session brought back.
-            if app.tree.active_workspace != id {
-                remember_context(app);
-                app.tree.active_workspace = id;
-                app.sel_project = 0;
-                restore_context(app, out);
-                clamp_selections(app);
-                refresh_palette(app);
-                // An open switcher keeps its ✓ on the now-open workspace.
-                refresh_workspace_picker(app);
-            }
             app.dirty = true;
         }
         ServerEvent::Metrics { req_id, snapshot } => {
@@ -6004,11 +6333,19 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         }
         ServerEvent::Error { req_id, message } => {
             // A failed request's intent never gets an Ack; clear it — and if
-            // it was an optimistic worktree delete, put the rows back.
-            if let Some(PendingIntent::DeleteWorktree(rollback)) =
-                req_id.and_then(|id| app.pending.remove(&id))
-            {
-                restore_worktree_rows(app, rollback);
+            // it was an optimistic worktree delete, put the rows back. A
+            // failed Cloud launch reopens its populated task editor.
+            match req_id.and_then(|id| app.pending.remove(&id)) {
+                Some(PendingIntent::DeleteWorktree(rollback)) => {
+                    restore_worktree_rows(app, rollback)
+                }
+                Some(PendingIntent::AttachCreatedWithCloudRetry { kind, task }) => {
+                    open_prompt(app, kind);
+                    if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
+                        prompt.input.set_text(task);
+                    }
+                }
+                _ => {}
             }
             app.flash = Some(message);
             app.dirty = true;
@@ -6137,9 +6474,9 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
     use nebula_core::EntityId;
     match id {
         EntityId::Workspace(id) => {
-            // Only empty, non-open workspaces get deleted (and an open one is
-            // switched away from first, via ActiveWorkspaceChanged), so no
-            // project rows need cleanup here.
+            // Only empty workspaces get deleted, so no project rows need
+            // cleanup here — but this instance may have been scoped to it,
+            // which `reseat_deleted_workspace` sorts out afterwards.
             app.tree.workspaces.retain(|w| &w.id != id);
         }
         EntityId::Project(id) => {
@@ -6560,7 +6897,9 @@ mod tests {
     #[test]
     fn splash_footer_lists_only_keys_that_work() {
         let mut app = App::new();
-        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        // Wide enough that the panel hints reach `?: help` unclipped —
+        // the version nameplate on the far left costs ~18 columns.
+        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("n/o: add project"), "{text}");
@@ -6876,9 +7215,9 @@ mod tests {
         seed_tree(&mut app);
         let pid = app.selected_project().expect("a project").id.clone();
 
-        note_open_prs_answer(&mut app, pid.clone(), Some(vec![]));
+        note_open_prs_answer(&mut app, pid.clone(), Some(vec![]), &mut Vec::new());
         assert_eq!(app.open_prs[&pid].step, OPEN_PRS_RECHECK_MIN);
-        note_open_prs_answer(&mut app, pid.clone(), Some(vec![]));
+        note_open_prs_answer(&mut app, pid.clone(), Some(vec![]), &mut Vec::new());
         assert_eq!(app.open_prs[&pid].step, OPEN_PRS_RECHECK_MIN * 2);
 
         let found = vec![crate::pull_request::OpenPr {
@@ -6887,14 +7226,14 @@ mod tests {
             url: "https://github.com/o/r/pull/7".into(),
             is_draft: false,
         }];
-        note_open_prs_answer(&mut app, pid.clone(), Some(found.clone()));
+        note_open_prs_answer(&mut app, pid.clone(), Some(found.clone()), &mut Vec::new());
         assert_eq!(
             app.open_prs[&pid].step, OPEN_PRS_REFRESH,
             "a repo with pull requests settles onto the steady beat"
         );
         assert_eq!(app.visible_open_prs().len(), 1);
 
-        note_open_prs_answer(&mut app, pid.clone(), None);
+        note_open_prs_answer(&mut app, pid.clone(), None, &mut Vec::new());
         assert_eq!(
             app.open_prs[&pid].list, found,
             "a failed call keeps the last good list"
@@ -6910,7 +7249,7 @@ mod tests {
         let mut app = App::new();
         seed_tree(&mut app);
         let pid = app.selected_project().expect("a project").id.clone();
-        note_open_prs_answer(&mut app, pid.clone(), Some(vec![]));
+        note_open_prs_answer(&mut app, pid.clone(), Some(vec![]), &mut Vec::new());
 
         schedule_open_prs_lookup(&mut app);
         assert!(
@@ -6959,6 +7298,53 @@ mod tests {
         );
     }
 
+    /// Drafts belong in the group. A draft is an open pull request — often
+    /// the one a nebula worktree is still attached to — so it renders
+    /// alongside the rest, told apart by a badge rather than left out.
+    #[test]
+    fn draft_pull_requests_render_in_the_group() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let pid = app.selected_project().expect("a project").id.clone();
+        note_open_prs_answer(
+            &mut app,
+            pid,
+            Some(vec![
+                crate::pull_request::OpenPr {
+                    number: 9,
+                    title: "Still cooking".into(),
+                    url: pr_url(9),
+                    is_draft: true,
+                },
+                crate::pull_request::OpenPr {
+                    number: 7,
+                    title: "Attach links".into(),
+                    url: pr_url(7),
+                    is_draft: false,
+                },
+            ]),
+            &mut Vec::new(),
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("OPEN PRS · 2"), "both are counted:\n{text}");
+        let row = |needle: &str| {
+            text.lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle} row:\n{text}"))
+        };
+        assert!(
+            row("#9").contains("draft"),
+            "the draft is in the list, badged:\n{text}"
+        );
+        assert!(
+            !row("#7").contains("draft"),
+            "and the finished one is not:\n{text}"
+        );
+    }
+
     /// `/` searches pull requests by title alongside everything else, and
     /// Enter on one opens the browser instead of moving any panel cursor.
     #[test]
@@ -6988,6 +7374,176 @@ mod tests {
         assert_eq!(app.flash.as_deref(), Some("opened github.com/o/r/pull/7"));
         assert_eq!(app.sel_worktree, 0, "no panel cursor moved");
         assert_eq!(app.focus, Focus::Worktrees);
+    }
+
+    /// A space in the query is an AND between terms, not a char to match: the
+    /// PR row has no space between its project prefix and its `#7`, and
+    /// "demo #7" still has to find it.
+    #[test]
+    fn palette_query_terms_match_independently_across_a_space() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links to worktrees")]);
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        for c in "demo #7".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        let p = palette(&app);
+        assert_eq!(p.query, "demo #7", "the space reaches the query");
+        let texts: Vec<&str> = p
+            .matches
+            .iter()
+            .map(|m| p.items[m.item].text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["demo/#7 Attach links to worktrees"]);
+    }
+
+    /// A pull request merged or closed on GitHub simply stops coming back
+    /// from `gh pr list`, and that is the whole retirement mechanism: the
+    /// next refresh drops the row, the cursor lands on a surviving one
+    /// rather than on whatever inherited its index, and the body cached for
+    /// the reading pane is forgotten with it. A draft is an open pull
+    /// request and comes through the same pass untouched.
+    #[test]
+    fn a_merged_pull_request_leaves_the_list_on_the_next_refresh() {
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 / w1(main) / a1
+        let pid = app.selected_project().expect("a project").id.clone();
+        let answer = |app: &mut App, prs: Vec<(u64, bool)>| {
+            let list = prs
+                .into_iter()
+                .map(|(number, is_draft)| crate::pull_request::OpenPr {
+                    number,
+                    title: format!("pull {number}"),
+                    url: format!("https://github.com/o/r/pull/{number}"),
+                    is_draft,
+                })
+                .collect();
+            note_open_prs_answer(app, pid.clone(), Some(list), &mut Vec::new());
+        };
+
+        answer(&mut app, vec![(7, false), (9, true)]);
+        assert_eq!(app.worktree_row_count(), 3, "the checkout, then both PRs");
+        app.pr_detail
+            .insert(pr_url(7), a_detail(7, "read on a hover", vec![]));
+        app.sel_worktree = 1;
+        assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+
+        // #7 is merged: the next list doesn't mention it.
+        answer(&mut app, vec![(9, true)]);
+        assert_eq!(
+            open_pr_numbers(&app),
+            vec![9],
+            "the draft is still open and stays; the merged one goes"
+        );
+        assert_eq!(
+            app.selected_worktree_pr().map(|p| p.number),
+            Some(9),
+            "the cursor lands on the row that survived"
+        );
+        assert!(
+            !app.pr_detail.contains_key(&pr_url(7)),
+            "and the body cached for the reading pane goes with it"
+        );
+
+        // The last one closes too: the cursor falls back to the checkout.
+        answer(&mut app, vec![]);
+        assert!(app.visible_open_prs().is_empty());
+        assert!(
+            app.selected_worktree().is_some(),
+            "the cursor lands on the checkout, not past the end of the list"
+        );
+    }
+
+    /// A refresh that merely reorders the list keeps the cursor on the pull
+    /// request it was reading, not on whatever now holds that index — `gh`
+    /// sorts newest first, so anyone opening a PR reshuffles everything
+    /// below it.
+    #[test]
+    fn the_cursor_follows_its_pull_request_across_a_reorder() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(9, "Number lines"), (7, "Attach links")]);
+        app.sel_worktree = 2;
+        assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+
+        let pid = app.selected_project().expect("a project").id.clone();
+        let list = vec![
+            crate::pull_request::OpenPr {
+                number: 11,
+                title: "Brand new".into(),
+                url: pr_url(11),
+                is_draft: true,
+            },
+            crate::pull_request::OpenPr {
+                number: 9,
+                title: "Number lines".into(),
+                url: pr_url(9),
+                is_draft: false,
+            },
+            crate::pull_request::OpenPr {
+                number: 7,
+                title: "Attach links".into(),
+                url: pr_url(7),
+                is_draft: false,
+            },
+        ];
+        // Halfway down #7's conversation when the refresh lands.
+        app.pr_preview_scroll = 12;
+        note_open_prs_answer(&mut app, pid, Some(list), &mut Vec::new());
+        assert_eq!(open_pr_numbers(&app), vec![11, 9, 7]);
+        assert_eq!(
+            app.selected_worktree_pr().map(|p| p.number),
+            Some(7),
+            "still on #7, two rows further down"
+        );
+        assert_eq!(app.sel_worktree, 3);
+        assert_eq!(
+            app.pr_preview_scroll, 12,
+            "and still where they were reading — a beat this quick must not \
+             rewind the pane under them"
+        );
+    }
+
+    /// The detail fetched for the row under the cursor is GitHub's answer
+    /// about that one pull request, so a `MERGED` or `CLOSED` state retires
+    /// the row on the spot instead of leaving the user reading something
+    /// the next refresh is about to take away.
+    #[test]
+    fn a_detail_that_says_merged_retires_the_row_on_the_spot() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Number lines")]);
+        app.sel_worktree = 1;
+
+        let mut merged = a_detail(7, "shipped", vec![]);
+        merged.state = "MERGED".into();
+        assert!(!merged.is_open());
+        app.pr_detail.insert(pr_url(7), merged);
+        drop_retired_pr(&mut app, &pr_url(7), &mut Vec::new());
+
+        assert_eq!(open_pr_numbers(&app), vec![9]);
+        assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(9));
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("#7 is no longer open"),
+            "a row that evaporates mid-read says why"
+        );
+
+        // A draft is open, so nothing about it is retired.
+        let mut draft = a_detail(9, "still cooking", vec![]);
+        draft.is_draft = true;
+        assert!(draft.is_open(), "a draft is an open pull request");
+    }
+
+    fn pr_url(number: u64) -> String {
+        format!("https://github.com/o/r/pull/{number}")
+    }
+
+    fn open_pr_numbers(app: &App) -> Vec<u64> {
+        app.visible_open_prs().iter().map(|p| p.number).collect()
     }
 
     fn a_detail(
@@ -7788,6 +8344,7 @@ diff --git a/src/b.rs b/src/b.rs
                     kind: AgentKind::Claude,
                     model: Some("opus".into()),
                     effort: Some("high".into()),
+                    cloud: false,
                 },
             )));
             let mut out = Vec::new();
@@ -7831,6 +8388,39 @@ diff --git a/src/b.rs b/src/b.rs
         );
         let (armed, _) = fresh.pending_prewarm.clone().expect("prewarm armed");
         assert_eq!(armed, nebula_core::WorktreeId("w1".into()));
+    }
+
+    /// The footer's far left is a nameplate: which nebula this is, ahead
+    /// of the workspace and every cursor-driven crumb after it. It yields
+    /// the columns back to a flash that would otherwise be cut off mid
+    /// sentence — a clipped key list is still readable, a clipped message
+    /// is not.
+    #[test]
+    fn footer_shows_the_nebula_version_but_never_truncates_a_flash() {
+        let stamp = concat!("nebula v", env!("CARGO_PKG_VERSION"));
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains(stamp), "{stamp} missing from:\n{text}");
+
+        // A flash short enough to share the bar keeps the nameplate.
+        app.flash = Some("saved".into());
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains(stamp), "{stamp} missing from:\n{text}");
+        assert!(text.contains("saved"), "{text}");
+
+        // One that isn't takes the whole left edge instead.
+        let long = "the pull request link can't be deleted from here, close it on github";
+        app.flash = Some(long.into());
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            !text.contains(stamp),
+            "nameplate should have yielded:\n{text}"
+        );
     }
 
     /// The footer's right edge shows live session counts and nebula's
@@ -8799,6 +9389,201 @@ diff --git a/src/b.rs b/src/b.rs
         })
     }
 
+    #[test]
+    fn tab_on_claude_toggles_cloud_and_collects_a_multiline_task() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected new-session picker");
+            };
+            assert_eq!(menu.items[0].label, "Claude · cloud");
+            assert!(matches!(
+                &menu.items[0].action,
+                MenuAction::NewAgentOfKind {
+                    kind: AgentKind::Claude,
+                    cloud: true,
+                    ..
+                }
+            ));
+
+            // Cloud creation is cold on purpose: a bare-Claude warm PTY
+            // cannot be adopted because it never received --cloud + task.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(out.is_empty(), "cloud name entry must not prewarm: {out:?}");
+            assert!(matches!(
+                &app.overlay,
+                Some(Overlay::Prompt(p)) if matches!(
+                    &p.kind,
+                    PromptKind::NewAgent {
+                        kind: AgentKind::Claude,
+                        cloud: true,
+                        ..
+                    }
+                )
+            ));
+
+            // The usual name prompt stays in the flow. Accepting its empty
+            // default opens one additional, multiline task prompt.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("expected Claude Cloud task prompt");
+            };
+            assert_eq!(prompt.title, "Claude Cloud task");
+            assert!(prompt.is_multiline());
+
+            assert!(paste_into_overlay(&mut app, "Fix auth"));
+            press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
+            assert!(paste_into_overlay(&mut app, "Run the tests"));
+            press(
+                &mut app,
+                KeyCode::Char('j'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert!(paste_into_overlay(&mut app, "Ship it"));
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("task prompt closed while editing");
+            };
+            assert_eq!(prompt.input.as_str(), "Fix auth\nRun the tests\nShip it");
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none());
+            assert!(matches!(
+                out.as_slice(),
+                [ClientRequest::CreateAgent {
+                    kind: AgentKind::Claude,
+                    cloud_prompt: Some(task),
+                    auto_title: true,
+                    ..
+                }] if task == "Fix auth\nRun the tests\nShip it"
+            ));
+            assert!(
+                !out.iter()
+                    .any(|request| matches!(request, ClientRequest::PrewarmAgent { .. })),
+                "cloud launch must never consume/refill the local warm slot: {out:?}"
+            );
+
+            let req_id = match &out[0] {
+                ClientRequest::CreateAgent { req_id, .. } => *req_id,
+                other => panic!("expected create request, got {other:?}"),
+            };
+            handle_server_event(
+                &mut app,
+                ServerEvent::Error {
+                    req_id: Some(req_id),
+                    message: "cloud unavailable — retry".into(),
+                },
+                &mut out,
+            );
+            assert_eq!(app.flash.as_deref(), Some("cloud unavailable — retry"));
+            assert!(matches!(
+                &app.overlay,
+                Some(Overlay::Prompt(prompt))
+                    if prompt.is_multiline()
+                        && prompt.input.as_str() == "Fix auth\nRun the tests\nShip it"
+            ));
+        })
+    }
+
+    #[test]
+    fn cloud_task_is_still_required_when_session_naming_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"skip_session_naming": true}"#).unwrap();
+        crate::config::with_config_path(path, || {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+
+            assert!(out.is_empty(), "the task dialog comes before creation");
+            assert!(matches!(
+                &app.overlay,
+                Some(Overlay::Prompt(p)) if p.is_multiline()
+            ));
+
+            // Empty is validation, not dismissal: keep the dialog open so
+            // the user can correct it in place.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(out.is_empty());
+            assert!(matches!(
+                &app.overlay,
+                Some(Overlay::Prompt(p)) if p.is_multiline()
+            ));
+
+            let Some(Overlay::Prompt(prompt)) = &mut app.overlay else {
+                unreachable!()
+            };
+            prompt.input.set_text("fix\0auth");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert_eq!(
+                app.flash.as_deref(),
+                Some("Claude Cloud task cannot contain NUL bytes")
+            );
+            assert!(matches!(&app.overlay, Some(Overlay::Prompt(p)) if p.is_multiline()));
+
+            let Some(Overlay::Prompt(prompt)) = &mut app.overlay else {
+                unreachable!()
+            };
+            prompt
+                .input
+                .set_text("x".repeat(MAX_CLOUD_PROMPT_BYTES + 1));
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert_eq!(
+                app.flash.as_deref(),
+                Some("Claude Cloud task is too long (max 16 KiB)")
+            );
+            assert!(matches!(&app.overlay, Some(Overlay::Prompt(p)) if p.is_multiline()));
+        });
+    }
+
+    #[test]
+    fn claude_cloud_task_prompt_soft_wraps_instead_of_horizontally_scrolling() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.overlay = Some(Overlay::Prompt(PromptDialog::new(
+            "Claude Cloud task",
+            "what should Claude do?",
+            format!("BEGIN {} END", "word ".repeat(20)),
+            PromptKind::ClaudeCloudTask {
+                worktree: WorktreeId("w1".into()),
+                name: String::new(),
+                model: None,
+                effort: None,
+            },
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        let begin = find_cell(&terminal, "BEGIN");
+        let end = find_cell(&terminal, "END");
+        assert_ne!(begin.1, end.1, "long task should wrap across rows");
+        assert!(buffer_text(&terminal).contains("Shift+Enter/^J: newline"));
+
+        let Some(Overlay::Prompt(prompt)) = &mut app.overlay else {
+            unreachable!()
+        };
+        prompt.input.set_text("VISIBLE");
+        let mut small = Terminal::new(TestBackend::new(32, 6)).unwrap();
+        small.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&small);
+        assert!(
+            text.contains("VISIBLE"),
+            "small prompt lost its editor: {text}"
+        );
+        assert!(text.contains("Esc") && text.contains("^J") && text.contains("Enter"));
+    }
+
     /// With `skip_session_naming` on, picking the kind is the whole flow:
     /// no name prompt, the generated default name, and the same auto-title
     /// opt-in that accepting an empty prompt gives.
@@ -8978,7 +9763,7 @@ diff --git a/src/b.rs b/src/b.rs
             app.focus = Focus::Sessions;
             let mut out = Vec::new();
 
-            // n → Codex row → models → gpt-5.5 → efforts → minimal → Enter.
+            // n → Codex row → models → Luna → efforts → minimal → Enter.
             press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
@@ -8986,8 +9771,15 @@ diff --git a/src/b.rs b/src/b.rs
                 panic!("expected codex model submenu");
             };
             assert_eq!(menu.title.as_deref(), Some("Codex model"));
-            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            assert!(menu.items.iter().any(|item| item.label == "gpt-5.6-terra"));
+            let luna = menu
+                .items
+                .iter()
+                .position(|item| item.label.starts_with("gpt-5.6-luna"))
+                .expect("Luna row");
+            for _ in 0..luna {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            }
             press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
@@ -8999,12 +9791,12 @@ diff --git a/src/b.rs b/src/b.rs
                     model: Some(m),
                     effort: Some(e),
                     ..
-                }) if m == "gpt-5.5" && e == "minimal"
+                }) if m == "gpt-5.6-luna" && e == "minimal"
             ));
             let Some(Overlay::Prompt(p)) = &app.overlay else {
                 panic!("expected name prompt, got {:?}", app.overlay);
             };
-            assert_eq!(p.title, "New agent (gpt-5.5 · minimal)");
+            assert_eq!(p.title, "New agent (gpt-5.6-luna · minimal)");
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(matches!(
                 out.last(),
@@ -9013,7 +9805,7 @@ diff --git a/src/b.rs b/src/b.rs
                     model: Some(m),
                     effort: Some(e),
                     ..
-                }) if m == "gpt-5.5" && e == "minimal"
+                }) if m == "gpt-5.6-luna" && e == "minimal"
             ));
         })
     }
@@ -14701,8 +15493,8 @@ diff --git a/src/b.rs b/src/b.rs
         );
     }
 
-    /// ActiveWorkspaceChanged re-filters everything live: panel rows, an
-    /// open palette, the selection, and the footer's workspace name.
+    /// Switching re-filters everything live: panel rows, an open palette,
+    /// the selection, and the footer's workspace name.
     #[test]
     fn switching_workspace_refilters_rows_palette_and_footer() {
         let mut app = App::new();
@@ -14723,13 +15515,7 @@ diff --git a/src/b.rs b/src/b.rs
             &app.open_prs,
         )));
         let mut out = Vec::new();
-        handle_server_event(
-            &mut app,
-            ServerEvent::ActiveWorkspaceChanged {
-                id: nebula_core::WorkspaceId("ws2".into()),
-            },
-            &mut out,
-        );
+        switch_workspace(&mut app, nebula_core::WorkspaceId("ws2".into()), &mut out);
         assert_eq!(
             app.selected_project().map(|p| p.name.clone()),
             Some("secret".into()),
@@ -14769,13 +15555,7 @@ diff --git a/src/b.rs b/src/b.rs
         let mut out = Vec::new();
         attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
         assert!(app.term.is_some());
-        handle_server_event(
-            &mut app,
-            ServerEvent::ActiveWorkspaceChanged {
-                id: WorkspaceId("ws-empty".into()),
-            },
-            &mut out,
-        );
+        switch_workspace(&mut app, WorkspaceId("ws-empty".into()), &mut out);
         assert!(app.project_rows().is_empty(), "no visible projects");
         assert!(app.term.is_none(), "pane blanked");
         assert!(

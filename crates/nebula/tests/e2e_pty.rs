@@ -26,15 +26,15 @@ impl TestEnv {
         self.runtime_dir.join("daemon.sock")
     }
 
-    fn spawn_daemon(&self) -> std::process::Child {
+    fn spawn_daemon(&self) -> DaemonProc {
         self.spawn_daemon_with_agent_cmd("/bin/sh") // no real claude in tests
     }
 
-    fn spawn_daemon_with_agent_cmd(&self, agent_cmd: &str) -> std::process::Child {
+    fn spawn_daemon_with_agent_cmd(&self, agent_cmd: &str) -> DaemonProc {
         self.spawn_daemon_with(agent_cmd, &[])
     }
 
-    fn spawn_daemon_with(&self, agent_cmd: &str, envs: &[(&str, &str)]) -> std::process::Child {
+    fn spawn_daemon_with(&self, agent_cmd: &str, envs: &[(&str, &str)]) -> DaemonProc {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
         cmd.args(["daemon", "--foreground"])
             .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
@@ -47,14 +47,14 @@ impl TestEnv {
         for (k, v) in envs {
             cmd.env(k, v);
         }
-        cmd.spawn().unwrap()
+        DaemonProc(cmd.spawn().unwrap())
     }
 
     /// Daemon with no `NEBULA_AGENT_CMD` override, so agent spawns take the
     /// real login-shell path, and `$SHELL` set to `shell`. Lets a test decide
     /// what the daemon can find on PATH.
-    fn spawn_daemon_with_shell(&self, shell: &Path) -> std::process::Child {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+    fn spawn_daemon_with_shell(&self, shell: &Path) -> DaemonProc {
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
             .args(["daemon", "--foreground"])
             .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
             .env("NEBULA_DATA_DIR", self.tmp.path().join("data"))
@@ -63,7 +63,8 @@ impl TestEnv {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .unwrap()
+            .unwrap();
+        DaemonProc(child)
     }
 
     /// A `$SHELL` that answers `-l -i -c` but sees no agent CLI on PATH.
@@ -110,6 +111,58 @@ impl TestEnv {
         git(&["add", "."]);
         git(&["commit", "-m", "init"]);
         repo
+    }
+}
+
+/// A daemon spawned for one test, killed when the test's scope ends.
+///
+/// Without this, a test that panics before its closing `Shutdown` — a failed
+/// assertion, a timeout — leaks its `nebula daemon --foreground`. Nothing
+/// reaps it: it detaches from the test binary and outlives the whole `cargo
+/// test` run. They pile up across days of development, and dozens of them
+/// holding watchers and fds starve *later* runs' daemons, which surfaces as
+/// every test in the file failing with "daemon socket never appeared" —
+/// an error that points nowhere near the actual cause.
+struct DaemonProc(std::process::Child);
+
+impl std::ops::Deref for DaemonProc {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for DaemonProc {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for DaemonProc {
+    fn drop(&mut self) {
+        // Already exited (the clean path: `Shutdown` + `wait_for_exit`).
+        // Checking matters — `Child::kill` on a reaped child is an error
+        // rather than a signal to whatever now owns that recycled pid, but
+        // there is nothing to do here either way.
+        if matches!(self.0.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        // SIGTERM, not SIGKILL: the daemon's handler runs the same clean
+        // shutdown as `Shutdown`, taking its PTY children down with it.
+        // SIGKILL would leave those orphaned instead.
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &self.0.id().to_string()])
+            .stderr(std::process::Stdio::null())
+            .status();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if matches!(self.0.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -319,6 +372,7 @@ async fn full_crud_attach_and_restart_persistence() {
             model: None,
             effort: None,
             auto_title: false,
+            cloud_prompt: None,
         },
     )
     .await
@@ -701,6 +755,7 @@ async fn hook_post_from_agent_pty_drives_status() {
             model: None,
             effort: None,
             auto_title: false,
+            cloud_prompt: None,
         },
     )
     .await
@@ -1032,6 +1087,7 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
             model: None,
             effort: None,
             auto_title: false,
+            cloud_prompt: None,
         },
     )
     .await
@@ -1192,6 +1248,7 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
             model: None,
             effort: None,
             auto_title: false,
+            cloud_prompt: None,
         },
     )
     .await
@@ -1372,6 +1429,7 @@ async fn codex_hooks_install_and_drive_status() {
             model: None,
             effort: None,
             auto_title: false,
+            cloud_prompt: None,
         },
     )
     .await
@@ -1968,6 +2026,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
             model: None,
             effort: None,
             auto_title: false,
+            cloud_prompt: None,
         },
     )
     .await
@@ -2096,6 +2155,7 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
             model: None,
             effort: None,
             auto_title: false,
+            cloud_prompt: None,
         },
     )
     .await
@@ -2152,6 +2212,7 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
                 model: None,
                 effort: None,
                 auto_title: false,
+                cloud_prompt: None,
             },
         )
         .await
@@ -2243,6 +2304,7 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
             model: None,
             effort: None,
             auto_title: false,
+            cloud_prompt: None,
         },
     )
     .await
@@ -2311,6 +2373,7 @@ async fn create_agent_get_id(
             model: None,
             effort: None,
             auto_title: false,
+            cloud_prompt: None,
         },
     )
     .await
@@ -2487,6 +2550,7 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
             model: None,
             effort: None,
             auto_title: false,
+            cloud_prompt: None,
         },
     )
     .await
@@ -2552,6 +2616,7 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
             model: None,
             effort: None,
             auto_title: false,
+            cloud_prompt: None,
         },
     )
     .await
@@ -2602,6 +2667,7 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
             model: None,
             effort: None,
             auto_title: false,
+            cloud_prompt: None,
         },
     )
     .await
@@ -2720,6 +2786,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             model: None,
             effort: None,
             auto_title: false,
+            cloud_prompt: None,
         },
     )
     .await
@@ -2773,6 +2840,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             model: None,
             effort: None,
             auto_title: false,
+            cloud_prompt: None,
         },
     )
     .await
@@ -2915,7 +2983,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     wait_for_exit(&mut daemon);
 }
 
-fn wait_for_exit(daemon: &mut std::process::Child) {
+fn wait_for_exit(daemon: &mut DaemonProc) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         match daemon.try_wait().unwrap() {
@@ -3026,6 +3094,7 @@ async fn auto_title_instruction_and_rename_flow() {
             model: None,
             effort: None,
             auto_title: true,
+            cloud_prompt: None,
         },
     )
     .await
@@ -3101,6 +3170,186 @@ async fn auto_title_instruction_and_rename_flow() {
 /// `nebula add <dir>` and the bare `nebula <dir>` shorthand: the one-shot CLI
 /// resolves the path against its own cwd (the daemon's differs), registers
 /// the repo over IPC, and surfaces daemon rejections as nonzero exits.
+/// Two nebula instances are two independent views: one switching workspaces
+/// leaves the other where its user put it, and each one's `AddProject`
+/// lands in the workspace *it* is looking at. The daemon still remembers
+/// the last pick as where a fresh instance boots.
+#[tokio::test]
+async fn workspace_scope_is_per_connection() {
+    let env = TestEnv::new();
+    let mut daemon = env.spawn_daemon();
+
+    let subscribe = |sock: PathBuf| async move {
+        let mut c = connect(&sock).await;
+        handshake(&mut c).await;
+        write_frame(&mut c, &ClientRequest::Subscribe)
+            .await
+            .unwrap();
+        let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+            evs.iter()
+                .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+        })
+        .await;
+        let active = events
+            .iter()
+            .find_map(|e| match e {
+                ServerEvent::Snapshot {
+                    active_workspace, ..
+                } => Some(active_workspace.clone()),
+                _ => None,
+            })
+            .expect("snapshot carries the workspace to boot into");
+        (c, active)
+    };
+
+    // Two instances, both booted into the default workspace.
+    let (mut a, a_boot) = subscribe(env.sock()).await;
+    let (mut b, b_boot) = subscribe(env.sock()).await;
+    assert_eq!(a_boot.as_str(), "default");
+    assert_eq!(b_boot.as_str(), "default");
+
+    // Instance A creates a workspace and switches into it.
+    write_frame(
+        &mut a,
+        &ClientRequest::AddWorkspace {
+            req_id: 1,
+            name: "client".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut a, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Ack { req_id: 1, .. }))
+    })
+    .await;
+    let ws = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::Ack {
+                req_id: 1,
+                created: Some(EntityId::Workspace(id)),
+            } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("AddWorkspace acks with the new id");
+    write_frame(
+        &mut a,
+        &ClientRequest::OpenWorkspace {
+            req_id: 2,
+            id: ws.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut a, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Ack { req_id: 2, .. }))
+    })
+    .await;
+
+    // A project added from A lands in A's workspace...
+    let repo_a = env.make_repo();
+    write_frame(
+        &mut a,
+        &ClientRequest::AddProject {
+            req_id: 3,
+            path: repo_a.clone(),
+            name: None,
+            create_missing: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut a, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Ack { req_id: 3, .. }))
+    })
+    .await;
+    let project_a = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(p),
+            } => Some(p.clone()),
+            _ => None,
+        })
+        .expect("AddProject upserts the project");
+    assert_eq!(
+        project_a.workspace_id, ws,
+        "A's project lands in the workspace A switched to"
+    );
+
+    // ...while B, which never switched, is still adding to the default.
+    // This is the whole bug: B must not have been dragged along.
+    let repo_b = env.tmp.path().join("repo-b");
+    make_repo_at(&repo_b);
+    write_frame(
+        &mut b,
+        &ClientRequest::AddProject {
+            req_id: 4,
+            path: repo_b.clone(),
+            name: None,
+            create_missing: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut b, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Ack { req_id: 4, .. }))
+    })
+    .await;
+    let project_b = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(p),
+            } if p.repo_path == repo_b.canonicalize().unwrap() => Some(p.clone()),
+            _ => None,
+        })
+        .expect("AddProject upserts the project");
+    assert_eq!(
+        project_b.workspace_id.as_str(),
+        "default",
+        "B never switched, so B still adds to the workspace it booted into"
+    );
+
+    // A third instance launched now boots into A's pick — the switch is
+    // remembered as a default for new clients, just not pushed onto live ones.
+    let (_c, c_boot) = subscribe(env.sock()).await;
+    assert_eq!(
+        c_boot, ws,
+        "a fresh instance opens the last workspace opened"
+    );
+
+    write_frame(&mut a, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// `TestEnv::make_repo` at a caller-chosen path, for tests that need two.
+fn make_repo_at(repo: &Path) {
+    std::fs::create_dir_all(repo).unwrap();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@nebula.dev"]);
+    git(&["config", "user.name", "nebula-test"]);
+    std::fs::write(repo.join("README.md"), "# test\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "init"]);
+}
+
 #[tokio::test]
 async fn cli_add_project() {
     let env = TestEnv::new();

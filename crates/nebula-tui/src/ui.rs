@@ -181,9 +181,17 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             let any_submenu = menu.items.iter().any(|i| i.action.submenu().is_some());
             // The workspace switcher carries its key verbs in the bottom
             // border, the notes-modal pattern; the modal widens to fit.
-            let hint = menu
-                .is_workspace_picker()
-                .then_some(" n: new  r: rename  d: delete ");
+            let hint = if menu.is_workspace_picker() {
+                Some(" n: new  r: rename  d: delete ")
+            } else {
+                menu.hovered_claude_cloud().map(|cloud| {
+                    if cloud {
+                        " Tab: cloud on "
+                    } else {
+                        " Tab: cloud off "
+                    }
+                })
+            };
             let width = (label_w + 4 + if any_submenu { 2 } else { 0 })
                 .max(title_width + 2)
                 .max(hint.map_or(0, |h| h.chars().count() + 2))
@@ -277,6 +285,65 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 Span::styled("[Esc/n] cancel", Style::default().fg(th.dim)),
             ]));
             f.render_widget(Paragraph::new(lines), inner);
+        }
+        Overlay::Prompt(prompt) if prompt.is_multiline() => {
+            let area = centered_rect(f.area(), 76, 14);
+            f.render_widget(Clear, area);
+            let hint = if area.width >= 64 {
+                " Enter: launch · Shift+Enter/^J: newline · Esc: cancel "
+            } else if area.width >= 36 {
+                " Enter launch · ^J newline · Esc cancel "
+            } else {
+                " Esc · ^J · Enter "
+            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(th.accent))
+                .title(Span::styled(
+                    format!(" {} ", prompt.title),
+                    Style::default().fg(th.accent),
+                ))
+                .title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            let label_rows = usize::from(inner.height >= 4);
+            if label_rows == 1 {
+                let row = row_rect(inner, 0).expect("a four-row inner area has a label row");
+                f.render_widget(
+                    Paragraph::new(Span::styled(prompt.label, Style::default().fg(th.dim))),
+                    row,
+                );
+            }
+
+            // A bordered, multi-row task editor. Its own wrapping helper
+            // keeps words intact and follows the caret once the task grows
+            // beyond the visible rows.
+            let editor_area = Rect {
+                x: inner.x,
+                y: inner.y.saturating_add(label_rows as u16),
+                width: inner.width,
+                height: inner.height.saturating_sub(label_rows as u16),
+            };
+            let editor_inner = if editor_area.height >= 3 && editor_area.width >= 4 {
+                let editor_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(th.dim));
+                let editor_inner = editor_block.inner(editor_area);
+                f.render_widget(editor_block, editor_area);
+                editor_inner
+            } else {
+                editor_area
+            };
+            let (lines, caret_row) =
+                multiline_input_lines(&prompt.input, editor_inner.width as usize, th.accent, th);
+            let visible = editor_inner.height.max(1) as usize;
+            let max_start = lines.len().saturating_sub(visible);
+            let start = caret_row.saturating_sub(visible / 2).min(max_start);
+            let shown: Vec<Line> = lines.into_iter().skip(start).take(visible).collect();
+            f.render_widget(Paragraph::new(shown), editor_inner);
         }
         Overlay::Prompt(prompt) => {
             // Path prompts get a wide dialog with the live directory
@@ -3503,6 +3570,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     // connection state only when something is wrong.
     let mut spans = vec![Span::raw(" ")];
     // The open workspace leads the bar — it scopes everything else shown.
+    // (The version nameplate is spliced in ahead of it further down, once
+    // the width left for the hints is known.)
     spans.push(Span::styled(
         format!("◇ {}", truncate(app.tree.active_workspace_name(), 20)),
         Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
@@ -3552,6 +3621,24 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         width: area.width.saturating_sub(right_w),
         ..area
     };
+    // Which nebula this is, at the far left: the one thing on the bar that
+    // never moves with the cursor, so it reads as a nameplate rather than
+    // context. It costs the hints ~18 columns, which they can afford — a
+    // clipped key list still spells the keys that matter, in order. A
+    // clipped *flash* loses the end of a sentence, so the nameplate steps
+    // aside for one that would not otherwise fit.
+    let plate = format!("nebula v{}", env!("CARGO_PKG_VERSION"));
+    let plate_w = plate.chars().count() + "  ·  ".chars().count();
+    let body_w: usize = spans.iter().map(|s| s.width()).sum();
+    if app.flash.is_none() || body_w + plate_w <= left.width as usize {
+        spans.splice(
+            1..1,
+            [
+                Span::styled(plate, Style::default().fg(th.dim)),
+                Span::styled("  ·  ", Style::default().fg(th.dim)),
+            ],
+        );
+    }
     f.render_widget(Paragraph::new(Line::from(spans)), left);
     if let Some(usage) = usage {
         let right = Rect {
@@ -3682,6 +3769,101 @@ fn fuzzy_highlight_spans(shown: &str, positions: &[usize], th: Theme) -> Vec<Spa
     }
     push(run, run_hl, &mut spans);
     spans
+}
+
+/// Word-wrapped rows for the Claude Cloud task editor. Explicit newlines
+/// always break; soft breaks prefer the last whitespace that fits. The
+/// returned row index is where the caret rendered, so the caller can keep
+/// that row inside its fixed-height viewport.
+fn multiline_input_lines(
+    input: &TextInput,
+    width: usize,
+    cursor: Color,
+    th: Theme,
+) -> (Vec<Line<'static>>, usize) {
+    let chars: Vec<char> = input.chars().collect();
+    let caret = input.cursor_chars();
+    let width = width.max(1);
+    let mut ranges = Vec::new();
+    let mut paragraph_start = 0usize;
+    loop {
+        let paragraph_end = chars[paragraph_start..]
+            .iter()
+            .position(|c| *c == '\n')
+            .map(|offset| paragraph_start + offset)
+            .unwrap_or(chars.len());
+        if paragraph_start == paragraph_end {
+            ranges.push((paragraph_start, paragraph_end));
+        } else {
+            let mut start = paragraph_start;
+            while start < paragraph_end {
+                let hard_end = (start + width).min(paragraph_end);
+                let end = if hard_end < paragraph_end {
+                    chars[start..hard_end]
+                        .iter()
+                        .rposition(|c| c.is_whitespace())
+                        .map(|offset| start + offset + 1)
+                        .filter(|cut| *cut > start)
+                        .unwrap_or(hard_end)
+                } else {
+                    hard_end
+                };
+                ranges.push((start, end));
+                start = end;
+            }
+        }
+        if paragraph_end == chars.len() {
+            break;
+        }
+        paragraph_start = paragraph_end + 1;
+    }
+
+    let plain = Style::default().fg(th.text);
+    let block = Style::default().fg(th.on_accent).bg(cursor);
+    let mut caret_row = 0usize;
+    let mut found_caret = false;
+    let lines = ranges
+        .into_iter()
+        .enumerate()
+        .map(|(row, (start, end))| {
+            let mut cells: Vec<(char, bool)> =
+                (start..end).map(|i| (chars[i], i == caret)).collect();
+            // At EOF, on an empty line, or immediately before an explicit
+            // newline, the caret needs its own blank cell.
+            if (start == end && caret == start)
+                || (caret == end
+                    && (end == chars.len() || chars.get(end).is_some_and(|c| *c == '\n')))
+            {
+                cells.push((' ', true));
+            }
+            if cells.iter().any(|(_, is_caret)| *is_caret) {
+                caret_row = row;
+                found_caret = true;
+            }
+
+            let mut spans = Vec::new();
+            let mut run = String::new();
+            let mut run_is_caret = false;
+            for (c, is_caret) in cells {
+                if is_caret != run_is_caret && !run.is_empty() {
+                    spans.push(Span::styled(
+                        std::mem::take(&mut run),
+                        if run_is_caret { block } else { plain },
+                    ));
+                }
+                run_is_caret = is_caret;
+                run.push(c);
+            }
+            if !run.is_empty() {
+                spans.push(Span::styled(run, if run_is_caret { block } else { plain }));
+            }
+            Line::from(spans)
+        })
+        .collect::<Vec<_>>();
+    if !found_caret {
+        caret_row = lines.len().saturating_sub(1);
+    }
+    (lines, caret_row)
 }
 
 /// Spans for a one-line text field: the value with a block cursor sitting

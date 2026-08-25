@@ -306,7 +306,10 @@ pub async fn run_workspace_op(op: WorkspaceOp) -> Result<()> {
                 req_id,
                 id: resolve(&name)?,
             },
-            format!("workspace '{name}' opened"),
+            // Running instances keep the workspace their user put them on;
+            // this sets where the next one starts. `nebula --workspace
+            // <name>` is the way to aim one instance without moving this.
+            format!("workspace '{name}' will open in new nebula instances"),
         ),
         WorkspaceOp::Delete { name } => (
             ClientRequest::RemoveWorkspace {

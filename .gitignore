@@ -7,3 +7,6 @@
 CLAUDE.local.md
 design-screenshots/
 .DS_Store
+
+# nebula-managed git worktrees for agent sessions
+/.claude/worktrees/

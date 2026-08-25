@@ -108,6 +108,15 @@ impl TextInput {
         self.cursor += flat.len();
     }
 
+    /// Insert a bracketed paste while preserving line breaks. This is kept
+    /// opt-in so every established one-line field retains its flattening
+    /// contract; the Claude Cloud task editor is the sole caller.
+    pub fn insert_multiline_str(&mut self, s: &str) {
+        let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
+        self.text.insert_str(self.cursor, &normalized);
+        self.cursor += normalized.len();
+    }
+
     /// Apply one key press. Returns [`Edit::Ignored`] for anything that
     /// isn't an editing key, leaving it for the caller.
     pub fn handle_key(&mut self, key: &KeyEvent) -> Edit {
@@ -464,6 +473,15 @@ mod tests {
         input.insert_str("one\ntwo");
         assert_eq!(input.as_str(), "aone twob");
         assert_eq!(input.cursor_chars(), 8);
+    }
+
+    #[test]
+    fn multiline_paste_preserves_and_normalizes_line_breaks() {
+        let mut input = typed("ab");
+        press(&mut input, KeyCode::Left, KeyModifiers::NONE);
+        input.insert_multiline_str("one\r\ntwo\rthree");
+        assert_eq!(input.as_str(), "aone\ntwo\nthreeb");
+        assert_eq!(input.cursor_chars(), 14);
     }
 
     #[test]

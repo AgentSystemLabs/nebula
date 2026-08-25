@@ -17,6 +17,11 @@ struct Cli {
     /// (A directory whose name collides with a subcommand needs the long
     /// form or a `./` prefix.)
     dir: Option<String>,
+    /// Open this instance on the named workspace instead of the last one
+    /// opened. Each nebula window scopes itself, so two can sit on two
+    /// different workspaces at once.
+    #[arg(long, value_name = "NAME")]
+    workspace: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -46,8 +51,8 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Manage workspaces — named project groups; one is open at a time and
-    /// the TUI scopes its project list (and `/` search) to it.
+    /// Manage workspaces — named project groups. Each nebula instance has
+    /// one open and scopes its project list (and `/` search) to it.
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
@@ -81,9 +86,10 @@ enum Command {
 enum WorkspaceCommand {
     /// Create a workspace (does not open it).
     Add { name: String },
-    /// Open a workspace: projects (and the TUI, live) scope to it.
+    /// Open a workspace in the next nebula instance launched. Running ones
+    /// keep theirs — aim a single instance with `nebula --workspace <name>`.
     Open { name: String },
-    /// List workspaces; `*` marks the open one.
+    /// List workspaces; `*` marks the one new instances open into.
     List,
     /// Delete an empty workspace.
     Delete { name: String },
@@ -133,7 +139,10 @@ fn main() -> Result<()> {
             Some(dir) => nebula_tui::run_add_project(dir),
             None => {
                 init_tui_logging()?;
-                let handoff = log_fatal(nebula_tui::run_tui(), nebula_core::paths::tui_log_path())?;
+                let handoff = log_fatal(
+                    nebula_tui::run_tui(cli.workspace),
+                    nebula_core::paths::tui_log_path(),
+                )?;
                 match handoff {
                     // Hosts-picker handoff: the TUI quit and restored the
                     // terminal so a fresh `nebula ssh` can exec over us (the

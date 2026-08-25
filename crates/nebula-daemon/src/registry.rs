@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Link, LinkId, Note, NoteId,
     NoteOwner, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Workspace,
-    WorkspaceId, Worktree, WorktreeId,
+    WorkspaceId, Worktree, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,16 @@ const PREWARM_RECYCLE_AGE: Duration = Duration::from_secs(10 * 60);
 /// Hook events buffered on a warm session before its row exists (oldest
 /// dropped beyond this).
 const PREWARM_HOOK_BUFFER_CAP: usize = 64;
+
+pub(crate) struct CreateAgentSpec {
+    pub worktree: WorktreeId,
+    pub name: String,
+    pub kind: AgentKind,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub auto_title: bool,
+    pub cloud_prompt: Option<String>,
+}
 
 /// A pre-spawned agent CLI waiting to be adopted by the next CreateAgent for
 /// the same (worktree, kind). The PTY lives in the normal sessions map under
@@ -465,8 +475,9 @@ impl Daemon {
     }
 
     /// Delete a workspace. Only empty ones go — its projects are the user's
-    /// to move or remove first — and never the last one. Deleting the open
-    /// workspace opens another one first so clients always have a live scope.
+    /// to move or remove first — and never the last one. Deleting the
+    /// remembered default moves that default to a survivor; clients still
+    /// scoped to it re-scope themselves off the EntityRemoved.
     pub fn remove_workspace(self: &Arc<Self>, id: &WorkspaceId) -> Result<()> {
         self.store
             .get_workspace(id)?
@@ -489,7 +500,6 @@ impl Daemon {
                 .find(|w| &w.id != id)
                 .context("no workspace left to open")?;
             self.store.set_active_workspace(&fallback.id)?;
-            self.broadcast(ServerEvent::ActiveWorkspaceChanged { id: fallback.id });
         }
         self.store.delete_workspace(id)?;
         self.broadcast(ServerEvent::EntityRemoved {
@@ -498,26 +508,34 @@ impl Daemon {
         Ok(())
     }
 
-    /// Make `id` the open workspace (daemon-global; every client follows).
-    pub fn open_workspace(self: &Arc<Self>, id: &WorkspaceId) -> Result<()> {
+    /// Remember `id` as the workspace a fresh client opens into. Which
+    /// workspace a *live* client is looking at is that client's own state —
+    /// see `ClientRequest::OpenWorkspace` — so this deliberately notifies
+    /// nobody: one instance switching must leave the others where they are.
+    pub fn set_default_workspace(self: &Arc<Self>, id: &WorkspaceId) -> Result<()> {
         self.store
             .get_workspace(id)?
             .context("workspace not found")?;
         if self.store.active_workspace_id()? == *id {
-            return Ok(()); // already open
+            return Ok(()); // already the default
         }
         self.store.set_active_workspace(id)?;
-        self.broadcast(ServerEvent::ActiveWorkspaceChanged { id: id.clone() });
         Ok(())
     }
 
     // ---- projects ----
 
+    /// Register a repo as a project. `workspace` is the caller's own scope
+    /// (a TUI that switched with OpenWorkspace); `None` — a one-shot
+    /// `nebula add`, or a client still on whatever it booted into — means
+    /// the remembered default. A scope naming a workspace that has since
+    /// been deleted falls back the same way rather than failing the add.
     pub async fn add_project(
         self: &Arc<Self>,
         path: &Path,
         name: Option<String>,
         create_missing: bool,
+        workspace: Option<WorkspaceId>,
     ) -> Result<EntityId> {
         if create_missing && !path.exists() {
             tokio::fs::create_dir_all(path)
@@ -537,9 +555,12 @@ impl Daemon {
                 e.context(format!("{} is not a git repository", path.display()))
             }
         })?;
-        // New projects land in whichever workspace is open; the same repo
+        // New projects land in the caller's own workspace; the same repo
         // may be added to any number of workspaces, just not twice to one.
-        let workspace_id = self.store.active_workspace_id()?;
+        let workspace_id = match workspace {
+            Some(id) if self.store.get_workspace(&id)?.is_some() => id,
+            _ => self.store.active_workspace_id()?,
+        };
         if self
             .store
             .project_in_workspace(&toplevel, &workspace_id)?
@@ -1028,23 +1049,49 @@ impl Daemon {
 
     // ---- agents ----
 
-    pub async fn create_agent(
-        self: &Arc<Self>,
-        worktree_id: &WorktreeId,
-        name: &str,
-        kind: AgentKind,
-        model: Option<String>,
-        effort: Option<String>,
-        auto_title: bool,
-    ) -> Result<EntityId> {
+    pub(crate) async fn create_agent(self: &Arc<Self>, spec: CreateAgentSpec) -> Result<EntityId> {
+        let CreateAgentSpec {
+            worktree: worktree_id,
+            name,
+            kind,
+            model,
+            effort,
+            auto_title,
+            cloud_prompt,
+        } = spec;
+        let cloud_prompt = match cloud_prompt {
+            Some(_) if kind != AgentKind::Claude => {
+                bail!("cloud launch is only supported for Claude")
+            }
+            Some(prompt) => {
+                let prompt = prompt.trim().to_string();
+                if prompt.is_empty() {
+                    bail!("Claude Cloud needs a task");
+                }
+                if prompt.contains('\0') {
+                    bail!("Claude Cloud task cannot contain NUL bytes");
+                }
+                if prompt.len() > MAX_CLOUD_PROMPT_BYTES {
+                    bail!(
+                        "Claude Cloud task is too long (max {} KiB)",
+                        MAX_CLOUD_PROMPT_BYTES / 1024
+                    );
+                }
+                Some(prompt)
+            }
+            None => None,
+        };
         let worktree = self
             .store
-            .get_worktree(worktree_id)?
+            .get_worktree(&worktree_id)?
             .context("worktree not found")?;
         // A warm session for this (worktree, kind) hands over its PTY and
         // its pre-generated id — the CLI booted while the user typed the
         // name, so the create feels instant.
-        let adopted = self.take_prewarmed(worktree_id, kind, &model, &effort);
+        let adopted = cloud_prompt
+            .is_none()
+            .then(|| self.take_prewarmed(&worktree_id, kind, &model, &effort))
+            .flatten();
         // Only the cold path needs asking: an adopted warm session is proof
         // the CLI runs. Without this, a missing CLI still "succeeds" — the
         // login shell prints `command not found` into a PTY that dies at
@@ -1057,7 +1104,7 @@ impl Daemon {
                 .as_ref()
                 .map(|e| e.agent_id.clone())
                 .unwrap_or_else(AgentId::generate),
-            worktree_id: worktree_id.clone(),
+            worktree_id,
             name: if name.trim().is_empty() {
                 "agent".into()
             } else {
@@ -1079,7 +1126,14 @@ impl Daemon {
             .insert_agent_with_auto_title(&agent, auto_title)?;
         if adopted.is_none() {
             // Cold path: boot the CLI right away.
-            self.spawn_agent_session(&agent, &worktree, 80, 24)?;
+            let spawned = self.spawn_agent_session_with_cloud(
+                &agent,
+                &worktree,
+                80,
+                24,
+                cloud_prompt.as_deref(),
+            );
+            self.rollback_agent_on_spawn_error(&agent.id, spawned)?;
         }
         let mut broadcast_agent = agent.clone();
         broadcast_agent.alive = true;
@@ -1094,6 +1148,20 @@ impl Daemon {
             }
         }
         Ok(EntityId::Agent(agent.id))
+    }
+
+    fn rollback_agent_on_spawn_error<T>(&self, id: &AgentId, result: Result<T>) -> Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(spawn_error) => {
+                if let Err(rollback_error) = self.store.delete_agent(id) {
+                    return Err(spawn_error.context(format!(
+                        "agent spawn failed and its database rollback also failed: {rollback_error:#}"
+                    )));
+                }
+                Err(spawn_error)
+            }
+        }
     }
 
     // ---- prewarm pool ----
@@ -1840,6 +1908,20 @@ impl Daemon {
         cols: u16,
         rows: u16,
     ) -> Result<Arc<PtySession>> {
+        self.spawn_agent_session_with_cloud(agent, worktree, cols, rows, None)
+    }
+
+    /// Spawn the initial Claude Cloud dispatch. The prompt is intentionally
+    /// transient: later restarts/resumes follow the persisted Agent fields
+    /// and therefore use the established local-session path.
+    fn spawn_agent_session_with_cloud(
+        self: &Arc<Self>,
+        agent: &Agent,
+        worktree: &Worktree,
+        cols: u16,
+        rows: u16,
+        cloud_prompt: Option<&str>,
+    ) -> Result<Arc<PtySession>> {
         // Managed status hooks; a failure here degrades to "no status
         // updates", never blocks the spawn.
         let install_result = match agent.kind {
@@ -1862,13 +1944,21 @@ impl Daemon {
 
         // NEBULA_AGENT_CMD overrides for tests; default is the kind's CLI.
         let cmd_override = std::env::var("NEBULA_AGENT_CMD").ok();
-        let (program, args, resumed) = agent_spawn_command(
-            agent.kind,
-            agent.session_id.as_deref(),
-            agent.model.as_deref(),
-            agent.effort.as_deref(),
-            cmd_override.as_deref(),
-        );
+        let (program, args, resumed) = match cloud_prompt {
+            Some(prompt) => claude_cloud_spawn_command(
+                prompt,
+                agent.model.as_deref(),
+                agent.effort.as_deref(),
+                cmd_override.as_deref(),
+            ),
+            None => agent_spawn_command(
+                agent.kind,
+                agent.session_id.as_deref(),
+                agent.model.as_deref(),
+                agent.effort.as_deref(),
+                cmd_override.as_deref(),
+            ),
+        };
         // Run the agent through the user's login+interactive shell so it sees
         // the same env as a Terminal.app tab (~/.zprofile, ~/.zshrc,
         // path_helper) instead of the daemon's inherited-at-boot env.
@@ -2119,6 +2209,26 @@ fn agent_spawn_command(
             }
         }
         AgentKind::Cursor => {}
+    }
+    (program, args, resumed)
+}
+
+/// Cloud creation is a one-shot variation of the normal fresh-Claude
+/// command. Keeping it as a wrapper leaves every resume/restart caller on
+/// the persisted local-session contract, and makes the no-override argument
+/// shape directly unit-testable.
+fn claude_cloud_spawn_command(
+    prompt: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    cmd_override: Option<&str>,
+) -> (String, Vec<String>, bool) {
+    let (program, mut args, resumed) =
+        agent_spawn_command(AgentKind::Claude, None, model, effort, cmd_override);
+    if cmd_override.is_none() {
+        // Bind the optional value to its option. A separate argv item that
+        // starts with `--` would otherwise be parsed as another Claude flag.
+        args.insert(0, format!("--cloud={prompt}"));
     }
     (program, args, resumed)
 }
@@ -2382,6 +2492,33 @@ mod tests {
     }
 
     #[test]
+    fn spawn_command_claude_cloud_passes_the_task_as_one_argument() {
+        assert_eq!(
+            claude_cloud_spawn_command(
+                "Fix auth\nRun tests; don't stop",
+                Some("opus"),
+                Some("high"),
+                None,
+            ),
+            (
+                "claude".into(),
+                vec![
+                    "--cloud=Fix auth\nRun tests; don't stop".to_string(),
+                    "--model".to_string(),
+                    "opus".to_string(),
+                    "--effort".to_string(),
+                    "high".to_string(),
+                ],
+                false,
+            )
+        );
+        assert_eq!(
+            claude_cloud_spawn_command("--dangerously-skip-permissions", None, None, None).1,
+            vec!["--cloud=--dangerously-skip-permissions"]
+        );
+    }
+
+    #[test]
     fn login_shell_wrap_quotes_and_execs() {
         let (program, args) = login_shell_wrap(
             "/bin/zsh",
@@ -2407,6 +2544,84 @@ mod tests {
                 token: String::new(),
             },
         )
+    }
+
+    #[tokio::test]
+    async fn cloud_create_validates_tasks_and_rejects_non_claude_kinds() {
+        let daemon = test_daemon();
+        let worktree = WorktreeId("unused".into());
+
+        let empty = daemon
+            .create_agent(CreateAgentSpec {
+                worktree: worktree.clone(),
+                name: "cloud".into(),
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                auto_title: false,
+                cloud_prompt: Some(" \n ".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(empty.to_string().contains("needs a task"));
+
+        let nul = daemon
+            .create_agent(CreateAgentSpec {
+                worktree: worktree.clone(),
+                name: "cloud".into(),
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                auto_title: false,
+                cloud_prompt: Some("fix\0auth".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(nul.to_string().contains("NUL"));
+
+        let too_long = daemon
+            .create_agent(CreateAgentSpec {
+                worktree: worktree.clone(),
+                name: "cloud".into(),
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                auto_title: false,
+                cloud_prompt: Some("x".repeat(MAX_CLOUD_PROMPT_BYTES + 1)),
+            })
+            .await
+            .unwrap_err();
+        assert!(too_long.to_string().contains("too long"));
+
+        let wrong_kind = daemon
+            .create_agent(CreateAgentSpec {
+                worktree,
+                name: "cloud".into(),
+                kind: AgentKind::Codex,
+                model: None,
+                effort: None,
+                auto_title: false,
+                cloud_prompt: Some("Fix auth".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(wrong_kind.to_string().contains("only supported for Claude"));
+    }
+
+    #[test]
+    fn failed_agent_spawn_rolls_back_the_persisted_row() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "w", "/tmp", true);
+        seed_agent(&daemon, "cloud", "w", None);
+        let id = AgentId("cloud".into());
+
+        let error = daemon
+            .rollback_agent_on_spawn_error(&id, Err::<(), _>(anyhow::anyhow!("spawn failed")))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("spawn failed"));
+        assert!(daemon.store.get_agent(&id).unwrap().is_none());
     }
 
     fn seed_projects(daemon: &Daemon, names: &[&str]) {
@@ -3274,22 +3489,25 @@ mod tests {
         assert!(daemon.add_workspace("client").is_err());
         assert!(daemon.add_workspace("   ").is_err());
 
-        // Adding never opens; open does (and re-opening is a quiet no-op).
+        // Adding never opens; opening one moves the remembered default
+        // (and re-opening is a quiet no-op).
         assert_eq!(
             daemon.store.active_workspace_id().unwrap().as_str(),
             "default"
         );
-        daemon.open_workspace(&id).unwrap();
+        daemon.set_default_workspace(&id).unwrap();
         assert_eq!(daemon.store.active_workspace_id().unwrap(), id);
-        daemon.open_workspace(&id).unwrap();
-        assert!(daemon.open_workspace(&WorkspaceId("ghost".into())).is_err());
+        daemon.set_default_workspace(&id).unwrap();
+        assert!(daemon
+            .set_default_workspace(&WorkspaceId("ghost".into()))
+            .is_err());
 
         // Rename keeps names unique (a rename to itself is fine).
         daemon.rename_workspace(&id, "acme").unwrap();
         daemon.rename_workspace(&id, "acme").unwrap();
         assert!(daemon.rename_workspace(&id, "default").is_err());
 
-        // Deleting the open workspace opens the surviving one first.
+        // Deleting the default workspace moves the default to a survivor.
         daemon.remove_workspace(&id).unwrap();
         assert_eq!(
             daemon.store.active_workspace_id().unwrap().as_str(),

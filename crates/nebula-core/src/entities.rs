@@ -87,8 +87,10 @@ impl AgentKind {
     }
 }
 
-/// A named group of projects. Exactly one workspace is "open" at a time
-/// (daemon-global state); the TUI shows only the open workspace's projects.
+/// A named group of projects. Each nebula instance has exactly one
+/// workspace open and shows only that workspace's projects; the daemon
+/// remembers the last one opened as the workspace a fresh instance boots
+/// into, not as a scope every client shares.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: WorkspaceId,

@@ -238,6 +238,19 @@ impl OpenPr {
 /// and is deliberately distinct from `Some(vec![])`, which is the real
 /// answer "nothing is open": the caller keeps the last good list rather than
 /// blanking the panel over one failed call.
+///
+/// Two properties of `--state open` the group depends on:
+///
+/// * **Drafts are in it.** A draft *is* an open pull request, and it is the
+///   one most likely to have a nebula worktree still attached to it — the
+///   list would be worth least if it hid exactly the work in progress. They
+///   arrive with `isDraft` set and wear a `draft` badge; nothing here or
+///   downstream filters them out.
+/// * **Closed ones fall out of it.** This is the whole mechanism for
+///   pruning: a pull request that was merged or closed since the last call
+///   simply stops coming back, so re-asking on a beat *is* the periodic
+///   "should this row still be here?" check. Nothing has to track closures
+///   separately.
 pub async fn list(dir: &Path) -> Option<Vec<OpenPr>> {
     let run = tokio::process::Command::new("gh")
         .args([
@@ -321,6 +334,18 @@ pub struct PrDetail {
     /// Issue comments and review submissions in one list, oldest first —
     /// the order they were said in, which is the order they read in.
     pub comments: Vec<PrComment>,
+}
+
+impl PrDetail {
+    /// Whether this pull request still accepts work. A draft counts: it is
+    /// open, just not finished. This is the per-row second opinion on the
+    /// question [`list`] answers in bulk — when the cursor rests on a row
+    /// long enough to fetch its detail, GitHub gets asked about that one
+    /// pull request directly, and a `MERGED` or `CLOSED` answer retires the
+    /// row without waiting for the next list.
+    pub fn is_open(&self) -> bool {
+        self.state == "OPEN"
+    }
 }
 
 /// One thing somebody said on a pull request.

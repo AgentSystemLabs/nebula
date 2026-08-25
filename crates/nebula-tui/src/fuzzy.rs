@@ -4,6 +4,11 @@
 //! consecutive runs and matches that start a path segment or word, which is
 //! enough to float `src/server.rs` above `crates/serde_helpers.rs` for the
 //! query "srv" without pulling in a matcher crate.
+//!
+//! Whitespace in a query splits it into independent terms, all of which must
+//! match somewhere in the candidate, in any order (fzf's extended-search AND).
+//! That is what lets `neb #10` find `nebula/#10 Credit Codex…` — a single
+//! subsequence pass would demand a literal space between `neb` and `#10`.
 
 /// A successful match: the score (higher is better) and the ascending char
 /// indices of `candidate` that matched, for highlighting.
@@ -24,30 +29,50 @@ fn is_boundary(prev: Option<char>) -> bool {
     }
 }
 
-/// Case-insensitive subsequence match of `query` inside `candidate`.
-/// Returns None when some query char never appears. An empty query matches
-/// everything with score 0 and no positions.
+/// Case-insensitive match of `query` inside `candidate`.
 ///
-/// Runs one greedy pass from each occurrence of the first query char and
+/// The query is split on whitespace; every term must match `candidate` as a
+/// subsequence, but the terms are matched independently and may appear in any
+/// order. Returns None when some term never matches. An empty (or all
+/// whitespace) query matches everything with score 0 and no positions.
+///
+/// Each term runs one greedy pass from each occurrence of its first char and
 /// keeps the best score, so "serv" prefers the `server` filename over a
 /// scattered s…e…r…v through the directory prefix.
 pub fn fuzzy_match(query: &str, candidate: &str) -> Option<FuzzyMatch> {
-    let query: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
-    if query.is_empty() {
+    let cand: Vec<char> = candidate.chars().collect();
+    let mut score = 0i32;
+    let mut positions: Vec<usize> = Vec::new();
+    for term in query.split_whitespace() {
+        let term: Vec<char> = term.chars().map(|c| c.to_ascii_lowercase()).collect();
+        let m = match_term(&term, &cand)?;
+        score += m.score;
+        positions.extend(m.positions);
+    }
+    // Terms match independently, so their spans can overlap and arrive out of
+    // order; highlighting wants one ascending, deduplicated run.
+    positions.sort_unstable();
+    positions.dedup();
+    Some(FuzzyMatch { score, positions })
+}
+
+/// Best subsequence match of one whitespace-free `term` (already lowercased)
+/// anywhere in `cand`.
+fn match_term(term: &[char], cand: &[char]) -> Option<FuzzyMatch> {
+    if term.is_empty() {
         return Some(FuzzyMatch {
             score: 0,
             positions: Vec::new(),
         });
     }
-    let cand: Vec<char> = candidate.chars().collect();
     let mut best: Option<FuzzyMatch> = None;
     for start in 0..cand.len() {
-        if cand[start].to_ascii_lowercase() != query[0] {
+        if cand[start].to_ascii_lowercase() != term[0] {
             continue;
         }
         // A failed greedy pass from here also fails from every later start
         // (its chars are a subset), so the first miss ends the search.
-        let Some(m) = greedy_from(&query, &cand, start) else {
+        let Some(m) = greedy_from(term, cand, start) else {
             break;
         };
         if best.as_ref().is_none_or(|b| m.score > b.score) {
@@ -93,7 +118,9 @@ pub fn rank<'a, I>(query: &str, candidates: I) -> Vec<(usize, Vec<usize>)>
 where
     I: IntoIterator<Item = &'a str>,
 {
-    if query.is_empty() {
+    // Whitespace-only counts as empty: every candidate scores 0, and sorting
+    // that by length would shuffle the list for a query that says nothing.
+    if query.split_whitespace().next().is_none() {
         return candidates
             .into_iter()
             .enumerate()
@@ -162,5 +189,65 @@ mod tests {
         let boundary = fuzzy_match("ui", "src/ui.rs").unwrap();
         let mid = fuzzy_match("ui", "build.rs").unwrap();
         assert!(boundary.score > mid.score, "{boundary:?} vs {mid:?}");
+    }
+
+    #[test]
+    fn space_separated_terms_match_independently() {
+        // The reported case: one subsequence pass wants a literal space
+        // between "neb" and "#10", which the PR row does not have.
+        let m = fuzzy_match(
+            "neb #10",
+            "nebula/#10 Credit Codex and Cursor in the README",
+        )
+        .unwrap();
+        assert_eq!(m.positions, vec![0, 1, 2, 7, 8, 9]);
+    }
+
+    #[test]
+    fn terms_may_appear_in_any_order() {
+        assert!(fuzzy_match("#10 neb", "nebula/#10 Credit Codex").is_some());
+        assert!(fuzzy_match("requests show", "nebula/main/Show Open Pull Requests").is_some());
+    }
+
+    #[test]
+    fn every_term_must_match() {
+        assert!(fuzzy_match("neb #11", "nebula/#10 Credit Codex").is_none());
+        assert!(fuzzy_match("neb zzz", "nebula/#10 Credit Codex").is_none());
+    }
+
+    #[test]
+    fn positions_are_ascending_and_deduped_across_overlapping_terms() {
+        // "ne" and "neb" both land on the same leading chars.
+        let m = fuzzy_match("ne neb", "nebula/main").unwrap();
+        assert_eq!(m.positions, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn whitespace_only_query_matches_everything_in_order() {
+        let m = fuzzy_match("   ", "anything").unwrap();
+        assert_eq!(m.score, 0);
+        assert!(m.positions.is_empty());
+        let ranked = rank("  ", vec!["a-longer-one", "ab"]);
+        assert_eq!(ranked, vec![(0, vec![]), (1, vec![])]);
+    }
+
+    #[test]
+    fn trailing_space_behaves_like_the_bare_term() {
+        assert_eq!(
+            fuzzy_match("serv ", "src/server.rs"),
+            fuzzy_match("serv", "src/server.rs")
+        );
+    }
+
+    #[test]
+    fn multi_term_ranking_floats_the_row_that_matches_both() {
+        let rows = vec![
+            "nebula/main/Show Open Pull Requests",
+            "nebula/worktree-readme-tweak/Readme Tweak Pull Request",
+            "nebula/#10 Credit Codex and Cursor in the README tagline",
+        ];
+        let ranked = rank("neb #10", rows.clone());
+        assert_eq!(ranked.len(), 1, "only the #10 row has both terms");
+        assert_eq!(ranked[0].0, 2);
     }
 }
