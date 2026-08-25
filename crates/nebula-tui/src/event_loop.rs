@@ -1810,7 +1810,7 @@ fn open_notes_for_owner(app: &mut App, owner: NoteOwner) {
     app.overlay = Some(Overlay::Notes(NoteView::new(owner, context)));
 }
 
-/// `h`: destinations remembered by `nebula ssh`, newest first. Opens even
+/// `Shift+H`: destinations remembered by `nebula ssh`, newest first. Opens even
 /// when empty — the modal's hint is how the feature introduces itself.
 fn open_hosts_picker(app: &mut App) {
     app.overlay = Some(Overlay::Hosts(crate::app::HostsView::new(
@@ -6996,13 +6996,48 @@ mod tests {
             .expect("link row");
     }
 
+    /// `h`/`l` are the vim twins of `←`/`→`: same focus walk, same stops at
+    /// the ends. The plain letters used to open the hosts picker and the
+    /// add-link prompt, which now live on the shifted keys.
     #[test]
-    fn l_adds_a_link_to_the_selected_worktree() {
+    fn h_and_l_walk_panel_focus_like_the_arrows() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        let l = |app: &mut App, out: &mut Vec<ClientRequest>| {
+            press(app, KeyCode::Char('l'), KeyModifiers::NONE, out)
+        };
+        let h = |app: &mut App, out: &mut Vec<ClientRequest>| {
+            press(app, KeyCode::Char('h'), KeyModifiers::NONE, out)
+        };
+
+        app.focus = Focus::Projects;
+        l(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Worktrees);
+        l(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Sessions);
+        l(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Sessions, "stops at sessions, as → does");
+        assert!(
+            app.overlay.is_none(),
+            "l no longer opens the add-link prompt"
+        );
+
+        h(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Worktrees);
+        h(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Projects);
+        h(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Projects, "stops at projects, as ← does");
+        assert!(app.overlay.is_none(), "h no longer opens the hosts picker");
+    }
+
+    #[test]
+    fn shift_l_adds_a_link_to_the_selected_worktree() {
         let mut app = App::new();
         seed_tree(&mut app);
         app.focus = Focus::Sessions;
         let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('L'), KeyModifiers::SHIFT, &mut out);
         let Some(Overlay::Prompt(p)) = &app.overlay else {
             panic!("expected the add-link prompt, got {:?}", app.overlay);
         };
@@ -15799,13 +15834,16 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
-    fn h_opens_hosts_picker_newest_first() {
+    fn shift_h_opens_hosts_picker_newest_first() {
         with_seeded_hosts(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('H'), KeyModifiers::SHIFT, &mut out);
             let Some(Overlay::Hosts(view)) = &app.overlay else {
-                panic!("h should open the hosts picker, got {:?}", app.overlay);
+                panic!(
+                    "shift+h should open the hosts picker, got {:?}",
+                    app.overlay
+                );
             };
             assert_eq!(view.hosts.len(), 2);
             assert_eq!(view.hosts[0].host, "new@two", "most recent first");
@@ -15832,7 +15870,7 @@ diff --git a/src/b.rs b/src/b.rs
         with_seeded_hosts(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('H'), KeyModifiers::SHIFT, &mut out);
             press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(app.should_quit, "Enter hands off by quitting");
@@ -15848,7 +15886,7 @@ diff --git a/src/b.rs b/src/b.rs
         with_seeded_hosts(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('H'), KeyModifiers::SHIFT, &mut out);
             press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
             match &app.overlay {
                 Some(Overlay::Hosts(view)) => {
@@ -15869,7 +15907,7 @@ diff --git a/src/b.rs b/src/b.rs
         with_seeded_hosts(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('H'), KeyModifiers::SHIFT, &mut out);
             // Draw once so the modal writes back its hit-test rects.
             let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
             terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
@@ -15893,7 +15931,7 @@ diff --git a/src/b.rs b/src/b.rs
             // Reopened, a click outside the modal closes it.
             app.should_quit = false;
             app.pending_ssh = None;
-            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('H'), KeyModifiers::SHIFT, &mut out);
             terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
             handle_mouse(
                 &mut app,
@@ -15910,7 +15948,7 @@ diff --git a/src/b.rs b/src/b.rs
         with_seeded_hosts(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('H'), KeyModifiers::SHIFT, &mut out);
             press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
             // While typing, list verbs are just characters — q must not
             // close, d must not delete.
@@ -15943,7 +15981,7 @@ diff --git a/src/b.rs b/src/b.rs
         with_seeded_hosts(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('H'), KeyModifiers::SHIFT, &mut out);
             press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             match &app.overlay {
@@ -15970,7 +16008,7 @@ diff --git a/src/b.rs b/src/b.rs
         crate::hosts::with_hosts_path(path, || {
             let mut app = App::new();
             let mut out = Vec::new();
-            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('H'), KeyModifiers::SHIFT, &mut out);
             assert!(matches!(app.overlay, Some(Overlay::Hosts(_))));
             let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
             terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
