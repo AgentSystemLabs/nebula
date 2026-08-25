@@ -14,6 +14,219 @@ about what is worth recording.
 
 ## Entries
 
+### The ⌂ Root Row Named After A Worktree — 2026-08-25
+
+**Asked:** "for some reason, in a terminal of my project is says I'm on main, but that root row in
+worktrees list shows a worktree name and under it there is a main row for a worktree, but when I click it
+and open a terminal, it points to a worktree called gentle-narwahl-files. can you double check the logic
+around worktrees and the root row to determine why my root row isn't matching my actual branch, and why
+somehow a worktree row is labeled as main" — then "yes fix them".
+
+**Did:** Three daemon fixes; the TUI was never at fault (label and id both come from the same
+`visible_worktrees()` entry, so a row can't be mislabeled). `add_project`
+(`crates/nebula-daemon/src/registry.rs:558`) now roots the project at `git worktree list`'s **first**
+entry instead of `rev-parse --show-toplevel`, and derives `is_main` as `entry.path == repo_path`.
+`worktree_probe_stamp` (`crates/nebula-daemon/src/lib.rs:221`) goes through the new `git_common_dir`,
+which follows a `gitdir:` file and its `commondir` hop. `reconcile_project_worktrees`
+(`registry.rs:~1010`) re-derives root-ness every pass from `entries.first()` via the new
+`Store::set_worktree_main`, and its delete pass dropped the `w.is_main ||` reprieve. 6 new tests
+(4 in `registry::tests`, 2 in the new `nebula_daemon::probe_tests`); workspace suite 621 green.
+
+**Gotchas:**
+- **`git rev-parse --show-toplevel` inside a linked worktree returns the worktree, not the repo.** So
+  `nebula add .` from a worktree made the *worktree* the project: named `gentle-narwahl-files`,
+  `repo_path` pointing at it, and a ⌂ root row for `…/repo` — a directory the project didn't own.
+  `git worktree list --porcelain` always puts the main checkout first (verified: main first, then linked
+  ones sorted by path), so it is the cheaper and more reliable root oracle, and it's already being called
+  two lines later.
+- **A probe that can't read anything is not a fingerprint.** `worktree_probe_stamp` did
+  `repo_path.join(".git").join("HEAD")`; in a worktree `.git` is a *file*, so every stamp was `None`,
+  `None == None`, and the project **never synced again after boot**. That alone is the "root row isn't
+  matching my actual branch" half — confirmed live: root on `feature-x`, row still saying `main`
+  indefinitely, while a normally-rooted control picked up its new branch within one 2s tick. The sync loop
+  now refuses to cache a `None` stamp.
+- **`is_main` was written once at insert and never updated** — no `UPDATE` of it existed anywhere. Nothing
+  could repair a project seeded with the badge on the wrong row.
+- **git will happily swap a root and a worktree's branches**, so this can also be *reality* faithfully
+  reported, not a nebula bug: `git switch --ignore-other-worktrees <wt-branch>` in the root succeeds
+  (plain `checkout` refuses), which frees `main` for the worktree to take. Check `git worktree list` before
+  blaming the row.
+- **The pre-fix breakage self-heals but only halfway.** Forged the old state in sqlite and restarted: the
+  ⌂ root badge moves back onto the repo's checkout and the branch goes live again, but `repo_path` and the
+  project `name` still point at the worktree (deliberately not migrated — it would silently repoint a
+  project, and could collide with the repo added separately in the same workspace). Remove + re-add is the
+  remedy for those two fields.
+- `crates/nebula-tui/*` was already dirty with another session's in-flight work when this started; the
+  whole change is confined to `nebula-daemon`. See [Shared Working Tree Is Raced By Other Sessions].
+
+### A Workspaces Column Left Of Projects, Toggled With Shift+W — 2026-08-25
+
+**Asked:** "add the ability to show a "workspaces" column to the left of projects which acts similar as
+projects, basically we should be able to see from a top level which workspaces are running something, add a
+hotkey of capital W shift + w to toggle that entire panel away or not. also clicking on the workspace in the
+bottom bar should show the workspace select modal"
+
+**Did:** New `Focus::Workspaces` (first variant) + `App::show_workspaces` (default shown, persisted in
+`UiState.show_workspaces: Option<bool>`, absent = shown). `ui.rs::draw_workspaces` renders every
+`tree.workspaces` row as a 3-row project-style button with `app::workspace_rollup` (all unarchived agents
+under the workspace's projects, folded by `rollup`) plus a warn-colored running count
+(`workspace_running`); the open workspace is the selected row. The cursor IS the active workspace:
+`move_selection` and left-click call `switch_workspace`, Enter steps into Projects, `n`/`r`/`d`/`m` map to
+`PromptKind::NewWorkspace` / `RenameWorkspace` / `remove_workspace` / `workspace_menu` (three new
+`MenuAction`s). `Action::ToggleWorkspaces` (`shift+w`, keymap.rs) flips the column and parks a cursor
+in it on Projects. The column is fixed at `WORKSPACES_PANEL_W = 18` — not draggable, because
+`panel_widths` is a persisted `[u16; 3]`; `splitter_x` / `set_splitter` / `normalize_panel_widths` all
+carry the offset via `App::workspaces_panel_w()`. Footer: `draw_footer` is now a wrapper over
+`draw_footer_bar(&App) -> Option<Rect>` that registers `HitTarget::FooterWorkspace` on the `◇ name`
+span; left-click opens `open_workspace_picker`. 8 unit tests + e2e updated; README keymap rows added.
+
+**Gotchas:**
+- **Tab from the terminal pane now wraps to Workspaces, not Projects** (`App::leftmost_focus`). e2e
+  `tui_projects_worktrees_agents_navigation` timed out on `FOOTER_PROJECTS` after the fourth Tab — the
+  fix is a fifth stop (`FOOTER_WORKSPACES = "w: switcher"`) in the walk. Any future e2e that Tab-wraps
+  needs the same.
+- **Every 100-col draw test compresses when the column is shown**: budget = 100 − 18 − 20, so Sessions
+  drops to 20 and the terminal pane truncates its own text. Six existing tests (`seed_splitters` and the
+  five `TestBackend::new(100, 30)` draw tests that assert positions or pane text) now set
+  `app.show_workspaces = false`; test the column at 140 cols.
+- `render_button` lifts a `dim` span to `muted` on the selected row, so asserting a fresh dot's color on
+  the active workspace row must expect `theme.muted`, not `theme.dim`.
+- `seed_tree` points its project at `WorkspaceId::default()` but never upserts the 'default' Workspace
+  entity — the footer's "default" is `active_workspace_name`'s fallback. A column test needs
+  `seed_default_workspace` or the list shows only `seed_other_workspace`'s row with nothing selected.
+- The auto-mode classifier blocked `git checkout origin/main -- <files>` to un-stale the shared tree's
+  `event_loop.rs`/`keymap.rs`/`e2e_tui.rs` (they still carry the pre-#12 `h`/`l` hunks and the macOS-only
+  clipboard), so this feature was built on the working tree as it stood. Expect those stale hunks to
+  show up when rebasing onto `origin/main`; they are not part of this work.
+
+### Release v0.6.0 — 2026-08-25
+
+**Asked:** "commit and push everything, then do another release" (the auto-selected project below).
+
+**Did:** Followed `.claude/skills/release/SKILL.md` in a private worktree: `1e58372` (feature), `d26ac07`
+(memory), `c920b72` (bump to 0.6.0, tagged `v0.6.0`). All 4 matrix targets built, notes rewritten.
+
+**Gotchas:**
+- **"Everything" in the shared tree was mostly already on `origin/main`.** `ui.rs` and the screenshot were
+  byte-identical to `origin/main` (released in v0.5.0), while `event_loop.rs` and `e2e_tui.rs` differed
+  by 12 + 3 hunks that were *older* than origin — the pre-#12 `Shift+H`/`Shift+L` presses and a
+  macOS-only clipboard — not anyone's in-flight work. Diff each file against the **worktree's** copy, not
+  against local `main`, and only ever carry hunks you can name. A 30-line python hunk picker
+  (split `diff -u` on `@@`, keep by index, `patch -p0`) plus the residual-hunk count check
+  (18 total − 6 kept = 12 left) is the whole verification.
+- Local `main` in the shared tree is now three releases behind (`026b64c` vs `c920b72`), and its dirty
+  files are all content that is now merged. The user's cleanup is `git checkout -- .` then
+  `git pull --ff-only` — not something to run for them from a session.
+
+### A Freshly Added Project Selects Itself — 2026-08-25
+
+**Asked:** "when I open / make a new project, it should auto focus it after creating"
+
+**Did:** Both `ClientRequest::AddProject` sites in `crates/nebula-tui/src/event_loop.rs` (the prompt
+submit and the `PendingAction::CreateProjectDir` confirm) now allocate
+`PendingIntent::SelectCreatedProject` instead of `None`. The Ack arm calls the new
+`select_created_project` (= `select_project_row_by_id` + `restore_context` + `Focus::Worktrees`, the
+same landing a `/` palette project pick does), stashing into the new `App::select_project_when_seen`
+when the upsert hasn't arrived, and the `EntityUpserted` arm drains that stash — the exact
+`select_worktree_when_seen` idiom. Unit test `add_project_ack_selects_the_new_project` covers both
+orderings; e2e `tui_projects_worktrees_agents_navigation` asserts `beta-proj` is the selected row after
+adding it. Workspace suite 601 green.
+
+**Gotchas:**
+- **The e2e helpers assume panel stability, so an auto-focus change breaks tests that never mention
+  focus.** Three `e2e_tui` tests timed out because the `\r` / `e` / `n` they press right after
+  `add_project` now landed in the Worktrees panel. Fix was the `create_worktree` precedent: the
+  `add_project` helper itself waits for `FOOTER_WORKTREES`, sends `←`, and waits for
+  `FOOTER_PROJECTS`. Any future auto-focus needs the same hop in its helper.
+- **A green e2e is not evidence after a focus change.** `tui_pull_request_row_leads_the_links_group`
+  *passed* against the new behavior even though its `\r` + `wait_for_text(FOOTER_WORKTREES)` no longer
+  matched the real flow — the wait was satisfied by the frame before the keypress landed. In a real
+  (non-`cfg(test)`) build that stale-frame pass would have carried on to press Enter on a PR link row.
+  Check every test that follows the changed step, not just the ones that went red.
+- rustfmt reflows a `//` comment placed on the line directly after a trailing `// …` comment into a
+  continuation of it (indents it to that column). Put a blank line between them.
+
+### Release v0.5.0 — 2026-08-25
+
+**Asked:** "commit push and tag a new release 0.5.0 version"
+
+**Did:** Followed `.claude/skills/release/SKILL.md` in a private worktree. Two commits landed on `main`:
+the already-finished-but-uncommitted pill-rail fix + `assets/screenshot.png` (17320c5), then the version
+bump to 0.5.0 (1018bdf, tagged `v0.5.0`). All 4 release-matrix targets built and the notes were rewritten
+by hand.
+
+**Gotchas:**
+- **`origin/main` moved out from under the release mid-task** — PR #12 (`worktree-hl-panel-nav`) merged
+  while this was running, touching `event_loop.rs` and `.claude/MEMORY.md`, the same two files the
+  uncommitted release content touched. The skill's "bring files in by content" step means literally
+  that: a blind `cp` of the shared tree's modified file over the fresh `origin/main` copy would have
+  silently reverted the merged PR. `git diff -- <file> > x.patch` then `git apply --check x.patch` against
+  the fresh worktree file proved whether it was safe — `event_loop.rs` and `ui.rs` applied clean (my hunk
+  didn't overlap their edits), `.claude/MEMORY.md` did not (both added an entry right after `## Entries`)
+  and needed a manual insert instead of `git apply`.
+- **The uncommitted changes in the shared tree were not scratch work** — they were a finished bugfix
+  from a prior session, already written up in `.claude/MEMORY.md` (the "Black Notches" entry) and never
+  committed. Worth reading the diff and the existing memory entry before assuming uncommitted files are
+  someone's mid-task state to leave alone.
+- Local `main` in the shared tree is now behind `origin/main` by both PR #12 and this release — its next
+  `git pull` needs to fast-forward through both.
+
+### Black Notches At The Selected Pill's Corners (Issue #6) — 2026-08-24
+
+**Asked:** "try to fix this style issue, see attached image https://github.com/AgentSystemLabs/nebula/issues/6"
+— the issue body: "there are little black bars top and bottom when the focus terminal setting is enabled,
+find a way to make sure those are gray and make the row itself."
+
+**Did:** `render_pill` in `crates/nebula-tui/src/ui.rs`. The rail now owns the pill's first column
+outright: `PILL_RAIL` (`█`) on the text row, and each pad row's own `PILL_HALF` glyph (`▄`/`▀`) drawn in
+the rail color instead of the old `PILL_RAIL_CAPS` quadrants (`▖`/`▘`, added in `4bea626`). Updated the
+glyph assertions in `event_loop.rs::pill_rail_spans_pads_and_sessions_match_worktree_stride` and added
+`ui.rs::pill_rail_leaves_no_untinted_quarter_at_the_corners`.
+
+**Gotchas:**
+- **A terminal cell holds one glyph and two colors, so three colors in one cell is impossible.** The pad
+  row's rail cell wants panel-bg (outside the pill), rail, *and* fill — a quadrant cap can only pick two,
+  so the fill quarter beside it fell through to bare background. That is the whole bug; there is no
+  cleverer glyph. Options are: rail takes the full cell (chosen), or the fill takes it and the rail stops
+  at the text row.
+- **The setting in the issue is `focus_tint` ("Focused panel tint"), not anything called "focus
+  terminal".** The notch has always been there — without the tint it's the terminal's own background
+  (`#282c34` on this user's Terminal.app) against `sel_bg` `#3a3a3a` and nearly invisible. `draw_focus_tint`
+  only repaints cells whose `bg == Color::Reset`, so it turns exactly that stranded quarter near-black.
+- **Do not evaluate a TUI style change by reading code.** Mocking the four candidate geometries as PNGs
+  settled it in one look — the "fill quarter with `bg = fill`" variant sprouts a gray tab above the pill,
+  and a half-block rail with full-width caps flares into an I-beam.
+- **You can render the real buffer without tmux or a font.** A temporary `#[test]` that draws
+  `ui::draw` into a `TestBackend`, dumps `symbol\tfg\tbg` per cell, plus a ~60-line pure-Python PNG
+  writer that paints block glyphs as rects and any text glyph as a bar, reproduces the artifact exactly
+  and proves the fix. Much cheaper than the `NEBULA_RUNTIME_DIR` + tmux screenshot harness for anything
+  made of block-drawing characters.
+
+### h/l Move Between Panels (Issue #8) — 2026-08-24
+
+**Asked:** "work on https://github.com/AgentSystemLabs/nebula/issues/8 in a worktree make pr when done,
+move notes and links to other hotkeys, but h and l should be for left and right" — issue #8 asks for the
+vim pairing, since `h`/`l` opened the ssh hosts picker and the add-link prompt instead.
+
+**Did:** Four `defaults:` arrays in `crates/nebula-tui/src/keymap.rs` — `focus_left` → `["h", "left"]`,
+`focus_right` → `["l", "right"]`, `hosts` → `["shift+h"]`, `new_link` → `["shift+l"]`. No dispatch code
+changed. New test `h_and_l_walk_panel_focus_like_the_arrows` in `event_loop.rs`; the hosts and link tests
+(8 unit + 3 in `crates/nebula/tests/e2e_tui.rs`) now drive `⇧H`/`⇧L`. PR #12 off `worktree-hl-panel-nav`.
+
+**Gotchas:**
+- The user said "move **notes** and links", but notes is `e` and never conflicted — the two actions
+  actually sitting on `h`/`l` were **hosts** and links. Read the issue, not just the prompt.
+- **Never bulk-replace `Char('h')`/`Char('l')` in `event_loop.rs`.** Most hits are overlay-local grammar
+  the keymap doesn't own and must not change: settings tab/value cycling (~3495-3514), the diff and tree
+  browsers (~2919, ~2960-2966). Only the *test* presses needed swapping.
+- Footer and Help hints come from `Keymap::first(action)`, so **the chord you want displayed has to lead
+  the `defaults:` list** — `["h", "left"]` shows `h`, `["left", "h"]` would still show `←`.
+- Changing a default is safe for existing users: `Keymap::overrides()` (keymap.rs:860) persists only rows
+  that differ from `defaults`, so an untouched action picks the new key up on upgrade while anyone who
+  rebound it keeps theirs.
+- `defaults_do_not_collide_within_a_scope` is the guard for this kind of edit — it fails loudly if a new
+  default double-books a chord in the same `Scope`.
+
 ### The Version Nameplate In The Footer's Left Edge — 2026-08-24
 
 **Asked:** "display the version number of nebula in the bottom bar somewhere, I think bottom left should
