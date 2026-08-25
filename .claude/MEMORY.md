@@ -14,6 +14,25 @@ about what is worth recording.
 
 ## Entries
 
+### Release v0.6.0 — 2026-08-25
+
+**Asked:** "commit and push everything, then do another release" (the auto-selected project below).
+
+**Did:** Followed `.claude/skills/release/SKILL.md` in a private worktree: `1e58372` (feature), `d26ac07`
+(memory), `c920b72` (bump to 0.6.0, tagged `v0.6.0`). All 4 matrix targets built, notes rewritten.
+
+**Gotchas:**
+- **"Everything" in the shared tree was mostly already on `origin/main`.** `ui.rs` and the screenshot were
+  byte-identical to `origin/main` (released in v0.5.0), while `event_loop.rs` and `e2e_tui.rs` differed
+  by 12 + 3 hunks that were *older* than origin — the pre-#12 `Shift+H`/`Shift+L` presses and a
+  macOS-only clipboard — not anyone's in-flight work. Diff each file against the **worktree's** copy, not
+  against local `main`, and only ever carry hunks you can name. A 30-line python hunk picker
+  (split `diff -u` on `@@`, keep by index, `patch -p0`) plus the residual-hunk count check
+  (18 total − 6 kept = 12 left) is the whole verification.
+- Local `main` in the shared tree is now three releases behind (`026b64c` vs `c920b72`), and its dirty
+  files are all content that is now merged. The user's cleanup is `git checkout -- .` then
+  `git pull --ff-only` — not something to run for them from a session.
+
 ### A Freshly Added Project Selects Itself — 2026-08-25
 
 **Asked:** "when I open / make a new project, it should auto focus it after creating"
