@@ -14,6 +14,110 @@ about what is worth recording.
 
 ## Entries
 
+### `nebula browser` Terminal Stopped ~24 Columns Short — 2026-08-25
+
+**Asked:** "when running nebula browser, there is a bunch of empty space in the right side of the terminal
+panel... fix this. running nebula in iterm or ghostty doesn't have this extra space"
+
+**Did:** One line of ttyd args: `ttyd_args` (`crates/nebula/src/browser.rs:87`) now passes
+`-t fontSize=13`, plus a test `a_font_client_option_is_passed_so_ttyd_refits_after_the_renderer_swap`.
+The TUI was never at fault — it filled every column it was given; the xterm.js **grid** was too narrow.
+Measured before/after through the real `nebula browser` at a 1600px window: 201 cols / 1407px grid /
+183px dead → 225 cols / 1575px grid / 15px. Rejected `-t rendererType=dom` (also fills the width, since
+the DOM renderer never rounds — but it is the slow renderer for a TUI that redraws constantly).
+
+**Gotchas:**
+- **The cause is a measure/render split inside xterm, invisible to the server.** ttyd calls
+  `fitAddon.fit()` right after `Terminal.open()`, while the **DOM** renderer is live and
+  `dimensions.css.cell.width` is the raw measured advance (7.8267px at size 13, Menlo).
+  `cols = floor(avail / cellWidth)` → 201. ttyd *then* swaps in WebGL/canvas, which **floors the cell to
+  a whole pixel (7px)** and never re-fits. 201 × 7 = 1407px of grid in 1590px of page.
+- **`-t fontSize=13` is ttyd's own default and looks like a no-op — it is load-bearing.** ttyd's
+  `applyPreferences` loop ends in `t.options[r]=n, 0===r.indexOf("font") && i.fit()`: *any* client option
+  **named** `font…` buys a second `fit()`, and that one runs after the renderer swap. `rendererType` is
+  merged in ahead of the server's `-t` keys, so the ordering holds. The test guards the flag, the `font`
+  prefix, and its position before `--`.
+- **Rows never showed the bug** — the cell height was already an integer (15px), so flooring changed
+  nothing vertically. A "why is only the width wrong" symptom is the tell for integer-rounding of a cell.
+- **`ps` renders `-t fontSize=13` as `-t fontSize 13`.** ttyd's `strsep(&option, "=")` NULs the `=` in
+  argv in place. That is ttyd having *parsed* it, not nebula having passed it wrong.
+- **Scale depends on `devicePixelRatio`.** At dpr 1 (external monitor, headless) the floor is to a whole
+  pixel → ~10% loss; on Retina it floors to a half pixel → ~4%. Don't conclude "not reproducing" from a
+  Retina window alone.
+- **`--virtual-time-budget` cannot screenshot ttyd** — it fast-forwards timers and tears the page down
+  while the PTY bytes are still arriving in real time. Drive Chrome over CDP instead: launch
+  `--headless=new --remote-debugging-port=9333 --user-data-dir=/tmp/cdp-profile --window-size=1600,1000`,
+  then `Page.navigate` + a real `setTimeout` + `Page.captureScreenshot`. Node 22 has a global `WebSocket`,
+  so the whole client is ~25 dependency-free lines.
+- **ttyd exposes the live terminal as `window.term`** (no React/preact fiber to dig through — the
+  container has no framework keys). `window.term._core._renderService.dimensions` and
+  `_charSizeService.width` are what prove a measure/render mismatch; the `.xterm-helper-textarea`'s inline
+  `width`/`height` are the rendered cell dimensions if you only need a quick read.
+- A `make browser` run of your own leaves a `ttyd … ~/.cargo/bin/nebula` on 7681 that is **the user's**,
+  not test residue. Match on the port you started before `pkill`.
+
+### The Workspaces Column Drags To Resize — 2026-08-25
+
+**Asked:** "also allow dragging the workspaces panel to resize like we do on the other panels"
+
+**Did:** Reversed the "not draggable" decision from [A Workspaces Column Left Of Projects]. The column's
+width moved out of the `WORKSPACES_PANEL_W` const into `App::workspaces_w`
+(`crates/nebula-tui/src/app.rs:1894`), seeded from `DEFAULT_WORKSPACES_PANEL_W = 18` and persisted as its
+own `UiState::workspaces_w: Option<u16>` field rather than as a fourth slot in `panel_widths` — that blob
+stays `[u16; 3]`, so every saved layout still deserializes. **`HitTarget::Splitter(usize)` was reindexed:
+0 is now the workspaces|projects boundary, and the three old splitters became 1/2/3.** New
+`App::splitter_indices() -> Range<usize>` returns `0..4` or `1..4` depending on `show_workspaces`; both
+`ui.rs` loops (grab-zone registration at `ui.rs:78` and `draw_splitter_grips`) iterate it instead of
+`0..3`. `splitter_x` dropped its inclusive range (`panel_widths[..idx]`, not `[..=idx]`) so idx 0
+naturally means "the column's right edge". Drag/hover/pointer-shape handling in `event_loop.rs` needed no
+changes at all — it was already index-generic. 2 new tests, 4 updated; whole workspace suite green (440
+tui unit + 21 e2e_pty + 6 e2e_tui + 133 daemon).
+
+**Gotchas:**
+- `set_splitter(0, …)` is *not* the same shape as the other three: the column starts at x=0, so the
+  boundary x IS the width — no `offset + left` subtraction. Reusing the panel branch gives a column that
+  drifts under the cursor.
+- `normalize_panel_widths` had to clamp `workspaces_w` **before** computing the panel budget
+  (`max = body_w - 3*MIN_PANEL_W - MIN_TERM_W`). Without it, a width dragged out on a wide screen
+  survives into a narrow one, the budget goes to zero, all three panels floor at `MIN_PANEL_W` anyway,
+  and the layout overflows the body.
+- The grip for splitter 0 lands on the Workspaces panel's own `Borders::RIGHT` cell, which exists — but
+  a body only 120 wide with the default panels caps the column at 26 (`120 - 74 - MIN_TERM_W`), so a test
+  that drags it to 30 and asserts 30 fails at 26. Pick drag targets inside that headroom.
+- `seed_splitters` in `event_loop.rs` tests still hides the column (its `x = 20, 42, 68` depend on it),
+  so its loop is `app.splitter_indices()` = `1..4` — every assertion in the drag/hover tests that read
+  `idx == 0` for the projects|worktrees boundary had to become `1`.
+
+### `make dev` Showed v0.4.0 And No Projects — 2026-08-25
+
+**Asked:** "still when I run make dev, it shows version v0.4.0 in the bottom left and now it seems like
+all my projects and workspaces are done [gone]"
+
+**Did:** Two unrelated causes. (1) The shared checkout was still at `026b64c` / `Cargo.toml` 0.4.0 while
+`origin/main` was at v0.7.0 — every release since had been cut from a private worktree and never pulled
+back, so `make dev` (which builds *this* checkout) faithfully reported 0.4.0. Synced it: `git stash -u`
+(kept as `stash@{0}` for safety), `git pull --ff-only`, then restored only the `Makefile` from the stash.
+(2) `make dev` runs with `NEBULA_DATA_DIR=~/.nebula-dev`, a deliberately separate DB, so it had zero
+projects by design. Added `dev-seed` (Makefile) — on the first `make dev` it `sqlite3 .backup`s the real
+DB into the dev dir, `DELETE`s `agents` and `terminals`, and copies `config.json`/`reviewed.json`; plus
+`dev-reset` (wipe, so the next run re-seeds) and `make dev SEED=0` (start blank). Verified: dev DB got
+7 projects / 3 workspaces / 9 worktrees / 0 agents, real DB untouched, and `nebula workspace list` against
+the dev env booted a 0.7.0 dev daemon on it with a clean log.
+
+**Gotchas:**
+- **The real data dir is `~/Library/Application Support/dev.nebula.nebula/`** on macOS
+  (`directories::ProjectDirs::from("dev","nebula","nebula")`, `nebula-core/src/paths.rs`);
+  `$XDG_DATA_HOME/nebula` on Linux. Nothing prints it — the Makefile mirrors the rule by hand.
+- Every dirty file in the shared tree except the `Makefile` was either byte-identical to `origin/main` or
+  *older* than it (the pre-#12 `h`/`l` bindings and the macOS-only clipboard) — the same stale hunks the
+  v0.6.0/v0.7.0 entries describe. `git diff origin/main -- <file> | grep -c ^@@` per file is the quick
+  way to tell in-flight work from leftovers before discarding anything.
+- Agent rows are only spawned lazily (`Registry::ensure_session`, `registry.rs:~1857`), so copying
+  `agents` would not have launched anything at boot — they're dropped anyway so the dev instance can't
+  `--resume` your live claude sessions.
+- `sqlite3 ".backup"` reads the WAL, so the snapshot is consistent with the real daemon still running;
+  a plain `cp nebula.db` would miss everything in `nebula.db-wal`.
+
 ### Release v0.7.0 — Merge, Don't Copy, When The Shared Tree Is Behind — 2026-08-25
 
 **Asked:** "commit and push and make a next version release"
@@ -103,9 +207,9 @@ under the workspace's projects, folded by `rollup`) plus a warn-colored running 
 `move_selection` and left-click call `switch_workspace`, Enter steps into Projects, `n`/`r`/`d`/`m` map to
 `PromptKind::NewWorkspace` / `RenameWorkspace` / `remove_workspace` / `workspace_menu` (three new
 `MenuAction`s). `Action::ToggleWorkspaces` (`shift+w`, keymap.rs) flips the column and parks a cursor
-in it on Projects. The column is fixed at `WORKSPACES_PANEL_W = 18` — not draggable, because
-`panel_widths` is a persisted `[u16; 3]`; `splitter_x` / `set_splitter` / `normalize_panel_widths` all
-carry the offset via `App::workspaces_panel_w()`. Footer: `draw_footer` is now a wrapper over
+in it on Projects. The column shipped fixed at 18 columns; `splitter_x` / `set_splitter` /
+`normalize_panel_widths` all carry the offset via `App::workspaces_panel_w()`. (Superseded — it is
+draggable now, see [The Workspaces Column Drags To Resize].) Footer: `draw_footer` is now a wrapper over
 `draw_footer_bar(&App) -> Option<Rect>` that registers `HitTarget::FooterWorkspace` on the `◇ name`
 span; left-click opens `open_workspace_picker`. 8 unit tests + e2e updated; README keymap rows added.
 
@@ -819,8 +923,10 @@ a settings toggle to disable animations for CPU.
   the rightmost pane silently vanishes from the capture.
 - Color and animation checks don't need PNGs: `capture-pane -ep` keeps SGR escapes; decode with
   `LC_ALL=C sed 's/\x1b\[/¶/g'` and grep for `38;5;N`, capturing 2–3 frames ~350ms apart to prove motion.
-- Chrome headless gets SIGKILLed on this Mac and charmbracelet freeze wrecks the cell grid — use a small
-  pillow grid renderer instead.
+- charmbracelet freeze wrecks the cell grid — use a small pillow grid renderer instead. (This bullet used
+  to also say Chrome headless gets SIGKILLed on this Mac; that is **no longer true** — see
+  [Browser Terminal Stopped ~24 Columns Short], which drives `/Applications/Google Chrome.app` with
+  `--headless=new` over CDP without trouble.)
 
 ### Sessions Auto-Rename Themselves — 2026-08-20
 
