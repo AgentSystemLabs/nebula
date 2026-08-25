@@ -3777,7 +3777,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 }));
                 return;
             }
-            let req_id = app.alloc_req_id(PendingIntent::None);
+            let req_id = app.alloc_req_id(PendingIntent::SelectCreatedProject);
             out.push(ClientRequest::AddProject {
                 req_id,
                 path: expanded,
@@ -3911,7 +3911,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
 fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<ClientRequest>) {
     match action {
         PendingAction::CreateProjectDir(path) => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
+            let req_id = app.alloc_req_id(PendingIntent::SelectCreatedProject);
             out.push(ClientRequest::AddProject {
                 req_id,
                 path,
@@ -4467,6 +4467,22 @@ fn select_worktree_by_id(
     }
     // Land on the sessions panel so `n` immediately creates a session here.
     app.focus = Focus::Sessions;
+    true
+}
+
+/// Land on a project we just added, the way a `/` palette pick of it
+/// would: select its row, show its main checkout, and step into its
+/// Worktrees panel. False when its upsert hasn't arrived yet.
+fn select_created_project(
+    app: &mut App,
+    id: &nebula_core::ProjectId,
+    out: &mut Vec<ClientRequest>,
+) -> bool {
+    if !select_project_row_by_id(app, id) {
+        return false;
+    }
+    restore_context(app, out);
+    app.focus = Focus::Worktrees;
     true
 }
 
@@ -6267,9 +6283,14 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         app.term_locked = true;
                     }
                 }
-                (Some(PendingIntent::SelectCreatedWorktree), Some(EntityId::Worktree(id))) => {
+                (Some(PendingIntent::SelectCreatedProject), Some(EntityId::Project(id))) => {
                     // Its upsert usually lands just before this Ack; if not,
                     // stash the id and select once it does.
+                    if !select_created_project(app, &id, out) {
+                        app.select_project_when_seen = Some(id);
+                    }
+                }
+                (Some(PendingIntent::SelectCreatedWorktree), Some(EntityId::Worktree(id))) => {
                     if !select_worktree_by_id(app, &id, out) {
                         app.select_worktree_when_seen = Some(id);
                     }
@@ -6305,6 +6326,12 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // Fix the selection onto a session we just created — or follow
             // one we just moved into another worktree of this project.
             land_pending_selection(app, out);
+            // ...and onto a project we just added.
+            if let Some(pid) = app.select_project_when_seen.clone() {
+                if select_created_project(app, &pid, out) {
+                    app.select_project_when_seen = None;
+                }
+            }
             // ...and onto a worktree we just created.
             if let Some(wt_id) = app.select_worktree_when_seen.clone() {
                 if select_worktree_by_id(app, &wt_id, out) {
@@ -10135,6 +10162,93 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(app.focus, Focus::Terminal);
         assert!(app.term_locked, "a created terminal takes the input lock");
         assert_eq!(app.sel_session, 1, "selection follows the new terminal row");
+    }
+
+    /// Adding a project lands on it: its row, its main checkout, and the
+    /// Worktrees panel — whether the upsert arrives before the Ack (the
+    /// daemon's usual order) or after it.
+    #[test]
+    fn add_project_ack_selects_the_new_project() {
+        use crate::app::{Overlay, PromptDialog, PromptKind};
+        use nebula_core::{Entity, ProjectId, Worktree};
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("herdr")).unwrap();
+
+        for upsert_first in [true, false] {
+            let mut app = App::new();
+            seed_tree(&mut app); // p1 / w1(main) / a1, selected
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+            app.overlay = Some(Overlay::Prompt(PromptDialog::new(
+                "Add project",
+                "path",
+                format!("{}/herdr", tmp.path().display()),
+                PromptKind::AddProject,
+            )));
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut out,
+            );
+            let Some(ClientRequest::AddProject { req_id, .. }) = out.last() else {
+                panic!("expected AddProject, got {:?}", out.last());
+            };
+            let req_id = *req_id;
+
+            let upsert = |app: &mut App| {
+                hse(
+                    app,
+                    ServerEvent::EntityUpserted {
+                        entity: project("p2", "herdr", 1, false, None),
+                    },
+                );
+                hse(
+                    app,
+                    ServerEvent::EntityUpserted {
+                        entity: Entity::Worktree(Worktree {
+                            id: WorktreeId("w2".into()),
+                            project_id: ProjectId("p2".into()),
+                            path: "/tmp/herdr".into(),
+                            branch: "main".into(),
+                            is_main: true,
+                            pinned: false,
+                            sort_order: 0,
+                        }),
+                    },
+                );
+            };
+            if upsert_first {
+                upsert(&mut app);
+            }
+            hse(
+                &mut app,
+                ServerEvent::Ack {
+                    req_id,
+                    created: Some(EntityId::Project(ProjectId("p2".into()))),
+                },
+            );
+            if !upsert_first {
+                assert_eq!(
+                    app.select_project_when_seen,
+                    Some(ProjectId("p2".into())),
+                    "an Ack ahead of the upsert waits for it"
+                );
+                upsert(&mut app);
+            }
+
+            assert_eq!(
+                app.selected_project().map(|p| p.id.clone()),
+                Some(ProjectId("p2".into())),
+                "upsert_first={upsert_first}: the new project is selected"
+            );
+            assert_eq!(
+                app.selected_worktree().map(|w| w.id.clone()),
+                Some(WorktreeId("w2".into())),
+                "upsert_first={upsert_first}: on its main checkout"
+            );
+            assert_eq!(app.focus, Focus::Worktrees);
+            assert_eq!(app.select_project_when_seen, None);
+        }
     }
 
     #[test]

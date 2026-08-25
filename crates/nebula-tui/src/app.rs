@@ -1253,6 +1253,8 @@ pub enum PendingIntent {
         kind: PromptKind,
         task: String,
     },
+    /// Select the added project and step into its Worktrees panel.
+    SelectCreatedProject,
     /// Select the created worktree in the Worktrees panel.
     SelectCreatedWorktree,
     /// Move the note modal's cursor onto the created note.
@@ -1770,6 +1772,8 @@ pub struct App {
     /// this project (`true` = its leading divider) so the selection can
     /// follow it there.
     pub select_divider_when_seen: Option<(ProjectId, bool)>,
+    /// Project added by us, awaiting its upsert to fix the selection.
+    pub select_project_when_seen: Option<ProjectId>,
     /// Worktree created by us, awaiting its upsert to fix the selection.
     pub select_worktree_when_seen: Option<WorktreeId>,
     /// Note created by us, awaiting its upsert to land the modal's cursor.
@@ -1974,6 +1978,7 @@ impl App {
             startup_workspace: None,
             select_when_seen: None,
             select_divider_when_seen: None,
+            select_project_when_seen: None,
             select_worktree_when_seen: None,
             select_note_when_seen: None,
             select_link_when_seen: None,

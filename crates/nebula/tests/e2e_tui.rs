@@ -327,6 +327,11 @@ fn add_project(tui: &mut TuiHarness, path: &Path, expect_name: &str) {
     // overlay's own text can satisfy the wait (stale-frame race).
     tui.wait_for_gone("Add project");
     tui.wait_for_text(expect_name);
+    // A fresh project auto-selects itself and steps into its Worktrees
+    // panel; hop back to Projects so callers stay panel-stable.
+    tui.wait_for_text(FOOTER_WORKTREES);
+    tui.send(b"\x1b[D"); // ← (h is the hosts picker)
+    tui.wait_for_text(FOOTER_PROJECTS);
 }
 
 fn repo_git(repo: &std::path::Path, args: &[&str]) {
@@ -379,6 +384,11 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.wait_for_text("alpha-proj");
     tui.wait_for_text("main ⌂ root"); // main checkout appears as the root row
 
+    // Adding landed in the new project's Worktrees panel; step back.
+    tui.wait_for_text(FOOTER_WORKTREES);
+    tui.send(b"\x1b[D"); // ←
+    tui.wait_for_text(FOOTER_PROJECTS);
+
     // The live directory browser: typing "…/T/.tmpX/" lists both repos as
     // rows (no Tab needed), then Esc cancels.
     tui.send(b"n");
@@ -391,7 +401,10 @@ fn tui_projects_worktrees_agents_navigation() {
 
     // ---- second project typed the plain way ----
     add_project(&mut tui, &beta, "beta-proj");
-    // First project stays selected; its rows render reversed in the focused panel.
+    // The project just added is the selected one; k walks back up to the
+    // first, whose rows render reversed in the focused panel.
+    tui.wait_for_selected("beta-proj");
+    tui.send(b"k");
     tui.wait_for_selected("alpha-proj");
 
     // ---- Tab cycles focus across all four panes and back ----
