@@ -1,3 +1,4 @@
+mod browser;
 mod ssh;
 mod upgrade;
 
@@ -56,6 +57,12 @@ enum Command {
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
+    },
+    /// Serve this TUI in a web browser via ttyd (loopback only) and open it.
+    Browser {
+        /// Port for ttyd to listen on.
+        #[arg(long, default_value_t = browser::DEFAULT_PORT)]
+        port: u16,
     },
     /// Open nebula on a remote host over ssh (installs it there if missing).
     Ssh {
@@ -123,6 +130,7 @@ fn main() -> Result<()> {
         }
         Some(Command::Kill) => nebula_tui::run_kill(),
         Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),
+        Some(Command::Browser { port }) => browser::run_browser(port),
         Some(Command::Ssh { host, path }) => ssh::run_ssh(&host, path.as_deref()),
         Some(Command::Upgrade { force }) => upgrade::run_upgrade(force),
         Some(Command::StaleDaemonNote) => {

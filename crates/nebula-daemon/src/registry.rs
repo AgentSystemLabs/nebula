@@ -555,6 +555,22 @@ impl Daemon {
                 e.context(format!("{} is not a git repository", path.display()))
             }
         })?;
+        // `--show-toplevel` answers with the checkout it was run in, so inside a
+        // linked worktree it names the worktree rather than the repo. A project
+        // is the repo: root it at the main checkout, which `git worktree list`
+        // always puts first. Adding from inside a worktree used to name the
+        // project after that worktree and leave its ⌂ root row pointing at a
+        // directory the project did not own.
+        let entries = git::list_worktrees(&toplevel)
+            .await
+            .with_context(|| format!("list checkouts of {}", toplevel.display()))?;
+        let repo_path = match entries.first() {
+            Some(main) => main.path.clone(),
+            // git listing no checkout at all for a path it just called a work
+            // tree would leave the root unknowable; refuse rather than seed a
+            // project with no rows, which is how a project loses its root row.
+            None => bail!("git listed no checkout for {}", toplevel.display()),
+        };
         // New projects land in the caller's own workspace; the same repo
         // may be added to any number of workspaces, just not twice to one.
         let workspace_id = match workspace {
@@ -563,16 +579,16 @@ impl Daemon {
         };
         if self
             .store
-            .project_in_workspace(&toplevel, &workspace_id)?
+            .project_in_workspace(&repo_path, &workspace_id)?
             .is_some()
         {
             bail!(
                 "project already added to this workspace: {}",
-                toplevel.display()
+                repo_path.display()
             );
         }
         let name = name.unwrap_or_else(|| {
-            toplevel
+            repo_path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "project".into())
@@ -581,7 +597,7 @@ impl Daemon {
             id: ProjectId::generate(),
             name,
             workspace_id,
-            repo_path: toplevel.clone(),
+            repo_path: repo_path.clone(),
             sort_order: self.store.next_project_sort_order()?,
             divider_after: false,
             divider_label: None,
@@ -594,20 +610,19 @@ impl Daemon {
         });
 
         // Main checkout is modeled as a worktree row; adopt pre-existing
-        // worktrees too so `nebula` matches reality on day one.
-        let entries = git::list_worktrees(&toplevel).await.unwrap_or_default();
-        let mut first = true;
+        // worktrees too so `nebula` matches reality on day one. Root-ness is
+        // the path test the reconcile uses, not insert order — the two agreeing
+        // is what keeps `repo_path` and the ⌂ root row the same directory.
         for entry in entries {
             let worktree = Worktree {
                 id: WorktreeId::generate(),
                 project_id: project.id.clone(),
+                is_main: entry.path == repo_path,
                 path: entry.path.clone(),
                 branch: entry.branch,
-                is_main: first,
                 pinned: false,
                 sort_order: 0,
             };
-            first = false;
             self.store.insert_worktree(&worktree)?;
             self.broadcast(ServerEvent::EntityUpserted {
                 entity: Entity::Worktree(worktree),
@@ -994,6 +1009,13 @@ impl Daemon {
     async fn reconcile_project_worktrees(self: &Arc<Self>, project: &Project) -> Result<bool> {
         let mut adopted = false;
         let entries = git::list_worktrees(&project.repo_path).await?;
+        // git lists the main checkout first, and that — not the order rows
+        // happened to be inserted in — is what makes a row the ⌂ root row.
+        // Deriving it here every pass repairs a project whose rows were seeded
+        // before the root was known, and keeps root-ness following the repo
+        // when the checkouts underneath it change.
+        let main_path = entries.first().map(|e| e.path.clone());
+        let is_root = |path: &Path| main_path.as_deref() == Some(path);
         let (_, worktrees, agents, terminals) = self.store.load_tree()?;
         let ours: Vec<&Worktree> = worktrees
             .iter()
@@ -1004,11 +1026,18 @@ impl Daemon {
                 // Branch switched in place (checkout on the root or inside a
                 // linked worktree): refresh the stored name so the row tracks
                 // reality instead of the branch at adoption time.
-                if known.branch != entry.branch {
-                    self.store
-                        .update_worktree_branch(&known.id, &entry.branch)?;
+                let root = is_root(&entry.path);
+                if known.branch != entry.branch || known.is_main != root {
+                    if known.branch != entry.branch {
+                        self.store
+                            .update_worktree_branch(&known.id, &entry.branch)?;
+                    }
+                    if known.is_main != root {
+                        self.store.set_worktree_main(&known.id, root)?;
+                    }
                     let mut updated = (*known).clone();
                     updated.branch = entry.branch.clone();
+                    updated.is_main = root;
                     self.broadcast(ServerEvent::EntityUpserted {
                         entity: Entity::Worktree(updated),
                     });
@@ -1018,9 +1047,9 @@ impl Daemon {
             let worktree = Worktree {
                 id: WorktreeId::generate(),
                 project_id: project.id.clone(),
+                is_main: is_root(&entry.path),
                 path: entry.path.clone(),
                 branch: entry.branch.clone(),
-                is_main: false,
                 pinned: false,
                 sort_order: 0,
             };
@@ -1031,7 +1060,11 @@ impl Daemon {
             });
         }
         for w in ours {
-            if w.is_main || entries.iter().any(|e| e.path == w.path) {
+            // The main checkout is always somewhere in git's list, so a row
+            // that isn't there is a linked checkout that went away — including
+            // one still carrying an `is_main` from before root-ness was
+            // derived, which no longer earns the row a reprieve.
+            if entries.iter().any(|e| e.path == w.path) {
                 continue;
             }
             let occupied = agents.iter().any(|a| a.worktree_id == w.id)
@@ -3265,6 +3298,173 @@ mod tests {
         daemon.reparent_agents_by_last_cwd(&q);
         assert_eq!(agent_worktree(&daemon, "a1"), "q-feat");
         assert_eq!(agent_worktree(&daemon, "a2"), "q-root");
+    }
+
+    /// `git rev-parse --show-toplevel` answers with the checkout it ran in, so
+    /// `nebula add .` from inside a linked worktree used to make the worktree
+    /// the project: named after the branch directory, `repo_path` pointing at
+    /// it, and a ⌂ root row for a directory the project did not own. The repo
+    /// is the project no matter which of its checkouts you add it from.
+    #[tokio::test]
+    async fn add_project_from_inside_a_worktree_roots_at_the_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        let feat = root.join("repo-worktrees").join("gentle-narwhal-files");
+        git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                &feat.to_string_lossy(),
+                "-b",
+                "gentle-narwhal-files",
+            ],
+        );
+
+        let daemon = test_daemon();
+        daemon.add_project(&feat, None, false, None).await.unwrap();
+
+        let (projects, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        let project = projects.first().expect("project added");
+        assert_eq!(project.repo_path, repo, "project is rooted at the repo");
+        assert_eq!(project.name, "repo", "named after the repo, not the branch");
+
+        let main: Vec<&Worktree> = worktrees.iter().filter(|w| w.is_main).collect();
+        assert_eq!(main.len(), 1, "exactly one root row: {worktrees:#?}");
+        assert_eq!(
+            main[0].path, repo,
+            "the ⌂ root row is the project's own dir"
+        );
+        assert_eq!(main[0].branch, "main");
+        let linked = worktrees
+            .iter()
+            .find(|w| !w.is_main)
+            .expect("the worktree we added from is a plain row");
+        assert_eq!(linked.path, feat);
+        assert_eq!(linked.branch, "gentle-narwhal-files");
+    }
+
+    /// Adding the repo from a worktree of one already in the workspace is the
+    /// same repo, so it collides instead of arriving as a second project.
+    #[tokio::test]
+    async fn adding_a_worktree_of_a_known_repo_is_a_duplicate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        let feat = root.join("repo-worktrees").join("feat");
+        git_in(
+            &repo,
+            &["worktree", "add", &feat.to_string_lossy(), "-b", "feat"],
+        );
+
+        let daemon = test_daemon();
+        daemon.add_project(&repo, None, false, None).await.unwrap();
+        let err = daemon
+            .add_project(&feat, None, false, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already added"),
+            "expected a duplicate error, got: {err}"
+        );
+    }
+
+    /// Root-ness is derived from git's checkout list on every pass, not frozen
+    /// at insert time: a project whose rows were seeded before the root was
+    /// known (or seeded wrong) has its ⌂ root row repaired in place, and the
+    /// stale one loses the reprieve that kept it undeletable.
+    #[tokio::test]
+    async fn reconcile_moves_root_ness_onto_the_checkout_git_lists_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        let feat = root.join("repo-worktrees").join("feat");
+        git_in(
+            &repo,
+            &["worktree", "add", &feat.to_string_lossy(), "-b", "feat"],
+        );
+
+        let daemon = test_daemon();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId("p".into()),
+            name: "p".into(),
+            repo_path: repo.clone(),
+            sort_order: 0,
+            divider_after: false,
+            divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
+        };
+        daemon.store.insert_project(&project).unwrap();
+        // The wrong way round: the linked checkout wears the root badge and
+        // the repo's own checkout is a plain row.
+        seed_worktree(&daemon, "p", "wt", &feat.to_string_lossy(), true);
+        seed_worktree(&daemon, "p", "rt", &repo.to_string_lossy(), false);
+
+        daemon.sync_project_worktrees(&project).await.unwrap();
+
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        let by = |id: &str| worktrees.iter().find(|w| w.id.as_str() == id).unwrap();
+        assert!(by("rt").is_main, "the repo's checkout is the root row");
+        assert!(!by("wt").is_main, "the linked checkout gave the badge back");
+        assert_eq!(by("rt").branch, "main");
+        assert_eq!(by("wt").branch, "feat");
+    }
+
+    /// A row still carrying a stale `is_main` no longer survives its checkout
+    /// going away — the real root is always in git's list, so anything missing
+    /// from it is a linked checkout, whatever flag it happens to hold.
+    #[tokio::test]
+    async fn reconcile_drops_a_vanished_row_that_still_claims_to_be_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+
+        let daemon = test_daemon();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId("p".into()),
+            name: "p".into(),
+            repo_path: repo.clone(),
+            sort_order: 0,
+            divider_after: false,
+            divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
+        };
+        daemon.store.insert_project(&project).unwrap();
+        seed_worktree(&daemon, "p", "rt", &repo.to_string_lossy(), true);
+        seed_worktree(
+            &daemon,
+            "p",
+            "ghost",
+            &root.join("repo-worktrees").join("gone").to_string_lossy(),
+            true,
+        );
+
+        daemon.sync_project_worktrees(&project).await.unwrap();
+
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        assert!(
+            worktrees.iter().all(|w| w.id.as_str() != "ghost"),
+            "the ghost row is gone: {worktrees:#?}"
+        );
+        let rt = worktrees.iter().find(|w| w.id.as_str() == "rt").unwrap();
+        assert!(rt.is_main, "the surviving root row keeps the badge");
     }
 
     fn git_in(repo: &Path, args: &[&str]) {

@@ -884,6 +884,7 @@ fn ui_state_json(app: &App) -> String {
         show_archived: app.show_archived,
         collapsed: app.collapsed,
         panel_widths: Some(app.panel_widths),
+        show_workspaces: Some(app.show_workspaces),
         diff_files_width: Some(app.diff_files_width),
     };
     serde_json::to_string(&state).unwrap_or_else(|_| "{}".into())
@@ -935,6 +936,9 @@ fn restore_ui_state(app: &mut App, json: &str) {
         return;
     };
     app.show_archived = state.show_archived;
+    if let Some(shown) = state.show_workspaces {
+        app.show_workspaces = shown;
+    }
     if let Some(w) = state.panel_widths {
         // Coarse sanity clamp; normalize_panel_widths re-fits to the actual
         // screen on the next draw.
@@ -1257,16 +1261,21 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             app.splash_preview = true;
             app.collapsed = false;
         }
+        // The Workspaces column is in the walk only while it's shown
+        // (`leftmost_focus`); hidden, the walk starts and stops at Projects.
         Action::FocusNext => {
             app.focus = match app.focus {
+                Focus::Workspaces => Focus::Projects,
                 Focus::Projects => Focus::Worktrees,
                 Focus::Worktrees => Focus::Sessions,
                 Focus::Sessions => Focus::Terminal,
-                Focus::Terminal => Focus::Projects,
+                Focus::Terminal => app.leftmost_focus(),
             }
         }
         Action::FocusPrev => {
             app.focus = match app.focus {
+                Focus::Workspaces => Focus::Terminal,
+                Focus::Projects if app.show_workspaces => Focus::Workspaces,
                 Focus::Projects => Focus::Terminal,
                 Focus::Worktrees => Focus::Projects,
                 Focus::Sessions => Focus::Worktrees,
@@ -1275,7 +1284,8 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         }
         Action::FocusLeft => {
             app.focus = match app.focus {
-                Focus::Projects => Focus::Projects,
+                Focus::Workspaces => Focus::Workspaces,
+                Focus::Projects => app.leftmost_focus(),
                 Focus::Worktrees => Focus::Projects,
                 Focus::Sessions => Focus::Worktrees,
                 Focus::Terminal => Focus::Sessions,
@@ -1286,6 +1296,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // Ctrl+← escape hatch).
         Action::FocusTerminal => {
             app.focus = match app.focus {
+                Focus::Workspaces => Focus::Projects,
                 Focus::Projects => Focus::Worktrees,
                 Focus::Worktrees => Focus::Sessions,
                 Focus::Sessions => Focus::Terminal,
@@ -1297,10 +1308,19 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             // chose a session, which is Enter's job — plain focus movement
             // never crosses into the pane (Tab/Ctrl+→ do).
             app.focus = match app.focus {
+                Focus::Workspaces => Focus::Projects,
                 Focus::Projects => Focus::Worktrees,
                 Focus::Worktrees => Focus::Sessions,
                 Focus::Sessions => Focus::Sessions,
                 Focus::Terminal => Focus::Terminal,
+            }
+        }
+        // Show/hide the Workspaces column. Hiding it moves a cursor parked
+        // there onto Projects — there'd be nothing on screen to drive.
+        Action::ToggleWorkspaces => {
+            app.show_workspaces = !app.show_workspaces;
+            if !app.show_workspaces && app.focus == Focus::Workspaces {
+                app.focus = Focus::Projects;
             }
         }
         // Reordering only means anything in the projects panel; elsewhere
@@ -1323,6 +1343,8 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::MoveDown => move_selection(app, 1, out),
         Action::MoveUp => move_selection(app, -1, out),
         Action::Activate => match app.focus {
+            // The cursor already IS the open workspace; Enter steps into it.
+            Focus::Workspaces => app.focus = Focus::Projects,
             Focus::Projects => match app.selected_project_row() {
                 Some(ProjectRow::Divider { project, before }) => {
                     let id = app.tree.projects[project].id.clone();
@@ -1349,6 +1371,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // matter which panel has focus.
         Action::New if !app.tree.has_visible_projects() => open_prompt(app, PromptKind::AddProject),
         Action::New => match app.focus {
+            Focus::Workspaces => open_prompt(app, PromptKind::NewWorkspace),
             Focus::Projects => open_prompt(app, PromptKind::AddProject),
             Focus::Worktrees => {
                 if let Some(p) = app.selected_project() {
@@ -1380,6 +1403,10 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     let id = app.tree.projects[project].id.clone();
                     open_prompt(app, PromptKind::DividerLabel { id, before });
                 }
+            }
+            Focus::Workspaces => {
+                let id = app.tree.active_workspace.clone();
+                open_prompt(app, PromptKind::RenameWorkspace { id });
             }
             _ => {}
         },
@@ -1494,6 +1521,10 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 // Dividers are cheap to recreate — no confirmation dance.
                 (Focus::Projects, Some(ProjectRow::Divider { project, before })) => {
                     remove_divider(app, project, before, out)
+                }
+                (Focus::Workspaces, _) => {
+                    let id = app.tree.active_workspace.clone();
+                    remove_workspace(app, id, out);
                 }
                 _ => open_delete_confirm(app),
             }
@@ -2223,7 +2254,9 @@ fn open_delete_confirm(app: &mut App) {
             Some(SessionRow::Link(l)) => delete_link(app, &l),
             None => {}
         },
-        Focus::Terminal => {}
+        // The Workspaces column's `d` never reaches here (`Action::Delete`
+        // routes it to `remove_workspace`).
+        Focus::Workspaces | Focus::Terminal => {}
     }
 }
 
@@ -2353,7 +2386,7 @@ fn open_delete_all_confirm(app: &mut App) {
                 action: PendingAction::DeleteAllSessions { agents, terminals },
             }));
         }
-        Focus::Projects | Focus::Terminal => {}
+        Focus::Workspaces | Focus::Projects | Focus::Terminal => {}
     }
 }
 
@@ -2753,6 +2786,38 @@ fn reseat_deleted_workspace(app: &mut App, out: &mut Vec<ClientRequest>) {
     switch_workspace(app, fallback, out);
 }
 
+/// Ask the daemon to delete a workspace — no confirm, the same as the
+/// switcher's `d`: it only deletes empty workspaces, so a refusal just
+/// flashes, and when the open one does go the deletion delta reseats this
+/// instance (`reseat_deleted_workspace`).
+fn remove_workspace(app: &mut App, id: WorkspaceId, out: &mut Vec<ClientRequest>) {
+    let req_id = app.alloc_req_id(PendingIntent::None);
+    out.push(ClientRequest::RemoveWorkspace { req_id, id });
+}
+
+/// The Workspaces column's menu (`m`, right-click): the switcher's n / r / d
+/// verbs as rows, for the open workspace.
+fn workspace_menu(app: &App) -> Vec<MenuItem> {
+    let id = app.tree.active_workspace.clone();
+    vec![
+        MenuItem {
+            label: "New workspace".into(),
+            action: MenuAction::NewWorkspace,
+            destructive: false,
+        },
+        MenuItem {
+            label: "Rename workspace".into(),
+            action: MenuAction::RenameWorkspace(id.clone()),
+            destructive: false,
+        },
+        MenuItem {
+            label: "Delete workspace".into(),
+            action: MenuAction::RemoveWorkspace(id),
+            destructive: true,
+        },
+    ]
+}
+
 fn refresh_workspace_picker(app: &mut App) {
     let Some(Overlay::Menu(menu)) = &app.overlay else {
         return;
@@ -2775,6 +2840,10 @@ fn open_context_menu_for_selection(app: &mut App) {
     // Keyboard-invoked menu: anchor near the selected row's panel.
     let at = (30, 4);
     match app.focus {
+        Focus::Workspaces => {
+            let items = workspace_menu(app);
+            open_menu(app, items, at);
+        }
         Focus::Projects => {
             if let Some(ProjectRow::Divider { project, before }) = app.selected_project_row() {
                 let id = app.tree.projects[project].id.clone();
@@ -3777,7 +3846,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 }));
                 return;
             }
-            let req_id = app.alloc_req_id(PendingIntent::None);
+            let req_id = app.alloc_req_id(PendingIntent::SelectCreatedProject);
             out.push(ClientRequest::AddProject {
                 req_id,
                 path: expanded,
@@ -3911,7 +3980,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
 fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<ClientRequest>) {
     match action {
         PendingAction::CreateProjectDir(path) => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
+            let req_id = app.alloc_req_id(PendingIntent::SelectCreatedProject);
             out.push(ClientRequest::AddProject {
                 req_id,
                 path,
@@ -4160,6 +4229,9 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         }
         MenuAction::AddProject => open_prompt(app, PromptKind::AddProject),
         MenuAction::OpenWorkspace(id) => switch_workspace(app, id, out),
+        MenuAction::NewWorkspace => open_prompt(app, PromptKind::NewWorkspace),
+        MenuAction::RenameWorkspace(id) => open_prompt(app, PromptKind::RenameWorkspace { id }),
+        MenuAction::RemoveWorkspace(id) => remove_workspace(app, id, out),
         MenuAction::RemoveProject(id) => {
             if let Some(p) = app.tree.projects.iter().find(|p| p.id == id).cloned() {
                 app.overlay = Some(Overlay::Confirm(ConfirmDialog {
@@ -4470,6 +4542,22 @@ fn select_worktree_by_id(
     true
 }
 
+/// Land on a project we just added, the way a `/` palette pick of it
+/// would: select its row, show its main checkout, and step into its
+/// Worktrees panel. False when its upsert hasn't arrived yet.
+fn select_created_project(
+    app: &mut App,
+    id: &nebula_core::ProjectId,
+    out: &mut Vec<ClientRequest>,
+) -> bool {
+    if !select_project_row_by_id(app, id) {
+        return false;
+    }
+    restore_context(app, out);
+    app.focus = Focus::Worktrees;
+    true
+}
+
 /// Select the Projects-panel row for project `id`, with the manual-move
 /// bookkeeping (drop pending selection-follows, remember the context being
 /// left). Does NOT restore the target's remembered worktree/session — the
@@ -4650,6 +4738,7 @@ fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
 
 fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
     let len = match app.focus {
+        Focus::Workspaces => app.tree.workspaces.len(),
         Focus::Projects => app.project_rows().len(),
         Focus::Worktrees => app.worktree_row_count(),
         Focus::Sessions => app.visible_session_rows().len(),
@@ -4659,6 +4748,7 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
         return;
     }
     let sel = match app.focus {
+        Focus::Workspaces => app.tree.active_workspace_index().unwrap_or(0),
         Focus::Projects => app.sel_project,
         Focus::Worktrees => app.sel_worktree,
         Focus::Sessions => app.sel_session,
@@ -4670,6 +4760,13 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
     }
     // Selecting a different parent resets child selections.
     match app.focus {
+        // The Workspaces cursor is the open workspace itself: stepping is
+        // a switch, with everything a switch entails (remembered context,
+        // re-scoped panels, the daemon told).
+        Focus::Workspaces => {
+            let id = app.tree.workspaces[new].id.clone();
+            switch_workspace(app, id, out);
+        }
         Focus::Projects => {
             // Walking onto a divider keeps its project's context, so the
             // child panels only change when the actual project does.
@@ -5722,6 +5819,15 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         grab_offset: app.splitter_x(i) as i32 - mouse.column as i32,
                     });
                 }
+                // A workspace row opens that workspace here, as ↑/↓ in the
+                // column do; the footer's nameplate opens the switcher.
+                Some(HitTarget::Workspace(i)) => {
+                    if let Some(id) = app.tree.workspaces.get(i).map(|w| w.id.clone()) {
+                        switch_workspace(app, id, out);
+                    }
+                    app.focus = Focus::Workspaces;
+                }
+                Some(HitTarget::FooterWorkspace) => open_workspace_picker(app),
                 Some(HitTarget::Project(i)) => {
                     if app.sel_project != i {
                         app.select_divider_when_seen = None;
@@ -5984,6 +6090,14 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         MouseEventKind::Down(MouseButton::Right) => {
             let at = (mouse.column, mouse.row);
             match app.hit_at(mouse.column, mouse.row) {
+                Some(HitTarget::Workspace(i)) => {
+                    if let Some(id) = app.tree.workspaces.get(i).map(|w| w.id.clone()) {
+                        switch_workspace(app, id, out);
+                    }
+                    app.focus = Focus::Workspaces;
+                    let items = workspace_menu(app);
+                    open_menu_at(app, items, at);
+                }
                 Some(HitTarget::Project(i)) => {
                     app.sel_project = i;
                     app.focus = Focus::Projects;
@@ -6077,6 +6191,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 Some(HitTarget::PanelBg(focus)) => {
                     app.focus = focus;
                     let items = match focus {
+                        Focus::Workspaces => vec![MenuItem {
+                            label: "New workspace".into(),
+                            action: MenuAction::NewWorkspace,
+                            destructive: false,
+                        }],
                         Focus::Projects => vec![MenuItem {
                             label: "Add project".into(),
                             action: MenuAction::AddProject,
@@ -6248,9 +6367,14 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         app.term_locked = true;
                     }
                 }
-                (Some(PendingIntent::SelectCreatedWorktree), Some(EntityId::Worktree(id))) => {
+                (Some(PendingIntent::SelectCreatedProject), Some(EntityId::Project(id))) => {
                     // Its upsert usually lands just before this Ack; if not,
                     // stash the id and select once it does.
+                    if !select_created_project(app, &id, out) {
+                        app.select_project_when_seen = Some(id);
+                    }
+                }
+                (Some(PendingIntent::SelectCreatedWorktree), Some(EntityId::Worktree(id))) => {
                     if !select_worktree_by_id(app, &id, out) {
                         app.select_worktree_when_seen = Some(id);
                     }
@@ -6286,6 +6410,12 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // Fix the selection onto a session we just created — or follow
             // one we just moved into another worktree of this project.
             land_pending_selection(app, out);
+            // ...and onto a project we just added.
+            if let Some(pid) = app.select_project_when_seen.clone() {
+                if select_created_project(app, &pid, out) {
+                    app.select_project_when_seen = None;
+                }
+            }
             // ...and onto a worktree we just created.
             if let Some(wt_id) = app.select_worktree_when_seen.clone() {
                 if select_worktree_by_id(app, &wt_id, out) {
@@ -8468,6 +8598,8 @@ diff --git a/src/b.rs b/src/b.rs
     #[test]
     fn embedded_terminal_renders_pty_output() {
         let mut app = App::new();
+        // Sized for the three panels alone; the Workspaces column is its own test.
+        app.show_workspaces = false;
         seed_tree(&mut app);
         assert_eq!(app.tree.projects.len(), 1);
 
@@ -10083,6 +10215,93 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(app.sel_session, 1, "selection follows the new terminal row");
     }
 
+    /// Adding a project lands on it: its row, its main checkout, and the
+    /// Worktrees panel — whether the upsert arrives before the Ack (the
+    /// daemon's usual order) or after it.
+    #[test]
+    fn add_project_ack_selects_the_new_project() {
+        use crate::app::{Overlay, PromptDialog, PromptKind};
+        use nebula_core::{Entity, ProjectId, Worktree};
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("herdr")).unwrap();
+
+        for upsert_first in [true, false] {
+            let mut app = App::new();
+            seed_tree(&mut app); // p1 / w1(main) / a1, selected
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+            app.overlay = Some(Overlay::Prompt(PromptDialog::new(
+                "Add project",
+                "path",
+                format!("{}/herdr", tmp.path().display()),
+                PromptKind::AddProject,
+            )));
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut out,
+            );
+            let Some(ClientRequest::AddProject { req_id, .. }) = out.last() else {
+                panic!("expected AddProject, got {:?}", out.last());
+            };
+            let req_id = *req_id;
+
+            let upsert = |app: &mut App| {
+                hse(
+                    app,
+                    ServerEvent::EntityUpserted {
+                        entity: project("p2", "herdr", 1, false, None),
+                    },
+                );
+                hse(
+                    app,
+                    ServerEvent::EntityUpserted {
+                        entity: Entity::Worktree(Worktree {
+                            id: WorktreeId("w2".into()),
+                            project_id: ProjectId("p2".into()),
+                            path: "/tmp/herdr".into(),
+                            branch: "main".into(),
+                            is_main: true,
+                            pinned: false,
+                            sort_order: 0,
+                        }),
+                    },
+                );
+            };
+            if upsert_first {
+                upsert(&mut app);
+            }
+            hse(
+                &mut app,
+                ServerEvent::Ack {
+                    req_id,
+                    created: Some(EntityId::Project(ProjectId("p2".into()))),
+                },
+            );
+            if !upsert_first {
+                assert_eq!(
+                    app.select_project_when_seen,
+                    Some(ProjectId("p2".into())),
+                    "an Ack ahead of the upsert waits for it"
+                );
+                upsert(&mut app);
+            }
+
+            assert_eq!(
+                app.selected_project().map(|p| p.id.clone()),
+                Some(ProjectId("p2".into())),
+                "upsert_first={upsert_first}: the new project is selected"
+            );
+            assert_eq!(
+                app.selected_worktree().map(|w| w.id.clone()),
+                Some(WorktreeId("w2".into())),
+                "upsert_first={upsert_first}: on its main checkout"
+            );
+            assert_eq!(app.focus, Focus::Worktrees);
+            assert_eq!(app.select_project_when_seen, None);
+        }
+    }
+
     #[test]
     fn terminal_rows_render_under_terminals_header() {
         let mut app = App::new();
@@ -10099,6 +10318,8 @@ diff --git a/src/b.rs b/src/b.rs
     #[test]
     fn link_rows_render_under_a_links_header() {
         let mut app = App::new();
+        // Sized for the three panels alone; the Workspaces column is its own test.
+        app.show_workspaces = false;
         seed_tree(&mut app);
         seed_link(&mut app, "https://example.dev/spec");
         app.pull_requests.insert(
@@ -10523,6 +10744,8 @@ diff --git a/src/b.rs b/src/b.rs
     #[test]
     fn archived_list_scrolls_by_wheel_and_follows_the_cursor() {
         let mut app = App::new();
+        // Sized for the three panels alone; the Workspaces column is its own test.
+        app.show_workspaces = false;
         seed_tree(&mut app);
         for i in 0..20i64 {
             hse(
@@ -11026,8 +11249,11 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     /// Mirror ui::draw's splitter registration for a 120x35 body with the
-    /// default panel widths (splitters at x = 20, 42, 68).
+    /// default panel widths (splitters at x = 20, 42, 68). The Workspaces
+    /// column is hidden so those x's hold; its offset has its own test
+    /// (`splitters_shift_right_by_the_workspaces_column`).
     fn seed_splitters(app: &mut App) {
+        app.show_workspaces = false;
         app.body_area = ratatui::layout::Rect::new(0, 0, 120, 35);
         for i in 0..3 {
             let x = app.splitter_x(i);
@@ -11274,6 +11500,8 @@ diff --git a/src/b.rs b/src/b.rs
     #[test]
     fn normalize_panel_widths_shrinks_rightmost_first() {
         let mut app = App::new();
+        // The three panels alone; the Workspaces column offset is its own test.
+        app.show_workspaces = false;
         app.panel_widths = [40, 40, 40];
         app.normalize_panel_widths(100);
         assert_eq!(
@@ -11873,6 +12101,8 @@ diff --git a/src/b.rs b/src/b.rs
     #[test]
     fn divider_renders_under_project_row() {
         let mut app = App::new();
+        // Sized for the three panels alone; the Workspaces column is its own test.
+        app.show_workspaces = false;
         seed_tree(&mut app);
         hse(
             &mut app,
@@ -11922,9 +12152,9 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     /// The selection rail on a worktree/session pill runs the pill's full
-    /// visual height — quadrant caps on the half-block pad rows, `▌` on
-    /// the text row — and sessions share the worktrees' 2-row pill stride
-    /// so the two lists read uniformly.
+    /// visual height — the pad's own half-block on the pad rows, a solid
+    /// block on the text row — and sessions share the worktrees' 2-row
+    /// pill stride so the two lists read uniformly.
     #[test]
     fn pill_rail_spans_pads_and_sessions_match_worktree_stride() {
         use nebula_core::{Agent, AgentStatus, Entity, WorktreeId};
@@ -11963,7 +12193,9 @@ diff --git a/src/b.rs b/src/b.rs
         let char_col =
             |line: &str, needle: &str| line.find(needle).map(|b| line[..b].chars().count());
         let at = |row: usize, col: usize| lines[row].chars().nth(col);
-        // rail col ▌, then dot + name: the rail sits one cell left of the dot.
+        // rail col █, then dot + name: the rail sits one cell left of the
+        // dot, and on the pads it wears the same half-block as the fill so
+        // no bare-background quarter is left beside it.
         let rail_check = |name: &str, text: &str, lines: &Vec<&str>| {
             let dot = format!("● {name}");
             let row = lines
@@ -11973,17 +12205,17 @@ diff --git a/src/b.rs b/src/b.rs
             let col = char_col(lines[row], &dot).unwrap() - 1;
             assert_eq!(
                 at(row, col),
-                Some('▌'),
+                Some('█'),
                 "rail on {name}'s text row:\n{text}"
             );
             assert_eq!(
                 at(row - 1, col),
-                Some('▖'),
+                Some('▄'),
                 "rail cap on {name}'s top pad:\n{text}"
             );
             assert_eq!(
                 at(row + 1, col),
-                Some('▘'),
+                Some('▀'),
                 "rail cap on {name}'s bottom pad:\n{text}"
             );
             row
@@ -12098,6 +12330,8 @@ diff --git a/src/b.rs b/src/b.rs
     #[test]
     fn selected_divider_blanks_the_panes_with_a_hint() {
         let mut app = App::new();
+        // Sized for the three panels alone; the Workspaces column is its own test.
+        app.show_workspaces = false;
         seed_tree(&mut app); // p1/w1(main) + agent-1
         let mut out = Vec::new();
         app.focus = Focus::Projects;
@@ -15534,6 +15768,393 @@ diff --git a/src/b.rs b/src/b.rs
         assert!(text.contains("◇ client"), "{text}");
         assert!(text.contains("secret"), "{text}");
         assert!(!text.contains("demo"), "{text}");
+    }
+
+    /// The 'default' workspace as an entity — `seed_tree`'s project points
+    /// at it by id, but nothing lists it until the daemon's row arrives.
+    fn seed_default_workspace(app: &mut App) {
+        use nebula_core::{Entity, Workspace, WorkspaceId};
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Workspace(Workspace {
+                    id: WorkspaceId::default(),
+                    name: "default".into(),
+                }),
+            },
+        );
+    }
+
+    /// A running agent in the other workspace's checkout — the thing the
+    /// Workspaces column exists to surface without opening it.
+    fn seed_background_run(app: &mut App) {
+        use nebula_core::{Agent, AgentId, AgentStatus, Entity, WorktreeId};
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a9".into()),
+                    worktree_id: WorktreeId("w9".into()),
+                    name: "bg-run".into(),
+                    status: AgentStatus::Running,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    alive: true,
+                }),
+            },
+        );
+    }
+
+    // ---- the Workspaces column ----
+
+    /// `Shift+W` shows and hides the Workspaces column. Hiding it parks a
+    /// cursor that was in it on Projects — there's nothing left to drive —
+    /// and showing it again doesn't steal focus back.
+    #[test]
+    fn shift_w_toggles_the_workspaces_column_and_parks_focus() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_default_workspace(&mut app);
+        let mut out = Vec::new();
+        assert!(app.show_workspaces, "shown until hidden");
+
+        app.focus = Focus::Workspaces;
+        press(&mut app, KeyCode::Char('W'), KeyModifiers::SHIFT, &mut out);
+        assert!(!app.show_workspaces);
+        assert_eq!(app.focus, Focus::Projects, "focus leaves the hidden column");
+        press(&mut app, KeyCode::Char('W'), KeyModifiers::SHIFT, &mut out);
+        assert!(app.show_workspaces);
+        assert_eq!(app.focus, Focus::Projects, "showing it doesn't steal focus");
+
+        // The draw follows: the column leads the sidebar, then doesn't.
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[1].starts_with("   WORKSPACES"),
+            "the column leads the sidebar:\n{text}"
+        );
+        assert!(lines[1].contains("PROJECTS"), "{text}");
+        press(&mut app, KeyCode::Char('W'), KeyModifiers::SHIFT, &mut out);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[1].starts_with("   PROJECTS"),
+            "hidden: projects lead again:\n{text}"
+        );
+        assert!(!text.contains("WORKSPACES"), "{text}");
+    }
+
+    /// The column lists every workspace with the rollup of the agents under
+    /// it, so a run in a workspace you don't have open still shows: the
+    /// running dot and a count ride the name, and the open workspace is the
+    /// selected row.
+    #[test]
+    fn workspaces_column_rolls_up_every_workspace() {
+        use nebula_core::{AgentStatus, WorkspaceId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_default_workspace(&mut app);
+        seed_other_workspace(&mut app);
+        seed_background_run(&mut app);
+
+        let other = WorkspaceId("ws2".into());
+        assert_eq!(app.workspace_rollup(&other), Some(AgentStatus::Running));
+        assert_eq!(app.workspace_running(&other), 1);
+        assert_eq!(
+            app.workspace_rollup(&WorkspaceId::default()),
+            Some(AgentStatus::Fresh),
+            "demo's never-run agent"
+        );
+        assert_eq!(app.workspace_running(&WorkspaceId::default()), 0);
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("WORKSPACES · 2"), "{text}");
+        let buffer = terminal.backend().buffer();
+
+        // "● " sits two cells ahead of the name, in the running color; the
+        // count follows the name.
+        let (x, y) = find_cell(&terminal, "client");
+        let dot = &buffer[(x - 2, y)];
+        assert_eq!(dot.symbol(), "●", "{text}");
+        assert_eq!(dot.fg, app.theme.warn, "running dot:\n{text}");
+        let row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect();
+        assert!(row.contains("client 1"), "running count:\n{text}");
+        assert_eq!(
+            buffer[(x - 3, y)].symbol(),
+            " ",
+            "not the open workspace, no rail:\n{text}"
+        );
+
+        // The open workspace's row carries the selection rail.
+        let (x, y) = find_cell(&terminal, "default");
+        assert_eq!(buffer[(x - 3, y)].symbol(), "▌", "selected rail:\n{text}");
+        // A fresh dot is dim, lifted to muted on the selection fill.
+        assert_eq!(buffer[(x - 2, y)].fg, app.theme.muted, "fresh dot:\n{text}");
+    }
+
+    /// ↑/↓ in the column switch workspaces outright — the cursor IS the open
+    /// workspace — and a click on a row does the same.
+    #[test]
+    fn walking_or_clicking_the_workspaces_column_switches_workspace() {
+        use nebula_core::WorkspaceId;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_default_workspace(&mut app);
+        seed_other_workspace(&mut app);
+        let mut out = Vec::new();
+        let other = WorkspaceId("ws2".into());
+
+        app.focus = Focus::Workspaces;
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.tree.active_workspace, other);
+        assert_eq!(
+            app.selected_project().map(|p| p.name.clone()),
+            Some("secret".into()),
+            "the panels re-scope"
+        );
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::OpenWorkspace { id, .. } if *id == other)),
+            "the daemon is told: {out:?}"
+        );
+        assert_eq!(app.focus, Focus::Workspaces, "focus stays in the column");
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.tree.active_workspace, other, "clamps at the end");
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.tree.active_workspace, WorkspaceId::default());
+
+        // Enter steps into Projects, the way Enter on a project steps into
+        // its worktrees.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.focus, Focus::Projects);
+
+        // A click on a row opens that workspace and focuses the column.
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let (x, y) = find_cell(&terminal, "client");
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), x, y),
+            &mut out,
+        );
+        assert_eq!(app.tree.active_workspace, other);
+        assert_eq!(app.focus, Focus::Workspaces);
+        assert_eq!(
+            app.selected_project().map(|p| p.name.clone()),
+            Some("secret".into())
+        );
+    }
+
+    /// The footer's `◇ workspace` nameplate is a button: a click opens the
+    /// switcher — under the splash too, where an empty workspace is exactly
+    /// when you'd want to leave it. The rest of the bar stays inert.
+    #[test]
+    fn clicking_the_footer_workspace_opens_the_switcher() {
+        let mut app = App::new();
+        seed_default_workspace(&mut app);
+        let mut out = Vec::new();
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(app.splash_showing(), "no projects yet");
+        let (x, y) = find_cell(&terminal, "◇ default");
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), x + 3, y),
+            &mut out,
+        );
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.is_workspace_picker()),
+            "under the splash: {:?}",
+            app.overlay
+        );
+
+        app.overlay = None;
+        seed_tree(&mut app);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let (x, y) = find_cell(&terminal, "◇ default");
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), x, y),
+            &mut out,
+        );
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.is_workspace_picker()),
+            "with the panels up: {:?}",
+            app.overlay
+        );
+
+        app.overlay = None;
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), x + 40, y),
+            &mut out,
+        );
+        assert!(app.overlay.is_none(), "the hints aren't a button");
+    }
+
+    /// The three draggable panels start where the Workspaces column ends:
+    /// splitter x's, drag targets and the width budget all carry the offset,
+    /// and drop it when the column is hidden.
+    #[test]
+    fn splitters_shift_right_by_the_workspaces_column() {
+        use crate::app::{DEFAULT_PANEL_WIDTHS, WORKSPACES_PANEL_W};
+        let mut app = App::new();
+        assert!(app.show_workspaces);
+        assert_eq!(app.splitter_x(0), WORKSPACES_PANEL_W + 20);
+        assert_eq!(app.splitter_x(2), WORKSPACES_PANEL_W + 74);
+
+        // Dragging the first boundary to screen x=45 leaves Projects 27
+        // wide: the 18 columns ahead of it aren't its to keep.
+        app.set_splitter(0, 45, 160);
+        assert_eq!(app.panel_widths[0], 27);
+
+        // A 100-wide body: the column comes off the top of the budget
+        // (100 - 18 - 20 for the pane = 62), and Sessions gives up the rest.
+        app.panel_widths = DEFAULT_PANEL_WIDTHS;
+        app.normalize_panel_widths(100);
+        assert_eq!(app.panel_widths, [20, 22, 20]);
+
+        app.show_workspaces = false;
+        assert_eq!(app.splitter_x(0), 20);
+        app.panel_widths = DEFAULT_PANEL_WIDTHS;
+        app.normalize_panel_widths(100);
+        assert_eq!(
+            app.panel_widths, DEFAULT_PANEL_WIDTHS,
+            "80 columns fit them all"
+        );
+        app.set_splitter(0, 45, 160);
+        assert_eq!(app.panel_widths[0], 45);
+    }
+
+    /// Tab / Shift+Tab / ← walk through the column only while it's shown.
+    #[test]
+    fn focus_walk_includes_the_workspaces_column_only_when_shown() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        let go = |app: &mut App, out: &mut Vec<ClientRequest>, code: KeyCode| {
+            press(app, code, KeyModifiers::NONE, out);
+            app.focus
+        };
+
+        app.focus = Focus::Projects;
+        assert_eq!(go(&mut app, &mut out, KeyCode::Left), Focus::Workspaces);
+        assert_eq!(
+            go(&mut app, &mut out, KeyCode::Left),
+            Focus::Workspaces,
+            "stops"
+        );
+        assert_eq!(go(&mut app, &mut out, KeyCode::Right), Focus::Projects);
+        assert_eq!(go(&mut app, &mut out, KeyCode::BackTab), Focus::Workspaces);
+        assert_eq!(go(&mut app, &mut out, KeyCode::BackTab), Focus::Terminal);
+        assert_eq!(go(&mut app, &mut out, KeyCode::Tab), Focus::Workspaces);
+        assert_eq!(go(&mut app, &mut out, KeyCode::Tab), Focus::Projects);
+
+        app.show_workspaces = false;
+        app.focus = Focus::Projects;
+        assert_eq!(
+            go(&mut app, &mut out, KeyCode::Left),
+            Focus::Projects,
+            "hidden: ← stops"
+        );
+        assert_eq!(go(&mut app, &mut out, KeyCode::BackTab), Focus::Terminal);
+        assert_eq!(go(&mut app, &mut out, KeyCode::Tab), Focus::Projects);
+    }
+
+    /// n / r / d in the column act on the open workspace the way the
+    /// switcher's do, and m lists the same three verbs.
+    #[test]
+    fn workspaces_column_verbs_act_on_the_open_workspace() {
+        use nebula_core::WorkspaceId;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_default_workspace(&mut app);
+        let mut out = Vec::new();
+        app.focus = Focus::Workspaces;
+
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Prompt(p)) if p.kind == PromptKind::NewWorkspace),
+            "n: {:?}",
+            app.overlay
+        );
+        app.overlay = None;
+
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
+        match &app.overlay {
+            Some(Overlay::Prompt(p)) => {
+                assert_eq!(
+                    p.kind,
+                    PromptKind::RenameWorkspace {
+                        id: WorkspaceId::default()
+                    }
+                );
+                assert_eq!(
+                    p.input.as_str(),
+                    "default",
+                    "prefilled with the current name"
+                );
+            }
+            other => panic!("r: {other:?}"),
+        }
+        app.overlay = None;
+
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+        assert!(
+            app.overlay.is_none(),
+            "no confirm — the daemon refuses non-empty ones"
+        );
+        assert!(
+            out.iter().any(|r| matches!(
+                r,
+                ClientRequest::RemoveWorkspace { id, .. } if *id == WorkspaceId::default()
+            )),
+            "{out:?}"
+        );
+
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE, &mut out);
+        match &app.overlay {
+            Some(Overlay::Menu(m)) => {
+                let labels: Vec<&str> = m.items.iter().map(|i| i.label.as_str()).collect();
+                assert_eq!(
+                    labels,
+                    ["New workspace", "Rename workspace", "Delete workspace"]
+                );
+                assert!(!m.is_workspace_picker(), "verbs, not the switcher");
+            }
+            other => panic!("m: {other:?}"),
+        }
+    }
+
+    /// The column's visibility rides the persisted UI state, and an older
+    /// blob without the field leaves it shown.
+    #[test]
+    fn show_workspaces_round_trips_through_ui_state() {
+        let mut app = App::new();
+        app.show_workspaces = false;
+        let json = ui_state_json(&app);
+        let mut restored = App::new();
+        restore_ui_state(&mut restored, &json);
+        assert!(!restored.show_workspaces);
+
+        let mut legacy = App::new();
+        restore_ui_state(&mut legacy, r#"{"show_archived":false,"collapsed":false}"#);
+        assert!(legacy.show_workspaces, "absent means shown");
     }
 
     /// Opening an empty workspace clears the child panels and the terminal

@@ -61,11 +61,13 @@ Worktrees also carry a **link list**: URLs pinned to a checkout — the pull req
 
 **Remote hosts path:** `nebula ssh host [dir]` execs `ssh -t` with a self-installing remote command, and first records the destination in `~/.local/share/nebula/ssh_hosts.json` (newest first, capped at 20, keyed by host + start dir). The TUI's `h` picker lists that file; choosing an entry — or typing a new `user@host [dir]` with `a` — quits the TUI cleanly (UI state saved, terminal restored) and hands the destination back to the binary, which execs a fresh `nebula ssh` over the same terminal. The local daemon and its sessions keep running; exiting the remote nebula lands back in the local shell. `d` in the picker forgets an entry.
 
+**Browser path:** `nebula browser` shells out to [ttyd](https://github.com/tsl0922/ttyd) rather than serving anything itself — ttyd runs a command in a PTY and bridges it to xterm.js in the page, so pointing it at this binary (`current_exe`, not whatever `nebula` resolves to on PATH) puts the real TUI in a browser tab, sidebar and all. The command polls `127.0.0.1:<port>` until it accepts, opens the URL, then blocks on ttyd; Ctrl+C reaches both through the shared process group. It binds loopback and stays unauthenticated deliberately — ttyd ships no auth and what it serves is a live terminal, so remote access is `ssh -L` or a tunnel, never a wider bind. The daemon is uninvolved: this is a second TUI client like any other, so it obeys the same one-open-workspace rule.
+
 ## Crate layout
 
 | Crate | Role |
 |---|---|
-| `nebula` | Thin CLI: no args → TUI; `daemon`, `kill`, `rename`, `upgrade`, `ssh` |
+| `nebula` | Thin CLI: no args → TUI; `daemon`, `kill`, `rename`, `upgrade`, `ssh`, `browser` |
 | `nebula-core` | Shared protocol, entities, IDs, paths, codec |
 | `nebula-daemon` | PTYs, SQLite, git, hook receiver, status engine |
 | `nebula-tui` | ratatui UI, keyboard/mouse, attach/scrollback |

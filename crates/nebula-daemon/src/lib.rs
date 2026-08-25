@@ -144,10 +144,8 @@ async fn serve() -> Result<()> {
                 .unwrap_or(2_000)
                 .max(50);
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(period));
-            let mut seen: std::collections::HashMap<
-                nebula_core::ProjectId,
-                Option<std::time::SystemTime>,
-            > = std::collections::HashMap::new();
+            let mut seen: std::collections::HashMap<nebula_core::ProjectId, std::time::SystemTime> =
+                std::collections::HashMap::new();
             loop {
                 tokio::select! {
                     _ = daemon.shutdown.cancelled() => break,
@@ -158,16 +156,25 @@ async fn serve() -> Result<()> {
                 };
                 seen.retain(|id, _| projects.iter().any(|p| &p.id == id));
                 for project in projects {
+                    // An unreadable probe is not a fingerprint: caching it
+                    // would compare equal on every later tick and retire the
+                    // project from syncing for the life of the daemon. Only a
+                    // stamp we actually read can gate the skip.
                     let stamp = worktree_probe_stamp(&project.repo_path);
-                    if seen.get(&project.id) == Some(&stamp) {
+                    if stamp.is_some() && seen.get(&project.id) == stamp.as_ref() {
                         continue;
                     }
                     // The stamp is only recorded on success, so a failed
                     // sync (repo briefly locked, git missing) retries.
                     match daemon.sync_project_worktrees(&project).await {
-                        Ok(()) => {
-                            seen.insert(project.id.clone(), stamp);
-                        }
+                        Ok(()) => match stamp {
+                            Some(stamp) => {
+                                seen.insert(project.id.clone(), stamp);
+                            }
+                            None => {
+                                seen.remove(&project.id);
+                            }
+                        },
                         Err(e) => tracing::warn!(
                             project = %project.name, error = %e, "worktree sync failed"
                         ),
@@ -211,7 +218,7 @@ async fn serve() -> Result<()> {
 /// switch on the main checkout). Any of these moving forward means the
 /// stored rows may be stale.
 fn worktree_probe_stamp(repo_path: &std::path::Path) -> Option<std::time::SystemTime> {
-    let git_dir = repo_path.join(".git");
+    let git_dir = git_common_dir(repo_path)?;
     let mtime = |p: std::path::PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     let mut stamps: Vec<std::time::SystemTime> = Vec::new();
     stamps.extend(mtime(git_dir.join("HEAD")));
@@ -222,4 +229,110 @@ fn worktree_probe_stamp(repo_path: &std::path::Path) -> Option<std::time::System
         }
     }
     stamps.into_iter().max()
+}
+
+/// The `.git` holding the repo's shared HEAD and per-worktree HEADs — the
+/// files the probe above watches.
+///
+/// `<checkout>/.git` is that directory in a normal checkout, but in a linked
+/// worktree it is a `gitdir:` file pointing at `<repo>/.git/worktrees/<name>`,
+/// whose own `commondir` points back at the shared `.git`. Following both is
+/// what lets a project rooted at a worktree (one added with `nebula add` from
+/// inside one) probe anything at all: joining `HEAD` onto a *file* reads
+/// nothing, and a stamp that is always `None` compares equal to itself on
+/// every tick, so the sync would never run again after the first.
+fn git_common_dir(repo_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dot_git = repo_path.join(".git");
+    let git_dir = if std::fs::metadata(&dot_git).ok()?.is_dir() {
+        dot_git
+    } else {
+        let text = std::fs::read_to_string(&dot_git).ok()?;
+        rebase_on(repo_path, text.trim().strip_prefix("gitdir:")?.trim())
+    };
+    // A worktree gitdir has no HEAD history of the repo; `commondir` is the
+    // hop back to the `.git` that does. A normal checkout has no such file.
+    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
+        // git writes that hop relatively (`../..`), so the join keeps the
+        // parent components; canonicalizing folds them away, which is what
+        // makes the two checkouts of one repo answer with the same path
+        // rather than two spellings of it.
+        Ok(common) => rebase_on(&git_dir, common.trim()),
+        Err(_) => git_dir,
+    };
+    Some(std::fs::canonicalize(&common).unwrap_or(common))
+}
+
+/// Git writes these pointers as either an absolute path or one relative to the
+/// file that carries them.
+fn rebase_on(base: &std::path::Path, target: &str) -> std::path::PathBuf {
+    let target = std::path::PathBuf::from(target);
+    if target.is_absolute() {
+        target
+    } else {
+        base.join(target)
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    fn git_in(repo: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The sync only runs when this probe reports a change. A linked worktree
+    /// keeps a `gitdir:` *file* where a checkout keeps a directory, so the
+    /// probe used to read nothing there and answer `None` on every tick —
+    /// equal to itself, so a project rooted at a worktree synced once at boot
+    /// and never again. Both shapes must land on the same shared `.git`.
+    #[test]
+    fn probe_follows_a_linked_worktrees_gitdir_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        let feat = root.join("repo-worktrees").join("feat");
+        git_in(
+            &repo,
+            &["worktree", "add", &feat.to_string_lossy(), "-b", "feat"],
+        );
+
+        assert_eq!(
+            git_common_dir(&feat),
+            git_common_dir(&repo),
+            "both checkouts probe the repo's shared .git"
+        );
+        let stamp = worktree_probe_stamp(&feat);
+        assert!(stamp.is_some(), "a worktree-rooted project has a stamp");
+        assert_eq!(
+            stamp,
+            worktree_probe_stamp(&repo),
+            "and it is the same fingerprint the repo's own checkout reports"
+        );
+    }
+
+    /// A directory that is not a checkout at all has no fingerprint. The sync
+    /// loop must never cache that: `None` compares equal to itself forever.
+    #[test]
+    fn probe_has_no_stamp_outside_a_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(worktree_probe_stamp(tmp.path()), None);
+    }
 }

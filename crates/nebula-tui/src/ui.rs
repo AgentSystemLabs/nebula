@@ -56,13 +56,21 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     app.body_area = body;
     app.normalize_panel_widths(body.width);
+    // The Workspaces column (Shift+W) leads the sidebar at a fixed width —
+    // zero when hidden; the three draggable panels and the terminal pane
+    // share what's left. `splitter_x` knows about the offset.
+    let [workspaces_a, panels_a] = Layout::horizontal([
+        Constraint::Length(app.workspaces_panel_w()),
+        Constraint::Min(0),
+    ])
+    .areas(body);
     let [projects_a, worktrees_a, sessions_a, term_a] = Layout::horizontal([
         Constraint::Length(app.panel_widths[0]),
         Constraint::Length(app.panel_widths[1]),
         Constraint::Length(app.panel_widths[2]),
         Constraint::Min(20),
     ])
-    .areas(body);
+    .areas(panels_a);
 
     // Splitter grab zones: the two touching border cells at each panel
     // boundary. Registered first so they win `hit_at`'s first-match scan.
@@ -79,6 +87,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ));
     }
 
+    if app.show_workspaces {
+        draw_workspaces(f, app, workspaces_a);
+    }
     draw_projects(f, app, projects_a);
     draw_worktrees(f, app, worktrees_a);
     draw_sessions(f, app, sessions_a);
@@ -90,6 +101,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // panel.
     if app.focus_tint {
         let tinted = match app.focus {
+            Focus::Workspaces => shrink_r(workspaces_a),
             Focus::Projects => shrink_r(projects_a),
             Focus::Worktrees => shrink_r(worktrees_a),
             Focus::Sessions => shrink_r(sessions_a),
@@ -554,7 +566,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 (
                     "GENERAL",
                     &[
-                        (Act(&[Workspaces]), "workspaces: switch (n/r/d manage)"),
+                        (
+                            Act(&[Workspaces, ToggleWorkspaces]),
+                            "workspace switcher / workspaces column",
+                        ),
                         (Act(&[Hosts]), "ssh hosts: connect (a: new, d: del)"),
                         (Act(&[Settings]), "settings (Hotkeys tab rebinds these)"),
                         (Act(&[Metrics]), "memory usage (nebula + agents)"),
@@ -2220,21 +2235,22 @@ const ROW_GUTTER: &str = "   ";
 const PROJECT_BTN_H: u16 = 3;
 const PILL_H: u16 = 2;
 const PILL_HALF: (char, char) = ('▄', '▀');
-/// Quadrant caps for the selection rail on the pad rows — the left half
-/// of each `PILL_HALF` glyph — so the rail runs the pill's full visual
-/// height instead of stopping at the text row.
-const PILL_RAIL_CAPS: (char, char) = ('▖', '▘');
+/// The selection rail owns the pill's first column outright: a solid `█`
+/// on the text row, the pad's own `PILL_HALF` glyph on the pads. A
+/// half-width `▌` can't run the pill's full height — a cell holds one
+/// glyph and two colors, so a quadrant cap on a pad row strands the fill
+/// quarter beside it on bare panel background, which `focus_tint` turns
+/// into a black notch at each of the pill's left corners.
+const PILL_RAIL: &str = "█";
 
 /// Render one list entry into a 3-row cell starting at `top`: half-block
 /// pad, text, half-block pad. The name sits on the middle row so it
 /// stays vertically centered in the ~2-row pill. The pads run the full
-/// width so the fill has no dark notch beside the status dot, except in
-/// the rail column, where a quadrant cap extends the accent `▌` across
-/// the pads so the rail spans the pill's full visual height (matching
-/// the 3-row project bar; the cap costs the fill quarter beside it — a
-/// cell can't hold a rail quadrant, a fill quarter, and bare background
-/// at once — but the bright rail owns that corner anyway). Dim spans get
-/// lifted to muted on the fill, same as `render_button`.
+/// width so the fill has no dark notch beside the status dot, and the
+/// `PILL_RAIL` column carries the pad's own half-block in the rail color
+/// so the rail spans the pill's full visual height without stranding a
+/// bare-background quarter at either left corner. Dim spans get lifted
+/// to muted on the fill, same as `render_button`.
 fn render_pill(
     f: &mut Frame,
     inner: Rect,
@@ -2255,7 +2271,7 @@ fn render_pill(
         }
         let fill = if focused { th.sel_bg } else { th.sel_bg_dim };
         let rail = if focused { th.accent } else { th.dim };
-        let mut pad = |glyph: char, cap: char, row: isize| {
+        let mut pad = |glyph: char, row: isize| {
             if let Some(r) = row_rect_at(inner, row) {
                 f.render_widget(
                     Paragraph::new(Line::from(Span::styled(
@@ -2264,19 +2280,22 @@ fn render_pill(
                     ))),
                     r,
                 );
+                // Same half-block, rail-colored: the rail's cap and the
+                // fill quarter beside it are one cell, so they have to be
+                // one color, and the rail is the one worth keeping.
                 f.render_widget(
-                    Paragraph::new(Span::styled(cap.to_string(), Style::default().fg(rail))),
+                    Paragraph::new(Span::styled(glyph.to_string(), Style::default().fg(rail))),
                     Rect { width: 1, ..r },
                 );
             }
         };
-        pad(PILL_HALF.0, PILL_RAIL_CAPS.0, top);
-        pad(PILL_HALF.1, PILL_RAIL_CAPS.1, top + 2);
+        pad(PILL_HALF.0, top);
+        pad(PILL_HALF.1, top + 2);
     }
     let marker = if selected && focused {
-        Span::styled("▌", Style::default().fg(th.accent))
+        Span::styled(PILL_RAIL, Style::default().fg(th.accent))
     } else if selected {
-        Span::styled("▌", Style::default().fg(th.dim))
+        Span::styled(PILL_RAIL, Style::default().fg(th.dim))
     } else {
         Span::raw(" ")
     };
@@ -2285,6 +2304,87 @@ fn render_pill(
         Paragraph::new(Line::from(spans)).style(row_bar(selected, focused, th)),
         text_area,
     );
+}
+
+/// The Workspaces column: every workspace the daemon knows, each with the
+/// rolled-up status of every live agent under it — so a run finishing (or
+/// asking for feedback) in a workspace you don't have open still shows at
+/// the top level. The open workspace is the selected row, and moving the
+/// cursor IS a switch, the way moving in the Projects column re-scopes the
+/// worktrees. Rows are the same 3-row buttons projects get: this is the
+/// tier above them, not a list of children.
+fn draw_workspaces(f: &mut Frame, app: &mut App, area: Rect) {
+    let th = app.theme;
+    let focused = app.focus == Focus::Workspaces;
+    let count = Some(app.tree.workspaces.len()).filter(|n| *n > 0);
+    let inner = draw_column(f, area, "WORKSPACES", count, focused, th);
+
+    if app.tree.workspaces.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{ROW_GUTTER}no workspaces"),
+                Style::default().fg(th.dim),
+            ))),
+            inner,
+        );
+        app.hits
+            .push((inner, HitTarget::PanelBg(Focus::Workspaces)));
+        return;
+    }
+
+    let active = app.tree.active_workspace_index();
+    // Per-row display data, pre-collected to end the tree borrow: name,
+    // rollup, and how many agents are running right now (the dot says
+    // "something", the count says how much).
+    let rows: Vec<(String, Option<AgentStatus>, usize)> = app
+        .tree
+        .workspaces
+        .iter()
+        .map(|w| {
+            (
+                w.name.clone(),
+                app.workspace_rollup(&w.id),
+                app.workspace_running(&w.id),
+            )
+        })
+        .collect();
+    let mut screen_row = 0usize;
+    for (i, (name, roll, running)) in rows.iter().enumerate() {
+        let Some(row_area) = rows_rect(inner, screen_row, PROJECT_BTN_H) else {
+            break;
+        };
+        let badge = if *running > 0 {
+            format!(" {running}")
+        } else {
+            String::new()
+        };
+        let mut spans = vec![status_dot(*roll, th)];
+        spans.extend(status_name_spans(
+            truncate(
+                name,
+                (inner.width as usize).saturating_sub(2 + badge.chars().count()),
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+            sweep_ramp(*roll, th, app.animations),
+            app.sweep_phase(),
+        ));
+        if !badge.is_empty() {
+            spans.push(Span::styled(badge, Style::default().fg(th.warn)));
+        }
+        render_button(
+            f,
+            row_area,
+            spans,
+            Some(i) == active,
+            focused,
+            th,
+            PROJECT_BTN_H / 2,
+        );
+        app.hits.push((row_area, HitTarget::Workspace(i)));
+        screen_row += PROJECT_BTN_H as usize;
+    }
+    app.hits
+        .push((inner, HitTarget::PanelBg(Focus::Workspaces)));
 }
 
 fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
@@ -3359,7 +3459,19 @@ fn editor_name(cmd: &str) -> &str {
         .unwrap_or(cmd)
 }
 
-fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+/// The bottom bar, plus its one clickable cell run: the `◇ workspace`
+/// nameplate registers as a hit target so a click on it opens the switcher.
+/// The bar is drawn under the splash and the collapsed view too, so the
+/// registration lives here rather than in `draw`'s panel branch.
+fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
+    if let Some(rect) = draw_footer_bar(f, app, area) {
+        app.hits.push((rect, HitTarget::FooterWorkspace));
+    }
+}
+
+/// Draw the bar; returns the screen rect of the workspace nameplate when
+/// it fit on the bar.
+fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
     // `area` includes the blank padding row; the bar itself is its last row.
     let area = Rect {
         y: area.y + area.height.saturating_sub(1),
@@ -3493,6 +3605,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 k(Action::FocusLeft)
             ),
             Focus::Terminal => "select a session and press Enter to attach".to_string(),
+            // The cursor here is the open workspace, so ↑/↓ already
+            // switches; the verbs are the switcher's, plus the way out.
+            Focus::Workspaces => format!(
+                "{}: projects  {}: switcher  {}: new  {}: rename  {}: delete  {}: hide column  {}: help",
+                k(Action::Activate),
+                k(Action::Workspaces),
+                k(Action::New),
+                k(Action::Rename),
+                k(Action::Delete),
+                k(Action::ToggleWorkspaces),
+                k(Action::Help)
+            ),
             Focus::Projects => match app.selected_project_row() {
                 Some(ProjectRow::Divider { .. }) => format!(
                     "{}/{}: label  {}: delete divider  {}/{}: move  {}: menu  {}: help",
@@ -3572,6 +3696,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     // The open workspace leads the bar — it scopes everything else shown.
     // (The version nameplate is spliced in ahead of it further down, once
     // the width left for the hints is known.)
+    let mut workspace_idx = spans.len();
     spans.push(Span::styled(
         format!("◇ {}", truncate(app.tree.active_workspace_name(), 20)),
         Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
@@ -3638,7 +3763,19 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled("  ·  ", Style::default().fg(th.dim)),
             ],
         );
+        workspace_idx += 2;
     }
+    // Where the workspace nameplate landed: everything ahead of it on the
+    // bar is fixed-width chrome, so its cells are a prefix sum. Clipped
+    // off the bar (a very narrow screen) means no target.
+    let workspace_x: usize = spans[..workspace_idx].iter().map(|s| s.width()).sum();
+    let workspace_w = spans[workspace_idx].width();
+    let workspace_rect = (workspace_x + workspace_w <= left.width as usize).then(|| Rect {
+        x: left.x + workspace_x as u16,
+        y: left.y,
+        width: workspace_w as u16,
+        height: 1,
+    });
     f.render_widget(Paragraph::new(Line::from(spans)), left);
     if let Some(usage) = usage {
         let right = Rect {
@@ -3652,6 +3789,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             right,
         );
     }
+    workspace_rect
 }
 
 /// The footer's right-edge readout: live sessions, their process count,
@@ -4147,6 +4285,50 @@ mod tests {
         assert_eq!(bg(4, 1), Color::Reset, "right of the panel");
         assert_eq!(bg(1, 0), Color::Reset, "above the panel");
         assert_eq!(bg(1, 5), Color::Reset, "below the panel");
+    }
+
+    /// The selected pill's rail column is solid rail color top to bottom:
+    /// the pad's own half-block on the pads, `█` on the text row. Nothing
+    /// in it may be left on bare background — a quadrant cap used to
+    /// strand the fill quarter beside it, which `focus_tint` then painted
+    /// near-black, reading as a notch at each left corner of the pill.
+    #[test]
+    fn pill_rail_leaves_no_untinted_quarter_at_the_corners() {
+        let th = Theme::default();
+        let inner = Rect::new(0, 0, 8, 3);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(8, 3)).unwrap();
+        terminal
+            .draw(|f| {
+                render_pill(f, inner, 0, vec![Span::raw("● ok")], true, true, th);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let cell = |x, y| buf.cell((x, y)).unwrap().clone();
+
+        // Pads: rail column carries the fill's own half-block, so the
+        // whole cell is glyph — no background quarter survives.
+        for (y, glyph) in [(0, PILL_HALF.0), (2, PILL_HALF.1)] {
+            let glyph = glyph.to_string();
+            let c = cell(0, y);
+            assert_eq!(c.symbol(), glyph, "pad row {y} rail glyph");
+            assert_eq!(c.fg, th.accent, "pad row {y} rail color");
+            // The rail cell covers exactly what the fill cells beside it
+            // do; a narrower glyph there is the notch coming back.
+            for x in 1..8 {
+                assert_eq!(
+                    cell(x, y).symbol(),
+                    glyph,
+                    "pad row {y} fill glyph at x={x}"
+                );
+                assert_eq!(cell(x, y).fg, th.sel_bg, "pad row {y} fill color at x={x}");
+            }
+        }
+        // Text row: a solid block, sitting on the fill.
+        let c = cell(0, 1);
+        assert_eq!(c.symbol(), PILL_RAIL);
+        assert_eq!(c.fg, th.accent);
+        assert_eq!(c.bg, th.sel_bg);
     }
 
     /// Each grip sits on its rule column (one left of the boundary), three

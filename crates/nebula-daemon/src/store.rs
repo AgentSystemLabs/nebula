@@ -458,6 +458,16 @@ impl Store {
         Ok(())
     }
 
+    /// Root-ness is derived from git's own checkout list on every reconcile
+    /// rather than frozen at insert time, so it needs to be writable.
+    pub fn set_worktree_main(&self, id: &WorktreeId, is_main: bool) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE worktrees SET is_main = ?2 WHERE id = ?1",
+            params![id.as_str(), is_main as i64],
+        )?;
+        Ok(())
+    }
+
     pub fn set_worktree_pinned(&self, id: &WorktreeId, pinned: bool) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE worktrees SET pinned = ?2 WHERE id = ?1",

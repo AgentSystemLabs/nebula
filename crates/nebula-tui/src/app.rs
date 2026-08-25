@@ -26,6 +26,10 @@ pub fn now_ms() -> i64 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
+    /// The optional leftmost column (`Shift+W` shows/hides it). Its cursor
+    /// IS the open workspace — moving it switches, the way moving in the
+    /// Projects column re-scopes the worktrees.
+    Workspaces,
     Projects,
     Worktrees,
     Sessions,
@@ -35,6 +39,11 @@ pub enum Focus {
 /// What a screen cell maps to; rebuilt on every draw for hit-testing.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HitTarget {
+    /// Row index into `tree.workspaces`; a click opens that workspace.
+    Workspace(usize),
+    /// The `◇ workspace` nameplate on the footer; a click opens the
+    /// workspace switcher.
+    FooterWorkspace,
     /// Row index into `App::project_rows()` (projects and dividers both).
     Project(usize),
     Worktree(usize),
@@ -53,6 +62,11 @@ pub enum HitTarget {
 /// Default widths of the Projects / Worktrees / Sessions panels. Sessions
 /// is the widest because its rows carry the most: name, "23m ago", harness.
 pub const DEFAULT_PANEL_WIDTHS: [u16; 3] = [20, 22, 32];
+/// Width of the Workspaces column when it's shown. Fixed rather than
+/// draggable: the persisted `panel_widths` blob is a `[u16; 3]`, and a
+/// fourth splitter would either break every saved layout or need a second
+/// schema. Names longer than this truncate, as project names do.
+pub const WORKSPACES_PANEL_W: u16 = 18;
 /// A panel can't be dragged narrower than this.
 pub const MIN_PANEL_W: u16 = 10;
 /// The terminal pane always keeps at least this much width.
@@ -120,6 +134,11 @@ pub enum MenuAction {
     /// verbs are keys, not rows — n: new, r: rename, d: delete (footer
     /// hints, the notes-modal pattern).
     OpenWorkspace(WorkspaceId),
+    /// The Workspaces column's menu rows: the switcher's n / r / d verbs,
+    /// for a mouse that never learned the keys.
+    NewWorkspace,
+    RenameWorkspace(WorkspaceId),
+    RemoveWorkspace(WorkspaceId),
     SetProjectDivider {
         id: ProjectId,
         before: bool,
@@ -1253,6 +1272,8 @@ pub enum PendingIntent {
         kind: PromptKind,
         task: String,
     },
+    /// Select the added project and step into its Worktrees panel.
+    SelectCreatedProject,
     /// Select the created worktree in the Worktrees panel.
     SelectCreatedWorktree,
     /// Move the note modal's cursor onto the created note.
@@ -1438,6 +1459,45 @@ pub fn project_rollup(tree: &Tree, project_id: &ProjectId) -> Option<AgentStatus
     )
 }
 
+/// One status for a whole workspace: every live agent under every project
+/// in it, folded the same way a project folds its worktrees. This is what
+/// lets the Workspaces column say "something is running over there"
+/// without opening it — background workspaces keep receiving status
+/// deltas, so the reading is live.
+pub fn workspace_rollup(tree: &Tree, workspace_id: &WorkspaceId) -> Option<AgentStatus> {
+    rollup(workspace_agents(tree, workspace_id).map(|a| a.status))
+}
+
+/// How many agents are running right now across a workspace — the
+/// Workspaces column's count badge, next to the rollup dot.
+pub fn workspace_running(tree: &Tree, workspace_id: &WorkspaceId) -> usize {
+    workspace_agents(tree, workspace_id)
+        .filter(|a| a.status == AgentStatus::Running)
+        .count()
+}
+
+/// Every unarchived agent under every project in a workspace.
+fn workspace_agents<'a>(
+    tree: &'a Tree,
+    workspace_id: &WorkspaceId,
+) -> impl Iterator<Item = &'a Agent> + 'a {
+    let project_ids: Vec<&ProjectId> = tree
+        .projects
+        .iter()
+        .filter(|p| &p.workspace_id == workspace_id)
+        .map(|p| &p.id)
+        .collect();
+    let wt_ids: Vec<WorktreeId> = tree
+        .worktrees
+        .iter()
+        .filter(|w| project_ids.contains(&&w.project_id))
+        .map(|w| w.id.clone())
+        .collect();
+    tree.agents
+        .iter()
+        .filter(move |a| !a.archived && wt_ids.contains(&a.worktree_id))
+}
+
 /// One selectable row in the Projects panel. The payload indexes
 /// `tree.projects`; a `Divider` is the separator hanging below that project
 /// — or, with `before`, the leading divider drawn above the whole list
@@ -1531,6 +1591,14 @@ impl Tree {
         p.workspace_id == self.active_workspace
     }
 
+    /// Row of the open workspace in `workspaces` — the Workspaces column's
+    /// cursor. None only before the first snapshot lands.
+    pub fn active_workspace_index(&self) -> Option<usize> {
+        self.workspaces
+            .iter()
+            .position(|w| w.id == self.active_workspace)
+    }
+
     /// Display name of the open workspace, for the footer and switcher.
     pub fn active_workspace_name(&self) -> &str {
         self.workspaces
@@ -1607,6 +1675,10 @@ pub struct UiState {
     /// Panel widths (projects, worktrees, sessions); absent in older blobs.
     #[serde(default)]
     pub panel_widths: Option<[u16; 3]>,
+    /// Whether the Workspaces column is shown (`Shift+W`); absent in older
+    /// blobs, which means shown.
+    #[serde(default)]
+    pub show_workspaces: Option<bool>,
     /// Diff modal file-list width; absent in older blobs.
     #[serde(default)]
     pub diff_files_width: Option<u16>,
@@ -1758,6 +1830,9 @@ pub struct App {
     pub show_archived: bool,
     /// Sidebars collapsed (z) — terminal takes the full width.
     pub collapsed: bool,
+    /// Workspaces column shown at the left edge (`Shift+W` toggles). The
+    /// three draggable panels sit to its right; see `splitter_x`.
+    pub show_workspaces: bool,
     pub next_req_id: u64,
     pub pending: HashMap<u64, PendingIntent>,
     /// `nebula --workspace <name>`: the workspace this instance was asked
@@ -1770,6 +1845,8 @@ pub struct App {
     /// this project (`true` = its leading divider) so the selection can
     /// follow it there.
     pub select_divider_when_seen: Option<(ProjectId, bool)>,
+    /// Project added by us, awaiting its upsert to fix the selection.
+    pub select_project_when_seen: Option<ProjectId>,
     /// Worktree created by us, awaiting its upsert to fix the selection.
     pub select_worktree_when_seen: Option<WorktreeId>,
     /// Note created by us, awaiting its upsert to land the modal's cursor.
@@ -1969,11 +2046,13 @@ impl App {
             overlay: None,
             show_archived: false,
             collapsed: false,
+            show_workspaces: true,
             next_req_id: 1,
             pending: HashMap::new(),
             startup_workspace: None,
             select_when_seen: None,
             select_divider_when_seen: None,
+            select_project_when_seen: None,
             select_worktree_when_seen: None,
             select_note_when_seen: None,
             select_link_when_seen: None,
@@ -2084,15 +2163,29 @@ impl App {
         (self.splash_epoch.elapsed().as_millis() / SWEEP_FRAME.as_millis()) as usize
     }
 
+    /// Columns the Workspaces panel takes at the left edge: its fixed width
+    /// when shown, nothing when hidden. Every screen-x computation for the
+    /// three draggable panels starts here.
+    pub fn workspaces_panel_w(&self) -> u16 {
+        if self.show_workspaces {
+            WORKSPACES_PANEL_W
+        } else {
+            0
+        }
+    }
+
     /// Screen x of splitter `idx` — the column where the panel to its right
-    /// starts (prefix sum of panel widths).
+    /// starts (the Workspaces column, then a prefix sum of panel widths).
     pub fn splitter_x(&self, idx: usize) -> u16 {
-        self.panel_widths[..=idx].iter().sum()
+        self.workspaces_panel_w() + self.panel_widths[..=idx].iter().sum::<u16>()
     }
 
     /// Move splitter `idx` so its boundary lands at `boundary_x`, clamped so
     /// the panel keeps `MIN_PANEL_W` and the terminal pane keeps `MIN_TERM_W`.
     pub fn set_splitter(&mut self, idx: usize, boundary_x: i32, body_w: u16) {
+        // The Workspaces column is spoken for before any panel is sized.
+        let offset = self.workspaces_panel_w();
+        let body_w = body_w.saturating_sub(offset);
         let left: u16 = self.panel_widths[..idx].iter().sum();
         let fixed_right: u16 = self.panel_widths[idx + 1..].iter().sum();
         let max = body_w.saturating_sub(left + fixed_right + MIN_TERM_W);
@@ -2100,14 +2193,17 @@ impl App {
             return; // terminal too small to honor the minimums
         }
         let want = boundary_x.max(0) as u16;
-        self.panel_widths[idx] = want.saturating_sub(left).clamp(MIN_PANEL_W, max);
+        self.panel_widths[idx] = want.saturating_sub(offset + left).clamp(MIN_PANEL_W, max);
     }
 
     /// Re-fit panel widths to the current body width, shrinking the rightmost
     /// panel first, each floored at `MIN_PANEL_W`. Keeps the terminal pane at
-    /// `MIN_TERM_W` whenever the screen allows it at all.
+    /// `MIN_TERM_W` whenever the screen allows it at all. The Workspaces
+    /// column, when shown, comes off the top of the budget.
     pub fn normalize_panel_widths(&mut self, body_w: u16) {
-        let budget = body_w.saturating_sub(MIN_TERM_W);
+        let budget = body_w
+            .saturating_sub(self.workspaces_panel_w())
+            .saturating_sub(MIN_TERM_W);
         for i in (0..3).rev() {
             let others: u16 = self
                 .panel_widths
@@ -2589,6 +2685,25 @@ impl App {
 
     pub fn project_rollup(&self, project_id: &ProjectId) -> Option<AgentStatus> {
         project_rollup(&self.tree, project_id)
+    }
+
+    pub fn workspace_rollup(&self, workspace_id: &WorkspaceId) -> Option<AgentStatus> {
+        workspace_rollup(&self.tree, workspace_id)
+    }
+
+    pub fn workspace_running(&self, workspace_id: &WorkspaceId) -> usize {
+        workspace_running(&self.tree, workspace_id)
+    }
+
+    /// The panel focus lands on walking off the left edge (or wrapping
+    /// around from the terminal pane): the Workspaces column when it's
+    /// shown, Projects otherwise.
+    pub fn leftmost_focus(&self) -> Focus {
+        if self.show_workspaces {
+            Focus::Workspaces
+        } else {
+            Focus::Projects
+        }
     }
 
     pub fn hit_at(&self, x: u16, y: u16) -> Option<HitTarget> {

@@ -88,6 +88,7 @@ pub enum Action {
     UnlockTerminal,
     // general
     Workspaces,
+    ToggleWorkspaces,
     Hosts,
     Settings,
     Metrics,
@@ -412,6 +413,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "GENERAL",
         scope: Scope::Global,
         defaults: &["w"],
+    },
+    ActionSpec {
+        action: Action::ToggleWorkspaces,
+        id: "toggle_workspaces",
+        label: "Workspaces column",
+        hint: "Show or hide the Workspaces column at the left edge",
+        group: "GENERAL",
+        scope: Scope::Global,
+        defaults: &["shift+w"],
     },
     ActionSpec {
         action: Action::Hosts,
