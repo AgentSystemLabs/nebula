@@ -11976,9 +11976,9 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     /// The selection rail on a worktree/session pill runs the pill's full
-    /// visual height — quadrant caps on the half-block pad rows, `▌` on
-    /// the text row — and sessions share the worktrees' 2-row pill stride
-    /// so the two lists read uniformly.
+    /// visual height — the pad's own half-block on the pad rows, a solid
+    /// block on the text row — and sessions share the worktrees' 2-row
+    /// pill stride so the two lists read uniformly.
     #[test]
     fn pill_rail_spans_pads_and_sessions_match_worktree_stride() {
         use nebula_core::{Agent, AgentStatus, Entity, WorktreeId};
@@ -12017,7 +12017,9 @@ diff --git a/src/b.rs b/src/b.rs
         let char_col =
             |line: &str, needle: &str| line.find(needle).map(|b| line[..b].chars().count());
         let at = |row: usize, col: usize| lines[row].chars().nth(col);
-        // rail col ▌, then dot + name: the rail sits one cell left of the dot.
+        // rail col █, then dot + name: the rail sits one cell left of the
+        // dot, and on the pads it wears the same half-block as the fill so
+        // no bare-background quarter is left beside it.
         let rail_check = |name: &str, text: &str, lines: &Vec<&str>| {
             let dot = format!("● {name}");
             let row = lines
@@ -12027,17 +12029,17 @@ diff --git a/src/b.rs b/src/b.rs
             let col = char_col(lines[row], &dot).unwrap() - 1;
             assert_eq!(
                 at(row, col),
-                Some('▌'),
+                Some('█'),
                 "rail on {name}'s text row:\n{text}"
             );
             assert_eq!(
                 at(row - 1, col),
-                Some('▖'),
+                Some('▄'),
                 "rail cap on {name}'s top pad:\n{text}"
             );
             assert_eq!(
                 at(row + 1, col),
-                Some('▘'),
+                Some('▀'),
                 "rail cap on {name}'s bottom pad:\n{text}"
             );
             row

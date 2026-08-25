@@ -2220,21 +2220,22 @@ const ROW_GUTTER: &str = "   ";
 const PROJECT_BTN_H: u16 = 3;
 const PILL_H: u16 = 2;
 const PILL_HALF: (char, char) = ('▄', '▀');
-/// Quadrant caps for the selection rail on the pad rows — the left half
-/// of each `PILL_HALF` glyph — so the rail runs the pill's full visual
-/// height instead of stopping at the text row.
-const PILL_RAIL_CAPS: (char, char) = ('▖', '▘');
+/// The selection rail owns the pill's first column outright: a solid `█`
+/// on the text row, the pad's own `PILL_HALF` glyph on the pads. A
+/// half-width `▌` can't run the pill's full height — a cell holds one
+/// glyph and two colors, so a quadrant cap on a pad row strands the fill
+/// quarter beside it on bare panel background, which `focus_tint` turns
+/// into a black notch at each of the pill's left corners.
+const PILL_RAIL: &str = "█";
 
 /// Render one list entry into a 3-row cell starting at `top`: half-block
 /// pad, text, half-block pad. The name sits on the middle row so it
 /// stays vertically centered in the ~2-row pill. The pads run the full
-/// width so the fill has no dark notch beside the status dot, except in
-/// the rail column, where a quadrant cap extends the accent `▌` across
-/// the pads so the rail spans the pill's full visual height (matching
-/// the 3-row project bar; the cap costs the fill quarter beside it — a
-/// cell can't hold a rail quadrant, a fill quarter, and bare background
-/// at once — but the bright rail owns that corner anyway). Dim spans get
-/// lifted to muted on the fill, same as `render_button`.
+/// width so the fill has no dark notch beside the status dot, and the
+/// `PILL_RAIL` column carries the pad's own half-block in the rail color
+/// so the rail spans the pill's full visual height without stranding a
+/// bare-background quarter at either left corner. Dim spans get lifted
+/// to muted on the fill, same as `render_button`.
 fn render_pill(
     f: &mut Frame,
     inner: Rect,
@@ -2255,7 +2256,7 @@ fn render_pill(
         }
         let fill = if focused { th.sel_bg } else { th.sel_bg_dim };
         let rail = if focused { th.accent } else { th.dim };
-        let mut pad = |glyph: char, cap: char, row: isize| {
+        let mut pad = |glyph: char, row: isize| {
             if let Some(r) = row_rect_at(inner, row) {
                 f.render_widget(
                     Paragraph::new(Line::from(Span::styled(
@@ -2264,19 +2265,22 @@ fn render_pill(
                     ))),
                     r,
                 );
+                // Same half-block, rail-colored: the rail's cap and the
+                // fill quarter beside it are one cell, so they have to be
+                // one color, and the rail is the one worth keeping.
                 f.render_widget(
-                    Paragraph::new(Span::styled(cap.to_string(), Style::default().fg(rail))),
+                    Paragraph::new(Span::styled(glyph.to_string(), Style::default().fg(rail))),
                     Rect { width: 1, ..r },
                 );
             }
         };
-        pad(PILL_HALF.0, PILL_RAIL_CAPS.0, top);
-        pad(PILL_HALF.1, PILL_RAIL_CAPS.1, top + 2);
+        pad(PILL_HALF.0, top);
+        pad(PILL_HALF.1, top + 2);
     }
     let marker = if selected && focused {
-        Span::styled("▌", Style::default().fg(th.accent))
+        Span::styled(PILL_RAIL, Style::default().fg(th.accent))
     } else if selected {
-        Span::styled("▌", Style::default().fg(th.dim))
+        Span::styled(PILL_RAIL, Style::default().fg(th.dim))
     } else {
         Span::raw(" ")
     };
@@ -4147,6 +4151,50 @@ mod tests {
         assert_eq!(bg(4, 1), Color::Reset, "right of the panel");
         assert_eq!(bg(1, 0), Color::Reset, "above the panel");
         assert_eq!(bg(1, 5), Color::Reset, "below the panel");
+    }
+
+    /// The selected pill's rail column is solid rail color top to bottom:
+    /// the pad's own half-block on the pads, `█` on the text row. Nothing
+    /// in it may be left on bare background — a quadrant cap used to
+    /// strand the fill quarter beside it, which `focus_tint` then painted
+    /// near-black, reading as a notch at each left corner of the pill.
+    #[test]
+    fn pill_rail_leaves_no_untinted_quarter_at_the_corners() {
+        let th = Theme::default();
+        let inner = Rect::new(0, 0, 8, 3);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(8, 3)).unwrap();
+        terminal
+            .draw(|f| {
+                render_pill(f, inner, 0, vec![Span::raw("● ok")], true, true, th);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let cell = |x, y| buf.cell((x, y)).unwrap().clone();
+
+        // Pads: rail column carries the fill's own half-block, so the
+        // whole cell is glyph — no background quarter survives.
+        for (y, glyph) in [(0, PILL_HALF.0), (2, PILL_HALF.1)] {
+            let glyph = glyph.to_string();
+            let c = cell(0, y);
+            assert_eq!(c.symbol(), glyph, "pad row {y} rail glyph");
+            assert_eq!(c.fg, th.accent, "pad row {y} rail color");
+            // The rail cell covers exactly what the fill cells beside it
+            // do; a narrower glyph there is the notch coming back.
+            for x in 1..8 {
+                assert_eq!(
+                    cell(x, y).symbol(),
+                    glyph,
+                    "pad row {y} fill glyph at x={x}"
+                );
+                assert_eq!(cell(x, y).fg, th.sel_bg, "pad row {y} fill color at x={x}");
+            }
+        }
+        // Text row: a solid block, sitting on the fill.
+        let c = cell(0, 1);
+        assert_eq!(c.symbol(), PILL_RAIL);
+        assert_eq!(c.fg, th.accent);
+        assert_eq!(c.bg, th.sel_bg);
     }
 
     /// Each grip sits on its rule column (one left of the boundary), three
