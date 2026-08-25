@@ -134,7 +134,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::FocusLeft,
         id: "focus_left",
         label: "Focus left",
-        hint: "Move focus one panel left (stops at projects)",
+        hint: "Move focus one panel left (stops at the leftmost column)",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["h", "left"],

@@ -7176,7 +7176,13 @@ mod tests {
         h(&mut app, &mut out);
         assert_eq!(app.focus, Focus::Projects);
         h(&mut app, &mut out);
-        assert_eq!(app.focus, Focus::Projects, "stops at projects, as ← does");
+        assert_eq!(
+            app.focus,
+            Focus::Workspaces,
+            "steps into the Workspaces column, as ← does"
+        );
+        h(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Workspaces, "stops at the left edge");
         assert!(app.overlay.is_none(), "h no longer opens the hosts picker");
     }
 
