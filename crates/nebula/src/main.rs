@@ -52,6 +52,19 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Move this session into a worktree of its project (run from inside a
+    /// nebula agent session; agents run it when you ask them to work in a
+    /// worktree). Creates the checkout when the branch has none, re-homes
+    /// the session at once, and restarts it resumed inside the worktree as
+    /// soon as the current turn ends.
+    Worktree {
+        /// Branch name; several words are joined with hyphens, none at all
+        /// gets a random `<adj>-<noun>-<verb>` one.
+        name: Vec<String>,
+        /// Start point for a new branch (default: the checkout's HEAD).
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
+    },
     /// Manage workspaces — named project groups. Each nebula instance has
     /// one open and scopes its project list (and `/` search) to it.
     Workspace {
@@ -130,6 +143,7 @@ fn main() -> Result<()> {
         }
         Some(Command::Kill) => nebula_tui::run_kill(),
         Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),
+        Some(Command::Worktree { name, base }) => nebula_tui::run_worktree(name.join(" "), base),
         Some(Command::Browser { port }) => browser::run_browser(port),
         Some(Command::Ssh { host, path }) => ssh::run_ssh(&host, path.as_deref()),
         Some(Command::Upgrade { force }) => upgrade::run_upgrade(force),

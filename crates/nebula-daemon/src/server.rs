@@ -293,35 +293,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     )
                     .await;
                 }
-                ClientRequest::SetProjectDivider {
-                    req_id,
-                    id,
-                    before,
-                    present,
-                    label,
-                } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon
-                            .set_project_divider(&id, before, present, label)
-                            .map(|_| None),
-                    )
-                    .await;
-                }
-                ClientRequest::MoveDivider {
-                    req_id,
-                    id,
-                    before,
-                    delta,
-                } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.move_divider(&id, before, delta).map(|_| None),
-                    )
-                    .await;
-                }
                 ClientRequest::CreateWorktree {
                     req_id,
                     project,
@@ -462,6 +433,25 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         daemon.move_agent(&id, &worktree).map(|_| None),
                     )
                     .await;
+                }
+                ClientRequest::EnterWorktree {
+                    req_id,
+                    id,
+                    branch,
+                    base,
+                } => {
+                    let ev = match daemon.enter_worktree(&id, &branch, base.as_deref()).await {
+                        Ok((worktree, outcome)) => ServerEvent::WorktreeEntered {
+                            req_id,
+                            worktree,
+                            outcome,
+                        },
+                        Err(e) => ServerEvent::Error {
+                            req_id: Some(req_id),
+                            message: format!("{e:#}"),
+                        },
+                    };
+                    let _ = out_tx.send(ev).await;
                 }
                 ClientRequest::ArchiveAgent { req_id, id } => {
                     reply(&out_tx, req_id, daemon.archive_agent(&id).map(|_| None)).await;

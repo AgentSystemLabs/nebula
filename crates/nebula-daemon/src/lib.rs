@@ -70,7 +70,7 @@ async fn serve() -> Result<()> {
             }) = hook_rx.recv().await
             {
                 let captures_session = event.captures_session();
-                daemon.apply_hook_event(&agent_id, event, session_id.clone());
+                daemon.apply_hook_event(&agent_id, event.clone(), session_id.clone());
                 if let Some(cwd) = &cwd {
                     daemon.reparent_agent_by_cwd(
                         &agent_id,
@@ -79,6 +79,11 @@ async fn serve() -> Result<()> {
                         captures_session,
                     );
                 }
+                // A `nebula worktree` relocation waits for the turn to end.
+                // After the reparent on purpose: this turn's final payload
+                // still carries the old checkout's cwd, which must be seen
+                // (and ignored) while the relocation is still pending.
+                daemon.complete_pending_move(&agent_id, &event);
             }
         });
     }

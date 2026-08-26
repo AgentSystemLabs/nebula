@@ -229,10 +229,6 @@ mod tests {
                 name: "p".into(),
                 repo_path: "/tmp/p".into(),
                 sort_order: 0,
-                divider_after: false,
-                divider_label: None,
-                divider_before: false,
-                divider_before_label: None,
             })
             .unwrap();
         store

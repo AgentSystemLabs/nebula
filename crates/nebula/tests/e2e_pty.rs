@@ -3029,8 +3029,12 @@ async fn read_env_file(path: &Path) -> std::collections::HashMap<String, String>
 /// one-liner the installed hook runs; returns (status, body) — the body is
 /// what the hook would pipe into the CLI's stdout.
 async fn hook_post(port: u16, path_query: &str, token: &str) -> (u16, String) {
+    hook_post_json(port, path_query, token, r#"{"session_id":"s1"}"#).await
+}
+
+/// `hook_post` with the payload the CLI would have piped in.
+async fn hook_post_json(port: u16, path_query: &str, token: &str, payload: &str) -> (u16, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let payload = r#"{"session_id":"s1"}"#;
     let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap();
@@ -3162,6 +3166,191 @@ async fn auto_title_instruction_and_rename_flow() {
     assert!(out.status.success(), "declined rename must exit 0: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("already has a title"), "stdout: {stdout}");
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// `nebula worktree <name>` from inside a session, end to end over real
+/// processes: the CLI (what the model runs) creates the checkout in nebula's
+/// sibling layout and re-homes the row at once; the live PTY is left alone
+/// until the turn's Stop hook — a tool hook still reporting the old
+/// checkout's cwd in between must not drag the row back — and then respawns
+/// inside the worktree.
+#[tokio::test]
+async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let env_dir = env.tmp.path().join("agent-env");
+    std::fs::create_dir_all(&env_dir).unwrap();
+    // Stand-in CLI: dump the NEBULA_* env its hooks would use, log where
+    // each boot runs, then park.
+    let script = env.tmp.path().join("agent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nenv | grep '^NEBULA_' > '{d}'/$NEBULA_AGENT_ID.env\n\
+             pwd >> '{d}'/$NEBULA_AGENT_ID.pwd\nexec sleep 600\n",
+            d = env_dir.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: main_worktree.id.clone(),
+            name: "agent-1".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+    let agent_env = read_env_file(&env_dir.join(format!("{}.env", agent_id.0))).await;
+    let port: u16 = agent_env["NEBULA_API_URL"]
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let token = agent_env["NEBULA_API_TOKEN"].clone();
+    let pwd_log = env_dir.join(format!("{}.pwd", agent_id.0));
+    let boots = |path: &Path| -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while boots(&pwd_log).len() < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "first boot never logged"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The model obeys the guidance — `nebula worktree feat x` (the space
+    // slugifies) with the session's env.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(["worktree", "feat", "x"])
+        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+        .env("NEBULA_AGENT_ID", &agent_id.0)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "nebula worktree failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("feat-x") && stdout.contains("this turn ends"),
+        "stdout: {stdout}"
+    );
+
+    // The row re-homes under the new checkout at once…
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.worktree_id != main_worktree.id)
+        })
+    })
+    .await;
+    let feat = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } if w.branch == "feat-x" => Some(w.clone()),
+            _ => None,
+        })
+        .expect("feat-x worktree upsert");
+    assert!(
+        feat.path.ends_with("repo-worktrees/feat-x"),
+        "nebula's sibling layout: {:?}",
+        feat.path
+    );
+    assert!(feat.path.join(".git").exists(), "a real checkout");
+    // …while the process is untouched: still the one boot, in the old checkout.
+    assert_eq!(boots(&pwd_log).len(), 1, "no respawn before the turn ends");
+
+    // Mid-turn the CLI's hooks keep reporting the old checkout's cwd; that
+    // must not drag the row back. Then the Stop — same old cwd — ends the
+    // turn and triggers the relocation.
+    let payload = format!(
+        r#"{{"session_id":"s1","cwd":"{}","tool_name":"Bash"}}"#,
+        repo.display()
+    );
+    for event in ["PostToolUse", "Stop"] {
+        let path = format!("/api/hooks/claude?agentId={}&hookEvent={event}", agent_id.0);
+        let (status, _) = hook_post_json(port, &path, &token, &payload).await;
+        assert_eq!(status, 200, "{event}");
+    }
+
+    // The respawn: alive again under feat-x, and booted inside it.
+    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.worktree_id == feat.id && a.alive)
+        })
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let b = boots(&pwd_log);
+        if b.len() >= 2 {
+            assert_eq!(b.len(), 2, "one respawn, not several: {b:?}");
+            assert!(
+                b[1].ends_with("repo-worktrees/feat-x"),
+                "respawned inside the worktree: {b:?}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "respawn never booted in the worktree: {b:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Already there now: a settled answer, and no second relocation.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(["worktree", "feat-x"])
+        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+        .env("NEBULA_AGENT_ID", &agent_id.0)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "repeat must exit 0: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("already runs inside it"),
+        "stdout: {stdout}"
+    );
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);

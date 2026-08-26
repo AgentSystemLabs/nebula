@@ -44,7 +44,7 @@ pub enum HitTarget {
     /// The `◇ workspace` nameplate on the footer; a click opens the
     /// workspace switcher.
     FooterWorkspace,
-    /// Row index into `App::project_rows()` (projects and dividers both).
+    /// Row index into `App::project_rows()`.
     Project(usize),
     Worktree(usize),
     Session(usize),
@@ -86,10 +86,6 @@ pub enum MenuAction {
     Attach(SessionRef),
     RestartAgent(AgentId),
     RenameAgent(AgentId),
-    /// Opens the destination-worktree picker for this agent.
-    MoveAgent(AgentId),
-    /// Picker result: re-home the agent under this worktree.
-    MoveAgentToWorktree(AgentId, WorktreeId),
     ArchiveAgent(AgentId),
     UnarchiveAgent(AgentId),
     SetAgentPinned(AgentId, bool),
@@ -139,12 +135,6 @@ pub enum MenuAction {
     NewWorkspace,
     RenameWorkspace(WorkspaceId),
     RemoveWorkspace(WorkspaceId),
-    SetProjectDivider {
-        id: ProjectId,
-        before: bool,
-        present: bool,
-    },
-    LabelDivider(ProjectId, bool),
     ToggleArchived,
 }
 
@@ -278,6 +268,9 @@ pub enum PendingAction {
     },
     RemoveProject(ProjectId),
     DeleteLink(LinkId),
+    /// `R` in the settings overlay: rewrite config.json from the defaults
+    /// (every setting and every hotkey), then reopen the overlay on them.
+    ResetSettings,
     Quit,
 }
 
@@ -291,12 +284,6 @@ pub struct ConfirmDialog {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptKind {
     AddProject,
-    /// Label for one of this project's dividers (`before` = the leading
-    /// divider above the list).
-    DividerLabel {
-        id: ProjectId,
-        before: bool,
-    },
     NewWorktree {
         project: ProjectId,
         /// Random `<adj>-<noun>-<verb>` name minted when the prompt
@@ -1205,7 +1192,8 @@ pub struct SettingsView {
     /// The tab strip itself has the cursor: ←/→ walk the tabs, ↓ drops
     /// back into the list. Stepping up off the top row is what puts it
     /// here, so arrows can steer tabs without ever fighting the ←/→ that
-    /// cycles a setting's value.
+    /// cycles a setting's value. An overlay opened for the first time
+    /// starts here (see [`App::settings_on_tabs`]).
     pub on_tabs: bool,
     /// Set during draw for click hit-testing.
     pub area: Rect,
@@ -1224,14 +1212,16 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
-    /// `tab`/`selected` are the remembered cursor position
-    /// (`App::settings_tab` / `App::settings_selected`), clamped in case
-    /// the lists shrank between builds.
-    pub fn new(tab: usize, selected: usize) -> Self {
+    /// `tab`/`selected`/`on_tabs` are the remembered cursor position
+    /// (`App::settings_tab` / `App::settings_selected` /
+    /// `App::settings_on_tabs`), clamped in case the lists shrank between
+    /// builds.
+    pub fn new(tab: usize, selected: usize, on_tabs: bool) -> Self {
         let tab = tab.min(crate::config::tab_count().saturating_sub(1));
         Self {
             tab,
             selected: selected.min(crate::config::tab_len(tab).saturating_sub(1)),
+            on_tabs,
             ..Self::default()
         }
     }
@@ -1552,26 +1542,6 @@ fn workspace_agents<'a>(
         .filter(move |a| !a.archived && wt_ids.contains(&a.worktree_id))
 }
 
-/// One selectable row in the Projects panel. The payload indexes
-/// `tree.projects`; a `Divider` is the separator hanging below that project
-/// — or, with `before`, the leading divider drawn above the whole list
-/// (always owned by project 0).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProjectRow {
-    Project(usize),
-    Divider { project: usize, before: bool },
-}
-
-impl ProjectRow {
-    /// Index of the project this row belongs to (a divider belongs to the
-    /// project that owns it).
-    pub fn project_index(&self) -> usize {
-        match self {
-            ProjectRow::Project(i) | ProjectRow::Divider { project: i, .. } => *i,
-        }
-    }
-}
-
 /// A session that is mid-turn or blocked on the user. These head the
 /// RECENT group and never age out of it — the whole point of the group is
 /// to keep what needs attention in view.
@@ -1661,6 +1631,14 @@ impl Tree {
             .find(|w| w.id == self.active_workspace)
             .map(|w| w.name.as_str())
             .unwrap_or("default")
+    }
+
+    /// Is the open workspace the built-in `default` one? The first-run
+    /// splash is scoped to it: an empty workspace the user created (or
+    /// stepped onto in the Workspaces column) is an ordinary empty tree,
+    /// not a first run.
+    pub fn in_default_workspace(&self) -> bool {
+        self.active_workspace.as_str() == nebula_core::DEFAULT_WORKSPACE_ID
     }
 
     /// Any project visible in the open workspace? (The splash and the
@@ -1839,8 +1817,8 @@ pub const OPEN_PRS_MIN_AGE: std::time::Duration = std::time::Duration::from_secs
 pub struct App {
     pub tree: Tree,
     pub focus: Focus,
-    /// Selected row in the Projects panel — indexes `project_rows()`, which
-    /// interleaves projects and their dividers.
+    /// Selected row in the Projects panel — indexes `project_rows()`, the
+    /// open workspace's projects in display order.
     pub sel_project: usize,
     pub sel_worktree: usize,
     pub sel_session: usize,
@@ -1894,10 +1872,6 @@ pub struct App {
     pub startup_workspace: Option<String>,
     /// Session created by us, awaiting its upsert to fix the selection.
     pub select_when_seen: Option<SessionRef>,
-    /// A divider we asked to move, awaiting the upsert that lands it on
-    /// this project (`true` = its leading divider) so the selection can
-    /// follow it there.
-    pub select_divider_when_seen: Option<(ProjectId, bool)>,
     /// Project added by us, awaiting its upsert to fix the selection.
     pub select_project_when_seen: Option<ProjectId>,
     /// Worktree created by us, awaiting its upsert to fix the selection.
@@ -1948,6 +1922,11 @@ pub struct App {
     /// Cursor row of the settings modal, one per tab, remembered across
     /// opens so switching tabs and coming back lands where you left.
     pub settings_selected: Vec<usize>,
+    /// Where the settings cursor was parked when the overlay last closed:
+    /// on the tab strip, or down in the list. True until the first visit
+    /// puts it somewhere, so a fresh overlay opens with the strip focused
+    /// and ←/→ immediately mean "walk the tabs".
+    pub settings_on_tabs: bool,
     /// Hotkeys as the panels dispatch them: `config.keymap()`, cached here
     /// because a keymap lookup happens on every single key press. The
     /// event loop refreshes it at startup and whenever a binding changes.
@@ -2106,7 +2085,6 @@ impl App {
             pending: HashMap::new(),
             startup_workspace: None,
             select_when_seen: None,
-            select_divider_when_seen: None,
             select_project_when_seen: None,
             select_worktree_when_seen: None,
             select_note_when_seen: None,
@@ -2124,6 +2102,7 @@ impl App {
             diff_files_width: DEFAULT_DIFF_FILES_W,
             settings_tab: 0,
             settings_selected: vec![0; crate::config::tab_count()],
+            settings_on_tabs: true,
             keymap: crate::keymap::Keymap::default(),
             splitter_drag: None,
             hover_splitter: None,
@@ -2171,6 +2150,12 @@ impl App {
             .min(crate::config::tab_len(tab).saturating_sub(1))
     }
 
+    /// Record where the settings cursor is parked, so the next open lands
+    /// in the same place.
+    pub fn remember_settings_focus(&mut self, on_tabs: bool) {
+        self.settings_on_tabs = on_tabs;
+    }
+
     pub fn remember_settings_row(&mut self, tab: usize, row: usize) {
         if self.settings_selected.len() < crate::config::tab_count() {
             self.settings_selected.resize(crate::config::tab_count(), 0);
@@ -2184,8 +2169,15 @@ impl App {
     /// (first run) or summoned with N, and the panels aren't collapsed
     /// away. True whether it's animating or drawn as a still frame, so the
     /// footer can key its hints off it.
+    ///
+    /// "First run" means the **default** workspace is empty. Any other
+    /// empty workspace keeps the panels (with their "no projects yet"
+    /// hints) — otherwise stepping the Workspaces column onto a fresh
+    /// workspace would hide the very column being stepped through.
     pub fn splash_showing(&self) -> bool {
-        !self.collapsed && (!self.tree.has_visible_projects() || self.splash_preview)
+        !self.collapsed
+            && ((self.tree.in_default_workspace() && !self.tree.has_visible_projects())
+                || self.splash_preview)
     }
 
     /// The animated splash is on screen and should be ticking: nothing in
@@ -2280,55 +2272,27 @@ impl App {
         id
     }
 
-    /// Projects panel rows in display order: the leading divider (when
-    /// present), then each project with its divider directly below it.
-    /// Scoped to the open workspace — rows index the FULL `tree.projects`
-    /// list but other workspaces' projects get no row.
-    pub fn project_rows(&self) -> Vec<ProjectRow> {
-        let mut rows = Vec::with_capacity(self.tree.projects.len() + 1);
-        let mut first = true;
-        for (i, p) in self.tree.projects.iter().enumerate() {
-            if !self.tree.in_active_workspace(p) {
-                continue;
-            }
-            if first && p.divider_before {
-                rows.push(ProjectRow::Divider {
-                    project: i,
-                    before: true,
-                });
-            }
-            first = false;
-            rows.push(ProjectRow::Project(i));
-            if p.divider_after {
-                rows.push(ProjectRow::Divider {
-                    project: i,
-                    before: false,
-                });
-            }
-        }
-        rows
+    /// Projects panel rows in display order, each an index into the FULL
+    /// `tree.projects` list. Scoped to the open workspace — other
+    /// workspaces' projects get no row.
+    pub fn project_rows(&self) -> Vec<usize> {
+        self.tree
+            .projects
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| self.tree.in_active_workspace(p))
+            .map(|(i, _)| i)
+            .collect()
     }
 
-    /// Is the Projects-panel selection sitting on a divider row? The
-    /// Worktrees/Sessions panels and the terminal pane blank their content
-    /// while it is — a separator has nothing underneath it to show.
-    pub fn divider_focused(&self) -> bool {
-        matches!(
-            self.selected_project_row(),
-            Some(ProjectRow::Divider { .. })
-        )
-    }
-
-    pub fn selected_project_row(&self) -> Option<ProjectRow> {
+    /// Index into `tree.projects` of the selected Projects-panel row.
+    pub fn selected_project_index(&self) -> Option<usize> {
         self.project_rows().get(self.sel_project).copied()
     }
 
-    /// The project giving the current selection its context. Selecting a
-    /// divider keeps the context of the project it hangs below, so the
-    /// Worktrees/Sessions panels stay put while walking the list.
+    /// The project giving the current selection its context.
     pub fn selected_project(&self) -> Option<&Project> {
-        let row = self.selected_project_row()?;
-        self.tree.projects.get(row.project_index())
+        self.tree.projects.get(self.selected_project_index()?)
     }
 
     pub fn selected_worktree(&self) -> Option<&Worktree> {
@@ -2789,10 +2753,6 @@ mod tests {
             name: "demo".into(),
             repo_path: "/tmp/demo".into(),
             sort_order: 0,
-            divider_after: false,
-            divider_label: None,
-            divider_before: false,
-            divider_before_label: None,
         });
         app.tree.worktrees.push(Worktree {
             id: worktree_id.clone(),

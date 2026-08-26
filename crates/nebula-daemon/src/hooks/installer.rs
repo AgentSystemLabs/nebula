@@ -105,9 +105,11 @@ fn hook_command(endpoint: &str, event: &str) -> String {
     )
 }
 
-/// Permission rule letting Claude Code run the auto-title command without a
-/// permission prompt (codex/cursor run with their skip-permissions flags).
-const CLAUDE_ALLOW_RENAME: &str = "Bash(nebula rename:*)";
+/// Permission rules letting Claude Code run nebula's own commands without a
+/// permission prompt: the auto-title `nebula rename`, and the `nebula
+/// worktree` relocation its appended system prompt tells it to use
+/// (codex/cursor run with their skip-permissions flags).
+const CLAUDE_ALLOW_RULES: &[&str] = &["Bash(nebula rename:*)", "Bash(nebula worktree:*)"];
 
 /// Cursor variant: the payload arrives on stdin like Claude's, but cursor
 /// expects a JSON response on stdout — `{"continue": true}` keeps gating
@@ -172,7 +174,9 @@ pub fn install_claude_hooks(cwd: &Path) -> Result<()> {
         );
     };
     merge_managed_hooks(root_obj, "claude", CLAUDE_EVENTS, &path)?;
-    ensure_permission_allow(root_obj, CLAUDE_ALLOW_RENAME, &path)?;
+    for rule in CLAUDE_ALLOW_RULES {
+        ensure_permission_allow(root_obj, rule, &path)?;
+    }
     write_hooks_root(&dir, "settings.local.json", &root)
 }
 
@@ -526,14 +530,13 @@ mod tests {
         let settings = read_settings(tmp.path());
         let allow = settings["permissions"]["allow"].as_array().unwrap();
         assert_eq!(allow[0], json!("Bash(ls:*)"), "user entry preserved first");
-        assert_eq!(
-            allow
-                .iter()
-                .filter(|v| v.as_str() == Some(CLAUDE_ALLOW_RENAME))
-                .count(),
-            1,
-            "exactly one nebula entry after reinstalls: {allow:?}"
-        );
+        for rule in CLAUDE_ALLOW_RULES {
+            assert_eq!(
+                allow.iter().filter(|v| v.as_str() == Some(rule)).count(),
+                1,
+                "exactly one {rule} entry after reinstalls: {allow:?}"
+            );
+        }
         assert_eq!(settings["permissions"]["deny"][0], json!("WebFetch"));
     }
 

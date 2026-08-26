@@ -101,26 +101,6 @@ pub enum ClientRequest {
         id: ProjectId,
         delta: i64,
     },
-    /// Set a group divider on a project row: presence and label.
-    /// `before` targets the leading divider drawn above the row (only
-    /// valid on the first project) instead of the one hanging below it.
-    /// `present: false` removes it (label is dropped too).
-    SetProjectDivider {
-        req_id: u64,
-        id: ProjectId,
-        before: bool,
-        present: bool,
-        label: Option<String>,
-    },
-    /// Move the divider on project `id` (`before` picks which one) to the
-    /// neighboring gap (sign of `delta`). No-op past the list's edges or
-    /// when the destination gap already has a divider.
-    MoveDivider {
-        req_id: u64,
-        id: ProjectId,
-        before: bool,
-        delta: i64,
-    },
     CreateWorktree {
         req_id: u64,
         project: ProjectId,
@@ -196,14 +176,28 @@ pub enum ClientRequest {
         id: AgentId,
         name: String,
     },
-    /// Re-home the agent row under another worktree of the same project.
-    /// A live PTY is killed and respawned (resumed) in the new path — left
-    /// running, its hooks would keep reporting the old checkout's cwd and
-    /// the daemon would re-home the row right back.
+    /// Re-home the agent row under another worktree of the same project,
+    /// right now. A live PTY is killed and respawned (resumed) in the new
+    /// path — left running, its hooks would keep reporting the old
+    /// checkout's cwd and the daemon would re-home the row right back.
+    /// The daemon-side primitive behind `EnterWorktree`; no TUI verb sends
+    /// it any more.
     MoveAgent {
         req_id: u64,
         id: AgentId,
         worktree: WorktreeId,
+    },
+    /// `nebula worktree <name>`, run by the agent from inside its own
+    /// session: create the worktree `branch` under the agent's project (or
+    /// take the existing one with that branch), re-home the agent row under
+    /// it at once, and relocate the live session into it when its current
+    /// turn ends — killed and respawned resumed there, with a prompt that
+    /// tells the CLI where it now is. Replies with `WorktreeEntered`.
+    EnterWorktree {
+        req_id: u64,
+        id: AgentId,
+        branch: String,
+        base: Option<String>,
     },
     /// Kills the PTY, sets archived=1.
     ArchiveAgent {
@@ -342,6 +336,18 @@ pub struct MetricsSnapshot {
     pub sessions: Vec<SessionMetrics>,
 }
 
+/// What `EnterWorktree` did to the agent's live session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EnterOutcome {
+    /// The agent already lived in that worktree; nothing changed.
+    AlreadyThere,
+    /// The row moved; the live session respawns inside the worktree, resumed,
+    /// once its current turn ends.
+    Relocating,
+    /// The row moved and nothing was running: the next launch lands there.
+    NextLaunch,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerEvent {
     HelloOk {
@@ -371,6 +377,13 @@ pub enum ServerEvent {
     Ack {
         req_id: u64,
         created: Option<EntityId>,
+    },
+    /// Reply to `EnterWorktree`: the worktree the agent now belongs to, and
+    /// what that meant for its process.
+    WorktreeEntered {
+        req_id: u64,
+        worktree: Worktree,
+        outcome: EnterOutcome,
     },
     Error {
         req_id: Option<u64>,

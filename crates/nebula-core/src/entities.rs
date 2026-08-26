@@ -107,17 +107,6 @@ pub struct Project {
     pub workspace_id: WorkspaceId,
     pub repo_path: PathBuf,
     pub sort_order: i64,
-    /// Draw a group divider under this row. Dividers belong to list
-    /// positions, not projects: reordering keeps them in place.
-    pub divider_after: bool,
-    /// Optional group label rendered inside the divider line.
-    pub divider_label: Option<String>,
-    /// Draw a group divider above this row. Only ever set on the first
-    /// project — it is the list's leading divider, re-owned by whichever
-    /// project is on top after a reorder.
-    pub divider_before: bool,
-    /// Optional group label for the leading divider.
-    pub divider_before_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

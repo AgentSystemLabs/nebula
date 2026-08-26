@@ -8,9 +8,9 @@ use crate::status::{AgentStatusMachine, Effect, HookEvent};
 use crate::store::Store;
 use anyhow::{bail, Context, Result};
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Link, LinkId, Note, NoteId,
-    NoteOwner, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Workspace,
-    WorkspaceId, Worktree, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
+    Agent, AgentId, AgentKind, AgentStatus, EnterOutcome, Entity, EntityId, Link, LinkId, Note,
+    NoteId, NoteOwner, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab,
+    Workspace, WorkspaceId, Worktree, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -97,6 +97,13 @@ pub struct Daemon {
     /// nebula hasn't adopted yet leaves its cwd here, so the worktree sync
     /// can finish the re-home once the row exists.
     last_cwd: Mutex<HashMap<AgentId, PathBuf>>,
+    /// Agents that ran `nebula worktree` and are waiting for their turn to
+    /// end: the row already sits under the target worktree while the PTY
+    /// still runs in the old checkout. Drained by `complete_pending_move`
+    /// on the turn-end hook (kill + respawn resumed in the target), cleared
+    /// by any other spawn of the agent, and consulted by the cwd reparent so
+    /// the old checkout's cwd can't drag the row back in the meantime.
+    pending_moves: Mutex<HashMap<AgentId, Worktree>>,
 }
 
 impl Daemon {
@@ -115,6 +122,7 @@ impl Daemon {
             attach_counts: Mutex::new(HashMap::new()),
             session_interest: Mutex::new(HashMap::new()),
             last_cwd: Mutex::new(HashMap::new()),
+            pending_moves: Mutex::new(HashMap::new()),
         })
     }
 
@@ -599,10 +607,6 @@ impl Daemon {
             workspace_id,
             repo_path: repo_path.clone(),
             sort_order: self.store.next_project_sort_order()?,
-            divider_after: false,
-            divider_label: None,
-            divider_before: false,
-            divider_before_label: None,
         };
         self.store.insert_project(&project)?;
         self.broadcast(ServerEvent::EntityUpserted {
@@ -633,31 +637,7 @@ impl Daemon {
 
     pub fn remove_project(self: &Arc<Self>, id: &ProjectId) -> Result<()> {
         // Kill any live sessions under this project first.
-        let (all_projects, worktrees, agents, terminals) = self.store.load_tree()?;
-        // Divider bookkeeping is per-workspace: the list clients see is the
-        // removed project's workspace, so its neighbors are found there.
-        let workspace = all_projects
-            .iter()
-            .find(|p| &p.id == id)
-            .map(|p| p.workspace_id.clone());
-        let projects: Vec<Project> = all_projects
-            .iter()
-            .filter(|p| Some(&p.workspace_id) == workspace.as_ref())
-            .cloned()
-            .collect();
-        // The leading divider belongs to the list, not the top project:
-        // removing that project hands it down to the next one.
-        if let (Some(first), Some(second)) = (projects.first(), projects.get(1)) {
-            if &first.id == id && first.divider_before {
-                let mut heir = second.clone();
-                heir.divider_before = true;
-                heir.divider_before_label = first.divider_before_label.clone();
-                self.store.set_project_position(&heir)?;
-                self.broadcast(ServerEvent::EntityUpserted {
-                    entity: Entity::Project(heir),
-                });
-            }
-        }
+        let (_, worktrees, agents, terminals) = self.store.load_tree()?;
         let wt_ids: Vec<WorktreeId> = worktrees
             .into_iter()
             .filter(|w| &w.project_id == id)
@@ -678,14 +658,9 @@ impl Daemon {
         Ok(())
     }
 
-    /// Move a project `delta` rows in the displayed list, where dividers
-    /// occupy rows of their own (clamped at the edges). A project steps into
-    /// the gap beside a divider before it swaps with the next project, so
-    /// repeated single-row moves can park it directly above or below a
-    /// divider — including below a divider that ends up above the whole
-    /// list (the leading divider). Sort orders are rewritten to the display
-    /// index for every project, which also normalizes legacy all-zero
-    /// orders on first use.
+    /// Move a project `delta` rows in the displayed list (clamped at the
+    /// edges). Sort orders are rewritten to the display index for every
+    /// project, which also normalizes legacy all-zero orders on first use.
     pub fn move_project(self: &Arc<Self>, id: &ProjectId, delta: i64) -> Result<()> {
         let (all_projects, _, _, _) = self.store.load_tree()?;
         // Reorders happen within the project's workspace — the list clients
@@ -696,220 +671,30 @@ impl Daemon {
             .iter()
             .find(|p| &p.id == id)
             .map(|p| p.workspace_id.clone());
-        let projects: Vec<Project> = all_projects
+        let mut projects: Vec<Project> = all_projects
             .into_iter()
             .filter(|p| Some(&p.workspace_id) == workspace.as_ref())
             .collect();
-        #[derive(Clone, PartialEq)]
-        enum Row {
-            Project(ProjectId),
-            Divider(Option<String>),
-        }
-        let mut rows: Vec<Row> = Vec::new();
-        if let Some(first) = projects.first() {
-            if first.divider_before {
-                rows.push(Row::Divider(first.divider_before_label.clone()));
-            }
-        }
-        for p in &projects {
-            rows.push(Row::Project(p.id.clone()));
-            if p.divider_after {
-                rows.push(Row::Divider(p.divider_label.clone()));
-            }
-        }
-        let Some(pos) = rows
-            .iter()
-            .position(|r| matches!(r, Row::Project(pid) if pid == id))
-        else {
+        let Some(pos) = projects.iter().position(|p| &p.id == id) else {
             bail!("project not found");
         };
-        let mut target = (pos as i64 + delta).clamp(0, rows.len() as i64 - 1) as usize;
-        let rows = loop {
-            let mut moved = rows.clone();
-            let row = moved.remove(pos);
-            moved.insert(target, row);
-            // Two dividers can't share a gap: a move that would leave them
-            // stacked (no project left between) pushes one row further so
-            // the keystroke still lands the project across, or no-ops at
-            // the edge.
-            let stacked = moved
-                .windows(2)
-                .any(|w| matches!(w, [Row::Divider(_), Row::Divider(_)]));
-            if !stacked && moved != rows {
-                break moved;
-            }
-            let next = (target as i64 + delta.signum()).clamp(0, rows.len() as i64 - 1) as usize;
-            if next == target {
-                return Ok(());
-            }
-            target = next;
-        };
-        type Position = (i64, bool, Option<String>, bool, Option<String>);
-        fn position(p: &Project) -> Position {
-            (
-                p.sort_order,
-                p.divider_after,
-                p.divider_label.clone(),
-                p.divider_before,
-                p.divider_before_label.clone(),
-            )
-        }
-        let before: HashMap<ProjectId, Position> = projects
-            .iter()
-            .map(|p| (p.id.clone(), position(p)))
-            .collect();
-        let mut by_id: HashMap<ProjectId, Project> =
-            projects.into_iter().map(|p| (p.id.clone(), p)).collect();
-        let mut ordered: Vec<Project> = Vec::new();
-        let mut leading: Option<Option<String>> = None;
-        for row in rows {
-            match row {
-                Row::Project(pid) => {
-                    let mut project = by_id.remove(&pid).expect("row ids come from projects");
-                    project.sort_order = ordered.len() as i64;
-                    project.divider_after = false;
-                    project.divider_label = None;
-                    project.divider_before = false;
-                    project.divider_before_label = None;
-                    ordered.push(project);
-                }
-                Row::Divider(label) => match ordered.last_mut() {
-                    Some(owner) => {
-                        owner.divider_after = true;
-                        owner.divider_label = label;
-                    }
-                    // Ahead of every project: the leading divider, re-owned
-                    // by whichever project ends up on top.
-                    None => leading = Some(label),
-                },
-            }
-        }
-        if let Some(label) = leading {
-            let first = ordered.first_mut().expect("rows contain every project");
-            first.divider_before = true;
-            first.divider_before_label = label;
-        }
-        for project in &ordered {
-            if before.get(&project.id) != Some(&position(project)) {
-                self.store.set_project_position(project)?;
-                self.broadcast(ServerEvent::EntityUpserted {
-                    entity: Entity::Project(project.clone()),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// Set or clear one of a project's dividers. `before` addresses the
-    /// leading divider (drawn above the whole list) — only the first
-    /// project can carry that one.
-    pub fn set_project_divider(
-        self: &Arc<Self>,
-        id: &ProjectId,
-        before: bool,
-        present: bool,
-        label: Option<String>,
-    ) -> Result<()> {
-        let mut project = self.store.get_project(id)?.context("project not found")?;
-        if before && present {
-            let (projects, _, _, _) = self.store.load_tree()?;
-            // "First" within the project's workspace — the list clients see.
-            let first = projects
-                .iter()
-                .find(|p| p.workspace_id == project.workspace_id)
-                .map(|p| &p.id);
-            if first != Some(id) {
-                bail!("only the first project can hold the leading divider");
-            }
-        }
-        // A removed divider keeps no label.
-        let label = if present {
-            label.filter(|l| !l.trim().is_empty())
-        } else {
-            None
-        };
-        let slot = if before {
-            (
-                &mut project.divider_before,
-                &mut project.divider_before_label,
-            )
-        } else {
-            (&mut project.divider_after, &mut project.divider_label)
-        };
-        if (*slot.0, &*slot.1) == (present, &label) {
+        let target = (pos as i64 + delta).clamp(0, projects.len() as i64 - 1) as usize;
+        if target == pos {
             return Ok(());
         }
-        *slot.0 = present;
-        *slot.1 = label;
-        self.store.set_project_position(&project)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Project(project),
-        });
-        Ok(())
-    }
-
-    /// Move project `id`'s divider (`before` picks which one) to the
-    /// neighboring gap (sign of `delta`; one step per call). The divider
-    /// under the first project can hop above it — the leading divider —
-    /// and back down. No-op past the list's edges or when the destination
-    /// gap already has a divider — two dividers can't share a gap.
-    pub fn move_divider(self: &Arc<Self>, id: &ProjectId, before: bool, delta: i64) -> Result<()> {
-        if delta == 0 {
-            return Ok(());
-        }
-        let (all_projects, _, _, _) = self.store.load_tree()?;
-        // Neighbors live in the project's workspace — the list clients see.
-        let workspace = all_projects
-            .iter()
-            .find(|p| &p.id == id)
-            .map(|p| p.workspace_id.clone());
-        let projects: Vec<Project> = all_projects
-            .into_iter()
-            .filter(|p| Some(&p.workspace_id) == workspace.as_ref())
-            .collect();
-        let Some(index) = projects.iter().position(|p| &p.id == id) else {
-            bail!("project not found");
-        };
-        let down = delta.signum() > 0;
-        if before {
-            if index != 0 || !projects[0].divider_before {
-                bail!("project has no leading divider");
+        let moved = projects.remove(pos);
+        projects.insert(target, moved);
+        for (index, project) in projects.iter_mut().enumerate() {
+            let sort_order = index as i64;
+            if project.sort_order == sort_order {
+                continue;
             }
-            if !down {
-                return Ok(()); // already above everything
-            }
-            // Hop from above the first project to below it.
-            if projects[0].divider_after {
-                return Ok(());
-            }
-            let label = projects[0].divider_before_label.clone();
-            self.set_project_divider(id, true, false, None)?;
-            self.set_project_divider(id, false, true, label)?;
-            return Ok(());
+            project.sort_order = sort_order;
+            self.store.set_project_position(project)?;
+            self.broadcast(ServerEvent::EntityUpserted {
+                entity: Entity::Project(project.clone()),
+            });
         }
-        if !projects[index].divider_after {
-            bail!("project has no divider");
-        }
-        let label = projects[index].divider_label.clone();
-        if index == 0 && !down {
-            // Hop from below the first project to above it.
-            if projects[0].divider_before {
-                return Ok(());
-            }
-            self.set_project_divider(id, false, false, None)?;
-            self.set_project_divider(id, true, true, label)?;
-            return Ok(());
-        }
-        let neighbor = index as i64 + delta.signum();
-        let Some(neighbor) = usize::try_from(neighbor).ok().and_then(|i| projects.get(i)) else {
-            return Ok(()); // no project on that side
-        };
-        if neighbor.divider_after {
-            return Ok(());
-        }
-        let neighbor_id = neighbor.id.clone();
-        self.set_project_divider(id, false, false, None)?;
-        self.set_project_divider(&neighbor_id, false, true, label)?;
         Ok(())
     }
 
@@ -1159,12 +944,13 @@ impl Daemon {
             .insert_agent_with_auto_title(&agent, auto_title)?;
         if adopted.is_none() {
             // Cold path: boot the CLI right away.
-            let spawned = self.spawn_agent_session_with_cloud(
+            let spawned = self.spawn_agent_session_with(
                 &agent,
                 &worktree,
                 80,
                 24,
                 cloud_prompt.as_deref(),
+                None,
             );
             self.rollback_agent_on_spawn_error(&agent.id, spawned)?;
         }
@@ -1468,17 +1254,8 @@ impl Daemon {
         if &agent.worktree_id == worktree_id {
             return Ok(());
         }
-        let target = self
-            .store
-            .get_worktree(worktree_id)?
-            .context("worktree not found")?;
-        let current = self
-            .store
-            .get_worktree(&agent.worktree_id)?
-            .context("worktree not found")?;
-        if target.project_id != current.project_id {
-            bail!("target worktree belongs to a different project");
-        }
+        let target = self.sibling_worktree(&agent, worktree_id)?;
+        self.pending_moves.lock().unwrap().remove(id);
         let sref = SessionRef::Agent(id.clone());
         let was_alive = self.session(&sref).is_some();
         if was_alive {
@@ -1499,6 +1276,145 @@ impl Daemon {
             entity: Entity::Agent(agent),
         });
         Ok(())
+    }
+
+    /// The worktree `worktree_id`, checked to belong to the same project as
+    /// `agent`'s current one — the only kind of move a row can make.
+    fn sibling_worktree(&self, agent: &Agent, worktree_id: &WorktreeId) -> Result<Worktree> {
+        let target = self
+            .store
+            .get_worktree(worktree_id)?
+            .context("worktree not found")?;
+        let current = self
+            .store
+            .get_worktree(&agent.worktree_id)?
+            .context("worktree not found")?;
+        if target.project_id != current.project_id {
+            bail!("target worktree belongs to a different project");
+        }
+        Ok(target)
+    }
+
+    /// `nebula worktree <branch>`, run by the agent inside its own session.
+    /// The row moves under `branch`'s worktree of the same project now —
+    /// created when the project has no checkout for that branch yet — and
+    /// a live PTY follows once its turn ends (`complete_pending_move`),
+    /// because the CLI running this command *is* that PTY's foreground
+    /// tool call: killing it here would cut the turn off mid-answer.
+    pub async fn enter_worktree(
+        self: &Arc<Self>,
+        id: &AgentId,
+        branch: &str,
+        base: Option<&str>,
+    ) -> Result<(Worktree, EnterOutcome)> {
+        let branch = branch.trim();
+        if branch.is_empty() {
+            bail!("branch name is empty");
+        }
+        let agent = self.store.get_agent(id)?.context("agent not found")?;
+        if agent.archived {
+            bail!("agent is archived");
+        }
+        let current = self
+            .store
+            .get_worktree(&agent.worktree_id)?
+            .context("worktree not found")?;
+        let (_, worktrees, _, _) = self.store.load_tree()?;
+        let existing = worktrees
+            .into_iter()
+            .find(|w| w.project_id == current.project_id && w.branch == branch);
+        let target = match existing {
+            Some(w) => w,
+            None => {
+                let created = self
+                    .create_worktree(&current.project_id, branch, base)
+                    .await?;
+                let EntityId::Worktree(new_id) = created else {
+                    bail!("worktree creation returned a non-worktree entity");
+                };
+                self.store
+                    .get_worktree(&new_id)?
+                    .context("worktree not found")?
+            }
+        };
+        if target.id == current.id {
+            return Ok((target, EnterOutcome::AlreadyThere));
+        }
+        let alive = self.session(&SessionRef::Agent(id.clone())).is_some();
+        // Same invalidation as `move_agent`: every cwd this process reports
+        // until it respawns is the old checkout's.
+        self.last_cwd.lock().unwrap().remove(id);
+        if alive {
+            self.pending_moves
+                .lock()
+                .unwrap()
+                .insert(id.clone(), target.clone());
+        }
+        self.store.set_agent_worktree(id, &target.id)?;
+        let entity = self.agent_entity(id)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Agent(entity),
+        });
+        let outcome = if alive {
+            EnterOutcome::Relocating
+        } else {
+            EnterOutcome::NextLaunch
+        };
+        Ok((target, outcome))
+    }
+
+    /// The turn an agent ran `nebula worktree` in has ended: make the
+    /// process match its row. Kill it and respawn it resumed in the target,
+    /// with a prompt naming the checkout it now runs in so the conversation
+    /// carries straight on (Claude takes that prompt as an argument; codex
+    /// and cursor resume silent and wait for the user). Gated on the
+    /// turn-end hooks — Stop, and the idle notification a Stop-less end
+    /// still fires — so a Bash hook from the same turn never triggers it.
+    pub fn complete_pending_move(self: &Arc<Self>, id: &AgentId, event: &HookEvent) {
+        let turn_over = match event {
+            HookEvent::Stop => true,
+            HookEvent::Notification { notification_type } => {
+                notification_type.as_deref() == Some("idle_prompt")
+            }
+            _ => false,
+        };
+        if !turn_over {
+            return;
+        }
+        let Some(target) = self.pending_moves.lock().unwrap().remove(id) else {
+            return;
+        };
+        let agent = match self.store.get_agent(id) {
+            Ok(Some(agent)) if !agent.archived && agent.worktree_id == target.id => agent,
+            // Archived, deleted, or moved elsewhere by hand since: the
+            // row's current home wins, nothing to relocate into.
+            _ => return,
+        };
+        let sref = SessionRef::Agent(id.clone());
+        if self.session(&sref).is_none() {
+            // Died since (or the user closed it): the next launch boots in
+            // the target on its own, only without the relocation notice.
+            return;
+        }
+        tracing::info!(agent = %id, to = %target.branch, "relocating session into its worktree");
+        self.kill_session(&sref);
+        self.last_cwd.lock().unwrap().remove(id);
+        let prompt = relocation_prompt(&target);
+        if let Err(e) = self.spawn_agent_session_with(&agent, &target, 80, 24, None, Some(&prompt))
+        {
+            tracing::warn!(agent = %id, error = %e, "respawn after worktree relocation failed");
+        }
+        if let Ok(entity) = self.agent_entity(id) {
+            self.broadcast(ServerEvent::EntityUpserted {
+                entity: Entity::Agent(entity),
+            });
+        }
+    }
+
+    /// Whether `id` is between `enter_worktree` and its respawn.
+    #[cfg(test)]
+    fn relocation_pending(&self, id: &AgentId) -> bool {
+        self.pending_moves.lock().unwrap().contains_key(id)
     }
 
     /// Row-only re-home: store update plus broadcast, never the PTY. The
@@ -1546,6 +1462,12 @@ impl Daemon {
         };
         if agent.archived {
             self.last_cwd.lock().unwrap().remove(agent_id);
+            return Ok(());
+        }
+        // Mid-relocation the row already sits under the target while the
+        // process still reports the old checkout — ignore it until the
+        // respawn lands there.
+        if self.pending_moves.lock().unwrap().contains_key(agent_id) {
             return Ok(());
         }
         // Same foreign-session rule as the status machine: a payload from a
@@ -1673,6 +1595,7 @@ impl Daemon {
     pub fn delete_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
         self.kill_session(&SessionRef::Agent(id.clone()));
         self.last_cwd.lock().unwrap().remove(id);
+        self.pending_moves.lock().unwrap().remove(id);
         self.store.delete_agent(id)?;
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Agent(id.clone()),
@@ -1941,20 +1864,27 @@ impl Daemon {
         cols: u16,
         rows: u16,
     ) -> Result<Arc<PtySession>> {
-        self.spawn_agent_session_with_cloud(agent, worktree, cols, rows, None)
+        self.spawn_agent_session_with(agent, worktree, cols, rows, None, None)
     }
 
-    /// Spawn the initial Claude Cloud dispatch. The prompt is intentionally
-    /// transient: later restarts/resumes follow the persisted Agent fields
-    /// and therefore use the established local-session path.
-    fn spawn_agent_session_with_cloud(
+    /// The general spawn: `cloud_prompt` makes it the initial Claude Cloud
+    /// dispatch, `initial_prompt` a first turn the CLI submits on its own
+    /// (the relocation notice a `nebula worktree` respawn opens with). Both
+    /// are intentionally transient: later restarts/resumes follow the
+    /// persisted Agent fields and therefore use the plain local-session
+    /// path.
+    fn spawn_agent_session_with(
         self: &Arc<Self>,
         agent: &Agent,
         worktree: &Worktree,
         cols: u16,
         rows: u16,
         cloud_prompt: Option<&str>,
+        initial_prompt: Option<&str>,
     ) -> Result<Arc<PtySession>> {
+        // Whatever spawns this agent, it runs in `worktree` from here: a
+        // relocation still pending for it has been overtaken.
+        self.pending_moves.lock().unwrap().remove(&agent.id);
         // Managed status hooks; a failure here degrades to "no status
         // updates", never blocks the spawn.
         let install_result = match agent.kind {
@@ -1984,12 +1914,14 @@ impl Daemon {
                 agent.effort.as_deref(),
                 cmd_override.as_deref(),
             ),
-            None => agent_spawn_command(
+            None => agent_spawn_command_with(
                 agent.kind,
                 agent.session_id.as_deref(),
                 agent.model.as_deref(),
                 agent.effort.as_deref(),
                 cmd_override.as_deref(),
+                initial_prompt,
+                true,
             ),
         };
         // Run the agent through the user's login+interactive shell so it sees
@@ -2195,14 +2127,65 @@ impl Daemon {
 /// `codex resume <sid>` (subcommand, so resume args must lead). Codex and
 /// cursor always get their skip-permissions flag (`--yolo` / `--force`),
 /// appended after the resume args — same convention as Mission Control.
-/// Model/effort choices trail everything: `claude --model m --effort e`,
+/// Model/effort choices follow: `claude --model m --effort e`,
 /// `codex -m m -c model_reasoning_effort=e` (cursor has neither knob).
+/// Claude then gets nebula's worktree guidance appended to its system
+/// prompt, and an `initial_prompt` — the relocation notice a `nebula
+/// worktree` respawn opens with — goes last, as Claude's positional prompt
+/// (codex and cursor take none; their resumes wait for the user).
+///
+/// The plain shape, as every restart/resume spawns it: no initial prompt,
+/// guidance on. Tests assert against this; the daemon calls the full form.
+#[cfg(test)]
 fn agent_spawn_command(
     kind: AgentKind,
     session_id: Option<&str>,
     model: Option<&str>,
     effort: Option<&str>,
     cmd_override: Option<&str>,
+) -> (String, Vec<String>, bool) {
+    agent_spawn_command_with(kind, session_id, model, effort, cmd_override, None, true)
+}
+
+/// What nebula appends to Claude's system prompt: how to take a "do this
+/// in a worktree" request through nebula (`Daemon::enter_worktree`) instead
+/// of Claude's own EnterWorktree tool, whose checkout lands under
+/// `<repo>/.claude/worktrees/` on a `worktree-*` branch — a layout the
+/// worktree list only adopts after the fact, and not where a nebula user
+/// keeps their worktrees. Claude only: codex and cursor have no
+/// system-prompt flag, and no EnterWorktree to steer away from.
+pub const CLAUDE_WORKTREE_GUIDANCE: &str = "[nebula] This session runs inside nebula, which \
+manages this project's git worktrees. When the user asks you to work in a worktree (\"do this in a \
+worktree\", \"in a new worktree\", \"branch this off in its own checkout\"), do not use the \
+EnterWorktree tool and do not run `git worktree add` yourself. Run this shell command instead, \
+exactly once:\n\n  nebula worktree <name>\n\nwhere <name> is the branch name the user gave, or a \
+short kebab-case name for the task (`nebula worktree` with no name invents one; `--base <ref>` picks \
+the start point). nebula creates the worktree, associates this session with it, and relocates the \
+session into it once your current turn ends. So when the command succeeds, end your turn at once: \
+tell the user in one line that the session is moving into the worktree, and make no further tool \
+calls or edits — you will be resumed inside the worktree with a prompt to carry on there. If the \
+command fails, report the error and carry on in the current checkout.";
+
+/// The prompt a relocated Claude session is resumed with: it names the
+/// checkout the process now runs in and asks for the work to pick back up
+/// there, so the user never has to type "continue".
+fn relocation_prompt(worktree: &Worktree) -> String {
+    format!(
+        "[nebula] This session now runs inside the worktree `{}` at {} — your working \
+         directory is that checkout. Continue the user's most recent request there.",
+        worktree.branch,
+        worktree.path.display()
+    )
+}
+
+fn agent_spawn_command_with(
+    kind: AgentKind,
+    session_id: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    cmd_override: Option<&str>,
+    initial_prompt: Option<&str>,
+    guidance: bool,
 ) -> (String, Vec<String>, bool) {
     if let Some(cmd) = cmd_override {
         let mut parts = cmd.split_whitespace().map(String::from).collect::<Vec<_>>();
@@ -2232,6 +2215,15 @@ fn agent_spawn_command(
             if let Some(e) = effort {
                 args.extend(["--effort".to_string(), e.to_string()]);
             }
+            if guidance {
+                args.extend([
+                    "--append-system-prompt".to_string(),
+                    CLAUDE_WORKTREE_GUIDANCE.to_string(),
+                ]);
+            }
+            if let Some(p) = initial_prompt {
+                args.push(p.to_string());
+            }
         }
         AgentKind::Codex => {
             if let Some(m) = model {
@@ -2249,15 +2241,23 @@ fn agent_spawn_command(
 /// Cloud creation is a one-shot variation of the normal fresh-Claude
 /// command. Keeping it as a wrapper leaves every resume/restart caller on
 /// the persisted local-session contract, and makes the no-override argument
-/// shape directly unit-testable.
+/// shape directly unit-testable. No worktree guidance either: the Cloud
+/// sandbox has no nebula CLI to follow it with.
 fn claude_cloud_spawn_command(
     prompt: &str,
     model: Option<&str>,
     effort: Option<&str>,
     cmd_override: Option<&str>,
 ) -> (String, Vec<String>, bool) {
-    let (program, mut args, resumed) =
-        agent_spawn_command(AgentKind::Claude, None, model, effort, cmd_override);
+    let (program, mut args, resumed) = agent_spawn_command_with(
+        AgentKind::Claude,
+        None,
+        model,
+        effort,
+        cmd_override,
+        None,
+        false,
+    );
     if cmd_override.is_none() {
         // Bind the optional value to its option. A separate argv item that
         // starts with `--` would otherwise be parsed as another Claude flag.
@@ -2390,12 +2390,23 @@ pub fn scrubbed_env_names() -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Claude argv: `args`, then nebula's appended worktree guidance.
+    fn guided(args: &[&str]) -> Vec<String> {
+        args.iter()
+            .map(|s| s.to_string())
+            .chain([
+                "--append-system-prompt".to_string(),
+                CLAUDE_WORKTREE_GUIDANCE.to_string(),
+            ])
+            .collect()
+    }
+
     #[test]
     fn spawn_command_per_kind_resume_shapes() {
-        // Fresh sessions: bare CLI.
+        // Fresh sessions: bare CLI (Claude plus its system-prompt guidance).
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, None, None, None, None),
-            ("claude".into(), vec![], false)
+            ("claude".into(), guided(&[]), false)
         );
         // Codex/cursor always run in skip-permissions mode.
         assert_eq!(
@@ -2410,11 +2421,7 @@ mod tests {
         // Claude resumes with a flag; codex with a subcommand (order matters).
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, Some("sid-1"), None, None, None),
-            (
-                "claude".into(),
-                vec!["--resume".to_string(), "sid-1".to_string()],
-                true
-            )
+            ("claude".into(), guided(&["--resume", "sid-1"]), true)
         );
         // Skip-permissions flags trail the resume args.
         assert_eq!(
@@ -2465,22 +2472,13 @@ mod tests {
             agent_spawn_command(AgentKind::Claude, None, Some("opus"), Some("high"), None),
             (
                 "claude".into(),
-                vec![
-                    "--model".to_string(),
-                    "opus".to_string(),
-                    "--effort".to_string(),
-                    "high".to_string()
-                ],
+                guided(&["--model", "opus", "--effort", "high"]),
                 false
             )
         );
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, None, None, Some("max"), None),
-            (
-                "claude".into(),
-                vec!["--effort".to_string(), "max".to_string()],
-                false
-            )
+            ("claude".into(), guided(&["--effort", "max"]), false)
         );
         // Codex takes --model plus a config override for effort, after --yolo.
         assert_eq!(
@@ -2503,12 +2501,7 @@ mod tests {
             agent_spawn_command(AgentKind::Claude, Some("sid"), Some("sonnet"), None, None),
             (
                 "claude".into(),
-                vec![
-                    "--resume".to_string(),
-                    "sid".to_string(),
-                    "--model".to_string(),
-                    "sonnet".to_string()
-                ],
+                guided(&["--resume", "sid", "--model", "sonnet"]),
                 true
             )
         );
@@ -2521,6 +2514,64 @@ mod tests {
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, None, Some("opus"), None, Some("/bin/sh")),
             ("/bin/sh".into(), vec![], false)
+        );
+    }
+
+    #[test]
+    fn spawn_command_initial_prompt_is_claudes_positional_argument() {
+        // The relocation notice trails everything, guidance included.
+        let (_, args, resumed) = agent_spawn_command_with(
+            AgentKind::Claude,
+            Some("sid"),
+            Some("opus"),
+            None,
+            None,
+            Some("carry on"),
+            true,
+        );
+        assert!(resumed);
+        let mut expected = guided(&["--resume", "sid", "--model", "opus"]);
+        expected.push("carry on".into());
+        assert_eq!(args, expected);
+        // Codex and cursor take no such argument — their resumes stay plain.
+        assert_eq!(
+            agent_spawn_command_with(
+                AgentKind::Codex,
+                Some("sid"),
+                None,
+                None,
+                None,
+                Some("carry on"),
+                true
+            )
+            .1,
+            vec!["resume", "sid", "--yolo"]
+        );
+        assert_eq!(
+            agent_spawn_command_with(
+                AgentKind::Cursor,
+                None,
+                None,
+                None,
+                None,
+                Some("carry on"),
+                true
+            )
+            .1,
+            vec!["--force"]
+        );
+        // An override is verbatim: no guidance, no prompt.
+        assert_eq!(
+            agent_spawn_command_with(
+                AgentKind::Claude,
+                None,
+                None,
+                None,
+                Some("/bin/sh -i"),
+                Some("carry on"),
+                true
+            ),
+            ("/bin/sh".into(), vec!["-i".to_string()], false)
         );
     }
 
@@ -2667,42 +2718,15 @@ mod tests {
                     name: (*name).into(),
                     repo_path: format!("/tmp/{name}").into(),
                     sort_order: i as i64,
-                    divider_after: false,
-                    divider_label: None,
-                    divider_before: false,
-                    divider_before_label: None,
                 })
                 .unwrap();
         }
     }
 
-    /// (name, divider_after, divider_label) in display order.
-    fn layout(daemon: &Daemon) -> Vec<(String, bool, Option<String>)> {
-        let (projects, _, _, _) = daemon.store.load_tree().unwrap();
-        projects
-            .into_iter()
-            .map(|p| (p.name, p.divider_after, p.divider_label))
-            .collect()
-    }
-
-    /// The leading divider: `Some(label)` when the list has one. Also
-    /// asserts the invariant that only the first project ever carries it.
-    fn leading(daemon: &Daemon) -> Option<Option<String>> {
-        let (projects, _, _, _) = daemon.store.load_tree().unwrap();
-        for p in projects.iter().skip(1) {
-            assert!(
-                !p.divider_before,
-                "leading divider drifted off the first project"
-            );
-        }
-        let first = projects.first()?;
-        first
-            .divider_before
-            .then(|| first.divider_before_label.clone())
-    }
-
+    /// Project names in display order.
     fn names(daemon: &Daemon) -> Vec<String> {
-        layout(daemon).into_iter().map(|(n, _, _)| n).collect()
+        let (projects, _, _, _) = daemon.store.load_tree().unwrap();
+        projects.into_iter().map(|p| p.name).collect()
     }
 
     #[test]
@@ -2722,258 +2746,6 @@ mod tests {
         daemon.move_project(&ProjectId("a".into()), -1).unwrap();
         daemon.move_project(&ProjectId("c".into()), 5).unwrap();
         assert_eq!(names(&daemon), ["a", "d", "b", "c"]);
-    }
-
-    #[test]
-    fn moves_step_one_visual_row_so_projects_park_beside_dividers() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["a", "b", "c", "d"]);
-        // Groups: [a b] [c d], labeled "work".
-        daemon
-            .set_project_divider(&ProjectId("b".into()), false, true, Some("work".into()))
-            .unwrap();
-
-        // First press: c crosses the divider into the first group without
-        // swapping past b — the divider (and its label) keeps marking the
-        // same gap, now below c.
-        daemon.move_project(&ProjectId("c".into()), -1).unwrap();
-        assert_eq!(
-            layout(&daemon),
-            [
-                ("a".to_string(), false, None),
-                ("b".to_string(), false, None),
-                ("c".to_string(), true, Some("work".to_string())),
-                ("d".to_string(), false, None),
-            ]
-        );
-
-        // Second press: c swaps with b like any project-to-project move.
-        daemon.move_project(&ProjectId("c".into()), -1).unwrap();
-        assert_eq!(
-            layout(&daemon),
-            [
-                ("a".to_string(), false, None),
-                ("c".to_string(), false, None),
-                ("b".to_string(), true, Some("work".to_string())),
-                ("d".to_string(), false, None),
-            ]
-        );
-
-        // Moving down retraces the same two steps back to the start.
-        daemon.move_project(&ProjectId("c".into()), 1).unwrap();
-        daemon.move_project(&ProjectId("c".into()), 1).unwrap();
-        assert_eq!(
-            layout(&daemon),
-            [
-                ("a".to_string(), false, None),
-                ("b".to_string(), true, Some("work".to_string())),
-                ("c".to_string(), false, None),
-                ("d".to_string(), false, None),
-            ]
-        );
-    }
-
-    #[test]
-    fn top_project_crossing_its_divider_leaves_it_leading() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["a", "b"]);
-        daemon
-            .set_project_divider(&ProjectId("a".into()), false, true, Some("work".into()))
-            .unwrap();
-
-        // a steps below its own divider, which stays put above the whole
-        // list — the leading divider, label intact.
-        daemon.move_project(&ProjectId("a".into()), 1).unwrap();
-        assert_eq!(names(&daemon), ["a", "b"]);
-        assert_eq!(leading(&daemon), Some(Some("work".to_string())));
-        assert!(layout(&daemon).iter().all(|(_, divider, _)| !divider));
-
-        // The next press swaps a past b like any project move; the leading
-        // divider stays on top, now owned by b.
-        daemon.move_project(&ProjectId("a".into()), 1).unwrap();
-        assert_eq!(names(&daemon), ["b", "a"]);
-        assert_eq!(leading(&daemon), Some(Some("work".to_string())));
-
-        // Moving a back up retraces both steps.
-        daemon.move_project(&ProjectId("a".into()), -1).unwrap();
-        assert_eq!(names(&daemon), ["a", "b"]);
-        assert_eq!(leading(&daemon), Some(Some("work".to_string())));
-        daemon.move_project(&ProjectId("a".into()), -1).unwrap();
-        assert_eq!(leading(&daemon), None);
-        assert_eq!(
-            layout(&daemon)[0],
-            ("a".to_string(), true, Some("work".to_string()))
-        );
-    }
-
-    #[test]
-    fn move_divider_hops_above_the_first_project_and_back() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["a", "b"]);
-        daemon
-            .set_project_divider(&ProjectId("a".into()), false, true, Some("work".into()))
-            .unwrap();
-
-        // Up from under a: the divider crosses onto the top slot.
-        daemon
-            .move_divider(&ProjectId("a".into()), false, -1)
-            .unwrap();
-        assert_eq!(leading(&daemon), Some(Some("work".to_string())));
-        assert!(layout(&daemon).iter().all(|(_, divider, _)| !divider));
-
-        // Up again clamps — it is already above everything.
-        daemon
-            .move_divider(&ProjectId("a".into()), true, -1)
-            .unwrap();
-        assert_eq!(leading(&daemon), Some(Some("work".to_string())));
-
-        // Down: back under a.
-        daemon
-            .move_divider(&ProjectId("a".into()), true, 1)
-            .unwrap();
-        assert_eq!(leading(&daemon), None);
-        assert_eq!(
-            layout(&daemon)[0],
-            ("a".to_string(), true, Some("work".to_string()))
-        );
-    }
-
-    #[test]
-    fn leading_divider_blocks_on_a_stacked_gap() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["a", "b"]);
-        daemon
-            .set_project_divider(&ProjectId("a".into()), true, true, Some("top".into()))
-            .unwrap();
-        daemon
-            .set_project_divider(&ProjectId("a".into()), false, true, Some("mid".into()))
-            .unwrap();
-
-        // Neither divider can move onto the other's gap.
-        daemon
-            .move_divider(&ProjectId("a".into()), true, 1)
-            .unwrap();
-        daemon
-            .move_divider(&ProjectId("a".into()), false, -1)
-            .unwrap();
-        assert_eq!(leading(&daemon), Some(Some("top".to_string())));
-        assert_eq!(
-            layout(&daemon)[0],
-            ("a".to_string(), true, Some("mid".to_string()))
-        );
-
-        // And the project pinched between them can't move either — that
-        // would stack the dividers into one gap.
-        daemon.move_project(&ProjectId("a".into()), 1).unwrap();
-        daemon.move_project(&ProjectId("a".into()), -1).unwrap();
-        assert_eq!(names(&daemon), ["a", "b"]);
-        assert_eq!(leading(&daemon), Some(Some("top".to_string())));
-    }
-
-    #[test]
-    fn removing_the_top_project_hands_the_leading_divider_down() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["a", "b"]);
-        daemon
-            .set_project_divider(&ProjectId("a".into()), true, true, Some("work".into()))
-            .unwrap();
-
-        daemon.remove_project(&ProjectId("a".into())).unwrap();
-        assert_eq!(names(&daemon), ["b"]);
-        assert_eq!(leading(&daemon), Some(Some("work".to_string())));
-    }
-
-    #[test]
-    fn move_divider_steps_between_projects_and_keeps_its_label() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["a", "b", "c"]);
-        daemon
-            .set_project_divider(&ProjectId("a".into()), false, true, Some("work".into()))
-            .unwrap();
-
-        // Down: the divider hops from under a to under b, label intact.
-        daemon
-            .move_divider(&ProjectId("a".into()), false, 1)
-            .unwrap();
-        assert_eq!(
-            layout(&daemon),
-            [
-                ("a".to_string(), false, None),
-                ("b".to_string(), true, Some("work".to_string())),
-                ("c".to_string(), false, None),
-            ]
-        );
-
-        // Back up under a (the top hop has its own test).
-        daemon
-            .move_divider(&ProjectId("b".into()), false, -1)
-            .unwrap();
-        assert_eq!(
-            layout(&daemon)[0],
-            ("a".to_string(), true, Some("work".to_string()))
-        );
-
-        // Down past the last project clamps.
-        daemon
-            .move_divider(&ProjectId("a".into()), false, 1)
-            .unwrap();
-        daemon
-            .move_divider(&ProjectId("b".into()), false, 1)
-            .unwrap();
-        daemon
-            .move_divider(&ProjectId("c".into()), false, 1)
-            .unwrap();
-        assert_eq!(
-            layout(&daemon)[2],
-            ("c".to_string(), true, Some("work".to_string()))
-        );
-    }
-
-    #[test]
-    fn move_divider_blocks_on_a_neighboring_divider() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["a", "b"]);
-        daemon
-            .set_project_divider(&ProjectId("a".into()), false, true, Some("one".into()))
-            .unwrap();
-        daemon
-            .set_project_divider(&ProjectId("b".into()), false, true, Some("two".into()))
-            .unwrap();
-
-        // Neither divider can move onto the other's gap.
-        daemon
-            .move_divider(&ProjectId("a".into()), false, 1)
-            .unwrap();
-        daemon
-            .move_divider(&ProjectId("b".into()), false, -1)
-            .unwrap();
-        assert_eq!(
-            layout(&daemon),
-            [
-                ("a".to_string(), true, Some("one".to_string())),
-                ("b".to_string(), true, Some("two".to_string())),
-            ]
-        );
-    }
-
-    #[test]
-    fn relabeling_keeps_divider_and_removal_drops_label() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["a", "b"]);
-        daemon
-            .set_project_divider(&ProjectId("a".into()), false, true, Some("work".into()))
-            .unwrap();
-
-        daemon
-            .set_project_divider(&ProjectId("a".into()), false, true, Some("play".into()))
-            .unwrap();
-        assert_eq!(layout(&daemon)[0].2.as_deref(), Some("play"));
-        daemon
-            .set_project_divider(&ProjectId("a".into()), false, false, Some("ignored".into()))
-            .unwrap();
-        assert!(layout(&daemon)
-            .iter()
-            .all(|(_, divider, label)| !divider && label.is_none()));
     }
 
     fn seed_worktree(daemon: &Daemon, project: &str, id: &str, path: &str, is_main: bool) {
@@ -3048,6 +2820,127 @@ mod tests {
             .move_agent(&AgentId("a1".into()), &WorktreeId("feat".into()))
             .unwrap();
         assert!(rx.try_recv().is_err(), "no broadcast for a no-op move");
+    }
+
+    #[tokio::test]
+    async fn enter_worktree_takes_an_existing_branch_and_moves_the_row_now() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
+        seed_agent(&daemon, "a1", "root", Some("s1"));
+        let a1 = AgentId("a1".into());
+        let mut rx = daemon.events.subscribe();
+
+        let (target, outcome) = daemon.enter_worktree(&a1, "feat", None).await.unwrap();
+        assert_eq!(target.id.to_string(), "feat");
+        // No PTY runs here, so nothing waits on a turn end.
+        assert_eq!(outcome, EnterOutcome::NextLaunch);
+        assert!(!daemon.relocation_pending(&a1));
+        assert_eq!(agent_worktree(&daemon, "a1"), "feat");
+        match rx.try_recv().unwrap() {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            } => assert_eq!(a.worktree_id.to_string(), "feat"),
+            other => panic!("expected agent upsert, got {other:?}"),
+        }
+
+        // Already there: a settled answer, no broadcast.
+        let (again, outcome) = daemon.enter_worktree(&a1, "feat", None).await.unwrap();
+        assert_eq!(again.id, target.id);
+        assert_eq!(outcome, EnterOutcome::AlreadyThere);
+        assert!(rx.try_recv().is_err(), "no broadcast for a no-op enter");
+
+        // Blank names are refused before anything is touched.
+        assert!(daemon.enter_worktree(&a1, "  ", None).await.is_err());
+    }
+
+    /// Between `nebula worktree` and the turn's Stop the row already sits
+    /// under the target while the process still reports the old checkout:
+    /// that cwd must not drag it back, and only a turn-end hook drains the
+    /// pending relocation.
+    #[test]
+    fn pending_relocation_ignores_the_old_cwd_until_the_turn_ends() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
+        seed_agent(&daemon, "a1", "feat", Some("s1"));
+        let a1 = AgentId("a1".into());
+        let feat = daemon
+            .store
+            .get_worktree(&WorktreeId("feat".into()))
+            .unwrap()
+            .unwrap();
+        daemon
+            .pending_moves
+            .lock()
+            .unwrap()
+            .insert(a1.clone(), feat);
+
+        daemon.reparent_agent_by_cwd(&a1, "/nebula-test/p", Some("s1"), false);
+        assert_eq!(
+            agent_worktree(&daemon, "a1"),
+            "feat",
+            "the old checkout's cwd is ignored mid-relocation"
+        );
+
+        daemon.complete_pending_move(
+            &a1,
+            &HookEvent::PostToolUse {
+                tool_name: Some("Bash".into()),
+            },
+        );
+        assert!(
+            daemon.relocation_pending(&a1),
+            "a tool hook is not a turn end"
+        );
+        daemon.complete_pending_move(&a1, &HookEvent::Stop);
+        assert!(!daemon.relocation_pending(&a1));
+
+        // Drained, the reparent is live again.
+        daemon.reparent_agent_by_cwd(&a1, "/nebula-test/p", Some("s1"), false);
+        assert_eq!(agent_worktree(&daemon, "a1"), "root");
+    }
+
+    #[tokio::test]
+    async fn enter_worktree_creates_the_checkout_in_nebulas_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        let daemon = test_daemon();
+        daemon
+            .store
+            .insert_project(&Project {
+                workspace_id: Default::default(),
+                id: ProjectId("p".into()),
+                name: "p".into(),
+                repo_path: repo.clone(),
+                sort_order: 0,
+            })
+            .unwrap();
+        seed_worktree(&daemon, "p", "root", &repo.to_string_lossy(), true);
+        seed_agent(&daemon, "a1", "root", Some("s1"));
+        let a1 = AgentId("a1".into());
+        let mut rx = daemon.events.subscribe();
+
+        let (target, _) = daemon.enter_worktree(&a1, "feat", None).await.unwrap();
+        assert_eq!(target.branch, "feat");
+        assert_eq!(target.path, root.join("repo-worktrees").join("feat"));
+        assert!(target.path.join(".git").exists(), "a real checkout");
+        assert_eq!(agent_worktree(&daemon, "a1"), target.id.to_string());
+        // The worktree's upsert lands first, then the agent's.
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ServerEvent::EntityUpserted { entity: Entity::Worktree(w) } if w.id == target.id
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ServerEvent::EntityUpserted { entity: Entity::Agent(a) } if a.worktree_id == target.id
+        ));
     }
 
     fn seed_pending_agent(daemon: &Daemon, id: &str, worktree: &str) {
@@ -3209,10 +3102,6 @@ mod tests {
             name: "p".into(),
             repo_path: repo.clone(),
             sort_order: 0,
-            divider_after: false,
-            divider_label: None,
-            divider_before: false,
-            divider_before_label: None,
         };
         daemon.store.insert_project(&project).unwrap();
         seed_worktree(&daemon, "p", "root", &repo.to_string_lossy(), true);
@@ -3401,10 +3290,6 @@ mod tests {
             name: "p".into(),
             repo_path: repo.clone(),
             sort_order: 0,
-            divider_after: false,
-            divider_label: None,
-            divider_before: false,
-            divider_before_label: None,
         };
         daemon.store.insert_project(&project).unwrap();
         // The wrong way round: the linked checkout wears the root badge and
@@ -3441,10 +3326,6 @@ mod tests {
             name: "p".into(),
             repo_path: repo.clone(),
             sort_order: 0,
-            divider_after: false,
-            divider_label: None,
-            divider_before: false,
-            divider_before_label: None,
         };
         daemon.store.insert_project(&project).unwrap();
         seed_worktree(&daemon, "p", "rt", &repo.to_string_lossy(), true);
@@ -3756,10 +3637,6 @@ mod tests {
                 name: "x".into(),
                 repo_path: "/tmp/x".into(),
                 sort_order: 1, // interleaves between a and b globally
-                divider_after: false,
-                divider_label: None,
-                divider_before: false,
-                divider_before_label: None,
             })
             .unwrap();
 
