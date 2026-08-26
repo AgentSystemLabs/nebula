@@ -251,7 +251,7 @@ pathed `workspace/project/branch/session`. `jump_to_target` switches workspace f
 - `TestBackend` renders the palette rows, so a failing palette assertion prints the whole modal — that
   dump is the fastest way to eyeball glyphs and paths (`◇ client` / `▫ client/secret`).
 
-### Releases v0.8.0 And v0.9.0 — A Clean Base Needs No Merge — 2026-08-25
+### Releases v0.8.0, v0.9.0 And v0.10.0 — A Clean Base Needs No Merge — 2026-08-25
 
 **Asked:** "ok pull in latest from origin/main then and merge into this work them commit push and make
 the next release"
@@ -268,6 +268,12 @@ read `0 0`, seven dirty files copied in, `2730e9f` (feature), `7ddee41` (memory)
 0.9.0, tagged `v0.9.0`). 629 tests green, all 4 matrix targets built, notes rewritten. Shipped the
 persistent Workspaces column and the cross-workspace `/` palette (entry above).
 
+**Then v0.10.0** (2026-08-26), asked as "commit and push and release" — same recipe at a much larger
+scale: base `0 0`, nineteen dirty files (~3.7k lines, six finished tasks bundled in one tree) copied in,
+`78a1714` (feature), `249668e` (memory), `fd45d42` (bump to 0.10.0, tagged `v0.10.0`). 628 tests green,
+all 4 matrix targets built, notes rewritten. Shipped `nebula worktree`, settings `R` reset, settings
+tab focus, snapshot re-attach, divider removal, and the default-workspace splash gate (entries above).
+
 **Gotchas:**
 - Nothing bit us. Worth recording only as the contrast to [Release v0.7.0]: the copy-files-into-a-worktree
   recipe is safe **exactly when** `git rev-list --left-right --count HEAD...origin/main` reads `0 0`.
@@ -278,6 +284,13 @@ persistent Workspaces column and the cross-workspace `/` palette (entry above).
   `git reset --hard origin/main`, not a merge — `origin/main` is a strict superset of what their working
   copy holds. Say that explicitly; a plain `git pull` on top of those identical-but-uncommitted files
   just stalls.
+- With many files, verify the copy in one line instead of eyeballing hunks: `git diff --stat` in the
+  shared tree and `git -C "$W" diff --stat` in the worktree must be byte-identical. Leave untracked junk
+  (`random.txt`) behind — `git diff --name-only` never lists it, so the loop skips it on its own.
+- `cargo clippy --workspace --all-targets` carried 8 warnings at v0.10.0 (unneeded `return`, items after a
+  test module, `&` on an auto-deref, `len() == 1`, a complex-type lint). They are **not** a release
+  blocker: the only workflow is `.github/workflows/release.yml` and it runs no clippy or fmt step. Report
+  them, don't fix them under a "release" ask.
 
 ### `nebula browser` Terminal Stopped ~24 Columns Short — 2026-08-25
 
