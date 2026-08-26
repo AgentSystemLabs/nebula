@@ -89,6 +89,8 @@ pub enum Action {
     // general
     Workspaces,
     ToggleWorkspaces,
+    /// Open the Nth workspace tab (1-based) straight from the top bar.
+    SelectWorkspace(u8),
     Hosts,
     Settings,
     Metrics,
@@ -108,6 +110,25 @@ pub struct ActionSpec {
     pub group: &'static str,
     pub scope: Scope,
     pub defaults: &'static [&'static str],
+}
+
+/// One positional workspace shortcut. `⌘N` is what the tab bar advertises
+/// and what a Mac user reaches for — but it is [`Reach::Blocked`] in
+/// Terminal.app and most other emulators, which never encode ⌘ into pty
+/// bytes at all. The bare digit is bound alongside it and is the chord that
+/// actually fires there; digits are otherwise unbound in the panels.
+macro_rules! workspace_slot {
+    ($n:literal, $id:literal, $label:literal, $cmd:literal, $digit:literal) => {
+        ActionSpec {
+            action: Action::SelectWorkspace($n),
+            id: $id,
+            label: $label,
+            hint: "Open that workspace tab from anywhere (⌘N only in emulators that send ⌘)",
+            group: "GENERAL",
+            scope: Scope::Global,
+            defaults: &[$cmd, $digit],
+        }
+    };
 }
 
 pub const ACTIONS: &[ActionSpec] = &[
@@ -417,12 +438,21 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         action: Action::ToggleWorkspaces,
         id: "toggle_workspaces",
-        label: "Workspaces column",
-        hint: "Show or hide the Workspaces column at the left edge",
+        label: "Workspaces bar",
+        hint: "Show or hide the Workspaces tab bar across the top",
         group: "GENERAL",
         scope: Scope::Global,
         defaults: &["shift+w"],
     },
+    workspace_slot!(1, "select_workspace_1", "Open workspace 1", "cmd+1", "1"),
+    workspace_slot!(2, "select_workspace_2", "Open workspace 2", "cmd+2", "2"),
+    workspace_slot!(3, "select_workspace_3", "Open workspace 3", "cmd+3", "3"),
+    workspace_slot!(4, "select_workspace_4", "Open workspace 4", "cmd+4", "4"),
+    workspace_slot!(5, "select_workspace_5", "Open workspace 5", "cmd+5", "5"),
+    workspace_slot!(6, "select_workspace_6", "Open workspace 6", "cmd+6", "6"),
+    workspace_slot!(7, "select_workspace_7", "Open workspace 7", "cmd+7", "7"),
+    workspace_slot!(8, "select_workspace_8", "Open workspace 8", "cmd+8", "8"),
+    workspace_slot!(9, "select_workspace_9", "Open workspace 9", "cmd+9", "9"),
     ActionSpec {
         action: Action::Hosts,
         id: "hosts",

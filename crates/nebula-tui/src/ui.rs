@@ -56,11 +56,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     app.body_area = body;
     app.normalize_panel_widths(body.width);
-    // The Workspaces column (Shift+W) leads the sidebar — zero wide when
-    // hidden; the three panels and the terminal pane share what's left.
-    // `splitter_x` knows about the offset.
-    let [workspaces_a, panels_a] = Layout::horizontal([
-        Constraint::Length(app.workspaces_panel_w()),
+    // The Workspaces bar (Shift+W) runs across the top of the body — zero
+    // rows tall when hidden; the three panels and the terminal pane take
+    // the full width of whatever is left under it.
+    let [workspaces_a, panels_a] = Layout::vertical([
+        Constraint::Length(app.workspaces_bar_h()),
         Constraint::Min(0),
     ])
     .areas(body);
@@ -73,35 +73,38 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     .areas(panels_a);
 
     // Splitter grab zones: the two touching border cells at each panel
-    // boundary. Registered first so they win `hit_at`'s first-match scan.
+    // boundary. Registered first so they win `hit_at`'s first-match scan —
+    // and only over the panels, so the tab bar above stays clickable.
     for i in app.splitter_indices() {
         let x = app.splitter_x(i);
         app.hits.push((
             Rect {
                 x: x.saturating_sub(1),
-                y: body.y,
+                y: panels_a.y,
                 width: 2,
-                height: body.height,
+                height: panels_a.height,
             },
             HitTarget::Splitter(i),
         ));
     }
 
     if app.show_workspaces {
-        draw_workspaces(f, app, workspaces_a);
+        draw_workspaces_bar(f, app, workspaces_a);
     }
     draw_projects(f, app, projects_a);
     draw_worktrees(f, app, worktrees_a);
     draw_sessions(f, app, sessions_a);
     draw_terminal(f, app, term_a);
-    draw_splitter_grips(f.buffer_mut(), app, body);
+    draw_splitter_grips(f.buffer_mut(), app, panels_a);
     // Focus cue (opt-in, `focus_tint` setting): the focused panel's whole
     // background picks up a faint accent tint. The sidebar columns stop
     // one cell short of their right rule so the tint stays inside the
     // panel.
     if app.focus_tint {
         let tinted = match app.focus {
-            Focus::Workspaces => shrink_r(workspaces_a),
+            // The bar's last row is its rule, which belongs to the boundary
+            // rather than to the bar — leave it untinted.
+            Focus::Workspaces => shrink_b(workspaces_a),
             Focus::Projects => shrink_r(projects_a),
             Focus::Worktrees => shrink_r(worktrees_a),
             Focus::Sessions => shrink_r(sessions_a),
@@ -568,8 +571,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     &[
                         (
                             Act(&[Workspaces, ToggleWorkspaces]),
-                            "workspace switcher / workspaces column",
+                            "workspace switcher / workspaces bar",
                         ),
+                        (Lit("⌘1-9 / 1-9"), "open that workspace tab"),
                         (Act(&[Hosts]), "ssh hosts: connect (a: new, d: del)"),
                         (Act(&[Settings]), "settings (Hotkeys tab rebinds these)"),
                         (Act(&[Metrics]), "memory usage (nebula + agents)"),
@@ -1930,6 +1934,14 @@ fn shrink_r(area: Rect) -> Rect {
     }
 }
 
+/// The Workspaces bar's rect minus its bottom rule row.
+fn shrink_b(area: Rect) -> Rect {
+    Rect {
+        height: area.height.saturating_sub(1),
+        ..area
+    }
+}
+
 /// Subtle focus cue: fill the whole focused panel with the theme's
 /// `focus_tint` — the accent at ~10% opacity, so the panel reads as a
 /// faintly lit surface. Painted after content, and only onto cells whose
@@ -2309,34 +2321,94 @@ fn render_pill(
     );
 }
 
-/// The Workspaces column: every workspace the daemon knows, each with the
-/// rolled-up status of every live agent under it — so a run finishing (or
-/// asking for feedback) in a workspace you don't have open still shows at
-/// the top level. The open workspace is the selected row, and moving the
-/// cursor IS a switch, the way moving in the Projects column re-scopes the
-/// worktrees. Rows are the same 3-row buttons projects get: this is the
-/// tier above them, not a list of children.
-fn draw_workspaces(f: &mut Frame, app: &mut App, area: Rect) {
+/// The Workspaces bar: `WORKSPACES` on the left, on the same row-1 / x-3
+/// grid the panel headers use so it sits directly above `PROJECTS` and
+/// reads as the tier over it — then one tab per workspace to its right,
+/// each carrying the rolled-up status of every live agent underneath, so a
+/// run finishing (or asking for feedback) in a workspace you don't have
+/// open still shows at the top level. The open workspace is the selected
+/// tab, and picking a tab IS a switch, the way moving in the Projects
+/// column re-scopes the worktrees.
+///
+/// Tabs answer to `⌘1`..`⌘9` / `1`..`9` from anywhere, to `←`/`→` once the
+/// bar has focus, and to a click. A rule closes the bar off from the panels
+/// — broken under the open tab, so that tab reads as attached to what's
+/// below it.
+fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Workspaces;
-    let count = Some(app.tree.workspaces.len()).filter(|n| *n > 0);
-    let inner = draw_column(f, area, "WORKSPACES", count, focused, th);
+    if area.width == 0 || area.height < 2 {
+        return;
+    }
+    // Last row is the rule; the label and the tabs share the row above it —
+    // `area.y + 1` at the default height, which is where a panel header
+    // lands too.
+    let rule_y = area.y + area.height - 1;
+    let row_y = rule_y - 1;
 
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(th.edge),
+        ))),
+        Rect {
+            y: rule_y,
+            height: 1,
+            ..area
+        },
+    );
+
+    // The header carries the focus signal, exactly as a column title does.
+    let header_style = if focused {
+        Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(th.muted).add_modifier(Modifier::BOLD)
+    };
+    let mut label = vec![Span::styled(
+        format!("{ROW_GUTTER}WORKSPACES"),
+        header_style,
+    )];
+    if !app.tree.workspaces.is_empty() {
+        label.push(Span::styled(
+            format!(" · {}", app.tree.workspaces.len()),
+            Style::default().fg(th.dim),
+        ));
+    }
+    let label_w: u16 = label.iter().map(|s| s.content.chars().count() as u16).sum();
+    f.render_widget(
+        Paragraph::new(Line::from(label)),
+        Rect {
+            y: row_y,
+            height: 1,
+            ..area
+        },
+    );
+
+    // Everything from here is drawn over that row, so the tabs win the
+    // cells they land on.
+    let tabs_x = area.x + label_w + TAB_GAP;
     if app.tree.workspaces.is_empty() {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!("{ROW_GUTTER}no workspaces"),
-                Style::default().fg(th.dim),
-            ))),
-            inner,
-        );
         app.hits
-            .push((inner, HitTarget::PanelBg(Focus::Workspaces)));
+            .push((shrink_b(area), HitTarget::PanelBg(Focus::Workspaces)));
+        if tabs_x < area.x + area.width {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "no workspaces",
+                    Style::default().fg(th.dim),
+                ))),
+                Rect {
+                    x: tabs_x,
+                    y: row_y,
+                    width: area.x + area.width - tabs_x,
+                    height: 1,
+                },
+            );
+        }
         return;
     }
 
     let active = app.tree.active_workspace_index();
-    // Per-row display data, pre-collected to end the tree borrow: name,
+    // Per-tab display data, pre-collected to end the tree borrow: name,
     // rollup, and how many agents are running right now (the dot says
     // "something", the count says how much).
     let rows: Vec<(String, Option<AgentStatus>, usize)> = app
@@ -2351,44 +2423,133 @@ fn draw_workspaces(f: &mut Frame, app: &mut App, area: Rect) {
             )
         })
         .collect();
-    let mut screen_row = 0usize;
-    for (i, (name, roll, running)) in rows.iter().enumerate() {
-        let Some(row_area) = rows_rect(inner, screen_row, PROJECT_BTN_H) else {
-            break;
-        };
-        let badge = if *running > 0 {
-            format!(" {running}")
-        } else {
-            String::new()
-        };
-        let mut spans = vec![status_dot(*roll, th)];
-        spans.extend(status_name_spans(
-            truncate(
-                name,
-                (inner.width as usize).saturating_sub(2 + badge.chars().count()),
-            ),
-            Style::default().add_modifier(Modifier::BOLD),
-            sweep_ramp(*roll, th, app.animations),
-            app.sweep_phase(),
-        ));
-        if !badge.is_empty() {
-            spans.push(Span::styled(badge, Style::default().fg(th.warn)));
-        }
-        render_button(
-            f,
-            row_area,
-            spans,
-            Some(i) == active,
-            focused,
-            th,
-            PROJECT_BTN_H / 2,
-        );
-        app.hits.push((row_area, HitTarget::Workspace(i)));
-        screen_row += PROJECT_BTN_H as usize;
+    let (phase, anim) = (app.sweep_phase(), app.animations);
+    let tabs: Vec<(Vec<Span<'static>>, u16)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (name, roll, running))| {
+            let selected = Some(i) == active;
+            // Only nine tabs have a shortcut; past that the slot stays
+            // blank so every name still starts on the same column.
+            let mut spans = vec![Span::styled(
+                if i < 9 {
+                    format!(" {} ", i + 1)
+                } else {
+                    "   ".to_string()
+                },
+                Style::default().fg(if selected { th.accent } else { th.dim }),
+            )];
+            spans.push(status_dot(*roll, th));
+            spans.extend(status_name_spans(
+                truncate(name, TAB_NAME_MAX),
+                Style::default().add_modifier(Modifier::BOLD),
+                sweep_ramp(*roll, th, anim),
+                phase,
+            ));
+            if *running > 0 {
+                spans.push(Span::styled(
+                    format!(" {running}"),
+                    Style::default().fg(th.warn),
+                ));
+            }
+            spans.push(Span::raw(" "));
+            if selected {
+                for sp in &mut spans {
+                    if sp.style.fg == Some(th.dim) {
+                        sp.style.fg = Some(th.muted);
+                    }
+                }
+            }
+            let w = spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>() as u16;
+            (spans, w)
+        })
+        .collect();
+
+    // Horizontal scroll: drop leading tabs until the open one fits. The
+    // last column is reserved for the `›` overflow mark, so a tab is never
+    // half-drawn under it. Stride is the tab plus the gap that follows it,
+    // which over-counts the last one by `TAB_SEP` — slack, not a bug.
+    let right = (area.x + area.width).saturating_sub(1);
+    let budget = right.saturating_sub(tabs_x);
+    let active_i = active.unwrap_or(0);
+    let stride = |t: &(Vec<Span<'static>>, u16)| t.1 + TAB_SEP;
+    let mut start = 0usize;
+    while start < active_i && tabs[start..=active_i].iter().map(stride).sum::<u16>() > budget {
+        start += 1;
     }
+
+    let mut x = tabs_x;
+    let mut drawn = start;
+    for (i, (spans, w)) in tabs.iter().enumerate().skip(start) {
+        if x + w > right {
+            break;
+        }
+        let selected = Some(i) == active;
+        f.render_widget(
+            Paragraph::new(Line::from(spans.clone())).style(row_bar(selected, focused, th)),
+            Rect {
+                x,
+                y: row_y,
+                width: *w,
+                height: 1,
+            },
+        );
+        if selected {
+            // Break the rule under the open tab: the tab-to-content join.
+            for cx in x..x + w {
+                if let Some(cell) = f.buffer_mut().cell_mut((cx, rule_y)) {
+                    cell.set_symbol(" ");
+                }
+            }
+        }
+        // The whole column band clicks, rule row included — a 1-row target
+        // is a hard thing to hit with a mouse.
+        app.hits.push((
+            Rect {
+                x,
+                y: area.y,
+                width: *w,
+                height: area.height,
+            },
+            HitTarget::Workspace(i),
+        ));
+        x += w + TAB_SEP;
+        drawn = i + 1;
+    }
+    // Overflow marks, so a workspace scrolled off the bar isn't silently
+    // missing.
+    let mark = |f: &mut Frame, x: u16, g: &'static str| {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(g, Style::default().fg(th.dim)))),
+            Rect {
+                x,
+                y: row_y,
+                width: 1,
+                height: 1,
+            },
+        );
+    };
+    if start > 0 {
+        mark(f, tabs_x.saturating_sub(1), "‹");
+    }
+    if drawn < tabs.len() {
+        mark(f, right, "›");
+    }
+    // Last, so every tab wins the cells it covers.
     app.hits
-        .push((inner, HitTarget::PanelBg(Focus::Workspaces)));
+        .push((shrink_b(area), HitTarget::PanelBg(Focus::Workspaces)));
 }
+
+/// Columns between the `WORKSPACES` label and the first tab.
+const TAB_GAP: u16 = 2;
+/// Columns between two tabs. Outside either tab's fill, so the open one's
+/// selection surface never runs up against its neighbour.
+const TAB_SEP: u16 = 1;
+/// A workspace name is truncated to this before it becomes a tab.
+const TAB_NAME_MAX: usize = 20;
 
 fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
@@ -3608,12 +3769,11 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::FocusLeft)
             ),
             Focus::Terminal => "select a session and press Enter to attach".to_string(),
-            // The cursor here is the open workspace, so ↑/↓ already
+            // The cursor here is the open workspace, so ←/→ already
             // switches; the verbs are the switcher's, plus the way out.
             Focus::Workspaces => format!(
-                "{}: projects  {}: switcher  {}: new  {}: rename  {}: delete  {}: hide column  {}: help",
+                "←/→ or 1-9: switch  {}: projects  {}: new  {}: rename  {}: delete  {}: hide bar  {}: help",
                 k(Action::Activate),
-                k(Action::Workspaces),
                 k(Action::New),
                 k(Action::Rename),
                 k(Action::Delete),
@@ -4345,7 +4505,7 @@ mod tests {
         let mut buf = ratatui::buffer::Buffer::empty(body);
         draw_splitter_grips(&mut buf, &app, body);
         let mid = body.height / 2; // 17
-        assert_eq!(app.splitter_indices(), 0..4);
+        assert_eq!(app.splitter_indices(), 0..3);
         for i in app.splitter_indices() {
             let x = app.splitter_x(i) - 1;
             for y in mid - 1..=mid + 1 {
@@ -4357,8 +4517,7 @@ mod tests {
             assert_eq!(buf.cell((x, mid + 2)).unwrap().symbol(), " ");
         }
 
-        // Hover lights only that splitter's grip — including the
-        // Workspaces column's own edge.
+        // Hover lights only that splitter's grip.
         app.hover_splitter = Some(0);
         draw_splitter_grips(&mut buf, &app, body);
         assert_eq!(
@@ -4367,16 +4526,16 @@ mod tests {
         );
         assert_eq!(buf.cell((app.splitter_x(1) - 1, mid)).unwrap().fg, th.muted);
 
-        // Hiding the column drops its grip; the rest keep theirs.
+        // The Workspaces bar runs across the top and owns no boundary, so
+        // hiding it leaves every grip exactly where it was.
         app.show_workspaces = false;
         app.hover_splitter = None;
         let mut buf = ratatui::buffer::Buffer::empty(body);
         draw_splitter_grips(&mut buf, &app, body);
         assert_eq!(
-            buf.cell((app.splitter_x(1) - 1, mid)).unwrap().symbol(),
+            buf.cell((app.splitter_x(0) - 1, mid)).unwrap().symbol(),
             "┃"
         );
-        assert_eq!(buf.cell((17, mid)).unwrap().symbol(), " ");
         app.show_workspaces = true;
 
         // A body too short for a grip plus breathing space draws nothing.

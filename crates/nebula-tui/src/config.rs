@@ -168,8 +168,8 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             },
             SettingSpec {
                 kind: SettingKind::ShowWorkspaces,
-                label: "Workspaces column",
-                hint: "Show the Workspaces column at the left edge (Shift+W toggles)",
+                label: "Workspaces bar",
+                hint: "Show the Workspaces tab bar across the top (Shift+W toggles)",
             },
         ]),
     },
