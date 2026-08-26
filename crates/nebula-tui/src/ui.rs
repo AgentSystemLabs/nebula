@@ -1,9 +1,7 @@
 //! View layer: draws the three panels + terminal pane + footer, and records
 //! hit regions for mouse interaction.
 
-use crate::app::{
-    App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, ProjectRow, SessionRow,
-};
+use crate::app::{App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, SessionRow};
 use crate::git_diff::{classify_diff_line, DiffLineKind};
 use crate::keymap::Action;
 use crate::text_input::TextInput;
@@ -42,10 +40,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // First run (or an empty workspace): no visible projects means three
-    // empty panels, so the whole body becomes the animated nebula splash
-    // until the first project lands. N summons the same splash as a
-    // dismissable preview.
+    // First run (the default workspace is empty): no visible projects
+    // means three empty panels, so the whole body becomes the animated
+    // nebula splash until the first project lands. Other empty workspaces
+    // keep their panels. N summons the same splash as a dismissable
+    // preview.
     if app.splash_showing() {
         crate::splash::draw_splash(f, app, body);
         draw_footer(f, app, footer);
@@ -509,7 +508,6 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[New, AddProject]), "add project (2nd: from anywhere)"),
                         (Act(&[Notes]), "project-level notes"),
                         (Act(&[MoveProjectDown, MoveProjectUp]), "reorder project"),
-                        (Act(&[ToggleDivider]), "divider below (Enter/r: label)"),
                         (Act(&[Delete]), "remove from list"),
                     ],
                 ),
@@ -1898,12 +1896,12 @@ fn settings_keys_hint(view: &crate::app::SettingsView) -> &'static str {
         return "Enter: reassign it here   Esc: leave it where it is";
     }
     if view.on_tabs {
-        return "←/→: tab   ↓: into the list   1-9: jump   Esc: close";
+        return "←/→: tab   ↓: into the list   1-9: jump   R: reset all   Esc: close";
     }
     if view.is_hotkeys() {
-        return "Enter: rebind  a: add a key  ⌫: default  x: unbind  Tab: next tab  ↑ at top: tabs";
+        return "Enter: rebind  a: add  ⌫: default  x: unbind  R: reset all  Tab: next  ↑: tabs";
     }
-    "↑/↓: move  Enter/Space: toggle  ←/→: cycle  Tab: next tab  ↑ at top: tabs"
+    "↑/↓: move  Enter: toggle  ←/→: cycle  R: reset all  Tab: next tab  ↑ at top: tabs"
 }
 
 fn centered_rect(frame: Rect, width: u16, height: u16) -> Rect {
@@ -2414,99 +2412,52 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // Projects and their dividers are one selectable row list; the payload
-    // pre-collects per-row display data to end the tree borrow.
-    let rows: Vec<(ProjectRow, String, Option<AgentStatus>, (usize, usize))> = app
+    // The payload pre-collects per-row display data to end the tree borrow.
+    let rows: Vec<(String, Option<AgentStatus>, (usize, usize))> = app
         .project_rows()
         .into_iter()
-        .map(|row| match row {
-            ProjectRow::Project(i) => {
-                let p = &app.tree.projects[i];
-                (
-                    row,
-                    p.name.clone(),
-                    app.project_rollup(&p.id),
-                    app.note_stats(&nebula_core::NoteOwner::Project(p.id.clone())),
-                )
-            }
-            ProjectRow::Divider { project, before } => {
-                let p = &app.tree.projects[project];
-                let label = if before {
-                    p.divider_before_label.clone()
-                } else {
-                    p.divider_label.clone()
-                }
-                .unwrap_or_default();
-                (row, label, None, (0, 0))
-            }
+        .map(|i| {
+            let p = &app.tree.projects[i];
+            (
+                p.name.clone(),
+                app.project_rollup(&p.id),
+                app.note_stats(&nebula_core::NoteOwner::Project(p.id.clone())),
+            )
         })
         .collect();
     let mut screen_row = 0usize;
-    for (row_idx, (row, text, roll, notes)) in rows.iter().enumerate() {
-        match row {
-            ProjectRow::Project(_) => {
-                let Some(row_area) = rows_rect(inner, screen_row, PROJECT_BTN_H) else {
-                    break;
-                };
-                // Same note-count badge as worktree rows: the project's own
-                // notes only (worktree notes badge on their worktree).
-                let note_badge = note_badge(*notes, th);
-                let badge_len = note_badge.as_ref().map_or(0, |(s, _)| s.chars().count());
-                // Bold name: the top of the tree reads "biggest".
-                let mut spans = vec![status_dot(*roll, th)];
-                spans.extend(status_name_spans(
-                    truncate(text, (inner.width as usize).saturating_sub(2 + badge_len)),
-                    Style::default().add_modifier(Modifier::BOLD),
-                    sweep_ramp(*roll, th, app.animations),
-                    app.sweep_phase(),
-                ));
-                if let Some((text, style)) = note_badge {
-                    spans.push(Span::styled(text, style));
-                }
-                render_button(
-                    f,
-                    row_area,
-                    spans,
-                    row_idx == app.sel_project,
-                    focused,
-                    th,
-                    PROJECT_BTN_H / 2,
-                );
-                app.hits.push((row_area, HitTarget::Project(row_idx)));
-                screen_row += PROJECT_BTN_H as usize;
-            }
-            ProjectRow::Divider { .. } => {
-                let Some(row_area) = row_rect(inner, screen_row) else {
-                    break;
-                };
-                let spans = divider_spans(text, inner.width, th);
-                render_row(f, row_area, spans, row_idx == app.sel_project, focused, th);
-                app.hits.push((row_area, HitTarget::Project(row_idx)));
-                screen_row += 1;
-            }
+    for (row_idx, (text, roll, notes)) in rows.iter().enumerate() {
+        let Some(row_area) = rows_rect(inner, screen_row, PROJECT_BTN_H) else {
+            break;
+        };
+        // Same note-count badge as worktree rows: the project's own
+        // notes only (worktree notes badge on their worktree).
+        let note_badge = note_badge(*notes, th);
+        let badge_len = note_badge.as_ref().map_or(0, |(s, _)| s.chars().count());
+        // Bold name: the top of the tree reads "biggest".
+        let mut spans = vec![status_dot(*roll, th)];
+        spans.extend(status_name_spans(
+            truncate(text, (inner.width as usize).saturating_sub(2 + badge_len)),
+            Style::default().add_modifier(Modifier::BOLD),
+            sweep_ramp(*roll, th, app.animations),
+            app.sweep_phase(),
+        ));
+        if let Some((text, style)) = note_badge {
+            spans.push(Span::styled(text, style));
         }
+        render_button(
+            f,
+            row_area,
+            spans,
+            row_idx == app.sel_project,
+            focused,
+            th,
+            PROJECT_BTN_H / 2,
+        );
+        app.hits.push((row_area, HitTarget::Project(row_idx)));
+        screen_row += PROJECT_BTN_H as usize;
     }
     app.hits.push((inner, HitTarget::PanelBg(Focus::Projects)));
-}
-
-/// A divider line, with the group label woven in when present:
-/// `─ label ────────`.
-fn divider_spans(label: &str, width: u16, th: Theme) -> Vec<Span<'static>> {
-    let w = width as usize;
-    let dim = Style::default().fg(th.edge);
-    if label.is_empty() {
-        return vec![Span::styled("─".repeat(w), dim)];
-    }
-    let label = truncate(label, w.saturating_sub(4));
-    let tail = w.saturating_sub(label.chars().count() + 3);
-    vec![
-        Span::styled("─ ".to_string(), dim),
-        Span::styled(
-            label,
-            Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!(" {}", "─".repeat(tail)), dim),
-    ]
 }
 
 /// One laid-out entry of the Worktrees panel. Checkout rows and pull-request
@@ -2536,15 +2487,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     // links out of nebula, and counting them here would say "9 worktrees"
     // over a list of two checkouts.
     let wt_count = app.visible_worktrees().len();
-    let count = Some(wt_count).filter(|n| *n > 0 && !app.divider_focused());
+    let count = Some(wt_count).filter(|n| *n > 0);
     let inner = draw_column(f, area, "WORKTREES", count, focused, th);
-
-    // A selected separator has nothing underneath it: keep the panel, hide
-    // the rows (the terminal pane carries the hint).
-    if app.divider_focused() {
-        app.hits.push((inner, HitTarget::PanelBg(Focus::Worktrees)));
-        return;
-    }
 
     let worktrees: Vec<(String, bool, Option<AgentStatus>, (usize, usize))> = app
         .visible_worktrees()
@@ -2774,15 +2718,8 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .filter(|r| r.as_link().is_none())
         .count();
-    let count = Some(visible).filter(|n| *n > 0 && !app.divider_focused());
+    let count = Some(visible).filter(|n| *n > 0);
     let inner = draw_column(f, area, "SESSIONS", count, focused, th);
-
-    // A selected separator has nothing underneath it: keep the panel, hide
-    // the rows (the terminal pane carries the hint).
-    if app.divider_focused() {
-        app.hits.push((inner, HitTarget::PanelBg(Focus::Sessions)));
-        return;
-    }
 
     let rows = app.visible_session_rows();
     if rows.is_empty() && app.selected_worktree().is_some() {
@@ -3221,34 +3158,9 @@ fn titled_frame(
 fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Terminal;
-    // A selected separator has no session behind it: keep the pane, swap
-    // the content for a hint. The attachment itself stays live so walking
-    // the list across a divider doesn't churn detach/attach.
-    if app.divider_focused() {
-        let inner = terminal_frame(f, area, Vec::new(), None, focused, th);
-        app.term_area = inner;
-        let msg = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "you're focused on a separator",
-                Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "select a project to see its worktrees and sessions",
-                Style::default().fg(th.dim),
-            )),
-        ])
-        .centered();
-        f.render_widget(msg, inner);
-        app.term_links = Vec::new();
-        app.term_file_links = Vec::new();
-        return;
-    }
     // The Worktrees cursor is resting on an open pull request: the pane
     // reads it. The attachment underneath stays live — walking down into
-    // the OPEN PRS group and back must not churn detach/attach — exactly
-    // like the divider case above.
+    // the OPEN PRS group and back must not churn detach/attach.
     if app.selected_worktree_pr().is_some() {
         draw_pr_preview(f, app, area, focused);
         return;
@@ -3414,21 +3326,6 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
     let sep = || Span::styled(" ▸ ", Style::default().fg(th.dim));
 
     let mut spans = Vec::new();
-    // A focused separator has no worktree/session context to spell out —
-    // the crumb is the separator itself.
-    if let Some(ProjectRow::Divider { project, before }) = app.selected_project_row() {
-        let p = &app.tree.projects[project];
-        let label = if before {
-            p.divider_before_label.as_deref()
-        } else {
-            p.divider_label.as_deref()
-        };
-        spans.push(seg(
-            &format!("─ {} ─", label.unwrap_or("separator")),
-            app.focus == Focus::Projects,
-        ));
-        return spans;
-    }
     let Some(project) = app.selected_project() else {
         return spans;
     };
@@ -3620,31 +3517,18 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::ToggleWorkspaces),
                 k(Action::Help)
             ),
-            Focus::Projects => match app.selected_project_row() {
-                Some(ProjectRow::Divider { .. }) => format!(
-                    "{}/{}: label  {}: delete divider  {}/{}: move  {}: menu  {}: help",
-                    k(Action::Activate),
-                    k(Action::Rename),
-                    k(Action::Delete),
-                    k(Action::MoveProjectDown),
-                    k(Action::MoveProjectUp),
-                    k(Action::ContextMenu),
-                    k(Action::Help)
-                ),
-                _ => format!(
-                    "{}/{}: add  {}: notes  {}: remove  {}: divider  {}/{}: move  {}: search  {}: menu  {}: help",
-                    k(Action::New),
-                    k(Action::AddProject),
-                    k(Action::Notes),
-                    k(Action::Delete),
-                    k(Action::ToggleDivider),
-                    k(Action::MoveProjectDown),
-                    k(Action::MoveProjectUp),
-                    k(Action::Palette),
-                    k(Action::ContextMenu),
-                    k(Action::Help)
-                ),
-            },
+            Focus::Projects => format!(
+                "{}/{}: add  {}: notes  {}: remove  {}/{}: move  {}: search  {}: menu  {}: help",
+                k(Action::New),
+                k(Action::AddProject),
+                k(Action::Notes),
+                k(Action::Delete),
+                k(Action::MoveProjectDown),
+                k(Action::MoveProjectUp),
+                k(Action::Palette),
+                k(Action::ContextMenu),
+                k(Action::Help)
+            ),
             // An open-PR row answers to a different set of verbs than a
             // checkout does, so the hint follows the cursor into the group.
             Focus::Worktrees if app.selected_worktree_pr().is_some() => format!(
@@ -3721,13 +3605,11 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
         spans.extend(crumbs);
         // The selected checkout's dirty-file count rides the breadcrumb —
         // it's context, not chrome.
-        if !app.divider_focused() {
-            if let Some(n) = app.selected_worktree_changes().filter(|n| *n > 0) {
-                spans.push(Span::styled(
-                    format!("  +{n} file{}", if n == 1 { "" } else { "s" }),
-                    Style::default().fg(th.warn),
-                ));
-            }
+        if let Some(n) = app.selected_worktree_changes().filter(|n| *n > 0) {
+            spans.push(Span::styled(
+                format!("  +{n} file{}", if n == 1 { "" } else { "s" }),
+                Style::default().fg(th.warn),
+            ));
         }
         spans.push(Span::styled("    ", Style::default()));
     }

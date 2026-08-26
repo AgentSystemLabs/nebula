@@ -3,9 +3,8 @@
 use crate::app::{
     App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder, Focus,
     GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, NoteInput, NoteView, Overlay,
-    Palette, PaletteTarget, PendingAction, PendingIntent, PointerShape, ProjectRow, PromptDialog,
-    PromptKind, RowKey, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection,
-    WorktreeRollback,
+    Palette, PaletteTarget, PendingAction, PendingIntent, PointerShape, PromptDialog, PromptKind,
+    RowKey, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection, WorktreeRollback,
 };
 use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
@@ -927,10 +926,13 @@ fn apply_startup_workspace(app: &mut App, out: &mut Vec<ClientRequest>) {
     }
 }
 
-fn restore_ui_state(app: &mut App, json: &str) {
+/// Re-seat the cursor from the persisted blob. Returns whether the
+/// remembered session landed under it, so the caller can bring its pane
+/// back too — the selection alone is a cursor on a blank screen.
+fn restore_ui_state(app: &mut App, json: &str) -> bool {
     use crate::app::UiState;
     let Ok(state) = serde_json::from_str::<UiState>(json) else {
-        return;
+        return false;
     };
     app.show_archived = state.show_archived;
     if let Some(w) = state.panel_widths {
@@ -946,9 +948,10 @@ fn restore_ui_state(app: &mut App, json: &str) {
         app.diff_files_width = w.clamp(crate::app::MIN_DIFF_FILES_W, 300);
     }
     if let Some(pid) = &state.project {
-        let row = app.project_rows().iter().position(
-            |r| matches!(r, ProjectRow::Project(i) if app.tree.projects[*i].id.as_str() == pid),
-        );
+        let row = app
+            .project_rows()
+            .iter()
+            .position(|i| app.tree.projects[*i].id.as_str() == pid);
         if let Some(i) = row {
             app.sel_project = i;
         }
@@ -962,6 +965,7 @@ fn restore_ui_state(app: &mut App, json: &str) {
             app.sel_worktree = i;
         }
     }
+    let mut session_landed = false;
     if let Some(sid) = state.session_agent {
         if let Some(i) = app
             .visible_session_rows()
@@ -969,8 +973,10 @@ fn restore_ui_state(app: &mut App, json: &str) {
             .position(|r| matches!(r, SessionRow::Agent(a) if a.id.as_str() == sid))
         {
             app.sel_session = i;
+            session_landed = true;
         }
     }
+    session_landed
 }
 
 /// Keep the vt100 parser and the daemon PTY sized to the drawn pane.
@@ -1244,6 +1250,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             app.overlay = Some(Overlay::Settings(SettingsView::new(
                 tab,
                 app.settings_row(tab),
+                app.settings_on_tabs,
             )))
         }
         // Request a reading right away — the main loop's poll may be up to
@@ -1346,13 +1353,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::Activate => match app.focus {
             // The cursor already IS the open workspace; Enter steps into it.
             Focus::Workspaces => app.focus = Focus::Projects,
-            Focus::Projects => match app.selected_project_row() {
-                Some(ProjectRow::Divider { project, before }) => {
-                    let id = app.tree.projects[project].id.clone();
-                    open_prompt(app, PromptKind::DividerLabel { id, before });
-                }
-                _ => app.focus = Focus::Worktrees,
-            },
+            Focus::Projects => app.focus = Focus::Worktrees,
             // An open-PR row leads out of nebula, so Enter hands it to the
             // browser and stays put; a checkout hands focus one column right.
             Focus::Worktrees => match app.selected_worktree_pr().map(|pr| pr.url.clone()) {
@@ -1399,12 +1400,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 Some(SessionRow::Link(l)) => edit_link(app, &l),
                 None => {}
             },
-            Focus::Projects => {
-                if let Some(ProjectRow::Divider { project, before }) = app.selected_project_row() {
-                    let id = app.tree.projects[project].id.clone();
-                    open_prompt(app, PromptKind::DividerLabel { id, before });
-                }
-            }
+            Focus::Projects => {}
             Focus::Workspaces => {
                 let id = app.tree.active_workspace.clone();
                 open_prompt(app, PromptKind::RenameWorkspace { id });
@@ -1495,41 +1491,13 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 )));
             }
         }
-        Action::ToggleDivider => {
-            if app.focus == Focus::Projects {
-                match app.selected_project_row() {
-                    Some(ProjectRow::Project(i)) => {
-                        let p = &app.tree.projects[i];
-                        let (id, present) = (p.id.clone(), !p.divider_after);
-                        let req_id = app.alloc_req_id(PendingIntent::None);
-                        out.push(ClientRequest::SetProjectDivider {
-                            req_id,
-                            id,
-                            before: false,
-                            present,
-                            label: None,
-                        });
-                    }
-                    Some(ProjectRow::Divider { project, before }) => {
-                        remove_divider(app, project, before, out)
-                    }
-                    None => {}
-                }
+        Action::Delete => match app.focus {
+            Focus::Workspaces => {
+                let id = app.tree.active_workspace.clone();
+                remove_workspace(app, id, out);
             }
-        }
-        Action::Delete => {
-            match (app.focus, app.selected_project_row()) {
-                // Dividers are cheap to recreate — no confirmation dance.
-                (Focus::Projects, Some(ProjectRow::Divider { project, before })) => {
-                    remove_divider(app, project, before, out)
-                }
-                (Focus::Workspaces, _) => {
-                    let id = app.tree.active_workspace.clone();
-                    remove_workspace(app, id, out);
-                }
-                _ => open_delete_confirm(app),
-            }
-        }
+            _ => open_delete_confirm(app),
+        },
         // Delete EVERY row of the focused panel (behind a confirm that
         // lists the casualties).
         Action::DeleteAll => open_delete_all_confirm(app),
@@ -1601,26 +1569,6 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
                 String::new()
             },
         ),
-        PromptKind::DividerLabel { id, before } => {
-            let current = app
-                .tree
-                .projects
-                .iter()
-                .find(|p| &p.id == id)
-                .and_then(|p| {
-                    if *before {
-                        p.divider_before_label.clone()
-                    } else {
-                        p.divider_label.clone()
-                    }
-                })
-                .unwrap_or_default();
-            (
-                "Divider label".to_string(),
-                "label (empty clears it)".to_string(),
-                current,
-            )
-        }
         PromptKind::NewWorktree { suggestion, .. } => (
             "New worktree".to_string(),
             format!("branch name (empty = {suggestion})"),
@@ -2451,11 +2399,6 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
                 destructive: false,
             },
             MenuItem {
-                label: "Move to worktree".into(),
-                action: MenuAction::MoveAgent(a.id.clone()),
-                destructive: false,
-            },
-            MenuItem {
                 label: "Archive".into(),
                 action: MenuAction::ArchiveAgent(a.id.clone()),
                 destructive: false,
@@ -2485,43 +2428,6 @@ fn menu_items_for_terminal(t: &nebula_core::TerminalTab) -> Vec<MenuItem> {
             label: "Close".into(),
             action: MenuAction::CloseTerminal(t.id.clone()),
             destructive: true,
-        },
-    ]
-}
-
-fn divider_menu_item(p: &nebula_core::Project) -> MenuItem {
-    MenuItem {
-        label: if p.divider_after {
-            "Remove divider below"
-        } else {
-            "Add divider below"
-        }
-        .into(),
-        action: MenuAction::SetProjectDivider {
-            id: p.id.clone(),
-            before: false,
-            present: !p.divider_after,
-        },
-        destructive: false,
-    }
-}
-
-/// Menu for a selected divider row.
-fn divider_row_menu(id: nebula_core::ProjectId, before: bool) -> Vec<MenuItem> {
-    vec![
-        MenuItem {
-            label: "Edit label".into(),
-            action: MenuAction::LabelDivider(id.clone(), before),
-            destructive: false,
-        },
-        MenuItem {
-            label: "Remove divider".into(),
-            action: MenuAction::SetProjectDivider {
-                id,
-                before,
-                present: false,
-            },
-            destructive: false,
         },
     ]
 }
@@ -2648,43 +2554,6 @@ fn kind_label(kind: AgentKind) -> &'static str {
         AgentKind::Codex => "Codex",
         AgentKind::Cursor => "Cursor",
     }
-}
-
-/// Step 1 of moving an agent: pick the destination — any other worktree of
-/// the selected project. Chains into `MenuAction::MoveAgentToWorktree`.
-fn open_move_agent_picker(app: &mut App, agent: AgentId) {
-    let current = app
-        .tree
-        .agents
-        .iter()
-        .find(|a| a.id == agent)
-        .map(|a| a.worktree_id.clone());
-    let items: Vec<MenuItem> = app
-        .visible_worktrees()
-        .iter()
-        .filter(|w| Some(&w.id) != current.as_ref())
-        .map(|w| MenuItem {
-            label: if w.is_main {
-                format!("{} ⌂ root", w.branch)
-            } else {
-                w.branch.clone()
-            },
-            action: MenuAction::MoveAgentToWorktree(agent.clone(), w.id.clone()),
-            destructive: false,
-        })
-        .collect();
-    if items.is_empty() {
-        app.flash = Some("no other worktree to move to".into());
-        return;
-    }
-    app.overlay = Some(Overlay::Menu(ContextMenu {
-        title: Some("Move to worktree".into()),
-        items,
-        at: None,
-        hover: 0,
-        area: ratatui::layout::Rect::default(),
-        parent: None,
-    }));
 }
 
 /// Workspace switcher (`w`): pick which workspace this instance shows. The
@@ -2869,11 +2738,6 @@ fn open_context_menu_for_selection(app: &mut App) {
             open_menu(app, items, at);
         }
         Focus::Projects => {
-            if let Some(ProjectRow::Divider { project, before }) = app.selected_project_row() {
-                let id = app.tree.projects[project].id.clone();
-                open_menu(app, divider_row_menu(id, before), at);
-                return;
-            }
             let mut items = vec![MenuItem {
                 label: "Add project".into(),
                 action: MenuAction::AddProject,
@@ -2893,7 +2757,6 @@ fn open_context_menu_for_selection(app: &mut App) {
                     action: MenuAction::OpenNotes(NoteOwner::Project(p.id.clone())),
                     destructive: false,
                 });
-                items.push(divider_menu_item(p));
                 items.push(MenuItem {
                     label: "Remove from list".into(),
                     action: MenuAction::RemoveProject(p.id.clone()),
@@ -3169,7 +3032,15 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
             }
         },
         Overlay::Confirm(confirm) => match key.code {
-            KeyCode::Esc | KeyCode::Char('n') => app.overlay = None,
+            KeyCode::Esc | KeyCode::Char('n') => {
+                // Backing out of a settings reset lands back in the
+                // overlay, not on the panels — that's where you were.
+                let to_settings = matches!(confirm.action, PendingAction::ResetSettings);
+                app.overlay = None;
+                if to_settings {
+                    reopen_settings(app);
+                }
+            }
             KeyCode::Enter | KeyCode::Char('y') => {
                 let action = confirm.action.clone();
                 app.overlay = None;
@@ -3584,6 +3455,9 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
                 return;
             }
         }
+        // Shift+R: back to the defaults, behind a confirmation. It isn't
+        // about a row, so it works from the strip and the list alike.
+        KeyCode::Char('R') => SettingsCmd::ResetAll,
         // ---- the tab strip has focus ----
         KeyCode::Left | KeyCode::Char('h') if on_tabs => SettingsCmd::Tab((tab + tabs - 1) % tabs),
         KeyCode::Right | KeyCode::Char('l') if on_tabs => SettingsCmd::Tab((tab + 1) % tabs),
@@ -3621,12 +3495,14 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
             }
         }
         SettingsCmd::FocusTabs => {
+            app.remember_settings_focus(true);
             if let Some(Overlay::Settings(view)) = &mut app.overlay {
                 view.on_tabs = true;
                 view.notice = None;
             }
         }
         SettingsCmd::EnterList => {
+            app.remember_settings_focus(false);
             if let Some(Overlay::Settings(view)) = &mut app.overlay {
                 view.on_tabs = false;
             }
@@ -3673,6 +3549,19 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
                 view.info("Enter: rebind   a: add another key   ⌫: default   x: unbind");
             }
         }
+        SettingsCmd::ResetAll => {
+            // The confirm replaces the overlay; both of its exits put the
+            // settings back on screen (see `reset_settings` and the Esc
+            // arm of the Confirm handler).
+            app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+                title: "Reset settings".into(),
+                message: "Every setting goes back to its default: theme, editor, agent \
+                          defaults,\ntimeouts, the Workspaces column, and all hotkey \
+                          bindings.\nYour config.json is rewritten — this can't be undone."
+                    .into(),
+                action: PendingAction::ResetSettings,
+            }));
+        }
     }
 }
 
@@ -3687,6 +3576,7 @@ enum SettingsCmd {
     ResetHotkey,
     ClearHotkey,
     Nudge,
+    ResetAll,
 }
 
 /// The keystroke that lands while the Hotkeys tab is waiting for one.
@@ -3817,6 +3707,36 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     set_show_workspaces(app, cfg.show_workspaces);
 }
 
+/// `R` in the settings overlay, confirmed: rewrite config.json from the
+/// defaults, adopt them live (values and hotkeys both), and put the
+/// overlay back where it was so the reset values are the next thing on
+/// screen.
+fn reset_settings(app: &mut App) {
+    let result = crate::config::Config::reset_to_defaults();
+    reopen_settings(app);
+    match result {
+        Ok(cfg) => {
+            apply_config(app, &cfg);
+            app.keymap = cfg.keymap();
+            if let Some(Overlay::Settings(view)) = &mut app.overlay {
+                view.info("every setting is back to its default");
+            }
+        }
+        Err(err) => app.flash = Some(format!("couldn't reset settings: {err}")),
+    }
+}
+
+/// Put the settings overlay back up on its remembered tab and row, the
+/// same way `Action::Settings` opens it.
+fn reopen_settings(app: &mut App) {
+    let tab = app.settings_tab;
+    app.overlay = Some(Overlay::Settings(SettingsView::new(
+        tab,
+        app.settings_row(tab),
+        app.settings_on_tabs,
+    )));
+}
+
 /// Show or hide the Workspaces column, moving a cursor parked there onto
 /// Projects — there'd be nothing on screen to drive.
 fn set_show_workspaces(app: &mut App, shown: bool) {
@@ -3828,18 +3748,6 @@ fn set_show_workspaces(app: &mut App, shown: bool) {
 
 fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientRequest>) {
     let value = prompt.input.trim().to_string();
-    // An empty divider label is meaningful: it clears the label.
-    if let PromptKind::DividerLabel { id, before } = &prompt.kind {
-        let req_id = app.alloc_req_id(PendingIntent::None);
-        out.push(ClientRequest::SetProjectDivider {
-            req_id,
-            id: id.clone(),
-            before: *before,
-            present: true,
-            label: (!value.is_empty()).then_some(value),
-        });
-        return;
-    }
     // A cloud session cannot start without its task. Keep the multiline
     // dialog open on validation so the user can correct it in place.
     if prompt.is_multiline() {
@@ -3873,7 +3781,6 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
         return;
     }
     match prompt.kind {
-        PromptKind::DividerLabel { .. } => unreachable!("handled above (empty input allowed)"),
         PromptKind::AddProject => {
             let expanded = shellexpand_home(&value);
             if !expanded.exists() {
@@ -4098,6 +4005,7 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::RemoveProject { req_id, id });
         }
+        PendingAction::ResetSettings => reset_settings(app),
         PendingAction::Quit => app.should_quit = true,
     }
 }
@@ -4114,17 +4022,6 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             out.push(ClientRequest::RestartAgent { req_id, id });
         }
         MenuAction::RenameAgent(id) => open_prompt(app, PromptKind::RenameAgent { id }),
-        MenuAction::MoveAgent(id) => open_move_agent_picker(app, id),
-        MenuAction::MoveAgentToWorktree(id, worktree) => {
-            // Follow the agent to its new home when the upsert lands.
-            app.select_when_seen = Some(SessionRef::Agent(id.clone()));
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::MoveAgent {
-                req_id,
-                id,
-                worktree,
-            });
-        }
         MenuAction::ArchiveAgent(id) => {
             archive_agent(app, id, out);
         }
@@ -4287,23 +4184,6 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 }));
             }
         }
-        MenuAction::SetProjectDivider {
-            id,
-            before,
-            present,
-        } => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::SetProjectDivider {
-                req_id,
-                id,
-                before,
-                present,
-                label: None,
-            });
-        }
-        MenuAction::LabelDivider(id, before) => {
-            open_prompt(app, PromptKind::DividerLabel { id, before })
-        }
         MenuAction::ToggleArchived => toggle_archived(app, out),
     }
 }
@@ -4332,112 +4212,24 @@ fn shellexpand_home(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
-/// Ask the daemon to shift the selected row — a project, or the divider
-/// itself when one is selected; the selection follows the moved row when the
-/// reordered rows come back (see `apply_upsert`).
+/// Ask the daemon to shift the selected project; the selection follows the
+/// moved row when the reordered rows come back (see `apply_upsert`).
 fn move_project(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
-    match app.selected_project_row() {
-        Some(ProjectRow::Project(index)) => {
-            // Edge check in row terms: crossing a divider at the edge is
-            // still a real move (the divider ends up leading / trailing).
-            let last = app.project_rows().len() - 1;
-            let at_edge = match delta.signum() {
-                -1 => app.sel_project == 0,
-                1 => app.sel_project == last,
-                _ => true,
-            };
-            if at_edge {
-                return;
-            }
-            let id = app.tree.projects[index].id.clone();
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::MoveProject { req_id, id, delta });
-        }
-        Some(ProjectRow::Divider { project, before }) => {
-            move_divider(app, project, before, delta, out)
-        }
-        None => {}
-    }
-}
-
-/// Ask the daemon to hop the selected divider into the previous/next gap —
-/// including the slot above the whole list (the leading divider). Mirrors
-/// the daemon's own rules so a blocked move flashes immediately instead of
-/// arming a selection-follow that never fires.
-fn move_divider(
-    app: &mut App,
-    project: usize,
-    before: bool,
-    delta: i64,
-    out: &mut Vec<ClientRequest>,
-) {
-    // Neighbors live in the open workspace's visible sequence — `project`
-    // indexes the full tree, where another workspace's rows may interleave.
-    let visible: Vec<usize> = app
-        .tree
-        .projects
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| app.tree.in_active_workspace(p))
-        .map(|(i, _)| i)
-        .collect();
-    let Some(vpos) = visible.iter().position(|&i| i == project) else {
+    let Some(index) = app.selected_project_index() else {
         return;
     };
-    let down = delta.signum() > 0;
-    if before {
-        // The leading divider: up is already the top; down hops below the
-        // first project when that gap is free.
-        if !down {
-            return;
-        }
-        if app.tree.projects[project].divider_after {
-            app.flash = Some("that gap already has a divider".into());
-            return;
-        }
-        app.select_divider_when_seen = Some((app.tree.projects[project].id.clone(), false));
-    } else if vpos == 0 && !down {
-        // The divider under the first project hops above the whole list.
-        if app.tree.projects[project].divider_before {
-            app.flash = Some("that gap already has a divider".into());
-            return;
-        }
-        app.select_divider_when_seen = Some((app.tree.projects[project].id.clone(), true));
-    } else {
-        let neighbor = vpos as i64 + delta.signum();
-        let Some(neighbor) = usize::try_from(neighbor)
-            .ok()
-            .and_then(|i| visible.get(i))
-            .and_then(|&i| app.tree.projects.get(i))
-        else {
-            return; // no project below: the divider is at the bottom edge
-        };
-        if neighbor.divider_after {
-            app.flash = Some("that gap already has a divider".into());
-            return;
-        }
-        app.select_divider_when_seen = Some((neighbor.id.clone(), false));
+    let last = app.project_rows().len() - 1;
+    let at_edge = match delta.signum() {
+        -1 => app.sel_project == 0,
+        1 => app.sel_project == last,
+        _ => true,
+    };
+    if at_edge {
+        return;
     }
-    let id = app.tree.projects[project].id.clone();
+    let id = app.tree.projects[index].id.clone();
     let req_id = app.alloc_req_id(PendingIntent::None);
-    out.push(ClientRequest::MoveDivider {
-        req_id,
-        id,
-        before,
-        delta,
-    });
-}
-
-fn remove_divider(app: &mut App, project_index: usize, before: bool, out: &mut Vec<ClientRequest>) {
-    let id = app.tree.projects[project_index].id.clone();
-    let req_id = app.alloc_req_id(PendingIntent::None);
-    out.push(ClientRequest::SetProjectDivider {
-        req_id,
-        id,
-        before,
-        present: false,
-        label: None,
-    });
+    out.push(ClientRequest::MoveProject { req_id, id, delta });
 }
 
 /// Snapshot the context being left — which worktree row this project was
@@ -4607,13 +4399,9 @@ fn select_created_project(
 /// caller decides. False when the project is gone from the tree.
 fn select_project_row_by_id(app: &mut App, id: &nebula_core::ProjectId) -> bool {
     let rows = app.project_rows();
-    let Some(row) = rows
-        .iter()
-        .position(|r| matches!(r, ProjectRow::Project(i) if &app.tree.projects[*i].id == id))
-    else {
+    let Some(row) = rows.iter().position(|i| &app.tree.projects[*i].id == id) else {
         return false;
     };
-    app.select_divider_when_seen = None;
     app.select_worktree_when_seen = None;
     remember_context(app);
     app.sel_project = row;
@@ -4866,10 +4654,7 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
             switch_workspace(app, id, out);
         }
         Focus::Projects => {
-            // Walking onto a divider keeps its project's context, so the
-            // child panels only change when the actual project does.
-            // A manual move also outranks any pending selection-follows.
-            app.select_divider_when_seen = None;
+            // A manual move outranks any pending selection-follows.
             app.select_worktree_when_seen = None;
             remember_context(app);
             let owner_before = app.selected_project().map(|p| p.id.clone());
@@ -4884,7 +4669,7 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
             app.sel_worktree = new;
             // Stepping onto an open-PR row is not a worktree switch: it has
             // no sessions to restore and nothing to attach, so the pane is
-            // left exactly as it was — the project-divider precedent.
+            // left exactly as it was.
             if app.selected_worktree().is_some() {
                 restore_session(app, out);
             }
@@ -5787,6 +5572,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 if mouse.row == area.y.saturating_add(1) {
                     app.settings_tab = next;
                     let row = app.settings_row(next);
+                    app.remember_settings_focus(false);
                     if let Some(Overlay::Settings(view)) = &mut app.overlay {
                         view.tab = next;
                         view.selected = row;
@@ -5811,6 +5597,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         view.notice = None;
                     }
                     app.remember_settings_row(tab, index);
+                    app.remember_settings_focus(false);
                     if selected == index {
                         if tab == crate::config::hotkeys_tab() {
                             // Second click on a hotkey row starts a rebind,
@@ -5947,7 +5734,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 Some(HitTarget::FooterWorkspace) => open_workspace_picker(app),
                 Some(HitTarget::Project(i)) => {
                     if app.sel_project != i {
-                        app.select_divider_when_seen = None;
                         app.select_worktree_when_seen = None;
                         remember_context(app);
                         let owner_before = app.selected_project().map(|p| p.id.clone());
@@ -6218,12 +6004,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 Some(HitTarget::Project(i)) => {
                     app.sel_project = i;
                     app.focus = Focus::Projects;
-                    if let Some(ProjectRow::Divider { project, before }) =
-                        app.selected_project_row()
-                    {
-                        let id = app.tree.projects[project].id.clone();
-                        open_menu_at(app, divider_row_menu(id, before), at);
-                    } else if let Some(p) = app.selected_project() {
+                    if let Some(p) = app.selected_project() {
                         let items = vec![
                             MenuItem {
                                 label: "New worktree".into(),
@@ -6235,7 +6016,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                                 action: MenuAction::AddProject,
                                 destructive: false,
                             },
-                            divider_menu_item(p),
                             MenuItem {
                                 label: "Remove from list".into(),
                                 action: MenuAction::RemoveProject(p.id.clone()),
@@ -6393,14 +6173,19 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // Before the UI-state restore, whose remembered project only
             // resolves against the workspace actually on screen.
             apply_startup_workspace(app, out);
-            if let Some(json) = ui_state {
-                restore_ui_state(app, &json);
-            }
+            let session_restored = ui_state
+                .as_deref()
+                .is_some_and(|json| restore_ui_state(app, json));
             clamp_selections(app);
             refresh_palette(app);
             // Boot the restored worktree's sessions right away — the first
             // thing the user does after launch is walk into one of them.
             schedule_prewarm(app);
+            // The cursor came back on the session the user left on; bring
+            // its terminal back with it, exactly as landing on the row would.
+            if session_restored {
+                preview_selected(app, out);
+            }
             app.dirty = true;
         }
         ServerEvent::Scrollback { session, data, .. } => {
@@ -6609,50 +6394,22 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             None => app.tree.workspaces.push(w),
         },
         Entity::Project(p) => {
-            // A row's kind: None = the project itself, Some(before) = one
-            // of its dividers.
-            let kind = |row: &ProjectRow| match row {
-                ProjectRow::Divider { before, .. } => Some(*before),
-                ProjectRow::Project(_) => None,
-            };
-            let selected = app.selected_project_row().map(|row| {
-                (
-                    kind(&row),
-                    app.tree.projects[row.project_index()].id.clone(),
-                )
-            });
+            let selected = app.selected_project().map(|p| p.id.clone());
             match app.tree.projects.iter_mut().find(|x| x.id == p.id) {
                 Some(existing) => *existing = p,
                 None => app.tree.projects.push(p),
             }
             // Reorders arrive as plain upserts with new sort_orders; stable
             // sort keeps snapshot order for legacy all-zero ties. The
-            // selection follows the row it was on, so children stay put; a
-            // selected divider that just vanished falls back to its project.
+            // selection follows the project it was on, so children stay put.
             app.tree.projects.sort_by_key(|x| x.sort_order);
-            if let Some((was_kind, id)) = selected {
-                let rows = app.project_rows();
-                let same_kind = rows.iter().position(|row| {
-                    kind(row) == was_kind && app.tree.projects[row.project_index()].id == id
-                });
-                let found = same_kind.or_else(|| {
-                    rows.iter()
-                        .position(|row| app.tree.projects[row.project_index()].id == id)
-                });
+            if let Some(id) = selected {
+                let found = app
+                    .project_rows()
+                    .iter()
+                    .position(|i| app.tree.projects[*i].id == id);
                 if let Some(i) = found {
                     app.sel_project = i;
-                }
-            }
-            // A divider we moved re-homes onto another slot; chase it
-            // there once the destination's upsert lands.
-            if let Some((target, before)) = app.select_divider_when_seen.clone() {
-                let rows = app.project_rows();
-                let landed = rows.iter().position(|row| {
-                    kind(row) == Some(before) && app.tree.projects[row.project_index()].id == target
-                });
-                if let Some(i) = landed {
-                    app.sel_project = i;
-                    app.select_divider_when_seen = None;
                 }
             }
         }
@@ -6660,10 +6417,23 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             Some(existing) => *existing = w,
             None => app.tree.worktrees.push(w),
         },
-        Entity::Agent(a) => match app.tree.agents.iter_mut().find(|x| x.id == a.id) {
-            Some(existing) => *existing = a,
-            None => app.tree.agents.push(a),
-        },
+        Entity::Agent(a) => {
+            // A row the daemon re-homed (`nebula worktree`, a hook cwd in
+            // another checkout) takes the cursor with it when it was the
+            // selected session — otherwise the selection would silently
+            // land on whatever row slid into its place.
+            let selected = app.selected_session().map(|s| s.id);
+            match app.tree.agents.iter_mut().find(|x| x.id == a.id) {
+                Some(existing) => {
+                    let moved = existing.worktree_id != a.worktree_id;
+                    *existing = a;
+                    if moved && selected.as_ref() == Some(&existing.id) {
+                        app.select_when_seen = Some(SessionRef::Agent(existing.id.clone()));
+                    }
+                }
+                None => app.tree.agents.push(a),
+            }
+        }
         Entity::Terminal(t) => match app.tree.terminals.iter_mut().find(|x| x.id == t.id) {
             Some(existing) => *existing = t,
             None => app.tree.terminals.push(t),
@@ -6835,12 +6605,6 @@ fn refresh_palette(app: &mut App) {
 /// before a tree mutation so `reconcile_selection` can compare afterwards.
 struct SelectionSnapshot {
     project: Option<nebula_core::ProjectId>,
-    /// The selected Projects-panel row's kind: None = the project itself,
-    /// Some(before) = one of its dividers (apply_upsert's convention).
-    project_kind: Option<bool>,
-    /// A divider move was in flight — its landing is apply_upsert's to
-    /// chase, so the project cursor is left alone.
-    divider_chase: bool,
     worktree: Option<WorktreeId>,
     session: Option<SessionRef>,
     /// Whether the selected session row was already in the archived group —
@@ -6848,22 +6612,10 @@ struct SelectionSnapshot {
     session_archived: bool,
 }
 
-fn project_row_kind(row: &ProjectRow) -> Option<bool> {
-    match row {
-        ProjectRow::Divider { before, .. } => Some(*before),
-        ProjectRow::Project(_) => None,
-    }
-}
-
 fn selection_snapshot(app: &App) -> SelectionSnapshot {
     let row = app.selected_session_row();
     SelectionSnapshot {
         project: app.selected_project().map(|p| p.id.clone()),
-        project_kind: app
-            .selected_project_row()
-            .as_ref()
-            .and_then(project_row_kind),
-        divider_chase: app.select_divider_when_seen.is_some(),
         worktree: app.selected_worktree().map(|w| w.id.clone()),
         session_archived: row.as_ref().is_some_and(|r| r.is_archived_agent()),
         session: row.and_then(|r| r.sref()),
@@ -6886,20 +6638,9 @@ fn reconcile_selection(app: &mut App, before: SelectionSnapshot, out: &mut Vec<C
             restore_context(app, out);
             return;
         }
-        // A divider move lands via apply_upsert's own chase; don't fight it.
-        if !before.divider_chase
-            && app.selected_project().map(|p| p.id.clone()).as_ref() != Some(pid)
-        {
+        if app.selected_project().map(|p| p.id.clone()).as_ref() != Some(pid) {
             let rows = app.project_rows();
-            let same_kind = rows.iter().position(|r| {
-                project_row_kind(r) == before.project_kind
-                    && &app.tree.projects[r.project_index()].id == pid
-            });
-            let found = same_kind.or_else(|| {
-                rows.iter().position(
-                    |r| matches!(r, ProjectRow::Project(i) if &app.tree.projects[*i].id == pid),
-                )
-            });
+            let found = rows.iter().position(|i| &app.tree.projects[*i].id == pid);
             if let Some(i) = found {
                 app.sel_project = i;
             }
@@ -7013,10 +6754,6 @@ mod tests {
                     name: "demo".into(),
                     repo_path: "/tmp/demo".into(),
                     sort_order: 0,
-                    divider_after: false,
-                    divider_label: None,
-                    divider_before: false,
-                    divider_before_label: None,
                 }),
             },
         );
@@ -7152,13 +6889,7 @@ mod tests {
         assert!(text.contains("n/o: add project"), "{text}");
         assert!(text.contains("w: workspaces"), "{text}");
         assert!(text.contains("q: quit"), "{text}");
-        for dead in [
-            "e: notes",
-            "d: remove",
-            "-: divider",
-            "m: menu",
-            "/: search",
-        ] {
+        for dead in ["e: notes", "d: remove", "m: menu", "/: search"] {
             assert!(
                 !text.contains(dead),
                 "{dead} does nothing on the splash: {text}"
@@ -8676,6 +8407,72 @@ diff --git a/src/b.rs b/src/b.rs
         );
         let (armed, _) = fresh.pending_prewarm.clone().expect("prewarm armed");
         assert_eq!(armed, nebula_core::WorktreeId("w1".into()));
+    }
+
+    /// The startup snapshot puts the cursor back on the session the user
+    /// left on — and its terminal back in the pane. A restored selection
+    /// over a blank pane reads as "nebula forgot", even though the row is
+    /// highlighted.
+    #[test]
+    fn snapshot_reattaches_the_remembered_session() {
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 / w1 / a1
+        let tree = app.tree.clone();
+        let snapshot = |ui_state: Option<String>| ServerEvent::Snapshot {
+            workspaces: tree.workspaces.clone(),
+            active_workspace: tree.active_workspace.clone(),
+            projects: tree.projects.clone(),
+            worktrees: tree.worktrees.clone(),
+            agents: tree.agents.clone(),
+            terminals: tree.terminals.clone(),
+            notes: tree.notes.clone(),
+            links: tree.links.clone(),
+            pr_seen: Vec::new(),
+            ui_state,
+        };
+        let a1 = SessionRef::Agent(nebula_core::AgentId("a1".into()));
+
+        // Remembered session present: the pane comes back with the cursor.
+        let mut fresh = App::new();
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut fresh,
+            snapshot(Some(
+                r#"{"project":"p1","worktree":"w1","session_agent":"a1","show_archived":false,"collapsed":false}"#
+                    .into(),
+            )),
+            &mut out,
+        );
+        assert_eq!(
+            fresh.term.as_ref().map(|t| t.sref.clone()),
+            Some(a1.clone())
+        );
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == a1)),
+            "expected an Attach for a1, got {out:?}"
+        );
+        // The cursor stays on the panels: this is a preview, not Enter.
+        assert_eq!(fresh.focus, Focus::Projects);
+        assert!(!fresh.term_locked);
+
+        // No blob (first launch) or a blob whose session is gone: nothing
+        // to bring back, so the pane stays blank rather than guessing.
+        for blob in [
+            None,
+            Some(
+                r#"{"project":"p1","worktree":"w1","session_agent":"gone","show_archived":false,"collapsed":false}"#
+                    .to_string(),
+            ),
+        ] {
+            let mut fresh = App::new();
+            let mut out = Vec::new();
+            handle_server_event(&mut fresh, snapshot(blob), &mut out);
+            assert!(fresh.term.is_none(), "{out:?}");
+            assert!(!out
+                .iter()
+                .any(|r| matches!(r, ClientRequest::Attach { .. })));
+        }
     }
 
     /// The footer's far left is a nameplate: which nebula this is, ahead
@@ -10408,7 +10205,7 @@ diff --git a/src/b.rs b/src/b.rs
                 hse(
                     app,
                     ServerEvent::EntityUpserted {
-                        entity: project("p2", "herdr", 1, false, None),
+                        entity: project("p2", "herdr", 1),
                     },
                 );
                 hse(
@@ -11696,13 +11493,7 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(legacy.workspaces_w, crate::app::DEFAULT_WORKSPACES_PANEL_W);
     }
 
-    fn project(
-        id: &str,
-        name: &str,
-        sort_order: i64,
-        divider_after: bool,
-        divider_label: Option<&str>,
-    ) -> nebula_core::Entity {
+    fn project(id: &str, name: &str, sort_order: i64) -> nebula_core::Entity {
         use nebula_core::{Entity, Project, ProjectId};
         Entity::Project(Project {
             workspace_id: Default::default(),
@@ -11710,15 +11501,15 @@ diff --git a/src/b.rs b/src/b.rs
             name: name.into(),
             repo_path: format!("/tmp/{name}").into(),
             sort_order,
-            divider_after,
-            divider_label: divider_label.map(String::from),
-            divider_before: false,
-            divider_before_label: None,
         })
     }
 
+    /// The daemon re-homes rows on its own — a `nebula worktree` run
+    /// inside the session, or a hook cwd that walked into another checkout.
+    /// The selected session must not vanish from under the cursor when
+    /// that happens: the selection follows it into its new worktree.
     #[test]
-    fn move_agent_menu_requests_move_and_selection_follows_the_upsert() {
+    fn selection_follows_the_selected_agent_when_the_daemon_rehomes_it() {
         use nebula_core::{Agent, AgentStatus, Entity, Worktree};
         let mut app = App::new();
         seed_tree(&mut app); // p1 / w1(main) / a1
@@ -11737,60 +11528,74 @@ diff --git a/src/b.rs b/src/b.rs
             },
         );
         app.focus = Focus::Sessions;
-        let mut out = Vec::new();
-
-        // The picker offers only the OTHER worktree.
-        open_move_agent_picker(&mut app, AgentId("a1".into()));
-        let Some(Overlay::Menu(menu)) = &app.overlay else {
-            panic!("picker did not open");
+        let moved = |worktree: &str| Agent {
+            id: AgentId("a1".into()),
+            worktree_id: WorktreeId(worktree.into()),
+            name: "agent-1".into(),
+            status: AgentStatus::Fresh,
+            archived: false,
+            archived_at: 0,
+            pinned: false,
+            kind: nebula_core::AgentKind::Claude,
+            model: None,
+            effort: None,
+            session_id: None,
+            sort_order: 0,
+            status_changed_at: 0,
+            alive: true,
         };
-        assert_eq!(menu.items.len(), 1);
-        assert_eq!(menu.items[0].label, "feat");
 
-        run_menu_action(
-            &mut app,
-            MenuAction::MoveAgentToWorktree(AgentId("a1".into()), WorktreeId("w2".into())),
-            &mut out,
-        );
-        assert!(
-            matches!(out.last(), Some(ClientRequest::MoveAgent { .. })),
-            "menu action sends MoveAgent: {out:?}"
-        );
-
-        // The daemon's upsert lands with the new worktree_id — the selection
-        // follows the agent into its new worktree.
+        // a1 is the selected session; its upsert lands under w2.
+        assert_eq!(app.selected_session().map(|a| a.id.0), Some("a1".into()));
         hse(
             &mut app,
             ServerEvent::EntityUpserted {
-                entity: Entity::Agent(Agent {
-                    id: AgentId("a1".into()),
-                    worktree_id: WorktreeId("w2".into()),
-                    name: "agent-1".into(),
-                    status: AgentStatus::Fresh,
-                    archived: false,
-                    archived_at: 0,
-                    pinned: false,
-                    kind: nebula_core::AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    session_id: None,
-                    sort_order: 0,
-                    status_changed_at: 0,
-                    alive: true,
-                }),
+                entity: Entity::Agent(moved("w2")),
             },
         );
         assert_eq!(
             app.selected_worktree().map(|w| w.branch.clone()),
             Some("feat".into()),
-            "worktree selection followed the moved agent"
+            "worktree selection followed the re-homed agent"
         );
-        assert_eq!(app.sel_session, 0);
+        assert_eq!(app.selected_session().map(|a| a.id.0), Some("a1".into()));
         assert!(app.select_when_seen.is_none(), "follow intent consumed");
+
+        // An agent that is NOT selected moving elsewhere leaves the cursor
+        // where the user put it.
+        app.sel_worktree = 0;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(moved("w1")),
+            },
+        );
+        app.sel_session = 0;
+        let before = app.selected_worktree().map(|w| w.id.clone());
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a9".into()),
+                    ..moved("w1")
+                }),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a9".into()),
+                    ..moved("w2")
+                }),
+            },
+        );
+        assert_eq!(app.selected_worktree().map(|w| w.id.clone()), before);
+        assert!(app.select_when_seen.is_none());
     }
 
     #[test]
-    fn shift_arrows_reorder_projects_and_dash_toggles_divider() {
+    fn shift_arrows_reorder_projects() {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
@@ -11807,7 +11612,7 @@ diff --git a/src/b.rs b/src/b.rs
         hse(
             &mut app,
             ServerEvent::EntityUpserted {
-                entity: project("p2", "two", 1, false, None),
+                entity: project("p2", "two", 1),
             },
         );
         handle_key(
@@ -11845,24 +11650,6 @@ diff --git a/src/b.rs b/src/b.rs
             ),
             "Shift+K requests a move up: {out:?}"
         );
-
-        // '-' toggles the divider below the selected project.
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE),
-            &mut out,
-        );
-        assert!(
-            matches!(
-                out.last(),
-                Some(ClientRequest::SetProjectDivider {
-                    before: false,
-                    present: true,
-                    ..
-                })
-            ),
-            "dash toggles the divider on: {out:?}"
-        );
     }
 
     #[test]
@@ -11872,7 +11659,7 @@ diff --git a/src/b.rs b/src/b.rs
         hse(
             &mut app,
             ServerEvent::EntityUpserted {
-                entity: project("p2", "two", 1, false, None),
+                entity: project("p2", "two", 1),
             },
         );
         app.focus = Focus::Projects;
@@ -11882,13 +11669,13 @@ diff --git a/src/b.rs b/src/b.rs
         hse(
             &mut app,
             ServerEvent::EntityUpserted {
-                entity: project("p1", "demo", 1, false, None),
+                entity: project("p1", "demo", 1),
             },
         );
         hse(
             &mut app,
             ServerEvent::EntityUpserted {
-                entity: project("p2", "two", 0, false, None),
+                entity: project("p2", "two", 0),
             },
         );
 
@@ -11898,105 +11685,6 @@ diff --git a/src/b.rs b/src/b.rs
             app.sel_project, 1,
             "selection follows the project it was on"
         );
-    }
-
-    #[test]
-    fn divider_moves_with_shift_and_selection_follows() {
-        let mut app = App::new();
-        seed_tree(&mut app); // p1 "demo" at sort 0, selected
-        let mut out = Vec::new();
-        app.focus = Focus::Projects;
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: project("p1", "demo", 0, true, Some("work")),
-            },
-        );
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: project("p2", "two", 1, false, None),
-            },
-        );
-
-        // j walks onto the divider under p1; Shift+J asks the daemon to hop
-        // it under p2.
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
-            &mut out,
-        );
-        assert_eq!(
-            app.selected_project_row(),
-            Some(ProjectRow::Divider {
-                project: 0,
-                before: false
-            })
-        );
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT),
-            &mut out,
-        );
-        assert!(
-            matches!(
-                out.last(),
-                Some(ClientRequest::MoveDivider {
-                    before: false,
-                    delta: 1,
-                    ..
-                })
-            ),
-            "Shift+J on a divider requests a divider move: {out:?}"
-        );
-
-        // The daemon answers with both upserts; the selection chases the
-        // divider to its new home under p2, label and all.
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: project("p1", "demo", 0, false, None),
-            },
-        );
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: project("p2", "two", 1, true, Some("work")),
-            },
-        );
-        assert_eq!(
-            app.selected_project_row(),
-            Some(ProjectRow::Divider {
-                project: 1,
-                before: false
-            })
-        );
-        assert_eq!(app.selected_project().unwrap().name, "two");
-
-        // Under the last project it sits at the bottom edge: nothing to send.
-        let sent = out.len();
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT),
-            &mut out,
-        );
-        assert_eq!(out.len(), sent, "edge divider move sends nothing");
-
-        // A divider in the neighboring gap blocks the hop with a flash.
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: project("p1", "demo", 0, true, None),
-            },
-        );
-        app.flash = None;
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
-            &mut out,
-        );
-        assert_eq!(out.len(), sent, "blocked divider move sends nothing");
-        assert!(app.flash.is_some(), "blocked divider move explains itself");
     }
 
     #[test]
@@ -12230,7 +11918,7 @@ diff --git a/src/b.rs b/src/b.rs
         hse(
             &mut app,
             ServerEvent::EntityUpserted {
-                entity: project("p2", "two", 1, false, None),
+                entity: project("p2", "two", 1),
             },
         );
         app.focus = Focus::Projects;
@@ -12259,59 +11947,6 @@ diff --git a/src/b.rs b/src/b.rs
             app.term.as_ref().map(|t| t.sref.clone()),
             Some(sref),
             "returning to p1 re-shows its session"
-        );
-    }
-
-    #[test]
-    fn divider_renders_under_project_row() {
-        let mut app = App::new();
-        // Sized for the three panels alone; the Workspaces column is its own test.
-        app.show_workspaces = false;
-        seed_tree(&mut app);
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: project("p1", "demo", 0, true, None),
-            },
-        );
-
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        // Borderless column: row 0 a top-padding spacer, row 1 the header,
-        // row 2 a spacer, rows 3-5 the 3-tall project button (selected in
-        // the focused panel → accent ▌ rail down its edge, name on the
-        // middle row), row 6 the divider behind a 1-cell gutter.
-        let lines: Vec<&str> = text.lines().collect();
-        assert!(
-            lines[1].starts_with("   PROJECTS"),
-            "column header first:\n{text}"
-        );
-        assert!(
-            lines[3].starts_with("▌ ") && lines[5].starts_with("▌ "),
-            "selection rail spans the project button:\n{text}"
-        );
-        assert!(
-            lines[4].starts_with("▌● demo"),
-            "project name centered in the button:\n{text}"
-        );
-        assert!(
-            lines[6].starts_with(&format!(" {}", "─".repeat(10))),
-            "divider row under the project:\n{text}"
-        );
-
-        // A labeled divider weaves the label into the line.
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: project("p1", "demo", 0, true, Some("work")),
-            },
-        );
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(
-            text.lines().nth(6).unwrap().starts_with(" ─ work ──"),
-            "labeled divider row:\n{text}"
         );
     }
 
@@ -12397,237 +12032,6 @@ diff --git a/src/b.rs b/src/b.rs
             a2_row,
             a1_row + 2,
             "session rows stack on the 2-row pill stride:\n{text}"
-        );
-    }
-
-    /// A project with the leading divider (divider above the whole list).
-    fn leading_project(
-        id: &str,
-        name: &str,
-        sort_order: i64,
-        label: Option<&str>,
-    ) -> nebula_core::Entity {
-        use nebula_core::{Entity, Project, ProjectId};
-        Entity::Project(Project {
-            workspace_id: Default::default(),
-            id: ProjectId(id.into()),
-            name: name.into(),
-            repo_path: format!("/tmp/{name}").into(),
-            sort_order,
-            divider_after: false,
-            divider_label: None,
-            divider_before: true,
-            divider_before_label: label.map(String::from),
-        })
-    }
-
-    #[test]
-    fn divider_under_the_top_project_hops_above_the_list() {
-        let mut app = App::new();
-        seed_tree(&mut app); // p1 "demo" at sort 0, selected
-        let mut out = Vec::new();
-        app.focus = Focus::Projects;
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: project("p1", "demo", 0, true, Some("work")),
-            },
-        );
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: project("p2", "two", 1, false, None),
-            },
-        );
-
-        // j onto the divider under p1; Shift+K asks for the hop above the
-        // whole list.
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
-            &mut out,
-        );
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
-            &mut out,
-        );
-        assert!(
-            matches!(
-                out.last(),
-                Some(ClientRequest::MoveDivider {
-                    before: false,
-                    delta: -1,
-                    ..
-                })
-            ),
-            "Shift+K under the first project requests the top hop: {out:?}"
-        );
-
-        // The daemon answers with the re-owned divider; the selection
-        // chases it onto the leading row, drawn above its project.
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: leading_project("p1", "demo", 0, Some("work")),
-            },
-        );
-        assert_eq!(
-            app.selected_project_row(),
-            Some(ProjectRow::Divider {
-                project: 0,
-                before: true
-            })
-        );
-        assert_eq!(app.sel_project, 0, "the leading divider is the first row");
-
-        // Shift+K again clamps — it is already above everything.
-        let sent = out.len();
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
-            &mut out,
-        );
-        assert_eq!(out.len(), sent, "top divider move up sends nothing");
-    }
-
-    #[test]
-    fn selected_divider_blanks_the_panes_with_a_hint() {
-        let mut app = App::new();
-        // Sized for the three panels alone; the Workspaces column is its own test.
-        app.show_workspaces = false;
-        seed_tree(&mut app); // p1/w1(main) + agent-1
-        let mut out = Vec::new();
-        app.focus = Focus::Projects;
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: project("p1", "demo", 0, true, Some("work")),
-            },
-        );
-
-        // On the project row the side panels show its content.
-        // Wide enough that the terminal pane fits the hint on one line
-        // once the three panels have taken their default widths.
-        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(text.contains("⌂ root"), "project shows worktrees:\n{text}");
-        assert!(text.contains("agent-1"), "project shows sessions:\n{text}");
-
-        // On the divider row the panels stay but their content blanks, and
-        // the terminal pane explains why.
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
-            &mut out,
-        );
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(
-            !text.contains("⌂ root"),
-            "divider hides worktree rows:\n{text}"
-        );
-        assert!(
-            !text.contains("agent-1"),
-            "divider hides session rows:\n{text}"
-        );
-        assert!(
-            text.contains("you're focused on a separator"),
-            "the pane hints at what to do:\n{text}"
-        );
-    }
-
-    #[test]
-    fn divider_rows_select_label_and_delete() {
-        let mut app = App::new();
-        seed_tree(&mut app);
-        let mut out = Vec::new();
-        app.focus = Focus::Projects;
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: project("p1", "demo", 0, true, None),
-            },
-        );
-
-        // j walks onto the divider; the project's context sticks.
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
-            &mut out,
-        );
-        assert_eq!(
-            app.selected_project_row(),
-            Some(ProjectRow::Divider {
-                project: 0,
-                before: false
-            })
-        );
-        assert_eq!(app.selected_project().unwrap().name, "demo");
-        assert!(
-            !app.visible_worktrees().is_empty(),
-            "divider keeps its project's context"
-        );
-
-        // Enter opens the label prompt; submitting sends the label.
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut out,
-        );
-        assert!(
-            matches!(&app.overlay, Some(Overlay::Prompt(p)) if p.title == "Divider label"),
-            "Enter on a divider prompts for its label"
-        );
-        for c in "work".chars() {
-            handle_key(
-                &mut app,
-                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
-                &mut out,
-            );
-        }
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut out,
-        );
-        assert!(
-            matches!(
-                out.last(),
-                Some(ClientRequest::SetProjectDivider { present: true, label: Some(l), .. })
-                    if l == "work"
-            ),
-            "label submit: {out:?}"
-        );
-
-        // With no project below, the divider is at the bottom edge — the
-        // Shift move has nowhere to go and sends nothing.
-        let sent = out.len();
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT),
-            &mut out,
-        );
-        assert_eq!(out.len(), sent, "edge divider move sends nothing");
-
-        // d deletes the divider without a confirm dialog.
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
-            &mut out,
-        );
-        assert!(app.overlay.is_none(), "divider delete needs no confirm");
-        assert!(
-            matches!(
-                out.last(),
-                Some(ClientRequest::SetProjectDivider {
-                    present: false,
-                    label: None,
-                    ..
-                })
-            ),
-            "divider delete: {out:?}"
         );
     }
 
@@ -12756,10 +12160,6 @@ diff --git a/src/b.rs b/src/b.rs
                     name: "demo".into(),
                     repo_path: path.to_path_buf(),
                     sort_order: 0,
-                    divider_after: false,
-                    divider_label: None,
-                    divider_before: false,
-                    divider_before_label: None,
                 }),
             },
         );
@@ -13498,10 +12898,6 @@ diff --git a/src/b.rs b/src/b.rs
                     name: "nebula".into(),
                     repo_path: "/tmp/nebula".into(),
                     sort_order: 1,
-                    divider_after: false,
-                    divider_label: None,
-                    divider_before: false,
-                    divider_before_label: None,
                 }),
             },
         );
@@ -13831,10 +13227,6 @@ diff --git a/src/b.rs b/src/b.rs
                     name: "fresh".into(),
                     repo_path: "/tmp/fresh".into(),
                     sort_order: 9,
-                    divider_after: false,
-                    divider_label: None,
-                    divider_before: false,
-                    divider_before_label: None,
                 }),
             },
         );
@@ -13995,7 +13387,7 @@ diff --git a/src/b.rs b/src/b.rs
     fn settings_j_k_move_selection() {
         let mut app = App::new();
         let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        open_settings_on(&mut app, 0, &mut out);
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
         let Some(Overlay::Settings(view)) = &app.overlay else {
             panic!("settings closed");
@@ -14017,7 +13409,7 @@ diff --git a/src/b.rs b/src/b.rs
     fn settings_reopens_on_last_focused_row() {
         let mut app = App::new();
         let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        open_settings_on(&mut app, 0, &mut out);
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
@@ -14026,6 +13418,30 @@ diff --git a/src/b.rs b/src/b.rs
             panic!("settings closed");
         };
         assert_eq!(view.selected, 2, "reopen lands on the last focused row");
+        assert!(!view.on_tabs, "…in the list, where we left the cursor");
+    }
+
+    /// Nothing visited yet: the strip has the cursor, so ←/→ mean "walk the
+    /// tabs" the moment the overlay is up. Once the cursor has been parked
+    /// somewhere, a reopen restores that tab/row/focus instead.
+    #[test]
+    fn settings_first_open_lands_on_the_tab_strip() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        assert!(settings_view(&app).on_tabs, "fresh open parks on the strip");
+        // ←/→ steer the strip straight away, no ↑ needed first.
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+        assert_eq!(settings_view(&app).tab, 1);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        assert_eq!(settings_view(&app).tab, 1, "reopen keeps the tab");
+        assert!(settings_view(&app).on_tabs, "…and the strip focus");
+        // Drop into the list, leave, come back: the list has it now.
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        assert!(!settings_view(&app).on_tabs, "reopen restores list focus");
     }
 
     #[test]
@@ -14035,7 +13451,7 @@ diff --git a/src/b.rs b/src/b.rs
         crate::config::with_config_path(path.clone(), || {
             let mut app = App::new();
             let mut out = Vec::new();
-            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+            open_settings_on(&mut app, 0, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             let cfg = crate::config::Config::load();
             assert!(
@@ -14059,12 +13475,9 @@ diff --git a/src/b.rs b/src/b.rs
         crate::config::with_config_path(path, || {
             let mut app = App::new();
             let mut out = Vec::new();
-            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
             let (tab, row) =
                 crate::config::locate(crate::config::SettingKind::RecentWindow).unwrap();
-            for _ in 0..tab {
-                press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
-            }
+            open_settings_on(&mut app, tab, &mut out);
             for _ in 0..row {
                 press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
             }
@@ -14128,12 +13541,15 @@ diff --git a/src/b.rs b/src/b.rs
 
     // ---- settings tabs & hotkeys ----
 
-    /// Open the settings overlay parked on `tab`.
+    /// Open the settings overlay parked on `tab`, cursor down in the list.
+    /// A fresh overlay opens on the tab strip, so the ↓ is what these tests
+    /// mean by "parked on the tab".
     fn open_settings_on(app: &mut App, tab: usize, out: &mut Vec<ClientRequest>) {
         press(app, KeyCode::Char('s'), KeyModifiers::NONE, out);
         for _ in 0..tab {
             press(app, KeyCode::Tab, KeyModifiers::NONE, out);
         }
+        press(app, KeyCode::Down, KeyModifiers::NONE, out);
     }
 
     fn settings_view(app: &App) -> &crate::app::SettingsView {
@@ -14180,7 +13596,7 @@ diff --git a/src/b.rs b/src/b.rs
         crate::config::with_config_path(dir.path().join("config.json"), || {
             let mut app = App::new();
             let mut out = Vec::new();
-            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+            open_settings_on(&mut app, 0, &mut out);
             assert!(!settings_view(&app).on_tabs);
             // In the list, → cycles the selected setting's value.
             press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
@@ -14211,7 +13627,7 @@ diff --git a/src/b.rs b/src/b.rs
     fn each_tab_remembers_its_own_cursor_row() {
         let mut app = App::new();
         let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        open_settings_on(&mut app, 0, &mut out);
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
         assert_eq!(settings_view(&app).selected, 2);
@@ -14475,6 +13891,87 @@ diff --git a/src/b.rs b/src/b.rs
             app.focus = Focus::Terminal;
             press(&mut app, KeyCode::F(4), KeyModifiers::NONE, &mut out);
             assert!(!app.term_locked);
+        });
+    }
+
+    // ---- settings reset ----
+
+    #[test]
+    fn shift_r_in_settings_asks_first_and_n_goes_back_to_the_overlay() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
+            let Some(Overlay::Confirm(c)) = &app.overlay else {
+                panic!("expected a confirmation, got {:?}", app.overlay);
+            };
+            assert_eq!(c.title, "Reset settings");
+            assert!(matches!(c.action, PendingAction::ResetSettings));
+            assert!(c.message.contains("hotkey"), "{}", c.message);
+
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(app.overlay, Some(Overlay::Settings(_))),
+                "n returns to the overlay, not the panels: {:?}",
+                app.overlay
+            );
+            assert_eq!(settings_view(&app).tab, 1, "on the tab it was opened from");
+            assert!(out.is_empty(), "nothing goes to the daemon");
+        });
+    }
+
+    #[test]
+    fn confirming_the_reset_rewrites_the_file_and_the_live_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        crate::config::with_config_path(path.clone(), || {
+            // Dirty the file the way the overlay would, plus a key the
+            // overlay doesn't own.
+            let mut cfg = crate::config::Config {
+                animations: false,
+                show_workspaces: false,
+                ..Default::default()
+            };
+            let mut keymap = cfg.keymap();
+            let splash = crate::keymap::index_of(crate::keymap::Action::Splash).unwrap();
+            keymap.bind(splash, crate::keymap::KeyChord::parse("f9").unwrap(), false);
+            cfg.keybindings = keymap.overrides();
+            cfg.save().unwrap();
+            let mut root: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            root["prewarm_agents"] = serde_json::json!(false);
+            std::fs::write(&path, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
+
+            let mut app = App::new();
+            app.animations = false;
+            app.show_workspaces = false;
+            app.focus = Focus::Workspaces;
+            app.keymap = keymap;
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
+            press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+
+            // Back in the overlay, saying what happened.
+            let (text, level) = settings_view(&app).notice.clone().expect("a notice");
+            assert!(text.contains("default"), "{text}");
+            assert_eq!(level, crate::app::NoticeLevel::Info);
+            assert!(app.flash.is_none(), "{:?}", app.flash);
+
+            // Live state adopted the defaults…
+            assert!(app.animations);
+            assert!(app.show_workspaces);
+            assert!(app.keymap.is_default(splash), "hotkeys reset too");
+
+            // …and so did the file, foreign keys included.
+            let saved = crate::config::Config::load();
+            assert!(saved.animations);
+            assert!(saved.show_workspaces);
+            assert!(saved.keybindings.is_empty());
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(!raw.contains("prewarm_agents"), "{raw}");
         });
     }
 
@@ -15772,7 +15269,7 @@ diff --git a/src/b.rs b/src/b.rs
         hse(
             &mut app,
             ServerEvent::EntityUpserted {
-                entity: project("p2", "two", 1, false, None),
+                entity: project("p2", "two", 1),
             },
         );
         hse(
@@ -15850,10 +15347,6 @@ diff --git a/src/b.rs b/src/b.rs
                     name: "secret".into(),
                     repo_path: "/tmp/secret".into(),
                     sort_order: 9,
-                    divider_after: false,
-                    divider_label: None,
-                    divider_before: false,
-                    divider_before_label: None,
                 }),
             },
         );
@@ -16606,7 +16099,9 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     /// Opening an empty workspace clears the child panels and the terminal
-    /// pane instead of keeping the previous workspace's session on screen.
+    /// pane instead of keeping the previous workspace's session on screen —
+    /// and it is NOT a first run, so the splash stays down and the panels
+    /// (Workspaces column included) stay on screen.
     #[test]
     fn switching_to_empty_workspace_blanks_the_pane() {
         use nebula_core::{Entity, Workspace, WorkspaceId};
@@ -16632,7 +16127,65 @@ diff --git a/src/b.rs b/src/b.rs
                 .any(|r| matches!(r, ClientRequest::Detach { .. })),
             "old session detached: {out:?}"
         );
-        assert!(app.splash_active(), "empty workspace shows the splash");
+        assert!(
+            !app.splash_showing(),
+            "an empty non-default workspace is not a first run"
+        );
+    }
+
+    /// The splash is scoped to the default workspace: stepping the
+    /// Workspaces column onto an empty workspace the user created keeps the
+    /// column and the "no projects yet" panels on screen, and stepping
+    /// back to an (empty) default brings the splash back.
+    #[test]
+    fn empty_non_default_workspace_keeps_the_panels_not_the_splash() {
+        use nebula_core::{Entity, Workspace, WorkspaceId};
+        let mut app = App::new();
+        seed_default_workspace(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Workspace(Workspace {
+                    id: WorkspaceId("ws-empty".into()),
+                    name: "fresh".into(),
+                }),
+            },
+        );
+        let mut out = Vec::new();
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            app.splash_showing(),
+            "empty default workspace is a first run"
+        );
+        assert!(
+            !buffer_text(&terminal).contains("no projects yet"),
+            "the splash replaces the panels"
+        );
+
+        app.focus = Focus::Workspaces;
+        move_selection(&mut app, 1, &mut out);
+        assert_eq!(app.tree.active_workspace_name(), "fresh");
+        assert!(!app.splash_showing(), "not a first run");
+        assert!(!app.splash_active());
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("WORKSPACES"),
+            "column stays on screen:\n{text}"
+        );
+        assert!(
+            text.contains("no projects yet"),
+            "panels stay on screen:\n{text}"
+        );
+
+        move_selection(&mut app, -1, &mut out);
+        assert_eq!(app.tree.active_workspace_name(), "default");
+        assert!(
+            app.splash_showing(),
+            "back on the empty default: splash again"
+        );
     }
 
     /// `w` opens the workspace switcher with the open workspace checked and

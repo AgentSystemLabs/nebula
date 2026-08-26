@@ -3,7 +3,7 @@
 
 use anyhow::{bail, Context, Result};
 use nebula_core::codec::{read_frame, write_frame};
-use nebula_core::{paths, AgentId, ClientRequest, ServerEvent, PROTOCOL_VERSION};
+use nebula_core::{paths, AgentId, ClientRequest, EnterOutcome, ServerEvent, PROTOCOL_VERSION};
 use std::time::Duration;
 use tokio::net::UnixStream;
 
@@ -187,6 +187,92 @@ pub async fn rename_current_agent(title: String, force: bool) -> Result<()> {
                 println!("nebula: {message}");
                 return Ok(());
             }
+            Some(_) => continue,
+            None => bail!("daemon closed the connection before replying"),
+        }
+    }
+}
+
+/// CLI: `nebula worktree [name] [--base <ref>]` from inside an agent
+/// session — take (or create) the named worktree of this session's project
+/// and have the daemon move the session into it. A blank name is invented
+/// the way the TUI's new-worktree prompt invents one, and spaces slugify to
+/// hyphens the same way. Never spawns a daemon: no daemon means no session
+/// to move.
+///
+/// What this prints is read by the model that ran it, so the relocating
+/// case spells out what happens next: the daemon kills and resumes this
+/// very process once the turn ends, and the answer has to be finished by
+/// then. A daemon-side failure is a nonzero exit — the model reports it and
+/// stays put.
+pub async fn enter_worktree_for_current_agent(name: &str, base: Option<String>) -> Result<()> {
+    let agent_id = std::env::var("NEBULA_AGENT_ID")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .context(
+            "NEBULA_AGENT_ID is not set — `nebula worktree` only works from inside a \
+             nebula agent session",
+        )?;
+    let branch = match crate::branch_name::slugify(name) {
+        slug if slug.is_empty() => crate::branch_name::random_name(&[]),
+        slug => slug,
+    };
+    let sock = paths::socket_path();
+    let Ok(stream) = try_connect(&sock).await else {
+        bail!("no nebula daemon is running — nothing to move");
+    };
+    let mut conn = handshake(stream).await?;
+    let req_id = 1u64;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::EnterWorktree {
+            req_id,
+            id: AgentId(agent_id),
+            branch,
+            base,
+        },
+    )
+    .await?;
+    loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::WorktreeEntered {
+                req_id: r,
+                worktree,
+                outcome,
+            }) if r == req_id => {
+                println!(
+                    "worktree \"{}\" is ready at {}",
+                    worktree.branch,
+                    worktree.path.display()
+                );
+                match outcome {
+                    EnterOutcome::AlreadyThere => {
+                        println!("this session already runs inside it — nothing to move.");
+                    }
+                    EnterOutcome::Relocating => {
+                        println!(
+                            "this session is now associated with it; nebula will relocate the \
+                             session into it the moment this turn ends."
+                        );
+                        println!(
+                            "Finish now: tell the user in one line that the session is moving \
+                             into the worktree, and make no further tool calls or edits — you \
+                             will be resumed inside the worktree with a prompt to continue."
+                        );
+                    }
+                    EnterOutcome::NextLaunch => {
+                        println!(
+                            "this session is now associated with it and runs there from its \
+                             next launch."
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            Some(ServerEvent::Error {
+                req_id: Some(r),
+                message,
+            }) if r == req_id => bail!("{message}"),
             Some(_) => continue,
             None => bail!("daemon closed the connection before replying"),
         }

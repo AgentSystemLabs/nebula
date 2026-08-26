@@ -429,10 +429,7 @@ impl Config {
     }
 
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut root = match std::fs::read_to_string(path) {
+        let root = match std::fs::read_to_string(path) {
             Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
                 .ok()
                 .filter(|v| v.is_object())
@@ -440,6 +437,32 @@ impl Config {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
             Err(err) => return Err(err),
         };
+        self.write_into(path, root)
+    }
+
+    /// Put every setting back to its default and return the result. The
+    /// file is rewritten from scratch rather than patched like
+    /// [`Config::save`], so keys the overlay doesn't own — the daemon's
+    /// `prewarm_*`, anything hand-added — go too: a reset reads as if the
+    /// file had never been edited.
+    pub fn reset_to_defaults() -> std::io::Result<Self> {
+        #[cfg(test)]
+        assert!(
+            CONFIG_PATH_OVERRIDE.with(|p| p.borrow().is_some()),
+            "Config::reset_to_defaults() in a test without a path override — wrap \
+             the test body in config::with_config_path (or with_default_config)"
+        );
+        let cfg = Self::default();
+        cfg.write_into(&settings_path(), serde_json::json!({}))?;
+        Ok(cfg)
+    }
+
+    /// Write this config's known keys over `root` (an object) and swap the
+    /// result into place atomically.
+    fn write_into(&self, path: &Path, mut root: serde_json::Value) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let obj = root
             .as_object_mut()
             .expect("root filtered to object or empty object");
@@ -704,6 +727,46 @@ mod tests {
         assert!(cfg.palette_enter_attaches);
         let cfg: Config = serde_json::from_str(r#"{"palette_enter_attaches": false}"#).unwrap();
         assert!(!cfg.palette_enter_attaches);
+    }
+
+    #[test]
+    fn reset_rewrites_the_file_from_scratch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        with_config_path(path.clone(), || {
+            let mut cfg = Config {
+                theme: "midnight".into(),
+                animations: false,
+                ..Config::default()
+            };
+            cfg.keybindings.insert("git_diff".into(), "f9".into());
+            cfg.save().unwrap();
+            // A key the overlay doesn't own survives an ordinary save…
+            let mut root: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            root["prewarm_agents"] = serde_json::json!(false);
+            std::fs::write(&path, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
+            Config::load().save().unwrap();
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                raw.contains("prewarm_agents"),
+                "save() patches, keeping foreign keys:\n{raw}"
+            );
+
+            // …but not a reset: the file starts over from an empty object.
+            let reset = Config::reset_to_defaults().unwrap();
+            assert!(reset.animations);
+            assert!(reset.keybindings.is_empty());
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !raw.contains("prewarm_agents"),
+                "foreign key survived:\n{raw}"
+            );
+            let loaded = Config::load();
+            assert_eq!(loaded.theme, Config::default().theme);
+            assert!(loaded.animations);
+            assert!(loaded.keybindings.is_empty());
+        });
     }
 
     #[test]

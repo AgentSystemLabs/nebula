@@ -60,6 +60,12 @@ pub fn run_rename(title: String, force: bool) -> Result<()> {
     runtime()?.block_on(ipc::rename_current_agent(title, force))
 }
 
+/// `nebula worktree [name] [--base <ref>]` — move the current agent session
+/// into a worktree of its project (see `ipc::enter_worktree_for_current_agent`).
+pub fn run_worktree(name: String, base: Option<String>) -> Result<()> {
+    runtime()?.block_on(ipc::enter_worktree_for_current_agent(&name, base))
+}
+
 /// `nebula add <dir>` / bare `nebula <dir>` — register a directory as a
 /// project (see `ipc::add_project`).
 pub fn run_add_project(path: String) -> Result<()> {

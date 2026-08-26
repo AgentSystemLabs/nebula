@@ -197,6 +197,15 @@ const MIGRATIONS: &[&str] = &[
       seen_at  INTEGER NOT NULL
     );
     ",
+    // 18: project group dividers are gone (migrations 2, 3 and 7 added
+    // them; 14 carried them through the table rebuild). Plain columns with
+    // no index or constraint, so DROP COLUMN is enough.
+    "
+    ALTER TABLE projects DROP COLUMN divider_after;
+    ALTER TABLE projects DROP COLUMN divider_label;
+    ALTER TABLE projects DROP COLUMN divider_before;
+    ALTER TABLE projects DROP COLUMN divider_before_label;
+    ",
 ];
 
 pub struct Store {
@@ -361,8 +370,8 @@ impl Store {
 
     pub fn insert_project(&self, p: &Project) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO projects (id, name, workspace_id, repo_path, sort_order, divider_after, divider_label, divider_before, divider_before_label, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![p.id.as_str(), p.name, p.workspace_id.as_str(), p.repo_path.to_string_lossy(), p.sort_order, p.divider_after as i64, p.divider_label, p.divider_before as i64, p.divider_before_label, now_ms()],
+            "INSERT INTO projects (id, name, workspace_id, repo_path, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![p.id.as_str(), p.name, p.workspace_id.as_str(), p.repo_path.to_string_lossy(), p.sort_order, now_ms()],
         )?;
         Ok(())
     }
@@ -376,18 +385,11 @@ impl Store {
         )?)
     }
 
-    /// Persist a project's list position: sort order plus both dividers.
+    /// Persist a project's list position (its sort order).
     pub fn set_project_position(&self, p: &Project) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "UPDATE projects SET sort_order = ?2, divider_after = ?3, divider_label = ?4, divider_before = ?5, divider_before_label = ?6 WHERE id = ?1",
-            params![
-                p.id.as_str(),
-                p.sort_order,
-                p.divider_after as i64,
-                p.divider_label,
-                p.divider_before as i64,
-                p.divider_before_label
-            ],
+            "UPDATE projects SET sort_order = ?2 WHERE id = ?1",
+            params![p.id.as_str(), p.sort_order],
         )?;
         Ok(())
     }
@@ -858,18 +860,14 @@ impl Store {
     pub fn get_project(&self, id: &ProjectId) -> Result<Option<Project>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, repo_path, sort_order, divider_after, divider_label, divider_before, divider_before_label, COALESCE(workspace_id, 'default') FROM projects WHERE id = ?1")?;
+            .prepare("SELECT id, name, repo_path, sort_order, COALESCE(workspace_id, 'default') FROM projects WHERE id = ?1")?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| Project {
             id: ProjectId(r.get::<_, String>(0).unwrap()),
             name: r.get(1).unwrap(),
             repo_path: PathBuf::from(r.get::<_, String>(2).unwrap()),
             sort_order: r.get(3).unwrap(),
-            divider_after: r.get::<_, i64>(4).unwrap() != 0,
-            divider_label: r.get(5).unwrap(),
-            divider_before: r.get::<_, i64>(6).unwrap() != 0,
-            divider_before_label: r.get(7).unwrap(),
-            workspace_id: WorkspaceId(r.get::<_, String>(8).unwrap()),
+            workspace_id: WorkspaceId(r.get::<_, String>(4).unwrap()),
         }))
     }
 
@@ -943,18 +941,14 @@ impl Store {
         let conn = self.conn.lock().unwrap();
 
         let projects = conn
-            .prepare("SELECT id, name, repo_path, sort_order, divider_after, divider_label, divider_before, divider_before_label, COALESCE(workspace_id, 'default') FROM projects ORDER BY sort_order, created_at")?
+            .prepare("SELECT id, name, repo_path, sort_order, COALESCE(workspace_id, 'default') FROM projects ORDER BY sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Project {
                     id: ProjectId(r.get(0)?),
                     name: r.get(1)?,
                     repo_path: PathBuf::from(r.get::<_, String>(2)?),
                     sort_order: r.get(3)?,
-                    divider_after: r.get::<_, i64>(4)? != 0,
-                    divider_label: r.get(5)?,
-                    divider_before: r.get::<_, i64>(6)? != 0,
-                    divider_before_label: r.get(7)?,
-                    workspace_id: WorkspaceId(r.get(8)?),
+                    workspace_id: WorkspaceId(r.get(4)?),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1044,10 +1038,6 @@ mod tests {
             name: "demo".into(),
             repo_path: "/tmp/demo".into(),
             sort_order: 0,
-            divider_after: false,
-            divider_label: None,
-            divider_before: false,
-            divider_before_label: None,
         };
         store.insert_project(&project).unwrap();
         let worktree = Worktree {
@@ -1135,10 +1125,6 @@ mod tests {
             name: "demo".into(),
             repo_path: "/tmp/demo".into(),
             sort_order: 0,
-            divider_after: false,
-            divider_label: None,
-            divider_before: false,
-            divider_before_label: None,
         };
         store.insert_project(&project).unwrap();
         let worktree = Worktree {
@@ -1230,10 +1216,6 @@ mod tests {
             name: "demo".into(),
             repo_path: "/tmp/demo".into(),
             sort_order: 0,
-            divider_after: false,
-            divider_label: None,
-            divider_before: false,
-            divider_before_label: None,
         };
         store.insert_project(&project).unwrap();
         let worktree = Worktree {
@@ -1353,6 +1335,60 @@ mod tests {
         }
     }
 
+    /// Real upgrade path: a v17 database still carries the project divider
+    /// columns (with data in them). Migration 18 drops them and the
+    /// projects underneath load untouched.
+    #[test]
+    fn migration_18_drops_the_divider_columns() {
+        let path =
+            std::env::temp_dir().join(format!("nebula-mig18-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            for (i, migration) in MIGRATIONS.iter().take(17).enumerate() {
+                conn.execute_batch(&format!(
+                    "BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;",
+                    i + 1
+                ))
+                .unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO projects (id, name, repo_path, sort_order, created_at, divider_after, divider_label, divider_before, divider_before_label, workspace_id)
+                   VALUES ('p1', 'one', '/tmp/one', 0, 0, 1, 'work', 1, 'top', 'default');
+                 INSERT INTO projects (id, name, repo_path, sort_order, created_at, workspace_id)
+                   VALUES ('p2', 'two', '/tmp/two', 1, 0, 'default');",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let (projects, _, _, _) = store.load_tree().unwrap();
+        assert_eq!(
+            projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        assert_eq!(projects[0].sort_order, 0);
+        assert_eq!(projects[1].workspace_id.as_str(), DEFAULT_WORKSPACE_ID);
+        let columns: Vec<String> = store
+            .conn
+            .lock()
+            .unwrap()
+            .prepare("PRAGMA table_info(projects)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            !columns.iter().any(|c| c.starts_with("divider")),
+            "divider columns survived the migration: {columns:?}"
+        );
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+    }
+
     /// Real upgrade path: a v13 database (global UNIQUE on repo_path) is
     /// rebuilt so the same repo can live in several workspaces. The rebuild
     /// drops the old projects table — child rows must survive it.
@@ -1398,10 +1434,6 @@ mod tests {
             workspace_id: WorkspaceId(workspace.into()),
             repo_path: PathBuf::from("/tmp/p"),
             sort_order: 1,
-            divider_after: false,
-            divider_label: None,
-            divider_before: false,
-            divider_before_label: None,
         };
         store.insert_project(&dup("p2", "w2")).unwrap();
         // …but still refused twice in the same one.
@@ -1481,10 +1513,6 @@ mod tests {
             name: "demo".into(),
             repo_path: "/tmp/demo".into(),
             sort_order: 0,
-            divider_after: false,
-            divider_label: None,
-            divider_before: false,
-            divider_before_label: None,
         };
         store.insert_project(&project).unwrap();
         assert_eq!(store.count_workspace_projects(&client.id).unwrap(), 1);
@@ -1513,10 +1541,6 @@ mod tests {
             name: "p".into(),
             repo_path: "/tmp/p".into(),
             sort_order: 0,
-            divider_after: false,
-            divider_label: None,
-            divider_before: false,
-            divider_before_label: None,
         };
         store.insert_project(&project).unwrap();
         let wt = Worktree {
@@ -1596,10 +1620,6 @@ mod tests {
             name: "demo".into(),
             repo_path: "/tmp/demo".into(),
             sort_order: 0,
-            divider_after: false,
-            divider_label: None,
-            divider_before: false,
-            divider_before_label: None,
         };
         store.insert_project(&project).unwrap();
         let worktree = Worktree {
@@ -1638,10 +1658,6 @@ mod tests {
             name: "p".into(),
             repo_path: "/tmp/p".into(),
             sort_order: 0,
-            divider_after: false,
-            divider_label: None,
-            divider_before: false,
-            divider_before_label: None,
         };
         store.insert_project(&project).unwrap();
         let wt = Worktree {

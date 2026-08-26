@@ -84,7 +84,8 @@ With no projects yet you get the splash instead — press `n` to add one without
 **3. Choose where the agent runs.** Select your project, then a worktree. Every project starts with one:
 the checkout itself. Press `n` in the Worktrees column to branch off into a real `git worktree` (created
 under `<repo>/../<repo-name>-worktrees/<branch>`). That's the point of the column — two agents in two
-worktrees edit two directories and never collide.
+worktrees edit two directories and never collide. Or skip the column and just ask: tell a Claude session
+"do this in a worktree" and it creates one through nebula and moves itself into it (see *How it works*).
 
 Under the checkouts, an `OPEN PRS` group lists every pull request still open on the repo — drafts
 included, badged as such — fetched with `gh` when you open the project and re-asked about once a minute
@@ -183,6 +184,16 @@ The panels aren't the only view. With a worktree selected, from any panel:
   session is untitled); Cursor gets a managed `.cursor/rules/nebula-title.mdc` project rule instead,
   since its hooks can't inject context. Titling is one-shot and never clobbers a name you typed or set
   with `r` — a late agent attempt is politely declined. `nebula rename --force` overrides.
+- **Ask the agent for a worktree and it moves there.** Tell a Claude session "do this in a worktree" and
+  it runs `nebula worktree <name>` instead of its own `EnterWorktree` tool (whose checkouts land under
+  `<repo>/.claude/worktrees/` on a `worktree-*` branch). nebula creates the checkout in its usual
+  `<repo-name>-worktrees/<branch>` spot — or takes the existing one for that branch — re-homes the
+  session's row under it at once, and the moment that turn ends restarts the CLI resumed inside the
+  worktree, opening with a note saying where it now runs, so the conversation carries on there without
+  you typing anything. Claude learns the rule from a short `--append-system-prompt` nebula passes at
+  spawn, plus a `Bash(nebula worktree:*)` permission so the command never prompts. Codex and Cursor
+  sessions can run the same command; they resume silent and wait for your next prompt. The restart is
+  the only way there: an agent CLI can't `cd` out of the directory it was started in.
 - **Everything persists in SQLite** (`~/.local/share/nebula/nebula.db` or the platform equivalent):
   projects, worktrees, agents (with kind + CLI session ids), notes, links, workspaces, pins, and your
   last selection.
@@ -196,7 +207,8 @@ The panels aren't the only view. With a worktree selected, from any panel:
   the daemon and the TUI, so hand edits apply without a restart. `s` opens the settings overlay over the
   same file: color theme, animations, focused-panel tint, whether the Workspaces column is shown,
   editor, default model and reasoning effort per agent CLI, the RECENT window, the idle timeout, and
-  whether new sessions stop to ask for a name.
+  whether new sessions stop to ask for a name. `R` inside the overlay puts every setting — hotkeys
+  included — back to its default, after a confirmation.
 - **Every panel key is rebindable.** The overlay's Hotkeys tab lists every action and what it answers to,
   and writes overrides into the same file (`"keybindings": {"git_diff": "ctrl+g, g"}`); an empty value
   unbinds. Because nebula is always a guest inside Terminal.app / Ghostty / tmux, the tab says at bind
@@ -223,9 +235,6 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Any panel | `o` | add ("open") a project — same prompt as `n`, from any focus |
 | Add project | type + `Tab`, `↓↑` / `→` / `←` | browse for the repo: type to filter (bash-style Tab completion), arrows pick a directory, `→` steps in, `←` steps up, `Enter` adds the highlighted (or typed) path; `●` marks git repos |
 | Projects | `Shift+J/K` | move project up / down the list (`Shift+↑/↓` too, but Terminal.app never sends those) |
-| Projects | `-` | toggle a group divider below the project |
-| Projects | `j/k` onto a divider, then `Enter`/`r` | edit the divider's label |
-| Projects | `d` or `-` on a divider | delete the divider |
 | Worktrees | `n` / `d` | new worktree / delete (typed confirm — deletes files) |
 | New worktree | type a sentence, or `Enter` on the empty prompt | the branch name is slugified (`fix login redirect` → `fix-login-redirect`); empty takes a random `<adj>-<noun>-<verb>` |
 | Projects / Worktrees | `e` | notes for the selected project / worktree |
@@ -246,7 +255,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Any panel | `Shift+H` | ssh hosts: every `nebula ssh` destination, newest first. `Enter`/click reconnects (quits this TUI and execs a fresh `nebula ssh` — local sessions keep running), `a` types a new `user@host [dir]`, `d` removes |
 | Any panel | `m` or right-click | context menu |
 | Any panel | `z` | full-screen terminal: collapse the sidebars and lock input into the attached session |
-| Any panel | `s` | settings overlay (theme, editor, agent defaults, timeouts) — its Hotkeys tab rebinds every key in this table |
+| Any panel | `s` | settings overlay (theme, editor, agent defaults, timeouts) — its Hotkeys tab rebinds every key in this table; `R` inside it resets everything to the defaults (with a confirmation) |
 | Any panel | `Shift+M` | memory usage: RAM per agent/terminal process tree, nebula itself, and the machine-wide share; `↑/↓` + `Enter` opens the selected session |
 | Any panel | `Shift+N` | replay the startup splash (any key returns) |
 | Any panel | `?` | help overlay |
@@ -275,6 +284,9 @@ nebula daemon             # run the daemon (normally auto-spawned)
 nebula daemon --foreground  # daemon with logs to stderr, for debugging
 nebula kill               # stop the daemon and all sessions cleanly
 nebula rename <title>     # title the current session (agents run this; --force to retitle)
+nebula worktree [name] [--base <ref>]  # move the current session into a worktree of its project,
+                          # creating the branch if it's new (agents run this when you ask for a
+                          # worktree; no name invents one; --base picks a new branch's start point)
 nebula workspace add <name>     # create a workspace (a named project group)
 nebula workspace open <name>    # open it in the next instance you launch
 nebula workspace list           # list workspaces; * marks the one new instances open into
