@@ -14,6 +14,191 @@ about what is worth recording.
 
 ## Entries
 
+### The Startup Snapshot Restores The Cursor But Left The Pane Blank — 2026-08-26
+
+**Asked:** "when nebula first loads, it seems to auto remember my last select pref, but it doesn't seem
+to show the focused session terminal"
+
+**Did:** The `ServerEvent::Snapshot` arm in `crates/nebula-tui/src/event_loop.rs` (`handle_server_event`)
+called `restore_ui_state` to re-seat `sel_project` / `sel_worktree` / `sel_session` from the persisted
+`UiState` blob and then stopped — nothing ever sent the `Attach`. `restore_ui_state` now returns `bool`
+("the remembered `session_agent` landed under the cursor") and the Snapshot arm calls `preview_selected`
+when it does, so the pane comes back with the row, focus staying on the panels exactly like a cursor
+move. No blob, or a blob whose session is gone/archived, still leaves the pane blank. Unit test
+`snapshot_reattaches_the_remembered_session`. TUI-only change: reopening the TUI is enough, the daemon
+does not need a restart.
+
+**Gotchas:**
+- `restore_context` / `restore_session` can't be reused on the startup path: they read
+  `last_worktree_for_project` / `last_session_for_worktree`, which `remember_context` only fills as the
+  user moves *away* from a context — both maps are empty on the first snapshot, so `restore_session`
+  would blank the pane it was asked to restore. The blob's ids are the only memory at boot.
+- Snapshot is a one-shot reply to `Subscribe` (event_loop.rs:136); the TUI never resubscribes, so
+  attaching there can't double up. If a reconnect path ever re-sends it, `attach`'s already-attached
+  early return is what keeps this safe.
+
+### "Do This In A Worktree" Goes Through `nebula worktree`, Not A Button — 2026-08-26
+
+**Asked:** "remove the move to worktree button and instead find a better way to hook into when a user
+prompts for a worktree, claude via a skill + system prompt or something knows to create the proper
+worktree in nebula and assiocate the sesion with it"
+
+**Did:** The Sessions context-menu verb "Move to worktree" and its picker are gone
+(`MenuAction::MoveAgent`/`MoveAgentToWorktree`, `open_move_agent_picker` in
+`crates/nebula-tui/src/event_loop.rs`); `ClientRequest::MoveAgent` stays as the daemon primitive
+(e2e `move_agent_respawns_live_session_in_target_worktree` still covers it). In its place:
+
+- **CLI** `nebula worktree [name…] [--base <ref>]` (`crates/nebula/src/main.rs`,
+  `ipc::enter_worktree_for_current_agent`) — same `NEBULA_AGENT_ID` + socket path as `nebula rename`;
+  spaces slugify, no name = `branch_name::random_name`. Sends the new `ClientRequest::EnterWorktree`,
+  gets `ServerEvent::WorktreeEntered { worktree, outcome: EnterOutcome }` back. Its stdout is written
+  for the model that ran it ("finish now, you'll be resumed inside the worktree").
+- **Daemon** `Daemon::enter_worktree` (`registry.rs`): existing branch row or `create_worktree` (nebula's
+  `<repo>-worktrees/<branch>` layout), `set_agent_worktree` + broadcast **immediately**, and — only if
+  the PTY is alive — an entry in the new `pending_moves` map. `complete_pending_move`, called from the
+  hook drain loop in `lib.rs`, does the kill + `claude --resume <sid> … "<relocation prompt>"` respawn on
+  `Stop` (or `Notification idle_prompt`). Any other spawn of the agent clears its pending entry.
+- **Claude guidance** rides `--append-system-prompt` on every non-cloud claude spawn
+  (`CLAUDE_WORKTREE_GUIDANCE`, `agent_spawn_command_with`): don't use `EnterWorktree`, run
+  `nebula worktree <name>`, then end the turn. Installer adds `Bash(nebula worktree:*)` to the allow list
+  next to the rename rule (`CLAUDE_ALLOW_RULES`). Rejected a `~/.claude/skills` install: a skill is only
+  loaded on description match and would live outside nebula's per-spawn hook management.
+- **TUI** follows a daemon-initiated re-home: an agent upsert whose `worktree_id` changed for the
+  *selected* session sets `select_when_seen` (event_loop.rs `Entity::Agent` arm), so the cursor and pane
+  ride along instead of landing on whatever slid into the slot. Also helps the hook-cwd reparent.
+
+Tests: `enter_worktree_*` + `pending_relocation_ignores_the_old_cwd_until_the_turn_ends` (registry),
+`spawn_command_initial_prompt_is_claudes_positional_argument`,
+`selection_follows_the_selected_agent_when_the_daemon_rehomes_it` (TUI), and e2e
+`nebula_worktree_cli_relocates_the_session_when_the_turn_ends`. README updated.
+
+**Gotchas:**
+- **The CLI the model runs *is* the session's foreground tool call.** `move_agent`'s kill-and-respawn
+  can't be reused directly — it would cut claude off mid-turn with a dangling tool_use. Hence the
+  two-phase design: row now, process at the turn's `Stop`. Ordering in the `lib.rs` drain loop matters:
+  `reparent_agent_by_cwd` runs *before* `complete_pending_move`, because the `Stop` payload itself still
+  carries the old checkout's cwd and must be ignored (pending guard in `try_reparent_agent_by_cwd`)
+  before the pending entry is consumed. The e2e posts a `PostToolUse` + `Stop` with the old cwd to pin
+  this down.
+- **Claude can't `cd` out of its start directory** (hook cwd is reset outside the workspace root — see
+  the 08-23 EnterWorktree experiment in the user's auto-memory), so a restart is the *only* way to put
+  the process in nebula's sibling worktree layout. `claude --resume <sid> "<prompt>"` is the documented
+  resume-with-initial-prompt shape and `--append-system-prompt` is listed for interactive use in
+  `claude --help` (2.1.246); the argv shape is unit-tested, but **the live auto-continue after a resume
+  was not exercised in this session** — first thing to watch when trying it for real. Codex/cursor get no
+  continuation prompt (unknown whether their resume takes one); they come back idle.
+- **Proving a respawn landed in the right directory without attaching:** the e2e stub agent does
+  `pwd >> $NEBULA_AGENT_ID.pwd` on every boot, so "one line, then two lines with the second ending in
+  `repo-worktrees/feat-x`" is the whole assertion — cheaper than the Attach/Input/`pwd` dance the
+  MoveAgent e2e uses.
+- `agent_spawn_command` (the 5-arg form) is now `#[cfg(test)]`: production goes through
+  `agent_spawn_command_with(.., initial_prompt, guidance)`, and clippy flagged the wrapper as dead.
+
+### Settings Reset To Defaults Behind A Confirmation — 2026-08-26
+
+**Asked:** "on settings modal add a hotkey to reset to default with confirmation that your settings will
+be cleared"
+
+**Did:** `Shift+R` anywhere in the settings overlay (tab strip or list) swaps in a `ConfirmDialog` with
+`PendingAction::ResetSettings`; confirming runs `reset_settings` (`crates/nebula-tui/src/event_loop.rs`),
+which calls the new `Config::reset_to_defaults()` (`config.rs`), `apply_config`s the result, replaces
+`app.keymap` with the default keymap, and reopens the overlay on its remembered tab/row with an info
+notice. Esc/`n` on that particular confirm reopens the overlay too (special-cased in the Confirm key
+handler) instead of dropping back to the panels. The key is deliberately not in the rebindable keymap —
+none of the overlay's own keys are. Hints in `ui.rs::settings_keys_hint` and the README say `R: reset all`.
+
+**Gotchas:**
+- **`Config::save()` is a patch, not a write — it can't reset.** It merges the TUI's known keys into
+  whatever JSON is already in `config.json`, on purpose, so daemon-owned keys (`prewarm_agents`,
+  `prewarm_sessions`, hand-added ones) survive every overlay edit. Saving `Config::default()` through it
+  would leave those behind. `reset_to_defaults` writes over `json!({})` via the split-out `write_into`,
+  so the file reads as never-edited; `config::tests::reset_rewrites_the_file_from_scratch` pins the
+  difference.
+- **The settings modal's inner width is 82 columns and `settings_keys_hint` is `truncate`d to it** (with
+  a leading space, so ≤81 usable). Adding a key to the hotkeys-tab hint pushed it to 86 and silently
+  chopped the end; shorten wording rather than appending.
+- **Another session was editing `app.rs` while this ran:** `SettingsView::new` grew a third `on_tabs`
+  argument between my first read and my edit. Re-read any signature you call right before writing the
+  call, then `grep` your symbols after the build to confirm they're still on disk (see [Shared Working
+  Tree Is Raced By Other Sessions]).
+
+### Settings Opens On The Tab Strip — 2026-08-26
+
+**Asked:** "when I load up the settings, it should always focus on the tab (or last selected tab +
+option combo)"
+
+**Did:** `App::settings_on_tabs` (`crates/nebula-tui/src/app.rs`, default `true`) joins the existing
+`settings_tab` / `settings_selected` memory, and `SettingsView::new` grew a third `on_tabs` arg. A first
+open now parks on the tab strip (←/→ walk tabs immediately, no ↑ first); every later open restores the
+tab, the row, *and* whether the cursor was on the strip or in the list. `remember_settings_focus` is
+called from `SettingsCmd::FocusTabs` / `EnterList` and from both settings mouse-click paths in
+`event_loop.rs`.
+
+**Gotchas:**
+- Twelve existing tests silently assumed `s` lands **in the list** — with the strip focused, `j` means
+  "drop into the list" and `Enter` means the same, so hotkey-capture and value-cycling tests all failed
+  in ways that looked like keymap bugs (`left: "?" right: "F6"`). The fix is one place: the shared
+  `open_settings_on` test helper now presses `↓` after picking the tab. Route new settings tests through
+  it rather than pressing `s` and navigating.
+- All this state is per-process only — `UiState` (the blob persisted in the daemon DB) was deliberately
+  left alone, so a fresh `nebula` always starts on the strip.
+
+### Project Dividers Removed From The Projects Column — 2026-08-25
+
+**Asked:** "remove the ability for a user to divide the projects column"
+
+**Did:** Deleted the divider feature end to end (~1.4k lines). `Project` lost its four `divider_*` fields
+(`crates/nebula-core/src/entities.rs`); `ClientRequest::SetProjectDivider` / `MoveDivider` are gone from
+`protocol.rs` and `server.rs`; `Daemon::set_project_divider` / `move_divider` and the leading-divider
+hand-down in `remove_project` are gone from `registry.rs`, and `move_project` is now a plain remove/insert
+that renumbers `sort_order` to the display index. Store: `insert_project` / `set_project_position` /
+`get_project` / `load_tree` no longer touch the columns, and **migration 18** is four
+`ALTER TABLE projects DROP COLUMN`s (`migration_18_drops_the_divider_columns` seeds a v17 DB with a
+labeled divider and checks `PRAGMA table_info`). TUI: the `ProjectRow` enum is gone — `App::project_rows()`
+is now `Vec<usize>` (indices into the full `tree.projects`, workspace-filtered) and
+`selected_project_row()` became `selected_project_index()`; `divider_focused()`, `select_divider_when_seen`,
+`PromptKind::DividerLabel`, `MenuAction::{SetProjectDivider,LabelDivider}`, `Action::ToggleDivider` (`-` is
+now unbound), `ui::divider_spans`, the "you're focused on a separator" pane, and
+`SelectionSnapshot::{project_kind,divider_chase}` are all removed. README lost its three divider rows.
+Workspace: 618 tests green, clippy/fmt clean.
+
+**Gotchas:**
+- A user keybinding config that still names `toggle_divider` is harmless: `Keymap` logs
+  `ignoring keybinding for unknown action` and moves on (`keymap.rs:~849`).
+- Migrations 2, 3, 7 and the migration-14 table rebuild still spell out the divider columns — they must,
+  since they already ran on every existing DB. Only migration 18 drops them; don't "tidy" the old SQL.
+- Two older entries (PR rows in the Worktrees panel, PR preview pane) described their behavior as a copy of
+  "the divider precedent" — those early returns now stand on their own and the entries were updated.
+
+### The Splash Is Scoped To The Default Workspace — 2026-08-25
+
+**Asked:** "when a user has multiple workspaces, and he hovers over a workspace with no projects, it should
+NOT show the nebula splash screen. that screen should only show when a user is on default workspace with no
+projects"
+
+**Did:** `App::splash_showing()` (`crates/nebula-tui/src/app.rs:~2170`) now requires the open workspace to
+be the built-in `default` one before an empty tree counts as a first run: new
+`Tree::in_default_workspace()` (`app.rs:~1640`, compares `active_workspace` to
+`nebula_core::DEFAULT_WORKSPACE_ID`). `splash_preview` (N) is unchanged. An empty non-default workspace
+now renders the normal layout — Workspaces column plus the three panels with their existing "no projects
+yet / n adds one" hints — instead of swapping the whole body for the nebula. The "hover" in the request is
+`move_selection` in the Workspaces column (`event_loop.rs:~4864`), which does a full `switch_workspace`
+per step, so previously stepping onto a fresh workspace hid the column you were stepping through.
+Flipped `switching_to_empty_workspace_blanks_the_pane` to assert `!splash_showing()`, added
+`empty_non_default_workspace_keeps_the_panels_not_the_splash` (TestBackend draw: "WORKSPACES" and "no
+projects yet" on screen after the step, splash back after stepping to the empty default). nebula-tui: 446
+green.
+
+**Gotchas:**
+- The shared tree didn't compile while this was done — another session was mid-removal of the divider
+  feature (`ClientRequest::MoveDivider` / `SetProjectDivider` gone from nebula-core, ~700 lines in flux).
+  Verified by `git worktree add --detach <scratchpad>/wt HEAD`, re-applying only these hunks there, and
+  running `cargo test -p nebula-tui` in that worktree. Same recipe works for any change while
+  [Shared tree races] is in effect; remove the worktree afterwards (`git worktree remove --force`).
+- `Tree::has_visible_projects()` is deliberately still workspace-scoped and still drives the panel hints,
+  `Action::New`'s add-project shortcut, and the splash's own "create your first project" line — only the
+  splash gate got the default-workspace condition. Don't fold the check into `has_visible_projects`.
+
 ### The Workspaces Column Remembers Itself, And `/` Crosses Workspaces — 2026-08-25
 
 **Asked:** "remember if someone had the workspaces panel collapsed so you don't show it the next time,
@@ -567,8 +752,9 @@ called PULL REQUEST.
 
 **Gotchas:**
 - **`draw_terminal` returning early on a PR row is the whole trick** — the attachment underneath stays
-  live, so walking into the OPEN PRS group and back never churns detach/attach. Exact copy of the
-  `divider_focused()` branch three lines above it. Do not try to "clear" the terminal for this.
+  live, so walking into the OPEN PRS group and back never churns detach/attach. (It was modeled on the
+  project-divider branch that sat above it until dividers were removed on 2026-08-25; it is now the only
+  early return there.) Do not try to "clear" the terminal for this.
 - **ratatui silently clips an overwide `Line`, taking the rest of the row with it.** A header row built
   from spans (state · author · base ← head) blew past the pane at width 24 and the test
   `no_rendered_line_overflows_the_pane` is what caught it. Everything the preview emits now goes through
@@ -647,8 +833,8 @@ makes them fuzzy-findable; `jump_to_target` opens the browser instead of moving 
   `move_selection` and `clamp_selections` needed the new `worktree_row_count()`.
 - `restore_session` must NOT run when the cursor lands on a PR row — it detaches the terminal when
   `selected_worktree()` is None, so arrowing into the group would blank the pane. Guarded in both
-  `move_selection` and the left-click handler. The Sessions panel does go empty there; that's the
-  project-divider precedent (`divider_focused()`), not a bug.
+  `move_selection` and the left-click handler. The Sessions panel does go empty there; that's deliberate
+  (it followed the project-divider behavior, since removed on 2026-08-25), not a bug.
 - **`gh pr list` returns a bare JSON array**, not an object — `parse_list` takes `as_array()`, unlike
   `parse` which reads fields off a map. Verified against `gh pr list -R cli/cli`.
 - `Some(vec![])` (repo genuinely has nothing open) and `None` (no `gh`, no remote, timeout) must stay
@@ -1304,6 +1490,8 @@ dividers, it just swaps projects, you must treat a divider as something I can mo
 above separate" and, escalating, "I should be able to move a project into any fucking divider I want."
 
 **Did:** `98dc681` — reordering treats dividers as real positions, and dividers are labelable and movable.
+**Superseded 2026-08-25:** dividers were removed entirely (see [Project Dividers Removed From The Projects
+Column]); Shift+J/K reordering stays, as a plain move within the workspace's list.
 
 **Gotchas:**
 - Shift+↑/↓ is **undeliverable in Terminal.app**: `keyMappings.plist` has entries for `$F702`/`$F703`
