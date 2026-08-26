@@ -51,6 +51,11 @@ const AGO_REFRESH: Duration = Duration::from_secs(30);
 /// list doesn't boot every CLI passed, short enough that the sessions are
 /// booting well before the user picks one.
 const PREWARM_DEBOUNCE: Duration = Duration::from_millis(250);
+/// How long a selection-driven attach waits for the cursor to settle. Long
+/// enough that walking a list (or the Workspaces column, where every step is
+/// a whole workspace switch) attaches only where the cursor stops; short
+/// enough to feel immediate when it does stop.
+const ATTACH_DEBOUNCE: Duration = Duration::from_millis(180);
 
 /// How often the standing keep-warm request for the selected worktree's
 /// default-spec Claude session is re-sent. Must stay comfortably under the
@@ -332,6 +337,13 @@ async fn main_loop(
                     }
                 }
                 app.dirty = true;
+            }
+            // The selection rested past the debounce: tell the daemon what
+            // the pane has been showing since the cursor landed here.
+            _ = tokio::time::sleep(app.attach_delay().unwrap_or_default()),
+                if app.pending_attach.is_some() =>
+            {
+                fire_pending_attach(&mut app, &mut out);
             }
             // The worktree selection rested past the debounce: ask the
             // daemon to boot its dead sessions in the background so
@@ -1052,6 +1064,12 @@ fn close_vim(app: &mut App) {
 }
 
 fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientRequest>) {
+    // With the pane holding input, whatever this event turns into is headed
+    // for the PTY — and the daemon drops Input for a session it hasn't
+    // spawned. A still-debounced attach has to land before the keystroke.
+    if app.term_locked {
+        fire_pending_attach(app, out);
+    }
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => {
             app.flash = None;
@@ -1283,7 +1301,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             Focus::Workspaces => app.focus = Focus::Projects,
             Focus::Projects => app.focus = Focus::Worktrees,
             Focus::Worktrees => app.focus = Focus::Sessions,
-            Focus::Sessions | Focus::Terminal => enter_terminal_pane(app),
+            Focus::Sessions | Focus::Terminal => enter_terminal_pane(app, out),
         },
         // ⇧Tab / ^⇧H walk back and stop dead at the first column — the
         // Workspaces bar while it's shown, Projects when it's hidden.
@@ -1400,7 +1418,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             },
             Focus::Sessions => attach_selected(app, out),
             // Lock input into an already-focused live pane.
-            Focus::Terminal => enter_terminal_pane(app),
+            Focus::Terminal => enter_terminal_pane(app, out),
         },
         // First run (or an empty workspace): with no visible projects every
         // panel is empty and the splash is up — New creates a project no
@@ -1550,6 +1568,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 app.collapsed = true;
                 app.focus = Focus::Terminal;
                 app.term_locked = true;
+                fire_pending_attach(app, out);
             } else {
                 app.flash = Some("attach a session first".into());
             }
@@ -3955,7 +3974,7 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
 fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientRequest>) {
     match action {
         MenuAction::Attach(sref) => {
-            attach(app, sref, out);
+            attach_now(app, sref, out);
             app.focus = Focus::Terminal;
             app.term_locked = true;
         }
@@ -4135,16 +4154,24 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
 }
 
 fn detach_if_attached(app: &mut App, sref: &SessionRef, out: &mut Vec<ClientRequest>) {
-    if let Some(term) = &app.term {
-        if &term.sref == sref {
-            out.push(ClientRequest::Detach {
-                session: sref.clone(),
-            });
-            app.term = None;
-            app.term_locked = false;
-            if app.focus == Focus::Terminal {
-                app.focus = Focus::Sessions;
-            }
+    // The daemon may hold this session even when the pane has already moved
+    // on to another one whose attach is still debounced — release it either
+    // way, or the connection stays attached to a row that no longer exists.
+    let showing = app.term.as_ref().is_some_and(|t| &t.sref == sref);
+    if app.attached_sref.as_ref() == Some(sref) || showing {
+        out.push(ClientRequest::Detach {
+            session: sref.clone(),
+        });
+        if app.attached_sref.as_ref() == Some(sref) {
+            app.attached_sref = None;
+        }
+    }
+    if showing {
+        app.pending_attach = None;
+        app.term = None;
+        app.term_locked = false;
+        if app.focus == Focus::Terminal {
+            app.focus = Focus::Sessions;
         }
     }
 }
@@ -4272,11 +4299,8 @@ fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
             attach(app, sref, out);
         }
         None => {
-            if let Some(term) = &app.term {
-                let session = term.sref.clone();
-                out.push(ClientRequest::Detach { session });
-                app.term = None;
-                app.term_locked = false;
+            if app.term.is_some() {
+                detach_pane(app, out);
             }
         }
     }
@@ -4428,7 +4452,19 @@ fn target_workspace(app: &App, target: &PaletteTarget) -> Option<WorkspaceId> {
 /// are re-validated against the
 /// tree — a pick can race a removal, in which case it flashes instead of
 /// jumping.
+/// Land the palette/finder on `target`, attaching without the debounce —
+/// the user typed a query and picked a row, which is as explicit as it gets.
 fn jump_to_target(
+    app: &mut App,
+    target: PaletteTarget,
+    attach: bool,
+    out: &mut Vec<ClientRequest>,
+) {
+    jump_to_target_inner(app, target, attach, out);
+    fire_pending_attach(app, out);
+}
+
+fn jump_to_target_inner(
     app: &mut App,
     target: PaletteTarget,
     attach: bool,
@@ -4663,6 +4699,16 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
 /// previews each session so it can be read; Enter (or a double-click) is
 /// what commits: focus + lock. Archived rows don't preview.
 fn preview_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
+    preview_inner(app, ATTACH_DEBOUNCE, out);
+}
+
+/// Preview with no debounce — a click points at exactly one row, so there is
+/// no sweep to wait out.
+fn preview_selected_now(app: &mut App, out: &mut Vec<ClientRequest>) {
+    preview_inner(app, Duration::ZERO, out);
+}
+
+fn preview_inner(app: &mut App, delay: Duration, out: &mut Vec<ClientRequest>) {
     let Some(row) = app.selected_session_row() else {
         return;
     };
@@ -4674,7 +4720,7 @@ fn preview_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
     let Some(sref) = row.sref() else {
         return;
     };
-    attach(app, sref, out);
+    attach_inner(app, sref, delay, out);
 }
 
 /// Enter on the Sessions panel: attach the session under the cursor, or —
@@ -4690,7 +4736,7 @@ fn attach_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
         }
         return;
     };
-    attach(app, sref, out);
+    attach_now(app, sref, out);
     app.focus = Focus::Terminal;
     app.term_locked = true;
 }
@@ -4698,11 +4744,14 @@ fn attach_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// Cross into the terminal pane and take the input lock, so what the user
 /// types after the walk reaches the agent instead of the panels. An empty
 /// or dead pane is focused but never locked: there is nothing to type into,
-/// and a lock would only send them hunting for an escape hatch.
-fn enter_terminal_pane(app: &mut App) {
+/// and a lock would only send them hunting for an escape hatch. Taking the
+/// lock is a commitment to this session, so a debounced attach stops
+/// waiting: keystrokes are about to need it.
+fn enter_terminal_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.focus = Focus::Terminal;
     if app.term.as_ref().is_some_and(|t| !t.exited) {
         app.term_locked = true;
+        fire_pending_attach(app, out);
     }
 }
 
@@ -4759,30 +4808,101 @@ fn mark_agent_seen(app: &mut App, id: &AgentId, out: &mut Vec<ClientRequest>) {
     out.push(ClientRequest::MarkAgentSeen { id: id.clone() });
 }
 
+/// Show `sref` in the pane, telling the daemon once the selection settles.
+/// The pane swaps immediately — the header must never name a session other
+/// than the selected one — but the Attach itself waits out
+/// [`ATTACH_DEBOUNCE`], because attaching a reaped session makes the daemon
+/// fork an agent CLI, and a cursor merely passing through a row has not
+/// asked for that.
 fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    attach_inner(app, sref, ATTACH_DEBOUNCE, out);
+}
+
+/// Attach with no debounce: the user named this row outright (Enter, a
+/// click, the menu, a session they just created), so there is nothing to
+/// wait to see whether they meant it.
+fn attach_now(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    attach_inner(app, sref, Duration::ZERO, out);
+}
+
+fn attach_inner(app: &mut App, sref: SessionRef, delay: Duration, out: &mut Vec<ClientRequest>) {
     // Whatever lands in the pane has been looked at — walking the cursor
     // onto a row previews it here, so this is where the counts come down.
+    // Keyed to the pane swap, not to the Attach: the user is reading the
+    // screen during the debounce just the same.
     if let SessionRef::Agent(id) = &sref {
         mark_agent_seen(app, id, out);
     }
-    if let Some(existing) = &app.term {
-        if existing.sref == sref && !existing.exited {
-            return; // already attached
-        }
-        out.push(ClientRequest::Detach {
-            session: existing.sref.clone(),
-        });
+    let showing = app
+        .term
+        .as_ref()
+        .is_some_and(|t| t.sref == sref && !t.exited);
+    if !showing {
+        let (cols, rows) = pane_size(app);
+        // Fresh screen, so any persisted selection would point at stale cells.
+        app.term_selection = None;
+        app.term = Some(AttachedTerm::new(sref.clone(), cols, rows));
+        app.dirty = true;
+    }
+    if delay.is_zero() {
+        app.pending_attach = None;
+        send_attach(app, sref, out);
+    } else if app.attached_sref.as_ref() == Some(&sref) {
+        // The daemon already holds it; nothing to send, nothing to wait for.
+        app.pending_attach = None;
+    } else {
+        app.pending_attach = Some((sref, std::time::Instant::now() + delay));
+    }
+}
+
+/// Move the daemon-side attachment to `sref`, releasing whatever it held.
+/// Idempotent, so every caller can just ask for the session it wants.
+fn send_attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    if app.attached_sref.as_ref() == Some(&sref) {
+        return;
+    }
+    if let Some(old) = app.attached_sref.take() {
+        out.push(ClientRequest::Detach { session: old });
     }
     let (cols, rows) = pane_size(app);
-    // Fresh screen, so any persisted selection would point at stale cells.
-    app.term_selection = None;
-    app.term = Some(AttachedTerm::new(sref.clone(), cols, rows));
+    app.attached_sref = Some(sref.clone());
     out.push(ClientRequest::Attach {
         session: sref,
         from_seq: None,
         cols,
         rows,
     });
+}
+
+/// Send the armed attach now — the selection settled, or something needs
+/// the session live this instant (a keystroke about to be forwarded).
+fn fire_pending_attach(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let Some((sref, _)) = app.pending_attach.take() else {
+        return;
+    };
+    send_attach(app, sref, out);
+}
+
+/// Release the daemon-side attachment: whatever the daemon holds, or — when
+/// an attach is still debounced — the session the pane is showing, so a
+/// caller that only knows about the pane still lets go. A Detach the daemon
+/// has no attachment for costs it a hash lookup and nothing else.
+fn release_attachment(app: &mut App, out: &mut Vec<ClientRequest>) {
+    app.pending_attach = None;
+    let session = app
+        .attached_sref
+        .take()
+        .or_else(|| app.term.as_ref().map(|t| t.sref.clone()));
+    if let Some(session) = session {
+        out.push(ClientRequest::Detach { session });
+    }
+}
+
+/// Blank the pane and release the daemon-side attachment.
+fn detach_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
+    release_attachment(app, out);
+    app.term = None;
+    app.term_locked = false;
 }
 
 /// Terminal-pane grid for spawn/attach requests; the fallback keeps
@@ -5811,7 +5931,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                                 // click commits.
                                 app.last_session_click = Some((now, key));
                                 app.focus = Focus::Sessions;
-                                preview_selected(app, out);
+                                preview_selected_now(app, out);
                             }
                         }
                         None => {}
@@ -6190,8 +6310,11 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             schedule_prewarm(app);
             // The cursor came back on the session the user left on; bring
             // its terminal back with it, exactly as landing on the row would.
+            // No debounce: a boot restores one remembered session once, so
+            // there is no cursor sweep to wait out — only the user waiting
+            // to see the screen they left.
             if session_restored {
-                preview_selected(app, out);
+                preview_selected_now(app, out);
             }
             app.dirty = true;
         }
@@ -6201,6 +6324,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     // Full replay: the screen is rebuilt from scratch.
                     app.term_selection = None;
                     term.reset();
+                    term.painted = !data.is_empty();
                     term.parser.process(&data);
                     app.dirty = true;
                 }
@@ -6209,6 +6333,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         ServerEvent::Output { session, data, .. } => {
             if let Some(term) = &mut app.term {
                 if term.sref == session {
+                    term.painted |= !data.is_empty();
                     term.parser.process(&data);
                     app.dirty = true;
                 }
@@ -6282,7 +6407,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         // Its upsert usually lands just before this Ack; land
                         // the selection now, or on the upsert otherwise.
                         land_pending_selection(app, out);
-                        attach(app, sref, out);
+                        attach_now(app, sref, out);
                         app.focus = Focus::Terminal;
                         app.term_locked = true;
                     }
@@ -6597,7 +6722,20 @@ fn selection_snapshot(app: &App) -> SelectionSnapshot {
 /// there (restore_context / restore_session / preview). The invariant: the
 /// terminal pane always shows the highlighted session, never a stale or
 /// blank one.
+/// Re-seat the selection after the tree changed under it, then attach at
+/// once. A delete, an archive or a move is an explicit act and the row the
+/// cursor gets pushed onto is where it stays — there is no sweep to wait
+/// out, unlike the key-walking that `attach`'s debounce exists for.
 fn reconcile_selection(app: &mut App, before: SelectionSnapshot, out: &mut Vec<ClientRequest>) {
+    reconcile_selection_inner(app, before, out);
+    fire_pending_attach(app, out);
+}
+
+fn reconcile_selection_inner(
+    app: &mut App,
+    before: SelectionSnapshot,
+    out: &mut Vec<ClientRequest>,
+) {
     clamp_selections(app);
     if let Some(pid) = &before.project {
         if !app.tree.projects.iter().any(|p| &p.id == pid) {
@@ -10947,9 +11085,22 @@ diff --git a/src/b.rs b/src/b.rs
             Some(a2.clone()),
             "the walked-to session shows in the pane"
         );
+        // The pane swaps at once, but the Attach waits for the cursor to
+        // settle — walking a list must not boot a CLI per row passed.
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { .. })),
+            "the walk itself attaches nothing: {out:?}"
+        );
+        assert_eq!(
+            app.pending_attach.as_ref().map(|(s, _)| s.clone()),
+            Some(a2.clone()),
+            "the attach is armed for the walked-to session"
+        );
+        fire_pending_attach(&mut app, &mut out);
         assert!(
             matches!(out.last(), Some(ClientRequest::Attach { session, .. }) if *session == a2),
-            "preview attaches so scrollback streams in"
+            "settling attaches so scrollback streams in: {out:?}"
         );
 
         // Walking onto an archived row keeps the previous preview.
@@ -12275,6 +12426,9 @@ diff --git a/src/b.rs b/src/b.rs
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
             &mut out,
         );
+        // The pane comes back at once; the Attach waits out the debounce, so
+        // sweeping through worktrees doesn't cold-boot each one in passing.
+        fire_pending_attach(&mut app, &mut out);
         assert!(
             matches!(out.last(), Some(ClientRequest::Attach { session, .. }) if *session == sref),
             "returning to w1 re-attaches its session: {out:?}"
@@ -16209,10 +16363,24 @@ diff --git a/src/b.rs b/src/b.rs
             Some(a2.clone()),
             "and that worktree's remembered session"
         );
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(a2.clone()),
+            "the remembered session comes back in the pane too"
+        );
+        // The Attach itself waits out ATTACH_DEBOUNCE: walking the
+        // Workspaces column runs a full switch per row, and a workspace
+        // merely passed through must not cold-boot its agent CLI.
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { .. })),
+            "the attach is debounced, not sent on the switch itself, got {out:?}"
+        );
+        fire_pending_attach(&mut app, &mut out);
         assert!(
             out.iter()
                 .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == a2)),
-            "the remembered session comes back in the pane too, got {out:?}"
+            "and lands once the cursor settles, got {out:?}"
         );
     }
 
@@ -16291,6 +16459,186 @@ diff --git a/src/b.rs b/src/b.rs
             },
         );
     }
+    /// Stepping through the Workspaces column runs a full `switch_workspace`
+    /// per row, and each one restores that workspace's remembered session.
+    /// Without the attach debounce every row merely passed through
+    /// cold-boots an agent CLI nobody asked to see, and the boot the user IS
+    /// waiting on queues behind them — the workspace-switch lag.
+    #[test]
+    fn walking_the_workspaces_column_attaches_only_where_it_stops() {
+        use nebula_core::{
+            Agent, AgentStatus, Entity, Project, ProjectId, Workspace, WorkspaceId, Worktree,
+        };
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_default_workspace(&mut app);
+        seed_other_workspace(&mut app); // ws2 → p9 → w9
+        seed_background_run(&mut app); // a9 lives in w9
+
+        // A third workspace, so the walk genuinely passes *through* ws2.
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Workspace(Workspace {
+                    id: WorkspaceId("ws3".into()),
+                    name: "third".into(),
+                }),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(Project {
+                    workspace_id: WorkspaceId("ws3".into()),
+                    id: ProjectId("p7".into()),
+                    name: "third-proj".into(),
+                    repo_path: "/tmp/third".into(),
+                    sort_order: 7,
+                }),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w7".into()),
+                    project_id: ProjectId("p7".into()),
+                    path: "/tmp/third".into(),
+                    branch: "main".into(),
+                    is_main: true,
+                    pinned: false,
+                    sort_order: 0,
+                }),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a7".into()),
+                    worktree_id: WorktreeId("w7".into()),
+                    name: "third-agent".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    unseen: false,
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    cloud_session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    alive: true,
+                    cloud_mirroring: false,
+                }),
+            },
+        );
+        // Both destinations remember a session, so a restoring switch has
+        // something to attach in each.
+        app.last_session_for_worktree.insert(
+            WorktreeId("w9".into()),
+            SessionRef::Agent(AgentId("a9".into())),
+        );
+        app.last_session_for_worktree.insert(
+            WorktreeId("w7".into()),
+            SessionRef::Agent(AgentId("a7".into())),
+        );
+
+        app.focus = Focus::Workspaces;
+        let mut out = Vec::new();
+        move_selection(&mut app, 1, &mut out); // onto ws2…
+        move_selection(&mut app, 1, &mut out); // …and straight through to ws3
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { .. })),
+            "nothing attaches while the cursor is still moving: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. }
+                if *session == SessionRef::Agent(AgentId("a9".into())))),
+            "the workspace passed through never boots its agent: {out:?}"
+        );
+
+        fire_pending_attach(&mut app, &mut out);
+        let attaches: Vec<_> = out
+            .iter()
+            .filter(|r| matches!(r, ClientRequest::Attach { .. }))
+            .collect();
+        assert_eq!(
+            attaches.len(),
+            1,
+            "exactly one attach, for the row it stopped on: {out:?}"
+        );
+        assert!(
+            matches!(out.last(), Some(ClientRequest::Attach { session, .. })
+                if *session == SessionRef::Agent(AgentId("a7".into()))),
+            "and it's the workspace the walk ended on: {out:?}"
+        );
+    }
+
+    /// An attach whose session the daemon had reaped replays an empty ring,
+    /// so the grid is blank for as long as the CLI takes to boot. The pane
+    /// has to say that rather than look hung.
+    #[test]
+    fn a_booting_session_says_so_instead_of_showing_a_blank_pane() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        let mut out = Vec::new();
+        attach_now(&mut app, sref.clone(), &mut out);
+        // Wide, and without the Workspaces column: the terminal pane has to
+        // be roomy enough that its text isn't truncated mid-assert.
+        app.show_workspaces = false;
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("starting"),
+            "a session with no output yet reads as starting:\n{text}"
+        );
+
+        // The empty replay on attach is not output — it must not clear the
+        // notice, or the pane goes blank again with nothing to explain it.
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: sref.clone(),
+                base_seq: 0,
+                data: Vec::new(),
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_text(&terminal).contains("starting"),
+            "an empty replay still means nothing has painted"
+        );
+
+        // First real bytes: the notice gives way to the PTY screen.
+        hse(
+            &mut app,
+            ServerEvent::Output {
+                session: sref,
+                seq: 0,
+                data: b"hello from the agent".to_vec(),
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("hello from the agent"),
+            "the real screen replaces it:\n{text}"
+        );
+        assert!(
+            !text.contains("starting"),
+            "and the notice is gone:\n{text}"
+        );
+    }
+
+    // ---- the Workspaces column ----
 
     // ---- the Workspaces bar ----
 

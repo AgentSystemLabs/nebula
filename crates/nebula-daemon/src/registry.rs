@@ -28,6 +28,12 @@ const PREWARM_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 /// `PREWARM_MAX_AGE - PREWARM_RECYCLE_AGE`, so a slot they still care about
 /// is always refreshed before the reaper can empty it.
 const PREWARM_RECYCLE_AGE: Duration = Duration::from_secs(10 * 60);
+/// Gap between the boots of a worktree prewarm sweep. A worktree with five
+/// agents must not fork five agent CLIs at once: they would all contend for
+/// the CPU with the one session the user is actually waiting to see, which
+/// is the whole reason the sweep exists. Nothing is watching these, so
+/// warming them slowly costs the user nothing.
+const PREWARM_STAGGER: Duration = Duration::from_millis(1500);
 /// Hook events buffered on a warm session before its row exists (oldest
 /// dropped beyond this).
 const PREWARM_HOOK_BUFFER_CAP: usize = 64;
@@ -142,6 +148,15 @@ pub struct Daemon {
     /// Cloud rows currently being mirrored (periodic re-teleport). Keyed by
     /// agent so a second follow request replaces rather than doubles up.
     cloud_mirrors: Mutex<HashMap<AgentId, Arc<tokio_util::sync::CancellationToken>>>,
+    /// Serializes the check-and-spawn inside [`Daemon::ensure_session`].
+    /// Attach (the request loop) and the worktree prewarm sweep (its own
+    /// task) can both reach for the same dead session; without this they
+    /// would both miss the registry and fork two CLIs, orphaning one.
+    spawn_gate: Mutex<()>,
+    /// The worktree prewarm sweep currently running, so a newer one can
+    /// cancel it. Stepping through the Workspaces column fires a sweep per
+    /// row, and only the row the cursor rests on is worth warming.
+    prewarm_sweep: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Daemon {
@@ -163,6 +178,8 @@ impl Daemon {
             pending_moves: Mutex::new(HashMap::new()),
             cloud_attach_gated: AtomicBool::new(false),
             cloud_mirrors: Mutex::new(HashMap::new()),
+            spawn_gate: Mutex::new(()),
+            prewarm_sweep: Mutex::new(None),
         })
     }
 
@@ -2185,6 +2202,13 @@ impl Daemon {
         if let Some(s) = self.session(sref) {
             return Ok(s);
         }
+        // Hold the gate across the whole check-and-install: an Attach and the
+        // prewarm sweep racing the same dead session must produce one CLI,
+        // not two. Re-check under it — the winner installed while we waited.
+        let _gate = self.spawn_gate.lock().unwrap();
+        if let Some(s) = self.session(sref) {
+            return Ok(s);
+        }
         match sref {
             SessionRef::Agent(id) => {
                 let agent = self.store.get_agent(id)?.context("agent not found")?;
@@ -2234,10 +2258,32 @@ impl Daemon {
         if !crate::config::Config::load().prewarm_sessions {
             return;
         }
+        let daemon = self.clone();
+        let worktree_id = worktree_id.clone();
+        let handle = tokio::spawn(async move {
+            daemon.run_worktree_prewarm(&worktree_id, cols, rows).await;
+        });
+        // Supersede whatever sweep was still warming the worktree the user
+        // has now left; its remaining boots are wasted work.
+        if let Some(old) = self.prewarm_sweep.lock().unwrap().replace(handle) {
+            old.abort();
+        }
+    }
+
+    /// The sweep itself: boot the worktree's dead sessions one at a time,
+    /// [`PREWARM_STAGGER`] apart. Deliberately off the connection's request
+    /// loop — it used to run inline, which stalled that client's Input and
+    /// Attach frames for as long as the whole burst of forks took.
+    async fn run_worktree_prewarm(
+        self: &Arc<Self>,
+        worktree_id: &WorktreeId,
+        cols: u16,
+        rows: u16,
+    ) {
         let Ok((_, _, agents, terminals)) = self.store.load_tree() else {
             return;
         };
-        let srefs = agents
+        let srefs: Vec<SessionRef> = agents
             .iter()
             .filter(|a| &a.worktree_id == worktree_id && !a.archived)
             .map(|a| SessionRef::Agent(a.id.clone()))
@@ -2246,14 +2292,32 @@ impl Daemon {
                     .iter()
                     .filter(|t| &t.worktree_id == worktree_id)
                     .map(|t| SessionRef::Terminal(t.id.clone())),
-            );
+            )
+            .collect();
         for sref in srefs {
             // The prewarm doubles as a "user is looking here" signal for
             // the idle reaper, for alive sessions as much as fresh spawns.
             self.touch_session(&sref);
-            if let Err(e) = self.ensure_session(&sref, cols, rows) {
-                tracing::debug!(session = ?sref, error = %e, "session prewarm failed");
+            // Already warm — most importantly the one the user just
+            // attached to, which Attach spawned a moment ago.
+            if self.is_alive(&sref) {
+                continue;
             }
+            let daemon = self.clone();
+            let target = sref.clone();
+            // fork/exec blocks; keep it off the async worker threads.
+            let spawned = tokio::task::spawn_blocking(move || {
+                daemon.ensure_session(&target, cols, rows).map(|_| ())
+            })
+            .await;
+            match spawned {
+                Ok(Err(e)) => {
+                    tracing::debug!(session = ?sref, error = %e, "session prewarm failed")
+                }
+                Err(e) => tracing::debug!(session = ?sref, error = %e, "session prewarm panicked"),
+                Ok(Ok(())) => {}
+            }
+            tokio::time::sleep(PREWARM_STAGGER).await;
         }
     }
 
