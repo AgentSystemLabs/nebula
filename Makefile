@@ -5,6 +5,10 @@
 #                 (first run copies your real projects, worktrees, workspaces and
 #                 settings in, so it looks like yours — `make dev-reset` re-copies)
 #   make browser  the same isolated instance, served into a browser tab via ttyd
+#
+# Each checkout gets its own instance, keyed to its path, so the main clone and
+# every worktree can run at once without sharing a daemon, a DB, or a port.
+# `make dev-ls` shows them all.
 #   make install  put it in ~/.cargo/bin for real use (then `make kill` to cut over)
 
 PREFIX      ?= $(HOME)/.cargo/bin
@@ -12,19 +16,30 @@ RELEASE_BIN := target/release/nebula
 DEBUG_BIN   := target/debug/nebula
 
 # The dev instance is a second, complete nebula: its own socket, DB, and
-# settings. The runtime dir holds a unix socket, so the path must stay short —
-# long ones silently blow past SUN_LEN.
-DEV_RUNTIME := /tmp/nebula-dev
-DEV_DATA    := $(HOME)/.nebula-dev
+# settings — and one *per checkout*, so the main clone and every worktree can
+# run at the same time. Sharing them is worse than a port clash: two checkouts
+# on one runtime dir means the second TUI silently attaches to the first's
+# daemon and you drive the other checkout's binary, while `dev-prep` below
+# SIGTERMs whichever daemon got there first.
+#
+# The slot is the checkout's directory name plus a hash of its absolute path,
+# so two worktrees with the same name in different repos still separate. The
+# runtime dir takes the hash alone — it holds a unix socket, and SUN_LEN (104
+# bytes on macOS) is not a budget a long worktree name should be spending.
+DEV_SLOT    := $(shell printf '%s' '$(CURDIR)' | shasum | cut -c1-8)
+DEV_RUNTIME := /tmp/nebula-dev-$(DEV_SLOT)
+DEV_DATA    := $(HOME)/.nebula-dev/$(notdir $(CURDIR))-$(DEV_SLOT)
 # `make dev SEED=0` skips the first-run copy and starts the dev instance empty.
 SEED ?= 1
 # `make dev AGENT=/bin/cat` stubs agents out, so nothing spawns a real claude —
 # including the warm-slot prewarm, which launches one before you create any
 # agent at all. Unset (the default) means real agents, exactly like production.
 AGENT ?=
-# The loopback port `make browser` serves on; matches `nebula browser`'s own
-# default, which is ttyd's. `make browser PORT=8080` if 7681 is taken.
-PORT ?= 7681
+# Left empty on purpose: `nebula browser` then takes 7681 when it is free and
+# a free port otherwise, printing which — so a `make browser` per checkout all
+# serve at once. `make browser PORT=8080` pins it (and fails if 8080 is taken,
+# which is what you want when you have an ssh tunnel pointed at it).
+PORT ?=
 
 # Every dev-instance run goes through this: its own socket dir and its own DB,
 # so nothing here can touch the real daemon's state.
@@ -32,16 +47,16 @@ DEV_ENV = NEBULA_RUNTIME_DIR=$(DEV_RUNTIME) NEBULA_DATA_DIR=$(DEV_DATA) \
 	$(if $(AGENT),NEBULA_AGENT_CMD=$(AGENT))
 
 .DEFAULT_GOAL := help
-.PHONY: help dev browser dev-prep dev-seed dev-reset dev-stop build install kill check fmt lint test ci clean
+.PHONY: help dev browser dev-prep dev-seed dev-reset dev-ls dev-stop build install kill check fmt lint test ci clean
 
 help: ## Show this help
 	@grep -hE '^[a-z][a-z-]*:.*?## ' $(MAKEFILE_LIST) \
-		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
+		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-11s\033[0m %s\n", $$1, $$2}'
 
 # --- running your changes ----------------------------------------------------
 
 dev: dev-prep ## Run the latest code in an isolated instance (own daemon + data)
-	@echo "dev instance → runtime $(DEV_RUNTIME), data $(DEV_DATA)"
+	@echo "dev instance [$(notdir $(CURDIR))] → runtime $(DEV_RUNTIME), data $(DEV_DATA)"
 	-@$(DEV_ENV) $(DEBUG_BIN)
 	@$(MAKE) --no-print-directory dev-stop
 
@@ -51,9 +66,9 @@ dev: dev-prep ## Run the latest code in an isolated instance (own daemon + data)
 # command it runs, so $(DEV_ENV) reaches the TUI in the tab and the browser
 # instance stays as isolated as `make dev`. Needs ttyd on PATH — the binary
 # says how to install it if it is missing. Ctrl+C here stops ttyd.
-browser: dev-prep ## Serve the latest code into a browser tab via ttyd (PORT=7681)
+browser: dev-prep ## Serve the latest code into a browser tab via ttyd (PORT= to pin)
 	@echo "dev instance → runtime $(DEV_RUNTIME), data $(DEV_DATA)"
-	-@$(DEV_ENV) $(DEBUG_BIN) browser --port $(PORT)
+	-@$(DEV_ENV) $(DEBUG_BIN) browser $(if $(PORT),--port $(PORT))
 	@$(MAKE) --no-print-directory dev-stop
 
 # Build, clear the way, and seed — everything `dev` and `browser` both need
@@ -97,8 +112,22 @@ dev-seed: ## Copy real projects/workspaces/settings into the dev instance (only 
 	done; \
 	echo "seeded dev instance from $$real (projects, worktrees, workspaces, settings — no sessions)"
 
-dev-reset: dev-stop ## Wipe the dev instance's data; the next `make dev` re-seeds it
+dev-reset: dev-stop ## Wipe this checkout's dev data; the next `make dev` re-seeds it
 	rm -rf $(DEV_DATA)
+
+# Slots accumulate: a worktree you deleted leaves its DB behind under
+# ~/.nebula-dev. This lists every one with its daemon's state, so you can see
+# what is still running and `rm -rf` what is not.
+dev-ls: ## List every checkout's dev instance and whether its daemon is up
+	@for d in $(HOME)/.nebula-dev/*-*/; do \
+		[ -d "$$d" ] || continue; \
+		slot=$${d%/}; slot=$${slot##*-}; \
+		pidfile=/tmp/nebula-dev-$$slot/daemon.pid; \
+		state=stopped; \
+		if [ -f "$$pidfile" ] && ps -p "$$(cat $$pidfile 2>/dev/null)" -o command= 2>/dev/null \
+			| grep -q 'nebula daemon'; then state=running; fi; \
+		printf '  %-8s %-40s %s\n' "$$state" "$$(basename $$d)" "$$d"; \
+	done
 
 # The pidfile outlives the process it names, so confirm the pid is still a
 # nebula daemon before signalling it — otherwise a recycled pid means killing

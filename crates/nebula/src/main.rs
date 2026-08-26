@@ -73,9 +73,12 @@ enum Command {
     },
     /// Serve this TUI in a web browser via ttyd (loopback only) and open it.
     Browser {
-        /// Port for ttyd to listen on.
-        #[arg(long, default_value_t = browser::DEFAULT_PORT)]
-        port: u16,
+        /// Port for ttyd to listen on. Omit to take 7681 when it's free and
+        /// a free one otherwise — so a checkout per worktree can each serve
+        /// at once. `--port 0` always picks a free one; a port named
+        /// explicitly is used or the command fails.
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Open nebula on a remote host over ssh (installs it there if missing).
     Ssh {

@@ -295,8 +295,11 @@ nebula workspace rename <a> <b> # rename a workspace
 nebula workspace delete <name>  # delete an empty workspace
 nebula ssh <host> [dir]   # open nebula on a remote machine over ssh (installs it there if
                           # missing); destinations are remembered for the TUI's `h` picker
-nebula browser [--port N] # serve this TUI in a browser tab via ttyd (loopback only, default
-                          # port 7681) and open it; needs ttyd on PATH
+nebula browser [--port N] # serve this TUI in a browser tab via ttyd (loopback only) and open
+                          # it; needs ttyd on PATH. With no --port it takes 7681 when that's
+                          # free and a free port otherwise, saying which — so one per checkout
+                          # can serve at once. --port 0 always picks a free one; --port N is
+                          # that port or an error, which is what you want behind an ssh tunnel
 nebula upgrade            # install the latest release (--force on a dev build)
 ```
 
