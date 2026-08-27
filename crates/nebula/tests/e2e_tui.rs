@@ -537,8 +537,7 @@ fn tui_help_modal_grouped_keymap() {
     tui.wait_for_text("create your first project");
 
     // The grouped two-column keymap: every section header on screen at
-    // once, including the note hotkey (the old single list clipped its
-    // tail on short terminals).
+    // once (the old single list clipped its tail on short terminals).
     tui.send(b"?");
     tui.wait_for_text("NAVIGATE & SEARCH");
     tui.wait_for_text("PROJECTS");
@@ -546,97 +545,9 @@ fn tui_help_modal_grouped_keymap() {
     tui.wait_for_text("SESSIONS");
     tui.wait_for_text("TERMINAL & MOUSE");
     tui.wait_for_text("GENERAL");
-    tui.wait_for_text("notes for the worktree");
-    tui.wait_for_text("project-level notes");
 
     tui.send(&[0x1b]); // Esc closes
     tui.wait_for_gone("NAVIGATE & SEARCH");
-}
-
-#[test]
-fn tui_note_modal_crud_and_badge() {
-    let mut tui = TuiHarness::spawn();
-    let repo = tui.make_repo("note-proj");
-
-    tui.wait_for_text("create your first project");
-    add_project(&mut tui, &repo, "note-proj");
-    // The root worktree row must exist before e has a list to open.
-    tui.wait_for_text("⌂ root");
-
-    // ---- Projects focus: t opens the PROJECT's own list (no branch in
-    // the title — the trailing space keeps it from matching ".../main") ----
-    tui.send(b"e");
-    tui.wait_for_text("Notes — note-proj ");
-    tui.wait_for_text("no notes yet");
-    tui.send(b"e"); // start the add input
-    tui.type_str("project level plan");
-    tui.send(b"\r");
-    tui.wait_for_text("☐ project level plan");
-    tui.send(b" "); // done — the project badge reads ✓1
-    tui.wait_for_text("✓ project level plan");
-    tui.send(&[0x1b]); // Esc closes
-    tui.wait_for_gone("Notes — note-proj ");
-    tui.wait_for_text("✓1"); // project-row badge
-
-    // ---- Worktrees focus: t opens the WORKTREE's list — a separate,
-    // still-empty set of notes ----
-    tui.send(b"\r"); // Projects → Worktrees
-    tui.wait_for_text(FOOTER_WORKTREES);
-    tui.send(b"e");
-    tui.wait_for_text("Notes — note-proj/main");
-    tui.wait_for_text("no notes yet");
-
-    // ---- create ----
-    tui.send(b"e"); // start the add input
-    tui.type_str("ship the feature");
-    tui.send(b"\r");
-    tui.wait_for_text("☐ ship the feature");
-    tui.wait_for_text("(1 open)");
-    tui.send(b"a"); // a second note, via the alternate add key
-    tui.type_str("write docs");
-    tui.send(b"\r");
-    tui.wait_for_text("☐ write docs");
-    tui.wait_for_text("(2 open)");
-
-    // ---- update: the cursor sits on the just-created note ----
-    tui.send(b"\r"); // edit "write docs" (prefilled)
-    tui.type_str(" tomorrow");
-    tui.send(b"\r");
-    tui.wait_for_text("☐ write docs tomorrow");
-
-    // ---- toggle done ----
-    tui.send(b" ");
-    tui.wait_for_text("✓ write docs tomorrow");
-    tui.wait_for_text("(1 open)");
-
-    // ---- the worktree row badge shows the open count ----
-    tui.send(&[0x1b]); // Esc closes the modal
-    tui.wait_for_gone("Notes — note-proj/main");
-    tui.wait_for_text("✎1");
-
-    // ---- delete: k up to the open note, d removes it ----
-    tui.send(b"e");
-    tui.wait_for_text("Notes — note-proj/main");
-    tui.send(b"k");
-    tui.wait_for_selected("☐ ship the feature");
-    tui.send(b"d");
-    tui.wait_for_gone("ship the feature");
-    tui.wait_for_text("(all 1 done)");
-
-    // ---- deleting the last worktree note empties only THIS list ----
-    tui.send(b"d");
-    tui.wait_for_text("no notes yet");
-    tui.send(&[0x1b]);
-    tui.wait_for_gone("Notes — note-proj/main");
-
-    // ---- the project's own note survived untouched ----
-    tui.send(b"\x1b[D"); // ← back to Projects focus
-    tui.wait_for_text(FOOTER_PROJECTS);
-    tui.send(b"e");
-    tui.wait_for_text("Notes — note-proj ");
-    tui.wait_for_text("✓ project level plan");
-    tui.send(&[0x1b]);
-    tui.wait_for_gone("Notes — note-proj ");
 }
 
 /// Links live in the Sessions panel's own LINKS group: `L` adds one from

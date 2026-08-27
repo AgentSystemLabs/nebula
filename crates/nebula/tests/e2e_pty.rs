@@ -3688,3 +3688,194 @@ async fn cli_add_project() {
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
 }
+
+/// A Claude Cloud row on an account without the live-attach rollout:
+/// `claude --cloud <task>` prints the session id and exits, the daemon
+/// captures the id off the PTY, and a Restart re-enters the session —
+/// the attach is refused (read off the output, not inferred from the exit),
+/// so the row is teleported instead, inside a `cloud-<id>` worktree of its
+/// own rather than on top of the user's main checkout. The stub stands in
+/// for all three CLI invocations in turn.
+#[tokio::test]
+async fn cloud_row_captures_its_session_id_and_reenters_it() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let state = env.tmp.path().join("cloud-stub");
+    std::fs::create_dir_all(&state).unwrap();
+    let stub = env.tmp.path().join("cloud-stub.sh");
+    std::fs::write(
+        &stub,
+        format!(
+            r#"#!/bin/sh
+n=$(cat "{state}/runs" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "{state}/runs"
+pwd >> "{state}/cwds"
+case "$n" in
+  1)
+    printf 'Created cloud session: Hello world\r\n'
+    printf 'View: https://claude.ai/code/session_016SiQW5Lem2LbnUf1A3undt?from=cli&m=0\r\n'
+    printf 'Resume with: claude --teleport session_016SiQW5Lem2LbnUf1A3undt\r\n'
+    exit 0
+    ;;
+  2)
+    printf 'Error: Attaching to an existing cloud session is not enabled for your account.\r\n'
+    exit 1
+    ;;
+  *)
+    exec sleep 300
+    ;;
+esac
+"#,
+            state = state.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let runs = || {
+        std::fs::read_to_string(state.join("runs"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    let mut daemon = env.spawn_daemon_with_agent_cmd(stub.to_str().unwrap());
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    // The create: the stub prints the session lines and exits at once.
+    const CLOUD_ID: &str = "session_016SiQW5Lem2LbnUf1A3undt";
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 10,
+            worktree: main_worktree.id.clone(),
+            name: "cloud".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: Some("Hello world".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        find_ack(evs, 10).is_some()
+            && evs.iter().any(|e| {
+                matches!(
+                    e,
+                    ServerEvent::EntityUpserted {
+                        entity: Entity::Agent(a)
+                    } if a.cloud_session_id.as_deref() == Some(CLOUD_ID)
+                )
+            })
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 10).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+    assert_eq!(runs(), "1");
+
+    // Restart on a Cloud row with no local session re-enters the cloud
+    // session: attach (refused by the stub) then teleport, in a worktree of
+    // the row's own. Wait for the stub's third run and the row's respawn.
+    write_frame(
+        &mut c,
+        &ClientRequest::RestartAgent {
+            req_id: 11,
+            id: agent_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    // Two live respawns of the row: the attach, then the teleport after it.
+    let events = read_events_until(&mut c, Duration::from_secs(20), |evs| {
+        let live_spawns = evs
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ServerEvent::EntityUpserted {
+                        entity: Entity::Agent(a)
+                    } if a.id == agent_id && a.alive
+                )
+            })
+            .count();
+        live_spawns >= 2
+    })
+    .await;
+    // The spawn upsert goes out before the child has run a line; give the
+    // stub a moment to record itself.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while runs() != "3" && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(runs(), "3", "create, refused attach, teleport");
+    assert!(
+        matches!(find_ack(&events, 11), Some(ServerEvent::Ack { .. })),
+        "RestartAgent failed: {events:#?}"
+    );
+    let cloud_worktree = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } if w.branch == "cloud-f1A3undt" => Some(w.clone()),
+            _ => None,
+        })
+        .expect("a cloud-<id> worktree was created for the attach");
+    assert_eq!(cloud_worktree.project_id, main_worktree.project_id);
+    assert!(!cloud_worktree.is_main);
+    let row = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            } if a.id == agent_id => Some(a.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        row.worktree_id, cloud_worktree.id,
+        "row re-homed before attaching"
+    );
+    assert_eq!(row.cloud_session_id.as_deref(), Some(CLOUD_ID));
+    assert!(row.alive);
+
+    // The create ran in the main checkout; the attach and the teleport both
+    // ran in the new worktree — the user's checkout never switched branch.
+    let cwds = std::fs::read_to_string(state.join("cwds")).unwrap();
+    let cwds: Vec<PathBuf> = cwds
+        .lines()
+        .map(|l| std::fs::canonicalize(l).unwrap())
+        .collect();
+    assert_eq!(
+        cwds,
+        vec![
+            std::fs::canonicalize(&main_worktree.path).unwrap(),
+            std::fs::canonicalize(&cloud_worktree.path).unwrap(),
+            std::fs::canonicalize(&cloud_worktree.path).unwrap(),
+        ]
+    );
+    let main_branch = std::process::Command::new("git")
+        .args(["-C", repo.to_str().unwrap(), "branch", "--show-current"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&main_branch.stdout).trim(), "main");
+
+    // A row that has never seen the attach refusal is left alone by a kill:
+    // shutting down must not spawn a fourth run.
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+    assert_eq!(runs(), "3");
+}

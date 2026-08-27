@@ -1,4 +1,4 @@
-use crate::ids::{AgentId, LinkId, NoteId, ProjectId, TerminalId, WorkspaceId, WorktreeId};
+use crate::ids::{AgentId, LinkId, ProjectId, TerminalId, WorkspaceId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -136,6 +136,13 @@ pub struct Agent {
     /// Pinned agents sort into their own PINNED group in the sessions list.
     #[serde(default)]
     pub pinned: bool,
+    /// Finished a turn (running or needs-feedback → finished) that no client
+    /// has looked at since. The Projects and Worktrees rows count these so
+    /// the user knows how many terminals to go read; the pane landing on
+    /// the session clears it (`ClientRequest::MarkAgentSeen`). Only ever
+    /// true on a finished, unarchived row — leaving `finished` clears it.
+    #[serde(default)]
+    pub unseen: bool,
     /// Epoch ms of the last status change; 0 = unknown (pre-upgrade rows or
     /// never-run agents). Drives the TUI's RECENT session group.
     #[serde(default)]
@@ -152,6 +159,13 @@ pub struct Agent {
     pub effort: Option<String>,
     /// CLI session id used for resume (claude, codex, or cursor, per `kind`).
     pub session_id: Option<String>,
+    /// The Claude Cloud session this row launched (`claude --cloud <task>`
+    /// prints the id as it creates one). Only cloud rows have it. Restarting
+    /// such a row while it has no local `session_id` re-enters the cloud
+    /// session — `claude --cloud <id>`, or `claude --teleport <id>` when the
+    /// account cannot attach — instead of booting a bare local CLI.
+    #[serde(default)]
+    pub cloud_session_id: Option<String>,
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this agent.
     pub alive: bool,
@@ -165,25 +179,6 @@ pub struct TerminalTab {
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this terminal.
     pub alive: bool,
-}
-
-/// Who a note list hangs off: a project (high-level notes spanning its
-/// worktrees) or one worktree (notes for that checkout). The two are
-/// separate lists — a project's notes never mix into its worktrees'.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum NoteOwner {
-    Project(ProjectId),
-    Worktree(WorktreeId),
-}
-
-/// One note.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Note {
-    pub id: NoteId,
-    pub owner: NoteOwner,
-    pub text: String,
-    pub done: bool,
-    pub sort_order: i64,
 }
 
 /// A URL pinned to a worktree — the pull request, the ticket, the design
@@ -208,7 +203,6 @@ pub enum Entity {
     Worktree(Worktree),
     Agent(Agent),
     Terminal(TerminalTab),
-    Note(Note),
     Link(Link),
 }
 
@@ -219,6 +213,5 @@ pub enum EntityId {
     Worktree(WorktreeId),
     Agent(AgentId),
     Terminal(TerminalId),
-    Note(NoteId),
     Link(LinkId),
 }

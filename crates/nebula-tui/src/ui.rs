@@ -194,7 +194,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // extra column so the affordance is visible before hovering.
             let any_submenu = menu.items.iter().any(|i| i.action.submenu().is_some());
             // The workspace switcher carries its key verbs in the bottom
-            // border, the notes-modal pattern; the modal widens to fit.
+            // border; the modal widens to fit.
             let hint = if menu.is_workspace_picker() {
                 Some(" n: new  r: rename  d: delete ")
             } else {
@@ -509,7 +509,6 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "PROJECTS",
                     &[
                         (Act(&[New, AddProject]), "add project (2nd: from anywhere)"),
-                        (Act(&[Notes]), "project-level notes"),
                         (Act(&[MoveProjectDown, MoveProjectUp]), "reorder project"),
                         (Act(&[Delete]), "remove from list"),
                     ],
@@ -518,7 +517,6 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "WORKTREES",
                     &[
                         (Act(&[New]), "new worktree"),
-                        (Act(&[Notes]), "notes for the worktree"),
                         (Act(&[GitDiff]), "git diff (^r: mark reviewed ✓)"),
                         (Act(&[OpenRepo]), "open the repo on GitHub"),
                         (Act(&[Pin]), "pin / unpin"),
@@ -1595,129 +1593,6 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 v.selected = selected;
             }
         }
-        Overlay::Notes(view) => {
-            // Rows come straight from the tree, so daemon upserts (another
-            // client editing the same list) render live.
-            let notes: Vec<&nebula_core::Note> = app
-                .tree
-                .notes
-                .iter()
-                .filter(|t| t.owner == view.owner)
-                .collect();
-            let total = notes.len();
-            let open = notes.iter().filter(|t| !t.done).count();
-            let selected = view.selected.min(total.saturating_sub(1));
-            let creating = view.input.as_ref().is_some_and(|i| i.editing.is_none());
-
-            let list_rows = (total + creating as usize).max(1);
-            // centered_rect caps to the frame; the max(5) only keeps clamp's
-            // bounds ordered on a tiny screen.
-            let height = (list_rows as u16)
-                .saturating_add(2)
-                .clamp(5, f.area().height.max(5));
-            let area = centered_rect(f.area(), 58, height);
-            f.render_widget(Clear, area);
-            let title = if total == 0 {
-                format!(" Notes — {} ", view.context)
-            } else if open > 0 {
-                format!(" Notes — {} ({open} open) ", view.context)
-            } else {
-                format!(" Notes — {} (all {total} done) ", view.context)
-            };
-            let hint = if view.input.is_some() {
-                " Enter: save  ⌥←→: word  Esc: cancel "
-            } else {
-                " e: add  Enter: edit  Space: done  d: delete "
-            };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.accent))
-                .title(Span::styled(
-                    truncate(&title, (area.width as usize).saturating_sub(2)),
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ))
-                .title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
-
-            if total == 0 && !creating {
-                if let Some(row_area) = row_rect(inner, 0) {
-                    f.render_widget(
-                        Paragraph::new(Span::styled(
-                            "no notes yet — e adds one",
-                            Style::default().fg(th.dim),
-                        )),
-                        row_area,
-                    );
-                }
-            }
-            // Follow-window keeps the cursor visible; while adding, pin the
-            // window to the tail so the input row is always on screen.
-            let start = if creating {
-                list_rows.saturating_sub(inner.height as usize)
-            } else {
-                view.window_start(inner.height as usize)
-            };
-            let mut screen_row = 0usize;
-            for (i, note) in notes.iter().enumerate().skip(start) {
-                let Some(row_area) = row_rect(inner, screen_row) else {
-                    break;
-                };
-                screen_row += 1;
-                let budget = (inner.width as usize).saturating_sub(2);
-                let editing_this =
-                    view.input.as_ref().and_then(|inp| inp.editing.as_ref()) == Some(&note.id);
-                let spans = if editing_this {
-                    let mut spans = vec![Span::styled("☐ ", Style::default().fg(th.warn))];
-                    if let Some(inp) = &view.input {
-                        spans.extend(input_spans(
-                            &inp.text,
-                            budget.saturating_sub(1),
-                            th.accent,
-                            th,
-                        ));
-                    }
-                    spans
-                } else if note.done {
-                    vec![
-                        Span::styled("✓ ", Style::default().fg(th.ok)),
-                        Span::styled(truncate(&note.text, budget), Style::default().fg(th.dim)),
-                    ]
-                } else {
-                    vec![
-                        Span::styled("☐ ", Style::default().fg(th.warn)),
-                        Span::raw(truncate(&note.text, budget)),
-                    ]
-                };
-                render_row(
-                    f,
-                    row_area,
-                    spans,
-                    i == selected && view.input.is_none(),
-                    true,
-                    th,
-                );
-            }
-            if creating {
-                if let Some(row_area) = row_rect(inner, screen_row) {
-                    let budget = (inner.width as usize).saturating_sub(2);
-                    let mut spans = vec![Span::styled("+ ", Style::default().fg(th.accent))];
-                    if let Some(inp) = &view.input {
-                        spans.extend(input_spans(&inp.text, budget, th.accent, th));
-                    }
-                    f.render_widget(Paragraph::new(Line::from(spans)), row_area);
-                }
-            }
-
-            // Write-back (draw works on a clone): rects for mouse
-            // hit-testing, plus the clamped cursor.
-            if let Some(Overlay::Notes(v)) = &mut app.overlay {
-                v.area = area;
-                v.list_area = inner;
-                v.selected = selected;
-            }
-        }
         Overlay::Tree(view) => {
             let area = centered_rect_pct(f.area(), 92, 90);
             f.render_widget(Clear, area);
@@ -2011,15 +1886,21 @@ fn panel_block(title: &str, focused: bool, th: Theme) -> Block<'_> {
     }
 }
 
-/// Note-count row badge for a (open, total) pair: open notes as `✎n`, an
-/// all-done list as `✓n`; no notes, no badge. The pencil is U+270E — a
-/// text-presentation glyph with no emoji variant, so it stays single-width.
-fn note_badge((open, total): (usize, usize), th: Theme) -> Option<(String, Style)> {
-    match (open, total) {
-        (_, 0) => None,
-        (0, total) => Some((format!(" ✓{total}"), Style::default().fg(th.ok))),
-        (open, _) => Some((format!(" ✎{open}"), Style::default().fg(th.warn))),
-    }
+/// Unwatched-finish count badge for a project or worktree row: how many
+/// sessions under it went green with nobody looking (`Agent::unseen`), as
+/// ` n new` in the finished color. The count is the number of terminals
+/// to go read; it drops as the cursor lands on each one, and the badge
+/// goes with it at zero.
+fn unseen_badge(unseen: usize, th: Theme) -> Option<(String, Style)> {
+    (unseen > 0).then(|| (format!(" {unseen} new"), Style::default().fg(th.ok)))
+}
+
+/// The trailing badges of a project or worktree row, and the columns they
+/// take together, so the name can be truncated around them.
+fn row_badges(unseen: usize, th: Theme) -> (Vec<(String, Style)>, usize) {
+    let badges: Vec<(String, Style)> = unseen_badge(unseen, th).into_iter().collect();
+    let len = badges.iter().map(|(s, _)| s.chars().count()).sum();
+    (badges, len)
 }
 
 /// Sweep shades for a status that animates: running rows shimmer yellow,
@@ -2541,6 +2422,14 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
         .push((shrink_b(area), HitTarget::PanelBg(Focus::Workspaces)));
 }
 
+/// Per-row display data of the Projects panel, pre-collected to end the
+/// tree borrow: name, rollup, unwatched-finish count.
+type ProjectRowData = (String, Option<AgentStatus>, usize);
+
+/// The same for the Worktrees panel: branch, is-root, rollup,
+/// unwatched-finish count.
+type WorktreeRowData = (String, bool, Option<AgentStatus>, usize);
+
 /// Columns between the `WORKSPACES` label and the first tab.
 const TAB_GAP: u16 = 2;
 /// Columns between two tabs. Outside either tab's fill, so the open one's
@@ -2573,8 +2462,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // The payload pre-collects per-row display data to end the tree borrow.
-    let rows: Vec<(String, Option<AgentStatus>, (usize, usize))> = app
+    let rows: Vec<ProjectRowData> = app
         .project_rows()
         .into_iter()
         .map(|i| {
@@ -2582,19 +2470,18 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
             (
                 p.name.clone(),
                 app.project_rollup(&p.id),
-                app.note_stats(&nebula_core::NoteOwner::Project(p.id.clone())),
+                app.project_unseen(&p.id),
             )
         })
         .collect();
     let mut screen_row = 0usize;
-    for (row_idx, (text, roll, notes)) in rows.iter().enumerate() {
+    for (row_idx, (text, roll, unseen)) in rows.iter().enumerate() {
         let Some(row_area) = rows_rect(inner, screen_row, PROJECT_BTN_H) else {
             break;
         };
-        // Same note-count badge as worktree rows: the project's own
-        // notes only (worktree notes badge on their worktree).
-        let note_badge = note_badge(*notes, th);
-        let badge_len = note_badge.as_ref().map_or(0, |(s, _)| s.chars().count());
+        // Same badge as worktree rows: sessions that finished unwatched
+        // anywhere under the project.
+        let (badges, badge_len) = row_badges(*unseen, th);
         // Bold name: the top of the tree reads "biggest".
         let mut spans = vec![status_dot(*roll, th)];
         spans.extend(status_name_spans(
@@ -2603,7 +2490,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
             sweep_ramp(*roll, th, app.animations),
             app.sweep_phase(),
         ));
-        if let Some((text, style)) = note_badge {
+        for (text, style) in badges {
             spans.push(Span::styled(text, style));
         }
         render_button(
@@ -2651,7 +2538,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let count = Some(wt_count).filter(|n| *n > 0);
     let inner = draw_column(f, area, "WORKTREES", count, focused, th);
 
-    let worktrees: Vec<(String, bool, Option<AgentStatus>, (usize, usize))> = app
+    let worktrees: Vec<WorktreeRowData> = app
         .visible_worktrees()
         .iter()
         .map(|w| {
@@ -2659,7 +2546,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 w.branch.clone(),
                 w.is_main,
                 app.worktree_rollup(&w.id),
-                app.note_stats(&nebula_core::NoteOwner::Worktree(w.id.clone())),
+                app.worktree_unseen(&w.id),
             )
         })
         .collect();
@@ -2783,9 +2670,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
             WorktreeEntry::Row(i) if *i < worktrees.len() => {
-                let (branch, is_main, roll, notes) = &worktrees[*i];
-                let note_badge = note_badge(*notes, th);
-                let badge_len = note_badge.as_ref().map_or(0, |(s, _)| s.chars().count());
+                let (branch, is_main, roll, unseen) = &worktrees[*i];
+                let (badges, badge_len) = row_badges(*unseen, th);
                 let ramp = sweep_ramp(*roll, th, app.animations);
                 let mut spans = vec![status_dot(*roll, th)];
                 if *is_main {
@@ -2806,7 +2692,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                         app.sweep_phase(),
                     ));
                 }
-                if let Some((text, style)) = note_badge {
+                for (text, style) in badges {
                     spans.push(Span::styled(text, style));
                 }
                 render_pill(f, inner, y, spans, *i == app.sel_worktree, focused, th);
@@ -3079,8 +2965,21 @@ fn draw_session_row(
             };
             // The CLI behind the session, as a dim trailing badge (same
             // idiom as the worktree root row) — every kind, so the column
-            // reads as one consistent "name · when · harness" list.
-            let badge = format!(" {}", a.kind.as_str());
+            // reads as one consistent "name · when · harness" list. A turn
+            // that finished with nobody looking takes the slot over and
+            // goes loud (as a link row's unread count does): these rows
+            // are what the parent rows' counts are counting, so each one
+            // says so until the cursor lands on it.
+            let (badge, badge_style) = if a.unseen && !a.archived {
+                (" new".to_string(), Style::default().fg(th.ok))
+            } else if a.cloud_session_id.is_some() {
+                // A Claude Cloud row: the harness that matters is the cloud
+                // sandbox, and the badge is how the user tells this row
+                // re-enters that session rather than booting a local CLI.
+                (" cloud".to_string(), Style::default().fg(th.dim))
+            } else {
+                (format!(" {}", a.kind.as_str()), Style::default().fg(th.dim))
+            };
             // How long since this session last did anything, sat between
             // the name and the harness. The list is sorted on this stamp,
             // so the label is what makes the order legible.
@@ -3110,7 +3009,7 @@ fn draw_session_row(
             if !ago.is_empty() {
                 spans.push(Span::styled(ago, Style::default().fg(th.dim)));
             }
-            spans.push(Span::styled(badge, Style::default().fg(th.dim)));
+            spans.push(Span::styled(badge, badge_style));
             spans
         }
         SessionRow::Terminal(t) => {
@@ -3592,15 +3491,6 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             },
             Style::default().fg(th.dim),
         )
-    } else if let Some(Overlay::Notes(view)) = &app.overlay {
-        Span::styled(
-            if view.input.is_some() {
-                "type the note  Enter: save  Esc: cancel"
-            } else {
-                "e: add  Enter: edit  Space: toggle done  d: delete  Esc: close"
-            },
-            Style::default().fg(th.dim),
-        )
     } else if matches!(&app.overlay, Some(Overlay::Metrics(_))) {
         Span::styled(
             "↑/↓: select  Enter: open session  Esc: close  (refreshes every 2s)",
@@ -3678,10 +3568,9 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::Help)
             ),
             Focus::Projects => format!(
-                "{}/{}: add  {}: notes  {}: remove  {}/{}: move  {}: search  {}: menu  {}: help",
+                "{}/{}: add  {}: remove  {}/{}: move  {}: search  {}: menu  {}: help",
                 k(Action::New),
                 k(Action::AddProject),
-                k(Action::Notes),
                 k(Action::Delete),
                 k(Action::MoveProjectDown),
                 k(Action::MoveProjectUp),
@@ -3700,9 +3589,8 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::Help)
             ),
             Focus::Worktrees => format!(
-                "{}: new worktree  {}: notes  {}: terminal  {}: pin  {}: delete  {}: search  {}: menu  {}: help",
+                "{}: new worktree  {}: terminal  {}: pin  {}: delete  {}: search  {}: menu  {}: help",
                 k(Action::New),
-                k(Action::Notes),
                 k(Action::NewTerminal),
                 k(Action::Pin),
                 k(Action::Delete),

@@ -4,9 +4,8 @@
 
 use anyhow::{Context, Result};
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Note, NoteId, NoteOwner, PrSeen, Project,
-    ProjectId, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
-    DEFAULT_WORKSPACE_ID,
+    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, PrSeen, Project, ProjectId, TerminalId,
+    TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId, DEFAULT_WORKSPACE_ID,
 };
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
@@ -205,6 +204,24 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE projects DROP COLUMN divider_label;
     ALTER TABLE projects DROP COLUMN divider_before;
     ALTER TABLE projects DROP COLUMN divider_before_label;
+    ",
+    // 19: a turn finished while nobody was looking (see `Agent::unseen`).
+    // Set by `set_agent_status` on a live → finished flip, cleared by
+    // `mark_agent_seen`, by leaving `finished`, and by archiving.
+    "
+    ALTER TABLE agents ADD COLUMN unseen INTEGER NOT NULL DEFAULT 0;
+    ",
+    // 20: the Claude Cloud session a row launched (`Agent::cloud_session_id`),
+    // read off the `claude --cloud` spawn's output. Drives the attach /
+    // teleport restart path; NULL for every local row.
+    "
+    ALTER TABLE agents ADD COLUMN cloud_session_id TEXT;
+    ",
+    // 21: notes are gone (migration 8 created them as `todos`, 10 gave them
+    // a project scope, 15 renamed the table). Nothing else references the
+    // table, so a plain DROP retires the feature and its rows.
+    "
+    DROP TABLE IF EXISTS notes;
     ",
 ];
 
@@ -489,8 +506,8 @@ impl Store {
     /// clients never see it, they only observe the eventual rename.
     pub fn insert_agent_with_auto_title(&self, a: &Agent, auto_title: bool) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 a.id.as_str(),
                 a.worktree_id.as_str(),
@@ -506,7 +523,9 @@ impl Store {
                 a.status_changed_at,
                 a.model,
                 a.effort,
-                auto_title as i64
+                auto_title as i64,
+                a.unseen as i64,
+                a.cloud_session_id
             ],
         )?;
         Ok(())
@@ -565,8 +584,12 @@ impl Store {
         // Stamp the archive time (cleared on unarchive) so the TUI can
         // order the ARCHIVED group newest-first.
         let archived_at = if archived { now_ms() } else { 0 };
+        // An archived row is out of sight by definition: nothing left to
+        // go and read, so its unseen-finish flag goes with it.
         self.conn.lock().unwrap().execute(
-            "UPDATE agents SET archived = ?2, archived_at = ?3 WHERE id = ?1",
+            "UPDATE agents SET archived = ?2, archived_at = ?3,
+                    unseen = CASE WHEN ?2 THEN 0 ELSE unseen END
+             WHERE id = ?1",
             params![id.as_str(), archived as i64, archived_at],
         )?;
         Ok(())
@@ -580,15 +603,62 @@ impl Store {
         Ok(())
     }
 
-    /// Returns the epoch-ms stamp written to `status_changed_at`, so the
-    /// caller can broadcast the exact same timestamp it persisted.
-    pub fn set_agent_status(&self, id: &AgentId, status: AgentStatus) -> Result<i64> {
+    /// Returns the epoch-ms stamp written to `status_changed_at` and the
+    /// row's `unseen` flag after the change, so the caller can broadcast
+    /// exactly what it persisted.
+    ///
+    /// The flag is maintained here, atomically with the status it
+    /// qualifies: a live turn (running or needs-feedback) landing on
+    /// `finished` raises it — that is the yellow-to-green flip nobody may
+    /// have been watching — staying on `finished` keeps it, and leaving
+    /// `finished` (a new prompt, a restart, a disconnect) drops it, since
+    /// there is no finished turn left to read. Archived rows never raise
+    /// it: they are out of sight already.
+    pub fn set_agent_status(&self, id: &AgentId, status: AgentStatus) -> Result<(i64, bool)> {
         let stamp = now_ms();
-        self.conn.lock().unwrap().execute(
-            "UPDATE agents SET status = ?2, status_changed_at = ?3 WHERE id = ?1",
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE agents SET status = ?2, status_changed_at = ?3,
+                    unseen = CASE
+                      WHEN ?2 = 'finished' THEN
+                        CASE WHEN status IN ('running', 'needs_feedback') AND archived = 0
+                             THEN 1 ELSE unseen END
+                      ELSE 0
+                    END
+             WHERE id = ?1",
             params![id.as_str(), status.as_str(), stamp],
         )?;
-        Ok(stamp)
+        let unseen: i64 = conn
+            .query_row(
+                "SELECT unseen FROM agents WHERE id = ?1",
+                params![id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        Ok((stamp, unseen != 0))
+    }
+
+    /// The agent's session is on screen: drop its unseen-finish flag.
+    /// Returns whether the flag was actually set, so the caller can skip
+    /// broadcasting a row that didn't change.
+    pub fn mark_agent_seen(&self, id: &AgentId) -> Result<bool> {
+        let changed = self.conn.lock().unwrap().execute(
+            "UPDATE agents SET unseen = 0 WHERE id = ?1 AND unseen = 1",
+            params![id.as_str()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn set_agent_cloud_session_id(
+        &self,
+        id: &AgentId,
+        cloud_session_id: Option<&str>,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE agents SET cloud_session_id = ?2 WHERE id = ?1",
+            params![id.as_str(), cloud_session_id],
+        )?;
+        Ok(())
     }
 
     pub fn set_agent_session_id(&self, id: &AgentId, session_id: Option<&str>) -> Result<()> {
@@ -649,111 +719,6 @@ impl Store {
             .unwrap()
             .execute("DELETE FROM terminals WHERE id = ?1", params![id.as_str()])?;
         Ok(())
-    }
-
-    // ---- notes ----
-
-    /// (project_id, worktree_id) column values for an owner — exactly one
-    /// is Some, mirroring the table's CHECK.
-    fn note_owner_cols(owner: &NoteOwner) -> (Option<&str>, Option<&str>) {
-        match owner {
-            NoteOwner::Project(id) => (Some(id.as_str()), None),
-            NoteOwner::Worktree(id) => (None, Some(id.as_str())),
-        }
-    }
-
-    /// Owner from a row's (project_id, worktree_id) pair.
-    fn note_owner_from(project_id: Option<String>, worktree_id: Option<String>) -> NoteOwner {
-        match (project_id, worktree_id) {
-            (Some(p), _) => NoteOwner::Project(ProjectId(p)),
-            (None, Some(w)) => NoteOwner::Worktree(WorktreeId(w)),
-            // Unreachable per the CHECK constraint.
-            (None, None) => NoteOwner::Worktree(WorktreeId(String::new())),
-        }
-    }
-
-    pub fn insert_note(&self, t: &Note) -> Result<()> {
-        let (project_id, worktree_id) = Self::note_owner_cols(&t.owner);
-        self.conn.lock().unwrap().execute(
-            "INSERT INTO notes (id, project_id, worktree_id, text, done, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                t.id.as_str(),
-                project_id,
-                worktree_id,
-                t.text,
-                t.done as i64,
-                t.sort_order,
-                now_ms()
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Sort slot for a new note: after everything else in its owner's list.
-    pub fn next_note_sort_order(&self, owner: &NoteOwner) -> Result<i64> {
-        let (project_id, worktree_id) = Self::note_owner_cols(owner);
-        Ok(self.conn.lock().unwrap().query_row(
-            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM notes WHERE project_id IS ?1 AND worktree_id IS ?2",
-            params![project_id, worktree_id],
-            |r| r.get(0),
-        )?)
-    }
-
-    pub fn set_note_text(&self, id: &NoteId, text: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE notes SET text = ?2 WHERE id = ?1",
-            params![id.as_str(), text],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_note_done(&self, id: &NoteId, done: bool) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE notes SET done = ?2 WHERE id = ?1",
-            params![id.as_str(), done as i64],
-        )?;
-        Ok(())
-    }
-
-    pub fn delete_note(&self, id: &NoteId) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM notes WHERE id = ?1", params![id.as_str()])?;
-        Ok(())
-    }
-
-    pub fn get_note(&self, id: &NoteId) -> Result<Option<Note>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, project_id, worktree_id, text, done, sort_order FROM notes WHERE id = ?1",
-        )?;
-        let mut rows = stmt.query(params![id.as_str()])?;
-        Ok(rows.next()?.map(|r| Note {
-            id: NoteId(r.get::<_, String>(0).unwrap()),
-            owner: Self::note_owner_from(r.get(1).unwrap(), r.get(2).unwrap()),
-            text: r.get(3).unwrap(),
-            done: r.get::<_, i64>(4).unwrap() != 0,
-            sort_order: r.get(5).unwrap(),
-        }))
-    }
-
-    /// Every note, in per-owner list order.
-    pub fn load_notes(&self) -> Result<Vec<Note>> {
-        let conn = self.conn.lock().unwrap();
-        let notes = conn
-            .prepare("SELECT id, project_id, worktree_id, text, done, sort_order FROM notes ORDER BY COALESCE(project_id, worktree_id), sort_order, created_at")?
-            .query_map([], |r| {
-                Ok(Note {
-                    id: NoteId(r.get(0)?),
-                    owner: Self::note_owner_from(r.get(1)?, r.get(2)?),
-                    text: r.get(3)?,
-                    done: r.get::<_, i64>(4)? != 0,
-                    sort_order: r.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(notes)
     }
 
     // ---- links ----
@@ -891,7 +856,7 @@ impl Store {
     pub fn get_agent(&self, id: &AgentId) -> Result<Option<Agent>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at FROM agents WHERE id = ?1",
+            "SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, unseen, cloud_session_id FROM agents WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| Agent {
@@ -909,6 +874,8 @@ impl Store {
             model: r.get(10).unwrap(),
             effort: r.get(11).unwrap(),
             archived_at: r.get(12).unwrap(),
+            unseen: r.get::<_, i64>(13).unwrap() != 0,
+            cloud_session_id: r.get(14).unwrap(),
             alive: false,
         }))
     }
@@ -969,7 +936,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let agents = conn
-            .prepare("SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at FROM agents ORDER BY sort_order, created_at")?
+            .prepare("SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, unseen, cloud_session_id FROM agents ORDER BY sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Agent {
                     id: AgentId(r.get(0)?),
@@ -985,6 +952,8 @@ impl Store {
                     model: r.get(10)?,
                     effort: r.get(11)?,
                     archived_at: r.get(12)?,
+                    unseen: r.get::<_, i64>(13)? != 0,
+                    cloud_session_id: r.get(14)?,
                     alive: false,
                 })
             })?
@@ -1058,10 +1027,12 @@ mod tests {
             archived: false,
             archived_at: 0,
             pinned: false,
+            unseen: false,
             kind: AgentKind::Claude,
             model: Some("opus".into()),
             effort: Some("high".into()),
             session_id: Some("sess-123".into()),
+            cloud_session_id: None,
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
@@ -1075,10 +1046,12 @@ mod tests {
             archived: false,
             archived_at: 0,
             pinned: false,
+            unseen: false,
             kind: AgentKind::Codex,
             model: None,
             effort: None,
             session_id: None,
+            cloud_session_id: None,
             sort_order: 1,
             status_changed_at: 0,
             alive: false,
@@ -1092,10 +1065,12 @@ mod tests {
             archived: false,
             archived_at: 0,
             pinned: false,
+            unseen: false,
             kind: AgentKind::Cursor,
             model: None,
             effort: None,
             session_id: None,
+            cloud_session_id: None,
             sort_order: 2,
             status_changed_at: 0,
             alive: false,
@@ -1114,71 +1089,6 @@ mod tests {
         assert_eq!(agents[1].kind, AgentKind::Codex);
         assert_eq!(agents[1].model, None);
         assert_eq!(agents[2].kind, AgentKind::Cursor);
-    }
-
-    #[test]
-    fn note_crud_roundtrip_and_cascade() {
-        let store = Store::open_in_memory().unwrap();
-        let project = Project {
-            workspace_id: Default::default(),
-            id: ProjectId::generate(),
-            name: "demo".into(),
-            repo_path: "/tmp/demo".into(),
-            sort_order: 0,
-        };
-        store.insert_project(&project).unwrap();
-        let worktree = Worktree {
-            id: WorktreeId::generate(),
-            project_id: project.id.clone(),
-            path: "/tmp/demo".into(),
-            branch: "main".into(),
-            is_main: true,
-            pinned: false,
-            sort_order: 0,
-        };
-        store.insert_worktree(&worktree).unwrap();
-
-        let wt_owner = NoteOwner::Worktree(worktree.id.clone());
-        let note = Note {
-            id: NoteId::generate(),
-            owner: wt_owner.clone(),
-            text: "write tests".into(),
-            done: false,
-            sort_order: store.next_note_sort_order(&wt_owner).unwrap(),
-        };
-        store.insert_note(&note).unwrap();
-        assert_eq!(store.next_note_sort_order(&wt_owner).unwrap(), 1);
-
-        // Project-scoped notes are their own list: separate sort space.
-        let p_owner = NoteOwner::Project(project.id.clone());
-        assert_eq!(store.next_note_sort_order(&p_owner).unwrap(), 0);
-        let project_note = Note {
-            id: NoteId::generate(),
-            owner: p_owner.clone(),
-            text: "high level plan".into(),
-            done: false,
-            sort_order: 0,
-        };
-        store.insert_note(&project_note).unwrap();
-        let read = store.get_note(&project_note.id).unwrap().unwrap();
-        assert_eq!(read.owner, p_owner);
-
-        store.set_note_text(&note.id, "write MORE tests").unwrap();
-        store.set_note_done(&note.id, true).unwrap();
-        let read = store.get_note(&note.id).unwrap().unwrap();
-        assert_eq!(read.text, "write MORE tests");
-        assert!(read.done);
-        assert_eq!(read.owner, wt_owner);
-        assert_eq!(store.load_notes().unwrap().len(), 2);
-
-        store.delete_note(&note.id).unwrap();
-        assert!(store.get_note(&note.id).unwrap().is_none());
-
-        // Deleting the project cascades to its own notes AND (via the
-        // worktree) its worktrees' notes.
-        store.insert_note(&note).unwrap();
-        store.delete_project(&project.id).unwrap();
-        assert!(store.load_notes().unwrap().is_empty());
     }
 
     /// Read marks are keyed by PR URL and outlive the worktree they were
@@ -1251,18 +1161,19 @@ mod tests {
         assert!(store.get_link(&link.id).unwrap().is_none());
 
         // Links hang off the worktree: deleting the project cascades
-        // through it, same as notes.
+        // through it.
         store.insert_link(&link).unwrap();
         store.delete_project(&project.id).unwrap();
         assert!(store.load_links().unwrap().is_empty());
     }
 
-    /// Real upgrade path: a v9 database (notes still worktree-only) picks
-    /// up migration 10's table rebuild without losing any notes.
+    /// Real upgrade path: a v9 database still carrying `todos` rows walks
+    /// the whole chain — 10's rebuild, 15's rename, 21's DROP — and lands
+    /// with the table retired rather than erroring partway.
     #[test]
-    fn migration_10_preserves_existing_worktree_notes() {
+    fn migration_21_retires_notes_from_a_v9_database() {
         let path =
-            std::env::temp_dir().join(format!("nebula-mig10-test-{}.db", std::process::id()));
+            std::env::temp_dir().join(format!("nebula-mig21-test-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         {
             let conn = Connection::open(&path).unwrap();
@@ -1283,12 +1194,19 @@ mod tests {
         }
 
         let store = Store::open(&path).unwrap();
-        let notes = store.load_notes().unwrap();
-        assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0].owner, NoteOwner::Worktree(WorktreeId("w1".into())));
-        assert_eq!(notes[0].text, "old note");
-        assert!(notes[0].done);
-        assert_eq!(notes[0].sort_order, 3);
+        // The project survived the walk; neither the original table name nor
+        // the renamed one is left behind.
+        assert_eq!(store.load_tree().unwrap().0.len(), 1);
+        let conn = store.conn.lock().unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('notes', 'todos')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
+        drop(conn);
         drop(store);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
@@ -1561,10 +1479,12 @@ mod tests {
             archived: false,
             archived_at: 0,
             pinned: false,
+            unseen: false,
             kind: AgentKind::Claude,
             model: None,
             effort: None,
             session_id: None,
+            cloud_session_id: None,
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
@@ -1684,10 +1604,12 @@ mod tests {
                     archived: false,
                     archived_at: 0,
                     pinned: false,
+                    unseen: false,
                     kind: AgentKind::Claude,
                     model: None,
                     effort: None,
                     session_id: None,
+                    cloud_session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: false,
@@ -1711,5 +1633,105 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// `Agent::unseen` rides along with the status: a live turn landing on
+    /// finished raises it, staying there keeps it, leaving drops it. Fresh
+    /// and archived rows never raise it, archiving takes it away, and a
+    /// daemon restart leaves finished rows — flag included — alone.
+    /// `mark_agent_seen` reports whether it had anything to clear.
+    #[test]
+    fn unseen_follows_the_status_and_clears_on_seen() {
+        let store = Store::open_in_memory().unwrap();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId::generate(),
+            name: "demo".into(),
+            repo_path: "/tmp/demo".into(),
+            sort_order: 0,
+        };
+        store.insert_project(&project).unwrap();
+        let worktree = Worktree {
+            id: WorktreeId::generate(),
+            project_id: project.id.clone(),
+            path: "/tmp/demo".into(),
+            branch: "main".into(),
+            is_main: true,
+            pinned: false,
+            sort_order: 0,
+        };
+        store.insert_worktree(&worktree).unwrap();
+        let seed = |name: &str, status: AgentStatus| {
+            let agent = Agent {
+                id: AgentId::generate(),
+                worktree_id: worktree.id.clone(),
+                name: name.into(),
+                status,
+                archived: false,
+                archived_at: 0,
+                pinned: false,
+                unseen: false,
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                session_id: None,
+                cloud_session_id: None,
+                sort_order: 0,
+                status_changed_at: 0,
+                alive: false,
+            };
+            store.insert_agent(&agent).unwrap();
+            agent.id
+        };
+        let unseen = |id: &AgentId| store.get_agent(id).unwrap().unwrap().unseen;
+        let flip =
+            |id: &AgentId, status: AgentStatus| store.set_agent_status(id, status).unwrap().1;
+
+        let a = seed("a", AgentStatus::Running);
+        assert!(!unseen(&a));
+        assert!(flip(&a, AgentStatus::Finished), "yellow → green raises it");
+        assert!(unseen(&a));
+        assert!(flip(&a, AgentStatus::Finished), "staying finished keeps it");
+        assert!(!flip(&a, AgentStatus::Running), "a new turn drops it");
+        assert!(!unseen(&a));
+        assert!(!flip(&a, AgentStatus::NeedsFeedback));
+        assert!(
+            flip(&a, AgentStatus::Finished),
+            "red → green is a finish too"
+        );
+        assert!(
+            store.mark_agent_seen(&a).unwrap(),
+            "there was something to clear"
+        );
+        assert!(!unseen(&a));
+        assert!(
+            !store.mark_agent_seen(&a).unwrap(),
+            "already clear: nothing to broadcast"
+        );
+
+        // The tree load carries it, same as the single-row read.
+        flip(&a, AgentStatus::Running);
+        flip(&a, AgentStatus::Finished);
+        let (_, _, agents, _) = store.load_tree().unwrap();
+        assert!(agents.iter().find(|x| x.id == a).unwrap().unseen);
+
+        // Archiving takes it away, and an archived row never raises it.
+        store.set_agent_archived(&a, true).unwrap();
+        assert!(!unseen(&a));
+        flip(&a, AgentStatus::Running);
+        assert!(
+            !flip(&a, AgentStatus::Finished),
+            "archived rows are out of sight"
+        );
+
+        // A Stop nebula never saw the prompt for is not a yellow → green.
+        let b = seed("b", AgentStatus::Fresh);
+        assert!(!flip(&b, AgentStatus::Finished));
+
+        // A daemon restart disconnects live rows and leaves finished ones alone.
+        let c = seed("c", AgentStatus::Running);
+        assert!(flip(&c, AgentStatus::Finished));
+        store.sweep_disconnected().unwrap();
+        assert!(unseen(&c), "still waiting to be read after the restart");
     }
 }

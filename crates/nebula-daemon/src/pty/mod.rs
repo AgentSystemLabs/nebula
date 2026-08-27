@@ -1,8 +1,10 @@
+pub mod cloud;
 pub mod kitty;
 pub mod progress;
 pub mod ring;
 
 use anyhow::{Context, Result};
+use cloud::CloudScanner;
 use nebula_core::SessionRef;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use progress::ProgressScanner;
@@ -45,6 +47,14 @@ pub enum PtyEvent {
     Progress {
         busy: bool,
     },
+    /// The child printed the id of the Claude Cloud session it created or
+    /// attached to. Only scanned for on `--cloud` launches (`arm_cloud_scan`).
+    CloudSession {
+        id: String,
+    },
+    /// The child refused to attach to a cloud session ("not enabled for
+    /// your account"); it exits right after. Likewise `--cloud` launches only.
+    CloudAttachRejected,
 }
 
 enum ReaderMsg {
@@ -69,6 +79,9 @@ pub struct PtySession {
     kitty: Mutex<kitty::KittyScanner>,
     /// OSC 9;4 busy/idle tracking, likewise fed from live output.
     progress: Mutex<ProgressScanner>,
+    /// Claude Cloud session id / attach-refusal scanner; `None` until a
+    /// `--cloud` launch arms it, so ordinary sessions pay nothing.
+    cloud: Mutex<Option<CloudScanner>>,
 }
 
 pub struct SpawnSpec {
@@ -130,6 +143,7 @@ impl PtySession {
             last_size: Mutex::new((spec.cols, spec.rows)),
             kitty: Mutex::new(kitty::KittyScanner::new()),
             progress: Mutex::new(ProgressScanner::new()),
+            cloud: Mutex::new(None),
         });
 
         let (tx, rx) = mpsc::channel::<ReaderMsg>(READER_CHANNEL_BOUND);
@@ -238,6 +252,21 @@ impl PtySession {
     pub fn progress_busy(&self) -> Option<bool> {
         self.progress.lock().unwrap().busy()
     }
+
+    /// Start watching this child's output for the Claude Cloud session id
+    /// it prints on creation and for an attach refusal (see `pty::cloud`).
+    /// Output that already landed in the ring is scanned first, so arming
+    /// a moment after spawn cannot miss a fast-printing child; sightings
+    /// then arrive as `PtyEvent::CloudSession` / `CloudAttachRejected`.
+    pub fn arm_cloud_scan(&self) {
+        let mut scanner = CloudScanner::new();
+        let (_, replay) = self.snapshot(None);
+        let sightings = scanner.feed(&replay);
+        *self.cloud.lock().unwrap() = Some(scanner);
+        for sighting in sightings {
+            let _ = self.events.send(sighting.into());
+        }
+    }
 }
 
 /// PTY reads are blocking → dedicated thread per session. After EOF it reaps
@@ -289,6 +318,10 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
             }
         }
         let busy_edge = session.progress.lock().unwrap().feed(pending);
+        let cloud_sightings = match session.cloud.lock().unwrap().as_mut() {
+            Some(scanner) => scanner.feed(pending),
+            None => Vec::new(),
+        };
         let seq = session.ring.lock().unwrap().append(pending);
         let _ = session.events.send(PtyEvent::Output {
             seq,
@@ -301,6 +334,10 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
         if let Some(busy) = busy_edge {
             tracing::debug!(session = ?session.sref, busy, "child progress state changed");
             let _ = session.events.send(PtyEvent::Progress { busy });
+        }
+        for sighting in cloud_sightings {
+            tracing::info!(session = ?session.sref, ?sighting, "cloud sighting in child output");
+            let _ = session.events.send(sighting.into());
         }
     };
 

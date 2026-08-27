@@ -8,9 +8,9 @@ use crate::status::{AgentStatusMachine, Effect, HookEvent};
 use crate::store::Store;
 use anyhow::{bail, Context, Result};
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, EnterOutcome, Entity, EntityId, Link, LinkId, Note,
-    NoteId, NoteOwner, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab,
-    Workspace, WorkspaceId, Worktree, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
+    Agent, AgentId, AgentKind, AgentStatus, EnterOutcome, Entity, EntityId, Link, LinkId, Project,
+    ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree,
+    WorktreeId, MAX_CLOUD_PROMPT_BYTES,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -203,17 +203,18 @@ impl Daemon {
         for effect in effects {
             match effect {
                 Effect::SetStatus(status) => {
-                    let changed_at = match self.store.set_agent_status(agent_id, status) {
-                        Ok(stamp) => stamp,
+                    let (changed_at, unseen) = match self.store.set_agent_status(agent_id, status) {
+                        Ok(stamped) => stamped,
                         Err(e) => {
                             tracing::warn!(error = %e, "persist status failed");
-                            epoch_ms()
+                            (epoch_ms(), false)
                         }
                     };
                     self.broadcast(ServerEvent::StatusChanged {
                         agent: agent_id.clone(),
                         status,
                         changed_at,
+                        unseen,
                     });
                 }
                 Effect::SaveSessionId(sid) => {
@@ -418,7 +419,6 @@ impl Daemon {
             worktrees,
             agents,
             terminals,
-            notes: self.store.load_notes()?,
             links: self.store.load_links()?,
             pr_seen: self.store.load_pr_seen()?,
             ui_state: self.store.load_ui_state()?,
@@ -932,10 +932,12 @@ impl Daemon {
             archived: false,
             archived_at: 0,
             pinned: false,
+            unseen: false,
             kind,
             model,
             effort,
             session_id: None,
+            cloud_session_id: None,
             sort_order: 0,
             status_changed_at: epoch_ms(),
             alive: false,
@@ -949,7 +951,7 @@ impl Daemon {
                 &worktree,
                 80,
                 24,
-                cloud_prompt.as_deref(),
+                cloud_prompt.as_deref().map(CloudLaunch::Create),
                 None,
             );
             self.rollback_agent_on_spawn_error(&agent.id, spawned)?;
@@ -1034,10 +1036,12 @@ impl Daemon {
             archived: false,
             archived_at: 0,
             pinned: false,
+            unseen: false,
             kind,
             model: model.clone(),
             effort: effort.clone(),
             session_id: None,
+            cloud_session_id: None,
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
@@ -1592,6 +1596,20 @@ impl Daemon {
         Ok(())
     }
 
+    /// A client put this agent's session on screen: its unseen-finish flag
+    /// (`Agent::unseen`) is cleared, and every subscriber gets the row so
+    /// their counts drop together. Nothing is sent when the flag was
+    /// already clear — re-attaching to a session you've read is free.
+    pub fn mark_agent_seen(&self, id: &AgentId) -> Result<()> {
+        if self.store.mark_agent_seen(id)? {
+            let agent = self.agent_entity(id)?;
+            self.broadcast(ServerEvent::EntityUpserted {
+                entity: Entity::Agent(agent),
+            });
+        }
+        Ok(())
+    }
+
     pub fn delete_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
         self.kill_session(&SessionRef::Agent(id.clone()));
         self.last_cwd.lock().unwrap().remove(id);
@@ -1603,10 +1621,17 @@ impl Daemon {
         Ok(())
     }
 
-    pub fn restart_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
+    pub async fn restart_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
         let agent = self.store.get_agent(id)?.context("agent not found")?;
         if agent.archived {
             bail!("agent is archived — unarchive it first");
+        }
+        // A Cloud row that never became a local session has nothing to
+        // resume here: a plain restart would boot a bare CLI with no link
+        // to the work. Re-enter the cloud session instead. Once a teleport
+        // has produced a local session id, restarts resume that.
+        if agent.cloud_session_id.is_some() && agent.session_id.is_none() {
+            return self.attach_cloud_agent(id).await;
         }
         let worktree = self
             .store
@@ -1620,6 +1645,119 @@ impl Daemon {
             entity: Entity::Agent(broadcast_agent),
         });
         Ok(())
+    }
+
+    /// Re-enter the Claude Cloud session a row launched. The live attach
+    /// (`claude --cloud <id>`) is tried first; on an account without that
+    /// rollout the CLI refuses and dies, and the fallback armed by the
+    /// spawn teleports the session into a local one instead (same branch
+    /// and transcript, minus the live link). Either CLI switches the
+    /// checkout to the cloud branch — and teleport refuses a dirty tree
+    /// outright — so a row still sitting in the main checkout is first
+    /// re-homed into a worktree of its own; the user's checkout is never
+    /// the one that gets switched.
+    pub async fn attach_cloud_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
+        let agent = self.store.get_agent(id)?.context("agent not found")?;
+        if agent.archived {
+            bail!("agent is archived — unarchive it first");
+        }
+        let Some(cloud_id) = agent.cloud_session_id.clone() else {
+            bail!("session was not launched in Claude Cloud");
+        };
+        let mut worktree = self
+            .store
+            .get_worktree(&agent.worktree_id)?
+            .context("worktree not found")?;
+        if worktree.is_main {
+            let branch = cloud_worktree_branch(&cloud_id);
+            let EntityId::Worktree(target) = self
+                .create_worktree(&worktree.project_id, &branch, None)
+                .await?
+            else {
+                bail!("worktree create returned a non-worktree entity");
+            };
+            worktree = self
+                .store
+                .get_worktree(&target)?
+                .context("worktree not found")?;
+            // Same invalidation as a deliberate move: the remembered hook
+            // cwd points at the old checkout and would sync the row back.
+            self.last_cwd.lock().unwrap().remove(id);
+            self.store.set_agent_worktree(id, &target)?;
+            tracing::info!(agent = %id, branch, "cloud row re-homed into its own worktree");
+        }
+        self.kill_session(&SessionRef::Agent(id.clone()));
+        self.spawn_agent_session_with(
+            &agent,
+            &worktree,
+            80,
+            24,
+            Some(CloudLaunch::Attach(&cloud_id)),
+            None,
+        )?;
+        let entity = self.agent_entity(id)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Agent(entity),
+        });
+        Ok(())
+    }
+
+    /// `claude --cloud <id>` on an account without the attach rollout
+    /// prints "Attaching to an existing cloud session is not enabled for
+    /// your account." and exits. The refusal is *read* off the output
+    /// (`pty::cloud`), not inferred from the exit: a deliberate kill of an
+    /// attach that worked looks identical by exit code and must not spawn
+    /// anything. Once the refused child is gone, the same row is respawned
+    /// as `claude --teleport <id>` in the same worktree.
+    fn arm_cloud_attach_fallback(
+        self: &Arc<Self>,
+        agent: Agent,
+        worktree: Worktree,
+        session: Arc<PtySession>,
+        cloud_id: String,
+        cols: u16,
+        rows: u16,
+    ) {
+        let daemon = self.clone();
+        let mut rx = session.events.subscribe();
+        tokio::spawn(async move {
+            let mut rejected = false;
+            loop {
+                match rx.recv().await {
+                    Ok(PtyEvent::CloudAttachRejected) => rejected = true,
+                    Ok(PtyEvent::Exited { .. }) => break,
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+            if !rejected {
+                return;
+            }
+            // Archived, deleted, or moved inside the window: leave it be.
+            match daemon.store.get_agent(&agent.id) {
+                Ok(Some(current)) if !current.archived && current.worktree_id == worktree.id => {}
+                _ => return,
+            }
+            tracing::info!(agent = %agent.id, "cloud attach refused — teleporting the session locally");
+            match daemon.spawn_agent_session_with(
+                &agent,
+                &worktree,
+                cols,
+                rows,
+                Some(CloudLaunch::Teleport(&cloud_id)),
+                None,
+            ) {
+                Ok(_) => {
+                    if let Ok(entity) = daemon.agent_entity(&agent.id) {
+                        daemon.broadcast(ServerEvent::EntityUpserted {
+                            entity: Entity::Agent(entity),
+                        });
+                    }
+                }
+                Err(e) => tracing::warn!(agent = %agent.id, error = %e, "teleport spawn failed"),
+            }
+        });
     }
 
     // ---- terminals ----
@@ -1671,65 +1809,6 @@ impl Daemon {
         self.store.delete_terminal(id)?;
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Terminal(id.clone()),
-        });
-        Ok(())
-    }
-
-    // ---- notes ----
-
-    pub fn create_note(self: &Arc<Self>, owner: &NoteOwner, text: &str) -> Result<EntityId> {
-        let text = text.trim();
-        if text.is_empty() {
-            bail!("note text is empty");
-        }
-        match owner {
-            NoteOwner::Project(id) => {
-                self.store.get_project(id)?.context("project not found")?;
-            }
-            NoteOwner::Worktree(id) => {
-                self.store.get_worktree(id)?.context("worktree not found")?;
-            }
-        }
-        let note = Note {
-            id: NoteId::generate(),
-            owner: owner.clone(),
-            text: text.to_string(),
-            done: false,
-            sort_order: self.store.next_note_sort_order(owner)?,
-        };
-        self.store.insert_note(&note)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Note(note.clone()),
-        });
-        Ok(EntityId::Note(note.id))
-    }
-
-    pub fn update_note(self: &Arc<Self>, id: &NoteId, text: &str) -> Result<()> {
-        let text = text.trim();
-        if text.is_empty() {
-            bail!("note text is empty");
-        }
-        self.store.set_note_text(id, text)?;
-        let note = self.store.get_note(id)?.context("note not found")?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Note(note),
-        });
-        Ok(())
-    }
-
-    pub fn set_note_done(self: &Arc<Self>, id: &NoteId, done: bool) -> Result<()> {
-        self.store.set_note_done(id, done)?;
-        let note = self.store.get_note(id)?.context("note not found")?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Note(note),
-        });
-        Ok(())
-    }
-
-    pub fn delete_note(self: &Arc<Self>, id: &NoteId) -> Result<()> {
-        self.store.delete_note(id)?;
-        self.broadcast(ServerEvent::EntityRemoved {
-            id: EntityId::Note(id.clone()),
         });
         Ok(())
     }
@@ -1867,19 +1946,21 @@ impl Daemon {
         self.spawn_agent_session_with(agent, worktree, cols, rows, None, None)
     }
 
-    /// The general spawn: `cloud_prompt` makes it the initial Claude Cloud
-    /// dispatch, `initial_prompt` a first turn the CLI submits on its own
+    /// The general spawn: `cloud` makes it a Claude Cloud launch (the
+    /// initial dispatch, or a later attach/teleport of the session it
+    /// created), `initial_prompt` a first turn the CLI submits on its own
     /// (the relocation notice a `nebula worktree` respawn opens with). Both
     /// are intentionally transient: later restarts/resumes follow the
-    /// persisted Agent fields and therefore use the plain local-session
-    /// path.
+    /// persisted Agent fields — a Cloud row's `cloud_session_id` routes a
+    /// restart back through `attach_cloud_agent`, everything else takes the
+    /// plain local-session path.
     fn spawn_agent_session_with(
         self: &Arc<Self>,
         agent: &Agent,
         worktree: &Worktree,
         cols: u16,
         rows: u16,
-        cloud_prompt: Option<&str>,
+        cloud: Option<CloudLaunch<'_>>,
         initial_prompt: Option<&str>,
     ) -> Result<Arc<PtySession>> {
         // Whatever spawns this agent, it runs in `worktree` from here: a
@@ -1907,9 +1988,9 @@ impl Daemon {
 
         // NEBULA_AGENT_CMD overrides for tests; default is the kind's CLI.
         let cmd_override = std::env::var("NEBULA_AGENT_CMD").ok();
-        let (program, args, resumed) = match cloud_prompt {
-            Some(prompt) => claude_cloud_spawn_command(
-                prompt,
+        let (program, args, resumed) = match cloud {
+            Some(launch) => claude_cloud_spawn_command(
+                launch,
                 agent.model.as_deref(),
                 agent.effort.as_deref(),
                 cmd_override.as_deref(),
@@ -1955,6 +2036,23 @@ impl Daemon {
         self.install_session(session.clone());
         if resumed {
             self.arm_resume_fallback(agent.clone(), worktree.clone(), session.clone(), cols, rows);
+        }
+        match cloud {
+            // The create prints the session id and (on accounts without
+            // the attach rollout) exits at once: capture it off the output.
+            Some(CloudLaunch::Create(_)) => session.arm_cloud_scan(),
+            Some(CloudLaunch::Attach(id)) => {
+                session.arm_cloud_scan();
+                self.arm_cloud_attach_fallback(
+                    agent.clone(),
+                    worktree.clone(),
+                    session.clone(),
+                    id.to_string(),
+                    cols,
+                    rows,
+                );
+            }
+            Some(CloudLaunch::Teleport(_)) | None => {}
         }
         Ok(session)
     }
@@ -2101,6 +2199,28 @@ impl Daemon {
                             daemon.apply_hook_event(id, HookEvent::Progress { busy }, None);
                         }
                     }
+                    // The Cloud session this row launched, read off the
+                    // `claude --cloud` output. Persisted at once — the child
+                    // is typically gone within milliseconds of printing it —
+                    // and re-broadcast so the row grows its `cloud` badge and
+                    // its attach menu entry.
+                    Ok(PtyEvent::CloudSession { id: cloud_id }) => {
+                        if let SessionRef::Agent(id) = &sref {
+                            match daemon.store.set_agent_cloud_session_id(id, Some(&cloud_id)) {
+                                Ok(()) => {
+                                    tracing::info!(agent = %id, cloud_session = %cloud_id, "cloud session id captured");
+                                    if let Ok(agent) = daemon.agent_entity(id) {
+                                        daemon.broadcast(ServerEvent::EntityUpserted {
+                                            entity: Entity::Agent(agent),
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(agent = %id, error = %e, "cloud session id not persisted")
+                                }
+                            }
+                        }
+                    }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         // A fire-hosing child can push progress edges off the
@@ -2238,13 +2358,38 @@ fn agent_spawn_command_with(
     (program, args, resumed)
 }
 
-/// Cloud creation is a one-shot variation of the normal fresh-Claude
-/// command. Keeping it as a wrapper leaves every resume/restart caller on
+/// How a Claude PTY enters the Cloud: dispatch a fresh task, attach live
+/// to the session it created, or teleport that session into a local one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloudLaunch<'a> {
+    Create(&'a str),
+    Attach(&'a str),
+    Teleport(&'a str),
+}
+
+/// Branch (and so directory) of the worktree a Cloud row is re-homed into
+/// before attaching: the CLI checks the cloud branch out on top of it, so
+/// the name only has to be stable per session and safe for git.
+fn cloud_worktree_branch(cloud_id: &str) -> String {
+    let suffix: String = cloud_id
+        .trim_start_matches("session_")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let tail = suffix.len().saturating_sub(8);
+    format!("cloud-{}", &suffix[tail..])
+}
+
+/// Cloud launches are one-shot variations of the normal fresh-Claude
+/// command. Keeping them a wrapper leaves every resume/restart caller on
 /// the persisted local-session contract, and makes the no-override argument
 /// shape directly unit-testable. No worktree guidance either: the Cloud
-/// sandbox has no nebula CLI to follow it with.
+/// sandbox has no nebula CLI to follow it with. Values bind with `=`
+/// (`--cloud=<task>`, `--cloud=<id>`, `--teleport=<id>`): both flags take an
+/// *optional* value, so a separate argv item that starts with `--` would be
+/// parsed as another Claude flag.
 fn claude_cloud_spawn_command(
-    prompt: &str,
+    launch: CloudLaunch<'_>,
     model: Option<&str>,
     effort: Option<&str>,
     cmd_override: Option<&str>,
@@ -2259,9 +2404,12 @@ fn claude_cloud_spawn_command(
         false,
     );
     if cmd_override.is_none() {
-        // Bind the optional value to its option. A separate argv item that
-        // starts with `--` would otherwise be parsed as another Claude flag.
-        args.insert(0, format!("--cloud={prompt}"));
+        let flag = match launch {
+            CloudLaunch::Create(task) => format!("--cloud={task}"),
+            CloudLaunch::Attach(id) => format!("--cloud={id}"),
+            CloudLaunch::Teleport(id) => format!("--teleport={id}"),
+        };
+        args.insert(0, flag);
     }
     (program, args, resumed)
 }
@@ -2579,7 +2727,7 @@ mod tests {
     fn spawn_command_claude_cloud_passes_the_task_as_one_argument() {
         assert_eq!(
             claude_cloud_spawn_command(
-                "Fix auth\nRun tests; don't stop",
+                CloudLaunch::Create("Fix auth\nRun tests; don't stop"),
                 Some("opus"),
                 Some("high"),
                 None,
@@ -2597,8 +2745,62 @@ mod tests {
             )
         );
         assert_eq!(
-            claude_cloud_spawn_command("--dangerously-skip-permissions", None, None, None).1,
+            claude_cloud_spawn_command(
+                CloudLaunch::Create("--dangerously-skip-permissions"),
+                None,
+                None,
+                None
+            )
+            .1,
             vec!["--cloud=--dangerously-skip-permissions"]
+        );
+    }
+
+    #[test]
+    fn spawn_command_cloud_attach_and_teleport_bind_the_id() {
+        let id = "session_016SiQW5Lem2LbnUf1A3undt";
+        assert_eq!(
+            claude_cloud_spawn_command(CloudLaunch::Attach(id), None, None, None),
+            ("claude".into(), vec![format!("--cloud={id}")], false)
+        );
+        assert_eq!(
+            claude_cloud_spawn_command(CloudLaunch::Teleport(id), Some("opus"), None, None),
+            (
+                "claude".into(),
+                vec![format!("--teleport={id}"), "--model".into(), "opus".into()],
+                false
+            )
+        );
+        // Overrides (tests) stay verbatim — no cloud flag at all.
+        assert_eq!(
+            claude_cloud_spawn_command(CloudLaunch::Attach(id), None, None, Some("/bin/true")).1,
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn cloud_worktree_branch_is_short_and_git_safe() {
+        assert_eq!(
+            cloud_worktree_branch("session_016SiQW5Lem2LbnUf1A3undt"),
+            "cloud-f1A3undt"
+        );
+        assert_eq!(cloud_worktree_branch("session_ab"), "cloud-ab");
+        assert_eq!(cloud_worktree_branch("session_"), "cloud-");
+    }
+
+    #[tokio::test]
+    async fn attach_cloud_agent_requires_a_cloud_session() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "w", "/tmp", true);
+        seed_agent(&daemon, "local", "w", None);
+        let err = daemon
+            .attach_cloud_agent(&AgentId("local".into()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not launched in Claude Cloud"),
+            "{err}"
         );
     }
 
@@ -2774,10 +2976,12 @@ mod tests {
                 archived: false,
                 archived_at: 0,
                 pinned: false,
+                unseen: false,
                 kind: AgentKind::Claude,
                 model: None,
                 effort: None,
                 session_id: session_id.map(str::to_string),
+                cloud_session_id: None,
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: false,
@@ -2955,10 +3159,12 @@ mod tests {
                     archived: false,
                     archived_at: 0,
                     pinned: false,
+                    unseen: false,
                     kind: AgentKind::Claude,
                     model: None,
                     effort: None,
                     session_id: None,
+                    cloud_session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: false,
@@ -3650,5 +3856,59 @@ mod tests {
         assert_eq!(default_order, ["b", "a"], "a swapped with b, not x");
         let x = projects.iter().find(|p| p.name == "x").unwrap();
         assert_eq!(x.sort_order, 1, "other workspace untouched");
+    }
+
+    /// The status broadcast carries the flag it persisted: a live turn
+    /// landing on finished says `unseen`, the next prompt says not.
+    #[test]
+    fn status_broadcast_carries_the_unseen_flag() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_agent(&daemon, "a1", "root", None); // running
+        let id = AgentId("a1".into());
+        let mut rx = daemon.events.subscribe();
+
+        daemon.apply_status_effects(&id, vec![Effect::SetStatus(AgentStatus::Finished)]);
+        match rx.try_recv().unwrap() {
+            ServerEvent::StatusChanged { status, unseen, .. } => {
+                assert_eq!(status, AgentStatus::Finished);
+                assert!(unseen, "yellow → green with nobody told otherwise");
+            }
+            other => panic!("expected a status change, got {other:?}"),
+        }
+        daemon.apply_status_effects(&id, vec![Effect::SetStatus(AgentStatus::Running)]);
+        match rx.try_recv().unwrap() {
+            ServerEvent::StatusChanged { unseen, .. } => {
+                assert!(!unseen, "a new turn: nothing finished to read")
+            }
+            other => panic!("expected a status change, got {other:?}"),
+        }
+    }
+
+    /// `mark_agent_seen` clears the flag and hands every subscriber the row
+    /// — once. Marking a row already read sends nothing.
+    #[test]
+    fn mark_agent_seen_broadcasts_only_a_flip() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_agent(&daemon, "a1", "root", None);
+        let id = AgentId("a1".into());
+        daemon
+            .store
+            .set_agent_status(&id, AgentStatus::Finished)
+            .unwrap();
+        let mut rx = daemon.events.subscribe();
+
+        daemon.mark_agent_seen(&id).unwrap();
+        match rx.try_recv().unwrap() {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            } => assert!(!a.unseen),
+            other => panic!("expected agent upsert, got {other:?}"),
+        }
+        daemon.mark_agent_seen(&id).unwrap();
+        assert!(rx.try_recv().is_err(), "nothing to say twice");
     }
 }

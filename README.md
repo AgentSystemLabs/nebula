@@ -100,7 +100,13 @@ opens it in the browser, and `/` finds it by title. Only the row you actually st
 run — **Claude**, **Codex**, **Cursor**, or a plain **Terminal (shell)**. `→` on Claude or Codex drills
 into model and reasoning-effort submenus; `Enter` anywhere takes your configured defaults. On the
 Claude row, `Tab` toggles Cloud mode: after the optional name, enter the task in the wrapped editor
-(`Shift+Enter` or `Ctrl+J` adds a line) and nebula launches `claude --cloud <task>`. Otherwise, name the session or
+(`Shift+Enter` or `Ctrl+J` adds a line) and nebula launches `claude --cloud <task>`. On accounts without
+Claude's live-attach rollout the CLI prints the session URL and exits; nebula keeps the session id it printed
+(the row gets a `cloud` badge) so you never need the browser to get back in: **Restart** the row — or pick
+**Attach cloud session** from its menu — and nebula runs `claude --cloud <id>`, falling back to
+`claude --teleport <id>` (the transcript and branch pulled into a local session) when the account can't attach.
+Either way the CLI switches the checkout to the cloud branch, so a row still in the main checkout is first
+re-homed into a `cloud-<id>` worktree of its own. Otherwise, name the session or
 accept the default and nebula spawns the CLI in that worktree and drops you straight into it.
 
 **5. Leave — it keeps running.** `Ctrl+q` gets you out of the terminal and back to the panels. That's the
@@ -136,6 +142,14 @@ carrying the rolled-up status of the agents under it, `s` opens settings, `?` li
 
 Worktree and project rows roll up their children: red beats yellow beats green.
 
+A dot going green while you were looking elsewhere is easy to miss, so nebula counts those for you:
+when a running (or red) session finishes a turn that isn't in the pane on screen, its worktree and
+project rows grow a green `n new` badge — the number of terminals you have left to go read — and the
+session row itself says `new` where its harness name normally sits. Walking the cursor onto a session
+previews it, which reads it: the badges count down as you go and disappear at zero. The flag lives in
+the daemon, so it survives closing the TUI and is shared by every client; a turn that finishes in the
+pane you're already looking at never counts.
+
 ## Working a worktree
 
 The panels aren't the only view. With a worktree selected, from any panel:
@@ -146,7 +160,6 @@ The panels aren't the only view. With a worktree selected, from any panel:
 | **`f`** | **Find file.** Fuzzy finder over the worktree. `Enter` opens the file in an editor modal (vim by default; the `editor` setting or `NEBULA_EDITOR` picks another), `Ctrl+y` copies the path — ready to paste into an agent. |
 | **`F`** | **Find in files.** `git grep` into the same modal; `Enter` opens the hit at its line. |
 | **`b`** | **File tree browser.** Tree on the left, syntax-highlighted preview on the right, and an always-live filter that narrows the tree to matching files and the directories holding them. |
-| **`e`** | **Notes.** Free-text notes pinned to a project or a worktree. |
 | **`l`** | **Links.** Pin a PR, doc or ticket URL to the worktree; it shows up in the Sessions panel's LINKS group. nebula also finds the pull request already open on the branch with `gh` and lists it there on its own, with a count of the comments that landed while you were away. |
 | **`p`** | **Pin.** Pinned worktrees and agents sort to the top of their panel and are spared by the idle reaper. |
 
@@ -195,7 +208,7 @@ The panels aren't the only view. With a worktree selected, from any panel:
   sessions can run the same command; they resume silent and wait for your next prompt. The restart is
   the only way there: an agent CLI can't `cd` out of the directory it was started in.
 - **Everything persists in SQLite** (`~/.local/share/nebula/nebula.db` or the platform equivalent):
-  projects, worktrees, agents (with kind + CLI session ids), notes, links, workspaces, pins, and your
+  projects, worktrees, agents (with kind + CLI session ids), links, workspaces, pins, and your
   last selection.
 - **Sessions warm up, then get reaped.** The daemon can pre-spawn an agent CLI while you're still naming
   the session, and pre-boot a worktree's dead sessions while your selection rests on it, so attaching
@@ -237,7 +250,6 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Projects | `Shift+J/K` | move project up / down the list (`Shift+↑/↓` too, but Terminal.app never sends those) |
 | Worktrees | `n` / `d` | new worktree / delete (typed confirm — deletes files) |
 | New worktree | type a sentence, or `Enter` on the empty prompt | the branch name is slugified (`fix login redirect` → `fix-login-redirect`); empty takes a random `<adj>-<noun>-<verb>` |
-| Projects / Worktrees | `e` | notes for the selected project / worktree |
 | Worktrees / Sessions | `p` | pin / unpin — pinned rows sort to the top and skip the idle reaper |
 | Sessions | `n` | new session (agent or shell terminal) |
 | New session picker (Claude) | `Tab` | toggle Claude Cloud; Cloud adds a wrapped task prompt (`Shift+Enter` or `Ctrl+J` inserts a line) before launch |
@@ -249,10 +261,10 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Any panel | `Shift+L` | attach a link (pull request, doc, ticket) to the selected worktree — it lands in the Sessions panel's LINKS group, above any open pull request nebula finds with `gh` |
 | Sessions | `Enter` / `r` / `d` on a link | open it in the browser / edit its URL / delete it (the detected pull request opens but can't be edited or deleted) |
 | Any panel | `t` | new shell terminal in the selected worktree's directory (Projects panel: the repo root) |
-| Any panel | `w` or click the `◇ workspace` nameplate bottom-left | workspace switcher: `Enter` opens, `n`/`r`/`d` create/rename/delete (the panels scope to the open workspace; `/` doesn't, and switches for you). Per window — switching here leaves your other nebula instances on the workspace you left them on |
+| Any panel | `w` or click the `◇ workspace` nameplate bottom-left | workspace switcher: `Enter` opens, `n`/`r`/`d` create/rename/delete — delete asks first (the panels scope to the open workspace; `/` doesn't, and switches for you). Per window — switching here leaves your other nebula instances on the workspace you left them on |
 | Any panel | `Shift+W` | show / hide the Workspaces bar across the top: `WORKSPACES` on the left, directly above `PROJECTS`, and one tab per workspace to its right with the rolled-up status of the agents under it (plus a count of the ones running), so a run in a workspace you don't have open still shows at the top level. The choice is remembered — it's the `Workspaces bar` setting, also in Settings → Appearance |
 | Any panel | `1`–`9` (or `⌘1`–`⌘9`) | open that numbered tab in the Workspaces bar without leaving the panel you're in. `⌘` is what the tabs advertise, but Terminal.app and most other emulators never encode it into pty bytes — the bare digit is the one that always arrives. Rebindable per slot in Settings → Hotkeys |
-| Workspaces | `←/→`, `↓`/`Enter`, `n`/`r`/`d`, `m` | the cursor is the open workspace, so `←/→` switches; `↓` or `Enter` steps down into Projects; create / rename / delete the open one (delete refuses a non-empty workspace); `m` or right-click lists the same verbs |
+| Workspaces | `←/→`, `↓`/`Enter`, `n`/`r`/`d`, `m` | the cursor is the open workspace, so `←/→` switches; `↓` or `Enter` steps down into Projects; create / rename / delete the open one (delete asks first, and refuses a non-empty workspace); `m` or right-click lists the same verbs |
 | Any panel | `Shift+H` | ssh hosts: every `nebula ssh` destination, newest first. `Enter`/click reconnects (quits this TUI and execs a fresh `nebula ssh` — local sessions keep running), `a` types a new `user@host [dir]`, `d` removes |
 | Any panel | `m` or right-click | context menu |
 | Any panel | `z` | full-screen terminal: collapse the sidebars and lock input into the attached session |

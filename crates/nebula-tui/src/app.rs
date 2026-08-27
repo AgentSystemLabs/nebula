@@ -4,8 +4,8 @@ use crate::git_diff::DiffFile;
 use crate::pull_request::{OpenPr, PrDetail, PullRequest};
 use crate::text_input::TextInput;
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Note, NoteId, NoteOwner, Project,
-    ProjectId, SessionRef, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
+    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Project, ProjectId, SessionRef,
+    TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
 };
 use ratatui::layout::Rect;
 use std::collections::HashMap;
@@ -85,6 +85,9 @@ pub const MIN_DIFF_PANE_W: u16 = 24;
 pub enum MenuAction {
     Attach(SessionRef),
     RestartAgent(AgentId),
+    /// Re-enter the Claude Cloud session a row launched (see
+    /// `ClientRequest::AttachCloudAgent`).
+    AttachCloudAgent(AgentId),
     RenameAgent(AgentId),
     ArchiveAgent(AgentId),
     UnarchiveAgent(AgentId),
@@ -110,8 +113,6 @@ pub enum MenuAction {
     RenameTerminal(TerminalId),
     CloseTerminal(TerminalId),
     NewWorktree(ProjectId),
-    /// Open the note modal for this owner (project or worktree).
-    OpenNotes(NoteOwner),
     /// Attach a URL to this worktree (prompts for it).
     NewLink(WorktreeId),
     /// Hand a link row's URL to the browser.
@@ -128,7 +129,7 @@ pub enum MenuAction {
     RemoveProject(ProjectId),
     /// Workspace-switcher row: open this workspace. The switcher's other
     /// verbs are keys, not rows — n: new, r: rename, d: delete (footer
-    /// hints, the notes-modal pattern).
+    /// hints).
     OpenWorkspace(WorkspaceId),
     /// The Workspaces column's menu rows: the switcher's n / r / d verbs,
     /// for a mouse that never learned the keys.
@@ -267,6 +268,14 @@ pub enum PendingAction {
         terminals: Vec<TerminalId>,
     },
     RemoveProject(ProjectId),
+    /// `d` on a workspace — the column, its menu, or the `w` switcher.
+    /// `reopen_picker` is the switcher's hover row when the confirm came
+    /// from there: both answers put the switcher back, hover intact, so
+    /// the EntityRemoved delta drops the row in place as before.
+    RemoveWorkspace {
+        id: WorkspaceId,
+        reopen_picker: Option<usize>,
+    },
     DeleteLink(LinkId),
     /// `R` in the settings overlay: rewrite config.json from the defaults
     /// (every setting and every hotkey), then reopen the overlay on them.
@@ -1077,52 +1086,6 @@ impl GrepView {
     }
 }
 
-/// In-progress add/edit inside the note modal; keys feed `text` while set.
-#[derive(Debug, Clone)]
-pub struct NoteInput {
-    /// None = creating a new note; Some = rewriting that note's text.
-    pub editing: Option<NoteId>,
-    pub text: TextInput,
-}
-
-/// Note notes modal (`o`) for one owner — a project (high-level notes) or
-/// a worktree. The rows themselves live in `App::tree.notes` (kept fresh
-/// by upserts) — the view only holds the owner plus cursor/input state.
-#[derive(Debug, Clone)]
-pub struct NoteView {
-    pub owner: NoteOwner,
-    /// `project` or `project/branch`, for the modal title.
-    pub context: String,
-    /// Index into the owner's note rows.
-    pub selected: usize,
-    /// Active add/edit input, if any.
-    pub input: Option<NoteInput>,
-    /// Whole modal rect, written back during draw so clicks outside close.
-    pub area: Rect,
-    /// Screen rect of the note rows, written back during draw so clicks can
-    /// hit-test rows.
-    pub list_area: Rect,
-}
-
-impl NoteView {
-    pub fn new(owner: NoteOwner, context: String) -> Self {
-        Self {
-            owner,
-            context,
-            selected: 0,
-            input: None,
-            area: Rect::default(),
-            list_area: Rect::default(),
-        }
-    }
-
-    /// First visible row of the list's stateless follow-window for a list of
-    /// `height` rows.
-    pub fn window_start(&self, height: usize) -> usize {
-        (self.selected + 1).saturating_sub(height)
-    }
-}
-
 /// Recent-hosts modal (`h`): destinations remembered by `nebula ssh`.
 /// Enter (or a click) quits the TUI and execs a fresh `nebula ssh` at the
 /// selected entry; `a` types a new destination, `d` forgets one. The rows
@@ -1289,7 +1252,6 @@ pub enum Overlay {
     Files(FileFinder),
     Grep(GrepView),
     Tree(crate::tree_browser::TreeBrowser),
-    Notes(NoteView),
     Metrics(MetricsView),
     Hosts(HostsView),
 }
@@ -1320,8 +1282,6 @@ pub enum PendingIntent {
     SelectCreatedProject,
     /// Select the created worktree in the Worktrees panel.
     SelectCreatedWorktree,
-    /// Move the note modal's cursor onto the created note.
-    SelectCreatedNote,
     /// Move the Sessions panel's cursor onto the link just created.
     SelectCreatedLink,
     /// Open the workspace this Ack just created (switcher's "New workspace…"
@@ -1520,6 +1480,25 @@ pub fn workspace_running(tree: &Tree, workspace_id: &WorkspaceId) -> usize {
         .count()
 }
 
+/// How many sessions under a worktree finished a turn nobody has looked at
+/// yet (`Agent::unseen`) — the row's count badge, the number of terminals
+/// to go read. Archived rows are out of sight, so they don't count.
+pub fn worktree_unseen(tree: &Tree, worktree_id: &WorktreeId) -> usize {
+    tree.agents
+        .iter()
+        .filter(|a| &a.worktree_id == worktree_id && !a.archived && a.unseen)
+        .count()
+}
+
+/// The same count over every worktree of a project.
+pub fn project_unseen(tree: &Tree, project_id: &ProjectId) -> usize {
+    tree.worktrees
+        .iter()
+        .filter(|w| &w.project_id == project_id)
+        .map(|w| worktree_unseen(tree, &w.id))
+        .sum()
+}
+
 /// Every unarchived agent under every project in a workspace.
 fn workspace_agents<'a>(
     tree: &'a Tree,
@@ -1606,7 +1585,6 @@ pub struct Tree {
     pub worktrees: Vec<Worktree>,
     pub agents: Vec<Agent>,
     pub terminals: Vec<TerminalTab>,
-    pub notes: Vec<Note>,
     pub links: Vec<Link>,
 }
 
@@ -1876,8 +1854,6 @@ pub struct App {
     pub select_project_when_seen: Option<ProjectId>,
     /// Worktree created by us, awaiting its upsert to fix the selection.
     pub select_worktree_when_seen: Option<WorktreeId>,
-    /// Note created by us, awaiting its upsert to land the modal's cursor.
-    pub select_note_when_seen: Option<NoteId>,
     /// Link created by us, awaiting its upsert to land the panel cursor on
     /// the new row.
     pub select_link_when_seen: Option<LinkId>,
@@ -1887,6 +1863,11 @@ pub struct App {
     /// Last selected session per worktree — switching back to a worktree
     /// re-shows the session the user left it on.
     pub last_session_for_worktree: HashMap<WorktreeId, SessionRef>,
+    /// Last selected project per workspace — switching back to a workspace
+    /// returns to the project the user left it on, which is what makes the
+    /// worktree and session memory above reachable across a workspace
+    /// switch (they key off the project the cursor lands on).
+    pub last_project_for_workspace: HashMap<WorkspaceId, ProjectId>,
     /// Debounced session prewarm: the worktree whose dead sessions the
     /// daemon should pre-spawn once the selection has rested on it past the
     /// deadline — armed on every worktree context switch, so walking the
@@ -2087,10 +2068,10 @@ impl App {
             select_when_seen: None,
             select_project_when_seen: None,
             select_worktree_when_seen: None,
-            select_note_when_seen: None,
             select_link_when_seen: None,
             last_worktree_for_project: HashMap::new(),
             last_session_for_worktree: HashMap::new(),
+            last_project_for_workspace: HashMap::new(),
             pending_prewarm: None,
             next_keepwarm: None,
             term_selection: None,
@@ -2676,27 +2657,6 @@ impl App {
         Some(at.saturating_duration_since(std::time::Instant::now()))
     }
 
-    /// An owner's notes, in tree order (snapshot order; new ones append).
-    pub fn notes_for(&self, owner: &NoteOwner) -> Vec<&Note> {
-        self.tree
-            .notes
-            .iter()
-            .filter(|t| &t.owner == owner)
-            .collect()
-    }
-
-    /// (open, total) note counts for an owner — the row badges.
-    pub fn note_stats(&self, owner: &NoteOwner) -> (usize, usize) {
-        let total = self.tree.notes.iter().filter(|t| &t.owner == owner).count();
-        let open = self
-            .tree
-            .notes
-            .iter()
-            .filter(|t| &t.owner == owner && !t.done)
-            .count();
-        (open, total)
-    }
-
     /// Aggregate status for a worktree row: red > yellow > green > gray,
     /// archived agents excluded.
     pub fn worktree_rollup(&self, worktree_id: &WorktreeId) -> Option<AgentStatus> {
@@ -2713,6 +2673,15 @@ impl App {
 
     pub fn workspace_running(&self, workspace_id: &WorkspaceId) -> usize {
         workspace_running(&self.tree, workspace_id)
+    }
+
+    /// Sessions under a worktree that went green with nobody looking.
+    pub fn worktree_unseen(&self, worktree_id: &WorktreeId) -> usize {
+        worktree_unseen(&self.tree, worktree_id)
+    }
+
+    pub fn project_unseen(&self, project_id: &ProjectId) -> usize {
+        project_unseen(&self.tree, project_id)
     }
 
     /// First stop in the Tab walk (and where a cross-workspace jump lands):
@@ -2853,11 +2822,13 @@ mod tests {
             archived: false,
             archived_at: 0,
             pinned: false,
+            unseen: false,
             status_changed_at: 0,
             kind: AgentKind::Claude,
             model: None,
             effort: None,
             session_id: None,
+            cloud_session_id: None,
             sort_order: 0,
             alive: true,
         });

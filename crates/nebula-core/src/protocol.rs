@@ -1,14 +1,14 @@
 use crate::entities::{
-    Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Note, NoteOwner, Project, TerminalTab,
-    Workspace, Worktree,
+    Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Project, TerminalTab, Workspace,
+    Worktree,
 };
-use crate::ids::{AgentId, LinkId, NoteId, ProjectId, TerminalId, WorkspaceId, WorktreeId};
+use crate::ids::{AgentId, LinkId, ProjectId, TerminalId, WorkspaceId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 24;
+pub const PROTOCOL_VERSION: u32 = 27;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -224,30 +224,20 @@ pub enum ClientRequest {
         req_id: u64,
         id: AgentId,
     },
+    /// Re-enter the Claude Cloud session a row launched: `claude --cloud
+    /// <id>` for a live attach, which the daemon downgrades to `claude
+    /// --teleport <id>` when the account cannot attach. A row still sitting
+    /// in the main checkout is first re-homed into a worktree of its own,
+    /// because either CLI switches the checkout to the cloud branch.
+    /// Rejected for rows without a `cloud_session_id`.
+    AttachCloudAgent {
+        req_id: u64,
+        id: AgentId,
+    },
     CreateTerminal {
         req_id: u64,
         worktree: WorktreeId,
         name: Option<String>,
-    },
-    CreateNote {
-        req_id: u64,
-        owner: NoteOwner,
-        text: String,
-    },
-    /// Rewrite a note's text.
-    UpdateNote {
-        req_id: u64,
-        id: NoteId,
-        text: String,
-    },
-    SetNoteDone {
-        req_id: u64,
-        id: NoteId,
-        done: bool,
-    },
-    DeleteNote {
-        req_id: u64,
-        id: NoteId,
     },
     /// Pin a URL to a worktree. `url` is normalized daemon-side (a bare
     /// `github.com/...` gains an https:// scheme) and refused if it can't be
@@ -287,6 +277,13 @@ pub enum ClientRequest {
     MarkPrSeen {
         url: String,
         marker: String,
+    },
+
+    /// Fire-and-forget: this agent's session is on screen, so a turn it
+    /// finished unwatched (`Agent::unseen`) has now been looked at. The
+    /// daemon answers with the agent's upsert when the flag actually flips.
+    MarkAgentSeen {
+        id: AgentId,
     },
 
     /// One point-in-time memory reading — the daemon plus every live
@@ -367,7 +364,6 @@ pub enum ServerEvent {
         worktrees: Vec<Worktree>,
         agents: Vec<Agent>,
         terminals: Vec<TerminalTab>,
-        notes: Vec<Note>,
         links: Vec<Link>,
         /// How far the user has read into each pull request they've opened.
         pr_seen: Vec<PrSeen>,
@@ -403,6 +399,10 @@ pub enum ServerEvent {
         /// Epoch ms the change was stamped with (matches the persisted
         /// `status_changed_at`, so clients regroup consistently).
         changed_at: i64,
+        /// The agent's `unseen` flag after this change: set when a live
+        /// turn just finished, cleared when it left `finished`.
+        #[serde(default)]
+        unseen: bool,
     },
 
     // -- PTY plane (only to clients attached to that session) --

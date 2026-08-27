@@ -102,7 +102,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         worktrees: vec![],
                         agents: vec![],
                         terminals: vec![],
-                        notes: vec![],
                         links: vec![],
                         pr_seen: vec![],
                         ui_state: None,
@@ -226,6 +225,11 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientRequest::MarkPrSeen { url, marker } => {
                     let _ = daemon.store.mark_pr_seen(&url, &marker);
+                }
+                ClientRequest::MarkAgentSeen { id } => {
+                    if let Err(e) = daemon.mark_agent_seen(&id) {
+                        tracing::warn!(error = %e, "mark agent seen failed");
+                    }
                 }
                 ClientRequest::GetMetrics { req_id } => {
                     // A machine-wide `ps` sweep takes tens of ms; keep it off
@@ -471,7 +475,20 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     reply(&out_tx, req_id, daemon.delete_agent(&id).map(|_| None)).await;
                 }
                 ClientRequest::RestartAgent { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.restart_agent(&id).map(|_| None)).await;
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.restart_agent(&id).await.map(|_| None),
+                    )
+                    .await;
+                }
+                ClientRequest::AttachCloudAgent { req_id, id } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.attach_cloud_agent(&id).await.map(|_| None),
+                    )
+                    .await;
                 }
                 ClientRequest::CreateTerminal {
                     req_id,
@@ -484,32 +501,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         daemon.create_terminal(&worktree, name).map(Some),
                     )
                     .await;
-                }
-                ClientRequest::CreateNote {
-                    req_id,
-                    owner,
-                    text,
-                } => {
-                    reply(&out_tx, req_id, daemon.create_note(&owner, &text).map(Some)).await;
-                }
-                ClientRequest::UpdateNote { req_id, id, text } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.update_note(&id, &text).map(|_| None),
-                    )
-                    .await;
-                }
-                ClientRequest::SetNoteDone { req_id, id, done } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.set_note_done(&id, done).map(|_| None),
-                    )
-                    .await;
-                }
-                ClientRequest::DeleteNote { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.delete_note(&id).map(|_| None)).await;
                 }
                 ClientRequest::CreateLink {
                     req_id,
@@ -614,8 +605,13 @@ async fn forward_pty(
                 }
             }
             // Daemon-side only: the progress edge drives the status machine
-            // and reaches clients as a StatusChanged, not as session output.
-            Ok(PtyEvent::Progress { .. }) => {}
+            // and reaches clients as a StatusChanged, not as session output;
+            // the cloud sightings reach them as the row's own upsert.
+            Ok(
+                PtyEvent::Progress { .. }
+                | PtyEvent::CloudSession { .. }
+                | PtyEvent::CloudAttachRejected,
+            ) => {}
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                 // Catch up from the ring. If the missed bytes are still
                 // retained, send them as a plain Output continuation so the

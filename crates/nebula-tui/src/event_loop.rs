@@ -2,9 +2,9 @@
 
 use crate::app::{
     App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder, Focus,
-    GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, NoteInput, NoteView, Overlay,
-    Palette, PaletteTarget, PendingAction, PendingIntent, PointerShape, PromptDialog, PromptKind,
-    RowKey, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection, WorktreeRollback,
+    GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, Overlay, Palette,
+    PaletteTarget, PendingAction, PendingIntent, PointerShape, PromptDialog, PromptKind, RowKey,
+    SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection, WorktreeRollback,
 };
 use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
@@ -17,8 +17,8 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use nebula_core::{
-    AgentId, AgentKind, ClientRequest, EntityId, LinkId, NoteId, NoteOwner, ProjectId, ServerEvent,
-    SessionRef, WorkspaceId, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
+    AgentId, AgentKind, ClientRequest, EntityId, LinkId, ProjectId, ServerEvent, SessionRef,
+    WorkspaceId, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -1057,8 +1057,8 @@ fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientReques
                 vim.input(&data);
             }
         }
-        // An overlay with a live text field takes the paste: ⌘V into a note,
-        // a filter, or the ssh destination lands where the caret is.
+        // An overlay with a live text field takes the paste: ⌘V into a
+        // filter or the ssh destination lands where the caret is.
         Event::Paste(text) if paste_into_overlay(app, &text) => {}
         Event::Paste(text) => {
             if app.focus == Focus::Terminal && app.term_locked {
@@ -1117,11 +1117,7 @@ fn paste_into_overlay(app: &mut App, text: &str) -> bool {
                 crate::git_diff::load_selected_diff(view);
             }
         }
-        // These two only type while their add/edit input is open.
-        Overlay::Notes(view) => match &mut view.input {
-            Some(input) => input.text.insert_str(text),
-            None => return false,
-        },
+        // Only types while its add/edit input is open.
         Overlay::Hosts(view) => match &mut view.input {
             Some(input) => input.insert_str(text),
             None => return false,
@@ -1512,13 +1508,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 )));
             }
         }
-        Action::Delete => match app.focus {
-            Focus::Workspaces => {
-                let id = app.tree.active_workspace.clone();
-                remove_workspace(app, id, out);
-            }
-            _ => open_delete_confirm(app),
-        },
+        Action::Delete => open_delete_confirm(app),
         // Delete EVERY row of the focused panel (behind a confirm that
         // lists the casualties).
         Action::DeleteAll => open_delete_all_confirm(app),
@@ -1533,7 +1523,6 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::AddProject => open_prompt(app, PromptKind::AddProject),
         Action::FindFile => open_file_finder(app),
         Action::Grep => open_grep_view(app),
-        Action::Notes => open_note_view(app),
         Action::TreeBrowser => open_tree_browser(app),
         // New shell terminal, spawned in the worktree's directory.
         // (Cmd+T never reaches a TUI — the emulator opens its own tab.)
@@ -1762,55 +1751,6 @@ fn restore_reviewed_marks(view: &mut DiffView) {
 /// Fuzzy file finder over every tracked + untracked file of the selected
 /// worktree (`f`). Same shell as `open_diff_view`: flash instead of opening
 /// when there's no worktree, the path is gone, or git fails.
-/// Open the note modal (`o`): the project's own notes from the Projects
-/// panel, the selected worktree's notes elsewhere (falling back to the
-/// project when it has no worktrees yet).
-fn open_note_view(app: &mut App) {
-    let owner = if app.focus == Focus::Projects {
-        app.selected_project()
-            .map(|p| NoteOwner::Project(p.id.clone()))
-    } else {
-        app.selected_worktree()
-            .map(|w| NoteOwner::Worktree(w.id.clone()))
-            .or_else(|| {
-                app.selected_project()
-                    .map(|p| NoteOwner::Project(p.id.clone()))
-            })
-    };
-    let Some(owner) = owner else {
-        app.flash = Some("select a project or worktree first".into());
-        return;
-    };
-    open_notes_for_owner(app, owner);
-}
-
-fn open_notes_for_owner(app: &mut App, owner: NoteOwner) {
-    let context = match &owner {
-        NoteOwner::Project(id) => {
-            let Some(project) = app.tree.projects.iter().find(|p| &p.id == id) else {
-                return;
-            };
-            project.name.clone()
-        }
-        NoteOwner::Worktree(id) => {
-            let Some(worktree) = app.tree.worktrees.iter().find(|w| &w.id == id) else {
-                return;
-            };
-            let project = app
-                .tree
-                .projects
-                .iter()
-                .find(|p| p.id == worktree.project_id);
-            format!(
-                "{}/{}",
-                project.map(|p| p.name.as_str()).unwrap_or("?"),
-                worktree.branch
-            )
-        }
-    };
-    app.overlay = Some(Overlay::Notes(NoteView::new(owner, context)));
-}
-
 /// `Shift+H`: destinations remembered by `nebula ssh`, newest first. Opens even
 /// when empty — the modal's hint is how the feature introduces itself.
 fn open_hosts_picker(app: &mut App) {
@@ -2224,9 +2164,11 @@ fn open_delete_confirm(app: &mut App) {
             Some(SessionRow::Link(l)) => delete_link(app, &l),
             None => {}
         },
-        // The Workspaces column's `d` never reaches here (`Action::Delete`
-        // routes it to `remove_workspace`).
-        Focus::Workspaces | Focus::Terminal => {}
+        Focus::Workspaces => {
+            let id = app.tree.active_workspace.clone();
+            open_remove_workspace_confirm(app, id, None);
+        }
+        Focus::Terminal => {}
     }
 }
 
@@ -2384,7 +2326,7 @@ fn menu_items_for_link(row: &LinkRow) -> Vec<MenuItem> {
 }
 
 fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
-    if a.archived {
+    let mut items = if a.archived {
         vec![
             MenuItem {
                 label: "Unarchive".into(),
@@ -2430,7 +2372,25 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
                 destructive: true,
             },
         ]
+    };
+    // A Cloud row can always be re-entered explicitly — even after a
+    // teleport made it a local session that Restart now resumes, a fresh
+    // attach/teleport picks up whatever the cloud side did since.
+    if !a.archived && a.cloud_session_id.is_some() {
+        let after_restart = items
+            .iter()
+            .position(|i| matches!(i.action, MenuAction::RestartAgent(_)))
+            .map_or(items.len(), |i| i + 1);
+        items.insert(
+            after_restart,
+            MenuItem {
+                label: "Attach cloud session".into(),
+                action: MenuAction::AttachCloudAgent(a.id.clone()),
+                destructive: false,
+            },
+        );
     }
+    items
 }
 
 fn menu_items_for_terminal(t: &nebula_core::TerminalTab) -> Vec<MenuItem> {
@@ -2580,7 +2540,7 @@ fn kind_label(kind: AgentKind) -> &'static str {
 /// Workspace switcher (`w`): pick which workspace this instance shows. The
 /// active one is checked and starts highlighted; Enter switches here and
 /// here only — another nebula window on another workspace stays put.
-/// Management verbs are keys with footer hints, the notes-modal pattern:
+/// Management verbs are keys with footer hints:
 /// n creates (and opens) a workspace, r renames the hovered one, d deletes
 /// it. The list refreshes in place as workspace deltas arrive.
 fn open_workspace_picker(app: &mut App) {
@@ -2630,8 +2590,7 @@ fn open_workspace_picker(app: &mut App) {
 }
 
 /// Rebuild an open workspace switcher after the workspace list (or the ✓
-/// marker) changed under it, keeping the cursor row. The notes modal gets
-/// this for free by reading the tree at draw time; the menu's rows are
+/// marker) changed under it, keeping the cursor row. The menu's rows are
 /// snapshots, so refresh them here.
 /// Show `id` in THIS instance. Everything visible re-filters; the selection
 /// lands on the new workspace's first project with its remembered
@@ -2669,6 +2628,11 @@ fn switch_workspace_inner(
     app.tree.active_workspace = id.clone();
     app.sel_project = 0;
     if restore {
+        // Land on the project this workspace was left on before restoring
+        // the worktree and session, which are remembered per project and
+        // per worktree — restoring them against row 0 would bring back the
+        // wrong project's context.
+        restore_workspace_project(app);
         restore_context(app, out);
     }
     clamp_selections(app);
@@ -2700,13 +2664,51 @@ fn reseat_deleted_workspace(app: &mut App, out: &mut Vec<ClientRequest>) {
     switch_workspace(app, fallback, out);
 }
 
-/// Ask the daemon to delete a workspace — no confirm, the same as the
-/// switcher's `d`: it only deletes empty workspaces, so a refusal just
-/// flashes, and when the open one does go the deletion delta reseats this
-/// instance (`reseat_deleted_workspace`).
+/// Put a confirm in front of deleting a workspace — every path to it (the
+/// column's `d`, its menu, the `w` switcher's `d`) lands here. The daemon
+/// still guards the delete itself (only an empty workspace goes, never the
+/// last one), so a refusal after `y` just flashes. `reopen_picker` is the
+/// switcher's hover row when the confirm came from there.
+fn open_remove_workspace_confirm(app: &mut App, id: WorkspaceId, reopen_picker: Option<usize>) {
+    let Some(name) = app
+        .tree
+        .workspaces
+        .iter()
+        .find(|w| w.id == id)
+        .map(|w| w.name.clone())
+    else {
+        return;
+    };
+    app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+        title: "Delete workspace".into(),
+        // Two lines: the dialog is sized to its longest line, and one
+        // 85-column sentence would outgrow a narrow terminal.
+        message: format!(
+            "Delete workspace '{name}'?\nOnly an empty workspace can go — nothing on disk is touched."
+        ),
+        action: PendingAction::RemoveWorkspace { id, reopen_picker },
+    }));
+}
+
+/// Ask the daemon to delete a workspace (after the confirm): it only
+/// deletes empty workspaces, so a refusal just flashes, and when the open
+/// one does go the deletion delta reseats this instance
+/// (`reseat_deleted_workspace`).
 fn remove_workspace(app: &mut App, id: WorkspaceId, out: &mut Vec<ClientRequest>) {
     let req_id = app.alloc_req_id(PendingIntent::None);
     out.push(ClientRequest::RemoveWorkspace { req_id, id });
+}
+
+/// Bring the `w` switcher back after a confirm that replaced it, on the
+/// row it was on (clamped — the row may have just been deleted).
+fn reopen_workspace_picker(app: &mut App, hover: usize) {
+    if app.tree.workspaces.is_empty() {
+        return;
+    }
+    open_workspace_picker(app);
+    if let Some(Overlay::Menu(menu)) = &mut app.overlay {
+        menu.hover = hover.min(menu.items.len().saturating_sub(1));
+    }
 }
 
 /// The Workspaces column's menu (`m`, right-click): the switcher's n / r / d
@@ -2744,10 +2746,7 @@ fn refresh_workspace_picker(app: &mut App) {
         app.overlay = None; // nothing left to list
         return;
     }
-    open_workspace_picker(app);
-    if let Some(Overlay::Menu(menu)) = &mut app.overlay {
-        menu.hover = hover.min(menu.items.len().saturating_sub(1));
-    }
+    reopen_workspace_picker(app, hover);
 }
 
 fn open_context_menu_for_selection(app: &mut App) {
@@ -2774,11 +2773,6 @@ fn open_context_menu_for_selection(app: &mut App) {
                     },
                 );
                 items.push(MenuItem {
-                    label: "Notes".into(),
-                    action: MenuAction::OpenNotes(NoteOwner::Project(p.id.clone())),
-                    destructive: false,
-                });
-                items.push(MenuItem {
                     label: "Remove from list".into(),
                     action: MenuAction::RemoveProject(p.id.clone()),
                     destructive: true,
@@ -2797,11 +2791,6 @@ fn open_context_menu_for_selection(app: &mut App) {
                     MenuItem {
                         label: "New terminal".into(),
                         action: MenuAction::NewTerminal(w.id.clone()),
-                        destructive: false,
-                    },
-                    MenuItem {
-                        label: "Notes".into(),
-                        action: MenuAction::OpenNotes(NoteOwner::Worktree(w.id.clone())),
                         destructive: false,
                     },
                     MenuItem {
@@ -2948,10 +2937,10 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
             // The root picker's Claude row owns Tab as a launch-mode
             // toggle. Submenus and every other menu leave it untouched.
             KeyCode::Tab if menu.toggle_hovered_claude_cloud() => {}
-            // Workspace-switcher verbs (footer-hinted, the notes-modal
-            // pattern): n creates a workspace (opened on Ack), r renames
-            // the hovered one, d deletes it — no confirm, the daemon only
-            // deletes empty workspaces so a refusal just flashes.
+            // Workspace-switcher verbs (footer-hinted): n creates a
+            // workspace (opened on Ack), r renames
+            // the hovered one, d deletes it behind a confirm that hands
+            // the switcher back either way.
             KeyCode::Char('n') if menu.is_workspace_picker() => {
                 open_prompt(app, PromptKind::NewWorkspace);
             }
@@ -2962,8 +2951,8 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
             }
             KeyCode::Char('d') if menu.is_workspace_picker() => {
                 if let Some(id) = menu.hovered_workspace() {
-                    let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::RemoveWorkspace { req_id, id });
+                    let hover = menu.hover;
+                    open_remove_workspace_confirm(app, id, Some(hover));
                 }
             }
             KeyCode::Enter => {
@@ -3054,12 +3043,19 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
         },
         Overlay::Confirm(confirm) => match key.code {
             KeyCode::Esc | KeyCode::Char('n') => {
-                // Backing out of a settings reset lands back in the
-                // overlay, not on the panels — that's where you were.
+                // Backing out lands where you were: a settings reset
+                // reopens the overlay, a switcher delete reopens the
+                // switcher — not the panels.
                 let to_settings = matches!(confirm.action, PendingAction::ResetSettings);
+                let to_picker = match &confirm.action {
+                    PendingAction::RemoveWorkspace { reopen_picker, .. } => *reopen_picker,
+                    _ => None,
+                };
                 app.overlay = None;
                 if to_settings {
                     reopen_settings(app);
+                } else if let Some(hover) = to_picker {
+                    reopen_workspace_picker(app, hover);
                 }
             }
             KeyCode::Enter | KeyCode::Char('y') => {
@@ -3298,125 +3294,6 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                     if view.filter.handle_key(&key).changed() {
                         view.apply_filter();
                     }
-                }
-            }
-        }
-        Overlay::Notes(view) => {
-            // The CRUD keys need both the view (cursor/input) and the tree
-            // (rows) — resolve the key to a command first, then act, so the
-            // overlay borrow never overlaps the request plumbing.
-            enum NoteCmd {
-                Nothing,
-                Close,
-                Move(i64),
-                StartCreate,
-                StartEdit(NoteId, String),
-                CancelInput,
-                Create(String),
-                Update(NoteId, String),
-                Toggle(NoteId, bool),
-                Delete(NoteId),
-            }
-            // Row order matches the draw: tree order for this owner.
-            let rows: Vec<(NoteId, String, bool)> = app
-                .tree
-                .notes
-                .iter()
-                .filter(|t| t.owner == view.owner)
-                .map(|t| (t.id.clone(), t.text.clone(), t.done))
-                .collect();
-            let selected = view.selected.min(rows.len().saturating_sub(1));
-            view.selected = selected;
-            let cmd = if let Some(input) = &mut view.input {
-                match key.code {
-                    KeyCode::Esc => NoteCmd::CancelInput,
-                    // Nothing typed = cancel; edits and adds both no-op.
-                    KeyCode::Enter => match (&input.editing, input.text.trim()) {
-                        (_, "") => NoteCmd::CancelInput,
-                        (Some(id), text) => NoteCmd::Update(id.clone(), text.to_string()),
-                        (None, text) => NoteCmd::Create(text.to_string()),
-                    },
-                    // Everything else is the line editor's: arrows, ⌥←/⌥→
-                    // by word, the readline chords (see text_input).
-                    _ => {
-                        input.text.handle_key(&key);
-                        NoteCmd::Nothing
-                    }
-                }
-            } else {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => NoteCmd::Close,
-                    KeyCode::Char('j') | KeyCode::Down => NoteCmd::Move(1),
-                    KeyCode::Char('k') | KeyCode::Up => NoteCmd::Move(-1),
-                    // `e` mirrors the key that opened the modal; a/n too.
-                    // (That costs `e` as an edit key — Enter/r cover it.)
-                    KeyCode::Char('e') | KeyCode::Char('a') | KeyCode::Char('n') => {
-                        NoteCmd::StartCreate
-                    }
-                    KeyCode::Enter | KeyCode::Char('r') => {
-                        match rows.get(selected) {
-                            Some((id, text, _)) => NoteCmd::StartEdit(id.clone(), text.clone()),
-                            // Empty list: Enter starts the first note.
-                            None => NoteCmd::StartCreate,
-                        }
-                    }
-                    KeyCode::Char(' ') | KeyCode::Char('x') => match rows.get(selected) {
-                        Some((id, _, done)) => NoteCmd::Toggle(id.clone(), !done),
-                        None => NoteCmd::Nothing,
-                    },
-                    KeyCode::Char('d') | KeyCode::Backspace | KeyCode::Delete => {
-                        match rows.get(selected) {
-                            Some((id, _, _)) => NoteCmd::Delete(id.clone()),
-                            None => NoteCmd::Nothing,
-                        }
-                    }
-                    _ => NoteCmd::Nothing,
-                }
-            };
-            match cmd {
-                NoteCmd::Nothing => {}
-                NoteCmd::Close => app.overlay = None,
-                NoteCmd::Move(delta) => {
-                    let max = rows.len().saturating_sub(1) as i64;
-                    view.selected = (selected as i64 + delta).clamp(0, max) as usize;
-                }
-                NoteCmd::StartCreate => {
-                    view.input = Some(NoteInput {
-                        editing: None,
-                        text: TextInput::new(),
-                    });
-                }
-                NoteCmd::StartEdit(id, text) => {
-                    view.input = Some(NoteInput {
-                        editing: Some(id),
-                        // Cursor lands at the end, ready for ⌥← to step back
-                        // through the existing name.
-                        text: TextInput::with_text(text),
-                    });
-                }
-                NoteCmd::CancelInput => view.input = None,
-                NoteCmd::Create(text) => {
-                    view.input = None;
-                    let owner = view.owner.clone();
-                    let req_id = app.alloc_req_id(PendingIntent::SelectCreatedNote);
-                    out.push(ClientRequest::CreateNote {
-                        req_id,
-                        owner,
-                        text,
-                    });
-                }
-                NoteCmd::Update(id, text) => {
-                    view.input = None;
-                    let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::UpdateNote { req_id, id, text });
-                }
-                NoteCmd::Toggle(id, done) => {
-                    let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::SetNoteDone { req_id, id, done });
-                }
-                NoteCmd::Delete(id) => {
-                    let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::DeleteNote { req_id, id });
                 }
             }
         }
@@ -4026,6 +3903,14 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::RemoveProject { req_id, id });
         }
+        PendingAction::RemoveWorkspace { id, reopen_picker } => {
+            remove_workspace(app, id, out);
+            // The switcher stays up across the delete, as it did before the
+            // confirm: the EntityRemoved delta drops the row in place.
+            if let Some(hover) = reopen_picker {
+                reopen_workspace_picker(app, hover);
+            }
+        }
         PendingAction::ResetSettings => reset_settings(app),
         PendingAction::Quit => app.should_quit = true,
     }
@@ -4041,6 +3926,10 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::RestartAgent(id) => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::RestartAgent { req_id, id });
+        }
+        MenuAction::AttachCloudAgent(id) => {
+            let req_id = app.alloc_req_id(PendingIntent::None);
+            out.push(ClientRequest::AttachCloudAgent { req_id, id });
         }
         MenuAction::RenameAgent(id) => open_prompt(app, PromptKind::RenameAgent { id }),
         MenuAction::ArchiveAgent(id) => {
@@ -4159,7 +4048,6 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             )
         }
         MenuAction::NewWorktree(project) => open_new_worktree_prompt(app, project),
-        MenuAction::OpenNotes(owner) => open_notes_for_owner(app, owner),
         MenuAction::NewLink(worktree) => open_prompt(app, PromptKind::NewLink { worktree }),
         MenuAction::OpenLink(url) => open_link(app, &url, out),
         MenuAction::ViewPrDiff => request_pr_diff(app),
@@ -4192,7 +4080,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         }
         MenuAction::NewWorkspace => open_prompt(app, PromptKind::NewWorkspace),
         MenuAction::RenameWorkspace(id) => open_prompt(app, PromptKind::RenameWorkspace { id }),
-        MenuAction::RemoveWorkspace(id) => remove_workspace(app, id, out),
+        MenuAction::RemoveWorkspace(id) => open_remove_workspace_confirm(app, id, None),
         MenuAction::RemoveProject(id) => {
             if let Some(p) = app.tree.projects.iter().find(|p| p.id == id).cloned() {
                 app.overlay = Some(Overlay::Confirm(ConfirmDialog {
@@ -4253,10 +4141,18 @@ fn move_project(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
     out.push(ClientRequest::MoveProject { req_id, id, delta });
 }
 
-/// Snapshot the context being left — which worktree row this project was
-/// on, and which session row that worktree was on — so switching back
-/// restores both. Call BEFORE moving the selection away.
+/// Snapshot the context being left — which project row this workspace was
+/// on, which worktree row that project was on, and which session row that
+/// worktree was on — so switching back restores all three. Call BEFORE
+/// moving the selection away.
 fn remember_context(app: &mut App) {
+    // The workspace's project is recorded first and unconditionally: a
+    // project with no worktree yet still has to come back under the cursor,
+    // and the early return below would skip it.
+    if let Some(pid) = app.selected_project().map(|p| p.id.clone()) {
+        app.last_project_for_workspace
+            .insert(app.tree.active_workspace.clone(), pid);
+    }
     let Some(wid) = app.selected_worktree().map(|w| w.id.clone()) else {
         return;
     };
@@ -4277,6 +4173,27 @@ fn remember_context(app: &mut App) {
         None => {
             app.last_session_for_worktree.remove(&wid);
         }
+    }
+}
+
+/// After a workspace switch: put the cursor back on the project the user
+/// left this workspace on. Silent when there is nothing remembered (first
+/// visit) or the project is gone — the caller has already parked the
+/// cursor on the first row.
+fn restore_workspace_project(app: &mut App) {
+    let Some(pid) = app
+        .last_project_for_workspace
+        .get(&app.tree.active_workspace)
+        .cloned()
+    else {
+        return;
+    };
+    if let Some(i) = app
+        .project_rows()
+        .iter()
+        .position(|i| app.tree.projects[*i].id == pid)
+    {
+        app.sel_project = i;
     }
 }
 
@@ -4780,7 +4697,26 @@ fn mark_pr_seen(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
     });
 }
 
+/// Record that this agent's session is on screen, so a turn it finished
+/// unwatched (`Agent::unseen`) stops counting on its worktree and project
+/// rows. Applied locally as well as sent, so the counts drop on this frame
+/// instead of waiting for the daemon's upsert — and skipped entirely when
+/// there is nothing to clear.
+fn mark_agent_seen(app: &mut App, id: &AgentId, out: &mut Vec<ClientRequest>) {
+    let Some(a) = app.tree.agents.iter_mut().find(|a| &a.id == id && a.unseen) else {
+        return;
+    };
+    a.unseen = false;
+    app.dirty = true;
+    out.push(ClientRequest::MarkAgentSeen { id: id.clone() });
+}
+
 fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    // Whatever lands in the pane has been looked at — walking the cursor
+    // onto a row previews it here, so this is where the counts come down.
+    if let SessionRef::Agent(id) = &sref {
+        mark_agent_seen(app, id, out);
+    }
     if let Some(existing) = &app.term {
         if existing.sref == sref && !existing.exited {
             return; // already attached
@@ -5509,52 +5445,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         }
         return;
     }
-    // Note modal: the wheel moves the selection, a click on a row selects
-    // it, a click outside the modal closes; everything else is swallowed.
-    if let Some(Overlay::Notes(view)) = &mut app.overlay {
-        let count = app
-            .tree
-            .notes
-            .iter()
-            .filter(|t| t.owner == view.owner)
-            .count();
-        let max = count.saturating_sub(1) as i64;
-        match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                view.selected = (view.selected as i64 - 1).clamp(0, max) as usize;
-                app.dirty = true;
-            }
-            MouseEventKind::ScrollDown => {
-                view.selected = (view.selected as i64 + 1).clamp(0, max) as usize;
-                app.dirty = true;
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                let list = view.list_area;
-                let inside_list = list.width > 0
-                    && mouse.column >= list.x
-                    && mouse.column < list.x + list.width
-                    && mouse.row >= list.y
-                    && mouse.row < list.y + list.height;
-                let area = view.area;
-                let inside_modal = mouse.column >= area.x
-                    && mouse.column < area.x + area.width
-                    && mouse.row >= area.y
-                    && mouse.row < area.y + area.height;
-                if inside_list {
-                    let start = view.window_start(list.height as usize);
-                    let index = start + (mouse.row - list.y) as usize;
-                    if index < count {
-                        view.selected = index;
-                    }
-                } else if !inside_modal {
-                    app.overlay = None;
-                }
-                app.dirty = true;
-            }
-            _ => {}
-        }
-        return;
-    }
     // Settings: click a tab to switch, a row to select (or activate it if
     // it was already selected), outside to close; everything else is
     // swallowed. While a hotkey capture is live the mouse is inert — the
@@ -6176,7 +6066,6 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             worktrees,
             agents,
             terminals,
-            notes,
             links,
             pr_seen,
             ui_state,
@@ -6187,7 +6076,6 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.tree.worktrees = worktrees;
             app.tree.agents = agents;
             app.tree.terminals = terminals;
-            app.tree.notes = notes;
             app.tree.links = links;
             app.pr_seen = pr_seen.into_iter().map(|s| (s.url, s.marker)).collect();
             // `--workspace <name>` overrides the daemon's last-opened one.
@@ -6247,6 +6135,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             agent,
             status,
             changed_at,
+            unseen,
         } => {
             // A status flip can pull the agent into the RECENT group and
             // reorder the list; keep the selection on the same session.
@@ -6254,7 +6143,17 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             if let Some(a) = app.tree.agents.iter_mut().find(|a| a.id == agent) {
                 a.status = status;
                 a.status_changed_at = changed_at;
+                a.unseen = unseen;
                 app.dirty = true;
+            }
+            // A turn that finished in the pane the user is looking at was
+            // watched: clear it before it can count anywhere.
+            let on_screen = app
+                .term
+                .as_ref()
+                .is_some_and(|t| t.sref == SessionRef::Agent(agent.clone()));
+            if unseen && on_screen {
+                mark_agent_seen(app, &agent, out);
             }
             if let Some(keep) = keep {
                 if let Some(i) = app
@@ -6302,13 +6201,6 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         app.select_worktree_when_seen = Some(id);
                     }
                 }
-                (Some(PendingIntent::SelectCreatedNote), Some(EntityId::Note(id))) => {
-                    // Same idiom: land the modal's cursor now, or when the
-                    // upsert arrives.
-                    if !select_note_by_id(app, &id) {
-                        app.select_note_when_seen = Some(id);
-                    }
-                }
                 (Some(PendingIntent::SelectCreatedLink), Some(EntityId::Link(id))) => {
                     if !select_link_by_id(app, &id) {
                         app.select_link_when_seen = Some(id);
@@ -6343,12 +6235,6 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             if let Some(wt_id) = app.select_worktree_when_seen.clone() {
                 if select_worktree_by_id(app, &wt_id, out) {
                     app.select_worktree_when_seen = None;
-                }
-            }
-            // ...and the note modal's cursor onto a note we just created.
-            if let Some(note_id) = app.select_note_when_seen.clone() {
-                if select_note_by_id(app, &note_id) {
-                    app.select_note_when_seen = None;
                 }
             }
             // ...and the panel cursor onto a link we just added.
@@ -6459,10 +6345,6 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             Some(existing) => *existing = t,
             None => app.tree.terminals.push(t),
         },
-        Entity::Note(t) => match app.tree.notes.iter_mut().find(|x| x.id == t.id) {
-            Some(existing) => *existing = t,
-            None => app.tree.notes.push(t),
-        },
         Entity::Link(l) => match app.tree.links.iter_mut().find(|x| x.id == l.id) {
             Some(existing) => *existing = l,
             None => app.tree.links.push(l),
@@ -6484,27 +6366,6 @@ fn select_link_by_id(app: &mut App, id: &LinkId) -> bool {
             true
         }
         None => false,
-    }
-}
-
-/// Land the note modal's cursor on `id`; false when the modal isn't open on
-/// that note's owner or the note hasn't arrived in the tree yet.
-fn select_note_by_id(app: &mut App, id: &NoteId) -> bool {
-    let pos = match &app.overlay {
-        Some(Overlay::Notes(view)) => app
-            .tree
-            .notes
-            .iter()
-            .filter(|t| t.owner == view.owner)
-            .position(|t| &t.id == id),
-        _ => return false,
-    };
-    match (pos, &mut app.overlay) {
-        (Some(i), Some(Overlay::Notes(view))) => {
-            view.selected = i;
-            true
-        }
-        _ => false,
     }
 }
 
@@ -6530,10 +6391,6 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
             app.tree
                 .terminals
                 .retain(|t| !wt_ids.contains(&t.worktree_id));
-            app.tree.notes.retain(|t| match &t.owner {
-                NoteOwner::Project(p) => p != id,
-                NoteOwner::Worktree(w) => !wt_ids.contains(w),
-            });
             app.tree.links.retain(|l| !wt_ids.contains(&l.worktree_id));
             app.pull_requests.retain(|w, _| !wt_ids.contains(w));
             app.pr_recheck.retain(|w, _| !wt_ids.contains(w));
@@ -6543,9 +6400,6 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
         EntityId::Worktree(id) => {
             app.tree.agents.retain(|a| &a.worktree_id != id);
             app.tree.terminals.retain(|t| &t.worktree_id != id);
-            app.tree
-                .notes
-                .retain(|t| t.owner != NoteOwner::Worktree(id.clone()));
             app.tree.links.retain(|l| &l.worktree_id != id);
             app.pull_requests.remove(id);
             app.pr_recheck.remove(id);
@@ -6553,18 +6407,7 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
         }
         EntityId::Agent(id) => app.tree.agents.retain(|a| &a.id != id),
         EntityId::Terminal(id) => app.tree.terminals.retain(|t| &t.id != id),
-        EntityId::Note(id) => app.tree.notes.retain(|t| &t.id != id),
         EntityId::Link(id) => app.tree.links.retain(|l| &l.id != id),
-    }
-    // A note modal aimed at a vanished owner has nothing left to show.
-    if let Some(Overlay::Notes(view)) = &app.overlay {
-        let gone = match &view.owner {
-            NoteOwner::Project(id) => !app.tree.projects.iter().any(|p| &p.id == id),
-            NoteOwner::Worktree(id) => !app.tree.worktrees.iter().any(|w| &w.id == id),
-        };
-        if gone {
-            app.overlay = None;
-        }
     }
 }
 
@@ -6731,6 +6574,180 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    /// A second agent, `a2` / "agent-2", under the seeded worktree.
+    fn seed_second_agent(app: &mut App, status: nebula_core::AgentStatus) {
+        use nebula_core::{Agent, Entity, WorktreeId};
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a2".into()),
+                    worktree_id: WorktreeId("w1".into()),
+                    name: "agent-2".into(),
+                    status,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    unseen: false,
+                    kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    cloud_session_id: None,
+                    sort_order: 1,
+                    status_changed_at: 0,
+                    alive: true,
+                }),
+            },
+        );
+    }
+
+    /// Row index of an agent in the Sessions panel.
+    fn row_of(app: &App, id: &str) -> usize {
+        let sref = SessionRef::Agent(AgentId(id.into()));
+        app.visible_session_rows()
+            .iter()
+            .position(|r| r.sref().as_ref() == Some(&sref))
+            .unwrap_or_else(|| panic!("{id} has no row"))
+    }
+
+    /// A session that goes green while the pane shows something else counts
+    /// on its worktree and project rows — the number of terminals to go
+    /// read — and stays counted until the cursor walks onto it. Landing
+    /// previews it, so that is the moment the counts come down: locally on
+    /// the spot, and at the daemon for every other client.
+    #[test]
+    fn an_unwatched_finish_counts_until_the_cursor_lands_on_it() {
+        use nebula_core::{AgentStatus, ProjectId, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_agent(&mut app, AgentStatus::Running);
+        let a2 = AgentId("a2".into());
+        let (w1, p1) = (WorktreeId("w1".into()), ProjectId("p1".into()));
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            40,
+            10,
+        ));
+        app.focus = Focus::Sessions;
+        app.sel_session = row_of(&app, "a1");
+
+        hse(
+            &mut app,
+            ServerEvent::StatusChanged {
+                agent: a2.clone(),
+                status: AgentStatus::Finished,
+                changed_at: crate::app::now_ms(),
+                unseen: true,
+            },
+        );
+        assert_eq!(app.worktree_unseen(&w1), 1, "one terminal to go read");
+        assert_eq!(app.project_unseen(&p1), 1);
+        assert_eq!(
+            app.sel_session,
+            row_of(&app, "a1"),
+            "the cursor stayed on the session it was on"
+        );
+
+        let mut out = Vec::new();
+        let delta = row_of(&app, "a2") as i64 - app.sel_session as i64;
+        move_selection(&mut app, delta, &mut out);
+        assert_eq!(app.sel_session, row_of(&app, "a2"));
+        assert_eq!(app.worktree_unseen(&w1), 0, "landing on the row reads it");
+        assert_eq!(app.project_unseen(&p1), 0);
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::MarkAgentSeen { id } if *id == a2)),
+            "the daemon is told: {out:?}"
+        );
+
+        // Walking off and back sends nothing: there is nothing left to clear.
+        out.clear();
+        move_selection(&mut app, -delta, &mut out);
+        move_selection(&mut app, delta, &mut out);
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::MarkAgentSeen { .. })),
+            "{out:?}"
+        );
+    }
+
+    /// A turn that finishes in the pane the user is already looking at was
+    /// watched: the flag is dropped the moment it arrives, so it never
+    /// counts anywhere, and the daemon is told so every client agrees.
+    #[test]
+    fn a_finish_in_the_pane_on_screen_is_already_seen() {
+        use nebula_core::{AgentStatus, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_agent(&mut app, AgentStatus::Running);
+        let a2 = AgentId("a2".into());
+        app.term = Some(AttachedTerm::new(SessionRef::Agent(a2.clone()), 40, 10));
+
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut app,
+            ServerEvent::StatusChanged {
+                agent: a2.clone(),
+                status: AgentStatus::Finished,
+                changed_at: crate::app::now_ms(),
+                unseen: true,
+            },
+            &mut out,
+        );
+        assert_eq!(app.worktree_unseen(&WorktreeId("w1".into())), 0);
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::MarkAgentSeen { id } if *id == a2)),
+            "{out:?}"
+        );
+    }
+
+    /// The badges: project and worktree rows count their unwatched finishes
+    /// as ` n new`, and the session rows being counted say `new` in the
+    /// harness slot — all of it gone once the session has been read.
+    #[test]
+    fn unwatched_finishes_badge_the_rows_until_read() {
+        use nebula_core::AgentStatus;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_agent(&mut app, AgentStatus::Running);
+        let a2 = AgentId("a2".into());
+        hse(
+            &mut app,
+            ServerEvent::StatusChanged {
+                agent: a2.clone(),
+                status: AgentStatus::Finished,
+                changed_at: crate::app::now_ms(),
+                unseen: true,
+            },
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("demo 1 new"), "project row counts it: {text}");
+        assert!(
+            text.contains("root 1 new"),
+            "worktree row counts it: {text}"
+        );
+        let row = text.lines().find(|l| l.contains("agent-2")).unwrap();
+        let tail = &row[row.find("agent-2").unwrap()..];
+        assert!(tail.contains(" new"), "the session row says so: {row}");
+        assert!(
+            !tail.contains("claude"),
+            "the harness slot is taken over: {row}"
+        );
+
+        let mut out = Vec::new();
+        mark_agent_seen(&mut app, &a2, &mut out);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(!text.contains("1 new"), "read: the counts are gone: {text}");
+        let row = text.lines().find(|l| l.contains("agent-2")).unwrap();
+        let tail = &row[row.find("agent-2").unwrap()..];
+        assert!(tail.contains("claude"), "the harness is back: {row}");
+    }
+
     fn hse(app: &mut App, ev: ServerEvent) {
         let mut out = Vec::new();
         handle_server_event(app, ev, &mut out);
@@ -6803,10 +6820,12 @@ mod tests {
                     archived: false,
                     archived_at: 0,
                     pinned: false,
+                    unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
                     effort: None,
                     session_id: None,
+                    cloud_session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
@@ -6910,7 +6929,7 @@ mod tests {
         assert!(text.contains("n/o: add project"), "{text}");
         assert!(text.contains("w: workspaces"), "{text}");
         assert!(text.contains("q: quit"), "{text}");
-        for dead in ["e: notes", "d: remove", "m: menu", "/: search"] {
+        for dead in ["d: remove", "m: menu", "/: search"] {
             assert!(
                 !text.contains(dead),
                 "{dead} does nothing on the splash: {text}"
@@ -7931,97 +7950,6 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(agents.len(), 1);
         assert!(terminals.is_empty());
     }
-
-    /// `e` opens the notes modal for the current selection.
-    #[test]
-    fn e_opens_notes_for_selection() {
-        let mut app = App::new();
-        seed_tree(&mut app);
-        app.focus = Focus::Worktrees;
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(app.overlay, Some(Overlay::Notes(_))),
-            "expected notes overlay, got {:?}",
-            app.overlay
-        );
-    }
-
-    /// Editing a note's text behaves like a terminal line: the caret starts
-    /// at the end, ⌥← (which macOS terminals send as ESC b) walks back a
-    /// word at a time, and typing lands at the caret instead of the tail.
-    #[test]
-    fn note_edit_takes_word_motion_and_inserts_at_the_caret() {
-        use crate::app::NoteView;
-        use nebula_core::{Note, NoteId, NoteOwner, ProjectId};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        let owner = NoteOwner::Project(ProjectId("p1".into()));
-        app.tree.notes.push(Note {
-            id: NoteId("t1".into()),
-            owner: owner.clone(),
-            text: "fix login redirect".into(),
-            done: false,
-            sort_order: 0,
-        });
-        app.overlay = Some(Overlay::Notes(NoteView::new(owner, "demo".into())));
-        let mut out = Vec::new();
-
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        for _ in 0..2 {
-            press(&mut app, KeyCode::Char('b'), KeyModifiers::ALT, &mut out);
-        }
-        for c in "the ".chars() {
-            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
-        }
-        let Some(Overlay::Notes(view)) = &app.overlay else {
-            panic!("notes closed")
-        };
-        let input = view.input.as_ref().expect("still editing");
-        assert_eq!(input.text.as_str(), "fix the login redirect");
-
-        out.clear();
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(out.as_slice(), [ClientRequest::UpdateNote { text, .. }] if text == "fix the login redirect"),
-            "Enter saves the edited text, got {out:?}"
-        );
-    }
-
-    /// Backspace on a note being edited deletes a character; it must not
-    /// reach the list's "delete the selected note" binding, and at column 0
-    /// it does nothing at all.
-    #[test]
-    fn note_edit_swallows_backspace_instead_of_deleting_the_note() {
-        use crate::app::NoteView;
-        use nebula_core::{Note, NoteId, NoteOwner, ProjectId};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        let owner = NoteOwner::Project(ProjectId("p1".into()));
-        app.tree.notes.push(Note {
-            id: NoteId("t1".into()),
-            owner: owner.clone(),
-            text: "ab".into(),
-            done: false,
-            sort_order: 0,
-        });
-        app.overlay = Some(Overlay::Notes(NoteView::new(owner, "demo".into())));
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        out.clear();
-        for _ in 0..4 {
-            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
-        }
-        let Some(Overlay::Notes(view)) = &app.overlay else {
-            panic!("notes closed")
-        };
-        assert_eq!(
-            view.input.as_ref().expect("still editing").text.as_str(),
-            ""
-        );
-        assert!(out.is_empty(), "no DeleteNote leaked out, got {out:?}");
-    }
-
     /// The always-live search fields edit the same way — and ⌥←/⌥→ move the
     /// caret rather than typing a literal "b"/"f" into the query.
     #[test]
@@ -8418,7 +8346,6 @@ diff --git a/src/b.rs b/src/b.rs
                 worktrees: tree.worktrees,
                 agents: tree.agents,
                 terminals: tree.terminals,
-                notes: tree.notes,
                 links: tree.links,
                 pr_seen: Vec::new(),
                 ui_state: None,
@@ -8444,7 +8371,6 @@ diff --git a/src/b.rs b/src/b.rs
             worktrees: tree.worktrees.clone(),
             agents: tree.agents.clone(),
             terminals: tree.terminals.clone(),
-            notes: tree.notes.clone(),
             links: tree.links.clone(),
             pr_seen: Vec::new(),
             ui_state,
@@ -8635,10 +8561,12 @@ diff --git a/src/b.rs b/src/b.rs
                         archived: false,
                         archived_at: 0,
                         pinned: false,
+                        unseen: false,
                         kind,
                         model: None,
                         effort: None,
                         session_id: None,
+                        cloud_session_id: None,
                         sort_order: i,
                         status_changed_at: 0,
                         alive: true,
@@ -8690,10 +8618,12 @@ diff --git a/src/b.rs b/src/b.rs
                     archived: false,
                     archived_at: 0,
                     pinned: true,
+                    unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
                     effort: None,
                     session_id: None,
+                    cloud_session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
@@ -8789,10 +8719,12 @@ diff --git a/src/b.rs b/src/b.rs
                 archived: false,
                 archived_at: 0,
                 pinned,
+                unseen: false,
                 kind: nebula_core::AgentKind::Claude,
                 model: None,
                 effort: None,
                 session_id: None,
+                cloud_session_id: None,
                 sort_order: sort,
                 status_changed_at: changed_at,
                 alive: true,
@@ -8847,10 +8779,12 @@ diff --git a/src/b.rs b/src/b.rs
                     archived: false,
                     archived_at: 0,
                     pinned: false,
+                    unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
                     effort: None,
                     session_id: None,
+                    cloud_session_id: None,
                     sort_order: sort,
                     status_changed_at: changed_at,
                     alive: true,
@@ -8915,10 +8849,12 @@ diff --git a/src/b.rs b/src/b.rs
                     archived: false,
                     archived_at: 0,
                     pinned,
+                    unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
                     effort: None,
                     session_id: None,
+                    cloud_session_id: None,
                     sort_order: sort,
                     status_changed_at: at,
                     alive: true,
@@ -8978,6 +8914,7 @@ diff --git a/src/b.rs b/src/b.rs
                 agent: AgentId("cold-2h".into()),
                 status: AgentStatus::Finished,
                 changed_at: now,
+                unseen: false,
             },
         );
         let rows = app.visible_sessions();
@@ -9013,10 +8950,12 @@ diff --git a/src/b.rs b/src/b.rs
                     archived: false,
                     archived_at: 0,
                     pinned: false,
+                    unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
                     effort: None,
                     session_id: None,
+                    cloud_session_id: None,
                     sort_order: 1,
                     status_changed_at: crate::app::now_ms() - 23 * 60_000,
                     alive: true,
@@ -9074,10 +9013,12 @@ diff --git a/src/b.rs b/src/b.rs
                     archived: false,
                     archived_at: 0,
                     pinned: false,
+                    unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
                     effort: None,
                     session_id: None,
+                    cloud_session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
@@ -9093,6 +9034,7 @@ diff --git a/src/b.rs b/src/b.rs
                 agent: AgentId("a2".into()),
                 status: AgentStatus::Finished,
                 changed_at: crate::app::now_ms(),
+                unseen: false,
             },
         );
         let rows = app.visible_sessions();
@@ -9142,10 +9084,12 @@ diff --git a/src/b.rs b/src/b.rs
                     archived: false,
                     archived_at: 0,
                     pinned: false,
+                    unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
                     effort: None,
                     session_id: None,
+                    cloud_session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
@@ -10572,10 +10516,12 @@ diff --git a/src/b.rs b/src/b.rs
                 archived,
                 archived_at: 0,
                 pinned: false,
+                unseen: false,
                 kind: nebula_core::AgentKind::Claude,
                 model: None,
                 effort: None,
                 session_id: None,
+                cloud_session_id: None,
                 sort_order: sort,
                 status_changed_at: 0,
                 alive: true,
@@ -10640,12 +10586,14 @@ diff --git a/src/b.rs b/src/b.rs
             name: name.into(),
             status: AgentStatus::Fresh,
             archived: true,
+            unseen: false,
             archived_at,
             pinned: false,
             kind: nebula_core::AgentKind::Claude,
             model: None,
             effort: None,
             session_id: None,
+            cloud_session_id: None,
             sort_order: sort,
             status_changed_at: 0,
             alive: false,
@@ -11548,10 +11496,12 @@ diff --git a/src/b.rs b/src/b.rs
             archived: false,
             archived_at: 0,
             pinned: false,
+            unseen: false,
             kind: nebula_core::AgentKind::Claude,
             model: None,
             effort: None,
             session_id: None,
+            cloud_session_id: None,
             sort_order: 0,
             status_changed_at: 0,
             alive: true,
@@ -11983,10 +11933,12 @@ diff --git a/src/b.rs b/src/b.rs
                     archived: false,
                     archived_at: 0,
                     pinned: false,
+                    unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
                     effort: None,
                     session_id: None,
+                    cloud_session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
@@ -12938,10 +12890,12 @@ diff --git a/src/b.rs b/src/b.rs
                     archived: false,
                     archived_at: 0,
                     pinned: false,
+                    unseen: false,
                     kind: nebula_core::AgentKind::Codex,
                     model: None,
                     effort: None,
                     session_id: None,
+                    cloud_session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
@@ -12959,10 +12913,12 @@ diff --git a/src/b.rs b/src/b.rs
                     archived: true,
                     archived_at: 0,
                     pinned: false,
+                    unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
                     effort: None,
                     session_id: None,
+                    cloud_session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: false,
@@ -13315,10 +13271,12 @@ diff --git a/src/b.rs b/src/b.rs
                     archived: false,
                     archived_at: 0,
                     pinned: false,
+                    unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
                     effort: None,
                     session_id: None,
+                    cloud_session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
@@ -13718,7 +13676,7 @@ diff --git a/src/b.rs b/src/b.rs
             let mut app = App::new();
             let mut out = Vec::new();
             open_settings_on(&mut app, crate::config::hotkeys_tab(), &mut out);
-            let row = crate::keymap::index_of(crate::keymap::Action::Notes).unwrap();
+            let row = crate::keymap::index_of(crate::keymap::Action::Help).unwrap();
             for _ in 0..row {
                 press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
             }
@@ -13732,15 +13690,15 @@ diff --git a/src/b.rs b/src/b.rs
             assert!(text.contains("Git diff"), "names the current owner: {text}");
             assert!(!view.capturing(), "the capture is paused on the warning");
             assert_eq!(
-                app.keymap.label(crate::keymap::Action::Notes),
-                "e",
+                app.keymap.label(crate::keymap::Action::Help),
+                "?",
                 "nothing changed yet"
             );
 
             // Esc leaves it where it was.
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
             assert_eq!(app.keymap.label(crate::keymap::Action::GitDiff), "g");
-            assert_eq!(app.keymap.label(crate::keymap::Action::Notes), "e");
+            assert_eq!(app.keymap.label(crate::keymap::Action::Help), "?");
         });
     }
 
@@ -13751,14 +13709,14 @@ diff --git a/src/b.rs b/src/b.rs
             let mut app = App::new();
             let mut out = Vec::new();
             open_settings_on(&mut app, crate::config::hotkeys_tab(), &mut out);
-            let row = crate::keymap::index_of(crate::keymap::Action::Notes).unwrap();
+            let row = crate::keymap::index_of(crate::keymap::Action::Help).unwrap();
             for _ in 0..row {
                 press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
             }
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert_eq!(app.keymap.label(crate::keymap::Action::Notes), "g");
+            assert_eq!(app.keymap.label(crate::keymap::Action::Help), "g");
             assert_eq!(
                 app.keymap.label(crate::keymap::Action::GitDiff),
                 "—",
@@ -13769,7 +13727,7 @@ diff --git a/src/b.rs b/src/b.rs
             seed_tree(&mut app);
             app.focus = Focus::Worktrees;
             press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
-            assert!(matches!(app.overlay, Some(Overlay::Notes(_))));
+            assert!(matches!(app.overlay, Some(Overlay::Help)));
         });
     }
 
@@ -14025,7 +13983,7 @@ diff --git a/src/b.rs b/src/b.rs
     fn a_hand_edited_duplicate_is_called_out_on_the_row() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        std::fs::write(&path, r#"{"keybindings": {"notes": "g"}}"#).unwrap();
+        std::fs::write(&path, r#"{"keybindings": {"help": "g"}}"#).unwrap();
         crate::config::with_config_path(path, || {
             let mut app = App::new();
             app.keymap = crate::config::Config::load().keymap();
@@ -14039,7 +13997,7 @@ diff --git a/src/b.rs b/src/b.rs
             terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
             let text = buffer_text(&terminal);
             assert!(
-                text.contains("also belongs to Notes"),
+                text.contains("also belongs to Help"),
                 "the row names its rival:\n{text}"
             );
         });
@@ -14971,10 +14929,12 @@ diff --git a/src/b.rs b/src/b.rs
                         archived,
                         archived_at: 0,
                         pinned: false,
+                        unseen: false,
                         kind: nebula_core::AgentKind::Claude,
                         model: None,
                         effort: None,
                         session_id: None,
+                        cloud_session_id: None,
                         sort_order: 1,
                         status_changed_at: 0,
                         alive: true,
@@ -15041,10 +15001,12 @@ diff --git a/src/b.rs b/src/b.rs
             archived,
             archived_at: 0,
             pinned: false,
+            unseen: false,
             kind: nebula_core::AgentKind::Claude,
             model: None,
             effort: None,
             session_id: None,
+            cloud_session_id: None,
             sort_order: 1,
             status_changed_at: 0,
             alive: true,
@@ -15469,10 +15431,12 @@ diff --git a/src/b.rs b/src/b.rs
                     archived: false,
                     archived_at: 0,
                     pinned: false,
+                    unseen: false,
                     kind: AgentKind::Claude,
                     model: None,
                     effort: None,
                     session_id: None,
+                    cloud_session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
@@ -15605,6 +15569,119 @@ diff --git a/src/b.rs b/src/b.rs
         assert!(!text.contains("demo"), "{text}");
     }
 
+    /// Switching away from a workspace and back brings the whole cursor
+    /// home — project, worktree and session — not just the workspace. The
+    /// project is the load-bearing part: the worktree and session are
+    /// remembered per project and per worktree, so landing back on row 0
+    /// would restore some other project's context.
+    #[test]
+    fn switching_back_to_a_workspace_restores_project_worktree_and_session() {
+        use nebula_core::{
+            Agent, AgentId, AgentStatus, Entity, Project, ProjectId, Worktree, WorktreeId,
+        };
+        let mut app = App::new();
+        seed_tree(&mut app); // default: demo (p1) / main (w1) / a1
+        seed_other_workspace(&mut app); // client: secret (p9) / main (w9)
+
+        // A second project in the default workspace, on a non-main worktree
+        // with its own session — so "the row we left on" is not row 0 at any
+        // of the three levels.
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(Project {
+                    workspace_id: Default::default(),
+                    id: ProjectId("p2".into()),
+                    name: "other".into(),
+                    repo_path: "/tmp/other".into(),
+                    sort_order: 1,
+                }),
+            },
+        );
+        for (id, branch, is_main, sort_order) in
+            [("w2a", "main", true, 0), ("w2b", "feature", false, 1)]
+        {
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(Worktree {
+                        id: WorktreeId(id.into()),
+                        project_id: ProjectId("p2".into()),
+                        path: format!("/tmp/other-{id}").into(),
+                        branch: branch.into(),
+                        is_main,
+                        pinned: false,
+                        sort_order,
+                    }),
+                },
+            );
+        }
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a2".into()),
+                    worktree_id: WorktreeId("w2b".into()),
+                    name: "agent-2".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    unseen: false,
+                    kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    cloud_session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    alive: true,
+                }),
+            },
+        );
+
+        // Park the cursor on other / feature / agent-2.
+        app.sel_project = 1;
+        app.sel_worktree = 1;
+        app.sel_session = 0;
+        assert_eq!(
+            app.selected_worktree().map(|w| w.branch.clone()),
+            Some("feature".into())
+        );
+
+        let mut out = Vec::new();
+        switch_workspace(&mut app, nebula_core::WorkspaceId("ws2".into()), &mut out);
+        assert_eq!(
+            app.selected_project().map(|p| p.name.clone()),
+            Some("secret".into()),
+            "a workspace with nothing remembered still opens on its first row"
+        );
+
+        out.clear();
+        switch_workspace(&mut app, nebula_core::WorkspaceId::default(), &mut out);
+        assert_eq!(
+            app.selected_project().map(|p| p.name.clone()),
+            Some("other".into()),
+            "back on the project the workspace was left on, not row 0"
+        );
+        assert_eq!(
+            app.selected_worktree().map(|w| w.branch.clone()),
+            Some("feature".into()),
+            "and that project's remembered worktree"
+        );
+        let a2 = SessionRef::Agent(AgentId("a2".into()));
+        assert_eq!(
+            app.selected_session_row().and_then(|r| r.sref()),
+            Some(a2.clone()),
+            "and that worktree's remembered session"
+        );
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == a2)),
+            "the remembered session comes back in the pane too, got {out:?}"
+        );
+    }
+
     /// The 'default' workspace as an entity — `seed_tree`'s project points
     /// at it by id, but nothing lists it until the daemon's row arrives.
     fn seed_default_workspace(app: &mut App) {
@@ -15635,10 +15712,12 @@ diff --git a/src/b.rs b/src/b.rs
                     archived: false,
                     archived_at: 0,
                     pinned: false,
+                    unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
                     effort: None,
                     session_id: None,
+                    cloud_session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
@@ -16109,11 +16188,32 @@ diff --git a/src/b.rs b/src/b.rs
         }
         app.overlay = None;
 
+        // d: a confirm first — Esc backs out to the panels with nothing
+        // sent, y sends the request (the daemon still refuses non-empty
+        // ones).
         press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+        match &app.overlay {
+            Some(Overlay::Confirm(c)) => {
+                assert_eq!(c.title, "Delete workspace");
+                assert!(c.message.contains("'default'"), "{}", c.message);
+                assert!(matches!(
+                    &c.action,
+                    PendingAction::RemoveWorkspace { id, reopen_picker: None }
+                        if *id == WorkspaceId::default()
+                ));
+            }
+            other => panic!("d should confirm, got {other:?}"),
+        }
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "Esc lands on the panels");
         assert!(
-            app.overlay.is_none(),
-            "no confirm — the daemon refuses non-empty ones"
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::RemoveWorkspace { .. })),
+            "nothing sent on Esc: {out:?}"
         );
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none());
         assert!(
             out.iter().any(|r| matches!(
                 r,
@@ -16322,7 +16422,7 @@ diff --git a/src/b.rs b/src/b.rs
         );
         assert_eq!(menu.hover, 0, "active row starts highlighted");
 
-        // The key verbs ride the modal's bottom border (notes-modal style).
+        // The key verbs ride the modal's bottom border.
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
@@ -16425,8 +16525,8 @@ diff --git a/src/b.rs b/src/b.rs
         );
     }
 
-    /// `r` and `d` in the switcher act on the hovered workspace (the
-    /// notes-modal pattern — footer hints, no submenus); after a delete the
+    /// `r` and `d` in the switcher act on the hovered workspace (footer
+    /// hints, no submenus); after a delete the
     /// open switcher refreshes its rows in place.
     #[test]
     fn switcher_r_and_d_act_on_the_hovered_workspace() {
@@ -16470,12 +16570,42 @@ diff --git a/src/b.rs b/src/b.rs
             "rename request sent: {out:?}"
         );
 
-        // d: straight to the request (the daemon guards misuse); the menu
-        // stays up and drops the row when the removal delta lands.
+        // d: a confirm replaces the switcher; Esc hands the switcher back
+        // on the same row with nothing sent.
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('w'), &mut out);
         press(&mut app, KeyCode::Char('j'), &mut out);
         press(&mut app, KeyCode::Char('d'), &mut out);
+        match &app.overlay {
+            Some(Overlay::Confirm(c)) => {
+                assert_eq!(c.title, "Delete workspace");
+                assert!(c.message.contains("'client'"), "{}", c.message);
+                assert!(matches!(
+                    &c.action,
+                    PendingAction::RemoveWorkspace { id, reopen_picker: Some(1) }
+                        if id.as_str() == "ws2"
+                ));
+            }
+            other => panic!("d should confirm, got {other:?}"),
+        }
+        press(&mut app, KeyCode::Esc, &mut out);
+        match &app.overlay {
+            Some(Overlay::Menu(menu)) => {
+                assert!(menu.is_workspace_picker(), "Esc reopens the switcher");
+                assert_eq!(menu.hover, 1, "on the row it was on");
+            }
+            other => panic!("Esc should reopen the switcher, got {other:?}"),
+        }
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::RemoveWorkspace { .. })),
+            "nothing sent on Esc: {out:?}"
+        );
+
+        // y: the request goes out (the daemon guards misuse) and the
+        // switcher stays up, dropping the row when the removal delta lands.
+        press(&mut app, KeyCode::Char('d'), &mut out);
+        press(&mut app, KeyCode::Char('y'), &mut out);
         assert!(
             matches!(
                 out.last(),
@@ -16484,8 +16614,8 @@ diff --git a/src/b.rs b/src/b.rs
             "delete request sent: {out:?}"
         );
         assert!(
-            matches!(&app.overlay, Some(Overlay::Menu(_))),
-            "switcher stays open"
+            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.is_workspace_picker() && m.hover == 1),
+            "switcher stays open on its row"
         );
         hse(
             &mut app,

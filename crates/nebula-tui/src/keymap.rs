@@ -67,7 +67,6 @@ pub enum Action {
     Pin,
     GitDiff,
     OpenRepo,
-    Notes,
     // sessions
     NewTerminal,
     NewLink,
@@ -276,15 +275,6 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["shift+g"],
-    },
-    ActionSpec {
-        action: Action::Notes,
-        id: "notes",
-        label: "Notes",
-        hint: "Notes for the selected project or worktree",
-        group: "PROJECTS & WORKTREES",
-        scope: Scope::Global,
-        defaults: &["e"],
     },
     // ---- SESSIONS ----
     ActionSpec {
@@ -1158,13 +1148,13 @@ mod tests {
     fn binding_steals_the_chord_from_its_previous_owner() {
         let mut map = Keymap::default();
         let g = KeyChord::parse("g").unwrap();
-        let notes = index_of(Action::Notes).unwrap();
+        let open_repo = index_of(Action::OpenRepo).unwrap();
         assert_eq!(
-            map.conflicts(notes, &g),
+            map.conflicts(open_repo, &g),
             vec![index_of(Action::GitDiff).unwrap()]
         );
-        map.bind(notes, g, false);
-        assert_eq!(map.lookup(Scope::Global, &g), Some(Action::Notes));
+        map.bind(open_repo, g, false);
+        assert_eq!(map.lookup(Scope::Global, &g), Some(Action::OpenRepo));
         assert!(!map.chords(Action::GitDiff).contains(&g));
     }
 
@@ -1212,12 +1202,12 @@ mod tests {
     #[test]
     fn a_hand_edited_duplicate_is_flagged_on_both_rows() {
         // Nothing in the overlay can produce this; a text editor can.
-        let map = Keymap::from_overrides(&BTreeMap::from([("notes".into(), "g".into())]));
-        let notes = index_of(Action::Notes).unwrap();
+        let map = Keymap::from_overrides(&BTreeMap::from([("open_repo".into(), "g".into())]));
+        let open_repo = index_of(Action::OpenRepo).unwrap();
         let diff = index_of(Action::GitDiff).unwrap();
-        assert!(map.is_ambiguous(notes));
+        assert!(map.is_ambiguous(open_repo));
         assert!(map.is_ambiguous(diff));
-        assert_eq!(map.shadowed_by(notes), vec!["Git diff"]);
+        assert_eq!(map.shadowed_by(open_repo), vec!["Git diff"]);
         // The defaults themselves are always unambiguous.
         assert!(Keymap::default()
             .binds

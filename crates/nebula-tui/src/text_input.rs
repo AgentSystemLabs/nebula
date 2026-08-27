@@ -1,7 +1,7 @@
 //! One-line text field with the editing keys a terminal user expects.
 //!
-//! Every typed field in the TUI — the note editor, the prompt dialog, the
-//! fuzzy filters, the grep query, the ssh destination — is one of these, so
+//! Every typed field in the TUI — the prompt dialog, the fuzzy filters,
+//! the grep query, the ssh destination — is one of these, so
 //! the keys are learned once and work everywhere: arrows and Home/End,
 //! word motion on ⌥←/⌥→, the readline control chords (Ctrl+A/E/B/F/W/U/K),
 //! and word/line deletes.

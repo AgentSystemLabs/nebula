@@ -93,12 +93,65 @@ async fn handshake(mut stream: UnixStream) -> Result<Connection> {
         Some(ServerEvent::HelloOk { daemon_pid, .. }) => Ok(Connection { stream, daemon_pid }),
         Some(ServerEvent::Incompatible {
             daemon_protocol_version,
-        }) => bail!(
-            "daemon speaks protocol v{daemon_protocol_version}, this client v{PROTOCOL_VERSION} — \
-             run `nebula kill` and relaunch"
-        ),
+        }) => bail!(version_skew_message(daemon_protocol_version)),
         other => bail!("unexpected handshake reply: {other:?}"),
     }
+}
+
+/// Explain a failed version handshake in terms of the fix.
+///
+/// Which side is stale decides the remedy, and getting it backwards costs a
+/// debugging session: when the *daemon* is ahead, the `nebula` that just ran
+/// is an older build than the one the daemon was launched from, and `nebula
+/// kill` cannot help — the live instance immediately respawns its daemon
+/// from its own binary (`spawn_daemon` above uses `current_exe`), so the
+/// skew survives every restart. That is the common shape in a checkout,
+/// where `make dev` runs `target/debug` while PATH still finds an older
+/// `nebula` from the last `make install`.
+fn version_skew_message(daemon_protocol_version: u32) -> String {
+    let client = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    let daemon = daemon_exe_path().unwrap_or_else(|| "unknown".into());
+    let header = format!(
+        "protocol mismatch: the daemon speaks v{daemon_protocol_version}, this client \
+         v{PROTOCOL_VERSION}\n  this client: {client}\n  the daemon:  {daemon}\n"
+    );
+    if daemon_protocol_version > PROTOCOL_VERSION {
+        format!(
+            "{header}This client is the older build, so `nebula kill` will not fix it — the \
+             running instance respawns its daemon from its own binary. Install the daemon's \
+             build over this one instead (`make install` from that checkout)."
+        )
+    } else {
+        format!(
+            "{header}The daemon is the older build — run `nebula kill` and relaunch. That \
+             stops every live session."
+        )
+    }
+}
+
+/// Best-effort path of the binary the running daemon was launched from, so
+/// the mismatch message can name it. Read from the pidfile rather than the
+/// handshake: `Incompatible` is what a *newer* daemon sends an older client,
+/// so adding a field to it would only break decoding on the clients that
+/// need this message most. The buildstamp beside the pidfile is no help
+/// either — it is a content hash, not a path.
+fn daemon_exe_path() -> Option<String> {
+    let pid = std::fs::read_to_string(paths::pidfile_path()).ok()?;
+    let pid = pid.trim();
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if let Ok(path) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+        return Some(path.display().to_string());
+    }
+    let out = std::process::Command::new("ps")
+        .args(["-p", pid, "-o", "comm="])
+        .output()
+        .ok()?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!path.is_empty()).then_some(path)
 }
 
 /// Channel-based IPC handle for the TUI event loop: outbound requests go
@@ -557,4 +610,37 @@ fn send_sigterm(pid: i32) -> i32 {
     }
     const SIGTERM: i32 = 15;
     unsafe { kill(pid, SIGTERM) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The whole point of the message: `nebula kill` is the fix for exactly
+    // one of the two skews, and recommending it for the other sends the user
+    // in a circle (kill the daemon, the live TUI respawns the same one).
+    #[test]
+    fn skew_message_blames_the_older_side() {
+        let daemon_ahead = version_skew_message(PROTOCOL_VERSION + 2);
+        assert!(daemon_ahead.contains("This client is the older build"));
+        assert!(
+            !daemon_ahead.contains("run `nebula kill` and relaunch"),
+            "must not send the user to kill a daemon that is not the stale side: {daemon_ahead}"
+        );
+        assert!(daemon_ahead.contains("make install"));
+
+        let daemon_behind = version_skew_message(PROTOCOL_VERSION - 1);
+        assert!(daemon_behind.contains("The daemon is the older build"));
+        assert!(daemon_behind.contains("run `nebula kill` and relaunch"));
+    }
+
+    #[test]
+    fn skew_message_names_both_binaries() {
+        let msg = version_skew_message(PROTOCOL_VERSION + 1);
+        assert!(msg.contains("this client: "), "{msg}");
+        assert!(msg.contains("the daemon:  "), "{msg}");
+        // current_exe resolves under a test binary, so this half is never
+        // the "unknown" fallback.
+        assert!(msg.contains(&format!("v{PROTOCOL_VERSION}")), "{msg}");
+    }
 }
