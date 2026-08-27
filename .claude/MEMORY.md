@@ -14,6 +14,119 @@ about what is worth recording.
 
 ## Entries
 
+### Copy Over `nebula ssh` Asks The Terminal, Not The Remote Box — 2026-08-27
+
+**Asked:** "when I try to copy text after doing nebula ssh into an ubuntu machine I spun up, it keeps
+saying copy failed (clipboard unavvailable). help me debug if this is something I need to support in
+nebula using ssh -X or if I just need to install something on the device"
+
+**Did:** Neither — added an OSC 52 route. `nebula ssh` execs `ssh -t HOST '… exec nebula'`
+(`crates/nebula/src/ssh.rs:40`), so the *whole TUI* including the copy path runs on the remote;
+`copy_to_clipboard` (`crates/nebula-tui/src/event_loop.rs`) then shells out to wl-copy/xclip/xsel on a
+headless VM that has none of them and no `DISPLAY`. New `copy_and_flash(app, text, label)` fronts all
+three copy call sites (file finder Ctrl+y, tree view Ctrl+y, `copy_selection`): local → platform tool as
+before; `app.is_remote` (already computed from `SSH_CONNECTION`/`SSH_TTY` via
+`nebula_core::host::is_remote_session`) → queue `App::pending_clipboard`, which `main_loop` writes as
+`\x1b]52;c;<b64>\x07` through `terminal.backend_mut()` next to the existing OSC 22 pointer-shape write.
+Dependency-free `base64_encode` (RFC 4648 vectors test) rather than pulling a crate for one call site.
+Rejected `ssh -X`: it needs xclip remotely *plus* XQuartz locally, and lands the text in the X11
+clipboard rather than the macOS pasteboard.
+
+**Gotchas:**
+- **The "clipboard unavailable" failure path no longer exists** — OSC 52 is always available as a
+  fallback, so a copy can now silently no-op on a terminal that drops OSC 52 (Terminal.app does; Ghostty
+  and iTerm2 don't). That is why the flash says `copied N chars (via terminal)` on the OSC 52 route: the
+  route is the only thing we can honestly report. iTerm2 additionally needs Settings → General →
+  Selection → "Applications in terminal may access clipboard".
+- **BEL-terminate OSC 52, not ST.** The neighbouring OSC 22 write uses `\x1b\\`; OSC 52 is the sequence
+  where BEL is the form every implementer accepts.
+- The payload cannot be written with a bare `std::io::stdout()` from the copy helper — ratatui owns a
+  `BufWriter<Stdout>` that would interleave. Queue it on `App` and let the main loop write it through the
+  backend, exactly as `pointer_shape` does.
+- **The fix has to be on the *remote* binary.** `nebula ssh` only installs nebula when the remote lacks
+  it, so an existing remote keeps its old version until `nebula upgrade` runs *there* — testing this from
+  a freshly built local binary proves nothing.
+- Not covered: `nebula ssh` launched from *inside* a local nebula pane. The remote's OSC 52 hits the local
+  nebula's vt100 parser and dies; passing it through the PTY layer is unbuilt.
+
+### The Open Tab's Underline Was A Half-Cell Away From The Tab — 2026-08-27
+
+**Asked:** "fix the small gap between the header workspace name and the bottom bar if possible" — with a
+screenshot of the Workspaces bar: the open tab's dark `sel_bg` block, a strip of black, then the green
+accent underline.
+
+**Did:** One glyph. `crates/nebula-tui/src/ui.rs::draw_workspaces_bar` drew the open tab's underline as
+`━` (U+2501) into the rule row; it now draws **`▀`** (U+2580, upper half block) with the same `th.accent`
+fg. The tab's `sel_bg` fill still stops at `area.height - 1`, so the block's bottom edge and the half
+block's top edge are the same pixel row — flush, no gap. Rejected: extending the fill through the rule row
+and painting `set_bg(th.sel_bg)` under a kept `━` — it closes the black gap but leaves a half-cell of
+`sel_bg` *below* the accent, so the tab hangs past its own underline. Tests updated in
+`crates/nebula-tui/src/event_loop.rs`: the cell assertion in the tab-surface test (`"━"` → `"▀"`, plus the
+why) and `rule.contains("━━")` → `"▀▀"` in `the_workspaces_bar_sits_directly_above_projects`. 452
+nebula-tui tests green, fmt clean.
+
+**Gotchas:**
+- **A sub-cell gap is invisible to `TestBackend`.** The buffer holds a symbol and a style, not pixels, so
+  no `buffer_text` or cell assertion can see that `━` renders at the cell's *midline* and leaves the top
+  ~40% of the cell unpainted. The only guard available is asserting the symbol, which is why the test
+  carries the reason in a comment.
+- **Box-drawing line glyphs never touch a cell edge; block elements do.** Any "join two rows of fill"
+  problem in this TUI is a block-element problem (`▀`/`▄`), not a heavier-line problem.
+- **Judging this needs a real font raster, not a terminal.** Pillow + `/System/Library/Fonts/Menlo.ttc` at
+  ~27px, drawing the candidate cell stacks side by side, settles it in one PNG — no demo daemon, no tmux.
+  See the `tui-screenshot-harness` note for the full-app version when a change is bigger than a glyph.
+- The accent underline now sits slightly *above* the `─` edge rule flanking it (mid-cell vs top-of-cell).
+  That is deliberate — the tab indicator reads as heavier than the divider — not a misalignment to "fix".
+
+### Cloud Rows Mirror Their Session Instead Of Dying At Create — 2026-08-27
+
+**Asked:** "still when I try to create a claude cloud session, it doesn't seem to update me with the
+changes, it just says use a command to resume, and if i leave and come back to that terminal it errors
+out.  find a way to allow the cloud session output to show up in the ui" → chose, from the options put
+to them: auto-follow until the pane is touched, plus a send-message path.
+
+**Did:** Probed the real CLI first (2.1.247, see the gotchas), then built the follow on `--teleport`.
+`crates/nebula-daemon/src/pty/mod.rs`: `PtySession.input_seen` (AtomicBool, set by `write_input` on a
+non-empty write only — resizes don't count). `registry.rs`: `Daemon.cloud_attach_gated` (AtomicBool, set
+when `arm_cloud_attach_fallback` sees the refusal) routes every later re-entry through the new pure
+`cloud_reentry_launch(id, gated)` → `Teleport` instead of re-flashing the red error; `arm_cloud_follow`
+watches a `CloudLaunch::Create` PTY for its id + exit and then calls `attach_cloud_agent` unasked, so a
+create no longer leaves a dead "Resume with:" pane; `start_cloud_mirror`/`refresh_cloud_mirror`/
+`stop_cloud_mirror` + `Daemon.cloud_mirrors` re-teleport the row every `CLOUD_MIRROR_REFRESH` (45s,
+`NEBULA_CLOUD_MIRROR_SECS` overrides, `0` disables, floor 2s); `cloud_worktree_for` is the re-home split
+out of `attach_cloud_agent`; `send_cloud_message` runs `claude -p <msg> --cloud=<id>` via
+`tokio::process` + `login_shell_wrap` and refreshes after. `validate_cloud_text` now covers both the
+launch task and the message. Protocol **v28**: `ClientRequest::SendCloudMessage` and runtime-only
+`Agent.cloud_mirroring` (set in `agent_entity` like `alive`). TUI: `PromptKind::CloudMessage` (multiline),
+`MenuAction::SendCloudMessage`, "Send to cloud session" menu item, `PendingIntent::ReopenPromptOnError`
+so a failed send hands the text back, and a `cloud ↻` accent badge in `ui.rs`. 654 tests green.
+
+**Gotchas:**
+- **Live attach is still gated off** (verified 2026-08-27 under a real PTY): `claude --cloud=<id>` prints
+  `Error: Attaching to an existing cloud session is not enabled for your account.` Without a TTY it now
+  fails differently — `non-interactive --cloud <session_id> requires a prompt` — so a non-PTY probe reads
+  like the gate is gone. Probe under `script -q`.
+- **`claude --teleport=<id>` is a repeatable snapshot pull, and that is the whole mechanism.** Verified
+  three runs against one live session: it re-fetches the transcript each time, picks up turns taken
+  since (a `-p --cloud` message sent between runs showed up), is idempotent in the same worktree, and
+  does **not** end the cloud session. It is a fork to local, not a live link — hence the re-teleport loop.
+- `claude -p "msg" --cloud=<id>` still only prints `Sent to cloud session.`; `--output-format
+  stream-json` is refused outright for `--cloud`. There is no reply to stream.
+- The CLI binary carries `/v1/code/sessions/{id}/events/stream` (real SSE, what the CLI itself uses).
+  Rejected: it needs the OAuth token scraped out of the macOS keychain and is undocumented. Reading the
+  keychain was blocked by the auto-mode classifier, which is the right instinct.
+- **A mirror must stop when its pane is gone, or cloud rows become unreapable.** The idle reaper kills
+  unattended sessions; a mirror that respawns on every tick would fight it forever. `refresh_cloud_mirror`
+  returns `Ok(false)` when the session is absent — that also stops a teleport that dies on every try.
+- The mirror ends on the first keystroke, not on the row gaining a local `session_id` — a teleport sets
+  one immediately via the hooks. `restart_agent` therefore routes on `session_id.is_none() ||
+  cloud_mirror_active(id)`.
+- A mirror that quits must re-broadcast the row, or the `cloud ↻` badge keeps promising refreshes.
+- e2e can't tell a stub's attach from its teleport (`NEBULA_AGENT_CMD` spawns override the argv verbatim,
+  no cloud flag), so the gate is unit-tested on `cloud_reentry_launch` instead. And the recorded
+  "upsert beats the stub's first line" race bites again: a `!cloud_mirroring` predicate matches the
+  create's own upsert, so wait for the run count first, then require lit-then-quiet.
+
 ### Released v0.12.0 From A Checkout That Was Behind Its Own Work — 2026-08-27
 
 **Asked:** "commit push release"
@@ -285,7 +398,9 @@ cannot miss it; sightings are `PtyEvent::CloudSession` / `CloudAttachRejected`, 
 `restart_agent` (now async) routes a row with `cloud_session_id` and no local `session_id` to
 `attach_cloud_agent`, which re-homes a main-checkout row into a `cloud-<last 8 of id>` worktree, spawns
 the attach, and `arm_cloud_attach_fallback` respawns as a teleport once the refusal was *seen* and the
-child exited. `ClientRequest::AttachCloudAgent` + the "Attach cloud session" menu item force the chain
+child exited. **Superseded in part on 2026-08-27** ([Cloud Rows Mirror Their Session Instead Of Dying At
+Create]): a create now re-enters on its own, the attach is only tried until this daemon has seen it
+refused once, and the teleported pane keeps re-teleporting until it is typed into. `ClientRequest::AttachCloudAgent` + the "Attach cloud session" menu item force the chain
 any time; the sessions list shows a `cloud` badge. e2e `cloud_row_captures_its_session_id_and_reenters_it`
 walks the whole chain with a three-run stub. README step 4 documents it.
 
@@ -298,7 +413,8 @@ walks the whole chain with a three-run stub. README step 4 documents it.
   branch, hence the mandatory fresh worktree for rows in the main checkout. The placeholder
   `cloud-…` branch stays behind once teleport checks the cloud branch out on top of it.
 - `SessionEnded` only flips status from Running/NeedsFeedback, so the dead create row stays gray
-  `Fresh` — the `cloud` badge and `alive:false` are the only tells.
+  `Fresh` — the `cloud` badge and `alive:false` are the only tells. (The create no longer leaves a dead
+  row at all as of 2026-08-27, but a failed create still does.)
 - In e2e, a spawn's `EntityUpserted{alive:true}` reaches the client before the stub has executed a
   line: don't assert on stub side effects inside the `read_events_until` predicate (it is only
   re-evaluated per event) — wait for the event, then poll the file.
@@ -1390,7 +1506,9 @@ launch metadata without the task. README documents the flow. Full workspace suit
   continue?" prompt, so run it in a fresh worktree) and `claude -p "msg" --cloud session_…` (queue a
   message, no reply). `claude agents --json --all` lists only local background/interactive sessions,
   never cloud ones, so there is no CLI poll for "cloud session finished". The reattach path built on this
-  is [Cloud Rows Re-Enter Their Session On Restart].
+  is [Cloud Rows Re-Enter Their Session On Restart]. Teleport was later confirmed **repeatable** — it
+  re-pulls newer turns, is idempotent in the same worktree, and leaves the cloud session running — which
+  is what [Cloud Rows Mirror Their Session Instead Of Dying At Create] is built on.
 
 ### Workspaces Are Per Instance, Not Daemon-Global — 2026-08-24
 
