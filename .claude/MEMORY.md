@@ -14,6 +14,84 @@ about what is worth recording.
 
 ## Entries
 
+### Done Reads Violet And Says "done" — 2026-08-27
+
+**Asked:** Four turns, one thread. "don't put the number of running sessions in workspace hreader tabs,
+just show \"2 done\"" → "replace word \"new\" with \"done\"" → "can you make the status dot for done a
+different color than green so it's obvious something needs to be addressed" → the correction that settled
+it: **"no you misunderstood, it should be green after I focus on the session, but purple when done and not
+yet read"**.
+
+**Did:** The unread finish is now a state with its own color, not a synonym for finished.
+`workspace_running` → **`workspace_unseen`** (`crates/nebula-tui/src/app.rs:1477`) counts `a.unseen`,
+mirroring `worktree_unseen` / `project_unseen`, so all three tiers count the same thing and the count dies
+as you read. `ui.rs::status_dot` took an **`unseen: bool`** third arg: `Finished` draws `th.done` when
+unread and `th.ok` once seen; every other status ignores it. All four call sites pass it (workspace tab,
+project row, worktree row, session row — `a.unseen && !a.archived`), and `PaletteItem` gained an `unseen`
+field so `/` splits the same way. Wording: `unseen_badge` → ` n done` (was ` n new`), session row's
+harness-slot takeover → ` done`. New theme role **`done`** = `Color::Indexed(141)` violet, `Indexed(45)`
+turquoise in the `rose` preset (whose `special` is already 141). `th.ok` keeps green for diff-adds,
+`⏻ connected`, reviewed-file ticks — and now for read finishes. The PR link row's ` n new` was left alone:
+it counts unread review comments, not finished turns. README dot table, feature bullet, badge paragraph and
+`Shift+W` row updated. Tests: theme asserts `done` differs from `ok`/`warn`/`err`/`special`/`dim` in all 5
+presets; `unwatched_finishes_badge_the_rows_until_read` now asserts violet before the read and green after,
+on the session row *and* the project row above it. 450 nebula-tui + 143 daemon + 7 core green, fmt clean.
+
+**Gotchas:**
+- **The panel columns are a fixed 20 cells wide, so a wider badge clips instead of reflowing** — widening
+  the `TestBackend` from 100 to 120 changed nothing but the TERMINAL pane. ` 1 new` → ` 1 done` is one
+  cell more and the worktree root row started rendering `root 1 don`.
+- **The project and worktree name budgets never billed the pill marker.** `render_pill` / `render_button`
+  both `spans.insert(0, marker)` — one cell, rail or space — but `ui.rs` subtracted only the dot's 2
+  (`saturating_sub(2 + badge_len)`). Pre-existing off-by-one that only bit once the badge grew; now 3.
+  The PR row two arms down had it right all along (`saturating_sub(3)` for a 2-char `↗ `), which is what
+  confirmed the convention.
+- With that fixed, `main` ellipsized to `ma…` to keep ` ⌂ root`. The root badge now **yields** to a branch
+  it would otherwise truncate (`● main 1 done`, not `● ma… ⌂ root 1 done`) — the ⌂ is decoration, the
+  branch is the row's identity. e2e's `wait_for_text("main ⌂ root")` still passes: no badge, no contention.
+- `"client 1 done".contains("client 1 ")` is **true** — a negative assertion written to prove the bare
+  running count was gone would have passed for the wrong reason. Dropped it.
+- **"Done" is ambiguous and the first two readings were both wrong.** It went `Running` count → all
+  `Finished` → unread-`Finished`, and the dot went all-`Finished`-violet → violet-only-while-unread. The
+  distinction the user wanted was never finished-vs-not, it was **read-vs-unread** — the same axis
+  `Agent::unseen` already tracked for the counters. When a color is asked for "so it's obvious something
+  needs to be addressed", find the flag that already means "needs addressing" instead of coloring a status.
+- Test counts drifted 450 ↔ 451 between back-to-back runs and two workspaces-bar tests failed once and
+  never again: another session was editing this shared checkout mid-build. Rerun before debugging (see
+  [Shared tree races] in the user memory).
+
+### Released v0.11.0 Out Of A Shared Tree That Moved Mid-Release — 2026-08-26
+
+**Asked:** "commit push release"
+
+**Did:** Cut **v0.11.0** (0.10.0 → minor: new features) from the ~1,900 lines of uncommitted work sitting
+in the shared checkout — cloud re-attach, unseen counters, workspace-delete confirm, workspace context
+restore, notes removal, the protocol-skew message. Followed the `release` skill: private worktree on
+`release-v0.11.0` off `origin/main`, files copied in by content, `cargo test --workspace` in an isolated
+`CARGO_TARGET_DIR` (**647 passed, 0 failed**, all 7 binaries incl. e2e_pty 23 / e2e_tui 5), three commits
+(feature / `.claude/MEMORY.md` / `Release v0.11.0`), `git push origin release-v0.11.0:main`, tag, then
+`gh release edit --notes-file`. All four matrix targets green; 4 assets attached. `random.txt` (untracked
+scratch, "nothing here is load-bearing") deliberately left out.
+
+**Gotchas:**
+- **`for f in $(git diff --name-only)` silently copies nothing in zsh.** Unquoted expansions are not
+  word-split, so the loop ran once with all 19 paths as a single filename and `cp` failed with one
+  `No such file or directory`. The tell was `git status` in the new worktree showing only the untracked
+  file. Use `... | while IFS= read -r f`.
+- **`cargo test … | tail -60` reports `tail`'s exit code, not cargo's.** The first run "passed" with exit 0
+  while the tail showed no e2e results at all. Redirect to a file and check `$?` directly, or set
+  `pipefail` — never trust a piped cargo exit status for a green gate.
+- **An untracked file reads as `deleted` in `git diff <commit> -- <path>`.** Diffing the shared tree
+  against the release commit showed `cloud.rs | 286 ------` because untracked files aren't in the index.
+  It was byte-identical (`cmp`); nothing was lost. Verify with `cmp` before believing a deletion.
+- **The shared tree moved between the snapshot and the push.** `git diff | shasum` went `8d64c39` →
+  `3b9c7e0`: another session changed the Workspaces-bar badge from "count running" to "count done"
+  (`workspace_running` → `workspace_done` in `app.rs`/`ui.rs`, plus a README cell). Not in v0.11.0, by
+  design. Checksum the diff before and after the copy — it is the cheapest proof of what you actually shipped.
+- The user's local `main` stays at `0361f0a` while `origin/main` is `8102fa4`; the working tree still holds
+  every released change as uncommitted edits, so a plain `git pull` will refuse. Branch `release-v0.11.0`
+  is kept locally as the handle to those commits.
+
 ### `nebula rename` Broke On A Protocol Skew The Error Message Misdiagnosed — 2026-08-26
 
 **Asked:** "why is it printing … Error: daemon speaks protocol v26, this client v24 — run `nebula kill`
@@ -247,9 +325,11 @@ upsert only when the flag actually flipped. `PROTOCOL_VERSION` 24 → 25. TUI:
 `event_loop.rs::mark_agent_seen` runs from `attach()` (every path that lands the pane on a session goes
 through it — cursor walk, restore, palette, snapshot re-attach) and from the `StatusChanged` arm when the
 flip is for the session already in the pane; `app.rs::worktree_unseen` / `project_unseen` count;
-`ui.rs::row_badges` draws ` n new` (`th.ok`) on project and worktree rows (it also carried a note badge
+`ui.rs::row_badges` draws ` n done` (`th.done`) on project and worktree rows (it also carried a note badge
 until notes were removed 2026-08-26), and a
-session row swaps its ` claude` harness badge for ` new` (the link row's unread-count idiom). README
+session row swaps its ` claude` harness badge for ` done` (the link row's unread-count idiom). The badge
+read ` n new` in `th.ok` until 2026-08-27 — see [Done Reads Violet And Says "done"] for the rename and
+for the dot splitting violet (unread) from green (read) on the same `unseen` flag this entry added. README
 "Status dots" documents it. Tests: store `unseen_follows_the_status_and_clears_on_seen`; registry
 `status_broadcast_carries_the_unseen_flag`, `mark_agent_seen_broadcasts_only_a_flip`; event_loop
 `an_unwatched_finish_counts_until_the_cursor_lands_on_it`, `a_finish_in_the_pane_on_screen_is_already_seen`,
@@ -328,11 +408,10 @@ directly above `set_show_workspaces`; both sides prepended a memory entry).
 
 ### Prototype: The Workspaces Column Became A Top Tab Bar — 2026-08-26
 
-**Not on `main`.** This lives on the worktree branch `worktree-workspace-tabs`
-(`.claude/worktrees/workspace-tabs`), committed there and merged *up* from `origin/main` (v0.10.0), but
-never merged back — it is awaiting the user's verdict. If it is adopted, [The Workspaces Column Drags To
-Resize] and the column half of [A Workspaces Column Left Of Projects] are superseded wholesale — say so
-then, not before.
+**Adopted — on `main`** as of merge commit `0361f0a` (PR #16). It was written on the worktree branch
+`worktree-workspace-tabs` and awaiting a verdict when this entry was first written; that verdict came in.
+[The Workspaces Column Drags To Resize] and the column half of [A Workspaces Column Left Of Projects] are
+superseded wholesale by it.
 
 **Asked:** "in a worktree, protype having the workspaces actually be a top bar with WORKSPACES on the left
 aligned vertically above PROJECTS, but on the right it lists out the workspaces as tab buttons, each with a
@@ -344,7 +423,9 @@ toggle through"
 `   WORKSPACES · n` plus one tab per workspace, then a full-width rule **broken under the open tab** so it
 reads as joined to the panels. The label reuses `ROW_GUTTER`, so it lands on the same x=3 / row-1 grid as
 the panel headers and sits exactly `WORKSPACES_BAR_H` rows above `PROJECTS`. Each tab is
-` <digit> <dot><name><running-count> `, and the bar scrolls horizontally with `‹`/`›` marks when the tabs
+` <digit> <dot><name><count> ` — the count was running-sessions until 2026-08-27, when it became
+` n done`, the workspace's unread finishes; see [Done Reads Violet And Says "done"] — and the bar scrolls
+horizontally with `‹`/`›` marks when the tabs
 outrun the width.
 
 Layout plumbing: `App::workspaces_panel_w()` → `workspaces_bar_h()`, `WORKSPACES_BAR_H = 3` replaces
