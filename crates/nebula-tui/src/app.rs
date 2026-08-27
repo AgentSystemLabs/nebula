@@ -63,10 +63,12 @@ pub enum HitTarget {
 /// is the widest because its rows carry the most: name, "23m ago", harness.
 pub const DEFAULT_PANEL_WIDTHS: [u16; 3] = [20, 22, 32];
 /// Height of the Workspaces bar that spans the top of the body: a blank
-/// spacer, the label-plus-tabs row, and the rule that closes it off from
-/// the panels below. The label lands on the same row-1 / x-3 grid the panel
-/// headers use, so WORKSPACES sits directly above PROJECTS.
-pub const WORKSPACES_BAR_H: u16 = 3;
+/// spacer, the label-plus-tabs row, a second blank spacer, and the rule
+/// that closes it off from the panels below. The label lands on the same
+/// row-1 / x-3 grid the panel headers use, and the tabs get a row of air on
+/// either side so the bar reads as its own tier rather than as a header
+/// crowded against the rule.
+pub const WORKSPACES_BAR_H: u16 = 4;
 /// A panel can't be dragged narrower than this.
 pub const MIN_PANEL_W: u16 = 10;
 /// The terminal pane always keeps at least this much width.
@@ -693,6 +695,10 @@ pub struct PaletteItem {
     /// and the text sweep, so a running session reads as running in the
     /// palette too. Refreshed by [`Palette::rebuild`] as upserts land.
     pub status: Option<AgentStatus>,
+    /// Whether anything under this row finished a turn nobody has read.
+    /// Splits a finished dot green (read) from violet (waiting on you),
+    /// exactly as the panel rows do.
+    pub unseen: bool,
 }
 
 /// One visible palette row: an index into `items` plus the char positions of
@@ -835,6 +841,7 @@ fn build_palette_items(
                 text: ws.name.clone(),
                 archived: false,
                 status: workspace_rollup(tree, &ws.id),
+                unseen: workspace_unseen(tree, &ws.id) > 0,
             });
         }
         let at = match workspace {
@@ -854,6 +861,7 @@ fn build_palette_items(
                 text: format!("{at}{}", p.name),
                 archived: false,
                 status: project_rollup(tree, &p.id),
+                unseen: project_unseen(tree, &p.id) > 0,
             });
         }
         for p in &projects {
@@ -863,6 +871,7 @@ fn build_palette_items(
                     text: format!("{at}{}/{}", p.name, w.branch),
                     archived: false,
                     status: worktree_rollup(tree, &w.id),
+                    unseen: worktree_unseen(tree, &w.id) > 0,
                 });
             }
         }
@@ -877,6 +886,7 @@ fn build_palette_items(
                         text: format!("{at}{}/{}/{}", p.name, w.branch, a.name),
                         archived: a.archived,
                         status: Some(a.status),
+                        unseen: a.unseen && !a.archived,
                     });
                 }
             }
@@ -895,6 +905,7 @@ fn build_palette_items(
                     text: format!("{at}{}/{}", p.name, pr.label()),
                     archived: false,
                     status: None,
+                    unseen: false,
                 });
             }
         }
@@ -1472,11 +1483,13 @@ pub fn workspace_rollup(tree: &Tree, workspace_id: &WorkspaceId) -> Option<Agent
     rollup(workspace_agents(tree, workspace_id).map(|a| a.status))
 }
 
-/// How many agents are running right now across a workspace — the
-/// Workspaces column's count badge, next to the rollup dot.
-pub fn workspace_running(tree: &Tree, workspace_id: &WorkspaceId) -> usize {
+/// The `n done` count for a workspace tab: sessions under it that finished
+/// a turn nobody has read yet. Same thing [`worktree_unseen`] and
+/// [`project_unseen`] count, one tier up — a count means the same at every
+/// tier, and it counts down to nothing as the cursor visits each session.
+pub fn workspace_unseen(tree: &Tree, workspace_id: &WorkspaceId) -> usize {
     workspace_agents(tree, workspace_id)
-        .filter(|a| a.status == AgentStatus::Running)
+        .filter(|a| a.unseen)
         .count()
 }
 
@@ -2671,8 +2684,8 @@ impl App {
         workspace_rollup(&self.tree, workspace_id)
     }
 
-    pub fn workspace_running(&self, workspace_id: &WorkspaceId) -> usize {
-        workspace_running(&self.tree, workspace_id)
+    pub fn workspace_unseen(&self, workspace_id: &WorkspaceId) -> usize {
+        workspace_unseen(&self.tree, workspace_id)
     }
 
     /// Sessions under a worktree that went green with nobody looking.

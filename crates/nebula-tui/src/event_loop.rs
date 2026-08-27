@@ -6704,8 +6704,11 @@ mod tests {
     }
 
     /// The badges: project and worktree rows count their unwatched finishes
-    /// as ` n new`, and the session rows being counted say `new` in the
-    /// harness slot — all of it gone once the session has been read.
+    /// as ` n done`, and the session rows being counted say `done` in the
+    /// harness slot — all of it gone once the session has been read. Dot
+    /// and count share the `done` violet while the turn is unread; landing
+    /// the cursor on the session drops the dot to the plain-success green,
+    /// which is the whole distinction: violet is a job, green is a result.
     #[test]
     fn unwatched_finishes_badge_the_rows_until_read() {
         use nebula_core::AgentStatus;
@@ -6725,27 +6728,68 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("demo 1 new"), "project row counts it: {text}");
         assert!(
-            text.contains("root 1 new"),
+            text.contains("demo 1 done"),
+            "project row counts it: {text}"
+        );
+        // `main 1 done`, not `main ⌂ root 1 done`: in a twenty-cell column
+        // the root badge yields to the branch rather than ellipsize it.
+        assert!(
+            text.contains("main 1 done"),
             "worktree row counts it: {text}"
         );
         let row = text.lines().find(|l| l.contains("agent-2")).unwrap();
         let tail = &row[row.find("agent-2").unwrap()..];
-        assert!(tail.contains(" new"), "the session row says so: {row}");
+        assert!(tail.contains(" done"), "the session row says so: {row}");
         assert!(
             !tail.contains("claude"),
             "the harness slot is taken over: {row}"
         );
+        {
+            // Unread: the dot wears `done`, not the success green — and
+            // the rows above it roll that up, so they're violet too.
+            let (x, y) = find_cell(&terminal, "agent-2");
+            let (px, py) = find_cell(&terminal, "demo");
+            let buffer = terminal.backend().buffer();
+            let dot = &buffer[(x - 2, y)];
+            assert_eq!(dot.symbol(), "●", "{text}");
+            assert_eq!(dot.fg, app.theme.done, "unread done dot:\n{text}");
+            assert_ne!(
+                app.theme.done, app.theme.ok,
+                "and it isn't the success green"
+            );
+            assert_eq!(
+                buffer[(px - 2, py)].fg,
+                app.theme.done,
+                "project dot:\n{text}"
+            );
+        }
 
         let mut out = Vec::new();
         mark_agent_seen(&mut app, &a2, &mut out);
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(!text.contains("1 new"), "read: the counts are gone: {text}");
+        assert!(
+            !text.contains("1 done"),
+            "read: the counts are gone: {text}"
+        );
         let row = text.lines().find(|l| l.contains("agent-2")).unwrap();
         let tail = &row[row.find("agent-2").unwrap()..];
         assert!(tail.contains("claude"), "the harness is back: {row}");
+        // …and the dots go green: still finished, no longer a job.
+        let (x, y) = find_cell(&terminal, "agent-2");
+        let (px, py) = find_cell(&terminal, "demo");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            buffer[(x - 2, y)].fg,
+            app.theme.ok,
+            "read done dot:\n{text}"
+        );
+        assert_eq!(
+            buffer[(px - 2, py)].fg,
+            app.theme.ok,
+            "project dot:\n{text}"
+        );
     }
 
     fn hse(app: &mut App, ev: ServerEvent) {
@@ -15726,6 +15770,36 @@ diff --git a/src/b.rs b/src/b.rs
         );
     }
 
+    /// A finished-and-unread session in the same background workspace as
+    /// [`seed_background_run`], so the bar has something to count as done
+    /// while the rollup still reads as running.
+    fn seed_background_finished(app: &mut App) {
+        use nebula_core::{Agent, AgentId, AgentStatus, Entity, WorktreeId};
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a10".into()),
+                    worktree_id: WorktreeId("w9".into()),
+                    name: "bg-done".into(),
+                    status: AgentStatus::Finished,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    unseen: true,
+                    kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    cloud_session_id: None,
+                    sort_order: 1,
+                    status_changed_at: 0,
+                    alive: true,
+                }),
+            },
+        );
+    }
+
     // ---- the Workspaces bar ----
 
     /// `Shift+W` shows and hides the Workspaces bar. Hiding it parks a
@@ -15779,8 +15853,11 @@ diff --git a/src/b.rs b/src/b.rs
 
     /// The bar lists every workspace with the rollup of the agents under
     /// it, so a run in a workspace you don't have open still shows: the
-    /// shortcut digit, the running dot and a count ride the name, and the
-    /// open workspace is the selected tab.
+    /// shortcut digit, the rollup dot and a "done" count ride the name, and
+    /// the open workspace is the selected tab. The dot and the badge answer
+    /// different questions — the dot is what the workspace is doing (a run
+    /// outranks a finished turn), the badge is how much finished unread —
+    /// so a workspace mid-run still counts what's waiting to be read.
     #[test]
     fn workspaces_bar_rolls_up_every_workspace() {
         use nebula_core::{AgentStatus, WorkspaceId};
@@ -15789,16 +15866,17 @@ diff --git a/src/b.rs b/src/b.rs
         seed_default_workspace(&mut app);
         seed_other_workspace(&mut app);
         seed_background_run(&mut app);
+        seed_background_finished(&mut app);
 
         let other = WorkspaceId("ws2".into());
         assert_eq!(app.workspace_rollup(&other), Some(AgentStatus::Running));
-        assert_eq!(app.workspace_running(&other), 1);
+        assert_eq!(app.workspace_unseen(&other), 1);
         assert_eq!(
             app.workspace_rollup(&WorkspaceId::default()),
             Some(AgentStatus::Fresh),
             "demo's never-run agent"
         );
-        assert_eq!(app.workspace_running(&WorkspaceId::default()), 0);
+        assert_eq!(app.workspace_unseen(&WorkspaceId::default()), 0);
 
         let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
@@ -15807,7 +15885,7 @@ diff --git a/src/b.rs b/src/b.rs
         let buffer = terminal.backend().buffer();
 
         // "● " sits two cells ahead of the name, in the running color; the
-        // count follows the name.
+        // done count follows the name.
         let (x, y) = find_cell(&terminal, "client");
         let dot = &buffer[(x - 2, y)];
         assert_eq!(dot.symbol(), "●", "{text}");
@@ -15815,7 +15893,7 @@ diff --git a/src/b.rs b/src/b.rs
         let row: String = (0..buffer.area.width)
             .map(|x| buffer[(x, y)].symbol())
             .collect();
-        assert!(row.contains("client 1"), "running count:\n{text}");
+        assert!(row.contains("client 1 done"), "done count:\n{text}");
         // Its shortcut digit leads the tab, dim on an unopened one.
         assert_eq!(buffer[(x - 4, y)].symbol(), "2", "{text}");
         assert_eq!(buffer[(x - 4, y)].fg, app.theme.dim, "{text}");
@@ -15823,16 +15901,27 @@ diff --git a/src/b.rs b/src/b.rs
         // The open workspace's tab carries the selection fill, and its
         // digit is accented.
         let (x, y) = find_cell(&terminal, "default");
-        assert_eq!(buffer[(x, y)].bg, app.theme.sel_bg_dim, "open tab:\n{text}");
+        assert_eq!(buffer[(x, y)].bg, app.theme.sel_bg, "open tab:\n{text}");
+        // The fill takes the bar's padding rows too, so the tab reads as
+        // one block rather than a highlighted row.
+        assert_eq!(buffer[(x, y - 1)].bg, app.theme.sel_bg, "top pad:\n{text}");
+        assert_eq!(
+            buffer[(x, y + 1)].bg,
+            app.theme.sel_bg,
+            "bottom pad:\n{text}"
+        );
         assert_eq!(buffer[(x - 4, y)].symbol(), "1", "{text}");
         assert_eq!(buffer[(x - 4, y)].fg, app.theme.accent, "{text}");
         // A fresh dot is dim, lifted to muted on the selection fill.
         assert_eq!(buffer[(x - 2, y)].fg, app.theme.muted, "fresh dot:\n{text}");
 
-        // The rule under the bar breaks beneath the open tab, so it reads
-        // as attached to the panels below it.
-        assert_eq!(buffer[(x, y + 1)].symbol(), " ", "tab join:\n{text}");
-        assert_eq!(buffer[(0, y + 1)].symbol(), "─", "{text}");
+        // The rule under the bar stays unbroken beneath the open tab — it
+        // becomes that tab's accent underline, so the tab reads as
+        // attached to the panels below it.
+        assert_eq!(buffer[(x, y + 2)].symbol(), "━", "tab join:\n{text}");
+        assert_eq!(buffer[(x, y + 2)].fg, app.theme.accent, "{text}");
+        assert_eq!(buffer[(0, y + 2)].symbol(), "─", "{text}");
+        assert_eq!(buffer[(0, y + 2)].fg, app.theme.edge, "{text}");
     }
 
     /// ←/→ in the bar switch workspaces outright — the cursor IS the open
@@ -15966,7 +16055,7 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(
             lines[panel_row].find("PROJECTS"),
             Some(3),
-            "same column, three rows down:\n{text}"
+            "same column, the bar's height down:\n{text}"
         );
         // Tabs share that row, to the right of the label.
         let tabs_at = lines[bar_row].find("default").expect("first tab drawn");
@@ -15974,15 +16063,20 @@ diff --git a/src/b.rs b/src/b.rs
         assert!(lines[bar_row].contains("client"), "{text}");
 
         // The rule closes the bar off, full width bar the open tab's gap.
-        let rule = lines[bar_row + 1];
+        // It is the bar's last row, a blank pad row below the tabs.
+        assert!(
+            lines[bar_row + 1].trim().is_empty(),
+            "a padding row under the tabs:\n{text}"
+        );
+        let rule = lines[bar_row + 2];
         assert!(rule.starts_with("───"), "rule leads the row:\n{text}");
         assert!(
             rule.trim_end().ends_with('─'),
             "and runs to the end:\n{text}"
         );
         assert!(
-            rule.contains("  "),
-            "with a gap under the open tab:\n{text}"
+            rule.contains("━━"),
+            "turning into an underline under the open tab:\n{text}"
         );
     }
 

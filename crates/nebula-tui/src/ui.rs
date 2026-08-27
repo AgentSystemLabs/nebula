@@ -1295,6 +1295,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 } else {
                     match status {
                         Some(AgentStatus::Running) => (solid, th.warn),
+                        Some(AgentStatus::Finished) if item.unseen => (solid, th.done),
                         Some(AgentStatus::Finished) => (solid, th.ok),
                         Some(AgentStatus::NeedsFeedback) => (solid, th.err),
                         Some(AgentStatus::Terminated) => (solid, th.special),
@@ -1888,11 +1889,12 @@ fn panel_block(title: &str, focused: bool, th: Theme) -> Block<'_> {
 
 /// Unwatched-finish count badge for a project or worktree row: how many
 /// sessions under it went green with nobody looking (`Agent::unseen`), as
-/// ` n new` in the finished color. The count is the number of terminals
-/// to go read; it drops as the cursor lands on each one, and the badge
-/// goes with it at zero.
+/// ` n done` in the done color — the same word and hue the Workspaces
+/// tabs use, so a count reads the same at every tier. The count is the number
+/// of terminals to go read; it drops as the cursor lands on each one, and
+/// the badge goes with it at zero.
 fn unseen_badge(unseen: usize, th: Theme) -> Option<(String, Style)> {
-    (unseen > 0).then(|| (format!(" {unseen} new"), Style::default().fg(th.ok)))
+    (unseen > 0).then(|| (format!(" {unseen} done"), Style::default().fg(th.done)))
 }
 
 /// The trailing badges of a project or worktree row, and the columns they
@@ -1982,11 +1984,16 @@ fn ago_badge(status_changed_at: i64) -> String {
     }
 }
 
-fn status_dot(status: Option<AgentStatus>, th: Theme) -> Span<'static> {
+/// The dot. `unseen` splits the finished state in two: violet while a
+/// finished turn is still unread — the one state that wants a human — and
+/// green once the cursor has been on it, which is a result filed away, not
+/// a job. Every other status ignores the flag.
+fn status_dot(status: Option<AgentStatus>, unseen: bool, th: Theme) -> Span<'static> {
+    let finished = if unseen { th.done } else { th.ok };
     match status {
         Some(AgentStatus::Fresh) => Span::styled("● ", Style::default().fg(th.dim)),
         Some(AgentStatus::Running) => Span::styled("● ", Style::default().fg(th.warn)),
-        Some(AgentStatus::Finished) => Span::styled("● ", Style::default().fg(th.ok)),
+        Some(AgentStatus::Finished) => Span::styled("● ", Style::default().fg(finished)),
         Some(AgentStatus::NeedsFeedback) => Span::styled("● ", Style::default().fg(th.err)),
         Some(AgentStatus::Terminated) => Span::styled("● ", Style::default().fg(th.special)),
         Some(AgentStatus::Disconnected) => Span::styled("○ ", Style::default().fg(th.dim)),
@@ -2210,20 +2217,22 @@ fn render_pill(
 /// column re-scopes the worktrees.
 ///
 /// Tabs answer to `⌘1`..`⌘9` / `1`..`9` from anywhere, to `←`/`→` once the
-/// bar has focus, and to a click. A rule closes the bar off from the panels
-/// — broken under the open tab, so that tab reads as attached to what's
-/// below it.
+/// bar has focus, and to a click. A blank row sits above the tabs and
+/// another below them, so the bar reads as its own tier rather than as a
+/// header crowded against its rule. That rule — the bar's last row — closes
+/// it off from the panels, broken under the open tab, so that tab reads as
+/// attached to what's below it.
 fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Workspaces;
-    if area.width == 0 || area.height < 2 {
+    if area.width == 0 || area.height < 3 {
         return;
     }
-    // Last row is the rule; the label and the tabs share the row above it —
-    // `area.y + 1` at the default height, which is where a panel header
-    // lands too.
+    // Last row is the rule; the label and the tabs share `area.y + 1`,
+    // where a panel header lands too. Everything between that row and the
+    // rule is padding, so the tabs sit in air on both sides.
     let rule_y = area.y + area.height - 1;
-    let row_y = rule_y - 1;
+    let row_y = area.y + 1;
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -2288,8 +2297,8 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     let active = app.tree.active_workspace_index();
     // Per-tab display data, pre-collected to end the tree borrow: name,
-    // rollup, and how many agents are running right now (the dot says
-    // "something", the count says how much).
+    // rollup, and how many sessions under it finished unread — the same
+    // count the project and worktree rows carry, one tier up.
     let rows: Vec<(String, Option<AgentStatus>, usize)> = app
         .tree
         .workspaces
@@ -2298,7 +2307,7 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
             (
                 w.name.clone(),
                 app.workspace_rollup(&w.id),
-                app.workspace_running(&w.id),
+                app.workspace_unseen(&w.id),
             )
         })
         .collect();
@@ -2306,7 +2315,7 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let tabs: Vec<(Vec<Span<'static>>, u16)> = rows
         .iter()
         .enumerate()
-        .map(|(i, (name, roll, running))| {
+        .map(|(i, (name, roll, done))| {
             let selected = Some(i) == active;
             // Only nine tabs have a shortcut; past that the slot stays
             // blank so every name still starts on the same column.
@@ -2318,17 +2327,17 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
                 },
                 Style::default().fg(if selected { th.accent } else { th.dim }),
             )];
-            spans.push(status_dot(*roll, th));
+            spans.push(status_dot(*roll, *done > 0, th));
             spans.extend(status_name_spans(
                 truncate(name, TAB_NAME_MAX),
                 Style::default().add_modifier(Modifier::BOLD),
                 sweep_ramp(*roll, th, anim),
                 phase,
             ));
-            if *running > 0 {
+            if *done > 0 {
                 spans.push(Span::styled(
-                    format!(" {running}"),
-                    Style::default().fg(th.warn),
+                    format!(" {done} done"),
+                    Style::default().fg(th.done),
                 ));
             }
             spans.push(Span::raw(" "));
@@ -2367,8 +2376,26 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
             break;
         }
         let selected = Some(i) == active;
+        if selected {
+            // The open tab is a surface, not a highlighted row: its fill
+            // takes the bar's whole height above the rule, padding rows
+            // included, so it reads as one raised block carrying the name.
+            f.render_widget(
+                Block::default().style(Style::default().bg(th.sel_bg)),
+                Rect {
+                    x,
+                    y: area.y,
+                    width: *w,
+                    height: area.height - 1,
+                },
+            );
+        }
         f.render_widget(
-            Paragraph::new(Line::from(spans.clone())).style(row_bar(selected, focused, th)),
+            Paragraph::new(Line::from(spans.clone())).style(if selected {
+                Style::default().bg(th.sel_bg).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            }),
             Rect {
                 x,
                 y: row_y,
@@ -2377,10 +2404,12 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
             },
         );
         if selected {
-            // Break the rule under the open tab: the tab-to-content join.
+            // The bottom border stays under the open tab — it just turns
+            // into that tab's underline: heavy and accent-colored, so the
+            // tab-to-content join reads as a join rather than a hole.
             for cx in x..x + w {
                 if let Some(cell) = f.buffer_mut().cell_mut((cx, rule_y)) {
-                    cell.set_symbol(" ");
+                    cell.set_symbol("━").set_fg(th.accent);
                 }
             }
         }
@@ -2483,9 +2512,9 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
         // anywhere under the project.
         let (badges, badge_len) = row_badges(*unseen, th);
         // Bold name: the top of the tree reads "biggest".
-        let mut spans = vec![status_dot(*roll, th)];
+        let mut spans = vec![status_dot(*roll, *unseen > 0, th)];
         spans.extend(status_name_spans(
-            truncate(text, (inner.width as usize).saturating_sub(2 + badge_len)),
+            truncate(text, (inner.width as usize).saturating_sub(3 + badge_len)),
             Style::default().add_modifier(Modifier::BOLD),
             sweep_ramp(*roll, th, app.animations),
             app.sweep_phase(),
@@ -2673,24 +2702,30 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 let (branch, is_main, roll, unseen) = &worktrees[*i];
                 let (badges, badge_len) = row_badges(*unseen, th);
                 let ramp = sweep_ramp(*roll, th, app.animations);
-                let mut spans = vec![status_dot(*roll, th)];
-                if *is_main {
-                    let max = (inner.width as usize)
-                        .saturating_sub(2 + ROOT_BADGE.chars().count() + badge_len);
-                    spans.extend(status_name_spans(
-                        truncate(branch, max),
-                        Style::default(),
-                        ramp,
-                        app.sweep_phase(),
-                    ));
-                    spans.push(Span::styled(ROOT_BADGE, Style::default().fg(th.dim)));
+                // 3, not 2: the dot's two cells plus the pill marker
+                // `render_pill` prepends — bill them here or the trailing
+                // badge is what falls off the end of a twenty-cell column.
+                let free = (inner.width as usize).saturating_sub(3 + badge_len);
+                // The root badge then yields to a branch it would push into
+                // an ellipsis: in a narrow column `main 1 done` beats
+                // `ma… ⌂ root 1 done` — the ⌂ is the least load-bearing
+                // thing on the row, the branch is the row's identity.
+                let root = *is_main
+                    && branch.chars().count() <= free.saturating_sub(ROOT_BADGE.chars().count());
+                let max = if root {
+                    free - ROOT_BADGE.chars().count()
                 } else {
-                    spans.extend(status_name_spans(
-                        truncate(branch, (inner.width as usize).saturating_sub(2 + badge_len)),
-                        Style::default(),
-                        ramp,
-                        app.sweep_phase(),
-                    ));
+                    free
+                };
+                let mut spans = vec![status_dot(*roll, *unseen > 0, th)];
+                spans.extend(status_name_spans(
+                    truncate(branch, max),
+                    Style::default(),
+                    ramp,
+                    app.sweep_phase(),
+                ));
+                if root {
+                    spans.push(Span::styled(ROOT_BADGE, Style::default().fg(th.dim)));
                 }
                 for (text, style) in badges {
                     spans.push(Span::styled(text, style));
@@ -2953,7 +2988,7 @@ fn draw_session_row(
             let dot = if a.archived {
                 Span::styled("⊘ ", Style::default().fg(th.dim))
             } else {
-                status_dot(Some(a.status), th)
+                status_dot(Some(a.status), a.unseen && !a.archived, th)
             };
             // Muted names: sessions sit at the bottom of the tree, so
             // their text reads "smallest" next to the bold project
@@ -2971,7 +3006,7 @@ fn draw_session_row(
             // are what the parent rows' counts are counting, so each one
             // says so until the cursor lands on it.
             let (badge, badge_style) = if a.unseen && !a.archived {
-                (" new".to_string(), Style::default().fg(th.ok))
+                (" done".to_string(), Style::default().fg(th.done))
             } else if a.cloud_session_id.is_some() {
                 // A Claude Cloud row: the harness that matters is the cloud
                 // sandbox, and the badge is how the user tells this row

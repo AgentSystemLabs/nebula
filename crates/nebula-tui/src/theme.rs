@@ -30,8 +30,16 @@ pub struct Theme {
     /// Hints, dividers, badges, archived rows; also the unfocused
     /// selection-bar background.
     pub dim: Color,
-    /// Finished / added / connected.
+    /// Added / connected / a review file ticked off — the plain "this went
+    /// well" green. Also a finished turn you have already read: still a
+    /// good outcome, just no longer a job.
     pub ok: Color,
+    /// A turn that finished and nobody has read yet: the dot, and the
+    /// `n done` counts pointing at it. Deliberately NOT `ok` — the whole
+    /// point is that this one wants a human, and green is the color a
+    /// terminal teaches you to skip over. Reading the session turns the
+    /// dot green.
+    pub done: Color,
     /// Running / modified / flash messages / remote host.
     pub warn: Color,
     /// Needs feedback / deleted / destructive actions.
@@ -69,6 +77,7 @@ impl Default for Theme {
             muted: Color::Gray,
             dim: Color::DarkGray,
             ok: Color::Green,
+            done: Color::Indexed(141), // violet — no other status is near it
             warn: Color::Yellow,
             err: Color::Red,
             special: Color::Magenta,
@@ -101,6 +110,9 @@ impl Theme {
             "rose" => Self {
                 accent: Color::Indexed(211),  // pink
                 special: Color::Indexed(141), // violet
+                // Violet is spoken for here, so done goes turquoise — the
+                // one hue this preset leaves free.
+                done: Color::Indexed(45),
                 focus_tint: Color::Rgb(19, 10, 14),
                 ..base
             },
@@ -131,5 +143,17 @@ mod tests {
         }
         assert_eq!(Theme::by_name("no-such-theme"), Theme::default());
         assert_eq!(Theme::by_name(" Ocean "), Theme::by_name("ocean"));
+
+        // A done dot has to stay readable AS done: never green (that's
+        // `ok`, which the eye files as "nothing to do here"), and never
+        // the same color as another status in the same preset.
+        for name in THEMES {
+            let th = Theme::by_name(name);
+            assert_ne!(th.done, th.ok, "{name}: done reads as plain success");
+            assert_ne!(th.done, th.warn, "{name}: done reads as running");
+            assert_ne!(th.done, th.err, "{name}: done reads as needs-feedback");
+            assert_ne!(th.done, th.special, "{name}: done reads as terminated");
+            assert_ne!(th.done, th.dim, "{name}: done reads as fresh");
+        }
     }
 }

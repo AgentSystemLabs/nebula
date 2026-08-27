@@ -32,9 +32,9 @@ three, every time, and read the screens.
 nebula replaces that with a tree and a color:
 
 - **Every project, worktree and agent in one list.** Four columns, `h`/`j`/`k`/`l` to move, `Enter` to drill in.
-- **A dot per session that says what it's doing.** ● yellow is mid-turn, ● green is done, ● red wants
-  you. Parents roll up their children, so a red dot on a collapsed project tells you exactly where to
-  look without opening anything.
+- **A dot per session that says what it's doing.** ● yellow is mid-turn, ● violet is done and waiting
+  to be read, ● green is done and read, ● red wants you. Parents roll up their children, so a red dot
+  on a collapsed project tells you exactly where to look without opening anything.
 - **A daemon that owns the PTYs.** Quit the UI, close the laptop lid, come back tomorrow — the agents
   never stopped, and your scrollback is replayed.
 - **Real git worktrees, one keystroke.** Two agents in two directories don't collide.
@@ -135,17 +135,20 @@ carrying the rolled-up status of the agents under it, `s` opens settings, `?` li
 |---|---|
 | ● gray | fresh — agent never run |
 | ● yellow | running — turn in progress (Stop is gated on active subagents) |
-| ● green | finished — turn complete |
+| ● violet | done, unread — turn complete and nobody has looked at it yet |
+| ● green | done, read — same finished turn, once the cursor has been on the session |
 | ● red | needs feedback — permission prompt or question waiting on you |
 | ● magenta | terminated — process died mid-run |
 | ○ | disconnected — daemon restarted while the agent was live |
 
-Worktree and project rows roll up their children: red beats yellow beats green.
+Worktree and project rows roll up their children: red beats yellow beats done, and a parent's dot is
+violet whenever anything unread finished under it — so the violet walks up the tree and turns green as
+you read your way down it.
 
-A dot going green while you were looking elsewhere is easy to miss, so nebula counts those for you:
+A dot going violet while you were looking elsewhere is easy to miss, so nebula counts those for you:
 when a running (or red) session finishes a turn that isn't in the pane on screen, its worktree and
-project rows grow a green `n new` badge — the number of terminals you have left to go read — and the
-session row itself says `new` where its harness name normally sits. Walking the cursor onto a session
+project rows grow a violet `n done` badge — the number of terminals you have left to go read — and the
+session row itself says `done` where its harness name normally sits. Walking the cursor onto a session
 previews it, which reads it: the badges count down as you go and disappear at zero. The flag lives in
 the daemon, so it survives closing the TUI and is shared by every client; a turn that finishes in the
 pane you're already looking at never counts.
@@ -188,7 +191,7 @@ The panels aren't the only view. With a worktree selected, from any panel:
 - **…plus the progress bar, for the cancel no hook reports.** Escaping out of a turn fires no `Stop` and
   suppresses the idle notification that normally un-sticks one, so nebula also reads the CLI's terminal
   progress-bar escapes (OSC 9;4) straight off the PTY. That signal survives a cancel, and it stays busy
-  while a permission prompt is open — so it can't green out an agent that is actually waiting on you.
+  while a permission prompt is open — so it can't mark an agent done while it is actually waiting on you.
 - **Sessions title themselves.** Create a session with the default name and the agent renames it after
   your first prompt — a 3-4 word title describing the ask (e.g. `Fix Login Redirect`), via a
   `nebula rename <title>` command the CLI runs in its own turn (no extra API calls, no MCP server).
@@ -262,7 +265,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Sessions | `Enter` / `r` / `d` on a link | open it in the browser / edit its URL / delete it (the detected pull request opens but can't be edited or deleted) |
 | Any panel | `t` | new shell terminal in the selected worktree's directory (Projects panel: the repo root) |
 | Any panel | `w` or click the `◇ workspace` nameplate bottom-left | workspace switcher: `Enter` opens, `n`/`r`/`d` create/rename/delete — delete asks first (the panels scope to the open workspace; `/` doesn't, and switches for you). Per window — switching here leaves your other nebula instances on the workspace you left them on |
-| Any panel | `Shift+W` | show / hide the Workspaces bar across the top: `WORKSPACES` on the left, directly above `PROJECTS`, and one tab per workspace to its right with the rolled-up status of the agents under it (plus a count of the ones running), so a run in a workspace you don't have open still shows at the top level. The choice is remembered — it's the `Workspaces bar` setting, also in Settings → Appearance |
+| Any panel | `Shift+W` | show / hide the Workspaces bar across the top: `WORKSPACES` on the left, directly above `PROJECTS`, and one tab per workspace to its right with the rolled-up status of the agents under it (plus a count of the ones that finished unread), so a run in a workspace you don't have open still shows at the top level. The choice is remembered — it's the `Workspaces bar` setting, also in Settings → Appearance |
 | Any panel | `1`–`9` (or `⌘1`–`⌘9`) | open that numbered tab in the Workspaces bar without leaving the panel you're in. `⌘` is what the tabs advertise, but Terminal.app and most other emulators never encode it into pty bytes — the bare digit is the one that always arrives. Rebindable per slot in Settings → Hotkeys |
 | Workspaces | `←/→`, `↓`/`Enter`, `n`/`r`/`d`, `m` | the cursor is the open workspace, so `←/→` switches; `↓` or `Enter` steps down into Projects; create / rename / delete the open one (delete asks first, and refuses a non-empty workspace); `m` or right-click lists the same verbs |
 | Any panel | `Shift+H` | ssh hosts: every `nebula ssh` destination, newest first. `Enter`/click reconnects (quits this TUI and execs a fresh `nebula ssh` — local sessions keep running), `a` types a new `user@host [dir]`, `d` removes |
