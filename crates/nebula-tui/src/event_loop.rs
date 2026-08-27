@@ -880,7 +880,6 @@ fn ui_state_json(app: &App) -> String {
         show_archived: app.show_archived,
         collapsed: app.collapsed,
         panel_widths: Some(app.panel_widths),
-        workspaces_w: Some(app.workspaces_w),
         diff_files_width: Some(app.diff_files_width),
     };
     serde_json::to_string(&state).unwrap_or_else(|_| "{}".into())
@@ -939,9 +938,6 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
         // Coarse sanity clamp; normalize_panel_widths re-fits to the actual
         // screen on the next draw.
         app.panel_widths = w.map(|v| v.clamp(crate::app::MIN_PANEL_W, 300));
-    }
-    if let Some(w) = state.workspaces_w {
-        app.workspaces_w = w.clamp(crate::app::MIN_PANEL_W, 300);
     }
     if let Some(w) = state.diff_files_width {
         // Coarse sanity clamp; the draw re-caps it to the actual modal width.
@@ -1265,15 +1261,15 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             app.splash_preview = true;
             app.collapsed = false;
         }
-        // The Workspaces column is in the walk only while it's shown
-        // (`leftmost_focus`); hidden, the walk starts and stops at Projects.
+        // The Workspaces bar is in the Tab walk only while it's shown
+        // (`first_focus`); hidden, the walk starts and stops at Projects.
         Action::FocusNext => {
             app.focus = match app.focus {
                 Focus::Workspaces => Focus::Projects,
                 Focus::Projects => Focus::Worktrees,
                 Focus::Worktrees => Focus::Sessions,
                 Focus::Sessions => Focus::Terminal,
-                Focus::Terminal => app.leftmost_focus(),
+                Focus::Terminal => app.first_focus(),
             }
         }
         Action::FocusPrev => {
@@ -1286,13 +1282,34 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 Focus::Terminal => Focus::Sessions,
             }
         }
+        // Inside the Workspaces bar, ←/→ walk the tabs rather than the
+        // panels: the bar spans the top, so there is nothing horizontally
+        // beside it to move to. j/↓ and Enter are the way out (below).
+        Action::FocusLeft if app.focus == Focus::Workspaces => move_selection(app, -1, out),
+        Action::FocusRight if app.focus == Focus::Workspaces => move_selection(app, 1, out),
         Action::FocusLeft => {
             app.focus = match app.focus {
-                Focus::Workspaces => Focus::Workspaces,
-                Focus::Projects => app.leftmost_focus(),
+                // Nothing sits left of Projects any more — the bar is above.
+                Focus::Workspaces | Focus::Projects => Focus::Projects,
                 Focus::Worktrees => Focus::Projects,
                 Focus::Sessions => Focus::Worktrees,
                 Focus::Terminal => Focus::Sessions,
+            }
+        }
+        // ⌘N / N: open the Nth tab in the Workspaces bar from any panel.
+        // Focus stays where it is — the switch re-scopes the panels under
+        // the cursor, and yanking focus up to the bar would undo that.
+        Action::SelectWorkspace(n) => {
+            match app
+                .tree
+                .workspaces
+                .get(n as usize - 1)
+                .map(|w| w.id.clone())
+            {
+                Some(id) => {
+                    switch_workspace(app, id, out);
+                }
+                None => app.flash = Some(format!("no workspace {n}")),
             }
         }
         Action::Hosts => open_hosts_picker(app),
@@ -1319,7 +1336,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 Focus::Terminal => Focus::Terminal,
             }
         }
-        // Show/hide the Workspaces column. Hiding it moves a cursor parked
+        // Show/hide the Workspaces bar. Hiding it moves a cursor parked
         // there onto Projects — there'd be nothing on screen to drive.
         Action::ToggleWorkspaces => {
             set_show_workspaces(app, !app.show_workspaces);
@@ -1348,6 +1365,10 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 move_selection(app, -1, out)
             }
         }
+        // The Workspaces bar is a horizontal strip: ↓ steps out of it into
+        // the panels below, ↑ has nowhere left to go. ←/→ walk the tabs.
+        Action::MoveDown if app.focus == Focus::Workspaces => app.focus = Focus::Projects,
+        Action::MoveUp if app.focus == Focus::Workspaces => {}
         Action::MoveDown => move_selection(app, 1, out),
         Action::MoveUp => move_selection(app, -1, out),
         Action::Activate => match app.focus {
@@ -3737,7 +3758,7 @@ fn reopen_settings(app: &mut App) {
     )));
 }
 
-/// Show or hide the Workspaces column, moving a cursor parked there onto
+/// Show or hide the Workspaces bar, moving a cursor parked there onto
 /// Projects — there'd be nothing on screen to drive.
 fn set_show_workspaces(app: &mut App, shown: bool) {
     app.show_workspaces = shown;
@@ -4476,7 +4497,7 @@ fn jump_to_target(
                 app.flash = Some("workspace no longer exists".into());
                 return;
             }
-            app.focus = app.leftmost_focus();
+            app.focus = app.first_focus();
         }
         PaletteTarget::Project(id) => {
             // After a quiet switch the pane still shows the workspace we
@@ -4646,9 +4667,9 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
     }
     // Selecting a different parent resets child selections.
     match app.focus {
-        // The Workspaces cursor is the open workspace itself: stepping is
-        // a switch, with everything a switch entails (remembered context,
-        // re-scoped panels, the daemon told).
+        // The Workspaces cursor is the open workspace itself: stepping to
+        // the next tab is a switch, with everything a switch entails
+        // (remembered context, re-scoped panels, the daemon told).
         Focus::Workspaces => {
             let id = app.tree.workspaces[new].id.clone();
             switch_workspace(app, id, out);
@@ -7007,11 +7028,9 @@ mod tests {
         h(&mut app, &mut out);
         assert_eq!(
             app.focus,
-            Focus::Workspaces,
-            "steps into the Workspaces column, as ← does"
+            Focus::Projects,
+            "stops at projects — the Workspaces bar is above, not left"
         );
-        h(&mut app, &mut out);
-        assert_eq!(app.focus, Focus::Workspaces, "stops at the left edge");
         assert!(app.overlay.is_none(), "h no longer opens the hosts picker");
     }
 
@@ -11204,13 +11223,10 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     /// Mirror ui::draw's splitter registration for a 120x35 body with the
-    /// default panel widths (splitters 1..=3 at x = 20, 42, 68). The
-    /// Workspaces column is hidden so those x's hold and splitter 0 is
-    /// absent; the shown case has its own tests
-    /// (`splitters_shift_right_by_the_workspaces_column`,
-    /// `workspaces_column_drags_like_the_other_panels`).
+    /// default panel widths: splitters 0..=2 at x = 20, 42, 68. The
+    /// Workspaces bar runs across the top and owns no vertical boundary, so
+    /// these x's hold whether or not it is shown.
     fn seed_splitters(app: &mut App) {
-        app.show_workspaces = false;
         app.body_area = ratatui::layout::Rect::new(0, 0, 120, 35);
         for i in app.splitter_indices() {
             let x = app.splitter_x(i);
@@ -11300,7 +11316,7 @@ diff --git a/src/b.rs b/src/b.rs
         );
         assert!(app
             .splitter_drag
-            .is_some_and(|d| d.idx == 1 && d.grab_offset == 0));
+            .is_some_and(|d| d.idx == 0 && d.grab_offset == 0));
         assert!(
             app.term_selection.is_none(),
             "splitter grab must not arm a terminal selection"
@@ -11393,7 +11409,7 @@ diff --git a/src/b.rs b/src/b.rs
         app.dirty = false;
         handle_mouse(&mut app, mev(MouseEventKind::Moved, 20, 5), &mut out);
         assert_eq!(app.pointer_shape, PointerShape::ColResize);
-        assert_eq!(app.hover_splitter, Some(1));
+        assert_eq!(app.hover_splitter, Some(0));
         assert!(app.dirty, "hover change repaints the grip");
 
         // Hover away: back to default, grip resting.
@@ -11430,7 +11446,7 @@ diff --git a/src/b.rs b/src/b.rs
             &mut out,
         );
         assert_eq!(app.pointer_shape, PointerShape::ColResize);
-        assert_eq!(app.hover_splitter, Some(1));
+        assert_eq!(app.hover_splitter, Some(0));
     }
 
     #[test]
@@ -11457,8 +11473,6 @@ diff --git a/src/b.rs b/src/b.rs
     #[test]
     fn normalize_panel_widths_shrinks_rightmost_first() {
         let mut app = App::new();
-        // The three panels alone; the Workspaces column offset is its own test.
-        app.show_workspaces = false;
         app.panel_widths = [40, 40, 40];
         app.normalize_panel_widths(100);
         assert_eq!(
@@ -11474,23 +11488,21 @@ diff --git a/src/b.rs b/src/b.rs
     fn ui_state_roundtrip_includes_panel_widths() {
         let mut app = App::new();
         app.panel_widths = [33, 44, 55];
-        app.workspaces_w = 26;
         let json = ui_state_json(&app);
 
         let mut restored = App::new();
         restore_ui_state(&mut restored, &json);
         assert_eq!(restored.panel_widths, [33, 44, 55]);
-        assert_eq!(restored.workspaces_w, 26);
 
-        // Old blobs without the fields keep the defaults — the Workspaces
-        // width lives outside the `[u16; 3]` blob for exactly this reason.
+        // Old blobs without the field keep the defaults — including ones
+        // still carrying the retired `workspaces_w` of the column era,
+        // which deserializes as an ignored extra key.
         let mut legacy = App::new();
         restore_ui_state(
             &mut legacy,
-            r#"{"project":null,"worktree":null,"session_agent":null,"show_archived":false,"collapsed":false}"#,
+            r#"{"project":null,"worktree":null,"session_agent":null,"show_archived":false,"collapsed":false,"workspaces_w":26}"#,
         );
         assert_eq!(legacy.panel_widths, crate::app::DEFAULT_PANEL_WIDTHS);
-        assert_eq!(legacy.workspaces_w, crate::app::DEFAULT_WORKSPACES_PANEL_W);
     }
 
     fn project(id: &str, name: &str, sort_order: i64) -> nebula_core::Entity {
@@ -15635,13 +15647,13 @@ diff --git a/src/b.rs b/src/b.rs
         );
     }
 
-    // ---- the Workspaces column ----
+    // ---- the Workspaces bar ----
 
-    /// `Shift+W` shows and hides the Workspaces column. Hiding it parks a
+    /// `Shift+W` shows and hides the Workspaces bar. Hiding it parks a
     /// cursor that was in it on Projects — there's nothing left to drive —
     /// and showing it again doesn't steal focus back.
     #[test]
-    fn shift_w_toggles_the_workspaces_column_and_parks_focus() {
+    fn shift_w_toggles_the_workspaces_bar_and_parks_focus() {
         // The toggle writes the setting through, so pin the config to a
         // temp file — otherwise the suite edits the dev's real one.
         with_default_config(|| {
@@ -15654,39 +15666,44 @@ diff --git a/src/b.rs b/src/b.rs
             app.focus = Focus::Workspaces;
             press(&mut app, KeyCode::Char('W'), KeyModifiers::SHIFT, &mut out);
             assert!(!app.show_workspaces);
-            assert_eq!(app.focus, Focus::Projects, "focus leaves the hidden column");
+            assert_eq!(app.focus, Focus::Projects, "focus leaves the hidden bar");
             press(&mut app, KeyCode::Char('W'), KeyModifiers::SHIFT, &mut out);
             assert!(app.show_workspaces);
             assert_eq!(app.focus, Focus::Projects, "showing it doesn't steal focus");
 
-            // The draw follows: the column leads the sidebar, then doesn't.
+            // The draw follows: the bar tops the body with PROJECTS three
+            // rows under it on the same column, then it's gone and the
+            // panels take the top row back.
             let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
             terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
             let text = buffer_text(&terminal);
             let lines: Vec<&str> = text.lines().collect();
             assert!(
                 lines[1].starts_with("   WORKSPACES"),
-                "the column leads the sidebar:\n{text}"
+                "the bar tops the body:\n{text}"
             );
-            assert!(lines[1].contains("PROJECTS"), "{text}");
+            assert!(
+                lines[1 + crate::app::WORKSPACES_BAR_H as usize].starts_with("   PROJECTS"),
+                "PROJECTS sits directly under it, same column:\n{text}"
+            );
             press(&mut app, KeyCode::Char('W'), KeyModifiers::SHIFT, &mut out);
             terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
             let text = buffer_text(&terminal);
             let lines: Vec<&str> = text.lines().collect();
             assert!(
                 lines[1].starts_with("   PROJECTS"),
-                "hidden: projects lead again:\n{text}"
+                "hidden: projects take the top row:\n{text}"
             );
             assert!(!text.contains("WORKSPACES"), "{text}");
         });
     }
 
-    /// The column lists every workspace with the rollup of the agents under
+    /// The bar lists every workspace with the rollup of the agents under
     /// it, so a run in a workspace you don't have open still shows: the
-    /// running dot and a count ride the name, and the open workspace is the
-    /// selected row.
+    /// shortcut digit, the running dot and a count ride the name, and the
+    /// open workspace is the selected tab.
     #[test]
-    fn workspaces_column_rolls_up_every_workspace() {
+    fn workspaces_bar_rolls_up_every_workspace() {
         use nebula_core::{AgentStatus, WorkspaceId};
         let mut app = App::new();
         seed_tree(&mut app);
@@ -15720,23 +15737,29 @@ diff --git a/src/b.rs b/src/b.rs
             .map(|x| buffer[(x, y)].symbol())
             .collect();
         assert!(row.contains("client 1"), "running count:\n{text}");
-        assert_eq!(
-            buffer[(x - 3, y)].symbol(),
-            " ",
-            "not the open workspace, no rail:\n{text}"
-        );
+        // Its shortcut digit leads the tab, dim on an unopened one.
+        assert_eq!(buffer[(x - 4, y)].symbol(), "2", "{text}");
+        assert_eq!(buffer[(x - 4, y)].fg, app.theme.dim, "{text}");
 
-        // The open workspace's row carries the selection rail.
+        // The open workspace's tab carries the selection fill, and its
+        // digit is accented.
         let (x, y) = find_cell(&terminal, "default");
-        assert_eq!(buffer[(x - 3, y)].symbol(), "▌", "selected rail:\n{text}");
+        assert_eq!(buffer[(x, y)].bg, app.theme.sel_bg_dim, "open tab:\n{text}");
+        assert_eq!(buffer[(x - 4, y)].symbol(), "1", "{text}");
+        assert_eq!(buffer[(x - 4, y)].fg, app.theme.accent, "{text}");
         // A fresh dot is dim, lifted to muted on the selection fill.
         assert_eq!(buffer[(x - 2, y)].fg, app.theme.muted, "fresh dot:\n{text}");
+
+        // The rule under the bar breaks beneath the open tab, so it reads
+        // as attached to the panels below it.
+        assert_eq!(buffer[(x, y + 1)].symbol(), " ", "tab join:\n{text}");
+        assert_eq!(buffer[(0, y + 1)].symbol(), "─", "{text}");
     }
 
-    /// ↑/↓ in the column switch workspaces outright — the cursor IS the open
-    /// workspace — and a click on a row does the same.
+    /// ←/→ in the bar switch workspaces outright — the cursor IS the open
+    /// workspace — and a click on a tab does the same.
     #[test]
-    fn walking_or_clicking_the_workspaces_column_switches_workspace() {
+    fn walking_or_clicking_the_workspaces_bar_switches_workspace() {
         use nebula_core::WorkspaceId;
         let mut app = App::new();
         seed_tree(&mut app);
@@ -15746,7 +15769,7 @@ diff --git a/src/b.rs b/src/b.rs
         let other = WorkspaceId("ws2".into());
 
         app.focus = Focus::Workspaces;
-        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
         assert_eq!(app.tree.active_workspace, other);
         assert_eq!(
             app.selected_project().map(|p| p.name.clone()),
@@ -15758,18 +15781,40 @@ diff --git a/src/b.rs b/src/b.rs
                 .any(|r| matches!(r, ClientRequest::OpenWorkspace { id, .. } if *id == other)),
             "the daemon is told: {out:?}"
         );
-        assert_eq!(app.focus, Focus::Workspaces, "focus stays in the column");
-        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.focus, Focus::Workspaces, "focus stays in the bar");
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
         assert_eq!(app.tree.active_workspace, other, "clamps at the end");
-        press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE, &mut out);
         assert_eq!(app.tree.active_workspace, WorkspaceId::default());
+
+        // The positional shortcuts reach the same tabs from any panel,
+        // without dragging focus up to the bar.
+        app.focus = Focus::Sessions;
+        press(&mut app, KeyCode::Char('2'), KeyModifiers::NONE, &mut out);
+        assert_eq!(app.tree.active_workspace, other, "2 opens the second tab");
+        assert_eq!(app.focus, Focus::Sessions, "focus stays put");
+        press(&mut app, KeyCode::Char('1'), KeyModifiers::SUPER, &mut out);
+        assert_eq!(
+            app.tree.active_workspace,
+            WorkspaceId::default(),
+            "⌘1 opens the first — where the emulator delivers it"
+        );
+        press(&mut app, KeyCode::Char('9'), KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            app.tree.active_workspace,
+            WorkspaceId::default(),
+            "a digit past the last tab is a no-op"
+        );
+        assert_eq!(app.flash.take(), Some("no workspace 9".into()));
+
+        app.focus = Focus::Workspaces;
 
         // Enter steps into Projects, the way Enter on a project steps into
         // its worktrees.
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert_eq!(app.focus, Focus::Projects);
 
-        // A click on a row opens that workspace and focuses the column.
+        // A click on a tab opens that workspace and focuses the bar.
         let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let (x, y) = find_cell(&terminal, "client");
@@ -15784,6 +15829,118 @@ diff --git a/src/b.rs b/src/b.rs
             app.selected_project().map(|p| p.name.clone()),
             Some("secret".into())
         );
+    }
+
+    /// Seed `n` extra workspaces named ws-2..ws-(n+1), so the bar has more
+    /// tabs than a narrow screen can hold. Each gets a project of its own,
+    /// so opening one shows the panels rather than the first-run splash.
+    fn seed_many_workspaces(app: &mut App, n: usize) {
+        use nebula_core::{Entity, Project, ProjectId, Workspace, WorkspaceId};
+        for i in 2..=n + 1 {
+            hse(
+                app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Workspace(Workspace {
+                        id: WorkspaceId(format!("ws{i}")),
+                        name: format!("ws-{i}"),
+                    }),
+                },
+            );
+            hse(
+                app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Project(Project {
+                        workspace_id: WorkspaceId(format!("ws{i}")),
+                        id: ProjectId(format!("p{i}")),
+                        name: format!("proj-{i}"),
+                        repo_path: format!("/tmp/proj-{i}").into(),
+                        sort_order: i as i64,
+                    }),
+                },
+            );
+        }
+    }
+
+    /// The bar's whole point of alignment: `WORKSPACES` sits on the same
+    /// row-1 / x-3 grid the panel headers use, so it reads as the tier
+    /// directly above `PROJECTS`, and its rule spans the body — broken only
+    /// under the open tab.
+    #[test]
+    fn the_workspaces_bar_sits_directly_above_projects() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_default_workspace(&mut app);
+        seed_other_workspace(&mut app);
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let lines: Vec<&str> = text.lines().collect();
+
+        let bar_row = 1;
+        let panel_row = bar_row + crate::app::WORKSPACES_BAR_H as usize;
+        assert_eq!(
+            lines[bar_row].find("WORKSPACES"),
+            Some(3),
+            "label indent:\n{text}"
+        );
+        assert_eq!(
+            lines[panel_row].find("PROJECTS"),
+            Some(3),
+            "same column, three rows down:\n{text}"
+        );
+        // Tabs share that row, to the right of the label.
+        let tabs_at = lines[bar_row].find("default").expect("first tab drawn");
+        assert!(tabs_at > 3 + "WORKSPACES".len(), "tabs sit right:\n{text}");
+        assert!(lines[bar_row].contains("client"), "{text}");
+
+        // The rule closes the bar off, full width bar the open tab's gap.
+        let rule = lines[bar_row + 1];
+        assert!(rule.starts_with("───"), "rule leads the row:\n{text}");
+        assert!(
+            rule.trim_end().ends_with('─'),
+            "and runs to the end:\n{text}"
+        );
+        assert!(
+            rule.contains("  "),
+            "with a gap under the open tab:\n{text}"
+        );
+    }
+
+    /// More tabs than fit: the bar scrolls to keep the open one on screen
+    /// and marks what it dropped, rather than silently losing workspaces.
+    #[test]
+    fn workspace_tabs_scroll_to_keep_the_open_one_visible() {
+        use nebula_core::WorkspaceId;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_default_workspace(&mut app);
+        seed_many_workspaces(&mut app, 12);
+        let mut out = Vec::new();
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let bar = text.lines().nth(1).unwrap().to_string();
+        assert!(bar.contains("default"), "open tab is first:\n{text}");
+        assert!(bar.contains('›'), "and the rest overflow right:\n{text}");
+        assert!(
+            !bar.contains('‹'),
+            "nothing dropped on the left yet:\n{text}"
+        );
+
+        // Open the last one: the window slides so it is on screen, and the
+        // left overflow mark appears.
+        switch_workspace(&mut app, WorkspaceId("ws13".into()), &mut out);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let bar = text.lines().nth(1).unwrap().to_string();
+        assert!(
+            bar.contains("ws-13"),
+            "open tab scrolled into view:\n{text}"
+        );
+        assert!(bar.contains('‹'), "with the left overflow marked:\n{text}");
+        assert!(!bar.contains("default"), "and the head dropped:\n{text}");
     }
 
     /// The footer's `◇ workspace` nameplate is a button: a click opens the
@@ -15834,113 +15991,45 @@ diff --git a/src/b.rs b/src/b.rs
         assert!(app.overlay.is_none(), "the hints aren't a button");
     }
 
-    /// The three panels start where the Workspaces column ends: splitter
-    /// x's, drag targets and the width budget all carry the offset, and drop
-    /// it when the column is hidden. Splitter 0 is the column's own edge, so
-    /// only 1..=3 exist once it's gone.
+    /// The Workspaces bar spans the top, so it costs the panels rows, not
+    /// columns: splitter x's and the width budget are the same whether it
+    /// is shown or hidden, and there is no splitter for it to own.
     #[test]
-    fn splitters_shift_right_by_the_workspaces_column() {
-        use crate::app::{DEFAULT_PANEL_WIDTHS, DEFAULT_WORKSPACES_PANEL_W as WS_W};
+    fn the_workspaces_bar_costs_rows_not_columns() {
+        use crate::app::{DEFAULT_PANEL_WIDTHS, WORKSPACES_BAR_H};
         let mut app = App::new();
         assert!(app.show_workspaces);
-        assert_eq!(app.splitter_indices(), 0..4);
-        assert_eq!(app.splitter_x(0), WS_W);
-        assert_eq!(app.splitter_x(1), WS_W + 20);
-        assert_eq!(app.splitter_x(3), WS_W + 74);
+        assert_eq!(app.splitter_indices(), 0..3);
+        assert_eq!(app.workspaces_bar_h(), WORKSPACES_BAR_H);
+        assert_eq!(app.splitter_x(0), 20);
+        assert_eq!(app.splitter_x(2), 74);
 
         // Dragging the projects|worktrees boundary to screen x=45 leaves
-        // Projects 27 wide: the 18 columns ahead of it aren't its to keep.
-        app.set_splitter(1, 45, 160);
-        assert_eq!(app.panel_widths[0], 27);
+        // Projects 45 wide: nothing sits ahead of it any more.
+        app.set_splitter(0, 45, 160);
+        assert_eq!(app.panel_widths[0], 45);
 
-        // A 100-wide body: the column comes off the top of the budget
-        // (100 - 18 - 20 for the pane = 62), and Sessions gives up the rest.
-        app.panel_widths = DEFAULT_PANEL_WIDTHS;
-        app.normalize_panel_widths(100);
-        assert_eq!(app.panel_widths, [20, 22, 20]);
-
-        app.show_workspaces = false;
-        assert_eq!(app.splitter_indices(), 1..4);
-        assert_eq!(app.splitter_x(1), 20);
+        // A 100-wide body: only the terminal pane's minimum comes off the
+        // budget, and Sessions gives up the rest.
         app.panel_widths = DEFAULT_PANEL_WIDTHS;
         app.normalize_panel_widths(100);
         assert_eq!(
             app.panel_widths, DEFAULT_PANEL_WIDTHS,
-            "80 columns fit them all"
+            "80 columns of budget fit them all"
         );
-        app.set_splitter(1, 45, 160);
-        assert_eq!(app.panel_widths[0], 45);
+
+        // Hiding the bar changes nothing horizontal.
+        app.show_workspaces = false;
+        assert_eq!(app.workspaces_bar_h(), 0);
+        assert_eq!(app.splitter_indices(), 0..3);
+        assert_eq!(app.splitter_x(0), 20);
     }
 
-    /// The Workspaces column resizes by the same grab-and-drag as the rest:
-    /// splitter 0 sits on its right edge, the boundary x IS its width, and
-    /// the panels behind it keep theirs.
+    /// Tab / Shift+Tab walk through the bar only while it's shown. ← and →
+    /// never reach it — it is above the panels, not beside them — so inside
+    /// the bar they walk the tabs instead, and ↓ is the way out.
     #[test]
-    fn workspaces_column_drags_like_the_other_panels() {
-        use crate::app::{
-            DEFAULT_PANEL_WIDTHS, DEFAULT_WORKSPACES_PANEL_W as WS_W, MIN_PANEL_W, MIN_TERM_W,
-        };
-        let mut app = App::new();
-        app.body_area = ratatui::layout::Rect::new(0, 0, 120, 35);
-        for i in app.splitter_indices() {
-            let x = app.splitter_x(i);
-            app.hits.push((
-                ratatui::layout::Rect::new(x - 1, 0, 2, 35),
-                HitTarget::Splitter(i),
-            ));
-        }
-        let mut out = Vec::new();
-
-        // Grab the column's edge (x = 18) and pull it right to 24.
-        handle_mouse(
-            &mut app,
-            mev(MouseEventKind::Down(MouseButton::Left), WS_W, 5),
-            &mut out,
-        );
-        assert!(app.splitter_drag.is_some_and(|d| d.idx == 0));
-        assert_eq!(app.hover_splitter, Some(0));
-        handle_mouse(
-            &mut app,
-            mev(MouseEventKind::Drag(MouseButton::Left), 24, 5),
-            &mut out,
-        );
-        assert_eq!(app.workspaces_w, 24);
-        assert_eq!(app.panel_widths, DEFAULT_PANEL_WIDTHS, "panels stay put");
-        assert_eq!(app.splitter_x(1), 44, "the panels behind it slide over");
-
-        // Far left floors at the panel minimum; far right leaves the
-        // terminal pane its own minimum.
-        handle_mouse(
-            &mut app,
-            mev(MouseEventKind::Drag(MouseButton::Left), 0, 5),
-            &mut out,
-        );
-        assert_eq!(app.workspaces_w, MIN_PANEL_W);
-        handle_mouse(
-            &mut app,
-            mev(MouseEventKind::Drag(MouseButton::Left), 200, 5),
-            &mut out,
-        );
-        assert_eq!(app.splitter_x(3), app.body_area.width - MIN_TERM_W);
-
-        handle_mouse(
-            &mut app,
-            mev(MouseEventKind::Up(MouseButton::Left), 200, 5),
-            &mut out,
-        );
-        assert!(app.splitter_drag.is_none());
-        assert!(out.is_empty(), "no requests from a splitter drag");
-
-        // A width dragged out on a wide screen gives way first when the
-        // body shrinks, rather than squeezing the panels off it.
-        app.workspaces_w = 60;
-        app.normalize_panel_widths(90);
-        assert_eq!(app.workspaces_w, 90 - 3 * MIN_PANEL_W - MIN_TERM_W);
-    }
-
-    /// Tab / Shift+Tab / ← walk through the column only while it's shown.
-    #[test]
-    fn focus_walk_includes_the_workspaces_column_only_when_shown() {
+    fn focus_walk_includes_the_workspaces_bar_only_when_shown() {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
@@ -15950,13 +16039,22 @@ diff --git a/src/b.rs b/src/b.rs
         };
 
         app.focus = Focus::Projects;
-        assert_eq!(go(&mut app, &mut out, KeyCode::Left), Focus::Workspaces);
+        assert_eq!(
+            go(&mut app, &mut out, KeyCode::Left),
+            Focus::Projects,
+            "the bar is above, not left"
+        );
+        assert_eq!(go(&mut app, &mut out, KeyCode::BackTab), Focus::Workspaces);
         assert_eq!(
             go(&mut app, &mut out, KeyCode::Left),
             Focus::Workspaces,
-            "stops"
+            "in the bar, ← walks tabs and stays put"
         );
-        assert_eq!(go(&mut app, &mut out, KeyCode::Right), Focus::Projects);
+        assert_eq!(
+            go(&mut app, &mut out, KeyCode::Down),
+            Focus::Projects,
+            "↓ steps out of the bar"
+        );
         assert_eq!(go(&mut app, &mut out, KeyCode::BackTab), Focus::Workspaces);
         assert_eq!(go(&mut app, &mut out, KeyCode::BackTab), Focus::Terminal);
         assert_eq!(go(&mut app, &mut out, KeyCode::Tab), Focus::Workspaces);
@@ -15973,10 +16071,10 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(go(&mut app, &mut out, KeyCode::Tab), Focus::Projects);
     }
 
-    /// n / r / d in the column act on the open workspace the way the
+    /// n / r / d in the bar act on the open workspace the way the
     /// switcher's do, and m lists the same three verbs.
     #[test]
-    fn workspaces_column_verbs_act_on_the_open_workspace() {
+    fn workspaces_bar_verbs_act_on_the_open_workspace() {
         use nebula_core::WorkspaceId;
         let mut app = App::new();
         seed_tree(&mut app);
@@ -16068,7 +16166,7 @@ diff --git a/src/b.rs b/src/b.rs
     /// The Appearance tab edits the same value the hotkey does, live — and
     /// hiding the column out from under the cursor moves it to Projects.
     #[test]
-    fn the_appearance_tab_toggles_the_workspaces_column() {
+    fn the_appearance_tab_toggles_the_workspaces_bar() {
         let dir = tempfile::tempdir().unwrap();
         crate::config::with_config_path(dir.path().join("config.json"), || {
             let mut app = App::new();
@@ -16078,7 +16176,7 @@ diff --git a/src/b.rs b/src/b.rs
 
             apply_setting_at(&mut app, tab, row, 0);
             assert!(!app.show_workspaces);
-            assert_eq!(app.focus, Focus::Projects, "no column left to drive");
+            assert_eq!(app.focus, Focus::Projects, "no bar left to drive");
             assert!(!crate::config::Config::load().show_workspaces);
 
             apply_setting_at(&mut app, tab, row, 0);
@@ -16093,7 +16191,7 @@ diff --git a/src/b.rs b/src/b.rs
             let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
             terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
             let text = buffer_text(&terminal);
-            assert!(text.contains("Workspaces column"), "{text}");
+            assert!(text.contains("Workspaces bar"), "{text}");
             assert!(text.contains("Appearance"), "{text}");
         });
     }

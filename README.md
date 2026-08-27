@@ -119,8 +119,8 @@ From there: `t` opens a shell in the selected worktree, `/` fuzzy-jumps to any w
 worktree, session or open pull request by name — across every workspace, not just the open one, so
 picking a hit somewhere else switches you there on the way — `w` switches this window's workspace when
 one project list gets long (each nebula instance keeps its own — run two, on two workspaces, side by
-side) and `Shift+W` shows or hides the Workspaces column to the left of Projects, where every workspace
-carries the rolled-up status of the agents under it, `s` opens settings, `?` lists every key, and `m`
+side) and `Shift+W` shows or hides the Workspaces bar across the top, where every workspace is a tab
+carrying the rolled-up status of the agents under it, `s` opens settings, `?` lists every key, and `m`
 (or right-click) opens a context menu for whatever's selected.
 
 ## Status dots
@@ -205,7 +205,7 @@ The panels aren't the only view. With a worktree selected, from any panel:
   revives on the next attach with its conversation resumed.
 - **Settings live in one JSON file** (`config.json`, beside the database), read fresh on each use by both
   the daemon and the TUI, so hand edits apply without a restart. `s` opens the settings overlay over the
-  same file: color theme, animations, focused-panel tint, whether the Workspaces column is shown,
+  same file: color theme, animations, focused-panel tint, whether the Workspaces bar is shown,
   editor, default model and reasoning effort per agent CLI, the RECENT window, the idle timeout, and
   whether new sessions stop to ask for a name. `R` inside the overlay puts every setting — hotkeys
   included — back to its default, after a confirmation.
@@ -250,8 +250,9 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Sessions | `Enter` / `r` / `d` on a link | open it in the browser / edit its URL / delete it (the detected pull request opens but can't be edited or deleted) |
 | Any panel | `t` | new shell terminal in the selected worktree's directory (Projects panel: the repo root) |
 | Any panel | `w` or click the `◇ workspace` nameplate bottom-left | workspace switcher: `Enter` opens, `n`/`r`/`d` create/rename/delete (the panels scope to the open workspace; `/` doesn't, and switches for you). Per window — switching here leaves your other nebula instances on the workspace you left them on |
-| Any panel | `Shift+W` | show / hide the Workspaces column at the left edge: every workspace with the rolled-up status of the agents under it (plus a count of the ones running), so a run in a workspace you don't have open still shows at the top level. The choice is remembered — it's the `Workspaces column` setting, also in Settings → Appearance |
-| Workspaces | `↑/↓`, `Enter`, `n`/`r`/`d`, `m` | the cursor is the open workspace, so `↑/↓` switches; `Enter` steps into Projects; create / rename / delete the open one (delete refuses a non-empty workspace); `m` or right-click lists the same verbs |
+| Any panel | `Shift+W` | show / hide the Workspaces bar across the top: `WORKSPACES` on the left, directly above `PROJECTS`, and one tab per workspace to its right with the rolled-up status of the agents under it (plus a count of the ones running), so a run in a workspace you don't have open still shows at the top level. The choice is remembered — it's the `Workspaces bar` setting, also in Settings → Appearance |
+| Any panel | `1`–`9` (or `⌘1`–`⌘9`) | open that numbered tab in the Workspaces bar without leaving the panel you're in. `⌘` is what the tabs advertise, but Terminal.app and most other emulators never encode it into pty bytes — the bare digit is the one that always arrives. Rebindable per slot in Settings → Hotkeys |
+| Workspaces | `←/→`, `↓`/`Enter`, `n`/`r`/`d`, `m` | the cursor is the open workspace, so `←/→` switches; `↓` or `Enter` steps down into Projects; create / rename / delete the open one (delete refuses a non-empty workspace); `m` or right-click lists the same verbs |
 | Any panel | `Shift+H` | ssh hosts: every `nebula ssh` destination, newest first. `Enter`/click reconnects (quits this TUI and execs a fresh `nebula ssh` — local sessions keep running), `a` types a new `user@host [dir]`, `d` removes |
 | Any panel | `m` or right-click | context menu |
 | Any panel | `z` | full-screen terminal: collapse the sidebars and lock input into the attached session |
@@ -294,8 +295,11 @@ nebula workspace rename <a> <b> # rename a workspace
 nebula workspace delete <name>  # delete an empty workspace
 nebula ssh <host> [dir]   # open nebula on a remote machine over ssh (installs it there if
                           # missing); destinations are remembered for the TUI's `h` picker
-nebula browser [--port N] # serve this TUI in a browser tab via ttyd (loopback only, default
-                          # port 7681) and open it; needs ttyd on PATH
+nebula browser [--port N] # serve this TUI in a browser tab via ttyd (loopback only) and open
+                          # it; needs ttyd on PATH. With no --port it takes 7681 when that's
+                          # free and a free port otherwise, saying which — so one per checkout
+                          # can serve at once. --port 0 always picks a free one; --port N is
+                          # that port or an error, which is what you want behind an ssh tunnel
 nebula upgrade            # install the latest release (--force on a dev build)
 ```
 

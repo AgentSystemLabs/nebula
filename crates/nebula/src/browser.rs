@@ -1,5 +1,9 @@
 //! `nebula browser [--port N]`: open this TUI in a web browser.
 //!
+//! The port is chosen rather than fixed, because several checkouts each
+//! serving their own build is the normal case here, not a mistake — see
+//! `resolve_port`.
+//!
 //! The HTTP/WebSocket half is ttyd's job — it runs a command in a PTY and
 //! bridges that PTY to xterm.js in the page. We spawn `ttyd … nebula`, wait
 //! for the port to accept a connection, hand the URL to the desktop browser,
@@ -14,12 +18,13 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::ffi::OsString;
 use std::io::ErrorKind;
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// ttyd's own default, kept so a bare `nebula browser` lines up with every
-/// ttyd doc the user might read next.
+/// ttyd's own default, and where a bare `nebula browser` starts looking so
+/// it lines up with every ttyd doc the user might read next. It is a
+/// preference, not a reservation: `resolve_port` steps off it when it's busy.
 pub const DEFAULT_PORT: u16 = 7681;
 
 /// How long ttyd gets to bind before we stop waiting to open the browser.
@@ -42,14 +47,8 @@ binary so the TUI renders in a browser tab. Install it, then try again:
   Arch           sudo pacman -S ttyd
   elsewhere      https://github.com/tsl0922/ttyd#installation";
 
-pub fn run_browser(port: u16) -> Result<()> {
-    // `-p 0` is ttyd's "pick any free port", but it only reports the choice
-    // in its own log — we would have no URL to open.
-    if port == 0 {
-        bail!(
-            "nebula browser needs a fixed port; 0 asks ttyd to choose one and never tells us which"
-        );
-    }
+pub fn run_browser(requested: Option<u16>) -> Result<()> {
+    let port = resolve_port(requested)?;
     let mut child = spawn_ttyd(&nebula_exe(), port)?;
     wait_until_serving(&mut child, port)?;
 
@@ -68,6 +67,54 @@ pub fn run_browser(port: u16) -> Result<()> {
         Some(0) | None => Ok(()),
         Some(code) => bail!("ttyd exited with status {code}"),
     }
+}
+
+/// Settle on a port before ttyd is spawned, so the URL we print and the
+/// port ttyd binds are the same number. (`ttyd -p 0` picks its own and only
+/// mentions it in its log, which is why we never pass 0 through.)
+///
+/// * `--port N` — that port or nothing. The user named it, so a clash is an
+///   error they want to hear rather than a silent move.
+/// * `--port 0` — any free port, no preference.
+/// * nothing — [`DEFAULT_PORT`] when it's free, otherwise a free one, said
+///   out loud. Running a `nebula browser` per checkout is routine, and the
+///   second one failing on a port collision would be a papercut with no
+///   upside.
+fn resolve_port(requested: Option<u16>) -> Result<u16> {
+    match requested {
+        Some(0) => free_port(),
+        Some(n) => {
+            probe(n).with_context(|| format!("port {n} is not free"))?;
+            Ok(n)
+        }
+        None if probe(DEFAULT_PORT).is_ok() => Ok(DEFAULT_PORT),
+        None => {
+            let port = free_port()?;
+            println!("nebula browser: {DEFAULT_PORT} is busy — serving on {port} instead");
+            Ok(port)
+        }
+    }
+}
+
+/// Whether this loopback port can be bound right now. The listener is
+/// dropped immediately, so this reserves nothing — it only answers the
+/// question, and ttyd binds for real a moment later. A listener that never
+/// accepted anything doesn't go to TIME_WAIT, so the rebind is clean. The
+/// gap in between is a race in principle; ttyd's own bind failure (which
+/// `wait_until_serving` surfaces) is the backstop.
+fn probe(port: u16) -> std::io::Result<()> {
+    TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).map(drop)
+}
+
+/// A loopback port the kernel says is free right now.
+fn free_port() -> Result<u16> {
+    let sock = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .context("could not get a free loopback port from the kernel")?;
+    let port = sock
+        .local_addr()
+        .context("could not read back the port the kernel chose")?
+        .port();
+    Ok(port)
 }
 
 fn spawn_ttyd(exe: &OsString, port: u16) -> Result<Child> {
@@ -197,10 +244,46 @@ mod tests {
         assert!(opt + 1 < args.iter().position(|a| a == "--").unwrap());
     }
 
+    /// The whole point: a second checkout serving at the same time gets a
+    /// port of its own instead of an error.
     #[test]
-    fn port_zero_is_refused_before_anything_spawns() {
-        let err = run_browser(0).unwrap_err().to_string();
-        assert!(err.contains("fixed port"), "{err}");
+    fn a_busy_default_port_steps_aside_instead_of_failing() {
+        // Stand on the default the way another checkout's ttyd would.
+        let held = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)));
+        let Ok(held) = held else {
+            // Something outside the test already owns 7681 — which is the
+            // condition under test, so the assertion below still holds.
+            let port = resolve_port(None).expect("still resolves");
+            assert_ne!(port, DEFAULT_PORT);
+            return;
+        };
+        let port = resolve_port(None).expect("falls back");
+        assert_ne!(port, DEFAULT_PORT, "must not hand ttyd a taken port");
+        assert_ne!(port, 0, "must be a real port we can print");
+        drop(held);
+
+        // Free again: back to the default, so the usual case is unchanged.
+        assert_eq!(resolve_port(None).unwrap(), DEFAULT_PORT);
+    }
+
+    /// `--port 0` used to be refused outright. It now means "any free one",
+    /// which is what the Makefile's per-worktree dev instances ask for.
+    #[test]
+    fn port_zero_means_any_free_port() {
+        let port = resolve_port(Some(0)).expect("picks one");
+        assert_ne!(port, 0);
+        // And it is genuinely free — we can take it ourselves right after.
+        TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).expect("free");
+    }
+
+    /// A port the user named is theirs or nothing: silently moving would
+    /// break `ssh -L 9000:localhost:9000` set up against that number.
+    #[test]
+    fn an_explicit_port_that_is_taken_is_an_error() {
+        let held = free_port().unwrap();
+        let _guard = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], held))).unwrap();
+        let err = resolve_port(Some(held)).unwrap_err().to_string();
+        assert!(err.contains(&format!("port {held} is not free")), "{err}");
     }
 
     #[test]

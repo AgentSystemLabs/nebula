@@ -55,20 +55,18 @@ pub enum HitTarget {
     PanelBg(Focus),
     TerminalPane,
     /// Draggable vertical boundary between panels, left to right:
-    /// 0 = workspaces|projects (only while the column is shown),
-    /// 1 = projects|worktrees, 2 = worktrees|sessions, 3 = sessions|terminal.
+    /// 0 = projects|worktrees, 1 = worktrees|sessions, 2 = sessions|terminal.
     Splitter(usize),
 }
 
 /// Default widths of the Projects / Worktrees / Sessions panels. Sessions
 /// is the widest because its rows carry the most: name, "23m ago", harness.
 pub const DEFAULT_PANEL_WIDTHS: [u16; 3] = [20, 22, 32];
-/// Starting width of the Workspaces column. It's draggable like the three
-/// panels to its right, but persisted separately (`UiState::workspaces_w`)
-/// rather than as a fourth slot in the `[u16; 3]` `panel_widths` blob, so
-/// older saved layouts keep loading. Names longer than the column truncate,
-/// as project names do.
-pub const DEFAULT_WORKSPACES_PANEL_W: u16 = 18;
+/// Height of the Workspaces bar that spans the top of the body: a blank
+/// spacer, the label-plus-tabs row, and the rule that closes it off from
+/// the panels below. The label lands on the same row-1 / x-3 grid the panel
+/// headers use, so WORKSPACES sits directly above PROJECTS.
+pub const WORKSPACES_BAR_H: u16 = 3;
 /// A panel can't be dragged narrower than this.
 pub const MIN_PANEL_W: u16 = 10;
 /// The terminal pane always keeps at least this much width.
@@ -1710,9 +1708,6 @@ pub struct UiState {
     /// Panel widths (projects, worktrees, sessions); absent in older blobs.
     #[serde(default)]
     pub panel_widths: Option<[u16; 3]>,
-    /// Dragged width of the Workspaces column; absent in older blobs.
-    #[serde(default)]
-    pub workspaces_w: Option<u16>,
     /// Diff modal file-list width; absent in older blobs.
     #[serde(default)]
     pub diff_files_width: Option<u16>,
@@ -1864,10 +1859,10 @@ pub struct App {
     pub show_archived: bool,
     /// Sidebars collapsed (z) — terminal takes the full width.
     pub collapsed: bool,
-    /// Workspaces column shown at the left edge. The three panels sit to
-    /// its right; see `splitter_x`. Mirrors the `show_workspaces` setting,
-    /// which both `Shift+W` and the Appearance tab write — this field is
-    /// the live copy, the config file is where it persists.
+    /// Workspaces bar shown across the top of the body, with the panels
+    /// below it; see `workspaces_bar_h`. Mirrors the `show_workspaces`
+    /// setting, which both `Shift+W` and the Appearance tab write — this
+    /// field is the live copy, the config file is where it persists.
     pub show_workspaces: bool,
     pub next_req_id: u64,
     pub pending: HashMap<u64, PendingIntent>,
@@ -1920,7 +1915,6 @@ pub struct App {
     pub panel_widths: [u16; 3],
     /// Width of the Workspaces column when it's shown. Kept out of
     /// `panel_widths` so old persisted layouts still deserialize.
-    pub workspaces_w: u16,
     /// File-list width of the diff modal, remembered across opens.
     pub diff_files_width: u16,
     /// Selected tab of the settings modal, remembered across opens.
@@ -2105,7 +2099,6 @@ impl App {
             term_links: Vec::new(),
             term_file_links: Vec::new(),
             panel_widths: DEFAULT_PANEL_WIDTHS,
-            workspaces_w: DEFAULT_WORKSPACES_PANEL_W,
             diff_files_width: DEFAULT_DIFF_FILES_W,
             settings_tab: 0,
             settings_selected: vec![0; crate::config::tab_count()],
@@ -2217,77 +2210,48 @@ impl App {
         (self.splash_epoch.elapsed().as_millis() / SWEEP_FRAME.as_millis()) as usize
     }
 
-    /// Columns the Workspaces panel takes at the left edge: its dragged
-    /// width when shown, nothing when hidden. Every screen-x computation for
-    /// the three panels to its right starts here.
-    pub fn workspaces_panel_w(&self) -> u16 {
+    /// Rows the Workspaces bar takes off the top of the body when it's
+    /// shown, nothing when hidden. Every screen-y computation for the
+    /// panels below it starts here.
+    pub fn workspaces_bar_h(&self) -> u16 {
         if self.show_workspaces {
-            self.workspaces_w
+            WORKSPACES_BAR_H
         } else {
             0
         }
     }
 
-    /// The splitters that exist right now, left to right. The Workspaces
-    /// boundary (0) only exists while its column is shown; the three panel
-    /// boundaries (1..=3) always do.
+    /// The splitters, left to right. The Workspaces bar runs across the top
+    /// now, so it owns no vertical boundary: all three are panel edges.
     pub fn splitter_indices(&self) -> std::ops::Range<usize> {
-        if self.show_workspaces {
-            0..4
-        } else {
-            1..4
-        }
+        0..3
     }
 
     /// Screen x of splitter `idx` — the column where the panel to its right
-    /// starts. 0 is the Workspaces column's right edge; 1..=3 add a prefix
-    /// sum of the panel widths on top of it.
+    /// starts, i.e. the right edge of panel `idx`.
     pub fn splitter_x(&self, idx: usize) -> u16 {
-        self.workspaces_panel_w() + self.panel_widths[..idx].iter().sum::<u16>()
+        self.panel_widths[..=idx].iter().sum::<u16>()
     }
 
     /// Move splitter `idx` so its boundary lands at `boundary_x`, clamped so
     /// the panel keeps `MIN_PANEL_W` and the terminal pane keeps `MIN_TERM_W`.
     pub fn set_splitter(&mut self, idx: usize, boundary_x: i32, body_w: u16) {
         let want = boundary_x.max(0) as u16;
-        // Splitter 0 is the Workspaces column's own right edge: it starts at
-        // x=0, so the boundary IS its width, and everything to its right
-        // keeps the width it has.
-        if idx == 0 {
-            let fixed_right: u16 = self.panel_widths.iter().sum();
-            let max = body_w.saturating_sub(fixed_right + MIN_TERM_W);
-            if max >= MIN_PANEL_W {
-                self.workspaces_w = want.clamp(MIN_PANEL_W, max);
-            }
-            return;
-        }
-        // The Workspaces column is spoken for before any panel is sized.
-        let idx = idx - 1;
-        let offset = self.workspaces_panel_w();
-        let body_w = body_w.saturating_sub(offset);
         let left: u16 = self.panel_widths[..idx].iter().sum();
         let fixed_right: u16 = self.panel_widths[idx + 1..].iter().sum();
         let max = body_w.saturating_sub(left + fixed_right + MIN_TERM_W);
         if max < MIN_PANEL_W {
             return; // terminal too small to honor the minimums
         }
-        self.panel_widths[idx] = want.saturating_sub(offset + left).clamp(MIN_PANEL_W, max);
+        self.panel_widths[idx] = want.saturating_sub(left).clamp(MIN_PANEL_W, max);
     }
 
     /// Re-fit panel widths to the current body width, shrinking the rightmost
     /// panel first, each floored at `MIN_PANEL_W`. Keeps the terminal pane at
-    /// `MIN_TERM_W` whenever the screen allows it at all. The Workspaces
-    /// column, when shown, comes off the top of the budget — and gives way
-    /// first, since a width dragged out on a wide screen must not squeeze
-    /// three panels plus the pane off a narrow one.
+    /// `MIN_TERM_W` whenever the screen allows it at all. The Workspaces bar
+    /// spans the full width above them, so it costs the panels nothing here.
     pub fn normalize_panel_widths(&mut self, body_w: u16) {
-        if self.show_workspaces {
-            let max = body_w.saturating_sub(3 * MIN_PANEL_W + MIN_TERM_W);
-            self.workspaces_w = self.workspaces_w.clamp(MIN_PANEL_W, max.max(MIN_PANEL_W));
-        }
-        let budget = body_w
-            .saturating_sub(self.workspaces_panel_w())
-            .saturating_sub(MIN_TERM_W);
+        let budget = body_w.saturating_sub(MIN_TERM_W);
         for i in (0..3).rev() {
             let others: u16 = self
                 .panel_widths
@@ -2751,10 +2715,11 @@ impl App {
         workspace_running(&self.tree, workspace_id)
     }
 
-    /// The panel focus lands on walking off the left edge (or wrapping
-    /// around from the terminal pane): the Workspaces column when it's
-    /// shown, Projects otherwise.
-    pub fn leftmost_focus(&self) -> Focus {
+    /// First stop in the Tab walk (and where a cross-workspace jump lands):
+    /// the Workspaces bar when it's shown, Projects otherwise. Note this is
+    /// no longer the *leftmost* focus — the bar spans the top, so h/l never
+    /// reach it; Tab, Shift+Tab and j/k do.
+    pub fn first_focus(&self) -> Focus {
         if self.show_workspaces {
             Focus::Workspaces
         } else {

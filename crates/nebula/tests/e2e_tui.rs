@@ -20,8 +20,8 @@ const ROWS: u16 = 36;
 const WAIT: Duration = Duration::from_secs(20);
 
 // Distinct footer hints identify the focused panel on screen.
-/// The Workspaces column (shown by default, `Shift+W` hides it).
-const FOOTER_WORKSPACES: &str = "w: switcher";
+/// The Workspaces tab bar (shown by default, `Shift+W` hides it).
+const FOOTER_WORKSPACES: &str = "1-9: switch";
 const FOOTER_PROJECTS: &str = "n/o: add";
 const FOOTER_WORKTREES: &str = "n: new worktree";
 const FOOTER_SESSIONS: &str = "n: agent";
@@ -418,7 +418,7 @@ fn tui_projects_worktrees_agents_navigation() {
     // Terminal pane focused with nothing attached: no panel footer, no lock.
     tui.wait_for_gone(FOOTER_SESSIONS);
     tui.send(b"\t");
-    // Wrapped around to the leftmost column: Workspaces, then Projects.
+    // Wrapped around to the first stop: the Workspaces bar, then Projects.
     tui.wait_for_text(FOOTER_WORKSPACES);
     tui.send(b"\t");
     tui.wait_for_text(FOOTER_PROJECTS);
