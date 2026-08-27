@@ -14,6 +14,265 @@ about what is worth recording.
 
 ## Entries
 
+### `nebula rename` Broke On A Protocol Skew The Error Message Misdiagnosed — 2026-08-26
+
+**Asked:** "why is it printing … Error: daemon speaks protocol v26, this client v24 — run `nebula kill`
+and relaunch I've ran kill but the hook still seems to fail" — then "why doesn't make dev do this
+already though", and after the diagnosis "what do you recomend" → fix the message, not the plumbing.
+
+**Did:** Diagnosis: `make dev` runs `target/debug/nebula`, which spawns its daemon from `current_exe()`
+(`nebula-tui/src/ipc.rs:52`), so the daemon is always this checkout's build. But the auto-title hook
+injects a **bare** `nebula rename` (`AUTO_TITLE_INSTRUCTION`, `nebula-daemon/src/hooks/mod.rs:29`), and
+the agent's shell resolves that on PATH to `~/.cargo/bin/nebula` — 0.9.0/v24 there against the daemon's
+v26. Fix: `handshake()` in `nebula-tui/src/ipc.rs` now calls a new `version_skew_message()`, which
+compares the two versions, prints both binaries' paths, and recommends `make install` when the *client*
+is older and `nebula kill` only when the *daemon* is; new `daemon_exe_path()` resolves the daemon's
+binary from `paths::pidfile_path()` via `/proc/<pid>/exe` or `ps -p <pid> -o comm=`. Two tests in a new
+`mod tests`. Then `make install` (0.9.0 → 0.10.0). Rejected: a daemon-side PATH shim (agents run through
+`$SHELL -l -i -c`, `registry.rs:2015`, and this user's `.zshrc` prepends to PATH on ~11 lines, so a
+prepended dir lands behind them and breaks silently later), and an absolute path in the instruction
+(`CLAUDE_ALLOW_RULES` is `Bash(nebula rename:*)` — an absolute path stops matching and every auto-title
+turns into a permission prompt).
+
+**Gotchas:**
+- `nebula kill` is the wrong advice when the **client** is the older side, and it was the message's only
+  advice. Killing the daemon just makes the live TUI respawn an identical one from `current_exe()`, so
+  the skew survives every restart — a guaranteed dead end for whoever follows it.
+- Do **not** add a field to `ServerEvent::Incompatible` to carry the daemon's path. That frame is what a
+  *newer* daemon sends an *older* client and rmp is positional, so the clients that need the information
+  most would fail to decode it and report "unexpected handshake reply" instead.
+- `paths::buildstamp_path()` is a **content hash** (`lifecycle.rs::fingerprint_file`), not a path — it
+  can prove the daemon is stale but cannot name its binary. Pidfile + `ps` is the way.
+- Only the *model-facing* instruction goes through the CLI. The real hooks are `curl` to
+  `$NEBULA_API_URL/api/hooks/...` (`hooks/installer.rs:100`) — loopback HTTP, unversioned, fail-soft. So
+  a protocol bump can only ever break the auto-title and `nebula worktree` instructions, never status
+  reporting. Note the `silence` branch there: `UserPromptSubmit` keeps stdout precisely so the injected
+  instruction reaches the model; every other event is fully silenced.
+- The dev instance's isolation is *inherited*, not propagated: `NEBULA_RUNTIME_DIR`/`NEBULA_DATA_DIR`
+  come from the Makefile's `DEV_ENV` and flow down make → TUI → daemon → agent PTY. The daemon itself
+  only ever adds `NEBULA_AGENT_ID`/`NEBULA_API_URL`/`NEBULA_API_TOKEN` (`registry.rs:2023`). Nothing
+  propagates *which binary*, which is the entire hole.
+- The shared tree moved 26 → 27 under me mid-task (the notes-removal entry below), flipping the skew:
+  after `make install` the PATH binary is v27 and the still-running dev daemon is v26, so the hook stays
+  broken — now correctly reported as "The daemon is the older build". Restarting that daemon stops live
+  sessions, so it was left to the user.
+
+### Removed The Notes Feature Outright — 2026-08-26
+
+**Asked:** "remove the ability to add notes" — asked twice, identically. The literal words name only the
+*add* path, so I put the scope to the user before cutting: remove adding only (leaving a list that can
+shrink but never grow) vs. remove the feature entirely. They chose **entirely**.
+
+**Did:** Full-stack removal. `nebula-core`: `Note`/`NoteOwner` + `Entity::Note`/`EntityId::Note`
+(`entities.rs`), `id_newtype!(NoteId)` (`ids.rs`), the four `ClientRequest::{Create,Update,Delete}Note` /
+`SetNoteDone` variants and `Snapshot.notes` (`protocol.rs`), `PROTOCOL_VERSION` 26 → 27. `nebula-daemon`:
+the `// ---- notes ----` blocks in `store.rs` (7 fns) and `registry.rs` (4 fns), the 4 `server.rs` arms,
+plus **migration 21 `DROP TABLE IF EXISTS notes`**. `nebula-tui`: `Action::Notes` and its `e` binding
+(`keymap.rs`), `NoteView`/`NoteInput`/`Overlay::Notes`/`PendingIntent::SelectCreatedNote`/`Tree.notes`
+(`app.rs`), the modal draw + `note_badge` + both footer hints (`ui.rs`), and in `event_loop.rs` the
+`NoteCmd` key handler, the mouse handler, `open_note_view`/`open_notes_for_owner`/`select_note_by_id`,
+both context-menu rows, and the two delete-cascade `retain`s. Docs: README key table x2 + the SQLite
+bullet, ARCHITECTURE.md's note-list paragraph. Tests: deleted `store::note_crud_roundtrip_and_cascade`,
+the 3 `event_loop` note tests, and e2e `tui_note_modal_crud_and_badge`. 645 tests green, clippy clean
+(7 pre-existing warning sites, none mine), `cargo fmt` applied.
+
+**Gotchas:**
+- **`row_badges` in `ui.rs` lost an argument.** It was `(unseen, notes, th)` feeding two badge makers;
+  it is now `(unseen, th)`. `ProjectRowData`/`WorktreeRowData` each lost their `(usize, usize)` note-stats
+  tuple slot, so the destructuring at both call sites had to shrink with them.
+- **Don't cut a match arm by slicing to the *next* arm's name without checking arm order.**
+  `Overlay::Metrics` sits **before** `Overlay::Notes` in `ui.rs`'s draw match, so slicing
+  `[index(Notes) .. index(Metrics)]` had a negative span and silently **duplicated ~750 lines** instead of
+  deleting any. The tell is the file getting *longer*: `wc -l` went 4467 → 5199 and
+  `grep -c "Overlay::Metrics(view) => {"` returned 2. Find the arm's own closing brace instead.
+- **Three keymap/settings tests used `Action::Notes` as an arbitrary subject**, not because they were
+  about notes — they bind `g` to it to collide with `Git diff`. Swapped to `Action::OpenRepo`
+  (`keymap.rs`) and `Action::Help` (`event_loop.rs`); Help was the right stand-in for
+  `confirming_a_duplicate_moves_the_chord_off_its_old_action` because its final assertion needs an action
+  that **opens an overlay**, which `OpenRepo` (spawns a browser) does not.
+- **A stale `"keybindings": {"notes": "…"}` in a user's `config.json` is harmless** — `Keymap::from_overrides`
+  already ignores unknown action ids, covered by `a_broken_override_falls_back_instead_of_stranding_the_user`.
+- `e` is now **unbound**. `splash_footer_lists_only_keys_that_work` asserted `"e: notes"` was *absent*
+  from the splash; that string can never appear now, so it came out of the dead-key list.
+- The tree carried ~1700 lines of another session's uncommitted work (including a new
+  `crates/nebula-daemon/src/pty/cloud.rs`). Baseline `cargo check` was green **before** starting, which is
+  what made it safe to attribute every later error to my own edits — do that check first in a shared tree.
+
+### Switching Workspaces Kept The Project Cursor At Row 0 — 2026-08-26
+
+**Asked:** "when i switch between workspaces it should remember the last project, worktree, session
+slection"
+
+**Did:** Two of the three were already implemented and simply unreachable. `remember_context` /
+`restore_context` (`crates/nebula-tui/src/event_loop.rs`) have kept `App::last_worktree_for_project` and
+`App::last_session_for_worktree` since the panel work — but `switch_workspace_inner` hard-set
+`app.sel_project = 0`, and both maps are keyed off the project the cursor lands on, so coming back to a
+workspace restored *the first project's* worktree and session. Added
+`App::last_project_for_workspace: HashMap<WorkspaceId, ProjectId>` (`crates/nebula-tui/src/app.rs:1920`),
+recorded at the top of `remember_context`, and new `restore_workspace_project(app)` called from
+`switch_workspace_inner` immediately before `restore_context` — only on the `restore: true` path.
+Test `switching_back_to_a_workspace_restores_project_worktree_and_session`. 650 workspace tests green,
+clippy clean.
+
+**Gotchas:**
+- **Order is load-bearing.** `restore_context` reads `selected_project()` to find the remembered
+  worktree, and `restore_session` reads `selected_worktree()`. The project has to land *first* or the
+  other two restore against row 0's context — which is the original bug, just moved.
+- **`remember_context` early-returns when the selected project has no worktree** (`let Some(wid) = …
+  selected_worktree() else { return }`). The per-workspace project record goes ABOVE that return, or an
+  empty project silently never gets remembered.
+- **`switch_workspace_quietly` must keep landing on row 0.** Restoring there re-introduces the
+  attach-then-detach double the `/`-crosses-workspaces work added the quiet path to avoid
+  (see [The Workspaces Column Remembers Itself]).
+- **A one-project-per-workspace test can't fail.** Row 0 and "the row we left on" have to differ at all
+  three levels, so the test seeds a second project (`p2`) with a non-main worktree (`w2b`) and its own
+  agent. Same shape as the "only discriminates if the remembered session differs" trap in the 08-25
+  entry — confirmed by commenting out `restore_workspace_project` and watching it go red
+  (`left: Some("demo")`).
+
+### `make dev` Still On 0.9.0: Pulling v0.10.0 Under Real In-Flight Work — 2026-08-26
+
+**Asked:** "make dev is still showing the wrong version. pull latest from main into this"
+
+**Did:** Same root cause as the v0.4.0 entry below — the shared checkout was at `1506bbf` / 0.9.0 while
+`origin/main` was `0361f0a` / v0.10.0 (PR #16, the tab-bar merge). The difference this time: the dirty
+tree was not stale leftovers but ~1,300 lines of *uncommitted, un-branched* work (the three entries just
+under this one: cloud re-attach, workspace-delete confirm, unseen badges) based on `249668e`, overlapping
+almost every incoming file. Recipe that worked, in order: `git stash create` (a stash commit without
+touching the tree) → `git worktree add --detach <scratch> <that sha>` → `git merge origin/main` there →
+resolve the 7 conflicts → `cargo build`/`clippy`/`test` with `CARGO_TARGET_DIR` outside the repo → then
+in the shared tree `git diff --quiet <sha>` (nobody else edited meanwhile), `git stash push -u`,
+`git merge --ff-only origin/main`, `git restore --source=<scratch commit> --worktree -- <files>`. Result:
+HEAD = origin/main, working tree = v0.10.0 + the three features, still uncommitted, `target/debug/nebula
+--version` → 0.10.0. The WIP is kept as `stash@{0}` ("cloud/unseen/ws-delete wip before v0.10.0 pull").
+
+**Gotchas:**
+- `git stash create` ignores untracked files, so the scratch merge failed with `E0583 file not found for
+  module cloud` (`pty/cloud.rs`). Copy untracked files in by hand, and after the ff restore them from the
+  stash's third parent: `git restore --source='stash@{0}^3' --worktree -- <paths>`.
+- Conflict shape when the WIP already contains part of the incoming range: hunks where origin/main's later
+  commits did not touch the file (registry.rs, store.rs migrations 19/20) resolve as **ours** wholesale;
+  only files the tab-bar prototype (`30042e9`) rewrote needed thought — `leftmost_focus` → `first_focus`
+  in `app.rs`, the `Action::Delete` arm in `event_loop.rs` (local `open_delete_confirm` already routes
+  `Focus::Workspaces` through `open_remove_workspace_confirm`, so `ours` wins), and `ui.rs` where the
+  `TAB_*` consts and the `ProjectRowData`/`WorktreeRowData` aliases land on the same lines (keep both).
+  `git diff <base-commit> origin/main --stat -- crates/` tells you which files need thought.
+- `git diff --quiet <commit>` only compares tracked files — it will say the tree matches even when
+  untracked WIP is missing. `cmp` the untracked files separately.
+- `workspace_scope_is_per_connection` (e2e_pty) failed twice under a parallel clippy+test run and passed
+  alone: the Ack-beats-upsert load race the v0.10.0 entry describes, not the merge.
+- The old Makefile's dev daemon lives at `/tmp/nebula-dev`; the new per-checkout slot is
+  `/tmp/nebula-dev-<8 chars of shasum of $CURDIR>` (`2f3f877f` for the main checkout), so the new
+  `dev-stop` cannot see a daemon the old recipe started. A `make dev` TUI that was already open keeps its
+  0.9.0 daemon until it quits — the old recipe's trailing `dev-stop` then reaps it. Quit and rerun.
+- The new slot also means a fresh `$HOME/.nebula-dev/nebula-<slot>` data dir: first `make dev` re-seeds
+  from the real DB instead of reusing the old `~/.nebula-dev/nebula.db`.
+
+### Cloud Rows Re-Enter Their Session On Restart — 2026-08-26
+
+**Asked:** "find if there is a way to attach claude when waiting for the cloud to finish so thhat they
+don't need to go into abrowser to use" → after the diagnosis (live attach is flag-gated off for this
+account, see the 08-24 Cloud entry): "yes do it" — capture the `session_…` id from the spawn output, keep
+it on the Agent row, try `--cloud <id>` and fall back to `--teleport <id>` in a fresh worktree.
+
+**Did:** `Agent.cloud_session_id` (entities.rs, store migration 20, protocol v26 — rmp positional
+structs, so a new field is a bump). `crates/nebula-daemon/src/pty/cloud.rs::CloudScanner` reads the id
+(`claude.ai/code/session_…` / `--teleport session_…`) and the attach refusal (`… not enabled for your
+account`) off the PTY stream; `PtySession::arm_cloud_scan` replays the ring first so arming after spawn
+cannot miss it; sightings are `PtyEvent::CloudSession` / `CloudAttachRejected`, persisted in
+`watch_for_exit`. `registry.rs`: `CloudLaunch::{Create,Attach,Teleport}` drives
+`claude_cloud_spawn_command` (`--cloud=<task>`, `--cloud=<id>`, `--teleport=<id>`);
+`restart_agent` (now async) routes a row with `cloud_session_id` and no local `session_id` to
+`attach_cloud_agent`, which re-homes a main-checkout row into a `cloud-<last 8 of id>` worktree, spawns
+the attach, and `arm_cloud_attach_fallback` respawns as a teleport once the refusal was *seen* and the
+child exited. `ClientRequest::AttachCloudAgent` + the "Attach cloud session" menu item force the chain
+any time; the sessions list shows a `cloud` badge. e2e `cloud_row_captures_its_session_id_and_reenters_it`
+walks the whole chain with a three-run stub. README step 4 documents it.
+
+**Gotchas:**
+- The teleport fallback must key on the refusal text, not on "exited non-zero fast": a deliberate kill
+  (restart/archive) of a *working* attach exits non-zero too and would have spawned a stray teleport.
+- Both `--cloud` and `--teleport` take an *optional* value — always bind with `=`; verified both forms
+  parse (`--cloud=<id>` → the refusal, `--teleport=<id>` → teleport's stash prompt).
+- Teleport refuses a dirty tree ("Stash changes and continue?") and both CLIs switch the checkout's
+  branch, hence the mandatory fresh worktree for rows in the main checkout. The placeholder
+  `cloud-…` branch stays behind once teleport checks the cloud branch out on top of it.
+- `SessionEnded` only flips status from Running/NeedsFeedback, so the dead create row stays gray
+  `Fresh` — the `cloud` badge and `alive:false` are the only tells.
+- In e2e, a spawn's `EntityUpserted{alive:true}` reaches the client before the stub has executed a
+  line: don't assert on stub side effects inside the `read_events_until` predicate (it is only
+  re-evaluated per event) — wait for the event, then poll the file.
+- Running `claude` from an untrusted dir (the scratchpad) hangs on the workspace-trust prompt; probe
+  CLI behaviour from the repo checkout.
+
+### Workspace Delete Asks First — 2026-08-26
+
+**Asked:** "make sure deleting a workspace shows a confirmation"
+
+**Did:** All three no-confirm paths — `d` in the Workspaces column, "Delete workspace" in its `m` menu, and
+`d` in the `w` switcher — now go through the new `open_remove_workspace_confirm`
+(`crates/nebula-tui/src/event_loop.rs`), which opens a `ConfirmDialog` with the new
+`PendingAction::RemoveWorkspace { id, reopen_picker: Option<usize> }` (`app.rs`). `run_pending_action`
+sends the `RemoveWorkspace` request on `y`; the daemon is still the guard (empty workspaces only, never
+the last one), so a refusal after confirming just flashes as before. README rows for `w` and the
+Workspaces column say "delete asks first". Tests `workspaces_column_verbs_act_on_the_open_workspace` and
+`switcher_r_and_d_act_on_the_hovered_workspace` cover Esc (nothing sent) and `y` on both paths.
+
+**Gotchas:**
+- **A confirm replaces the overlay it came from, so the switcher's `d` needs a way home.** The old `d`
+  left the `w` menu up and let the `EntityRemoved` delta drop the row in place. The confirm is
+  `app.overlay`, which evicts the menu, so `reopen_picker` carries the switcher's hover row and both
+  answers reopen it there (`reopen_workspace_picker`, also now used by `refresh_workspace_picker`) —
+  the `ResetSettings` reopen-the-settings-overlay precedent. The Confirm key handler's Esc/`n` arm is
+  where that routing lives; a confirm opened from the column passes `None` and closes to the panels.
+- **The confirm dialog is sized to its longest message line** (`ui.rs` `Overlay::Confirm`, min 52
+  columns, no wrapping), so a single ~85-column sentence outgrows a narrow terminal. Put a `\n` in
+  long messages; the bulk-delete confirms already do.
+- The switcher test renames `ws2` to `client` before it presses `d`, so asserting the dialog message
+  against `'ws2'` fails — match the current name (or the id in the action), not the seed name.
+
+### Unwatched Finishes Count On The Project And Worktree Rows — 2026-08-26
+
+**Asked:** "i neeed a way to track when a session goes from yellow to green, it should put a counter in
+the projects, worktrees row so I know how many terminals I need to check, as I navigate down into rows it
+should decrement and eventually hide the notification counts"
+
+**Did:** New `Agent::unseen` flag (`crates/nebula-core/src/entities.rs`), owned by the daemon.
+`Store::set_agent_status` (`crates/nebula-daemon/src/store.rs`) now returns `(stamp, unseen)` and keeps
+the flag in the same `UPDATE`: running/needs_feedback → finished raises it, staying finished keeps it,
+leaving finished clears it, archived rows never raise it and `set_agent_archived` clears it; migration 19
+adds the column. `ServerEvent::StatusChanged` carries `unseen`; new fire-and-forget
+`ClientRequest::MarkAgentSeen { id }` → `Daemon::mark_agent_seen` (`registry.rs`) broadcasts the agent
+upsert only when the flag actually flipped. `PROTOCOL_VERSION` 24 → 25. TUI:
+`event_loop.rs::mark_agent_seen` runs from `attach()` (every path that lands the pane on a session goes
+through it — cursor walk, restore, palette, snapshot re-attach) and from the `StatusChanged` arm when the
+flip is for the session already in the pane; `app.rs::worktree_unseen` / `project_unseen` count;
+`ui.rs::row_badges` draws ` n new` (`th.ok`) on project and worktree rows (it also carried a note badge
+until notes were removed 2026-08-26), and a
+session row swaps its ` claude` harness badge for ` new` (the link row's unread-count idiom). README
+"Status dots" documents it. Tests: store `unseen_follows_the_status_and_clears_on_seen`; registry
+`status_broadcast_carries_the_unseen_flag`, `mark_agent_seen_broadcasts_only_a_flip`; event_loop
+`an_unwatched_finish_counts_until_the_cursor_lands_on_it`, `a_finish_in_the_pane_on_screen_is_already_seen`,
+`unwatched_finishes_badge_the_rows_until_read`.
+
+**Gotchas:**
+- Daemon-side on purpose: the counter's whole point is turns that finished while no TUI was open, which a
+  TUI-side set (even persisted in `UiState`) can never see — and two clients would clobber one blob.
+  `pr_seen` / `MarkPrSeen` was the template.
+- The rule lives in the SQL `CASE` of `set_agent_status`, not in `AgentStatusMachine`: the machine dedups
+  unchanged statuses (`set_status` only emits on change), and the flag has to be atomic with the status
+  it qualifies. Red → green counts (NeedsFeedback → Finished happens directly on a Stop / `idle_prompt`
+  after a prompt); Fresh → Finished does not — a Stop nebula never saw the prompt for is not a
+  yellow-to-green.
+- Adding a field to `Agent` touches ~15 struct literals across four crates. The perl pattern
+  `archived_at: 0,\n\s+pinned: false,` catches all but the test helpers that pass `pinned` as a
+  variable and the one literal with `pinned: true` — let the compiler list the rest.
+- `e2e_pty::workspace_scope_is_per_connection` failed 2 of 2 full-suite runs made while a
+  `cargo build --release` ran alongside, then passed alone and 2 of 2 idle full-suite runs. Its
+  `expect("AddProject upserts the project")` only sees the broadcast upsert if it lands before the Ack —
+  `server.rs` writes the Ack from the request loop and the upsert from the broadcast forwarder, so under
+  CPU contention the Ack can win. A load race, not a regression: rerun idle before debugging.
+
 ### One Nebula Per Checkout: Auto-Port For `browser`, Per-Path Dev Slots — 2026-08-26
 
 **Asked:** "merge latest from origin main into this and verify it works, find a way to be able to run nebula
@@ -1016,6 +1275,19 @@ launch metadata without the task. README documents the flow. Full workspace suit
 - The Cloud task is intentionally request-only, not persisted on `Agent`: a later restart follows the
   established local Claude resume/fresh path. Only a synchronous create error retains the in-memory
   draft and reopens it for retry.
+- **`claude --cloud=<task>` creates and exits on this account** (verified 2026-08-26, claude 2.1.247): it
+  prints `Created cloud session: … / View: https://claude.ai/code/session_… / Resume with: claude --teleport
+  session_…` and returns, so the nebula PTY row goes dead. Both "stay attached after create" and
+  `claude --cloud <session_id|url>` (live two-way attach) are gated in the binary on the server feature
+  flag `tengu_remote_backend`; `claude --cloud session_…` here fails with
+  `Error: Attaching to an existing cloud session is not enabled for your account.` Nothing nebula passes
+  can unlock it — when the flag lands, the existing spawn becomes a live attached terminal unchanged.
+- What works today without a browser: `claude --teleport session_…` (pulls transcript + branch into a
+  local session — a snapshot/fork, not a live stream; it refuses a dirty tree with a "Stash changes and
+  continue?" prompt, so run it in a fresh worktree) and `claude -p "msg" --cloud session_…` (queue a
+  message, no reply). `claude agents --json --all` lists only local background/interactive sessions,
+  never cloud ones, so there is no CLI poll for "cloud session finished". The reattach path built on this
+  is [Cloud Rows Re-Enter Their Session On Restart].
 
 ### Workspaces Are Per Instance, Not Daemon-Global — 2026-08-24
 
@@ -1265,7 +1537,9 @@ picker, note badge glyph).
   ("we should be able to add any projects to any workspaces").
 - The user twice asked for the key-combo hints to be rendered at the bottom of a modal rather than behind
   submenus ("nah I'd rather it just show r and d in the bottom of the workspace panel like we do for the
-  notes, we should need all these sub menus"). Follow the notes-modal pattern for any new modal.
+  notes, we should need all these sub menus"). Follow that pattern for any new modal — since notes were
+  removed 2026-08-26 the surviving exemplar is the **hosts picker** (`ui.rs` `Overlay::Hosts`, ~1504,
+  hint on `title_bottom` at ~1527).
 
 ### e2e Daemon-Boot Failures Have Two Different Causes — 2026-08-21 → 08-23
 
