@@ -877,6 +877,7 @@ impl Store {
             unseen: r.get::<_, i64>(13).unwrap() != 0,
             cloud_session_id: r.get(14).unwrap(),
             alive: false,
+            cloud_mirroring: false,
         }))
     }
 
@@ -955,6 +956,7 @@ impl Store {
                     unseen: r.get::<_, i64>(13)? != 0,
                     cloud_session_id: r.get(14)?,
                     alive: false,
+                    cloud_mirroring: false,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1036,6 +1038,7 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
+            cloud_mirroring: false,
         };
         store.insert_agent(&agent).unwrap();
         let codex_agent = Agent {
@@ -1055,6 +1058,7 @@ mod tests {
             sort_order: 1,
             status_changed_at: 0,
             alive: false,
+            cloud_mirroring: false,
         };
         store.insert_agent(&codex_agent).unwrap();
         let cursor_agent = Agent {
@@ -1074,6 +1078,7 @@ mod tests {
             sort_order: 2,
             status_changed_at: 0,
             alive: false,
+            cloud_mirroring: false,
         };
         store.insert_agent(&cursor_agent).unwrap();
 
@@ -1488,6 +1493,7 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
+            cloud_mirroring: false,
         };
 
         // Default-named session: pending until the agent titles it, and the
@@ -1613,6 +1619,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: false,
+                    cloud_mirroring: false,
                 })
                 .unwrap();
         }
@@ -1679,6 +1686,7 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: false,
+                cloud_mirroring: false,
             };
             store.insert_agent(&agent).unwrap();
             agent.id

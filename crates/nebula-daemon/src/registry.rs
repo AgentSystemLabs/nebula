@@ -14,6 +14,7 @@ use nebula_core::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -30,6 +31,33 @@ const PREWARM_RECYCLE_AGE: Duration = Duration::from_secs(10 * 60);
 /// Hook events buffered on a warm session before its row exists (oldest
 /// dropped beyond this).
 const PREWARM_HOOK_BUFFER_CAP: usize = 64;
+/// How often a Cloud mirror re-teleports to pick up the session's newer
+/// turns. `claude --teleport` re-fetches the transcript and re-checks-out
+/// the branch each time, so this trades freshness against a git checkout
+/// and a CLI boot per tick.
+const CLOUD_MIRROR_REFRESH: Duration = Duration::from_secs(45);
+/// Floor for the `NEBULA_CLOUD_MIRROR_SECS` override. A teleport is a git
+/// checkout plus a CLI boot; below this the row would spend its life
+/// respawning.
+const CLOUD_MIRROR_MIN: Duration = Duration::from_secs(2);
+
+/// Mirror cadence, `NEBULA_CLOUD_MIRROR_SECS` overriding the default (and
+/// `0` disabling the follow entirely — the pane is then only refreshed by
+/// hand, from the row's menu). Read once: this is a daemon-wide knob, not
+/// something to re-probe per tick.
+fn cloud_mirror_refresh() -> Option<Duration> {
+    static CADENCE: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *CADENCE.get_or_init(|| {
+        match std::env::var("NEBULA_CLOUD_MIRROR_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            Some(0) => None,
+            Some(secs) => Some(Duration::from_secs(secs).max(CLOUD_MIRROR_MIN)),
+            None => Some(CLOUD_MIRROR_REFRESH),
+        }
+    })
+}
 
 pub(crate) struct CreateAgentSpec {
     pub worktree: WorktreeId,
@@ -104,6 +132,16 @@ pub struct Daemon {
     /// by any other spawn of the agent, and consulted by the cwd reparent so
     /// the old checkout's cwd can't drag the row back in the meantime.
     pending_moves: Mutex<HashMap<AgentId, Worktree>>,
+    /// Set the first time `claude --cloud <id>` refuses to attach ("not
+    /// enabled for your account"). Live attach is a server-side rollout, so
+    /// once it has been refused every later re-entry teleports straight
+    /// away rather than flashing the same error again. Deliberately not
+    /// persisted: a fresh daemon re-probes, so the day the rollout lands
+    /// nebula picks it up without anyone clearing a flag.
+    cloud_attach_gated: AtomicBool,
+    /// Cloud rows currently being mirrored (periodic re-teleport). Keyed by
+    /// agent so a second follow request replaces rather than doubles up.
+    cloud_mirrors: Mutex<HashMap<AgentId, Arc<tokio_util::sync::CancellationToken>>>,
 }
 
 impl Daemon {
@@ -123,6 +161,8 @@ impl Daemon {
             session_interest: Mutex::new(HashMap::new()),
             last_cwd: Mutex::new(HashMap::new()),
             pending_moves: Mutex::new(HashMap::new()),
+            cloud_attach_gated: AtomicBool::new(false),
+            cloud_mirrors: Mutex::new(HashMap::new()),
         })
     }
 
@@ -428,6 +468,7 @@ impl Daemon {
     fn agent_entity(&self, id: &AgentId) -> Result<Agent> {
         let mut agent = self.store.get_agent(id)?.context("agent not found")?;
         agent.alive = self.is_alive(&SessionRef::Agent(id.clone()));
+        agent.cloud_mirroring = self.cloud_mirror_active(id);
         Ok(agent)
     }
 
@@ -882,19 +923,7 @@ impl Daemon {
                 bail!("cloud launch is only supported for Claude")
             }
             Some(prompt) => {
-                let prompt = prompt.trim().to_string();
-                if prompt.is_empty() {
-                    bail!("Claude Cloud needs a task");
-                }
-                if prompt.contains('\0') {
-                    bail!("Claude Cloud task cannot contain NUL bytes");
-                }
-                if prompt.len() > MAX_CLOUD_PROMPT_BYTES {
-                    bail!(
-                        "Claude Cloud task is too long (max {} KiB)",
-                        MAX_CLOUD_PROMPT_BYTES / 1024
-                    );
-                }
+                let prompt = validate_cloud_text(&prompt, "task")?;
                 Some(prompt)
             }
             None => None,
@@ -941,6 +970,7 @@ impl Daemon {
             sort_order: 0,
             status_changed_at: epoch_ms(),
             alive: false,
+            cloud_mirroring: false,
         };
         self.store
             .insert_agent_with_auto_title(&agent, auto_title)?;
@@ -1045,6 +1075,7 @@ impl Daemon {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
+            cloud_mirroring: false,
         };
         self.spawn_agent_session(&agent, &worktree, 80, 24)?;
         tracing::info!(agent = %agent.id, kind = kind.as_str(), worktree = %worktree.branch, "prewarmed agent session");
@@ -1630,7 +1661,14 @@ impl Daemon {
         // resume here: a plain restart would boot a bare CLI with no link
         // to the work. Re-enter the cloud session instead. Once a teleport
         // has produced a local session id, restarts resume that.
-        if agent.cloud_session_id.is_some() && agent.session_id.is_none() {
+        // A teleport leaves a local session id on the row, so `session_id`
+        // alone stops distinguishing "never entered the cloud session" from
+        // "mirroring it". While the mirror is live the row is still the
+        // cloud session's window: restart re-enters it rather than resuming
+        // whatever the last pull happened to snapshot.
+        if agent.cloud_session_id.is_some()
+            && (agent.session_id.is_none() || self.cloud_mirror_active(id))
+        {
             return self.attach_cloud_agent(id).await;
         }
         let worktree = self
@@ -1647,15 +1685,23 @@ impl Daemon {
         Ok(())
     }
 
-    /// Re-enter the Claude Cloud session a row launched. The live attach
-    /// (`claude --cloud <id>`) is tried first; on an account without that
-    /// rollout the CLI refuses and dies, and the fallback armed by the
-    /// spawn teleports the session into a local one instead (same branch
-    /// and transcript, minus the live link). Either CLI switches the
-    /// checkout to the cloud branch — and teleport refuses a dirty tree
-    /// outright — so a row still sitting in the main checkout is first
-    /// re-homed into a worktree of its own; the user's checkout is never
-    /// the one that gets switched.
+    /// Re-enter the Claude Cloud session a row launched, and keep the pane
+    /// current from there on.
+    ///
+    /// The live attach (`claude --cloud <id>`) is tried first, but only
+    /// until this daemon has seen it refused once: it is a server-side
+    /// rollout, so the second attempt on a gated account would just flash
+    /// the same red error at the user. After a refusal every re-entry goes
+    /// straight to `--teleport`, which fetches the session's transcript and
+    /// branch and renders it locally. Either CLI switches the checkout to
+    /// the cloud branch — and teleport refuses a dirty tree outright — so a
+    /// row still sitting in the main checkout is first re-homed into a
+    /// worktree of its own; the user's checkout is never the one that gets
+    /// switched.
+    ///
+    /// A teleport is a snapshot, not a live link, so the pane it produces is
+    /// registered as a *mirror*: [`Self::start_cloud_mirror`] re-teleports it
+    /// on a timer until the user types into it.
     pub async fn attach_cloud_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
         let agent = self.store.get_agent(id)?.context("agent not found")?;
         if agent.archived {
@@ -1664,42 +1710,285 @@ impl Daemon {
         let Some(cloud_id) = agent.cloud_session_id.clone() else {
             bail!("session was not launched in Claude Cloud");
         };
-        let mut worktree = self
-            .store
-            .get_worktree(&agent.worktree_id)?
-            .context("worktree not found")?;
-        if worktree.is_main {
-            let branch = cloud_worktree_branch(&cloud_id);
-            let EntityId::Worktree(target) = self
-                .create_worktree(&worktree.project_id, &branch, None)
-                .await?
-            else {
-                bail!("worktree create returned a non-worktree entity");
-            };
-            worktree = self
-                .store
-                .get_worktree(&target)?
-                .context("worktree not found")?;
-            // Same invalidation as a deliberate move: the remembered hook
-            // cwd points at the old checkout and would sync the row back.
-            self.last_cwd.lock().unwrap().remove(id);
-            self.store.set_agent_worktree(id, &target)?;
-            tracing::info!(agent = %id, branch, "cloud row re-homed into its own worktree");
-        }
+        let worktree = self.cloud_worktree_for(&agent, &cloud_id).await?;
         self.kill_session(&SessionRef::Agent(id.clone()));
-        self.spawn_agent_session_with(
-            &agent,
-            &worktree,
-            80,
-            24,
-            Some(CloudLaunch::Attach(&cloud_id)),
-            None,
-        )?;
+        let launch =
+            cloud_reentry_launch(&cloud_id, self.cloud_attach_gated.load(Ordering::Relaxed));
+        self.spawn_agent_session_with(&agent, &worktree, 80, 24, Some(launch), None)?;
+        self.start_cloud_mirror(id.clone());
         let entity = self.agent_entity(id)?;
         self.broadcast(ServerEvent::EntityUpserted {
             entity: Entity::Agent(entity),
         });
         Ok(())
+    }
+
+    /// The checkout a Cloud row re-enters its session in. A row sitting in
+    /// the main checkout is re-homed into a `cloud-<id>` worktree first —
+    /// both the attach and the teleport check the cloud branch out where
+    /// they run, and the user's main checkout must never be that place.
+    async fn cloud_worktree_for(
+        self: &Arc<Self>,
+        agent: &Agent,
+        cloud_id: &str,
+    ) -> Result<Worktree> {
+        let worktree = self
+            .store
+            .get_worktree(&agent.worktree_id)?
+            .context("worktree not found")?;
+        if !worktree.is_main {
+            return Ok(worktree);
+        }
+        let branch = cloud_worktree_branch(cloud_id);
+        let EntityId::Worktree(target) = self
+            .create_worktree(&worktree.project_id, &branch, None)
+            .await?
+        else {
+            bail!("worktree create returned a non-worktree entity");
+        };
+        let moved = self
+            .store
+            .get_worktree(&target)?
+            .context("worktree not found")?;
+        // Same invalidation as a deliberate move: the remembered hook cwd
+        // points at the old checkout and would sync the row back.
+        self.last_cwd.lock().unwrap().remove(&agent.id);
+        self.store.set_agent_worktree(&agent.id, &target)?;
+        tracing::info!(agent = %agent.id, branch, "cloud row re-homed into its own worktree");
+        Ok(moved)
+    }
+
+    /// Follow a Cloud row's session: re-teleport its pane every
+    /// [`CLOUD_MIRROR_REFRESH`] so turns the cloud agent has taken since the
+    /// last pull show up without anyone opening a browser.
+    ///
+    /// The mirror stops for good the moment the pane is typed into. A
+    /// teleport is a full kill-and-respawn of the local CLI, so refreshing
+    /// under someone mid-sentence would eat their turn — the first keystroke
+    /// is the handover: from then on the pane is an ordinary local session
+    /// that happens to have started from a cloud transcript.
+    fn start_cloud_mirror(self: &Arc<Self>, id: AgentId) {
+        let Some(cadence) = cloud_mirror_refresh() else {
+            return;
+        };
+        let token = Arc::new(tokio_util::sync::CancellationToken::new());
+        if let Some(previous) = self
+            .cloud_mirrors
+            .lock()
+            .unwrap()
+            .insert(id.clone(), token.clone())
+        {
+            previous.cancel();
+        }
+        let daemon = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = daemon.shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(cadence) => {}
+                }
+                match daemon.refresh_cloud_mirror(&id).await {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(e) => {
+                        tracing::warn!(agent = %id, error = %e, "cloud mirror refresh failed");
+                        break;
+                    }
+                }
+            }
+            // Only clear the slot if it is still ours: a newer mirror may
+            // have replaced (and cancelled) this one already.
+            let ours = {
+                let mut mirrors = daemon.cloud_mirrors.lock().unwrap();
+                let ours = mirrors.get(&id).is_some_and(|t| Arc::ptr_eq(t, &token));
+                if ours {
+                    mirrors.remove(&id);
+                }
+                ours
+            };
+            // The row wears a "following" badge while this task runs, so
+            // its end is news: re-broadcast so the badge goes back to a
+            // plain `cloud` instead of promising refreshes nobody is doing.
+            if ours && !daemon.shutdown.is_cancelled() {
+                if let Ok(entity) = daemon.agent_entity(&id) {
+                    daemon.broadcast(ServerEvent::EntityUpserted {
+                        entity: Entity::Agent(entity),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Cancel a row's mirror, if it has one. Called whenever the row is
+    /// respawned as something other than a cloud re-entry — a plain restart,
+    /// an archive, a delete — so a pending tick cannot teleport over it.
+    fn stop_cloud_mirror(&self, id: &AgentId) {
+        if let Some(token) = self.cloud_mirrors.lock().unwrap().remove(id) {
+            token.cancel();
+        }
+    }
+
+    pub fn cloud_mirror_active(&self, id: &AgentId) -> bool {
+        self.cloud_mirrors.lock().unwrap().contains_key(id)
+    }
+
+    /// One mirror tick. `Ok(false)` means stop following: the row was typed
+    /// into, archived, deleted, or lost its cloud session id.
+    async fn refresh_cloud_mirror(self: &Arc<Self>, id: &AgentId) -> Result<bool> {
+        let Some(agent) = self.store.get_agent(id)? else {
+            return Ok(false);
+        };
+        if agent.archived {
+            return Ok(false);
+        }
+        let Some(cloud_id) = agent.cloud_session_id.clone() else {
+            return Ok(false);
+        };
+        let sref = SessionRef::Agent(id.clone());
+        let live = self.sessions.lock().unwrap().get(&sref).cloned();
+        match live {
+            Some(session) if session.input_seen() => {
+                tracing::info!(agent = %id, "cloud mirror adopted — the pane has been typed into");
+                return Ok(false);
+            }
+            Some(_) => {}
+            // The pane this mirror last spawned is gone. Either the idle
+            // reaper took it — nobody has looked at this row in a long
+            // time, and respawning it every tick would make cloud rows the
+            // one kind of session that can never be reaped — or the
+            // teleport itself died, in which case retrying it forever is
+            // the wrong answer too. Stop; opening the row re-enters the
+            // session and starts a fresh mirror.
+            None => {
+                tracing::info!(agent = %id, "cloud mirror stopping — its pane is gone");
+                return Ok(false);
+            }
+        }
+        let worktree = self.cloud_worktree_for(&agent, &cloud_id).await?;
+        self.kill_session(&sref);
+        self.spawn_agent_session_with(
+            &agent,
+            &worktree,
+            80,
+            24,
+            Some(CloudLaunch::Teleport(&cloud_id)),
+            None,
+        )?;
+        if let Ok(entity) = self.agent_entity(id) {
+            self.broadcast(ServerEvent::EntityUpserted {
+                entity: Entity::Agent(entity),
+            });
+        }
+        Ok(true)
+    }
+
+    /// Queue a message on a Cloud session without leaving nebula.
+    /// `claude -p <msg> --cloud <id>` is fire-and-forget — the CLI prints
+    /// "Sent to cloud session." and returns, the reply only ever shows up in
+    /// the transcript — so the send is followed by an immediate mirror
+    /// refresh, and the answer lands in the pane on a later tick.
+    pub async fn send_cloud_message(self: &Arc<Self>, id: &AgentId, message: &str) -> Result<()> {
+        let agent = self.store.get_agent(id)?.context("agent not found")?;
+        let Some(cloud_id) = agent.cloud_session_id.clone() else {
+            bail!("session was not launched in Claude Cloud");
+        };
+        let message = validate_cloud_text(message, "message")?;
+        let worktree = self
+            .store
+            .get_worktree(&agent.worktree_id)?
+            .context("worktree not found")?;
+
+        let cmd_override = std::env::var("NEBULA_AGENT_CMD").ok();
+        let (program, args) = match cmd_override.as_deref() {
+            Some(over) => (over.to_string(), Vec::new()),
+            None => login_shell_wrap(
+                &user_shell(),
+                "claude",
+                &[
+                    "-p".to_string(),
+                    message.clone(),
+                    format!("--cloud={cloud_id}"),
+                ],
+            ),
+        };
+        let output = tokio::process::Command::new(&program)
+            .args(&args)
+            .current_dir(&worktree.path)
+            .output()
+            .await
+            .context("run claude -p --cloud")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.trim().lines().last().unwrap_or("").to_string();
+            bail!(
+                "claude could not reach the cloud session{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            );
+        }
+        tracing::info!(agent = %id, cloud_session = %cloud_id, bytes = message.len(), "message sent to cloud session");
+        // Pull the transcript now so the send is visibly acknowledged, and
+        // make sure the row keeps following from here even if it had been
+        // sitting dead since a create.
+        if !self.cloud_mirror_active(id) {
+            self.start_cloud_mirror(id.clone());
+        }
+        let _ = self.refresh_cloud_mirror(id).await;
+        Ok(())
+    }
+
+    /// A `claude --cloud <task>` create prints the new session's id and
+    /// exits — on this rollout it never stays attached. Left alone the row
+    /// is a dead pane whose last line is "Resume with: claude --teleport
+    /// …", which tells the user to go somewhere else to watch their own
+    /// agent work. So: capture the id off the output, wait for the create
+    /// to finish, and re-enter the session, which leaves the row mirroring
+    /// the cloud transcript.
+    ///
+    /// The id is persisted here as well as in `watch_for_exit` (both listen
+    /// to the same broadcast, in no fixed order) so the re-entry cannot read
+    /// a row the other task has not written yet. Both writes are the same
+    /// value, so whichever lands second is a no-op.
+    fn arm_cloud_follow(self: &Arc<Self>, id: AgentId, session: Arc<PtySession>) {
+        let daemon = self.clone();
+        let mut rx = session.events.subscribe();
+        tokio::spawn(async move {
+            let mut cloud_id: Option<String> = None;
+            loop {
+                match rx.recv().await {
+                    Ok(PtyEvent::CloudSession { id }) => cloud_id = Some(id),
+                    Ok(PtyEvent::Exited { .. }) => break,
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            // No id means the create failed (bad task, no auth, offline).
+            // Its error text is the most useful thing the pane can show.
+            let Some(cloud_id) = cloud_id else { return };
+            if daemon.shutdown.is_cancelled() {
+                return;
+            }
+            match daemon.store.get_agent(&id) {
+                Ok(Some(agent)) if !agent.archived => {}
+                _ => return,
+            }
+            if let Err(e) = daemon
+                .store
+                .set_agent_cloud_session_id(&id, Some(&cloud_id))
+            {
+                tracing::warn!(agent = %id, error = %e, "cloud session id not persisted");
+                return;
+            }
+            tracing::info!(agent = %id, cloud_session = %cloud_id, "created — re-entering to mirror it");
+            if let Err(e) = daemon.attach_cloud_agent(&id).await {
+                tracing::warn!(agent = %id, error = %e, "cloud follow failed");
+            }
+        });
     }
 
     /// `claude --cloud <id>` on an account without the attach rollout
@@ -1734,6 +2023,9 @@ impl Daemon {
             if !rejected {
                 return;
             }
+            // Live attach is a server-side rollout, not a per-row accident:
+            // remember the refusal so no later re-entry shows it again.
+            daemon.cloud_attach_gated.store(true, Ordering::Relaxed);
             // Archived, deleted, or moved inside the window: leave it be.
             match daemon.store.get_agent(&agent.id) {
                 Ok(Some(current)) if !current.archived && current.worktree_id == worktree.id => {}
@@ -1749,6 +2041,7 @@ impl Daemon {
                 None,
             ) {
                 Ok(_) => {
+                    daemon.start_cloud_mirror(agent.id.clone());
                     if let Ok(entity) = daemon.agent_entity(&agent.id) {
                         daemon.broadcast(ServerEvent::EntityUpserted {
                             entity: Entity::Agent(entity),
@@ -1966,6 +2259,15 @@ impl Daemon {
         // Whatever spawns this agent, it runs in `worktree` from here: a
         // relocation still pending for it has been overtaken.
         self.pending_moves.lock().unwrap().remove(&agent.id);
+        // A spawn that isn't a cloud re-entry replaces the pane for good —
+        // a pending mirror tick must not teleport over it. (The re-entries
+        // re-arm their own mirror; a create arms one once it has an id.)
+        if !matches!(
+            cloud,
+            Some(CloudLaunch::Attach(_)) | Some(CloudLaunch::Teleport(_))
+        ) {
+            self.stop_cloud_mirror(&agent.id);
+        }
         // Managed status hooks; a failure here degrades to "no status
         // updates", never blocks the spawn.
         let install_result = match agent.kind {
@@ -2039,8 +2341,13 @@ impl Daemon {
         }
         match cloud {
             // The create prints the session id and (on accounts without
-            // the attach rollout) exits at once: capture it off the output.
-            Some(CloudLaunch::Create(_)) => session.arm_cloud_scan(),
+            // the attach rollout) exits at once: capture it off the output,
+            // then re-enter the session it just made so the row shows the
+            // cloud agent's work instead of a "resume with" hint.
+            Some(CloudLaunch::Create(_)) => {
+                session.arm_cloud_scan();
+                self.arm_cloud_follow(agent.id.clone(), session.clone());
+            }
             Some(CloudLaunch::Attach(id)) => {
                 session.arm_cloud_scan();
                 self.arm_cloud_attach_fallback(
@@ -2365,6 +2672,41 @@ enum CloudLaunch<'a> {
     Create(&'a str),
     Attach(&'a str),
     Teleport(&'a str),
+}
+
+/// How a Cloud row re-enters its session. The live attach is worth one
+/// try per daemon — it is a server-side rollout, so the answer can change
+/// between runs — but not a second, because a gated account answers with a
+/// red `not enabled for your account` in the user's pane every time.
+fn cloud_reentry_launch(cloud_id: &str, attach_gated: bool) -> CloudLaunch<'_> {
+    if attach_gated {
+        CloudLaunch::Teleport(cloud_id)
+    } else {
+        CloudLaunch::Attach(cloud_id)
+    }
+}
+
+/// Trim and bounds-check text handed to the Claude CLI as one argv item —
+/// a Cloud task on create, a message queued on an existing session. Both
+/// ride the login shell's `-c` string as well as Claude's argv: quoting
+/// stops injection, but a NUL would truncate the command and an unbounded
+/// string would blow the argv limit, so both are rejected here rather than
+/// at the shell.
+fn validate_cloud_text(raw: &str, what: &str) -> Result<String> {
+    let text = raw.trim().to_string();
+    if text.is_empty() {
+        bail!("Claude Cloud needs a {what}");
+    }
+    if text.contains('\0') {
+        bail!("Claude Cloud {what} cannot contain NUL bytes");
+    }
+    if text.len() > MAX_CLOUD_PROMPT_BYTES {
+        bail!(
+            "Claude Cloud {what} is too long (max {} KiB)",
+            MAX_CLOUD_PROMPT_BYTES / 1024
+        );
+    }
+    Ok(text)
 }
 
 /// Branch (and so directory) of the worktree a Cloud row is re-homed into
@@ -2805,6 +3147,38 @@ mod tests {
     }
 
     #[test]
+    fn cloud_reentry_tries_attach_once_then_teleports() {
+        let id = "session_abc";
+        assert_eq!(cloud_reentry_launch(id, false), CloudLaunch::Attach(id));
+        // Once the account has refused, every later re-entry teleports —
+        // retrying the attach only reprints the refusal in the user's pane.
+        assert_eq!(cloud_reentry_launch(id, true), CloudLaunch::Teleport(id));
+    }
+
+    #[test]
+    fn cloud_text_is_trimmed_and_bounded() {
+        assert_eq!(
+            validate_cloud_text("  fix auth  ", "task").unwrap(),
+            "fix auth"
+        );
+        // Newlines are part of a multi-row task/message; only the ends go.
+        assert_eq!(
+            validate_cloud_text("\nline one\nline two\n", "message").unwrap(),
+            "line one\nline two"
+        );
+        for bad in ["", "   ", "\n"] {
+            assert!(validate_cloud_text(bad, "task").is_err(), "{bad:?}");
+        }
+        // A NUL would truncate the login shell's -c string.
+        assert!(validate_cloud_text("fix\0auth", "task").is_err());
+        assert!(validate_cloud_text(&"x".repeat(MAX_CLOUD_PROMPT_BYTES), "task").is_ok());
+        assert!(validate_cloud_text(&"x".repeat(MAX_CLOUD_PROMPT_BYTES + 1), "task").is_err());
+        // The label rides into the message the user sees.
+        let err = validate_cloud_text("", "message").unwrap_err().to_string();
+        assert!(err.contains("message"), "{err}");
+    }
+
+    #[test]
     fn login_shell_wrap_quotes_and_execs() {
         let (program, args) = login_shell_wrap(
             "/bin/zsh",
@@ -2985,6 +3359,7 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: false,
+                cloud_mirroring: false,
             })
             .unwrap();
     }
@@ -3168,6 +3543,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: false,
+                    cloud_mirroring: false,
                 },
                 true,
             )

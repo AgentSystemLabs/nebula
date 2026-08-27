@@ -10,6 +10,7 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use progress::ProgressScanner;
 use ring::ScrollbackRing;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
 
@@ -82,6 +83,11 @@ pub struct PtySession {
     /// Claude Cloud session id / attach-refusal scanner; `None` until a
     /// `--cloud` launch arms it, so ordinary sessions pay nothing.
     cloud: Mutex<Option<CloudScanner>>,
+    /// Set by the first `write_input`. A Cloud mirror stops re-teleporting
+    /// once its pane has been typed into: the moment the user talks to the
+    /// local session, replacing it under them would eat their turn.
+    /// Resizes and attaches deliberately do not count.
+    input_seen: AtomicBool,
 }
 
 pub struct SpawnSpec {
@@ -144,6 +150,7 @@ impl PtySession {
             kitty: Mutex::new(kitty::KittyScanner::new()),
             progress: Mutex::new(ProgressScanner::new()),
             cloud: Mutex::new(None),
+            input_seen: AtomicBool::new(false),
         });
 
         let (tx, rx) = mpsc::channel::<ReaderMsg>(READER_CHANNEL_BOUND);
@@ -153,6 +160,9 @@ impl PtySession {
     }
 
     pub fn write_input(&self, data: &[u8]) -> Result<()> {
+        if !data.is_empty() {
+            self.input_seen.store(true, Ordering::Relaxed);
+        }
         let mut w = self.writer.lock().unwrap();
         w.write_all(data)?;
         w.flush()?;
@@ -258,6 +268,12 @@ impl PtySession {
     /// Output that already landed in the ring is scanned first, so arming
     /// a moment after spawn cannot miss a fast-printing child; sightings
     /// then arrive as `PtyEvent::CloudSession` / `CloudAttachRejected`.
+    /// Whether anything has been typed into this session. Drives the
+    /// Cloud mirror's "stop refreshing once it's yours" rule.
+    pub fn input_seen(&self) -> bool {
+        self.input_seen.load(Ordering::Relaxed)
+    }
+
     pub fn arm_cloud_scan(&self) {
         let mut scanner = CloudScanner::new();
         let (_, replay) = self.snapshot(None);
@@ -375,4 +391,43 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
         flush(&session, &mut pending);
     }
     tracing::info!(session = ?session.sref, "pty pump ended");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nebula_core::AgentId;
+
+    fn echo_session() -> Arc<PtySession> {
+        PtySession::spawn(
+            SessionRef::Agent(AgentId::generate()),
+            SpawnSpec {
+                program: "/bin/cat".into(),
+                args: vec![],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: vec![],
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .unwrap()
+    }
+
+    /// The Cloud mirror stops refreshing a pane once its user has typed
+    /// into it, so `input_seen` must track keystrokes only — an attach's
+    /// resize jiggle happens without anyone touching the keyboard.
+    #[tokio::test]
+    async fn input_seen_tracks_keystrokes_not_resizes() {
+        let session = echo_session();
+        assert!(!session.input_seen());
+        session.resize_with_jiggle(100, 30).unwrap();
+        session.resize(80, 24).unwrap();
+        assert!(!session.input_seen(), "a resize is not input");
+        session.write_input(b"").unwrap();
+        assert!(!session.input_seen(), "an empty write is not input");
+        session.write_input(b"x").unwrap();
+        assert!(session.input_seen());
+        session.kill();
+    }
 }

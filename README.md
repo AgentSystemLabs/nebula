@@ -101,13 +101,22 @@ run — **Claude**, **Codex**, **Cursor**, or a plain **Terminal (shell)**. `→
 into model and reasoning-effort submenus; `Enter` anywhere takes your configured defaults. On the
 Claude row, `Tab` toggles Cloud mode: after the optional name, enter the task in the wrapped editor
 (`Shift+Enter` or `Ctrl+J` adds a line) and nebula launches `claude --cloud <task>`. On accounts without
-Claude's live-attach rollout the CLI prints the session URL and exits; nebula keeps the session id it printed
-(the row gets a `cloud` badge) so you never need the browser to get back in: **Restart** the row — or pick
-**Attach cloud session** from its menu — and nebula runs `claude --cloud <id>`, falling back to
-`claude --teleport <id>` (the transcript and branch pulled into a local session) when the account can't attach.
-Either way the CLI switches the checkout to the cloud branch, so a row still in the main checkout is first
-re-homed into a `cloud-<id>` worktree of its own. Otherwise, name the session or
-accept the default and nebula spawns the CLI in that worktree and drops you straight into it.
+Claude's live-attach rollout the CLI prints the session URL and exits — so nebula reads the session id off
+that output and re-enters the session for you, without being asked. The row becomes a **mirror** of the
+cloud session: nebula runs `claude --cloud <id>`, falling back to `claude --teleport <id>` (the transcript
+and branch pulled into a local session) when the account can't attach, and then re-teleports every 45s so
+turns the cloud agent takes keep landing in the pane. The badge reads `cloud ↻` while it is following.
+Since either CLI switches the checkout to the cloud branch, a row still in the main checkout is first
+re-homed into a `cloud-<id>` worktree of its own.
+
+A teleport is a snapshot, not a live link, which is why the mirror re-pulls — and why **the first key you
+type into the pane ends it**: from then on the session is yours, an ordinary local Claude that started from
+a cloud transcript, and nebula stops respawning it under you. `NEBULA_CLOUD_MIRROR_SECS` changes the
+cadence; `0` turns the follow off, leaving **Attach cloud session** (the row's `m` menu) as the manual
+refresh. To steer the cloud agent without a browser, pick **Send to cloud session** — the same wrapped
+editor — and nebula runs `claude -p <message> --cloud <id>` and pulls the transcript straight after. The
+reply shows up on a later refresh; the CLI never returns one. Otherwise, name the session or accept the
+default and nebula spawns the CLI in that worktree and drops you straight into it.
 
 **5. Leave — it keeps running.** `Ctrl+q` gets you out of the terminal and back to the panels. That's the
 key to remember: the agent doesn't care that you stopped watching. Press `q` to quit nebula entirely and
@@ -256,6 +265,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Worktrees / Sessions | `p` | pin / unpin — pinned rows sort to the top and skip the idle reaper |
 | Sessions | `n` | new session (agent or shell terminal) |
 | New session picker (Claude) | `Tab` | toggle Claude Cloud; Cloud adds a wrapped task prompt (`Shift+Enter` or `Ctrl+J` inserts a line) before launch |
+| Sessions (cloud row) | `m` | **Attach cloud session** re-pulls the transcript now; **Send to cloud session** queues a message on it |
 | Sessions | `r`, `a`, `u`, `d`, `A` | rename, archive, unarchive, delete, toggle archived |
 | Any panel | `Shift+D` | delete every row of the focused panel (confirm lists the casualties) |
 | Any panel | `g` | git diff for the selected worktree: filter, `↑↓` files, `Shift+↑↓`/`PgUp/PgDn`/`Ctrl+d/u` scroll, `Ctrl+r` marks a file reviewed ✓ |

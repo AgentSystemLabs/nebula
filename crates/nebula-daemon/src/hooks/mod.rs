@@ -259,6 +259,7 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
+            cloud_mirroring: false,
         };
         store
             .insert_agent_with_auto_title(&agent("pending"), true)

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 27;
+pub const PROTOCOL_VERSION: u32 = 28;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -233,6 +233,17 @@ pub enum ClientRequest {
     AttachCloudAgent {
         req_id: u64,
         id: AgentId,
+    },
+    /// Queue a message on the Claude Cloud session a row launched
+    /// (`claude -p <message> --cloud <id>`), then pull the transcript so the
+    /// send is visible. Fire-and-forget by nature: the CLI acknowledges the
+    /// send and returns, and the reply only ever appears in a later pull.
+    /// Rejected for rows without a `cloud_session_id`, and bounded by
+    /// [`MAX_CLOUD_PROMPT_BYTES`] like the launch task.
+    SendCloudMessage {
+        req_id: u64,
+        id: AgentId,
+        message: String,
     },
     CreateTerminal {
         req_id: u64,

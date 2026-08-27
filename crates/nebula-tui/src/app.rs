@@ -90,6 +90,9 @@ pub enum MenuAction {
     /// Re-enter the Claude Cloud session a row launched (see
     /// `ClientRequest::AttachCloudAgent`).
     AttachCloudAgent(AgentId),
+    /// Queue a message on the row's Claude Cloud session
+    /// (`ClientRequest::SendCloudMessage`), via a prompt.
+    SendCloudMessage(AgentId),
     RenameAgent(AgentId),
     ArchiveAgent(AgentId),
     UnarchiveAgent(AgentId),
@@ -320,6 +323,12 @@ pub enum PromptKind {
         model: Option<String>,
         effort: Option<String>,
     },
+    /// A message to queue on a row's Claude Cloud session
+    /// (`claude -p <message> --cloud <id>`). Multi-row like the launch task:
+    /// steering a cloud agent is rarely one line.
+    CloudMessage {
+        id: AgentId,
+    },
     RenameAgent {
         id: AgentId,
     },
@@ -382,9 +391,13 @@ impl PromptDialog {
         matches!(self.kind, PromptKind::AddProject)
     }
 
-    /// The Claude Cloud task is the only prompt with a multi-row editor.
+    /// The Claude Cloud prompts — the launch task and a message to a live
+    /// session — are the ones with a multi-row editor.
     pub fn is_multiline(&self) -> bool {
-        matches!(self.kind, PromptKind::ClaudeCloudTask { .. })
+        matches!(
+            self.kind,
+            PromptKind::ClaudeCloudTask { .. } | PromptKind::CloudMessage { .. }
+        )
     }
 
     fn home() -> Option<std::path::PathBuf> {
@@ -1289,6 +1302,14 @@ pub enum PendingIntent {
         kind: PromptKind,
         task: String,
     },
+    /// Flash `note` on success; on failure, reopen this prompt with `text`
+    /// restored. Same bargain as the Cloud task: a message worth typing into
+    /// a multi-row editor is worth not losing to a transient error.
+    ReopenPromptOnError {
+        kind: PromptKind,
+        text: String,
+        note: String,
+    },
     /// Select the added project and step into its Worktrees panel.
     SelectCreatedProject,
     /// Select the created worktree in the Worktrees panel.
@@ -1933,6 +1954,10 @@ pub struct App {
     pub hover_splitter: Option<usize>,
     /// Pointer shape the outer terminal should currently show (OSC 22).
     pub pointer_shape: PointerShape,
+    /// Base64 payload waiting to go out as an OSC 52 clipboard request, set
+    /// when the copy has to be delegated to the attached terminal (see
+    /// `copy_and_flash`). The main loop writes and clears it.
+    pub pending_clipboard: Option<String>,
     /// Body rect (everything above the footer) from the last draw; bounds
     /// splitter drags.
     pub body_area: Rect,
@@ -2101,6 +2126,7 @@ impl App {
             splitter_drag: None,
             hover_splitter: None,
             pointer_shape: PointerShape::default(),
+            pending_clipboard: None,
             body_area: Rect::default(),
             hostname: nebula_core::host::hostname(),
             is_remote: nebula_core::host::is_remote_session(),
@@ -2844,6 +2870,7 @@ mod tests {
             cloud_session_id: None,
             sort_order: 0,
             alive: true,
+            cloud_mirroring: false,
         });
         app.tree.agents.push(Agent {
             id: AgentId("a2".into()),

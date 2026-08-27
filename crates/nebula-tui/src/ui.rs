@@ -2405,11 +2405,15 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
         );
         if selected {
             // The bottom border stays under the open tab — it just turns
-            // into that tab's underline: heavy and accent-colored, so the
-            // tab-to-content join reads as a join rather than a hole.
+            // into that tab's underline, so the tab-to-content join reads
+            // as a join rather than a hole. It is a half block, not a
+            // heavy rule: a line glyph draws at the cell's midline, which
+            // leaves a strip of unpainted background between the tab's
+            // fill and the accent and reads as a gap. `▀` paints from the
+            // cell's top edge, flush against the block above it.
             for cx in x..x + w {
                 if let Some(cell) = f.buffer_mut().cell_mut((cx, rule_y)) {
-                    cell.set_symbol("━").set_fg(th.accent);
+                    cell.set_symbol("▀").set_fg(th.accent);
                 }
             }
         }
@@ -3007,6 +3011,12 @@ fn draw_session_row(
             // says so until the cursor lands on it.
             let (badge, badge_style) = if a.unseen && !a.archived {
                 (" done".to_string(), Style::default().fg(th.done))
+            } else if a.cloud_mirroring && !a.archived {
+                // Following the cloud session: the pane is re-pulled on a
+                // timer, so what it shows is the cloud agent's own work.
+                // Worth saying loudly — otherwise a pane that changes on
+                // its own looks like a glitch.
+                (" cloud ↻".to_string(), Style::default().fg(th.accent))
             } else if a.cloud_session_id.is_some() {
                 // A Claude Cloud row: the harness that matters is the cloud
                 // sandbox, and the badge is how the user tells this row

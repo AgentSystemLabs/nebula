@@ -3689,13 +3689,291 @@ async fn cli_add_project() {
     wait_for_exit(&mut daemon);
 }
 
+/// A teleport is a snapshot of the cloud session, not a live link, so the
+/// row keeps re-teleporting to stay current — that is what makes a cloud
+/// agent's work show up in nebula at all. The follow ends the moment the
+/// pane is typed into: from then on it is the user's local session, and
+/// respawning it under them would eat their turn.
+#[tokio::test]
+async fn cloud_mirror_refreshes_until_the_pane_is_typed_into() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let state = env.tmp.path().join("mirror-stub");
+    std::fs::create_dir_all(&state).unwrap();
+    let stub = env.tmp.path().join("mirror-stub.sh");
+    std::fs::write(
+        &stub,
+        format!(
+            r#"#!/bin/sh
+n=$(cat "{state}/runs" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "{state}/runs"
+case "$n" in
+  1)
+    printf 'Created cloud session: Follow me\r\n'
+    printf 'Resume with: claude --teleport session_01SQugK2HDyk33coSrfqFJk4\r\n'
+    exit 0
+    ;;
+  2)
+    printf 'Error: Attaching to an existing cloud session is not enabled for your account.\r\n'
+    exit 1
+    ;;
+  *)
+    exec sleep 300
+    ;;
+esac
+"#,
+            state = state.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let runs = || {
+        std::fs::read_to_string(state.join("runs"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    let mut daemon =
+        env.spawn_daemon_with(stub.to_str().unwrap(), &[("NEBULA_CLOUD_MIRROR_SECS", "2")]);
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 10,
+            worktree: main_worktree.id.clone(),
+            name: "cloud".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: Some("Follow me".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        find_ack(evs, 10).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 10).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+
+    // create, refused attach, teleport — then the follow keeps going: each
+    // tick kills the pane and teleports it again, pulling whatever the
+    // cloud session has done since.
+    let wait_for_runs = |target: u32| async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while runs() < target && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        runs()
+    };
+    assert!(
+        wait_for_runs(5).await >= 5,
+        "the mirror re-teleports on its own; runs stalled at {}",
+        runs()
+    );
+
+    // Attach and type: the pane is the user's from here.
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: SessionRef::Agent(agent_id.clone()),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: SessionRef::Agent(agent_id.clone()),
+            data: b"hello".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // The badge clears when the follow gives up, so wait on that rather
+    // than on a sleep — then hold still and confirm the runs stop climbing.
+    let events = read_events_until(&mut c, Duration::from_secs(20), |evs| {
+        evs.iter().any(|e| {
+            matches!(
+                e,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(a)
+                } if a.id == agent_id && !a.cloud_mirroring
+            )
+        })
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && !a.cloud_mirroring
+        )),
+        "the row should stop advertising a follow it has given up: {events:#?}"
+    );
+    let settled = runs();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        runs(),
+        settled,
+        "an adopted pane must not be teleported over"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// The mirror must not be able to loop forever. If the pane it last
+/// spawned is gone — the idle reaper took it because nobody has looked at
+/// this row in a long time, or the teleport itself died — following stops
+/// instead of respawning a session every tick, which would make cloud rows
+/// the one kind nebula can never reap.
+#[tokio::test]
+async fn cloud_mirror_gives_up_when_its_pane_stops_coming_back() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let state = env.tmp.path().join("dying-stub");
+    std::fs::create_dir_all(&state).unwrap();
+    let stub = env.tmp.path().join("dying-stub.sh");
+    std::fs::write(
+        &stub,
+        format!(
+            r#"#!/bin/sh
+n=$(cat "{state}/runs" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "{state}/runs"
+case "$n" in
+  1)
+    printf 'Created cloud session: Follow me\r\n'
+    printf 'Resume with: claude --teleport session_01SQugK2HDyk33coSrfqFJk4\r\n'
+    exit 0
+    ;;
+  2)
+    printf 'Error: Attaching to an existing cloud session is not enabled for your account.\r\n'
+    exit 1
+    ;;
+  3)
+    exec sleep 300
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"#,
+            state = state.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let runs = || {
+        std::fs::read_to_string(state.join("runs"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    let mut daemon =
+        env.spawn_daemon_with(stub.to_str().unwrap(), &[("NEBULA_CLOUD_MIRROR_SECS", "2")]);
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 10,
+            worktree: main_worktree.id.clone(),
+            name: "cloud".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: Some("Follow me".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        find_ack(evs, 10).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 10).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+
+    // create, refused attach, teleport — then one tick teleports again
+    // (run 4) and that child dies at once.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while runs() < 4 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(runs() >= 4, "the mirror never got a tick in: {}", runs());
+
+    // The tick after that finds no pane and gives up. Watch for the badge
+    // going quiet *after* it was lit — a row's upserts start out unmirrored,
+    // and a spawn's upsert reaches the client before its child runs a line.
+    let events = read_events_until(&mut c, Duration::from_secs(20), |evs| {
+        let is = |e: &ServerEvent, want: bool| {
+            matches!(
+                e,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(a)
+                } if a.id == agent_id && a.cloud_mirroring == want
+            )
+        };
+        let lit = evs.iter().position(|e| is(e, true));
+        let quiet = evs.iter().rposition(|e| is(e, false));
+        matches!((lit, quiet), (Some(lit), Some(quiet)) if quiet > lit)
+    })
+    .await;
+    let settled = runs();
+    assert!(
+        !events.is_empty(),
+        "the mirror should have stopped advertising itself"
+    );
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    assert_eq!(runs(), settled, "no endless respawn loop");
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// A Claude Cloud row on an account without the live-attach rollout:
-/// `claude --cloud <task>` prints the session id and exits, the daemon
-/// captures the id off the PTY, and a Restart re-enters the session —
-/// the attach is refused (read off the output, not inferred from the exit),
-/// so the row is teleported instead, inside a `cloud-<id>` worktree of its
-/// own rather than on top of the user's main checkout. The stub stands in
-/// for all three CLI invocations in turn.
+/// `claude --cloud <task>` prints the session id and exits, and the daemon
+/// captures the id off the PTY and re-enters the session *on its own* —
+/// nobody has to ask, because the alternative is a dead pane whose last
+/// line tells the user to go watch their agent somewhere else. The attach
+/// is refused (read off the output, not inferred from the exit), so the row
+/// is teleported instead, inside a `cloud-<id>` worktree of its own rather
+/// than on top of the user's main checkout. The stub stands in for all
+/// three CLI invocations in turn.
 #[tokio::test]
 async fn cloud_row_captures_its_session_id_and_reenters_it() {
     let env = TestEnv::new();
@@ -3740,7 +4018,13 @@ esac
             .map(|s| s.trim().to_string())
             .unwrap_or_default()
     };
-    let mut daemon = env.spawn_daemon_with_agent_cmd(stub.to_str().unwrap());
+    // A cadence long enough that no mirror tick lands inside the test: the
+    // run counts here are about the re-entry chain, not the refresh loop
+    // (which `cloud_mirror_refreshes_until_the_pane_is_typed_into` covers).
+    let mut daemon = env.spawn_daemon_with(
+        stub.to_str().unwrap(),
+        &[("NEBULA_CLOUD_MIRROR_SECS", "600")],
+    );
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
@@ -3783,21 +4067,10 @@ esac
         panic!("CreateAgent failed: {events:#?}");
     };
     let agent_id = agent_id.clone();
-    assert_eq!(runs(), "1");
 
-    // Restart on a Cloud row with no local session re-enters the cloud
-    // session: attach (refused by the stub) then teleport, in a worktree of
-    // the row's own. Wait for the stub's third run and the row's respawn.
-    write_frame(
-        &mut c,
-        &ClientRequest::RestartAgent {
-            req_id: 11,
-            id: agent_id.clone(),
-        },
-    )
-    .await
-    .unwrap();
-    // Two live respawns of the row: the attach, then the teleport after it.
+    // Nothing more is asked of the daemon: capturing the id is what starts
+    // the re-entry. Two further respawns of the row follow — the attach,
+    // refused, and then the teleport.
     let events = read_events_until(&mut c, Duration::from_secs(20), |evs| {
         let live_spawns = evs
             .iter()
@@ -3820,10 +4093,6 @@ esac
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(runs(), "3", "create, refused attach, teleport");
-    assert!(
-        matches!(find_ack(&events, 11), Some(ServerEvent::Ack { .. })),
-        "RestartAgent failed: {events:#?}"
-    );
     let cloud_worktree = events
         .iter()
         .find_map(|e| match e {
@@ -3851,6 +4120,10 @@ esac
     );
     assert_eq!(row.cloud_session_id.as_deref(), Some(CLOUD_ID));
     assert!(row.alive);
+    assert!(
+        row.cloud_mirroring,
+        "the teleported pane follows the cloud session from here"
+    );
 
     // The create ran in the main checkout; the attach and the teleport both
     // ran in the new worktree — the user's checkout never switched branch.
@@ -3873,9 +4146,39 @@ esac
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&main_branch.stdout).trim(), "main");
 
-    // A row that has never seen the attach refusal is left alone by a kill:
-    // shutting down must not spawn a fourth run.
+    // Restarting a row that is mirroring re-enters the cloud session rather
+    // than resuming the local session the teleport left behind — and it
+    // goes straight to the teleport, because this daemon has already seen
+    // the attach refused once. One new run, not two.
+    write_frame(
+        &mut c,
+        &ClientRequest::RestartAgent {
+            req_id: 11,
+            id: agent_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(20), |evs| {
+        find_ack(evs, 11).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&events, 11), Some(ServerEvent::Ack { .. })),
+        "RestartAgent failed: {events:#?}"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while runs() != "4" && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        runs(),
+        "4",
+        "one re-entry, and it skipped the refused attach"
+    );
+
+    // Shutting down must not spawn anything further.
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
-    assert_eq!(runs(), "3");
+    assert_eq!(runs(), "4");
 }

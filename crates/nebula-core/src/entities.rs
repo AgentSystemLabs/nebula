@@ -169,6 +169,13 @@ pub struct Agent {
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this agent.
     pub alive: bool,
+    /// True while the daemon is following this row's Claude Cloud session —
+    /// re-teleporting the pane on a timer so turns taken in the cloud show
+    /// up here. Runtime state like `alive`, never persisted: it ends the
+    /// moment the pane is typed into (the session is then the user's) and
+    /// does not survive a daemon restart.
+    #[serde(default)]
+    pub cloud_mirroring: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

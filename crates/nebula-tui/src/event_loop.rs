@@ -445,6 +445,17 @@ async fn main_loop(
             let _ = backend.flush();
         }
 
+        // A copy that had to be delegated to the attached terminal (OSC 52 —
+        // the only clipboard reachable from a headless `nebula ssh` host).
+        // BEL-terminated on purpose: it is the form every OSC 52 implementer
+        // accepts, ST is not.
+        if let Some(payload) = app.pending_clipboard.take() {
+            use std::io::Write;
+            let backend = terminal.backend_mut();
+            let _ = write!(backend, "\x1b]52;c;{payload}\x07");
+            let _ = backend.flush();
+        }
+
         for req in out.drain(..) {
             if channels.tx.send(req).await.is_err() {
                 app.conn = ConnState::Disconnected;
@@ -1608,6 +1619,11 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
             "what should Claude do?".to_string(),
             String::new(),
         ),
+        PromptKind::CloudMessage { .. } => (
+            "Send to cloud session".to_string(),
+            "message for the cloud agent".to_string(),
+            String::new(),
+        ),
         PromptKind::RenameAgent { id } => {
             let current = app
                 .tree
@@ -2386,6 +2402,14 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
             MenuItem {
                 label: "Attach cloud session".into(),
                 action: MenuAction::AttachCloudAgent(a.id.clone()),
+                destructive: false,
+            },
+        );
+        items.insert(
+            after_restart + 1,
+            MenuItem {
+                label: "Send to cloud session".into(),
+                action: MenuAction::SendCloudMessage(a.id.clone()),
                 destructive: false,
             },
         );
@@ -3192,11 +3216,8 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 KeyCode::Char('y') if ctrl => {
                     if let Some(path) = finder.selected_path().map(str::to_string) {
                         app.overlay = None;
-                        app.flash = Some(if copy_to_clipboard(&path) {
-                            format!("copied {path}")
-                        } else {
-                            "copy failed (clipboard unavailable)".into()
-                        });
+                        let label = format!("copied {path}");
+                        copy_and_flash(app, &path, &label);
                     }
                 }
                 // Everything else edits the query like a terminal line
@@ -3281,11 +3302,8 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 KeyCode::Char('y') if ctrl => {
                     if let Some(path) = view.selected_node().map(|n| n.path.clone()) {
                         app.overlay = None;
-                        app.flash = Some(if copy_to_clipboard(&path) {
-                            format!("copied {path}")
-                        } else {
-                            "copy failed (clipboard unavailable)".into()
-                        });
+                        let label = format!("copied {path}");
+                        copy_and_flash(app, &path, &label);
                     }
                 }
                 // Everything else feeds the always-on fuzzy filter, which
@@ -3770,6 +3788,18 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             },
             out,
         ),
+        PromptKind::CloudMessage { id } => {
+            let req_id = app.alloc_req_id(PendingIntent::ReopenPromptOnError {
+                kind: PromptKind::CloudMessage { id: id.clone() },
+                text: value.clone(),
+                note: "Sent to the cloud session — pulling the transcript".into(),
+            });
+            out.push(ClientRequest::SendCloudMessage {
+                req_id,
+                id,
+                message: value,
+            });
+        }
         PromptKind::RenameAgent { id } => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::RenameAgent {
@@ -3931,6 +3961,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::AttachCloudAgent { req_id, id });
         }
+        MenuAction::SendCloudMessage(id) => open_prompt(app, PromptKind::CloudMessage { id }),
         MenuAction::RenameAgent(id) => open_prompt(app, PromptKind::RenameAgent { id }),
         MenuAction::ArchiveAgent(id) => {
             archive_agent(app, id, out);
@@ -4917,11 +4948,8 @@ fn finish_selection(app: &mut App) {
 /// Copy the current selection's text to the clipboard, flashing the result.
 fn copy_selection(app: &mut App) {
     if let Some(text) = selection_text(app) {
-        app.flash = Some(if copy_to_clipboard(&text) {
-            format!("copied {} chars", text.chars().count())
-        } else {
-            "copy failed (clipboard unavailable)".into()
-        });
+        let label = format!("copied {} chars", text.chars().count());
+        copy_and_flash(app, &text, &label);
     }
 }
 
@@ -4962,7 +4990,61 @@ fn select_word_at(app: &mut App, cell: (u16, u16)) {
     copy_selection(app);
 }
 
-/// Copy to the system clipboard.
+/// Copy `text` to the clipboard the user is actually looking at, flashing
+/// `label` when it goes out.
+///
+/// Two routes, because "the clipboard" is not always on this machine. Run
+/// locally, we shell out to the platform tool (`copy_to_clipboard`). Run over
+/// `nebula ssh`, that tool would target the *remote* box — and a headless VM
+/// has no clipboard at all, which is what used to surface as "copy failed
+/// (clipboard unavailable)". There we ask the terminal on the near end of the
+/// ssh connection instead, via OSC 52; the main loop writes the request.
+///
+/// OSC 52 is also the fallback for a local host with no display tool, and it
+/// is silently dropped by terminals that do not implement it (Terminal.app),
+/// so the flash names the route it took rather than claiming success.
+fn copy_and_flash(app: &mut App, text: &str, label: &str) {
+    // Unit tests exercise the copy flows; don't clobber the developer's real
+    // clipboard, and don't depend on their terminal or their $SSH_TTY.
+    if cfg!(test) {
+        app.flash = Some(label.to_string());
+        return;
+    }
+    if !app.is_remote && copy_to_clipboard(text) {
+        app.flash = Some(label.to_string());
+        return;
+    }
+    app.pending_clipboard = Some(base64_encode(text.as_bytes()));
+    app.flash = Some(format!("{label} (via terminal)"));
+}
+
+/// Base64 (RFC 4648, padded) for OSC 52 payloads — one call site does not
+/// justify a dependency.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = u32::from(chunk[0]) << 16
+            | u32::from(chunk.get(1).copied().unwrap_or(0)) << 8
+            | u32::from(chunk.get(2).copied().unwrap_or(0));
+        out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Copy to *this machine's* system clipboard.
 /// macOS: pbcopy. Linux: wl-copy on Wayland, xclip (or xsel) on X11.
 fn copy_to_clipboard(text: &str) -> bool {
     // Unit tests exercise the selection flow; don't clobber the developer's
@@ -6189,6 +6271,9 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         app.term_locked = true;
                     }
                 }
+                (Some(PendingIntent::ReopenPromptOnError { note, .. }), _) => {
+                    app.flash = Some(note);
+                }
                 (Some(PendingIntent::SelectCreatedProject), Some(EntityId::Project(id))) => {
                     // Its upsert usually lands just before this Ack; if not,
                     // stash the id and select once it does.
@@ -6278,10 +6363,13 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 Some(PendingIntent::DeleteWorktree(rollback)) => {
                     restore_worktree_rows(app, rollback)
                 }
-                Some(PendingIntent::AttachCreatedWithCloudRetry { kind, task }) => {
+                Some(
+                    PendingIntent::AttachCreatedWithCloudRetry { kind, task: text }
+                    | PendingIntent::ReopenPromptOnError { kind, text, .. },
+                ) => {
                     open_prompt(app, kind);
                     if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
-                        prompt.input.set_text(task);
+                        prompt.input.set_text(text);
                     }
                 }
                 _ => {}
@@ -6597,6 +6685,7 @@ mod tests {
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
+                    cloud_mirroring: false,
                 }),
             },
         );
@@ -6873,8 +6962,116 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    cloud_mirroring: false,
                 }),
             },
+        );
+    }
+
+    /// Turn the seeded row into a Claude Cloud row, mirroring or not.
+    fn make_cloud_row(app: &mut App, mirroring: bool) {
+        let mut agent = app.tree.agents[0].clone();
+        agent.cloud_session_id = Some("session_01SQugK2HDyk33coSrfqFJk4".into());
+        agent.cloud_mirroring = mirroring;
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Agent(agent),
+            },
+        );
+    }
+
+    /// A Cloud row can be steered from nebula: its menu offers a message to
+    /// queue on the session, in the same multi-row editor the launch task
+    /// uses, and a failed send hands the text back rather than eating it.
+    #[test]
+    fn cloud_row_can_send_a_message_to_its_session() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        make_cloud_row(&mut app, true);
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("no menu: {:?}", app.overlay)
+        };
+        let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"Attach cloud session") && labels.contains(&"Send to cloud session"),
+            "cloud rows get both cloud verbs: {labels:?}"
+        );
+
+        let idx = menu
+            .items
+            .iter()
+            .position(|i| i.label == "Send to cloud session")
+            .unwrap();
+        let Some(Overlay::Menu(menu)) = &mut app.overlay else {
+            unreachable!()
+        };
+        menu.hover = idx;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Prompt(prompt)) = &mut app.overlay else {
+            panic!("no message prompt: {:?}", app.overlay)
+        };
+        assert!(
+            prompt.is_multiline(),
+            "steering a cloud agent is rarely one line"
+        );
+        prompt.input.set_text("also update the README");
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let req_id = match &out[..] {
+            [ClientRequest::SendCloudMessage {
+                req_id,
+                id,
+                message,
+            }] => {
+                assert_eq!(id.0, "a1");
+                assert_eq!(message, "also update the README");
+                *req_id
+            }
+            other => panic!("expected a cloud send: {other:?}"),
+        };
+        assert!(app.overlay.is_none(), "the prompt closes on submit");
+
+        // A failed send reopens the editor with the message intact.
+        hse(
+            &mut app,
+            ServerEvent::Error {
+                req_id: Some(req_id),
+                message: "claude could not reach the cloud session".into(),
+            },
+        );
+        let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+            panic!("a lost message should come back: {:?}", app.overlay)
+        };
+        assert_eq!(prompt.input.as_str(), "also update the README");
+    }
+
+    /// The badge says whether the pane is being kept current. A row that
+    /// changes on its own with no explanation reads as a glitch.
+    #[test]
+    fn cloud_badge_says_when_the_row_is_following() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        make_cloud_row(&mut app, true);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_text(&terminal).contains("cloud ↻"),
+            "a following row says so: {}",
+            buffer_text(&terminal)
+        );
+
+        make_cloud_row(&mut app, false);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("cloud"), "still a cloud row: {text}");
+        assert!(
+            !text.contains("cloud ↻"),
+            "the follow ended; stop promising refreshes: {text}"
         );
     }
 
@@ -8614,6 +8811,7 @@ diff --git a/src/b.rs b/src/b.rs
                         sort_order: i,
                         status_changed_at: 0,
                         alive: true,
+                        cloud_mirroring: false,
                     }),
                 },
             );
@@ -8671,6 +8869,7 @@ diff --git a/src/b.rs b/src/b.rs
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
+                    cloud_mirroring: false,
                 }),
             },
         );
@@ -8772,6 +8971,7 @@ diff --git a/src/b.rs b/src/b.rs
                 sort_order: sort,
                 status_changed_at: changed_at,
                 alive: true,
+                cloud_mirroring: false,
             }),
         };
         // Pinned with a fresh change: must stay in PINNED, not RECENT.
@@ -8832,6 +9032,7 @@ diff --git a/src/b.rs b/src/b.rs
                     sort_order: sort,
                     status_changed_at: changed_at,
                     alive: true,
+                    cloud_mirroring: false,
                 }),
             }
         };
@@ -8902,6 +9103,7 @@ diff --git a/src/b.rs b/src/b.rs
                     sort_order: sort,
                     status_changed_at: at,
                     alive: true,
+                    cloud_mirroring: false,
                 }),
             }
         };
@@ -9003,6 +9205,7 @@ diff --git a/src/b.rs b/src/b.rs
                     sort_order: 1,
                     status_changed_at: crate::app::now_ms() - 23 * 60_000,
                     alive: true,
+                    cloud_mirroring: false,
                 }),
             },
         );
@@ -9066,6 +9269,7 @@ diff --git a/src/b.rs b/src/b.rs
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
+                    cloud_mirroring: false,
                 }),
             },
         );
@@ -9137,6 +9341,7 @@ diff --git a/src/b.rs b/src/b.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    cloud_mirroring: false,
                 }),
             },
         );
@@ -10569,6 +10774,7 @@ diff --git a/src/b.rs b/src/b.rs
                 sort_order: sort,
                 status_changed_at: 0,
                 alive: true,
+                cloud_mirroring: false,
             })
         };
         hse(
@@ -10641,6 +10847,7 @@ diff --git a/src/b.rs b/src/b.rs
             sort_order: sort,
             status_changed_at: 0,
             alive: false,
+            cloud_mirroring: false,
         })
     }
 
@@ -11392,6 +11599,20 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
+    fn base64_encodes_every_padding_case() {
+        // RFC 4648 vectors — the OSC 52 payload is unusable if padding slips.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // Non-ASCII selections go over the wire as UTF-8 bytes.
+        assert_eq!(base64_encode("→".as_bytes()), "4oaS");
+    }
+
+    #[test]
     fn pointer_shape_tracks_splitter_hover() {
         let mut app = App::new();
         seed_splitters(&mut app);
@@ -11549,6 +11770,7 @@ diff --git a/src/b.rs b/src/b.rs
             sort_order: 0,
             status_changed_at: 0,
             alive: true,
+            cloud_mirroring: false,
         };
 
         // a1 is the selected session; its upsert lands under w2.
@@ -11986,6 +12208,7 @@ diff --git a/src/b.rs b/src/b.rs
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
+                    cloud_mirroring: false,
                 }),
             },
         );
@@ -12943,6 +13166,7 @@ diff --git a/src/b.rs b/src/b.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    cloud_mirroring: false,
                 }),
             },
         );
@@ -12966,6 +13190,7 @@ diff --git a/src/b.rs b/src/b.rs
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: false,
+                    cloud_mirroring: false,
                 }),
             },
         );
@@ -13324,6 +13549,7 @@ diff --git a/src/b.rs b/src/b.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    cloud_mirroring: false,
                 }),
             },
         );
@@ -14982,6 +15208,7 @@ diff --git a/src/b.rs b/src/b.rs
                         sort_order: 1,
                         status_changed_at: 0,
                         alive: true,
+                        cloud_mirroring: false,
                     }),
                 },
             );
@@ -15054,6 +15281,7 @@ diff --git a/src/b.rs b/src/b.rs
             sort_order: 1,
             status_changed_at: 0,
             alive: true,
+            cloud_mirroring: false,
         })
     }
 
@@ -15484,6 +15712,7 @@ diff --git a/src/b.rs b/src/b.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    cloud_mirroring: false,
                 }),
             },
         );
@@ -15680,6 +15909,7 @@ diff --git a/src/b.rs b/src/b.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    cloud_mirroring: false,
                 }),
             },
         );
@@ -15765,6 +15995,7 @@ diff --git a/src/b.rs b/src/b.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    cloud_mirroring: false,
                 }),
             },
         );
@@ -15795,6 +16026,7 @@ diff --git a/src/b.rs b/src/b.rs
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
+                    cloud_mirroring: false,
                 }),
             },
         );
@@ -15918,7 +16150,11 @@ diff --git a/src/b.rs b/src/b.rs
         // The rule under the bar stays unbroken beneath the open tab — it
         // becomes that tab's accent underline, so the tab reads as
         // attached to the panels below it.
-        assert_eq!(buffer[(x, y + 2)].symbol(), "━", "tab join:\n{text}");
+        // A half block, not a line glyph: it paints from the cell's top
+        // edge, flush against the tab's fill. A `━` draws at the midline
+        // and leaves a strip of background above it — a visible gap
+        // between the tab and its own underline.
+        assert_eq!(buffer[(x, y + 2)].symbol(), "▀", "tab join:\n{text}");
         assert_eq!(buffer[(x, y + 2)].fg, app.theme.accent, "{text}");
         assert_eq!(buffer[(0, y + 2)].symbol(), "─", "{text}");
         assert_eq!(buffer[(0, y + 2)].fg, app.theme.edge, "{text}");
@@ -16075,7 +16311,7 @@ diff --git a/src/b.rs b/src/b.rs
             "and runs to the end:\n{text}"
         );
         assert!(
-            rule.contains("━━"),
+            rule.contains("▀▀"),
             "turning into an underline under the open tab:\n{text}"
         );
     }

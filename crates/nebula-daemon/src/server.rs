@@ -490,6 +490,19 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     )
                     .await;
                 }
+                ClientRequest::SendCloudMessage {
+                    req_id,
+                    id,
+                    message,
+                } => {
+                    tracing::info!(agent = %id, bytes = message.len(), "send to cloud session");
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.send_cloud_message(&id, &message).await.map(|_| None),
+                    )
+                    .await;
+                }
                 ClientRequest::CreateTerminal {
                     req_id,
                     worktree,
