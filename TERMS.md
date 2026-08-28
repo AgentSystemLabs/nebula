@@ -303,9 +303,9 @@ Everything nests: WORKSPACE → PROJECT → WORKTREE → SESSION. The DAEMON own
 
 | TERM | What it is | Also called | Where · key |
 |---|---|---|---|
-| **SHARED CHECKOUT** | This repo's main working tree, which several nebula sessions edit at once. Assume it is behind `origin/main` (releases are cut from a RELEASE WORKTREE and never fast-forward it), and that compile errors or test-count drift may be another session's. Baseline `cargo check` before starting. | "shared tree", "the main checkout", "this", "the tree" | `git diff origin/main` (not HEAD) |
-| **RELEASE WORKTREE** | The private `release-vX.Y.Z` worktree off `origin/main` the RELEASE SKILL builds in: files copied in by content, tests in an isolated `CARGO_TARGET_DIR`, three commits (feature / `.claude/MEMORY.md` / `Release vX.Y.Z`), pushed as `main`, tagged. | "release branch" | `.claude/skills/release/SKILL.md` |
-| **RELEASE SKILL** | `/release`: verify green, commit, bump `[workspace.package].version`, tag, push, replace the GitHub notes with a real changelog. Triggered by "commit push release". | "commit push release", "cut a release", "ship it", "do a release", "commit and push and release" | `.claude/skills/release/SKILL.md` |
+| **SHARED CHECKOUT** | This repo's main working tree, which several nebula sessions edit at once. Assume it is behind `origin/main` (releases are cut from a RELEASE WORKTREE and PRs merge on GitHub; neither fast-forwards it), and that compile errors or test-count drift may be another session's. Baseline `cargo check` before starting. | "shared tree", "the main checkout", "this", "the tree" | `git diff origin/main` (not HEAD) |
+| **RELEASE WORKTREE** | The private `release-vX.Y.Z` worktree off `origin/main` the RELEASE SKILL builds in: the SHARED CHECKOUT's `git diff HEAD` applied with `git apply --3way` (untracked files copied in — a copy by content reverts whatever origin merged since), tests in an isolated `CARGO_TARGET_DIR`, three commits (feature / `.claude/MEMORY.md` / `Release vX.Y.Z`), pushed as `main`, tagged. | "release branch" | `.claude/skills/release/SKILL.md` |
+| **RELEASE SKILL** | `/release`: verify green, commit, bump `[workspace.package].version`, tag, push, replace the GitHub notes with a real changelog. Triggered by "commit push release". | "commit push release", "cut a release", "ship it", "do a release", "commit and push and release", "commit push and release" | `.claude/skills/release/SKILL.md` |
 | **RELEASE WORKFLOW** | CI on a `v*` tag: darwin arm/intel + linux x64/arm64 (musl) tarballs attached to a GitHub release — what INSTALL.SH downloads. | "the release action", "CI" | `.github/workflows/release.yml` |
 | **INSTALL.SH** | The curl-able installer: prebuilt tarball per target into `NEBULA_INSTALL_DIR`, `cargo install --git` fallback. Repo slug is `AgentSystemLabs/nebula`. | "the install script", "one command for anyone to install" | `install.sh` |
 | **MAKE DEV** | Run this checkout's build as an isolated DEV INSTANCE (own daemon and data, seeded from the real DB; `SEED=0`, `AGENT=/bin/cat`). Its daemon spawns from `current_exe()`, so it is always this build — but a bare `nebula rename` from an agent still resolves on PATH (see VERSION SKEW). | "make dev", "dev instance", "run nebula without port conflicts as i run in various worktrees" | `Makefile::dev` · `make dev` |
@@ -324,6 +324,7 @@ Everything nests: WORKSPACE → PROJECT → WORKTREE → SESSION. The DAEMON own
 | **NEBULA-MEMORY SKILL** | Appends or updates a MEMORY LOG entry at the end of a task. | "remember this", "write this to memory" | `.claude/skills/nebula-memory/SKILL.md` |
 | **PROMPT DADDY** | The skill that rewrites every new prompt three ways in TERMS and asks the user to pick before work begins; the pick is the request. | "prompt daddy", "improve my prompt" | `.claude/skills/prompt-daddy/SKILL.md` |
 | **PROJECT TERMS** | This file, and the skill that keeps it true after every task: it detects the vocabulary each task surfaced, records aliases, renames and retirements at once, and promotes a new name to a TERM only after it recurs across separate tasks (the Candidates ledger, section 14). | "the glossary", "terms", "the defined terms" | `TERMS.md` · `.claude/skills/project-terms/SKILL.md` |
+| **OUTPUT DOCTOR** | The skill every reply that answers or closes a request goes through last, after the NEBULA-MEMORY SKILL and PROJECT TERMS: it shapes the reply into three fixed sections — `==== YOU ASKED ====` (the PROMPT DADDY pick, verbatim), `==== OVERVIEW ====` (what happened, plain sentences), `==== TECHNICAL OVERVIEW ====` (the details, kept short). | "output doctor", "format this", "use the output format" | `.claude/skills/output-doctor/SKILL.md` · `CLAUDE.md` § "Before you reply" |
 | **CRATES** | `nebula-core` (protocol, entities, ids, paths, codec), `nebula-daemon` (registry, PTYs, hooks, status, store), `nebula-tui` (app, event loop, ui, keymap, config, overlays, IPC client), `nebula` (the binary: CLI dispatch, browser/ssh/tunnel/upgrade). | "the crates" | `Cargo.toml` members |
 
 ## 13. Retired
@@ -356,7 +357,6 @@ is pruned. Do not cross-reference a candidate in caps from a TERM row.
 |---|---|---|---|
 | **CANDIDATES LEDGER** | This section: the holding pen between a name's first sighting and its promotion to a TERM. | 2026-08-28 prompt ("detect vocabulary discoveries … only promote concepts that have actually become canonical") · 2026-08-28 MEMORY "Project Terms: Detect Every Session, Promote Only What Recurred" | `TERMS.md` § 14 · `.claude/skills/project-terms/SKILL.md` |
 | **SELF-IMPROVING LOOP** | The per-task cycle every agent runs: read the MEMORY LOG and `TERMS.md` → PROMPT DADDY → do the work → NEBULA-MEMORY SKILL → PROJECT TERMS → the `output-doctor` skill shapes the reply, so each task leaves the next one better grounded. | 2026-08-28 prompt ("the self improving look [loop]") · 2026-08-28 MEMORY "Project Terms: Detect Every Session, Promote Only What Recurred" | `CLAUDE.md` § "Project memory and vocabulary" · `AGENTS.md` |
-| **OUTPUT DOCTOR** | The skill every reply that answers or closes a request goes through last: three fixed sections — `==== YOU ASKED ====` (the PROMPT DADDY pick, verbatim), `==== OVERVIEW ====` (what happened, plain sentences), `==== TECHNICAL OVERVIEW ====` (the details, kept short). | 2026-08-28 prompt ("a skill called output-doctor … use that format I provided for all output") · 2026-08-28 MEMORY "Output Doctor: Every Reply Is YOU ASKED / OVERVIEW / TECHNICAL OVERVIEW" | `.claude/skills/output-doctor/SKILL.md` · `CLAUDE.md` § "Before you reply" |
 
 ---
 
@@ -444,7 +444,7 @@ The user's word → the TERM. A word under two TERMS is ambiguous: settle it (PR
 | "make dev", "dev instance", "dev slot", "the dev daemon" | MAKE DEV / DEV INSTANCE |
 | "make install", "install the build" | MAKE INSTALL |
 | "kill & install & dev all in one", "make cycle" | MAKE CYCLE |
-| "commit push release", "cut a release", "ship it", "make a release" | RELEASE SKILL |
+| "commit push release", "commit push and release", "cut a release", "ship it", "make a release" | RELEASE SKILL |
 | "e2e_pty", "e2e_tui", "the e2e tests" | E2E PTY / E2E TUI |
 | "buffer_text", "the render tests" | TESTBACKEND |
 | "stub", "fake agent" | STUB AGENT |
@@ -452,6 +452,7 @@ The user's word → the TERM. A word under two TERMS is ambiguous: settle it (PR
 | "memory.md", "the memory", "log this", "remember this" | MEMORY LOG / NEBULA-MEMORY SKILL |
 | "prompt daddy", "improve my prompt" | PROMPT DADDY |
 | "the glossary", "terms", "the defined terms" | PROJECT TERMS |
+| "output doctor", "format this", "use the output format" | OUTPUT DOCTOR |
 | "theme", "color scheme" | THEME |
 | "the animation", "the shimmer" | STATUS SWEEP |
 | "splash", "startup screen" | SPLASH |
