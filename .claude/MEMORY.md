@@ -14,73 +14,55 @@ about what is worth recording.
 
 ## Entries
 
-### Dedup Pass Over nebula-tui (Modal Frames, List Math, gh Wrapper, Key Table) — 2026-08-27
+### Workspace-Wide Dedup Pass: Named Literals, Shared Helpers, `nebula_core::env` — 2026-08-27
 
-**Asked:** "You are refactoring the Rust crate `crates/nebula-tui` in an isolated git worktree … edit ONLY
-these files under `crates/nebula-tui/src/`: ui.rs, app.rs, tree_browser.rs, grep_search.rs, ipc.rs,
-pull_request.rs, pr_preview.rs, config.rs, keymap.rs, git_diff.rs, lib.rs. Do NOT touch event_loop.rs …
-refactor with zero behavior change — identical rendered strings, widths, colors, argv."
+**Asked:** "go through the code and find places you can dry up magic numbers, remove duplicate code,
+improve code to match rust best practices. verify we have a test before the code you're about to refactor
+or write one if not, then refactor, make pr when done"
 
-**Did:** Pure dedup, no behavior change (467 tests, was 458; e2e_tui 5/5). `ui.rs`: `modal_block` /
-`render_modal_frame` (the accent+BOLD frame — Help, Confirm, both Prompts and the vim chip differ and were
-left alone), `below_first_row`, `empty_list_row` + `NO_MATCHES`, `visible_positions`, `hint_line`, named
-popup-size consts beside `VIM_MODAL_PCT`, `SPLIT_PANE_LAYOUT_MIN = 20`, and `truncate` made `pub` so
-`grep_search::clip` could go. `app.rs`: free `window_start`, `clamp_selection`, `max_scroll`, `scrolled_by`,
-`clamp_files_width` that `DiffView`/`Palette`/`FileFinder`/`GrepView`/`HostsView`/`TreeBrowser` delegate to.
-`git_diff::cap_lines(text, max, already_cut)` + `TRUNCATED_MARK` shared with the tree preview. `ipc.rs`:
-`agent_id_from`/`current_agent_id`, `await_reply`/`await_ack`, `RenameMode { Auto, Force }` (lib.rs keeps the
-bool at the CLI boundary since `crates/nebula/src/main.rs` passes one). `pull_request.rs`: one `gh(dir, args,
-timeout)` process wrapper, `str_at`/`u64_at`/`bool_at`/`arr_at`/`state_at`/`web_url`, `STATE_OPEN`.
-`keymap.rs`: `KEY_NAMES` table behind `parse_key_name`/`key_name`/`key_display`, `CTRL_COLLISIONS`, `UNBOUND`.
-Skipped `bind(.., add: bool)` → enum because `event_loop.rs` (another agent's file) calls it.
-
-**Gotchas:**
-- `nebula_core::env` (`AGENT_ID`, `non_empty`) does not exist on this branch despite the brief saying it
-  does — `ipc.rs` carries its own `AGENT_ID_VAR` const. Fold it into core's if/when that module lands.
-- `key_name`/`key_display` map `KeyCode::BackTab` to `"tab"`/`"Tab"` (the shift bit carries the
-  difference) while `parse_key_name("backtab")` yields `BackTab` — a single table can't express that, so
-  `key_row` folds BackTab onto Tab and parse special-cases the word. `named_keys_keep_their_spellings_and_glyphs`
-  pins every string; run it before touching the table.
-- `host_warning` returns `Option<&'static str>`, so `CTRL_COLLISIONS` has to hold full message strings
-  per entry — a `format!` with the key name would need a leak or a `String` return.
-- `tree_browser::read_preview` marks truncation on `lines dropped || byte_capped`; `cap_lines` takes that
-  second condition as `already_cut` rather than the caller appending the mark twice.
-- The prompt's line numbers for `ui.rs` were ~100 lines stale (memory modal added since); re-locate by
-  content, not `:line`.
-
-### Event-Loop Dedup Pass (29 Items, Zero Behavior Change) — 2026-08-27
-
-**Asked:** "You are refactoring ONE file, `crates/nebula-tui/src/event_loop.rs` … METHOD, for every
-item: (1) confirm the named tests exist and pass on the CURRENT code … WRITE a unit test first … (2)
-refactor with zero behavior change … ITEMS … Duplicate blocks / Literals → consts / Idioms"
-
-**Did:** `crates/nebula-tui/src/event_loop.rs` only (plus `impl MenuItem { new, destructive }` in
-`app.rs`). New helpers, all near their first caller: `send`/`send_with` (every `alloc_req_id` + push),
-`selected_checkout` + `load_worktree_files` (the four file-modal preambles), `spawn_editor_modal`,
-`settings`/`settings_mut`, `upsert_by`, `worktree_in_context`, `select_project_row`/`select_worktree_row`
-(shared by `move_selection` and the click arms), `is_double_click`, `leave_terminal_lock`, `bracketed`,
-`edit_keymap` + `save_config`, `confirm_delete_agent`/`confirm_close_terminal`/`confirm_remove_project`,
-`home_dir`, `next_focus`, `contains`, `pane_usable`, `clamp_index`, `step_selection`,
-`delete_agent`/`close_terminal`/`delete_worktree`/`create_terminal`, `enum Landing` for
-`jump_to_target`. Consts: `MODAL_WHEEL_LINES`, `TERM_WHEEL_LINES`, `MAX_RESTORED_WIDTH`, `MIN_PANE_DIM`,
-`FALLBACK_PANE`, `KEYBOARD_MENU_ANCHOR`, `PASTE_START/END`, `SELECT_CONTEXT_FIRST`, `SESSION_GONE`,
-`AGENT_ARCHIVED`. `open_menu_at` deleted. Two pinning tests written first:
-`menu_confirms_match_the_key_path_word_for_word`, `paste_into_a_locked_pane_is_bracketed`. 460 unit +
-5 e2e_tui green, clippy clean for event_loop.rs.
+**Did:** Six commits on `clean-up`, one per area, all behavior-preserving; 710 tests (was 690), clippy
+warning-free workspace-wide (was 7), `fmt --check` clean. Four read-only survey agents produced ~100
+candidates; the low-risk, tested ones were done and the medium-risk ones (list-modal mouse/key arm
+folding, `jump_to_target` vs `open_session`, the Diff/Tree two-pane scaffold in `ui.rs`, a `str_enum!`
+for `AgentStatus`, table-driving `Config::write_into`) were left, listed in the PR. Every extraction was
+gated on a test run green against the *old* code first. Highlights: new `nebula_core::env` (`AGENT_ID`,
+`API_URL`, `API_TOKEN`, `RUNTIME_DIR`, `DATA_DIR`, `AGENT_SESSION_VARS`, `non_empty()`) used by
+`paths.rs`, `registry.rs`, `ipc.rs`, `upgrade.rs`; `store.rs` `*_COLUMNS` + `row_to_*` shared by point
+lookups and `load_tree` (its ~40 `.unwrap()`s now propagate); `registry::broadcast_agent` (15 sites),
+`kill_sessions_in`, `pty::DEFAULT_COLS/ROWS`; `status::end_turn`; installer `root_object_mut`/`object_mut`/
+`array_mut` + `purge_nebula_groups`; `hooks::HookDialect` for the `bool`; `server::reply_done` (21 arms);
+`ui::modal_block`/`render_modal_frame`, `app::window_start`/`clamp_selection`; `keymap::KEY_NAMES` behind
+the three key-name fns; `ipc::await_ack`/`current_agent_id`/`RenameMode`; `pull_request::gh()`;
+`event_loop`: `send`/`send_with`, `selected_checkout`, `spawn_editor_modal`, `settings_mut`, `contains`,
+`is_double_click`, `MenuItem::new` (46 literals), `Landing` enum, `next_focus`. e2e: `make_executable`,
+`subscribe`, `agent_cli`, named timeouts and key-byte consts.
 
 **Gotchas:**
-- `step_selection` (clamp form) replaced the metrics modal's `k` = `selected.saturating_sub(1)`: identical
-  while the cursor is in range, but a cursor left past a shrunken `rows` now snaps to the last row instead
-  of drifting down one. `ui.rs` clamps only its local copy when drawing, so the state is reachable.
-- `home_dir()` is `var_os("HOME")`; `shellexpand_home` used `std::env::var` (Ok only for UTF-8) — a
-  non-UTF-8 `$HOME` now expands where it used to fall through. Accepted.
-- The prompt said `nebula_core::env` exists (`AGENT_ID`, `non_empty`); it does not in this checkout, so
-  `home_dir` is local to event_loop.rs.
-- `PromptDialog::new` already takes `impl Into<String>`; `open_prompt` only ever allocated the one arm it
-  matched, so item 26 was cosmetic — done with `Cow<'static, str>` locals.
-- 46 `MenuItem { .. }` literals, not 37; rewrote them with a brace-counting script rather than by hand.
-- A worktree-isolated agent's Bash refuses `for` loops, heredocs and multi-command lines ("too complex to
-  verify it stays inside the worktree") — write the script with the Write tool and run it as one command.
+- **Agent worktrees (`isolation: "worktree"`) branch from `main`, not from the lead's branch.** All three
+  builders reported `nebula_core::env` "does not exist" and found `ui.rs` ~100 lines shifted (a memory
+  modal had landed on main meanwhile). Commit the shared groundwork, then either rebase your branch onto
+  `main` before spawning or tell agents to `git cherry-pick <sha>` (their sandbox blocks `git merge`).
+  Cherry-picking their commits back in then applies cleanly; only `.claude/MEMORY.md` conflicted.
+- Main had reworked `browser.rs` (configurable `bind: IpAddr`) under my `LOOPBACK` const — the rebase
+  conflict was the tell that the refactor was obsolete; take `--ours` and re-apply only the `&OsStr` nit.
+- `e2e_pty::workspace_scope_is_per_connection` failed 2 of 3 full-suite runs while three agents were
+  compiling alongside and passed 6/6 alone: the documented Ack-beats-upsert load race, not the refactor.
+- `key_name`/`key_display` map `KeyCode::BackTab` to `"tab"`/`"Tab"` while `parse_key_name("backtab")`
+  yields `BackTab` — one table can't express that, so `key_row` folds BackTab onto Tab and parse
+  special-cases the word. `named_keys_keep_their_spellings_and_glyphs` pins every string.
+- `host_warning` returns `Option<&'static str>`, so `CTRL_COLLISIONS` holds full messages per entry.
+- `tree_browser::read_preview` marks truncation on `lines dropped || byte_capped`; `cap_lines` takes the
+  second as `already_cut` rather than the caller appending the mark twice.
+- `step_selection` (clamp form) replaced the metrics modal's unclamped `saturating_sub(1)`: a cursor left
+  past a shrunken `rows` now snaps to the last row. `home_dir()` is `var_os("HOME")` where
+  `shellexpand_home` used `var` — a non-UTF-8 `$HOME` now expands. Both accepted, noted in the PR.
+- A regex dedupe of the `agent_entity + broadcast` pair also rewrote the body of the new
+  `broadcast_agent` into a self-call; rustc's `unconditional_recursion` caught it. Exclude the definition
+  when pattern-rewriting.
+- The two e2e test files already had `subscribe`-shaped closures (`workspace_scope_is_per_connection`)
+  that shadowed the new free fn silently — grep for the name before adding a test helper.
+- A worktree-isolated agent's Bash refuses `for` loops, heredocs and `&&` chains ("too complex to verify
+  it stays inside the worktree") — write the script with the Write tool and run it as one command.
 
 ### The Root Worktree Row's Lower Half Wasn't Clickable — 2026-08-27
 
