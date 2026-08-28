@@ -132,6 +132,7 @@ to `ws2`, and shows the bar again. 685 workspace tests green, no new clippy warn
   now draw that header — harmless, but a future `text.contains("PROJECTS")` in one of them would fail.
 - One existing assertion had to move: `shift_w_toggles_the_workspaces_bar_and_parks_focus` checked
   `lines[1].starts_with("   PROJECTS")` on the hidden path; it's `"   DEFAULT"` now.
+
 ### A Paused Rebase Renamed The Worktree Row To `detached @ …` — 2026-08-27
 
 **Asked:** "something in this conversation caused the worktree to show up in the UI but then it switvhed
@@ -164,6 +165,14 @@ already-detached HEAD (`head-name` reads `detached HEAD`), still gets `detached_
   the entry.
 - `git::current_branch` is a second, uncalled copy of this label logic with its own `detached@` format.
   Left alone, but don't reach for it thinking it agrees with `list_worktrees`.
+- **A "load race" can be a build-layout race.** After this change `workspace_scope_is_per_connection`
+  (e2e_pty) failed 7 of 11 *idle* runs while the pre-change `git.rs` passed 13 of 13 — yet a probe
+  showed `rebasing_branch` was never called and the porcelain parse was identical. Adding file I/O to
+  `list_worktrees` for the probe made it pass 3/3: pure timing. It was the documented Ack-beats-upsert
+  race, and a code change that never runs in the test still shifts the odds. Fixed on the test side
+  (`6638952`): wait for the upsert *and* the Ack, as `cli_add_project` does; the TUI never relied on the
+  order (`event_loop.rs` "usually lands just before this Ack; if not, …"). A/B the old file in place
+  (`git show <sha>:path > path`, run, `git checkout -- path`) before believing either verdict.
 
 ### Released v0.13.0 Off A Checkout Three Releases Stale — 2026-08-27
 
@@ -639,7 +648,8 @@ HEAD = origin/main, working tree = v0.10.0 + the three features, still uncommitt
 - `git diff --quiet <commit>` only compares tracked files — it will say the tree matches even when
   untracked WIP is missing. `cmp` the untracked files separately.
 - `workspace_scope_is_per_connection` (e2e_pty) failed twice under a parallel clippy+test run and passed
-  alone: the Ack-beats-upsert load race the v0.10.0 entry describes, not the merge.
+  alone: the Ack-beats-upsert load race the v0.10.0 entry describes, not the merge (test fixed
+  2026-08-27, `6638952`).
 - The old Makefile's dev daemon lives at `/tmp/nebula-dev`; the new per-checkout slot is
   `/tmp/nebula-dev-<8 chars of shasum of $CURDIR>` (`2f3f877f` for the main checkout), so the new
   `dev-stop` cannot see a daemon the old recipe started. A `make dev` TUI that was already open keeps its
@@ -755,7 +765,8 @@ for the dot splitting violet (unread) from green (read) on the same `unseen` fla
   `cargo build --release` ran alongside, then passed alone and 2 of 2 idle full-suite runs. Its
   `expect("AddProject upserts the project")` only sees the broadcast upsert if it lands before the Ack —
   `server.rs` writes the Ack from the request loop and the upsert from the broadcast forwarder, so under
-  CPU contention the Ack can win. A load race, not a regression: rerun idle before debugging.
+  CPU contention the Ack can win. **Fixed 2026-08-27 (`6638952`):** the test now waits for the upsert as
+  well as the Ack, like `cli_add_project` always did — see [A Paused Rebase Renamed The Worktree Row].
 
 ### One Nebula Per Checkout: Auto-Port For `browser`, Per-Path Dev Slots — 2026-08-26
 
