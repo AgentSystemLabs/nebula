@@ -9,6 +9,11 @@
 //! box for anyone else to find and no ttyd password to set. `--no-open`
 //! because the desktop that should open the tab is this one.
 //!
+//! If the remote already has a ttyd on that port — a `nebula browser` the
+//! user left running there, say — the remote command reuses it instead of
+//! failing on the port clash: it holds the session open so the forward has
+//! something to reach, and starts nothing. See [`REMOTE_SCRIPT`].
+//!
 //! We spawn ssh rather than exec it (unlike `nebula ssh`) because there is
 //! work left after the connection: wait for the far end to answer through the
 //! forward, then open the local URL. The pty keeps the lifetime honest in
@@ -37,6 +42,21 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The reuse branch of [`REMOTE_SCRIPT`]: `$2` is the port. A macro for the
+/// same reason as [`install_prelude!`] — `concat!` takes only literals.
+/// Same quoting rules as the rest of the script.
+macro_rules! reuse_existing_ttyd {
+    () => {
+        concat!(
+            "if curl -sI --max-time 2 \"http://127.0.0.1:$2/\" 2>/dev/null | grep -qi \"^server: ttyd\"; then ",
+            "echo \"nebula tunnel: a nebula browser is already serving on this host at port $2; reusing it ",
+            "(if it was started with --credential, the tab will ask for that)\" >&2; ",
+            "exec sleep 2147483647; ",
+            "fi; "
+        )
+    };
+}
+
 /// Runs under `sh -c` on the remote: $1 = install URL, $2 = port to serve on,
 /// $3 = start dir (optional; defaults to the remote $HOME). Same quoting
 /// rules as [`crate::ssh`] — no single quotes, backslashes, or newlines.
@@ -47,12 +67,25 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// here. stderr is kept: the install progress, a missing ttyd, and a port
 /// clash are the whole diagnosis when this goes wrong.
 ///
+/// Before anything is started, the port is asked whether a ttyd is already
+/// on it: `curl -I` against the remote's own loopback, matched on the
+/// `server: ttyd/…` header ttyd sends with every response (a 401 from one
+/// behind `--credential` included). If so, this is a `nebula browser` the
+/// user already has serving there — most often one launched by hand with
+/// `--public` — and starting a second would only fail on the port clash. So
+/// the script says so and `exec`s a long sleep instead: the session stays
+/// open for the forward to reach the existing server, and Ctrl+C or a
+/// hang-up ends the sleep exactly as it would have ended `nebula browser`.
+/// The probe is shell-only, so a remote whose nebula predates this still
+/// reuses; a remote with no `curl` skips the probe and behaves as before.
+///
 /// The `--help` grep is the version check. `nebula ssh` and this only install
 /// nebula when the remote has *none*, so a box last touched a few releases
 /// ago keeps a `nebula browser` that predates `--no-open` and would fail on
 /// an unknown argument. Naming the fix beats a clap usage dump.
 const REMOTE_SCRIPT: &str = concat!(
     install_prelude!(),
+    reuse_existing_ttyd!(),
     "nebula browser --help 2>/dev/null | grep -q -- --no-open || { ",
     "echo \"nebula tunnel: the nebula on this host is too old to tunnel into; ",
     "reach it with nebula ssh and run nebula upgrade there\" >&2; exit 1; }; ",
@@ -329,6 +362,117 @@ mod tests {
         assert!(cmd.ends_with("7681 '/srv/my repo'"), "{cmd}");
         let cmd = remote_command(URL, 7681, Some("/tmp/it's here"));
         assert!(cmd.ends_with("7681 '/tmp/it'\\''s here'"), "{cmd}");
+    }
+
+    /// A ttyd already on the remote port is a `nebula browser` the user has
+    /// running there; the script keeps the session open for it rather than
+    /// starting a second one into a port clash — and decides that before the
+    /// version gate, since a reused server needs nothing from the remote's
+    /// own nebula.
+    #[test]
+    fn an_existing_ttyd_on_the_remote_port_is_reused_before_anything_starts() {
+        let probe = REMOTE_SCRIPT.find("curl -sI").expect("probes the port");
+        let gate = REMOTE_SCRIPT.find("grep -q -- --no-open").unwrap();
+        let start = REMOTE_SCRIPT.find("exec nebula browser").unwrap();
+        assert!(probe < gate && gate < start, "{REMOTE_SCRIPT}");
+        assert!(REMOTE_SCRIPT.contains("http://127.0.0.1:$2/"));
+        assert!(REMOTE_SCRIPT.contains("grep -qi \"^server: ttyd\""));
+        assert!(REMOTE_SCRIPT.contains("exec sleep "));
+    }
+
+    /// A listener that answers every request the way ttyd does — with its
+    /// `server:` header — on a port of the kernel's choosing.
+    fn fake_ttyd(status: &'static str) -> u16 {
+        let listener = TcpListener::bind(SocketAddr::new(LOOPBACK, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for sock in listener.incoming().map_while(Result::ok) {
+                let mut sock = sock;
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nserver: ttyd/1.7.7 (libwebsockets/5.0.0)\r\ncontent-length: 0\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        port
+    }
+
+    /// Run [`REMOTE_SCRIPT`] here the way sshd would there: under `sh -c`,
+    /// with `$HOME` pointed at an empty dir (the prelude prepends
+    /// `$HOME/.local/bin`, and the real nebula must not be found) and a
+    /// stub `nebula` first on PATH that answers nothing — so the version
+    /// gate, if reached, fails with the "too old" message rather than
+    /// launching anything.
+    fn run_remote_script(port: u16) -> (std::process::Child, tempfile::TempDir) {
+        let home = tempfile::tempdir().unwrap();
+        let stub = home.path().join("stub");
+        std::fs::create_dir(&stub).unwrap();
+        let nebula = stub.join("nebula");
+        std::fs::write(&nebula, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&nebula, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = format!(
+            "{}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+            stub.display()
+        );
+        let child = Command::new("sh")
+            .args(["-c", REMOTE_SCRIPT, "nebula-tunnel", "file:///nonexistent"])
+            .arg(port.to_string())
+            .env("HOME", home.path())
+            .env("PATH", path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("sh");
+        (child, home)
+    }
+
+    fn first_stderr_line(child: &mut Child) -> String {
+        let stderr = child.stderr.take().unwrap();
+        let mut line = String::new();
+        BufReader::new(stderr).read_line(&mut line).unwrap();
+        line
+    }
+
+    /// The whole point: a server already on the port means "reuse it", said
+    /// out loud, with the session held open — not a port clash.
+    #[test]
+    fn the_script_reuses_a_ttyd_that_answers_on_the_port() {
+        for status in ["200 OK", "401 Unauthorized"] {
+            let port = fake_ttyd(status);
+            let (mut child, _home) = run_remote_script(port);
+            let line = first_stderr_line(&mut child);
+            assert!(
+                line.contains(&format!("already serving on this host at port {port}")),
+                "{status}: {line:?}"
+            );
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "{status}: the session should stay open for the forward"
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Nothing on the port: the probe stays quiet and the script goes on to
+    /// start its own — here, into the version gate the stub nebula fails.
+    #[test]
+    fn the_script_starts_its_own_when_nothing_answers() {
+        let port = browser::free_port(LOOPBACK).unwrap();
+        let (mut child, _home) = run_remote_script(port);
+        let line = first_stderr_line(&mut child);
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "{line:?}");
+        assert!(line.contains("too old to tunnel into"), "{line:?}");
     }
 
     /// An old remote fails on an unknown `--no-open` with a clap usage dump;

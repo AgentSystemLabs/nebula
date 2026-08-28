@@ -223,6 +223,13 @@ const MIGRATIONS: &[&str] = &[
     "
     DROP TABLE IF EXISTS notes;
     ",
+    // 22: the PR URL that scopes a Claude AGENT created from an OPEN PRS
+    // row. Nullable and request-driven: every existing AGENT remains an
+    // ordinary session, while a PR-created one can rebuild its appended
+    // system prompt after a daemon restart or RESUME.
+    "
+    ALTER TABLE agents ADD COLUMN pr_url TEXT;
+    ",
 ];
 
 pub struct Store {
@@ -507,16 +514,28 @@ impl Store {
     // ---- agents ----
 
     pub fn insert_agent(&self, a: &Agent) -> Result<()> {
-        self.insert_agent_with_auto_title(a, false)
+        self.insert_agent_with_launch_context(a, false, None)
     }
 
     /// `auto_title` marks the row as awaiting one agent-driven title
     /// (`nebula rename` from inside the CLI). The flag is store-internal:
     /// clients never see it, they only observe the eventual rename.
     pub fn insert_agent_with_auto_title(&self, a: &Agent, auto_title: bool) -> Result<()> {
+        self.insert_agent_with_launch_context(a, auto_title, None)
+    }
+
+    /// Persist an AGENT plus the launch-only context that must be rebuilt
+    /// on every process spawn. `pr_url` is intentionally not part of the
+    /// shared Agent entity: it constrains Claude's launch, not row display.
+    pub fn insert_agent_with_launch_context(
+        &self,
+        a: &Agent,
+        auto_title: bool,
+        pr_url: Option<&str>,
+    ) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id, pr_url)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 a.id.as_str(),
                 a.worktree_id.as_str(),
@@ -534,10 +553,24 @@ impl Store {
                 a.effort,
                 auto_title as i64,
                 a.unseen as i64,
-                a.cloud_session_id
+                a.cloud_session_id,
+                pr_url,
             ],
         )?;
         Ok(())
+    }
+
+    /// PR launch context for an AGENT, or None for an ordinary/pre-existing
+    /// row. A missing row also returns None; the spawn path has already
+    /// resolved the Agent itself before asking for this adjunct.
+    pub fn agent_pr_url(&self, id: &AgentId) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT pr_url FROM agents WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id.as_str()])?;
+        match rows.next()? {
+            Some(row) => Ok(row.get(0)?),
+            None => Ok(None),
+        }
     }
 
     /// User rename: always applies, and retires any pending auto-title so a
@@ -1045,7 +1078,10 @@ mod tests {
             alive: false,
             cloud_mirroring: false,
         };
-        store.insert_agent(&agent).unwrap();
+        let pr_url = "https://github.com/AgentSystemLabs/nebula/pull/42";
+        store
+            .insert_agent_with_launch_context(&agent, false, Some(pr_url))
+            .unwrap();
         let codex_agent = Agent {
             id: AgentId::generate(),
             worktree_id: worktree.id.clone(),
@@ -1096,6 +1132,11 @@ mod tests {
         assert_eq!(agents[0].session_id.as_deref(), Some("sess-123"));
         assert_eq!(agents[0].model.as_deref(), Some("opus"));
         assert_eq!(agents[0].effort.as_deref(), Some("high"));
+        assert_eq!(
+            store.agent_pr_url(&agents[0].id).unwrap().as_deref(),
+            Some(pr_url)
+        );
+        assert_eq!(store.agent_pr_url(&agents[1].id).unwrap(), None);
         assert_eq!(agents[1].kind, AgentKind::Codex);
         assert_eq!(agents[1].model, None);
         assert_eq!(agents[2].kind, AgentKind::Cursor);
@@ -1217,6 +1258,49 @@ mod tests {
             .unwrap();
         assert_eq!(tables, 0);
         drop(conn);
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+    }
+
+    /// A database already at v21 gains nullable PR launch context without
+    /// rewriting or invalidating its existing AGENT rows.
+    #[test]
+    fn migration_22_adds_pr_context_without_backfill() {
+        let path =
+            std::env::temp_dir().join(format!("nebula-mig22-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for (i, migration) in MIGRATIONS.iter().take(21).enumerate() {
+                conn.execute_batch(&format!(
+                    "BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;",
+                    i + 1
+                ))
+                .unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO projects (id, name, repo_path, sort_order, created_at, workspace_id)
+                   VALUES ('p1', 'p', '/tmp/p', 0, 0, 'default');
+                 INSERT INTO worktrees (id, project_id, path, branch, is_main, sort_order, created_at, pinned)
+                   VALUES ('w1', 'p1', '/tmp/p', 'main', 1, 0, 0, 0);
+                 INSERT INTO agents (id, worktree_id, name, created_at)
+                   VALUES ('a1', 'w1', 'existing', 0);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.agent_pr_url(&AgentId("a1".into())).unwrap(), None);
+        let version: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 22);
         drop(store);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));

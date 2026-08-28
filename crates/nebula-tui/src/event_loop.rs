@@ -18,8 +18,8 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use nebula_core::{
-    AgentId, AgentKind, ClientRequest, EntityId, LinkId, ProjectId, ServerEvent, SessionRef,
-    TerminalId, WorkspaceId, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
+    AgentId, AgentKind, ClientRequest, EntityId, ProjectId, ServerEvent, SessionRef, TerminalId,
+    WorkspaceId, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -1472,7 +1472,9 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             Focus::Workspaces => open_prompt(app, PromptKind::NewWorkspace),
             Focus::Projects => open_prompt(app, PromptKind::AddProject),
             Focus::Worktrees => {
-                if let Some(p) = app.selected_project() {
+                if app.selected_worktree_pr().is_some() {
+                    open_pr_agent_picker(app);
+                } else if let Some(p) = app.selected_project() {
                     let project = p.id.clone();
                     open_new_worktree_prompt(app, project);
                 }
@@ -1615,7 +1617,6 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // New shell terminal, spawned in the worktree's directory.
         // (Cmd+T never reaches a TUI — the emulator opens its own tab.)
         Action::NewTerminal => create_terminal_for_context(app, out),
-        Action::NewLink => open_new_link_prompt(app),
         Action::Zoom => {
             if app.term.is_some() {
                 app.collapsed = true;
@@ -1748,11 +1749,7 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
                 .unwrap_or_default();
             ("Rename workspace".into(), "name".into(), current)
         }
-        PromptKind::NewLink { .. } => (
-            "Add link".into(),
-            "URL (pull request, doc, ticket)".into(),
-            String::new(),
-        ),
+
         PromptKind::EditLink { id } => {
             let current = app
                 .tree
@@ -2161,16 +2158,6 @@ fn create_terminal(app: &mut App, worktree: WorktreeId, out: &mut Vec<ClientRequ
     });
 }
 
-/// `L`: attach a URL to the worktree in context — the selected one, or the
-/// selected project's main checkout when the Projects panel has focus (the
-/// same rule `t` uses for terminals).
-fn open_new_link_prompt(app: &mut App) {
-    match worktree_in_context(app) {
-        Some(worktree) => open_prompt(app, PromptKind::NewLink { worktree }),
-        None => app.flash = Some(SELECT_CONTEXT_FIRST.into()),
-    }
-}
-
 /// The worktree the selection stands for: the selected one, or the selected
 /// project's main checkout (root) when the Projects panel has focus.
 fn worktree_in_context(app: &App) -> Option<WorktreeId> {
@@ -2273,10 +2260,7 @@ fn confirm_remove_project(name: &str, id: ProjectId) -> ConfirmDialog {
 fn edit_link(app: &mut App, row: &LinkRow) {
     match row.id() {
         Some(id) => open_prompt(app, PromptKind::EditLink { id: id.clone() }),
-        None => {
-            app.flash =
-                Some("the pull request link comes from git — l adds one you can edit".into())
-        }
+        None => app.flash = Some("the pull request comes from git and can't be edited".into()),
     }
 }
 
@@ -2507,6 +2491,7 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
                 model: None,
                 effort: None,
                 cloud: false,
+                pr_url: None,
             },
         )
     };
@@ -2525,6 +2510,56 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
     }));
 }
 
+/// ROOT WORKTREE used by PROJECT-scoped actions. An OPEN PRS row has no
+/// checkout of its own, so PR-created AGENTS follow the same established
+/// fallback as PROJECT-scoped TERMINAL SESSION and LINK creation.
+fn selected_project_main_worktree(app: &App) -> Option<WorktreeId> {
+    let project = app.selected_project()?;
+    app.tree
+        .worktrees
+        .iter()
+        .find(|worktree| worktree.project_id == project.id && worktree.is_main)
+        .map(|worktree| worktree.id.clone())
+}
+
+fn pr_agent_menu_item(
+    worktree: WorktreeId,
+    pr: &crate::pull_request::OpenPr,
+    label: &str,
+) -> MenuItem {
+    MenuItem::new(
+        label,
+        MenuAction::NewAgentOfKind {
+            worktree,
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            cloud: false,
+            pr_url: Some(pr.url.clone()),
+        },
+    )
+}
+
+/// An OPEN PRS row creates only a local Claude AGENT, while still reusing
+/// the MODEL/EFFORT and optional naming steps of the NEW SESSION PICKER.
+fn open_pr_agent_picker(app: &mut App) {
+    let Some(pr) = app.selected_worktree_pr().cloned() else {
+        return;
+    };
+    let Some(worktree) = selected_project_main_worktree(app) else {
+        app.flash = Some("the project has no ROOT WORKTREE for this PR session".into());
+        return;
+    };
+    app.overlay = Some(Overlay::Menu(ContextMenu {
+        title: Some(format!("New PR session · #{}", pr.number)),
+        items: vec![pr_agent_menu_item(worktree, &pr, "Claude")],
+        at: None,
+        hover: 0,
+        area: ratatui::layout::Rect::default(),
+        parent: None,
+    }));
+}
+
 /// Build the submenu a menu row expands into: the model list for a
 /// new-session kind row, or the effort list for a model row. Rows carry the
 /// full choice so Enter works the same at any depth; the row matching the
@@ -2536,6 +2571,7 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
         kind,
         model,
         cloud,
+        pr_url,
         ..
     } = &item.action
     else {
@@ -2576,6 +2612,7 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
                         SubmenuKind::Efforts => Some((*choice).to_string()),
                     },
                     cloud: *cloud,
+                    pr_url: pr_url.clone(),
                 },
             )
         })
@@ -2843,11 +2880,24 @@ fn open_context_menu_for_selection(app: &mut App) {
             open_menu(app, items, at);
         }
         Focus::Worktrees => {
-            if let Some(w) = app.selected_worktree() {
+            if let Some(pr) = app.selected_worktree_pr().cloned() {
+                let Some(worktree) = selected_project_main_worktree(app) else {
+                    app.flash = Some("the project has no ROOT WORKTREE for this PR session".into());
+                    return;
+                };
+                open_menu(
+                    app,
+                    vec![
+                        pr_agent_menu_item(worktree, &pr, "New Claude session"),
+                        MenuItem::new("Open in browser", MenuAction::OpenLink(pr.url)),
+                        MenuItem::new("View diff", MenuAction::ViewPrDiff),
+                    ],
+                    at,
+                );
+            } else if let Some(w) = app.selected_worktree() {
                 let mut items = vec![
                     MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
                     MenuItem::new("New terminal", MenuAction::NewTerminal(w.id.clone())),
-                    MenuItem::new("Add link", MenuAction::NewLink(w.id.clone())),
                     MenuItem::new(
                         if w.pinned { "Unpin" } else { "Pin" },
                         MenuAction::SetWorktreePinned(w.id.clone(), !w.pinned),
@@ -3830,6 +3880,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             model,
             effort,
             cloud,
+            pr_url,
         } => {
             if cloud {
                 open_prompt(
@@ -3851,6 +3902,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                         effort,
                         name: value,
                         cloud_prompt: None,
+                        pr_url,
                     },
                     out,
                 );
@@ -3870,6 +3922,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 effort,
                 name,
                 cloud_prompt: Some(value),
+                pr_url: None,
             },
             out,
         ),
@@ -3923,17 +3976,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 name: value,
             });
         }
-        PromptKind::NewLink { worktree } => {
-            // The new row lands at the end of LINKS; move the cursor there
-            // so the link the user just typed is the one under it.
-            send_with(app, out, PendingIntent::SelectCreatedLink, |req_id| {
-                ClientRequest::CreateLink {
-                    req_id,
-                    worktree,
-                    url: value,
-                }
-            });
-        }
+
         PromptKind::EditLink { id } => {
             send(app, out, |req_id| ClientRequest::UpdateLink {
                 req_id,
@@ -4097,6 +4140,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             model,
             effort,
             cloud,
+            pr_url,
         } => {
             // Resolve the picker's choice against the configured defaults:
             // an unexpanded submenu (None) and the explicit "default" row
@@ -4135,6 +4179,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                             effort,
                             name: String::new(),
                             cloud_prompt: None,
+                            pr_url,
                         },
                         out,
                     );
@@ -4144,7 +4189,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             // Warm the CLI while the user types the name: the daemon
             // pre-spawns the session so CreateAgent adopts an already-booted
             // PTY. Fail-soft — a missing CLI just means a cold spawn later.
-            if !cloud {
+            if !cloud && pr_url.is_none() {
                 out.push(ClientRequest::PrewarmAgent {
                     worktree: worktree.clone(),
                     kind,
@@ -4160,11 +4205,11 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     model,
                     effort,
                     cloud,
+                    pr_url,
                 },
             )
         }
         MenuAction::NewWorktree(project) => open_new_worktree_prompt(app, project),
-        MenuAction::NewLink(worktree) => open_prompt(app, PromptKind::NewLink { worktree }),
         MenuAction::OpenLink(url) => open_link(app, &url, out),
         MenuAction::ViewPrDiff => request_pr_diff(app),
         MenuAction::EditLink(id) => open_prompt(app, PromptKind::EditLink { id }),
@@ -5119,6 +5164,7 @@ struct AgentLaunchDraft {
     effort: Option<String>,
     name: String,
     cloud_prompt: Option<String>,
+    pr_url: Option<String>,
 }
 
 fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequest>) {
@@ -5129,6 +5175,7 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
         effort,
         name,
         cloud_prompt,
+        pr_url,
     } = draft;
     let intent = match &cloud_prompt {
         Some(task) => PendingIntent::AttachCreatedWithCloudRetry {
@@ -5149,15 +5196,30 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
         name
     };
     let cloud = cloud_prompt.is_some();
-    send_with(app, out, intent, |req_id| ClientRequest::CreateAgent {
-        req_id,
-        worktree: worktree.clone(),
-        name,
-        kind,
-        model,
-        effort,
-        auto_title,
-        cloud_prompt,
+    send_with(app, out, intent, |req_id| match pr_url {
+        Some(pr_url) => {
+            debug_assert_eq!(kind, AgentKind::Claude);
+            debug_assert!(!cloud);
+            ClientRequest::CreatePrAgent {
+                req_id,
+                worktree: worktree.clone(),
+                name,
+                model,
+                effort,
+                auto_title,
+                pr_url,
+            }
+        }
+        None => ClientRequest::CreateAgent {
+            req_id,
+            worktree: worktree.clone(),
+            name,
+            kind,
+            model,
+            effort,
+            auto_title,
+            cloud_prompt,
+        },
     });
     // The create consumes (or, off-spec, discards) the worktree's warm
     // Claude slot; refill it so the next create is instant too.
@@ -6261,17 +6323,20 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     app.sel_worktree = i;
                     app.sel_session = 0;
                     app.focus = Focus::Worktrees;
-                    if let Some(pr) = app.selected_worktree_pr() {
-                        let items = vec![
-                            MenuItem::new("Open in browser", MenuAction::OpenLink(pr.url.clone())),
+                    if let Some(pr) = app.selected_worktree_pr().cloned() {
+                        let mut items = Vec::new();
+                        if let Some(worktree) = selected_project_main_worktree(app) {
+                            items.push(pr_agent_menu_item(worktree, &pr, "New Claude session"));
+                        }
+                        items.extend([
+                            MenuItem::new("Open in browser", MenuAction::OpenLink(pr.url)),
                             MenuItem::new("View diff", MenuAction::ViewPrDiff),
-                        ];
+                        ]);
                         open_menu(app, items, at);
                     } else if let Some(w) = app.selected_worktree() {
                         let mut items = vec![
                             MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
                             MenuItem::new("New terminal", MenuAction::NewTerminal(w.id.clone())),
-                            MenuItem::new("Add link", MenuAction::NewLink(w.id.clone())),
                         ];
                         if !w.is_main {
                             items.push(MenuItem::destructive(
@@ -6319,7 +6384,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                             .map(|w| {
                                 vec![
                                     MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
-                                    MenuItem::new("Add link", MenuAction::NewLink(w.id.clone())),
                                     MenuItem::new("Show/hide archived", MenuAction::ToggleArchived),
                                 ]
                             })
@@ -6488,11 +6552,6 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         app.select_worktree_when_seen = Some(id);
                     }
                 }
-                (Some(PendingIntent::SelectCreatedLink), Some(EntityId::Link(id))) => {
-                    if !select_link_by_id(app, &id) {
-                        app.select_link_when_seen = Some(id);
-                    }
-                }
                 (Some(PendingIntent::OpenCreatedWorkspace), Some(EntityId::Workspace(id))) => {
                     // A workspace created from the WORKSPACE SWITCHER or the
                     // WORKSPACES BAR: show it right away, with the cursor on
@@ -6529,12 +6588,6 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             if let Some(wt_id) = app.select_worktree_when_seen.clone() {
                 if select_worktree_by_id(app, &wt_id, out) {
                     app.select_worktree_when_seen = None;
-                }
-            }
-            // ...and the panel cursor onto a link we just added.
-            if let Some(link_id) = app.select_link_when_seen.clone() {
-                if select_link_by_id(app, &link_id) {
-                    app.select_link_when_seen = None;
                 }
             }
             refresh_palette(app);
@@ -6650,20 +6703,6 @@ fn upsert_by<T>(list: &mut Vec<T>, item: T, same: impl Fn(&T, &T) -> bool) {
         Some(existing) => *existing = item,
         None => list.push(item),
     }
-}
-
-/// Land the Sessions panel's cursor on the link row for `id`; false until
-/// its upsert has arrived (or when it belongs to another worktree).
-fn select_link_by_id(app: &mut App, id: &LinkId) -> bool {
-    let found = app
-        .visible_session_rows()
-        .iter()
-        .position(|r| r.as_link().and_then(|l| l.id()) == Some(id));
-    if let Some(i) = found {
-        app.sel_session = i;
-        app.focus = Focus::Sessions;
-    }
-    found.is_some()
 }
 
 fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
@@ -6874,7 +6913,7 @@ fn clamp_selections(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nebula_core::{AgentId, ServerEvent, SessionRef};
+    use nebula_core::{AgentId, LinkId, ServerEvent, SessionRef};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -7475,8 +7514,8 @@ mod tests {
     /// at the ends — and a double tap at an end jumps the boundary the way
     /// ^⇧H / ^⇧L would: `l`,`l` at Sessions goes on into the pane, `h`,`h`
     /// at Projects steps up into the Workspaces bar. The plain letters used
-    /// to open the hosts picker and the add-link prompt, which now live on
-    /// the shifted keys.
+    /// to open the hosts picker and the add-link prompt. The hosts picker
+    /// moved to Shift+H; manual LINK creation is no longer exposed.
     #[test]
     fn h_and_l_walk_panel_focus_like_the_arrows() {
         let mut app = App::new();
@@ -7683,30 +7722,18 @@ mod tests {
     }
 
     #[test]
-    fn shift_l_adds_a_link_to_the_selected_worktree() {
+    fn shift_l_no_longer_opens_manual_link_creation() {
         let mut app = App::new();
         seed_tree(&mut app);
         app.focus = Focus::Sessions;
         let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('L'), KeyModifiers::SHIFT, &mut out);
-        let Some(Overlay::Prompt(p)) = &app.overlay else {
-            panic!("expected the add-link prompt, got {:?}", app.overlay);
-        };
-        assert_eq!(p.title, "Add link");
-        assert!(p.input.trim().is_empty(), "starts empty");
 
-        for c in "github.com/o/r/pull/7".chars() {
-            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
-        }
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        // The daemon normalizes the URL; the client sends what was typed.
+        press(&mut app, KeyCode::Char('L'), KeyModifiers::SHIFT, &mut out);
+
+        assert!(app.overlay.is_none(), "manual LINK creation stays closed");
         assert!(
-            out.iter().any(|r| matches!(
-                r,
-                ClientRequest::CreateLink { worktree, url, .. }
-                    if worktree.as_str() == "w1" && url == "github.com/o/r/pull/7"
-            )),
-            "expected CreateLink, got {out:?}"
+            out.is_empty(),
+            "manual LINK creation sends no request: {out:?}"
         );
     }
 
@@ -7890,6 +7917,124 @@ mod tests {
         click_at(&mut app, 4, &mut out);
         click_at(&mut app, 0, &mut out);
         assert!(app.flash.is_none(), "got {:?}", app.flash);
+    }
+
+    /// `n` on an OPEN PRS row creates a Claude-only SESSION draft against
+    /// the PROJECT's ROOT WORKTREE. The PR URL survives the normal naming
+    /// flow and crosses IPC on the dedicated create request; no unscoped
+    /// PREWARM POOL process can be adopted for it.
+    #[test]
+    fn new_on_an_open_pr_row_carries_its_url_into_a_claude_session() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            seed_open_prs(&mut app, &[(7, "Attach links")]);
+            app.focus = Focus::Worktrees;
+            app.sel_worktree = 1;
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the PR SESSION picker, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("New PR session · #7"));
+            assert_eq!(menu.items.len(), 1, "PR rows create Claude AGENTS only");
+            assert!(matches!(
+                &menu.items[0].action,
+                MenuAction::NewAgentOfKind {
+                    worktree,
+                    kind: AgentKind::Claude,
+                    pr_url: Some(url),
+                    cloud: false,
+                    ..
+                } if worktree.as_str() == "w1" && url == "https://github.com/o/r/pull/7"
+            ));
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(matches!(
+                &app.overlay,
+                Some(Overlay::Prompt(p)) if matches!(
+                    &p.kind,
+                    PromptKind::NewAgent {
+                        kind: AgentKind::Claude,
+                        pr_url: Some(url),
+                        cloud: false,
+                        ..
+                    } if url == "https://github.com/o/r/pull/7"
+                )
+            ));
+            assert!(
+                out.iter()
+                    .all(|request| !matches!(request, ClientRequest::PrewarmAgent { .. })),
+                "an unscoped warm Claude must not start before a PR SESSION: {out:?}"
+            );
+
+            for c in "pr-7".chars() {
+                press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(ClientRequest::CreatePrAgent {
+                        worktree,
+                        name,
+                        pr_url,
+                        ..
+                    }) if worktree.as_str() == "w1"
+                        && name == "pr-7"
+                        && pr_url == "https://github.com/o/r/pull/7"
+                ),
+                "{out:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn context_menu_on_an_open_pr_row_offers_a_claude_session() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 1;
+
+        open_context_menu_for_selection(&mut app);
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the OPEN PRS context menu, got {:?}", app.overlay);
+        };
+        assert!(menu.items.iter().any(|item| {
+            item.label == "New Claude session"
+                && matches!(
+                    &item.action,
+                    MenuAction::NewAgentOfKind {
+                        pr_url: Some(url),
+                        ..
+                    } if url == "https://github.com/o/r/pull/7"
+                )
+        }));
+
+        app.overlay = None;
+        app.hits.push((
+            ratatui::layout::Rect::new(0, 0, 20, 2),
+            HitTarget::Worktree(1),
+        ));
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: 1,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut Vec::new(),
+        );
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!(
+                "expected the right-click OPEN PRS menu, got {:?}",
+                app.overlay
+            );
+        };
+        assert_eq!(menu.items[0].label, "New Claude session");
     }
 
     /// A repo with nothing open backs off instead of asking every beat, and
@@ -8549,6 +8694,10 @@ diff --git a/src/b.rs b/src/b.rs
 
         press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
         assert!(app.overlay.is_none(), "nothing stored to edit");
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("the pull request comes from git and can't be edited")
+        );
         // Enter still opens it — reading the PR is the whole point.
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert_eq!(app.flash.as_deref(), Some("opened github.com/o/r/pull/7"));
@@ -8940,6 +9089,7 @@ diff --git a/src/b.rs b/src/b.rs
                     model: Some("opus".into()),
                     effort: Some("high".into()),
                     cloud: false,
+                    pr_url: None,
                 },
             )));
             let mut out = Vec::new();
@@ -10873,7 +11023,7 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
-    fn link_rows_render_under_a_links_header() {
+    fn pull_requests_and_legacy_links_render_under_open_prs() {
         let mut app = App::new();
         // Sized for the three panels alone; the Workspaces column is its own test.
         app.show_workspaces = false;
@@ -10894,14 +11044,14 @@ diff --git a/src/b.rs b/src/b.rs
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("LINKS"), "links header:\n{text}");
+        assert!(text.contains("OPEN PRS"), "open-PR header:\n{text}");
         assert!(
             text.contains("#7 Attach links"),
             "pull request row:\n{text}"
         );
         assert!(
             text.contains("example.dev/spec"),
-            "saved link row (scheme stripped):\n{text}"
+            "previously saved link row (scheme stripped):\n{text}"
         );
         // The panel's count is a session count; the two link rows don't
         // inflate it.

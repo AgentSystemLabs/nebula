@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 29;
+pub const PROTOCOL_VERSION: u32 = 30;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -143,6 +143,21 @@ pub enum ClientRequest {
         /// deliberately request-only: prompts are not persisted with Agent.
         #[serde(default)]
         cloud_prompt: Option<String>,
+    },
+    /// Create a local Claude AGENT from an OPEN PRS row. The PR URL is
+    /// persisted as launch context so every cold spawn and RESUME rebuilds
+    /// the same PR-scoped appended system prompt. Separate from CreateAgent
+    /// so ordinary callers cannot accidentally opt into a partial PR launch.
+    CreatePrAgent {
+        req_id: u64,
+        worktree: WorktreeId,
+        name: String,
+        /// Model the Claude CLI launches with; None = Claude's own default.
+        model: Option<String>,
+        /// Reasoning effort the Claude CLI launches with; None = default.
+        effort: Option<String>,
+        auto_title: bool,
+        pr_url: String,
     },
     /// Fire-and-forget: pre-spawn an agent CLI for this (worktree, kind) so
     /// the next CreateAgent adopts an already-booted session. Sent the

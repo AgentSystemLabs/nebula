@@ -69,7 +69,6 @@ pub enum Action {
     OpenRepo,
     // sessions
     NewTerminal,
-    NewLink,
     Rename,
     Archive,
     Unarchive,
@@ -285,15 +284,6 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["t", "shift+t"],
-    },
-    ActionSpec {
-        action: Action::NewLink,
-        id: "new_link",
-        label: "Attach a link",
-        hint: "Pin a PR, doc or ticket URL alongside the sessions",
-        group: "SESSIONS",
-        scope: Scope::Global,
-        defaults: &["shift+l"],
     },
     ActionSpec {
         action: Action::Rename,

@@ -157,6 +157,9 @@ pub enum MenuAction {
         /// One-shot launch modifier for Claude. The task itself is collected
         /// after the optional name prompt and crosses IPC only on create.
         cloud: bool,
+        /// OPEN PRS launch context. Some is valid only for local Claude and
+        /// is preserved through model/effort submenus and the name prompt.
+        pr_url: Option<String>,
     },
     /// Shell terminal in the worktree's directory; created immediately with
     /// a default name (no prompt), renameable later.
@@ -164,8 +167,6 @@ pub enum MenuAction {
     RenameTerminal(TerminalId),
     CloseTerminal(TerminalId),
     NewWorktree(ProjectId),
-    /// Attach a URL to this worktree (prompts for it).
-    NewLink(WorktreeId),
     /// Hand a link row's URL to the browser.
     OpenLink(String),
     /// Read the selected open pull request's diff in the diff modal. Carries
@@ -392,6 +393,7 @@ pub enum PromptKind {
         model: Option<String>,
         effort: Option<String>,
         cloud: bool,
+        pr_url: Option<String>,
     },
     /// Final task input for a one-shot `claude --cloud <task>` launch. Kept
     /// separate from the name prompt so Enter still submits names normally,
@@ -423,10 +425,6 @@ pub enum PromptKind {
     NewWorkspace,
     RenameWorkspace {
         id: WorkspaceId,
-    },
-    /// Pin a URL to this worktree.
-    NewLink {
-        worktree: WorktreeId,
     },
     /// Rewrite a pinned link's URL.
     EditLink {
@@ -1395,8 +1393,6 @@ pub enum PendingIntent {
     SelectCreatedProject,
     /// Select the created worktree in the Worktrees panel.
     SelectCreatedWorktree,
-    /// Move the Sessions panel's cursor onto the link just created.
-    SelectCreatedLink,
     /// Open the workspace this Ack just created (switcher's "New workspace…"
     /// flow: creating from there means you want to be in it).
     OpenCreatedWorkspace,
@@ -1411,8 +1407,8 @@ pub enum ConnState {
     Disconnected,
 }
 
-/// One row of the Sessions panel's LINKS group: a URL the user pinned to
-/// the worktree, or the pull request nebula found on its branch.
+/// One row of the Sessions panel's OPEN PRS group: a previously saved URL,
+/// or the pull request nebula found on the worktree's branch.
 #[derive(Debug, Clone)]
 pub enum LinkRow {
     /// Discovered by `gh pr view`, backed by nothing in the store — so it
@@ -1982,9 +1978,6 @@ pub struct App {
     pub select_project_when_seen: Option<ProjectId>,
     /// Worktree created by us, awaiting its upsert to fix the selection.
     pub select_worktree_when_seen: Option<WorktreeId>,
-    /// Link created by us, awaiting its upsert to land the panel cursor on
-    /// the new row.
-    pub select_link_when_seen: Option<LinkId>,
     /// Last selected worktree per project — switching back to a project
     /// returns to the worktree the user left it on.
     pub last_worktree_for_project: HashMap<ProjectId, WorktreeId>,
@@ -2216,7 +2209,6 @@ impl App {
             select_when_seen: None,
             select_project_when_seen: None,
             select_worktree_when_seen: None,
-            select_link_when_seen: None,
             last_worktree_for_project: HashMap::new(),
             last_session_for_worktree: HashMap::new(),
             last_project_for_workspace: HashMap::new(),
@@ -2493,8 +2485,9 @@ impl App {
         rows
     }
 
-    /// The selected worktree's LINKS group: the pull request on its branch
-    /// first (however it got there), then the saved links in list order.
+    /// The selected worktree's OPEN PRS group: the pull request on its branch
+    /// first (however it got there), then any previously saved links in list
+    /// order. New saved links are no longer exposed through the TUI.
     /// A saved link that *is* the pull request is shown once, as the
     /// pull-request row — a duplicate would just be the same destination
     /// twice.
