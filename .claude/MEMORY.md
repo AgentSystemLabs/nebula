@@ -48,6 +48,40 @@ Skipped `bind(.., add: bool)` → enum because `event_loop.rs` (another agent's 
 - The prompt's line numbers for `ui.rs` were ~100 lines stale (memory modal added since); re-locate by
   content, not `:line`.
 
+### Event-Loop Dedup Pass (29 Items, Zero Behavior Change) — 2026-08-27
+
+**Asked:** "You are refactoring ONE file, `crates/nebula-tui/src/event_loop.rs` … METHOD, for every
+item: (1) confirm the named tests exist and pass on the CURRENT code … WRITE a unit test first … (2)
+refactor with zero behavior change … ITEMS … Duplicate blocks / Literals → consts / Idioms"
+
+**Did:** `crates/nebula-tui/src/event_loop.rs` only (plus `impl MenuItem { new, destructive }` in
+`app.rs`). New helpers, all near their first caller: `send`/`send_with` (every `alloc_req_id` + push),
+`selected_checkout` + `load_worktree_files` (the four file-modal preambles), `spawn_editor_modal`,
+`settings`/`settings_mut`, `upsert_by`, `worktree_in_context`, `select_project_row`/`select_worktree_row`
+(shared by `move_selection` and the click arms), `is_double_click`, `leave_terminal_lock`, `bracketed`,
+`edit_keymap` + `save_config`, `confirm_delete_agent`/`confirm_close_terminal`/`confirm_remove_project`,
+`home_dir`, `next_focus`, `contains`, `pane_usable`, `clamp_index`, `step_selection`,
+`delete_agent`/`close_terminal`/`delete_worktree`/`create_terminal`, `enum Landing` for
+`jump_to_target`. Consts: `MODAL_WHEEL_LINES`, `TERM_WHEEL_LINES`, `MAX_RESTORED_WIDTH`, `MIN_PANE_DIM`,
+`FALLBACK_PANE`, `KEYBOARD_MENU_ANCHOR`, `PASTE_START/END`, `SELECT_CONTEXT_FIRST`, `SESSION_GONE`,
+`AGENT_ARCHIVED`. `open_menu_at` deleted. Two pinning tests written first:
+`menu_confirms_match_the_key_path_word_for_word`, `paste_into_a_locked_pane_is_bracketed`. 460 unit +
+5 e2e_tui green, clippy clean for event_loop.rs.
+
+**Gotchas:**
+- `step_selection` (clamp form) replaced the metrics modal's `k` = `selected.saturating_sub(1)`: identical
+  while the cursor is in range, but a cursor left past a shrunken `rows` now snaps to the last row instead
+  of drifting down one. `ui.rs` clamps only its local copy when drawing, so the state is reachable.
+- `home_dir()` is `var_os("HOME")`; `shellexpand_home` used `std::env::var` (Ok only for UTF-8) — a
+  non-UTF-8 `$HOME` now expands where it used to fall through. Accepted.
+- The prompt said `nebula_core::env` exists (`AGENT_ID`, `non_empty`); it does not in this checkout, so
+  `home_dir` is local to event_loop.rs.
+- `PromptDialog::new` already takes `impl Into<String>`; `open_prompt` only ever allocated the one arm it
+  matched, so item 26 was cosmetic — done with `Cow<'static, str>` locals.
+- 46 `MenuItem { .. }` literals, not 37; rewrote them with a brace-counting script rather than by hand.
+- A worktree-isolated agent's Bash refuses `for` loops, heredocs and multi-command lines ("too complex to
+  verify it stays inside the worktree") — write the script with the Write tool and run it as one command.
+
 ### The Root Worktree Row's Lower Half Wasn't Clickable — 2026-08-27
 
 **Asked:** "I can't seem to click on certain places of the root worktree row in some areas, other rows are

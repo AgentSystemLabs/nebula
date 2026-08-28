@@ -228,6 +228,26 @@ pub struct MenuItem {
     pub destructive: bool,
 }
 
+impl MenuItem {
+    /// A plain menu row.
+    pub fn new(label: impl Into<String>, action: MenuAction) -> Self {
+        Self {
+            label: label.into(),
+            action,
+            destructive: false,
+        }
+    }
+
+    /// A row drawn in the warning color: it deletes, closes, or removes.
+    pub fn destructive(label: impl Into<String>, action: MenuAction) -> Self {
+        Self {
+            label: label.into(),
+            action,
+            destructive: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ContextMenu {
     /// Optional title rendered in the border (used by picker-style menus).
