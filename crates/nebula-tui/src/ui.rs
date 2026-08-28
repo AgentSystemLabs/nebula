@@ -1,5 +1,5 @@
-//! View layer: draws the three panels + terminal pane + footer, and records
-//! hit regions for mouse interaction.
+//! View layer: draws the visible panels + terminal pane + footer, and
+//! records hit regions for mouse interaction.
 
 use crate::app::{App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, SessionRow};
 use crate::git_diff::{classify_diff_line, DiffLineKind};
@@ -63,13 +63,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Min(0),
     ])
     .areas(body);
-    let [projects_a, worktrees_a, sessions_a, term_a] = Layout::horizontal([
-        Constraint::Length(app.panel_widths[0]),
-        Constraint::Length(app.panel_widths[1]),
-        Constraint::Length(app.panel_widths[2]),
-        Constraint::Min(20),
-    ])
-    .areas(panels_a);
+    let visible_panels = app.visible_panel_indices();
+    let constraints = visible_panels
+        .iter()
+        .map(|idx| Constraint::Length(app.panel_widths[*idx]))
+        .chain(std::iter::once(Constraint::Min(crate::app::MIN_TERM_W)));
+    let areas = panels_a.layout_vec(&Layout::horizontal(constraints));
+    let mut panel_areas: [Option<Rect>; 3] = [None; 3];
+    for (idx, area) in visible_panels.iter().copied().zip(areas.iter().copied()) {
+        panel_areas[idx] = Some(area);
+    }
+    let term_a = areas[visible_panels.len()];
 
     // Splitter grab zones: the two touching border cells at each panel
     // boundary. Registered first so they win `hit_at`'s first-match scan —
@@ -90,9 +94,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.show_workspaces {
         draw_workspaces_bar(f, app, workspaces_a);
     }
-    draw_projects(f, app, projects_a);
-    draw_worktrees(f, app, worktrees_a);
-    draw_sessions(f, app, sessions_a);
+    if let Some(area) = panel_areas[0] {
+        draw_projects(f, app, area);
+    }
+    if let Some(area) = panel_areas[1] {
+        draw_worktrees(f, app, area);
+    }
+    draw_sessions(
+        f,
+        app,
+        panel_areas[2].expect("Sessions panel is always visible"),
+    );
     draw_terminal(f, app, term_a);
     draw_splitter_grips(f.buffer_mut(), app, panels_a);
     // Focus cue (opt-in, `focus_tint` setting): the focused panel's whole
@@ -103,13 +115,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let tinted = match app.focus {
             // The bar's last row is its rule, which belongs to the boundary
             // rather than to the bar — leave it untinted.
-            Focus::Workspaces => shrink_b(workspaces_a),
-            Focus::Projects => shrink_r(projects_a),
-            Focus::Worktrees => shrink_r(worktrees_a),
-            Focus::Sessions => shrink_r(sessions_a),
-            Focus::Terminal => term_a,
+            Focus::Workspaces => Some(shrink_b(workspaces_a)),
+            Focus::Projects => panel_areas[0].map(shrink_r),
+            Focus::Worktrees => panel_areas[1].map(shrink_r),
+            Focus::Sessions => panel_areas[2].map(shrink_r),
+            Focus::Terminal => Some(term_a),
         };
-        draw_focus_tint(f.buffer_mut(), tinted, app.theme);
+        if let Some(tinted) = tinted {
+            draw_focus_tint(f.buffer_mut(), tinted, app.theme);
+        }
     }
     draw_footer(f, app, footer);
     draw_overlay(f, app);
@@ -585,6 +599,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (
                             Act(&[Workspaces, ToggleWorkspaces]),
                             "workspace switcher / workspaces bar",
+                        ),
+                        (
+                            Act(&[ToggleProjects, ToggleWorktrees]),
+                            "show / hide Projects / Worktrees",
                         ),
                         (Lit("⌘1-9 / 1-9"), "open that workspace tab"),
                         (Act(&[Hosts]), "ssh hosts: connect (a: new, d: del)"),
@@ -3760,7 +3778,7 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             // The cursor here is the open workspace, so ←/→ already
             // switches; the verbs are the switcher's, plus the way out.
             Focus::Workspaces => format!(
-                "←/→ or 1-9: switch  {}: projects  {}: new  {}: rename  {}: delete  {}: hide bar  {}: help",
+                "←/→ or 1-9: switch  {}: panels  {}: new  {}: rename  {}: delete  {}: hide bar  {}: help",
                 k(Action::Activate),
                 k(Action::New),
                 k(Action::Rename),
@@ -3824,6 +3842,25 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::Help)
             ),
         };
+        let mut text = text;
+        if !app.term_locked {
+            let mut restore = Vec::new();
+            let hint = |action, panel: &str| {
+                app.keymap.first(action).map_or_else(
+                    || format!("{}: show {panel} in settings", k(Action::Settings)),
+                    |chord| format!("{}: show {panel}", chord.display()),
+                )
+            };
+            if app.hide_projects {
+                restore.push(hint(Action::ToggleProjects, "projects"));
+            }
+            if app.hide_worktrees {
+                restore.push(hint(Action::ToggleWorktrees, "worktrees"));
+            }
+            if !restore.is_empty() {
+                text = format!("{}  {text}", restore.join("  "));
+            }
+        }
         Span::styled(text, Style::default().fg(th.dim))
     };
     // Quiet footer: context on the left, live stats on the right. The
@@ -4489,7 +4526,7 @@ mod tests {
 
     /// Each grip sits on its rule column (one left of the boundary), three
     /// cells centered vertically: muted at rest, accent under hover. All
-    /// four boundaries get one while the Workspaces column is shown.
+    /// three visible sidebar boundaries get one.
     #[test]
     fn splitter_grips_center_on_the_rules() {
         let th = Theme::default();
@@ -4498,7 +4535,7 @@ mod tests {
         let mut buf = ratatui::buffer::Buffer::empty(body);
         draw_splitter_grips(&mut buf, &app, body);
         let mid = body.height / 2; // 17
-        assert_eq!(app.splitter_indices(), 0..3);
+        assert_eq!(app.splitter_indices(), vec![0, 1, 2]);
         for i in app.splitter_indices() {
             let x = app.splitter_x(i) - 1;
             for y in mid - 1..=mid + 1 {

@@ -570,6 +570,42 @@ fn tui_help_modal_grouped_keymap() {
     tui.wait_for_gone("NAVIGATE & SEARCH");
 }
 
+#[test]
+fn tui_hides_projects_and_worktrees_independently() {
+    let mut tui = TuiHarness::spawn();
+    let repo = tui.make_repo("roomy-proj");
+
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "roomy-proj");
+    tui.wait_for_text("PROJECTS");
+    tui.wait_for_text("WORKTREES");
+
+    tui.send(b"P");
+    tui.wait_for_gone("PROJECTS");
+    tui.wait_for_text("WORKTREES");
+    tui.wait_for_text(FOOTER_WORKTREES);
+
+    tui.send(b"B");
+    tui.wait_for_gone("WORKTREES");
+    tui.wait_for_text("SESSIONS");
+    tui.wait_for_text("⇧P: show projects");
+    tui.wait_for_text("⇧B: show worktrees");
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(tui.data_dir.join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(config["hide_projects"], true);
+    assert_eq!(config["hide_worktrees"], true);
+
+    tui.send(b"P");
+    tui.wait_for_text("PROJECTS");
+    tui.wait_for_gone("WORKTREES");
+    tui.wait_for_text("⇧B: show worktrees");
+
+    tui.send(b"B");
+    tui.wait_for_text("WORKTREES");
+    tui.wait_for_text(FOOTER_SESSIONS);
+}
+
 /// Links live in the Sessions panel's own LINKS group: `L` adds one from
 /// any panel, `r` edits it, Enter would open it, `d` removes it. The
 /// pull-request row is not exercised here — the test repo has no remote,
