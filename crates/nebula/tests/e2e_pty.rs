@@ -75,8 +75,7 @@ impl TestEnv {
             "#!/bin/sh\nPATH=/usr/bin:/bin\nexport PATH\nexec /bin/sh -c \"$4\"\n",
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        make_executable(&path);
         path
     }
 
@@ -91,25 +90,7 @@ impl TestEnv {
     /// A committed git repo to act as the project.
     fn make_repo(&self) -> PathBuf {
         let repo = self.tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        let git = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .unwrap()
-                .success();
-            assert!(ok, "git {args:?} failed");
-        };
-        git(&["init", "-b", "main"]);
-        git(&["config", "user.email", "test@nebula.dev"]);
-        git(&["config", "user.name", "nebula-test"]);
-        std::fs::write(repo.join("README.md"), "# test\n").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-m", "init"]);
+        make_repo_at(&repo);
         repo
     }
 }
@@ -247,14 +228,7 @@ async fn full_crud_attach_and_restart_persistence() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
+    let events = subscribe(&mut c).await;
     match &events[0] {
         ServerEvent::Snapshot { projects, .. } => assert!(projects.is_empty()),
         other => panic!("expected snapshot first, got {other:?}"),
@@ -557,14 +531,7 @@ async fn kitty_keyboard_negotiation_passthrough() {
     // AddProject's worktree upsert goes to subscribers only; fetch it via the DB
     // snapshot path instead: create the terminal against the main worktree id
     // that Subscribe would report. Simplest: subscribe now.
-    write_frame(&mut c, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
+    let events = subscribe(&mut c).await;
     let worktree_id = events
         .iter()
         .find_map(|e| match e {
@@ -704,14 +671,7 @@ async fn hook_post_from_agent_pty_drives_status() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
+    subscribe(&mut c).await;
 
     write_frame(
         &mut c,
@@ -1004,14 +964,7 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
+    subscribe(&mut c).await;
 
     write_frame(
         &mut c,
@@ -1169,14 +1122,7 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
+    subscribe(&mut c).await;
 
     write_frame(
         &mut c,
@@ -1378,14 +1324,7 @@ async fn codex_hooks_install_and_drive_status() {
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
+    subscribe(&mut c).await;
 
     write_frame(
         &mut c,
@@ -1990,11 +1929,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
         ),
     )
     .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    make_executable(&script);
     let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
 
     let mut c = connect(&env.sock()).await;
@@ -2120,11 +2055,7 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
     let repo = env.make_repo();
     let script = env.tmp.path().join("dying-agent.sh");
     std::fs::write(&script, "#!/bin/sh\nexit 127\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    make_executable(&script);
     let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
 
     let mut c = connect(&env.sock()).await;
@@ -2241,14 +2172,7 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
     }
 
     // And no half-created rows left behind in the Sessions column.
-    write_frame(&mut c, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
+    let events = subscribe(&mut c).await;
     let agents = events
         .iter()
         .find_map(|e| match e {
@@ -2275,8 +2199,7 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
     std::fs::create_dir_all(&bin).unwrap();
     let stub = bin.join("claude");
     std::fs::write(&stub, "#!/bin/sh\nsleep 60\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    make_executable(&stub);
 
     let shell = env.tmp.path().join("seeing-shell.sh");
     std::fs::write(
@@ -2287,7 +2210,7 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    make_executable(&shell);
 
     let mut daemon = env.spawn_daemon_with_shell(&shell);
     let mut c = connect(&env.sock()).await;
@@ -2427,11 +2350,7 @@ async fn archive_and_delete_kill_the_agent_process() {
         ),
     )
     .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    make_executable(&script);
     let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
 
     let mut c = connect(&env.sock()).await;
@@ -2529,11 +2448,7 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
         ),
     )
     .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    make_executable(&script);
     let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
 
     let mut c = connect(&env.sock()).await;
@@ -3076,11 +2991,7 @@ async fn auto_title_instruction_and_rename_flow() {
         ),
     )
     .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    make_executable(&script);
     let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
 
     let mut c = connect(&env.sock()).await;
@@ -3135,12 +3046,7 @@ async fn auto_title_instruction_and_rename_flow() {
     assert_eq!(body, nebula_daemon::hooks::auto_title_injection());
 
     // The model obeys — `nebula rename` runs with the session's env.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-        .args(["rename", "Fix", "Login", "Redirect"])
-        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
-        .env("NEBULA_AGENT_ID", &agent_id.0)
-        .output()
-        .unwrap();
+    let out = agent_cli(&env, &agent_id, &["rename", "Fix", "Login", "Redirect"]);
     assert!(out.status.success(), "rename failed: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Fix Login Redirect"), "stdout: {stdout}");
@@ -3157,12 +3063,7 @@ async fn auto_title_instruction_and_rename_flow() {
     assert_eq!((status, body.as_str()), (200, ""));
 
     // A repeat attempt is declined as a settled answer (exit 0), not a fault.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-        .args(["rename", "Another", "Title"])
-        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
-        .env("NEBULA_AGENT_ID", &agent_id.0)
-        .output()
-        .unwrap();
+    let out = agent_cli(&env, &agent_id, &["rename", "Another", "Title"]);
     assert!(out.status.success(), "declined rename must exit 0: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("already has a title"), "stdout: {stdout}");
@@ -3195,11 +3096,7 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
         ),
     )
     .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    make_executable(&script);
     let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
 
     let mut c = connect(&env.sock()).await;
@@ -3250,7 +3147,7 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
             .collect()
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while boots(&pwd_log).len() < 1 {
+    while boots(&pwd_log).is_empty() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "first boot never logged"
@@ -3260,12 +3157,7 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
 
     // The model obeys the guidance — `nebula worktree feat x` (the space
     // slugifies) with the session's env.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-        .args(["worktree", "feat", "x"])
-        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
-        .env("NEBULA_AGENT_ID", &agent_id.0)
-        .output()
-        .unwrap();
+    let out = agent_cli(&env, &agent_id, &["worktree", "feat", "x"]);
     assert!(out.status.success(), "nebula worktree failed: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -3339,12 +3231,7 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
     }
 
     // Already there now: a settled answer, and no second relocation.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-        .args(["worktree", "feat-x"])
-        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
-        .env("NEBULA_AGENT_ID", &agent_id.0)
-        .output()
-        .unwrap();
+    let out = agent_cli(&env, &agent_id, &["worktree", "feat-x"]);
     assert!(out.status.success(), "repeat must exit 0: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -3368,17 +3255,11 @@ async fn workspace_scope_is_per_connection() {
     let env = TestEnv::new();
     let mut daemon = env.spawn_daemon();
 
-    let subscribe = |sock: PathBuf| async move {
+    // Boot one client and report the workspace its snapshot lands it in.
+    let boot_client = |sock: PathBuf| async move {
         let mut c = connect(&sock).await;
         handshake(&mut c).await;
-        write_frame(&mut c, &ClientRequest::Subscribe)
-            .await
-            .unwrap();
-        let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-            evs.iter()
-                .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-        })
-        .await;
+        let events = subscribe(&mut c).await;
         let active = events
             .iter()
             .find_map(|e| match e {
@@ -3392,8 +3273,8 @@ async fn workspace_scope_is_per_connection() {
     };
 
     // Two instances, both booted into the default workspace.
-    let (mut a, a_boot) = subscribe(env.sock()).await;
-    let (mut b, b_boot) = subscribe(env.sock()).await;
+    let (mut a, a_boot) = boot_client(env.sock()).await;
+    let (mut b, b_boot) = boot_client(env.sock()).await;
     assert_eq!(a_boot.as_str(), "default");
     assert_eq!(b_boot.as_str(), "default");
 
@@ -3506,7 +3387,7 @@ async fn workspace_scope_is_per_connection() {
 
     // A third instance launched now boots into A's pick — the switch is
     // remembered as a default for new clients, just not pushed onto live ones.
-    let (_c, c_boot) = subscribe(env.sock()).await;
+    let (_c, c_boot) = boot_client(env.sock()).await;
     assert_eq!(
         c_boot, ws,
         "a fresh instance opens the last workspace opened"
@@ -3539,6 +3420,38 @@ fn make_repo_at(repo: &Path) {
     git(&["commit", "-m", "init"]);
 }
 
+/// Mark a freshly written stub script runnable.
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Subscribe a handshaken client and wait for its first `Snapshot`; returns
+/// everything received up to and including it.
+async fn subscribe(c: &mut UnixStream) -> Vec<ServerEvent> {
+    write_frame(c, &ClientRequest::Subscribe).await.unwrap();
+    read_events_until(c, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await
+}
+
+/// Run the `nebula` CLI the way a hook would inside an agent session: the
+/// test daemon's runtime dir plus the session's `NEBULA_AGENT_ID`.
+fn agent_cli(
+    env: &TestEnv,
+    agent_id: &nebula_core::AgentId,
+    args: &[&str],
+) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(args)
+        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+        .env("NEBULA_AGENT_ID", &agent_id.0)
+        .output()
+        .unwrap()
+}
+
 #[tokio::test]
 async fn cli_add_project() {
     let env = TestEnv::new();
@@ -3546,14 +3459,7 @@ async fn cli_add_project() {
     let mut daemon = env.spawn_daemon();
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
+    subscribe(&mut c).await;
 
     let run_cli = |args: &[&str], cwd: &Path| {
         std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
@@ -3727,10 +3633,7 @@ esac
         ),
     )
     .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    make_executable(&stub);
     let runs = || {
         std::fs::read_to_string(state.join("runs"))
             .ok()
@@ -3884,10 +3787,7 @@ esac
         ),
     )
     .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    make_executable(&stub);
     let runs = || {
         std::fs::read_to_string(state.join("runs"))
             .ok()
@@ -4009,10 +3909,7 @@ esac
         ),
     )
     .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    make_executable(&stub);
     let runs = || {
         std::fs::read_to_string(state.join("runs"))
             .map(|s| s.trim().to_string())

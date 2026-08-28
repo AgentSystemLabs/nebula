@@ -14,11 +14,15 @@ const INSTALL_URL: &str =
 /// The published install script, with `NEBULA_INSTALL_URL` as the override
 /// hook (tests point it at a file:// URL). Shared with `nebula ssh`.
 pub(crate) fn install_url() -> String {
-    std::env::var("NEBULA_INSTALL_URL")
-        .ok()
-        .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| INSTALL_URL.to_string())
+    nebula_core::env::non_empty(INSTALL_URL_ENV).unwrap_or_else(|| INSTALL_URL.to_string())
 }
+
+const INSTALL_URL_ENV: &str = "NEBULA_INSTALL_URL";
+
+/// Printed whenever a daemon from an older binary is left running: the only
+/// way onto the new code is a restart, and a restart takes the sessions.
+pub(crate) const KILL_HINT: &str =
+    "      run 'nebula kill' to restart onto the new binary (stops all sessions).";
 
 pub fn run_upgrade(force: bool) -> Result<()> {
     let url = install_url();
@@ -48,15 +52,11 @@ fn finish_daemon_handoff() {
         Ok(IdleShutdown::SessionsLive { count }) => {
             let plural = if count == 1 { "" } else { "s" };
             println!("note: the old daemon is still running with {count} live session{plural}.");
-            println!(
-                "      run 'nebula kill' to restart onto the new binary (stops all sessions)."
-            );
+            println!("{KILL_HINT}");
         }
         Ok(IdleShutdown::Skewed) | Err(_) => {
             println!("note: a daemon from a previous version may still be running.");
-            println!(
-                "      run 'nebula kill' to restart onto the new binary (stops all sessions)."
-            );
+            println!("{KILL_HINT}");
         }
     }
 }
@@ -138,7 +138,8 @@ fn dev_build() -> Option<PathBuf> {
     } else {
         dir
     };
-    matches!(dir.file_name()?.to_str()?, "debug" | "release").then(|| exe.clone())
+    let is_target_dir = matches!(dir.file_name()?.to_str()?, "debug" | "release");
+    is_target_dir.then_some(exe)
 }
 
 #[cfg(test)]

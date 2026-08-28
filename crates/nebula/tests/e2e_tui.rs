@@ -123,18 +123,7 @@ impl TuiHarness {
     fn make_repo(&self, name: &str) -> PathBuf {
         let repo = self._repos.path().join(name);
         std::fs::create_dir_all(&repo).unwrap();
-        let git = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .unwrap()
-                .success();
-            assert!(ok, "git {args:?} failed in {}", repo.display());
-        };
+        let git = |args: &[&str]| repo_git(&repo, args);
         git(&["init", "-b", "main"]);
         git(&["config", "user.email", "t@nebula.dev"]);
         git(&["config", "user.name", "nebula-test"]);
@@ -248,7 +237,7 @@ fn screen_to_text(screen: &vt100::Screen) -> String {
                     if contents.is_empty() {
                         out.push(' ');
                     } else {
-                        out.push_str(&contents);
+                        out.push_str(contents);
                     }
                 }
                 None => out.push(' '),
@@ -277,7 +266,7 @@ fn sessions_panel_contains(screen: &vt100::Screen, needle: &str) -> bool {
             if contents.is_empty() {
                 line.push(' ');
             } else {
-                line.push_str(&contents);
+                line.push_str(contents);
             }
         }
         if line.contains(needle) {
@@ -299,7 +288,7 @@ fn row_is_selected(screen: &vt100::Screen, needle: &str) -> bool {
             if contents.is_empty() {
                 line.push(' ');
             } else {
-                line.push_str(&contents);
+                line.push_str(contents);
             }
         }
         if line.contains(needle) {
