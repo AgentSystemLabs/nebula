@@ -14,11 +14,468 @@ about what is worth recording.
 
 ## Entries
 
+### `r` Renames A Project Row Without Touching Its Folder — 2026-08-28
+
+**Asked:** "Allow me to rename a project from the projects section, by using hte shortcut "r" if a project
+is selected. Currently the project name is the folder name. We don't want to changhe the folder name, is
+just a visual change, but then if the project is renamed, display under it on a smaller font size the
+folder name still." — then, after the first cut shipped a plain `th.dim` foreground: "I told you to use a
+smaller fontsize though for the project folder name that is being displayed under, and displayed it kinda
+with less opacity, so the priority in the ui the project name we chose" — then "Yes but in Terms of
+hierarchy we should display like the folder name in a smaller font size. Is there any way that we can do
+that?" — then, on testing it: "After renaming the project, if I rename again to an empty string, it should
+be like undoing the rename and come back to display as the default way"
+
+**Did:** No schema change — `projects.name` was already a plain display column and `repo_path` already
+carried the folder, so a rename is one `UPDATE`. `nebula-core/src/entities.rs` grew
+`Project::folder_name(&Path)` (the last path component, `"project"` fallback — lifted verbatim out of
+`add_project`, which now calls it) and `Project::folder_subtitle() -> Option<String>`, which returns the
+folder name only while it differs from `name`. That derived check *is* the "has it been renamed?" flag;
+no new field, no migration. Daemon: `Store::rename_project`, `Daemon::rename_project`
+(`registry.rs:~739`, trims, and an **empty name resets the row to the folder name** — the only way back
+from a rename), `ClientRequest::RenameProject` + **protocol 28 → 29**, `server.rs` dispatch. TUI:
+`PromptKind::RenameProject` / `MenuAction::RenameProject`, the previously-empty
+`Action::Rename => Focus::Projects => {}` arm in `event_loop.rs:1455`, a "Rename" row in both project
+context menus (keyboard `m` and right-click), footer hint, help-overlay PROJECTS row, README keymap row.
+`ui.rs::draw_projects` grows a renamed row to `PROJECT_BTN_H + 1` and renders the folder name on the row
+under the name as `└ <folder>` — the `└` flush with the name's first column (not the status dot), the
+whole line `th.dim` **plus `Modifier::DIM`**. Three signals, because a fourth is not available: see the
+font-size gotcha below. Tests:
+`rename_project_relabels_the_row_and_leaves_the_folder_alone` (registry),
+`r_renames_the_selected_project_row`, `renaming_a_project_to_nothing_undoes_the_rename` and
+`a_renamed_project_shows_its_folder_name_underneath` (event_loop), plus the real-PTY
+`tui_project_rename_shows_the_folder_and_empty_undoes_it` (e2e_tui). Workspace: 698 green, fmt/clippy
+clean.
+
+**Gotchas:**
+- **`submit_prompt` cancels empty input for every `PromptKind` not on an explicit allowlist**
+  (`event_loop.rs:~3739`): it flashes `cancelled: empty input` and returns *before* the `match`, so the
+  request never leaves the client. That made the daemon's "empty name resets to the folder name" branch
+  **unreachable from the UI** while its daemon-side test passed the whole time — the user found it by
+  using the feature. `RenameProject` had to join `NewAgent | NewWorktree` on that allowlist. Any future
+  prompt whose empty value *means* something must opt in the same way, and only an end-to-end press
+  proves it: a registry test and a "does the prompt open" test both stay green.
+- **"Render this text smaller" — the settled answer, so nobody re-derives it.** The user asked three
+  times; all three avenues were checked, not guessed:
+  1. **A terminal cell has exactly one font size.** No SGR attribute scales text down. DECDHL/DECDWL only
+     go *bigger* and re-flow the line.
+  2. **Kitty's text sizing protocol (OSC 66) genuinely does it** — `OSC 66 ; n=1:d=2 ; text ST` renders at
+     half size *inside the same cells* (`n`/`d` fractional scale, `v` for top/bottom/middle alignment), so
+     the grid survives. **But only Kitty and Foot implement it.** WezTerm: "does not support the Text
+     Sizing protocol". Ghostty 1.3.x *parses* OSC 66 and renders nothing (1.3.0 notes: "not implemented in
+     the GUI yet", tracking issue ghostty-org/ghostty#10333, open). tmux strips it even under Kitty. And on
+     a terminal that doesn't parse OSC 66 the whole run **including the text** is eaten as an OSC string,
+     so the content vanishes — never emit it without a CPR-based support probe.
+     `https://sw.kovidgoyal.net/kitty/text-sizing-protocol/`
+  3. **The Unicode fallbacks are font-dead.** Checked the real `cmap`s with fontTools:
+     small caps — `HackNerdFontMono-Regular` and `SFNSMono` missing **25/26**, Menlo 17/26; superscripts —
+     Hack **26/26** missing, SF Mono 24/26, only Menlo covers them (missing `q`); subscripts worse. Digits
+     have no small-cap form at all. They render as tofu or fall back to a proportional face and break
+     column alignment.
+  So the levers that actually work everywhere are **weight, opacity and position**: BOLD full-strength
+  name, `th.dim` (the dimmest color the theme has — nothing below it) + `Modifier::DIM`, and a `└ `.
+  **The user's terminal is WezTerm** (`TERM_PROGRAM=WezTerm`), with Ghostty 1.3.1 also installed — the
+  older entry saying they're on Ghostty is stale.
+- **`Modifier::DIM` really is opacity**: `ratatui-crossterm-0.1.2/src/lib.rs:441` maps it to crossterm
+  `Attribute::Dim` = **SGR 2 (faint)**, which Ghostty renders by blending fg toward bg. Confirmed on the
+  wire, not just in the buffer — drawing the `TestBackend` buffer's cells through a
+  `ratatui::prelude::CrosstermBackend::new(&mut Vec<u8>)` and grepping the bytes shows `\e[1m` before the
+  label and `\e[2m\e[38;5;8;49m` before the folder. **`TestBackend` alone cannot prove this**; a `Style`
+  in the buffer says nothing about whether the backend emits it. Worth the 20 lines when a change's whole
+  point is an attribute.
+- **`App::new()` starts with `sel_project = 0`, so the first project row is drawn *selected***, and
+  `render_button` lifts a `th.dim` fg to `th.muted` there. A style assertion on row 0 that expects
+  `th.dim` fails with `left: Some(Gray) right: Some(DarkGray)` and reads like a theme bug. Seed two rows
+  and assert the second for the unselected style. The faint attribute survives the lift; the color does
+  not.
+- **`render_button` took `spans: Vec<Span>` and adding a second `sub: Vec<Span>` fails borrowck**, not
+  just clippy: `spans.iter_mut().chain(sub.iter_mut())` errors with "lifetime may not live long enough"
+  because `&mut [Span<'a>]` is invariant and the two params infer independent lifetimes. Adding `<'a>` to
+  both fixes it but then trips `clippy::too_many_arguments` (8/7). The shape that satisfies both is one
+  `text: Vec<Vec<Span<'a>>>` param whose entries take consecutive rows from `text_row` — 7 args, no
+  chain. `render_row` passes `vec![spans]`.
+- **The Projects panel does not scroll** — `rows_rect` returns None past the bottom and `draw_projects`
+  `break`s — and `PROJECT_BTN_H` has no callers outside that one function. So a variable row height is
+  contained entirely in `draw_projects`; nothing in `event_loop.rs` does row math for this panel.
+- **`seed_tree` names its project `demo` at `/tmp/demo`**, so `folder_subtitle()` is None and not one of
+  the 462 existing nebula-tui tests grew a row. A new draw test that wants the subtitle must set
+  `app.tree.projects[i].repo_path` to something *other* than the name — upserting a `project(id, name, n)`
+  alone won't do it, since that helper derives `repo_path` as `/tmp/{name}`.
+- **A `TestBackend` buffer line can't be byte-sliced** (`&line[..30]` panics inside `●`/`▌`); use
+  `line.chars().take(n)` when dumping the buffer to eyeball a column.
+- Protocol 29 means a **v28 daemon still running from before the build refuses the new client** until it
+  is restarted — expected, and the client already offers the kill-and-restart.
+
+### Released v0.14.0 By Patching The Stale Checkout's Diff Onto origin/main — 2026-08-28
+
+**Asked:** "commit push and release"
+
+**Did:** Cut **v0.14.0** (0.13.0 → minor: new user-facing features). `release` skill in a private
+worktree on `release-v0.14.0` off `origin/main`, `cargo test --workspace` in an isolated
+`CARGO_TARGET_DIR` — **704 passed, 0 failed** — three commits (feature / scaffolding / `Release v0.14.0`),
+`git push origin release-v0.14.0:main`, tag, all four matrix targets green, notes replaced via
+`gh release edit --notes-file`. Carried the DOUBLE TAP of `h`/`l` at the PANEL WALK's ends, click-outside
+dismiss for every modal, the SETTINGS OVERLAY position expiry, PROJECTS PANEL focus on a created
+WORKSPACE, the deleted-OPEN-WORKSPACE reseat, `make cycle`, plus `TERMS.md` and the `prompt-daddy` /
+`project-terms` / `output-doctor` skills. The changelog also credits PR #17 (workspace-switch cold boot,
+paused-rebase relabel), which landed on origin after v0.13.0.
+
+**Gotchas:**
+- **The shared checkout was 8 commits behind `origin/main` again — this time a merged PR (#17), not a
+  release cut elsewhere**, and it touched `app.rs`, `event_loop.rs`, `ui.rs` and `MEMORY.md`, the same
+  files as the uncommitted work. Copying those files by content would have silently reverted the PR.
+  Better recipe than the skill's cp: in the shared tree `git diff HEAD > local.patch`, in the worktree
+  `git apply --3way local.patch` — 13 of 14 files merged cleanly, including both sides' `MEMORY.md`
+  entries. `git diff HEAD` does not carry untracked files; `TERMS.md` and the three new skill dirs still
+  needed a `cp`.
+- The one conflict was a signature skew: PR #17 gave `enter_terminal_pane` an `out: &mut Vec<ClientRequest>`
+  (it now calls `fire_pending_attach`), while the DOUBLE TAP work had just wrapped it in
+  `walk_focus_forward(app)`. Resolved by threading `out` through `walk_focus_forward` and its five call
+  sites in `handle_key`. The shared tree's uncommitted `event_loop.rs` is therefore *not* what shipped —
+  reconcile the shared tree with `git stash -u && git pull --ff-only && git stash drop`; everything in
+  that stash is on origin already, in its merged form.
+- `git ls-remote --tags origin | tail` sorts lexically, so `v0.9.0` comes last and `v0.13.0` looks
+  missing. `grep` the version you want instead.
+- `gh run list` right after `git push` of the tag can return the *previous* release's run; a `sleep 20`
+  (or checking `headBranch` equals the tag) before `gh run watch` avoids watching v0.13.0 again.
+
+### Output Doctor: Every Reply Is YOU ASKED / OVERVIEW / TECHNICAL OVERVIEW — 2026-08-28
+
+**Asked:** "what 3 features would you recommend I remove" → picked (prompt-daddy): *Cost vs. value audit*
+→ then, on the answer: "rewrite this in a format like this: ==== YOU ASKED ==== … ==== OVERVIEW ==== …
+==== TECHNICAL OVERVIEW ===" → "in the YOU ASKED section we should be only displaying the prompt created
+by prompt-daddy" → "use this final output structure as a skill called output-doctor which prompts the
+agent to use that format I provided for all output. update claude.md to always use this skill before it
+outputs anything"
+
+**Did:** New `.claude/skills/output-doctor/SKILL.md` (user-invocable): three fixed headers, four `=` each
+side, in order — `YOU ASKED` (the `prompt-daddy` pick verbatim, only the pick; the original/Other/as-typed
+prompt when there was none), `OVERVIEW` (plain sentences, no paths or symbols, TERMS in caps, the test
+gate and anything left out stated here), `TECHNICAL OVERVIEW` (bullets per overview item, `file:line`
+refs, err short — the user asks for more). It runs *after* `nebula-memory` and `project-terms`, whose
+one-line results close the technical section. Exceptions it lists: the "about to" preamble, mid-task
+progress notes, `AskUserQuestion`, file-bound text (commits, memory, TERMS), a reply that is only a
+question. `CLAUDE.md` gained a "Before you reply" step after the `project-terms` one; `AGENTS.md` gained
+the matching "Then shape the reply" paragraph. The audit that preceded it — CLAUDE CLOUD sessions,
+`nebula browser`/`tunnel`, the PREWARM POOL as the three costliest features — was recommendation only;
+nothing was cut and no decision was taken.
+
+**Gotchas:**
+- **`YOU ASKED` is the pick alone.** The first cut showed the original prompt with a `→ picked:` line
+  under it (the `nebula-memory` convention) and the user rejected it: the memory entry keeps both, the
+  reply keeps only the rewrite that was worked from.
+- The user's template had three `=` on the `TECHNICAL OVERVIEW` header and four on the other two;
+  standardized on four for all three in the skill. Match the skill, not the transcript.
+- **`AGENTS.md` is not a copy of `CLAUDE.md`** — it is the shorter, skill-tool-free version of the same
+  protocol for non-Claude agents, and it references the skills by file path. A protocol change has to be
+  written twice, once per file, in each file's own register.
+- Skill discovery is live (as the prompt-daddy entry says): `output-doctor` appeared in the session's
+  skill listing the moment the file existed, before `CLAUDE.md` was edited.
+
+### Deleting The OPEN WORKSPACE Lands On The Tab To Its Right, Then Its Left — 2026-08-28
+
+**Asked:** "when the workspace is deleted, it should select the previous workspace in the list. if deleting
+the first workspace, select the next, if deleting from the middle, we should focus on the workspace to the
+right"
+→ picked (prompt-daddy): *Right, else left* — "When the OPEN WORKSPACE is deleted — `d` / `m` in the
+WORKSPACES BAR, `d` in the WORKSPACE SWITCHER, or from another instance / `nebula workspace delete` —
+open the WORKSPACE TAB that was to its right … If it was the last tab, open the one to its left. Deleting
+a workspace that is not the open one leaves the OPEN WORKSPACE alone. Replace the current 'fall back to
+the first workspace' reseat."
+
+**Did:** `reseat_deleted_workspace` (`crates/nebula-tui/src/event_loop.rs` ~2685) takes a new
+`removed_tab: Option<usize>` and lands on `workspaces[removed_tab.min(len - 1)]` instead of
+`workspaces.first()`. The `ServerEvent::EntityRemoved` arm in `handle_server_event` computes that
+position with `workspaces.iter().position(..)` **before** `apply_removal`. Every delete path — bar, switcher,
+CONTEXT MENU, other instance, CLI — arrives through that one delta, so nothing else changed. Test
+`deleting_the_open_workspace_lands_on_its_right_neighbor_then_its_left` (first / middle / last / not-open).
+README rows for the switcher and the Workspaces keymap note it. 469 nebula-tui tests green.
+
+**Gotchas:**
+- The prompt's first sentence ("select the previous") contradicts its third ("to the right"); the pick
+  settled it as right-first, left only from the last tab. Don't relitigate — the "previous" case exists
+  only because the last tab has no right neighbor.
+- The deleted row's index must be captured before `apply_removal` runs its `retain`; after it the row is
+  gone and only `first()` is knowable — which is exactly why the old reseat jumped to the first tab.
+- After the retain, the right neighbor sits at the deleted tab's *own* index, so `min(len - 1)` is the
+  whole first/middle/last logic; no branching on position needed.
+
+### Project Terms: Detect Every Session, Promote Only What Recurred — 2026-08-28
+
+**Asked:** "update the project-terms skills: keep the architecture around the self improving look, but the
+main improvement I'd make is changing project-terms from \"harvest words from every session\" to \"detect
+vocabulary discoveries every session, but only promote concepts that have actually become canonical.\""
+→ picked (prompt-daddy): *Recur across tasks* — "new TERMS are not written into the glossary sections on
+first sight. They go to a candidates ledger (a section at the bottom of TERMS.md) with the date and where
+they were seen; a candidate is promoted to a real TERM only when a later, separate task uses it again (in
+my prompt, a commit, or a memory entry). Aliases for existing TERMS stay immediate. Renames and
+retirements stay immediate. Prune candidates nobody touched again after ~30 days."
+
+**Did:** Rewrote `.claude/skills/project-terms/SKILL.md` around two tiers. Every run still *detects* —
+the nouns in the **Asked** line, the names in **Did**/**Gotchas**, commit messages, new symbols/keys/
+commands — but a *new* name goes to a **Candidates** ledger (`TERMS.md` § 14, columns `CANDIDATE | What
+it seems to be | Seen | Where`, each sighting as `date source`) and is promoted to a TERM row only when a
+second sighting comes from a separate task (different MEMORY LOG entry, session, or commit; `git log
+--since --grep -i` catches other sessions' commits). Immediate, ungated edits: a user alias for an existing
+TERM, an ambiguity split, a rename, a retirement, a stale *Where*. "name this" / "add this to terms" /
+"promote X" from the user promotes on the spot. Candidates whose only sighting is >30 days old are deleted
+(not retired). `TERMS.md` got the § 14 section (between Retired and the Alias index, so the index stays
+"at the bottom" as `CLAUDE.md` says), an intro sentence about the ledger, and a reworded PROJECT TERMS row;
+`CLAUDE.md` (the "no TERM yet" sentence and the `project-terms` paragraph) and `AGENTS.md` (the "keep the
+glossary true" paragraph) now describe detect-then-promote instead of add-on-sight. The loop itself
+(MEMORY LOG + `TERMS.md` → PROMPT DADDY → work → NEBULA-MEMORY SKILL → PROJECT TERMS) is unchanged.
+
+**Gotchas:**
+- **The rule applies to the task that writes it.** First draft added CANDIDATES LEDGER as a full TERM in
+  the same task that coined it — exactly the add-on-sight the new rule forbids, and it cross-referenced a
+  not-yet-TERM in caps from the PROJECT TERMS row. It is now the ledger's first candidate row instead, with
+  its two same-day sightings (prompt + this entry) counting as *one* task; the next task that mentions it
+  promotes it.
+- The Candidates table has four columns with different headers from every other section (`CANDIDATE`, not
+  `TERM`; `Seen`, not `Also called`) and Retired has three — a row regex that assumes the TERM-table shape
+  matches neither. Anchor on `| **NAME** |` and the section header.
+- The Skill tool's listing re-reads the frontmatter live: the new `description` showed up in the skill
+  list on the very next tool call, no restart.
+
+### A Created Workspace Opens With Focus On The PROJECTS PANEL — 2026-08-28
+
+**Asked:** "when someone makes a new workspace, it should focus on the projects list"
+→ picked (prompt-daddy): *All three create paths* — "When I create a WORKSPACE from the TUI — `n` in the
+WORKSPACE SWITCHER, `n` in the WORKSPACES BAR, or "New workspace" in the bar's `m` menu — and the TUI
+opens it on the daemon's Ack, land focus on the PROJECTS PANEL instead of leaving it where it was … Keep
+the open-on-Ack switch exactly as it is; only the landing focus changes. Cover it with a unit test."
+
+**Did:** One landing site covers all three paths: every `PromptKind::NewWorkspace` submit allocates
+`PendingIntent::OpenCreatedWorkspace`, and the `ServerEvent::Ack` arm for it
+(`crates/nebula-tui/src/event_loop.rs` ~6434, `handle_server_event`) already called `switch_workspace`;
+it now also sets `app.term_locked = false; app.focus = Focus::Projects`. Tests:
+`a_workspace_created_from_the_bar_lands_focus_on_projects` (new, starts on `Focus::Workspaces`) and
+`switcher_creates_a_workspace_and_opens_it_on_ack` (now starts on Sessions and asserts the landing).
+README rows for the WORKSPACE SWITCHER and Workspaces keymap note it. 468 nebula-tui tests green.
+
+**Gotchas:**
+- Focus stays put between the prompt's Enter and the Ack — the switch and the landing both happen on the
+  Ack, not on submit. A test that asserts `Focus::Projects` right after Enter fails; feed the `Ack` with
+  `created: Some(EntityId::Workspace(..))` first (the existing switcher test shows the shape).
+- The two clippy warnings the crate prints (`event_loop.rs:5183` unneeded return, `config.rs:1007` field
+  assignment after `Default::default()`) predate this task — they are other sessions' hunks in the shared
+  tree, not this one's.
+
+### `make cycle`: MAKE INSTALL → NEBULA KILL → MAKE DEV As One Re-runnable Target — 2026-08-28
+
+**Asked:** "update makefile to include a kill & install & dev all in one I can keep re-running when I
+need" → picked (prompt-daddy): *Chain the three targets* — MAKE INSTALL, then NEBULA KILL (the real daemon
+and every SESSION), then MAKE DEV, install first so a build failure stops before anything is killed; the
+existing `install`, `kill` and `dev` targets unchanged.
+
+**Did:** Added `Makefile::cycle` — three `$(MAKE) --no-print-directory` recipe lines (`install`, `kill`,
+`dev`), listed in `make help` and `.PHONY`, plus a line in the header comment. Verified with `make help`
+and `make -n cycle`; did **not** run it for real — the kill step would take down the nebula session the
+agent was running in.
+
+**Gotchas:**
+- Order is install → kill, not the user's kill → install: `cargo build --release` failing after the kill
+  would have stopped every real SESSION for nothing. The STALE DAEMON NOTE `install` prints is then
+  immediately acted on by `kill`, which is the point.
+- `nebula kill` is safe on a cold machine: `run_kill` (`nebula-tui/src/lib.rs`) prints "no nebula daemon
+  running" and exits 0 when nothing is listening, and `ipc::kill_daemon` waits for the daemon to exit
+  (`wait_for_daemon_exit`) before returning — so `dev` never races the old daemon.
+- The steps are recipe lines rather than prerequisites (`cycle: install kill dev`) on purpose: `make -j`
+  may run prerequisites in parallel and could kill before the build finished.
+- `make cycle` from inside a nebula SESSION kills that session mid-run. Run it from a terminal outside
+  nebula.
+
+### TERMS.md: One ALL-CAPS Name Per Thing, Kept By `project-terms` — 2026-08-27
+
+**Asked:** "analyze my projetc and also previous chat history in memory.md, I want you to create a TERMS.md
+which has a descriptive name for various features, routes, short cuts, naming to help describe the project
+better between tean mates. update claude.md to call a project-terms skill which will update that TERMS.md
+with useful new terms after every prompt like we do for nebula-memory. update the claude.md to load and
+always speak in those terms. update the prompt-daddy to use those terms when rewrighting your prompt"
+→ prompt-daddy: no option picked; the note said *"make sure terms are always all caps"*.
+
+**Did:** New `TERMS.md` at the repo root — 254 TERMS in 13 sections (the tree, plumbing, layout, status,
+focus/keys, overlays, agents/hooks, daemon mechanisms, cloud, CLI, config/env, dev workflow, retired) plus
+an **Alias index** mapping the user's words to TERMS; every row is `TERM | meaning | "aliases" | where`,
+with the aliases quoted from the **Asked:** lines of this log and the *where* symbols verified by grep.
+Built from two parallel sweeps (this log lines 705–2425 for vocabulary; the code for keymap actions,
+overlays, CLI, routes, env vars, Makefile) plus README/ARCHITECTURE. New
+`.claude/skills/project-terms/SKILL.md` (runs after `nebula-memory` on every task; edits only for a new,
+renamed, retired, or newly-aliased TERM — *superseded 2026-08-28*: new names now wait in the Candidates
+ledger until a separate task uses them again, see "Project Terms: Detect Every Session, Promote Only
+What Recurred"). `CLAUDE.md` rewritten: read `TERMS.md` with the memory log, a
+"Speak in the project's terms" section (ALL CAPS in replies, `AskUserQuestion` options, commits, memory
+entries; alias → TERM on first use; never rename code to match), and the `project-terms` call after
+`nebula-memory`. `prompt-daddy` gained a TERMS row in its failure table, a TERMS lookup in the grounding
+step, an "in the project's TERMS" rewrite rule, and a worked example in caps. `AGENTS.md` mirrors the
+protocol for codex/cursor; the `release` skill's scaffolding-commit list now includes `TERMS.md`.
+
+**Gotchas:**
+- **The memory-mining subagent stopped without reporting once and had to be resumed with `SendMessage`**;
+  its result then arrived normally. Don't assume a "stopped" notification means lost work.
+- Two sweeps disagreed on facts — VENDORED VT100 is **0.16.2** (`vendor/vt100/Cargo.toml`), not 0.15.2 as
+  an old entry says; there is no `resolve_editor` fn (it is `Config::editor` + `NEBULA_EDITOR`). Grep every
+  *where* cell before writing it; the log's own symbols drift.
+- The Retired table has three columns, not four — a row-regex that assumes the four-column shape silently
+  skips it. Anchor on the `| **TERM** |` prefix when editing rows programmatically.
+- `nameplate` meant two things in README/log: the `nebula vX.Y.Z` (VERSION NAMEPLATE) and the `◇ workspace`
+  chip (WORKSPACE NAMEPLATE). Likewise "locked layer" ≠ LOCKED PANE (it is the WALK EDGE) and "done" splits
+  UNSEEN vs FINISHED — all three are listed under both TERMS in the Alias index on purpose.
+- An unquoted note inside an alias cell (`"sub agents" (mistaken)`) breaks a `", "`-split merge; keep
+  notes inside the quotes.
+
+### Click Outside Any Modal Dismisses It — 2026-08-27
+
+**Asked:** "when the help modal is up (or all modals), a user should be able to click outside to dismiss it"
+→ picked: Every modal, click = Esc — a left-click outside the box does exactly what Esc does (cancel a
+confirm, discard a prompt, close the rest), swallowed, never landing on the panel underneath.
+
+**Did:** Only four overlays lacked it — Palette, Files, Grep, Tree, Hosts, Settings, Metrics and the
+context menu already closed on an outside click in their own `handle_mouse` arms. A single pre-check at the
+top of `handle_mouse` (`crates/nebula-tui/src/event_loop.rs`, just after the menu arm) now covers
+`Overlay::Help` / `Confirm` / `Prompt` / `Diff`: Help and Diff set `app.overlay = None`; Confirm and Prompt
+route a synthesized `KeyCode::Esc` through `handle_overlay_key`, so the settings-reset confirm still lands
+back in the settings overlay, the switcher delete reopens the switcher, and an abandoned Claude name
+prompt still restores the warm slot's spec. `Overlay::Help` became `Help(HelpView { area })`;
+`ConfirmDialog` and `PromptDialog` grew `area: Rect`, written back in `ui.rs::draw_overlay`. Help overlay
+row `click outside → dismiss any modal (= Esc)`, README mouse paragraph. Five tests under
+`// ---- a click outside any modal dismisses it ----` in `event_loop.rs`.
+
+**Gotchas:**
+- Diff's Esc is two-stage (clears the file filter first), so click-outside must close it directly rather
+  than synthesize Esc; Confirm and Prompt have single-stage Esc with side effects worth keeping, so those
+  *do* synthesize it. Check the overlay's Esc arm before choosing which path a new modal takes.
+- `draw_overlay` matches on `app.overlay.clone()`, so a rect used for hit-testing has to be written back
+  with a second `if let Some(Overlay::X(v)) = &mut app.overlay { v.area = area }` at the end of the arm —
+  the `ContextMenu::area` pattern. A unit variant (as `Help` was) has nowhere to put it.
+- The pre-check requires `area.width > 0`: an overlay that has not been drawn yet has a zero rect, and
+  without the guard every click would count as "outside". Tests that click into a modal without drawing
+  first rely on this; tests that want the outside path draw once with `TestBackend` (see `drawn_modal_area`).
+- `ConfirmDialog` has 14 struct-literal constructors in `event_loop.rs`, every `action:` on one line — a
+  new field is a one-pass insert after that line, not 14 hand edits.
+- In tests, `D` on a bare `seed_tree` opens no confirm; the bulk-delete confirm needs `seed_link` too
+  (mirror `delete_all_sessions_leaves_links_alone`).
+
+### Settings Position Memory Expires A Minute After Closing — 2026-08-27
+
+**Asked:** "if a user tries to open the settings modal for the first time, it should start focused on
+the setting bar and if the launch it later it should retain their position. extend this logic to support
+timing out that retain so if it's been 1 minute since opening it should revert back"
+→ picked (prompt-daddy): *Timer runs from close* — "when I close the modal, note the time; if I reopen
+it more than 1 minute later, discard the remembered position and open fresh exactly like a first open
+(first tab, row 0, focused on the tab strip). Reopening within the minute restores the position as it
+does now."
+
+**Did:** The first-open-on-strip + retain half already existed ([Settings Opens On The Tab Strip]);
+this adds the expiry on top. `App::settings_closed_at: Option<Instant>` and
+`SETTINGS_MEMORY_TTL` (60s) in `crates/nebula-tui/src/app.rs`, with `note_settings_closed` /
+`settings_memory_expired` / `forget_settings_focus` (tab 0, every tab's row 0, `on_tabs = true`, stamp
+cleared). In `event_loop.rs`, `Action::Settings` now goes through new `open_settings(app)` = expiry
+check + the existing `reopen_settings`; both ways out — `SettingsCmd::Close` (Esc/`q`/`s`) and the
+click-outside mouse path — go through new `close_settings(app)`, which stamps the time. README `s` row
+mentions the minute. Tests: `settings_memory_expires_a_minute_after_closing`,
+`settings_reset_round_trip_ignores_the_memory_clock`, `clicking_outside_settings_stamps_the_close`.
+
+**Gotchas:**
+- **`reopen_settings` must stay clock-blind.** The `Shift+R` reset flow swaps Settings → Confirm →
+  Settings mid-visit through it; routing that through the expiry check would reset the cursor under the
+  user's hands whenever an old stamp had aged out. `open_settings` is the only from-the-panels entry.
+- Backdating in tests is `Instant::now().checked_sub(SETTINGS_MEMORY_TTL)` — `Option<Instant>` is the
+  field type, so it drops straight in.
+- Another session's uncommitted work was in the tree the whole time (Help/Confirm click-outside,
+  `Overlay::Help(HelpView)`, delete confirms): `confirm_click_outside_cancels_without_confirming` was
+  failing and clippy flagged `event_loop.rs` `copy_via`'s `return` + `config.rs:1007` — none of it
+  mine. See [Shared Working Tree Is Raced By Other Sessions] before chasing a red test you didn't cause.
+
+### A Double Tap Of `h`/`l` At The End Of The Row Jumps Like ^⇧H/^⇧L — 2026-08-27
+
+**Asked:** "when navigating with the h and l keys, extend it so when i double tap the h or l when I'm at
+the locked layer, it should act as if I did a control shift h or l command"
+→ picked (prompt-daddy): *Second press at the stop* — "When h or l is pressed and focus is already at the
+edge where it stops … that press should act like Ctrl+Shift+L / Ctrl+Shift+H instead of doing nothing"
+→ corrected after the first cut: "it incorrectly allows me to toggle past sessions list into the terminal
+panel, and the reverse end I incorrecly can press h once to get to the workspaces. how it really should
+work is a user must double tap h to 'jump' over that blocked boundary. you should just be able to add a
+50ms elapse time check to add this, but find other options"
+
+**Did:** `Action::FocusLeft` / `Action::FocusRight` in `crates/nebula-tui/src/event_loop.rs` (~1300)
+share `walk_focus_back(app)` / `walk_focus_forward(app)` (next to `enter_terminal_pane`, ~4745) with
+`FocusPrev` / `FocusNext`, except at the ends of the row: `l` at Sessions (or on an unlocked live pane)
+and `h` at Projects-with-the-bar-shown go through `double_tapped(app, action, armed, &chord, does)`. First
+press: stays put, arms `app.edge_tap = Some((action, Instant))` (new field in `app.rs` next to `flash`),
+and flashes "`l` again: enter pane" / "`h` again: workspaces" in the footer. Second press of the same
+action within `DOUBLE_TAP` (400 ms, matching `DOUBLE_CLICK`) jumps. `handle_key` `take()`s the arm before
+the keymap lookup, so any other key — bound or not — breaks the pair; a late second press re-arms. `h` at
+Projects with the bar hidden neither arms nor flashes. Docs: `focus_left`/`focus_right` hints, help row
+"focus left / right (2×: jump)", the locked-input comment, README rows 257–258. Tests:
+`h_and_l_walk_panel_focus_like_the_arrows`, `a_slow_or_interrupted_second_tap_at_the_edge_stays_put`,
+`double_tapped_right_at_sessions_enters_the_pane_and_locks_it` (was `plain_right_stops_at_sessions`),
+`focus_walk_includes_the_workspaces_bar_only_when_shown`. 467 unit + 5 e2e_tui green.
+
+**Gotchas:**
+- **"Double tap" means double tap.** The prompt-daddy pick read it as "a press at the edge that would
+  otherwise be a no-op" — no timer — and shipped a single `l` at Sessions crossing into the pane. The user
+  rejected that within a minute: the single press at the boundary *must* stay a no-op; only the pair jumps.
+  When the user says a gesture, implement the gesture, not the state it implies.
+- **50 ms is not a human double tap.** Two deliberate key-downs are ~120–250 ms apart; 50 ms would only
+  ever be hit by held-key auto-repeat. Reused the app's `DOUBLE_CLICK` value (400 ms) so the keyboard and
+  mouse "again, deliberately" gestures feel the same; it's one const to tune.
+- **Held-key auto-repeat still spills.** macOS default repeat is ~90 ms, inside any sane window, so holding
+  `l` from Worktrees will arm and then fire into the pane. Nebula pushes only
+  `KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES` (`event_loop.rs:166`); adding `REPORT_EVENT_TYPES`
+  would deliver repeats as `KeyEventKind::Repeat` and let `double_tapped` ignore them — not done, since it
+  changes what every terminal sends. The open option if the spill bites.
+- "Locked layer" in the original prompt meant the edge where h/l stop, not the locked pane — in a locked
+  pane `h`/`l` are forwarded to the agent and can't be a gesture without eating keystrokes.
+- `h`/`l` and `←`/`→` are one action each (`focus_left`/`focus_right`), so **the arrows got the double
+  tap too**; the flash uses `chord.display()` so it names whichever key was pressed.
+- `app.flash` is cleared at the top of every key event (`handle_terminal_event`, ~1057) *before* dispatch,
+  so a flash set during the press survives exactly until the next key — a free one-shot hint.
+- Help-overlay descriptions are clipped at `width - 16` of a 46-column half (≈30 chars); longer rows lose
+  their tail silently.
+- The locked-input comment above the hatch block still said "⇧Tab / ^⇧H wrapping round from the first
+  panel" — stale since the panel-walk change earlier today; prose near `HARDWIRED_UNLOCK` lies easily.
+- **The live TUI was `target/debug/nebula`** (a 1h+ old process), and `~/.cargo/bin/nebula` is now a
+  regular 8 MB file that differs from `target/release/nebula` — not the symlink the Focus-Key Odyssey entry
+  describes. Rebuild debug *and* release, and the user has to restart the TUI to see a keymap change.
+
+### Prompt Daddy: Every New Prompt Gets Three Rewrites To Pick From — 2026-08-27
+
+**Asked:** "analyze memory.md for how i normally prompt and give me patterns you see, good or bad" → "using
+this info, create a skill called prompt-daddy which will take your original prompt and give you 3 examples
+to pick from that improve the original prompt, add prompt daddy to claude.md instructions so my agent uses
+it on every new prompt"
+
+**Did:** New `.claude/skills/prompt-daddy/SKILL.md` (user-invocable). It runs after the MEMORY.md read and
+before any planning: read the prompt against an eleven-row failure table distilled from this log, write
+three rewrites in the user's voice, present them with `AskUserQuestion` (three previews + **Keep
+original**, recommended one first), and take the pick as the request. Ambiguous prompt → the three are the
+three plausible *readings*, fully specified; clear prompt → Tight / Grounded / Staged depth variants.
+`CLAUDE.md` gained a "Refine the prompt before acting on it" step between the memory read and the work.
+The skill skips itself for replies to an agent question, bare confirmations, already-specific mid-task
+corrections, slash-commands / skill triggers ("commit push release"), and headless runs.
+
+**Gotchas:**
+- The patterns behind the failure table, from the 84 prompts in this log: one word carrying the whole spec
+  ("done" — four turns, both first readings wrong; "move" — satisfied the literal words; "remove the
+  ability to add notes" — asked twice identically and still needed a scope question), tweaking a liked
+  behavior without naming what stays (Ctrl+Shift+H/L), circular when-clauses ("auto focus when focused"),
+  visual asks without a screenshot iterating where ones with a screenshot landed in one shot. Bug reports
+  with the exact on-screen text and a "works in X, not in Y" contrast were diagnosed in one session every
+  time. Escalated re-asks carried no new spec; the fix arrived with the next constraint, not the next tone.
+- When writing the memory entry for a task that went through prompt-daddy, quote the **original** prompt
+  (this skill's rule) and put the picked rewrite on the correction line underneath — the refinement is the
+  data the next analysis of prompting needs.
+- Skill discovery is live: the new `SKILL.md` appeared in the session's skill listing as soon as the file
+  existed, no restart needed.
+
 ### Workspace-Wide Dedup Pass: Named Literals, Shared Helpers, `nebula_core::env` — 2026-08-27
 
 **Asked:** "go through the code and find places you can dry up magic numbers, remove duplicate code,
 improve code to match rust best practices. verify we have a test before the code you're about to refactor
 or write one if not, then refactor, make pr when done"
+
+**Follow-up (2026-08-28):** "fix the conflicts on https://github.com/AgentSystemLabs/nebula/pull/18"
 
 **Did:** Six commits on `clean-up`, one per area, all behavior-preserving; 710 tests (was 690), clippy
 warning-free workspace-wide (was 7), `fmt --check` clean. Four read-only survey agents produced ~100
@@ -36,8 +493,20 @@ the three key-name fns; `ipc::await_ack`/`current_agent_id`/`RenameMode`; `pull_
 `event_loop`: `send`/`send_with`, `selected_checkout`, `spawn_editor_modal`, `settings_mut`, `contains`,
 `is_double_click`, `MenuItem::new` (46 literals), `Landing` enum, `next_focus`. e2e: `make_executable`,
 `subscribe`, `agent_cli`, named timeouts and key-byte consts.
+Merged `origin/main` into PR #18 without rewriting its history, retaining the v0.14.0 PROJECT rename,
+DOUBLE TAP, CONFIRM DIALOG hit-testing and paused-rebase worktree label changes. Verification after the
+merge: 728 workspace tests, `cargo fmt --check`, and workspace clippy with warnings denied.
 
 **Gotchas:**
+- **The four marker conflicts were not the whole merge.** `event_loop.rs::jump_to_target` auto-merged
+  the PR's `landing: Landing` signature with main's stale `attach` call, and the PR's shared
+  `confirm_*` constructors auto-merged without main's new `ConfirmDialog::area`; `cargo check --workspace`
+  caught both markerless failures. Audit the combined diff and compile before treating a marker-clean
+  merge as resolved.
+- `git.rs` needed both sides: keep the PR's pure `parse_worktree_list` (and its porcelain test), then let
+  async `list_worktrees` replace only detached labels via main's `rebasing_branch`. The E2E PTY conflict
+  likewise keeps `EVENT_TIMEOUT` while waiting for both the Ack and the project upsert; Ack and broadcast
+  order is deliberately unspecified.
 - **Agent worktrees (`isolation: "worktree"`) branch from `main`, not from the lead's branch.** All three
   builders reported `nebula_core::env` "does not exist" and found `ui.rs` ~100 lines shifted (a memory
   modal had landed on main meanwhile). Commit the shared groundwork, then either rebase your branch onto
@@ -159,8 +628,9 @@ hints, help-overlay row, the locked-input comment, two README spots. Tests
   sent the raw kitty bytes (`\x1b[108;6u` / `\x1b[104;6u`) to the real binary settled "is it the code
   or the build?" in one run. `strings target/debug/nebula | grep <new hint text>` settles which build
   is running. Both were fine — the disagreement was about the spec.
-- The user is on **Ghostty** now (`TERM_PROGRAM=ghostty`), which is why `^⇧H`/`^⇧L` reach nebula at
-  all; the older note that they're on Terminal.app is stale.
+- `^⇧H`/`^⇧L` only reach nebula on a terminal that encodes the chord — it did when this was written
+  (Ghostty). **Stale as of 2026-08-28: `TERM_PROGRAM=WezTerm`**, Ghostty 1.3.1 still installed. Check
+  `TERM_PROGRAM` rather than trusting either note; the older Terminal.app note is stale too.
 - In `crates/nebula/tests/e2e_tui.rs`, "the walk stops here" is untestable with `wait_for_text` alone —
   it passes trivially if the footer is already up — so the stop is proved by pressing the extra key and
   then walking one step the other way. ⇧Tab is `\x1b[Z`, Ctrl+→ is `\x1b[1;5C`.
@@ -190,6 +660,47 @@ to `ws2`, and shows the bar again. 685 workspace tests green, no new clippy warn
   now draw that header — harmless, but a future `text.contains("PROJECTS")` in one of them would fail.
 - One existing assertion had to move: `shift_w_toggles_the_workspaces_bar_and_parks_focus` checked
   `lines[1].starts_with("   PROJECTS")` on the hidden path; it's `"   DEFAULT"` now.
+
+### A Paused Rebase Renamed The Worktree Row To `detached @ …` — 2026-08-27
+
+**Asked:** "something in this conversation caused the worktree to show up in the UI but then it switvhed
+yp detached at f816b5f.  I wouldn't have expected the wortree name to become detached"
+
+**Did:** Diagnosed, then fixed in `95c0a18`. The cause was the `git rebase origin/main` in the entry above
+pausing on conflicts: a rebase parks HEAD on the commits it replays, so `git worktree list --porcelain`
+prints `detached` (no `branch` line) for the checkout for as long as it sits there. The 2s worktree sync
+(`reconcile_project_worktrees`, `registry.rs`) saw `known.branch != entry.branch`, wrote `detached @
+f816b5f` into the row and broadcast it, then wrote the branch back on the tick after `rebase --continue`
+finished. `git::list_worktrees` (`crates/nebula-daemon/src/git.rs`) now resolves a branch-less entry
+through the new `rebasing_branch(checkout)`: `git rev-parse --absolute-git-dir`, then
+`<git-dir>/{rebase-merge,rebase-apply}/head-name` (`refs/heads/<branch>` — the same file `git status`
+reads to say "rebasing branch X"). Only a checkout with no rebase in progress, or one rebasing from an
+already-detached HEAD (`head-name` reads `detached HEAD`), still gets `detached_label`. Test
+`a_paused_rebase_keeps_the_worktree_on_its_branch` walks mid-rebase → `--abort` → `checkout --detach`.
+147 daemon tests green.
+
+**Gotchas:**
+- **The row heals itself, so the bug is easy to write off as cosmetic — it isn't.** `nebula worktree
+  <name>` finds its target by `w.branch == branch` (`registry.rs:~1377`) and *creates* a worktree when
+  nothing matches, so an agent running it mid-rebase would have tried to add a second checkout for a
+  branch that already has one. Anything keyed on the branch string is blind for the whole pause.
+- The rebase state lives in the **per-worktree** git dir (`<repo>/.git/worktrees/<name>/rebase-merge/`),
+  not the shared `.git` — `git_common_dir` in `lib.rs` deliberately hops *to* the shared one for the
+  mtime probe and is the wrong helper here; `rev-parse --absolute-git-dir` from the checkout is right.
+- `git worktree list` may print canonical paths while `add_worktree` returns the tempdir spelling
+  (`/var/…` vs `/private/var/…` on macOS): the existing `remove_worktree_*` tests only assert
+  `e.path != wt`, which passes trivially either way. Canonicalize both sides when a test needs to *find*
+  the entry.
+- `git::current_branch` is a second, uncalled copy of this label logic with its own `detached@` format.
+  Left alone, but don't reach for it thinking it agrees with `list_worktrees`.
+- **A "load race" can be a build-layout race.** After this change `workspace_scope_is_per_connection`
+  (e2e_pty) failed 7 of 11 *idle* runs while the pre-change `git.rs` passed 13 of 13 — yet a probe
+  showed `rebasing_branch` was never called and the porcelain parse was identical. Adding file I/O to
+  `list_worktrees` for the probe made it pass 3/3: pure timing. It was the documented Ack-beats-upsert
+  race, and a code change that never runs in the test still shifts the odds. Fixed on the test side
+  (`6638952`): wait for the upsert *and* the Ack, as `cli_add_project` does; the TUI never relied on the
+  order (`event_loop.rs` "usually lands just before this Ack; if not, …"). A/B the old file in place
+  (`git show <sha>:path > path`, run, `git checkout -- path`) before believing either verdict.
 
 ### Released v0.13.0 Off A Checkout Three Releases Stale — 2026-08-27
 
@@ -399,6 +910,94 @@ on the session row *and* the project row above it. 450 nebula-tui + 143 daemon +
   never again: another session was editing this shared checkout mid-build. Rerun before debugging (see
   [Shared tree races] in the user memory).
 
+### A Workspace Switch Cold-Booted A Fleet Of Claude CLIs — 2026-08-26
+
+**Asked:** "in a worktree, debug a performance issue when a user switches between workspaces sometimes it
+seems like it's lagging or stuck loading up multiple claude sessions as the terminal panel doesn't show for
+like 5-10 seconds"
+
+**Did:** Three compounding causes, all confirmed against the live `~/.nebula-dev` daemon log and DB, fixed
+in `327757f` (originally `7246a47`; the branch sat unmerged for a day and was rebased onto `origin/main`
+at v0.13.0 on 2026-08-27 — see the rebase notes at the end of this entry).
+
+1. **Every switch attaches a *dead* session.** `session_idle_timeout` defaults to `5m`
+   (`nebula-daemon/src/config.rs:44`), and `reap_idle_sessions` kills everything in a workspace nobody is
+   attached to — the dev `daemon.log` is wall-to-wall `reaping idle session … idle_secs=300`. So
+   `switch_workspace_inner` → `restore_context` → `restore_session` → `attach` lands on a dead sref and
+   the daemon's `Attach` arm cold-spawns `zsh -l -i -c 'exec claude --resume <sid>'`. The replay it sends
+   back is **empty** (fresh ring), so the pane rendered a blank vt100 grid with no indication of anything
+   happening.
+2. **250ms later the prewarm booted every *other* session in the worktree, inline.**
+   `PrewarmWorktreeSessions` was handled synchronously on the connection's request loop
+   (`server.rs:426`, the old comment said "Deliberately inline"), and `prewarm_worktree_sessions` called
+   `ensure_session` for every dead non-archived row. `main` in the dev DB has **5 agents** → 5 concurrent
+   login-shell + claude boots, plus a 6th from `PrewarmAgent`, all starving the one the user was waiting
+   on — and stalling that client's `Input` frames for the whole burst.
+3. **`attach` had no debounce**, unlike prewarm. In the Workspaces column `move_selection` runs a full
+   `switch_workspace` per row (`event_loop.rs`), so walking past four workspaces cold-spawned four CLIs
+   and abandoned three, each then living 5 more minutes.
+
+Fixes: `Daemon::spawn_gate` (`registry.rs`) makes `ensure_session`'s check-and-install atomic, which is
+what lets the sweep leave the request loop — `run_worktree_prewarm` is now its own task, boots one session
+per `PREWARM_STAGGER` (1.5s), skips `is_alive` rows, and `prewarm_sweep` aborts a superseded sweep.
+TUI-side, `attach` defers the request by `ATTACH_DEBOUNCE` (180ms) via `pending_attach`, with
+`attached_sref` tracking what the daemon actually holds while `term.sref` runs ahead; `attach_now` /
+`preview_selected_now` skip the wait for explicit picks. `AttachedTerm::painted` drives a `starting…` tag
+plus a centered notice in `draw_terminal`. 631 tests green when written; **657 green after the rebase**
+(exit 0, `--no-fail-fast`, all 7 binaries).
+
+**Gotchas:**
+- **Measure the boot before blaming the code.** One fresh `claude` under `zsh -l -i` on this machine is
+  **0.67s to first byte, 1.47s to a painted screen** — and that's without `--resume` reloading a
+  transcript. Six of those at once is the whole 5-10s. A pty-fork bench spawning 4 at once got the shell
+  OOM-killed (exit 137) and 3 at once never finished in 120s; benchmark agent CLIs **one at a time**.
+- **`app.term` and the daemon's attachment are now two different things.** Tests that set
+  `app.term = Some(AttachedTerm::new(…))` directly leave `attached_sref` unset, so a `detach_if_attached`
+  keyed only on `attached_sref` silently stopped emitting `Detach` and broke 4 tests. Both
+  `detach_if_attached` and `release_attachment` deliberately fall back to `term.sref` — a `Detach` the
+  daemon holds no attachment for is a no-op there (`server.rs` `attached.remove()` returns `None`).
+- **Debouncing `attach` breaks every test that asserts an immediate `Attach` after a selection move.** 10
+  failed. Only 2 were genuinely the new contract (`session_arrows_preview_without_focusing`,
+  `switching_contexts_restores_the_remembered_session` — both now call `fire_pending_attach` to settle).
+  The other 8 were paths that *should* stay immediate: wrap `reconcile_selection` and `jump_to_target`
+  (both have early `return`s, so wrapping beats appending) and route clicks through
+  `preview_selected_now`.
+- **Input is dropped for a session the daemon hasn't spawned**, so a pending attach must land before the
+  first keystroke. `handle_terminal_event` fires it up front when `term_locked`; the two paths that take
+  the lock without attaching (`Action::Activate` on an already-focused pane, `Action::Zoom`) fire it too.
+- The 100-col draw-test truncation trap from [A Workspaces Column Left Of Projects] bites again: the
+  `starting…` test asserts pane body text, so it needs `show_workspaces = false` **and**
+  `TestBackend::new(140, 30)` or the string is clipped mid-assert.
+- The `switch_workspace_quietly` double-attach gotcha below is unaffected — the debounce happens to mask
+  that churn now, but the quiet variant is still what makes a cross-workspace jump correct.
+
+**Rebase onto v0.13.0 (2026-08-27), 20 commits later:**
+- Only two files conflicted (`registry.rs`, `event_loop.rs`); `server.rs`, `app.rs` and `ui.rs` merged
+  clean. Both `registry.rs` conflicts were additive-on-both-sides (main's `pending_moves` /
+  `cloud_attach_gated` / `cloud_mirrors` vs. this branch's `spawn_gate` / `prewarm_sweep`) — keep both.
+- **The one semantic conflict is `attach`.** Main added `mark_agent_seen` to the top of it (see
+  [Unwatched Finishes Count On The Project And Worktree Rows]) on the reasoning that every path landing
+  the pane on a session goes through `attach`. After this branch's split that funnel is `attach_inner`,
+  so the call moves there — keyed to the **pane swap, not the Attach**, because the user is reading the
+  screen during the debounce just the same. Putting it in `attach` alone would have skipped
+  `attach_now` / `preview_selected_now` and leaked unread counts on every explicit pick.
+- Two of main's newer tests failed, and they are not the same kind of failure:
+  `switching_back_to_a_workspace_restores_project_worktree_and_session` is *exactly* the path the
+  debounce exists for, so the test was updated to the new contract (pane restores now, Attach after
+  `fire_pending_attach`). `snapshot_reattaches_the_remembered_session` is not — a boot restores one
+  remembered session once, with no cursor sweep to wait out, so the Snapshot arm moved to
+  `preview_selected_now` and main's assertion stands unchanged. **A failing attach-timing test is a
+  question about which path it is, not a licence to relax the assertion.**
+- Struct drift in the branch's new test only: `Project` lost the four `divider_*` fields (migration 18)
+  and `Agent` gained `unseen` / `cloud_session_id` / `cloud_mirroring`. `cargo build` was clean and only
+  `cargo test --no-run` surfaced it — test-only literals need the test compile to be checked.
+- The workspaces *column* became a top tab bar on main, but `move_selection` there still does a full
+  `switch_workspace` per step, so the premise of cause 3 survived the rework and
+  `walking_the_workspaces_column_attaches_only_where_it_stops` passes untouched.
+- `cargo fmt --check` and clippy are **dirty on `origin/main` itself** (a `base64_encode` line, 7 clippy
+  warnings incl. `needless_return` at `event_loop.rs:5197`). None are in this diff — confirm with
+  `git diff origin/main --stat -- <file>` before assuming a warning is yours.
+
 ### Released v0.11.0 Out Of A Shared Tree That Moved Mid-Release — 2026-08-26
 
 **Asked:** "commit push release"
@@ -577,7 +1176,8 @@ HEAD = origin/main, working tree = v0.10.0 + the three features, still uncommitt
 - `git diff --quiet <commit>` only compares tracked files — it will say the tree matches even when
   untracked WIP is missing. `cmp` the untracked files separately.
 - `workspace_scope_is_per_connection` (e2e_pty) failed twice under a parallel clippy+test run and passed
-  alone: the Ack-beats-upsert load race the v0.10.0 entry describes, not the merge.
+  alone: the Ack-beats-upsert load race the v0.10.0 entry describes, not the merge (test fixed
+  2026-08-27, `6638952`).
 - The old Makefile's dev daemon lives at `/tmp/nebula-dev`; the new per-checkout slot is
   `/tmp/nebula-dev-<8 chars of shasum of $CURDIR>` (`2f3f877f` for the main checkout), so the new
   `dev-stop` cannot see a daemon the old recipe started. A `make dev` TUI that was already open keeps its
@@ -693,7 +1293,8 @@ for the dot splitting violet (unread) from green (read) on the same `unseen` fla
   `cargo build --release` ran alongside, then passed alone and 2 of 2 idle full-suite runs. Its
   `expect("AddProject upserts the project")` only sees the broadcast upsert if it lands before the Ack —
   `server.rs` writes the Ack from the request loop and the upsert from the broadcast forwarder, so under
-  CPU contention the Ack can win. A load race, not a regression: rerun idle before debugging.
+  CPU contention the Ack can win. **Fixed 2026-08-27 (`6638952`):** the test now waits for the upsert as
+  well as the Ack, like `cli_add_project` always did — see [A Paused Rebase Renamed The Worktree Row].
 
 ### One Nebula Per Checkout: Auto-Port For `browser`, Per-Path Dev Slots — 2026-08-26
 
@@ -943,6 +1544,8 @@ called from `SettingsCmd::FocusTabs` / `EnterList` and from both settings mouse-
   it rather than pressing `s` and navigating.
 - All this state is per-process only — `UiState` (the blob persisted in the daemon DB) was deliberately
   left alone, so a fresh `nebula` always starts on the strip.
+- Since 2026-08-27 the memory also expires a minute after closing — see [Settings Position Memory
+  Expires A Minute After Closing].
 
 ### Project Dividers Removed From The Projects Column — 2026-08-25
 
@@ -1423,7 +2026,8 @@ glyph assertions in `event_loop.rs::pill_rail_spans_pads_and_sessions_match_work
 move notes and links to other hotkeys, but h and l should be for left and right" — issue #8 asks for the
 vim pairing, since `h`/`l` opened the ssh hosts picker and the add-link prompt instead.
 
-**Did:** Four `defaults:` arrays in `crates/nebula-tui/src/keymap.rs` — `focus_left` → `["h", "left"]`,
+**Did:** (extended 2026-08-27: a double tap at either end now jumps like ⇧Tab/Tab — see the entry above.)
+Four `defaults:` arrays in `crates/nebula-tui/src/keymap.rs` — `focus_left` → `["h", "left"]`,
 `focus_right` → `["l", "right"]`, `hosts` → `["shift+h"]`, `new_link` → `["shift+l"]`. No dispatch code
 changed. New test `h_and_l_walk_panel_focus_like_the_arrows` in `event_loop.rs`; the hosts and link tests
 (8 unit + 3 in `crates/nebula/tests/e2e_tui.rs`) now drive `⇧H`/`⇧L`. PR #12 off `worktree-hl-panel-nav`.
@@ -2381,8 +2985,9 @@ vt100 `contents_between`, `pbcopy` on mouse-up).
   what made double-Esc unworkable.
 - "Shift+drag selects text" is a lie in Terminal.app — there's no mouse-reporting bypass there, unlike
   Ghostty/iTerm.
-- The user runs `nebula` via a `~/.cargo/bin` symlink to `target/release` — **rebuild release and restart
-  the TUI** before testing keybinding changes, or you are testing a stale process.
+- The user runs `nebula` via a `~/.cargo/bin` symlink to `target/release` (as of 2026-08-27 it is a
+  regular file, and the live TUI was `target/debug` — check `ps` for which) — **rebuild and restart the
+  TUI** before testing keybinding changes, or you are testing a stale process.
 
 ### Bootstrap: Daemon/TUI Split — 2026-08-04
 

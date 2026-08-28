@@ -81,7 +81,7 @@ End the message with:
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 ```
 
-Keep project-memory scaffolding (`.claude/`, `CLAUDE.md`) in its own commit — it is not part of the
+Keep project-memory scaffolding (`.claude/`, `CLAUDE.md`, `AGENTS.md`, `TERMS.md`) in its own commit — it is not part of the
 release story and clutters the changelog.
 
 ## 4. Bump the version

@@ -3257,9 +3257,21 @@ async fn workspace_scope_is_per_connection() {
     )
     .await
     .unwrap();
+    // Wait for the upsert itself, not just the Ack: the Ack is written from
+    // the request loop and the upsert from the broadcast forwarder, and the
+    // daemon promises no order between them (the TUI handles either).
+    let is_project_upsert = |e: &ServerEvent| {
+        matches!(
+            e,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(_)
+            }
+        )
+    };
     let events = read_events_until(&mut a, EVENT_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::Ack { req_id: 3, .. }))
+            && evs.iter().any(is_project_upsert)
     })
     .await;
     let project_a = events
@@ -3291,9 +3303,19 @@ async fn workspace_scope_is_per_connection() {
     )
     .await
     .unwrap();
+    let repo_b_canon = repo_b.canonicalize().unwrap();
+    let is_repo_b_upsert = |e: &ServerEvent| {
+        matches!(
+            e,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(p)
+            } if p.repo_path == repo_b_canon
+        )
+    };
     let events = read_events_until(&mut b, EVENT_TIMEOUT, |evs| {
         evs.iter()
             .any(|e| matches!(e, ServerEvent::Ack { req_id: 4, .. }))
+            && evs.iter().any(is_repo_b_upsert)
     })
     .await;
     let project_b = events
@@ -3301,7 +3323,7 @@ async fn workspace_scope_is_per_connection() {
         .find_map(|e| match e {
             ServerEvent::EntityUpserted {
                 entity: Entity::Project(p),
-            } if p.repo_path == repo_b.canonicalize().unwrap() => Some(p.clone()),
+            } if p.repo_path == repo_b_canon => Some(p.clone()),
             _ => None,
         })
         .expect("AddProject upserts the project");
