@@ -29,6 +29,8 @@
 //! progress bar, 1/2/3/4 are normal/error/indeterminate/paused. Anything
 //! that isn't 0 counts as busy.
 
+use super::{BEL, ESC};
+
 /// Longest OSC payload we will buffer. `9;4;<state>;<pct>` is far shorter;
 /// anything longer (a title, a hyperlink, a base64 image) is poisoned and
 /// skipped without allocating.
@@ -100,7 +102,7 @@ impl ProgressScanner {
     fn step(&mut self, b: u8) {
         match self.state {
             State::Ground => {
-                if b == 0x1b {
+                if b == ESC {
                     self.state = State::Esc;
                 }
             }
@@ -109,18 +111,18 @@ impl ProgressScanner {
                     self.buf.clear();
                     self.state = State::Osc { poisoned: false };
                 } else {
-                    self.state = if b == 0x1b { State::Esc } else { State::Ground };
+                    self.state = if b == ESC { State::Esc } else { State::Ground };
                 }
             }
             State::Osc { poisoned } => match b {
-                0x07 => {
+                BEL => {
                     if !poisoned {
                         self.dispatch();
                     }
                     self.buf.clear();
                     self.state = State::Ground;
                 }
-                0x1b => self.state = State::OscEsc { poisoned },
+                ESC => self.state = State::OscEsc { poisoned },
                 _ => {
                     if !poisoned {
                         self.buf.push(b);
@@ -143,7 +145,7 @@ impl ProgressScanner {
                 } else {
                     // Aborted mid-OSC; ESC ESC restarts the escape.
                     self.buf.clear();
-                    self.state = if b == 0x1b { State::Esc } else { State::Ground };
+                    self.state = if b == ESC { State::Esc } else { State::Ground };
                 }
             }
         }

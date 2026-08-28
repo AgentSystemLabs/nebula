@@ -250,15 +250,10 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     reply(&out_tx, req_id, daemon.add_workspace(&name).map(Some)).await;
                 }
                 ClientRequest::RemoveWorkspace { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.remove_workspace(&id).map(|_| None)).await;
+                    reply_done(&out_tx, req_id, daemon.remove_workspace(&id)).await;
                 }
                 ClientRequest::RenameWorkspace { req_id, id, name } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.rename_workspace(&id, &name).map(|_| None),
-                    )
-                    .await;
+                    reply_done(&out_tx, req_id, daemon.rename_workspace(&id, &name)).await;
                 }
                 ClientRequest::OpenWorkspace { req_id, id } => {
                     // Scope this connection, and leave the pick behind as the
@@ -268,7 +263,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     if result.is_ok() {
                         workspace = Some(id);
                     }
-                    reply(&out_tx, req_id, result.map(|_| None)).await;
+                    reply_done(&out_tx, req_id, result).await;
                 }
                 ClientRequest::AddProject {
                     req_id,
@@ -287,15 +282,10 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     .await;
                 }
                 ClientRequest::RemoveProject { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.remove_project(&id).map(|_| None)).await;
+                    reply_done(&out_tx, req_id, daemon.remove_project(&id)).await;
                 }
                 ClientRequest::MoveProject { req_id, id, delta } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.move_project(&id, delta).map(|_| None),
-                    )
-                    .await;
+                    reply_done(&out_tx, req_id, daemon.move_project(&id, delta)).await;
                 }
                 ClientRequest::CreateWorktree {
                     req_id,
@@ -321,21 +311,11 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     let daemon = daemon.clone();
                     let out_tx = out_tx.clone();
                     tokio::spawn(async move {
-                        reply(
-                            &out_tx,
-                            req_id,
-                            daemon.delete_worktree(&id, force).await.map(|_| None),
-                        )
-                        .await;
+                        reply_done(&out_tx, req_id, daemon.delete_worktree(&id, force).await).await;
                     });
                 }
                 ClientRequest::SetWorktreePinned { req_id, id, pinned } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.set_worktree_pinned(&id, pinned).map(|_| None),
-                    )
-                    .await;
+                    reply_done(&out_tx, req_id, daemon.set_worktree_pinned(&id, pinned)).await;
                 }
                 ClientRequest::CreateAgent {
                     req_id,
@@ -411,32 +391,17 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     daemon.prewarm_worktree_sessions(&worktree, cols, rows);
                 }
                 ClientRequest::RenameAgent { req_id, id, name } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.rename_agent(&id, &name).map(|_| None),
-                    )
-                    .await;
+                    reply_done(&out_tx, req_id, daemon.rename_agent(&id, &name)).await;
                 }
                 ClientRequest::AutoRenameAgent { req_id, id, name } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.auto_rename_agent(&id, &name).map(|_| None),
-                    )
-                    .await;
+                    reply_done(&out_tx, req_id, daemon.auto_rename_agent(&id, &name)).await;
                 }
                 ClientRequest::MoveAgent {
                     req_id,
                     id,
                     worktree,
                 } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.move_agent(&id, &worktree).map(|_| None),
-                    )
-                    .await;
+                    reply_done(&out_tx, req_id, daemon.move_agent(&id, &worktree)).await;
                 }
                 ClientRequest::EnterWorktree {
                     req_id,
@@ -458,37 +423,22 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     let _ = out_tx.send(ev).await;
                 }
                 ClientRequest::ArchiveAgent { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.archive_agent(&id).map(|_| None)).await;
+                    reply_done(&out_tx, req_id, daemon.archive_agent(&id)).await;
                 }
                 ClientRequest::UnarchiveAgent { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.unarchive_agent(&id).map(|_| None)).await;
+                    reply_done(&out_tx, req_id, daemon.unarchive_agent(&id)).await;
                 }
                 ClientRequest::SetAgentPinned { req_id, id, pinned } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.set_agent_pinned(&id, pinned).map(|_| None),
-                    )
-                    .await;
+                    reply_done(&out_tx, req_id, daemon.set_agent_pinned(&id, pinned)).await;
                 }
                 ClientRequest::DeleteAgent { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.delete_agent(&id).map(|_| None)).await;
+                    reply_done(&out_tx, req_id, daemon.delete_agent(&id)).await;
                 }
                 ClientRequest::RestartAgent { req_id, id } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.restart_agent(&id).await.map(|_| None),
-                    )
-                    .await;
+                    reply_done(&out_tx, req_id, daemon.restart_agent(&id).await).await;
                 }
                 ClientRequest::AttachCloudAgent { req_id, id } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.attach_cloud_agent(&id).await.map(|_| None),
-                    )
-                    .await;
+                    reply_done(&out_tx, req_id, daemon.attach_cloud_agent(&id).await).await;
                 }
                 ClientRequest::SendCloudMessage {
                     req_id,
@@ -496,10 +446,10 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     message,
                 } => {
                     tracing::info!(agent = %id, bytes = message.len(), "send to cloud session");
-                    reply(
+                    reply_done(
                         &out_tx,
                         req_id,
-                        daemon.send_cloud_message(&id, &message).await.map(|_| None),
+                        daemon.send_cloud_message(&id, &message).await,
                     )
                     .await;
                 }
@@ -528,21 +478,16 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     .await;
                 }
                 ClientRequest::UpdateLink { req_id, id, url } => {
-                    reply(&out_tx, req_id, daemon.update_link(&id, &url).map(|_| None)).await;
+                    reply_done(&out_tx, req_id, daemon.update_link(&id, &url)).await;
                 }
                 ClientRequest::DeleteLink { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.delete_link(&id).map(|_| None)).await;
+                    reply_done(&out_tx, req_id, daemon.delete_link(&id)).await;
                 }
                 ClientRequest::RenameTerminal { req_id, id, name } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.rename_terminal(&id, &name).map(|_| None),
-                    )
-                    .await;
+                    reply_done(&out_tx, req_id, daemon.rename_terminal(&id, &name)).await;
                 }
                 ClientRequest::CloseTerminal { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.close_terminal(&id).map(|_| None)).await;
+                    reply_done(&out_tx, req_id, daemon.close_terminal(&id)).await;
                 }
             }
         }
@@ -654,6 +599,11 @@ async fn forward_pty(
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+/// [`reply`] for the requests that create nothing: success is a bare Ack.
+async fn reply_done(out_tx: &mpsc::Sender<ServerEvent>, req_id: u64, result: anyhow::Result<()>) {
+    reply(out_tx, req_id, result.map(|_| None)).await
 }
 
 async fn reply(

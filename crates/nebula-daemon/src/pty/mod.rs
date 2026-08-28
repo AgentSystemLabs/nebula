@@ -27,6 +27,26 @@ const READER_CHANNEL_BOUND: usize = 64;
 /// After the polite SIGHUP, how long the child gets to exit before its whole
 /// process group is SIGKILLed.
 const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// Size a session is spawned at when no client is attached to say better
+/// (prewarms, respawns after a move, restarts). The first attach resizes it
+/// to the real pane, so these only shape the child's first paint.
+pub const DEFAULT_COLS: u16 = 80;
+pub const DEFAULT_ROWS: u16 = 24;
+/// The two bytes every output scanner in this module keys on: ESC opens a
+/// CSI/OSC sequence, BEL is the classic OSC terminator.
+pub(crate) const ESC: u8 = 0x1b;
+pub(crate) const BEL: u8 = 0x07;
+
+/// A `PtySize` in cells only. Nothing here knows pixel dimensions, and
+/// leaving them zero is what every caller wants.
+fn pty_size(cols: u16, rows: u16) -> PtySize {
+    PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
 
 /// Broadcast to attached clients (and, later, the status machine).
 #[derive(Clone, Debug)]
@@ -96,8 +116,9 @@ pub struct SpawnSpec {
     pub cwd: std::path::PathBuf,
     /// Extra env vars (NEBULA_* for agents). Plain terminals get none.
     pub env: Vec<(String, String)>,
-    /// Env var names to scrub from the inherited environment.
-    pub scrub_env: Vec<String>,
+    /// Env var names to scrub from the inherited environment. Only ever a
+    /// fixed list (the agent-session vars), so it is borrowed, not built.
+    pub scrub_env: &'static [&'static str],
     pub cols: u16,
     pub rows: u16,
 }
@@ -107,19 +128,14 @@ impl PtySession {
     pub fn spawn(sref: SessionRef, spec: SpawnSpec) -> Result<Arc<Self>> {
         let pty_system = native_pty_system();
         let pair = pty_system
-            .openpty(PtySize {
-                rows: spec.rows,
-                cols: spec.cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+            .openpty(pty_size(spec.cols, spec.rows))
             .context("openpty")?;
 
         let mut cmd = CommandBuilder::new(&spec.program);
         cmd.args(&spec.args);
         cmd.cwd(&spec.cwd);
         cmd.env("TERM", "xterm-256color");
-        for name in &spec.scrub_env {
+        for name in spec.scrub_env {
             cmd.env_remove(name);
         }
         for (k, v) in &spec.env {
@@ -171,12 +187,7 @@ impl PtySession {
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         let master = self.master.lock().unwrap();
-        master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+        master.resize(pty_size(cols, rows))?;
         *self.last_size.lock().unwrap() = (cols, rows);
         Ok(())
     }
@@ -188,18 +199,8 @@ impl PtySession {
         let same = { *self.last_size.lock().unwrap() == (cols, rows) };
         if same && rows > 1 {
             let master = self.master.lock().unwrap();
-            master.resize(PtySize {
-                rows: rows - 1,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })?;
-            master.resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })?;
+            master.resize(pty_size(cols, rows - 1))?;
+            master.resize(pty_size(cols, rows))?;
             Ok(())
         } else {
             self.resize(cols, rows)
@@ -406,9 +407,9 @@ mod tests {
                 args: vec![],
                 cwd: std::env::temp_dir(),
                 env: vec![],
-                scrub_env: vec![],
-                cols: 80,
-                rows: 24,
+                scrub_env: &[],
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
             },
         )
         .unwrap()

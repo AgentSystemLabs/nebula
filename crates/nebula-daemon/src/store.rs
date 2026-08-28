@@ -303,12 +303,19 @@ impl Store {
         Ok(())
     }
 
-    pub fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
+    /// `DELETE FROM <table> WHERE id = ?1` — every entity delete is exactly
+    /// this one statement, the schema's cascades taking the children with
+    /// the row.
+    fn delete_by_id(&self, table: &'static str, id: &str) -> Result<()> {
         self.conn
             .lock()
             .unwrap()
-            .execute("DELETE FROM workspaces WHERE id = ?1", params![id.as_str()])?;
+            .execute(&format!("DELETE FROM {table} WHERE id = ?1"), params![id])?;
         Ok(())
+    }
+
+    pub fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
+        self.delete_by_id("workspaces", id.as_str())
     }
 
     /// Every workspace, oldest first (the 'default' one leads — it is
@@ -316,25 +323,21 @@ impl Store {
     pub fn load_workspaces(&self) -> Result<Vec<Workspace>> {
         let conn = self.conn.lock().unwrap();
         let workspaces = conn
-            .prepare("SELECT id, name FROM workspaces ORDER BY created_at, id")?
-            .query_map([], |r| {
-                Ok(Workspace {
-                    id: WorkspaceId(r.get(0)?),
-                    name: r.get(1)?,
-                })
-            })?
+            .prepare(&format!(
+                "SELECT {WORKSPACE_COLUMNS} FROM workspaces ORDER BY created_at, id"
+            ))?
+            .query_map([], row_to_workspace)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(workspaces)
     }
 
     pub fn get_workspace(&self, id: &WorkspaceId) -> Result<Option<Workspace>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id, name FROM workspaces WHERE id = ?1")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE id = ?1"
+        ))?;
         let mut rows = stmt.query(params![id.as_str()])?;
-        Ok(rows.next()?.map(|r| Workspace {
-            id: WorkspaceId(r.get::<_, String>(0).unwrap()),
-            name: r.get(1).unwrap(),
-        }))
+        Ok(rows.next()?.map(row_to_workspace).transpose()?)
     }
 
     pub fn workspace_by_name(&self, name: &str) -> Result<Option<WorkspaceId>> {
@@ -343,7 +346,9 @@ impl Store {
         let mut rows = stmt.query(params![name])?;
         Ok(rows
             .next()?
-            .map(|r| WorkspaceId(r.get::<_, String>(0).unwrap())))
+            .map(|r| r.get::<_, String>(0))
+            .transpose()?
+            .map(WorkspaceId))
     }
 
     /// The open workspace. Falls back to 'default' if no row is flagged
@@ -355,7 +360,9 @@ impl Store {
         let mut rows = stmt.query([])?;
         Ok(rows
             .next()?
-            .map(|r| WorkspaceId(r.get::<_, String>(0).unwrap()))
+            .map(|r| r.get::<_, String>(0))
+            .transpose()?
+            .map(WorkspaceId)
             .unwrap_or_default())
     }
 
@@ -412,11 +419,7 @@ impl Store {
     }
 
     pub fn delete_project(&self, id: &ProjectId) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM projects WHERE id = ?1", params![id.as_str()])?;
-        Ok(())
+        self.delete_by_id("projects", id.as_str())
     }
 
     /// The project row for `path` within one workspace. Repo paths may
@@ -438,7 +441,9 @@ impl Store {
         ])?;
         Ok(rows
             .next()?
-            .map(|r| ProjectId(r.get::<_, String>(0).unwrap())))
+            .map(|r| r.get::<_, String>(0))
+            .transpose()?
+            .map(ProjectId))
     }
 
     // ---- worktrees ----
@@ -462,11 +467,7 @@ impl Store {
     }
 
     pub fn delete_worktree(&self, id: &WorktreeId) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM worktrees WHERE id = ?1", params![id.as_str()])?;
-        Ok(())
+        self.delete_by_id("worktrees", id.as_str())
     }
 
     pub fn update_worktree_branch(&self, id: &WorktreeId, branch: &str) -> Result<()> {
@@ -670,11 +671,7 @@ impl Store {
     }
 
     pub fn delete_agent(&self, id: &AgentId) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM agents WHERE id = ?1", params![id.as_str()])?;
-        Ok(())
+        self.delete_by_id("agents", id.as_str())
     }
 
     /// Boot sweep: agents whose PTYs died with the previous daemon.
@@ -714,11 +711,7 @@ impl Store {
     }
 
     pub fn delete_terminal(&self, id: &TerminalId) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM terminals WHERE id = ?1", params![id.as_str()])?;
-        Ok(())
+        self.delete_by_id("terminals", id.as_str())
     }
 
     // ---- links ----
@@ -755,39 +748,24 @@ impl Store {
     }
 
     pub fn delete_link(&self, id: &LinkId) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM links WHERE id = ?1", params![id.as_str()])?;
-        Ok(())
+        self.delete_by_id("links", id.as_str())
     }
 
     pub fn get_link(&self, id: &LinkId) -> Result<Option<Link>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id, worktree_id, url, sort_order FROM links WHERE id = ?1")?;
+        let mut stmt = conn.prepare(&format!("SELECT {LINK_COLUMNS} FROM links WHERE id = ?1"))?;
         let mut rows = stmt.query(params![id.as_str()])?;
-        Ok(rows.next()?.map(|r| Link {
-            id: LinkId(r.get::<_, String>(0).unwrap()),
-            worktree_id: WorktreeId(r.get::<_, String>(1).unwrap()),
-            url: r.get(2).unwrap(),
-            sort_order: r.get(3).unwrap(),
-        }))
+        Ok(rows.next()?.map(row_to_link).transpose()?)
     }
 
     /// Every link, in per-worktree list order.
     pub fn load_links(&self) -> Result<Vec<Link>> {
         let conn = self.conn.lock().unwrap();
         let links = conn
-            .prepare("SELECT id, worktree_id, url, sort_order FROM links ORDER BY worktree_id, sort_order, created_at")?
-            .query_map([], |r| {
-                Ok(Link {
-                    id: LinkId(r.get(0)?),
-                    worktree_id: WorktreeId(r.get(1)?),
-                    url: r.get(2)?,
-                    sort_order: r.get(3)?,
-                })
-            })?
+            .prepare(&format!(
+                "SELECT {LINK_COLUMNS} FROM links ORDER BY worktree_id, sort_order, created_at"
+            ))?
+            .query_map([], row_to_link)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(links)
     }
@@ -824,75 +802,37 @@ impl Store {
 
     pub fn get_project(&self, id: &ProjectId) -> Result<Option<Project>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, name, repo_path, sort_order, COALESCE(workspace_id, 'default') FROM projects WHERE id = ?1")?;
-        let mut rows = stmt.query(params![id.as_str()])?;
-        Ok(rows.next()?.map(|r| Project {
-            id: ProjectId(r.get::<_, String>(0).unwrap()),
-            name: r.get(1).unwrap(),
-            repo_path: PathBuf::from(r.get::<_, String>(2).unwrap()),
-            sort_order: r.get(3).unwrap(),
-            workspace_id: WorkspaceId(r.get::<_, String>(4).unwrap()),
-        }))
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PROJECT_COLUMNS} FROM projects WHERE id = ?2"
+        ))?;
+        let mut rows = stmt.query(params![DEFAULT_WORKSPACE_ID, id.as_str()])?;
+        Ok(rows.next()?.map(row_to_project).transpose()?)
     }
 
     pub fn get_worktree(&self, id: &WorktreeId) -> Result<Option<Worktree>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, project_id, path, branch, is_main, pinned, sort_order FROM worktrees WHERE id = ?1",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {WORKTREE_COLUMNS} FROM worktrees WHERE id = ?1"
+        ))?;
         let mut rows = stmt.query(params![id.as_str()])?;
-        Ok(rows.next()?.map(|r| Worktree {
-            id: WorktreeId(r.get::<_, String>(0).unwrap()),
-            project_id: ProjectId(r.get::<_, String>(1).unwrap()),
-            path: PathBuf::from(r.get::<_, String>(2).unwrap()),
-            branch: r.get(3).unwrap(),
-            is_main: r.get::<_, i64>(4).unwrap() != 0,
-            pinned: r.get::<_, i64>(5).unwrap() != 0,
-            sort_order: r.get(6).unwrap(),
-        }))
+        Ok(rows.next()?.map(row_to_worktree).transpose()?)
     }
 
     pub fn get_agent(&self, id: &AgentId) -> Result<Option<Agent>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, unseen, cloud_session_id FROM agents WHERE id = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare(&format!("SELECT {AGENT_COLUMNS} FROM agents WHERE id = ?1"))?;
         let mut rows = stmt.query(params![id.as_str()])?;
-        Ok(rows.next()?.map(|r| Agent {
-            id: AgentId(r.get::<_, String>(0).unwrap()),
-            worktree_id: WorktreeId(r.get::<_, String>(1).unwrap()),
-            name: r.get(2).unwrap(),
-            status: AgentStatus::parse(&r.get::<_, String>(3).unwrap())
-                .unwrap_or(AgentStatus::Fresh),
-            archived: r.get::<_, i64>(4).unwrap() != 0,
-            pinned: r.get::<_, i64>(5).unwrap() != 0,
-            kind: AgentKind::parse(&r.get::<_, String>(6).unwrap()).unwrap_or_default(),
-            session_id: r.get(7).unwrap(),
-            sort_order: r.get(8).unwrap(),
-            status_changed_at: r.get(9).unwrap(),
-            model: r.get(10).unwrap(),
-            effort: r.get(11).unwrap(),
-            archived_at: r.get(12).unwrap(),
-            unseen: r.get::<_, i64>(13).unwrap() != 0,
-            cloud_session_id: r.get(14).unwrap(),
-            alive: false,
-            cloud_mirroring: false,
-        }))
+        Ok(rows.next()?.map(row_to_agent).transpose()?)
     }
 
     pub fn get_terminal(&self, id: &TerminalId) -> Result<Option<TerminalTab>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id, worktree_id, name, sort_order FROM terminals WHERE id = ?1")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {TERMINAL_COLUMNS} FROM terminals WHERE id = ?1"
+        ))?;
         let mut rows = stmt.query(params![id.as_str()])?;
-        Ok(rows.next()?.map(|r| TerminalTab {
-            id: TerminalId(r.get::<_, String>(0).unwrap()),
-            worktree_id: WorktreeId(r.get::<_, String>(1).unwrap()),
-            name: r.get(2).unwrap(),
-            sort_order: r.get(3).unwrap(),
-            alive: false,
-        }))
+        Ok(rows.next()?.map(row_to_terminal).transpose()?)
     }
 
     pub fn count_terminals(&self, worktree_id: &WorktreeId) -> Result<i64> {
@@ -909,69 +849,31 @@ impl Store {
         let conn = self.conn.lock().unwrap();
 
         let projects = conn
-            .prepare("SELECT id, name, repo_path, sort_order, COALESCE(workspace_id, 'default') FROM projects ORDER BY sort_order, created_at")?
-            .query_map([], |r| {
-                Ok(Project {
-                    id: ProjectId(r.get(0)?),
-                    name: r.get(1)?,
-                    repo_path: PathBuf::from(r.get::<_, String>(2)?),
-                    sort_order: r.get(3)?,
-                    workspace_id: WorkspaceId(r.get(4)?),
-                })
-            })?
+            .prepare(&format!(
+                "SELECT {PROJECT_COLUMNS} FROM projects ORDER BY sort_order, created_at"
+            ))?
+            .query_map(params![DEFAULT_WORKSPACE_ID], row_to_project)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let worktrees = conn
-            .prepare("SELECT id, project_id, path, branch, is_main, pinned, sort_order FROM worktrees ORDER BY is_main DESC, sort_order, created_at")?
-            .query_map([], |r| {
-                Ok(Worktree {
-                    id: WorktreeId(r.get(0)?),
-                    project_id: ProjectId(r.get(1)?),
-                    path: PathBuf::from(r.get::<_, String>(2)?),
-                    branch: r.get(3)?,
-                    is_main: r.get::<_, i64>(4)? != 0,
-                    pinned: r.get::<_, i64>(5)? != 0,
-                    sort_order: r.get(6)?,
-                })
-            })?
+            .prepare(&format!(
+                "SELECT {WORKTREE_COLUMNS} FROM worktrees ORDER BY is_main DESC, sort_order, created_at"
+            ))?
+            .query_map([], row_to_worktree)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let agents = conn
-            .prepare("SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, unseen, cloud_session_id FROM agents ORDER BY sort_order, created_at")?
-            .query_map([], |r| {
-                Ok(Agent {
-                    id: AgentId(r.get(0)?),
-                    worktree_id: WorktreeId(r.get(1)?),
-                    name: r.get(2)?,
-                    status: AgentStatus::parse(&r.get::<_, String>(3)?).unwrap_or(AgentStatus::Fresh),
-                    archived: r.get::<_, i64>(4)? != 0,
-                    pinned: r.get::<_, i64>(5)? != 0,
-                    kind: AgentKind::parse(&r.get::<_, String>(6)?).unwrap_or_default(),
-                    session_id: r.get(7)?,
-                    sort_order: r.get(8)?,
-                    status_changed_at: r.get(9)?,
-                    model: r.get(10)?,
-                    effort: r.get(11)?,
-                    archived_at: r.get(12)?,
-                    unseen: r.get::<_, i64>(13)? != 0,
-                    cloud_session_id: r.get(14)?,
-                    alive: false,
-                    cloud_mirroring: false,
-                })
-            })?
+            .prepare(&format!(
+                "SELECT {AGENT_COLUMNS} FROM agents ORDER BY sort_order, created_at"
+            ))?
+            .query_map([], row_to_agent)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let terminals = conn
-            .prepare("SELECT id, worktree_id, name, sort_order FROM terminals ORDER BY sort_order, created_at")?
-            .query_map([], |r| {
-                Ok(TerminalTab {
-                    id: TerminalId(r.get(0)?),
-                    worktree_id: WorktreeId(r.get(1)?),
-                    name: r.get(2)?,
-                    sort_order: r.get(3)?,
-                    alive: false,
-                })
-            })?
+            .prepare(&format!(
+                "SELECT {TERMINAL_COLUMNS} FROM terminals ORDER BY sort_order, created_at"
+            ))?
+            .query_map([], row_to_terminal)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         Ok((projects, worktrees, agents, terminals))
@@ -992,8 +894,99 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT json FROM ui_state WHERE id = 1")?;
         let mut rows = stmt.query([])?;
-        Ok(rows.next()?.map(|r| r.get::<_, String>(0).unwrap()))
+        Ok(rows.next()?.map(|r| r.get::<_, String>(0)).transpose()?)
     }
+}
+
+// ---- row shapes ----
+//
+// One column list and one row mapper per entity, shared by the point
+// lookups and `load_tree`, so a row can never read differently depending
+// on which path fetched it. The column order is the mapper's contract.
+
+const WORKSPACE_COLUMNS: &str = "id, name";
+/// Binds the default workspace id as `?1` (rows from before workspaces
+/// existed have a NULL `workspace_id`), so a query over these columns
+/// numbers its own parameters from `?2`.
+const PROJECT_COLUMNS: &str = "id, name, repo_path, sort_order, COALESCE(workspace_id, ?1)";
+const WORKTREE_COLUMNS: &str = "id, project_id, path, branch, is_main, pinned, sort_order";
+const AGENT_COLUMNS: &str = "id, worktree_id, name, status, archived, pinned, kind, \
+                             claude_session_id, sort_order, status_changed_at, model, effort, \
+                             archived_at, unseen, cloud_session_id";
+const TERMINAL_COLUMNS: &str = "id, worktree_id, name, sort_order";
+const LINK_COLUMNS: &str = "id, worktree_id, url, sort_order";
+
+fn row_to_workspace(r: &rusqlite::Row) -> rusqlite::Result<Workspace> {
+    Ok(Workspace {
+        id: WorkspaceId(r.get(0)?),
+        name: r.get(1)?,
+    })
+}
+
+fn row_to_project(r: &rusqlite::Row) -> rusqlite::Result<Project> {
+    Ok(Project {
+        id: ProjectId(r.get(0)?),
+        name: r.get(1)?,
+        repo_path: PathBuf::from(r.get::<_, String>(2)?),
+        sort_order: r.get(3)?,
+        workspace_id: WorkspaceId(r.get(4)?),
+    })
+}
+
+fn row_to_worktree(r: &rusqlite::Row) -> rusqlite::Result<Worktree> {
+    Ok(Worktree {
+        id: WorktreeId(r.get(0)?),
+        project_id: ProjectId(r.get(1)?),
+        path: PathBuf::from(r.get::<_, String>(2)?),
+        branch: r.get(3)?,
+        is_main: r.get::<_, i64>(4)? != 0,
+        pinned: r.get::<_, i64>(5)? != 0,
+        sort_order: r.get(6)?,
+    })
+}
+
+/// `alive` and `cloud_mirroring` are daemon state, not columns: the
+/// registry fills them in from its session table after the read.
+fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<Agent> {
+    Ok(Agent {
+        id: AgentId(r.get(0)?),
+        worktree_id: WorktreeId(r.get(1)?),
+        name: r.get(2)?,
+        status: AgentStatus::parse(&r.get::<_, String>(3)?).unwrap_or(AgentStatus::Fresh),
+        archived: r.get::<_, i64>(4)? != 0,
+        pinned: r.get::<_, i64>(5)? != 0,
+        kind: AgentKind::parse(&r.get::<_, String>(6)?).unwrap_or_default(),
+        session_id: r.get(7)?,
+        sort_order: r.get(8)?,
+        status_changed_at: r.get(9)?,
+        model: r.get(10)?,
+        effort: r.get(11)?,
+        archived_at: r.get(12)?,
+        unseen: r.get::<_, i64>(13)? != 0,
+        cloud_session_id: r.get(14)?,
+        alive: false,
+        cloud_mirroring: false,
+    })
+}
+
+/// `alive` is daemon state, filled in by the registry like the agent's.
+fn row_to_terminal(r: &rusqlite::Row) -> rusqlite::Result<TerminalTab> {
+    Ok(TerminalTab {
+        id: TerminalId(r.get(0)?),
+        worktree_id: WorktreeId(r.get(1)?),
+        name: r.get(2)?,
+        sort_order: r.get(3)?,
+        alive: false,
+    })
+}
+
+fn row_to_link(r: &rusqlite::Row) -> rusqlite::Result<Link> {
+    Ok(Link {
+        id: LinkId(r.get(0)?),
+        worktree_id: WorktreeId(r.get(1)?),
+        url: r.get(2)?,
+        sort_order: r.get(3)?,
+    })
 }
 
 #[cfg(test)]
