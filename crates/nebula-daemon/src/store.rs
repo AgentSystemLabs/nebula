@@ -411,6 +411,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn rename_project(&self, id: &ProjectId, name: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE projects SET name = ?2 WHERE id = ?1",
+            params![id.as_str(), name],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_project(&self, id: &ProjectId) -> Result<()> {
         self.conn
             .lock()

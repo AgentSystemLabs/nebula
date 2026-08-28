@@ -132,6 +132,9 @@ pub enum MenuAction {
     DeleteWorktree(WorktreeId),
     AddProject,
     RemoveProject(ProjectId),
+    /// Retitle a project's row. Display only — the folder keeps its name and
+    /// stays visible under the new one.
+    RenameProject(ProjectId),
     /// Workspace-switcher row: open this workspace. The switcher's other
     /// verbs are keys, not rows — n: new, r: rename, d: delete (footer
     /// hints).
@@ -334,6 +337,11 @@ pub enum PromptKind {
     },
     RenameTerminal {
         id: TerminalId,
+    },
+    /// Retitle a project's row. The folder on disk is untouched; an empty
+    /// name puts the row back on the folder's own name.
+    RenameProject {
+        id: ProjectId,
     },
     /// Name for a workspace created from the switcher; opened on Ack.
     NewWorkspace,

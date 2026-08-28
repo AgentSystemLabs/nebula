@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 28;
+pub const PROTOCOL_VERSION: u32 = 29;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -94,6 +94,14 @@ pub enum ClientRequest {
     RemoveProject {
         req_id: u64,
         id: ProjectId,
+    },
+    /// Retitle a project's row. Purely cosmetic: `repo_path` — the folder on
+    /// disk — is never touched. An empty name resets the row to the folder's
+    /// own name, which is the only way back from a rename.
+    RenameProject {
+        req_id: u64,
+        id: ProjectId,
+        name: String,
     },
     /// Move a project `delta` slots in the list (clamped at the edges).
     MoveProject {

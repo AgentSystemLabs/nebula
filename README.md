@@ -262,6 +262,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Any panel | `o` | add ("open") a project — same prompt as `n`, from any focus |
 | Add project | type + `Tab`, `↓↑` / `→` / `←` | browse for the repo: type to filter (bash-style Tab completion), arrows pick a directory, `→` steps in, `←` steps up, `Enter` adds the highlighted (or typed) path; `●` marks git repos |
 | Projects | `Shift+J/K` | move project up / down the list (`Shift+↑/↓` too, but Terminal.app never sends those) |
+| Projects | `r` | rename the row — a label, not a move: the folder on disk keeps its name and hangs off a `└` under the new one. A terminal cell has one font size (Kitty's OSC 66 renders half-size text, but WezTerm and Ghostty don't implement it), so the hierarchy is weight, opacity and position instead: the name you chose is bold, the folder is the dimmest theme color plus the faint attribute. An empty name puts the row back on the folder's name |
 | Worktrees | `n` / `d` | new worktree / delete (typed confirm — deletes files) |
 | New worktree | type a sentence, or `Enter` on the empty prompt | the branch name is slugified (`fix login redirect` → `fix-login-redirect`); empty takes a random `<adj>-<noun>-<verb>` |
 | Worktrees / Sessions | `p` | pin / unpin — pinned rows sort to the top and skip the idle reaper |

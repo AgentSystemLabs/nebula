@@ -1452,7 +1452,12 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 Some(SessionRow::Link(l)) => edit_link(app, &l),
                 None => {}
             },
-            Focus::Projects => {}
+            Focus::Projects => {
+                if let Some(p) = app.selected_project() {
+                    let id = p.id.clone();
+                    open_prompt(app, PromptKind::RenameProject { id });
+                }
+            }
             Focus::Workspaces => {
                 let id = app.tree.active_workspace.clone();
                 open_prompt(app, PromptKind::RenameWorkspace { id });
@@ -1668,6 +1673,20 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
                 .map(|t| t.name.clone())
                 .unwrap_or_default();
             ("Rename terminal".to_string(), "name".to_string(), current)
+        }
+        PromptKind::RenameProject { id } => {
+            let current = app
+                .tree
+                .projects
+                .iter()
+                .find(|p| &p.id == id)
+                .map(|p| p.name.clone())
+                .unwrap_or_default();
+            (
+                "Rename project".to_string(),
+                "name (empty resets to the folder name)".to_string(),
+                current,
+            )
         }
         PromptKind::NewWorkspace => (
             "New workspace".to_string(),
@@ -2822,6 +2841,11 @@ fn open_context_menu_for_selection(app: &mut App) {
                     },
                 );
                 items.push(MenuItem {
+                    label: "Rename".into(),
+                    action: MenuAction::RenameProject(p.id.clone()),
+                    destructive: false,
+                });
+                items.push(MenuItem {
                     label: "Remove from list".into(),
                     action: MenuAction::RemoveProject(p.id.clone()),
                     destructive: true,
@@ -3711,11 +3735,16 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
         }
     }
     // An empty agent name falls back to the next free default (agent-1, …),
-    // an empty worktree name to the random branch the prompt offered.
+    // an empty worktree name to the random branch the prompt offered, and an
+    // empty project name undoes the rename — the row goes back to the
+    // folder's own name, which is the only way back from a rename. For every
+    // other prompt an empty field is a cancel.
     if value.is_empty()
         && !matches!(
             prompt.kind,
-            PromptKind::NewAgent { .. } | PromptKind::NewWorktree { .. }
+            PromptKind::NewAgent { .. }
+                | PromptKind::NewWorktree { .. }
+                | PromptKind::RenameProject { .. }
         )
     {
         app.flash = Some("cancelled: empty input".into());
@@ -3836,6 +3865,14 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
         PromptKind::RenameTerminal { id } => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::RenameTerminal {
+                req_id,
+                id,
+                name: value,
+            });
+        }
+        PromptKind::RenameProject { id } => {
+            let req_id = app.alloc_req_id(PendingIntent::None);
+            out.push(ClientRequest::RenameProject {
                 req_id,
                 id,
                 name: value,
@@ -4131,6 +4168,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             }
         }
         MenuAction::AddProject => open_prompt(app, PromptKind::AddProject),
+        MenuAction::RenameProject(id) => open_prompt(app, PromptKind::RenameProject { id }),
         MenuAction::OpenWorkspace(id) => {
             switch_workspace(app, id, out);
         }
@@ -6143,6 +6181,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                             MenuItem {
                                 label: "Add project".into(),
                                 action: MenuAction::AddProject,
+                                destructive: false,
+                            },
+                            MenuItem {
+                                label: "Rename".into(),
+                                action: MenuAction::RenameProject(p.id.clone()),
                                 destructive: false,
                             },
                             MenuItem {
@@ -12115,6 +12158,196 @@ diff --git a/src/b.rs b/src/b.rs
         );
         assert_eq!(app.selected_worktree().map(|w| w.id.clone()), before);
         assert!(app.select_when_seen.is_none());
+    }
+
+    /// `r` in the Projects panel retitles the row: the prompt opens on the
+    /// current name and the request carries a name and nothing else —
+    /// renaming a project never moves the folder it points at.
+    #[test]
+    fn r_renames_the_selected_project_row() {
+        use nebula_core::ProjectId;
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 "demo" at /tmp/demo
+        let mut out = Vec::new();
+        app.focus = Focus::Projects;
+
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
+        match &app.overlay {
+            Some(Overlay::Prompt(p)) => {
+                assert_eq!(
+                    p.kind,
+                    PromptKind::RenameProject {
+                        id: ProjectId("p1".into())
+                    }
+                );
+                assert_eq!(p.input.as_str(), "demo", "prefilled with the current name");
+            }
+            other => panic!("r: {other:?}"),
+        }
+
+        // Retype it and submit.
+        press(
+            &mut app,
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        for c in "Acme API".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::RenameProject { id, name, .. })
+                    if id.as_str() == "p1" && name == "Acme API"
+            ),
+            "expected RenameProject, got {out:?}"
+        );
+    }
+
+    /// Submitting an empty name undoes the rename: the row goes back to the
+    /// folder's own name. `submit_prompt` cancels empty input for most
+    /// prompts, so this is the arm that has to opt out of that — the daemon
+    /// has always handled the reset, but the request never reached it.
+    #[test]
+    fn renaming_a_project_to_nothing_undoes_the_rename() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].name = "Acme API".into();
+        app.tree.projects[0].repo_path = "/tmp/acme-repo".into();
+        let mut out = Vec::new();
+        app.focus = Focus::Projects;
+
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
+        press(
+            &mut app,
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::RenameProject { id, name, .. })
+                    if id.as_str() == "p1" && name.is_empty()
+            ),
+            "an empty name is the undo, not a cancel: {out:?} flash={:?}",
+            app.flash
+        );
+        assert!(
+            app.overlay.is_none(),
+            "the prompt closes: {:?}",
+            app.overlay
+        );
+    }
+
+    /// A renamed project keeps the folder it lives in visible: the folder
+    /// name takes the row directly under the new one, and the row grows by
+    /// exactly that line. An unrenamed row repeats nothing.
+    ///
+    /// The two lines are a hierarchy, not a pair — a terminal cell has one
+    /// font size, so "smaller" is carried by weight, opacity and position:
+    /// the chosen label is BOLD in full-strength text, the folder hangs off
+    /// a `└ ` in `dim` *plus* DIM (SGR 2, faint). Assert the styles, because
+    /// `buffer_text` can't see them and a silent loss of either flattens
+    /// the row.
+    #[test]
+    fn a_renamed_project_shows_its_folder_name_underneath() {
+        use ratatui::style::Modifier;
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 "demo" at /tmp/demo
+        seed_default_workspace(&mut app);
+        app.show_workspaces = false;
+        let th = app.theme;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let draw = |app: &mut App, terminal: &mut Terminal<TestBackend>| {
+            terminal.draw(|f| ui::draw(f, app)).unwrap();
+            buffer_text(terminal)
+        };
+
+        // Unrenamed: the folder name is the row's name, so it appears once.
+        let text = draw(&mut app, &mut terminal);
+        let rows: Vec<&str> = text.lines().collect();
+        let name_row = rows
+            .iter()
+            .position(|l| l.contains("demo"))
+            .unwrap_or_else(|| panic!("no project row:\n{text}"));
+        assert!(
+            !rows[name_row + 1].contains("demo"),
+            "nothing under an unrenamed row:\n{text}"
+        );
+
+        // Two renamed rows, so both the selected and the unselected style
+        // are on screen in one draw. The cursor starts on the first.
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: project("p1", "Acme API", 0),
+            },
+        );
+        app.tree.projects[0].repo_path = "/tmp/acme-repo".into();
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: project("p2", "Side Quest", 1),
+            },
+        );
+        app.tree.projects[1].repo_path = "/tmp/side-repo".into();
+        assert_eq!(app.sel_project, 0, "cursor on the first row");
+
+        let text = draw(&mut app, &mut terminal);
+        let rows: Vec<&str> = text.lines().collect();
+        let name_row = rows
+            .iter()
+            .position(|l| l.contains("Acme API"))
+            .unwrap_or_else(|| panic!("renamed row missing:\n{text}"));
+        assert!(
+            rows[name_row + 1].contains("└ acme-repo"),
+            "the folder hangs off the label on the next row:\n{text}"
+        );
+        // The glyph lands under the name's first letter, not the dot.
+        let (label_x, _) = find_cell(&terminal, "Acme API");
+        let (glyph_x, _) = find_cell(&terminal, "└ acme-repo");
+        assert_eq!(label_x, glyph_x, "`└` is flush with the label:\n{text}");
+
+        // The label leads on weight and never goes faint.
+        let (x, y) = find_cell(&terminal, "Acme API");
+        let label = terminal.backend().buffer()[(x, y)].style();
+        assert!(
+            label.add_modifier.contains(Modifier::BOLD),
+            "the chosen label is the bold one: {label:?}"
+        );
+        assert!(
+            !label.add_modifier.contains(Modifier::DIM),
+            "and never faint: {label:?}"
+        );
+
+        // Unselected: the dimmest color the theme has, plus faint.
+        let (x, y) = find_cell(&terminal, "side-repo");
+        let sub = terminal.backend().buffer()[(x, y)].style();
+        assert_eq!(sub.fg, Some(th.dim), "folder takes the dimmest color");
+        assert!(
+            sub.add_modifier.contains(Modifier::DIM),
+            "and the faint attribute on top of it: {sub:?}"
+        );
+        assert!(
+            !sub.add_modifier.contains(Modifier::BOLD),
+            "never bold: {sub:?}"
+        );
+
+        // Selected, the fill would swallow a `dim` foreground, so
+        // `render_button` lifts it to muted — the faint attribute has to
+        // survive that lift or the hierarchy flattens on the cursor row.
+        let (x, y) = find_cell(&terminal, "acme-repo");
+        let sub = terminal.backend().buffer()[(x, y)].style();
+        assert_eq!(sub.fg, Some(th.muted), "lifted off the selection fill");
+        assert!(
+            sub.add_modifier.contains(Modifier::DIM),
+            "still faint on the selected row: {sub:?}"
+        );
     }
 
     #[test]
