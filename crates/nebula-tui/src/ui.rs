@@ -524,6 +524,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "PROJECTS",
                     &[
                         (Act(&[New, AddProject]), "add project (2nd: from anywhere)"),
+                        (Act(&[Rename]), "rename row (folder keeps its name)"),
                         (Act(&[MoveProjectDown, MoveProjectUp]), "reorder project"),
                         (Act(&[Delete]), "remove from list"),
                     ],
@@ -2105,25 +2106,27 @@ fn render_row(
     focused: bool,
     th: Theme,
 ) {
-    render_button(f, area, spans, selected, focused, th, 0);
+    render_button(f, area, vec![spans], selected, focused, th, 0);
 }
 
 /// Render one list entry as a button `area.height` rows tall: the
 /// selection fill covers the whole rect, the `▌` marker runs down its
-/// left edge, and the text sits on `text_row` (0-based, inside the rect).
-/// Dim spans (idle dots, archived names) would sink into the selection
-/// fill, so they get lifted to muted there.
-fn render_button(
+/// left edge, and `text` takes consecutive rows starting at `text_row`
+/// (0-based, inside the rect). A second entry is a terminal's answer to a
+/// smaller line under the first, so the caller must size `area` for it.
+/// Dim spans (idle dots, archived names, subtitles) would sink into the
+/// selection fill, so they get lifted to muted there.
+fn render_button<'a>(
     f: &mut Frame,
     area: Rect,
-    mut spans: Vec<Span>,
+    mut text: Vec<Vec<Span<'a>>>,
     selected: bool,
     focused: bool,
     th: Theme,
     text_row: u16,
 ) {
     if selected {
-        for s in &mut spans {
+        for s in text.iter_mut().flatten() {
             if s.style.fg == Some(th.dim) {
                 s.style.fg = Some(th.muted);
             }
@@ -2138,17 +2141,16 @@ fn render_button(
             Span::raw(" ")
         }
     };
-    let mut text_spans = Some(spans);
     let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
     for r in 0..area.height {
-        if r == text_row {
-            if let Some(mut spans) = text_spans.take() {
-                spans.insert(0, marker());
-                lines.push(Line::from(spans));
-                continue;
-            }
+        let mut spans = vec![marker()];
+        if let Some(row) = r
+            .checked_sub(text_row)
+            .and_then(|i| text.get_mut(i as usize))
+        {
+            spans.append(row);
         }
-        lines.push(Line::from(marker()));
+        lines.push(Line::from(spans));
     }
     f.render_widget(
         Paragraph::new(lines).style(row_bar(selected, focused, th)),
@@ -2535,8 +2537,9 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Per-row display data of the Projects panel, pre-collected to end the
-/// tree borrow: name, rollup, unwatched-finish count.
-type ProjectRowData = (String, Option<AgentStatus>, usize);
+/// tree borrow: name, the folder name to show under it (Some only once the
+/// row has been renamed away from it), rollup, unwatched-finish count.
+type ProjectRowData = (String, Option<String>, Option<AgentStatus>, usize);
 
 /// The same for the Worktrees panel: branch, is-root, rollup,
 /// unwatched-finish count.
@@ -2593,14 +2596,18 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
             let p = &app.tree.projects[i];
             (
                 p.name.clone(),
+                p.folder_subtitle(),
                 app.project_rollup(&p.id),
                 app.project_unseen(&p.id),
             )
         })
         .collect();
     let mut screen_row = 0usize;
-    for (row_idx, (text, roll, unseen)) in rows.iter().enumerate() {
-        let Some(row_area) = rows_rect(inner, screen_row, PROJECT_BTN_H) else {
+    for (row_idx, (text, folder, roll, unseen)) in rows.iter().enumerate() {
+        // A renamed row grows by the one line its folder name takes, so the
+        // pads above and below stay a row each either way.
+        let height = PROJECT_BTN_H + folder.is_some() as u16;
+        let Some(row_area) = rows_rect(inner, screen_row, height) else {
             break;
         };
         // Same badge as worktree rows: sessions that finished unwatched
@@ -2617,17 +2624,41 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
         for (text, style) in badges {
             spans.push(Span::styled(text, style));
         }
+        // Renaming a project is a label change, never a move on disk, so the
+        // folder keeps its name on the row underneath — as a child of the
+        // label, not a second label. A terminal cell has exactly one font
+        // size (Kitty's OSC 66 can render half-size text, but neither
+        // WezTerm nor Ghostty implements it), so "smaller" is spelled with
+        // the three signals that do work everywhere: the name above is
+        // BOLD at full strength, this line is the dimmest color the theme
+        // has *plus* DIM (SGR 2, faint, which blends fg toward bg), and a
+        // `└ ` hangs it off the name — the same tree glyph the metrics
+        // modal uses. The glyph lands under the name's first letter, so
+        // the folder text itself sits two columns further in.
+        let mut text = vec![spans];
+        if let Some(folder) = folder {
+            text.push(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!(
+                        "└ {}",
+                        truncate(folder, (inner.width as usize).saturating_sub(5))
+                    ),
+                    Style::default().fg(th.dim).add_modifier(Modifier::DIM),
+                ),
+            ]);
+        }
         render_button(
             f,
             row_area,
-            spans,
+            text,
             row_idx == app.sel_project,
             focused,
             th,
             PROJECT_BTN_H / 2,
         );
         app.hits.push((row_area, HitTarget::Project(row_idx)));
-        screen_row += PROJECT_BTN_H as usize;
+        screen_row += height as usize;
     }
     app.hits.push((inner, HitTarget::PanelBg(Focus::Projects)));
 }
@@ -3738,9 +3769,10 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::Help)
             ),
             Focus::Projects => format!(
-                "{}/{}: add  {}: remove  {}/{}: move  {}: search  {}: menu  {}: help",
+                "{}/{}: add  {}: rename  {}: remove  {}/{}: move  {}: search  {}: menu  {}: help",
                 k(Action::New),
                 k(Action::AddProject),
+                k(Action::Rename),
                 k(Action::Delete),
                 k(Action::MoveProjectDown),
                 k(Action::MoveProjectUp),

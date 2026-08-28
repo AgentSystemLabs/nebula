@@ -289,6 +289,14 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientRequest::RemoveProject { req_id, id } => {
                     reply(&out_tx, req_id, daemon.remove_project(&id).map(|_| None)).await;
                 }
+                ClientRequest::RenameProject { req_id, id, name } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.rename_project(&id, &name).map(|_| None),
+                    )
+                    .await;
+                }
                 ClientRequest::MoveProject { req_id, id, delta } => {
                     reply(
                         &out_tx,

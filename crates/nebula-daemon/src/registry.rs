@@ -681,12 +681,7 @@ impl Daemon {
                 repo_path.display()
             );
         }
-        let name = name.unwrap_or_else(|| {
-            repo_path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "project".into())
-        });
+        let name = name.unwrap_or_else(|| Project::folder_name(&repo_path));
         let project = Project {
             id: ProjectId::generate(),
             name,
@@ -719,6 +714,25 @@ impl Daemon {
             });
         }
         Ok(EntityId::Project(project.id))
+    }
+
+    /// Retitle a project's row. Cosmetic only — the checkout on disk is never
+    /// renamed, and every worktree under the project keeps its own path. An
+    /// empty name resets the row to the folder's name, which is the only way
+    /// back once a project has been renamed.
+    pub fn rename_project(self: &Arc<Self>, id: &ProjectId, name: &str) -> Result<()> {
+        let mut project = self.store.get_project(id)?.context("project not found")?;
+        let name = name.trim();
+        project.name = if name.is_empty() {
+            Project::folder_name(&project.repo_path)
+        } else {
+            name.to_string()
+        };
+        self.store.rename_project(id, &project.name)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Project(project),
+        });
+        Ok(())
     }
 
     pub fn remove_project(self: &Arc<Self>, id: &ProjectId) -> Result<()> {
@@ -3861,6 +3875,44 @@ mod tests {
         daemon.reparent_agents_by_last_cwd(&q);
         assert_eq!(agent_worktree(&daemon, "a1"), "q-feat");
         assert_eq!(agent_worktree(&daemon, "a2"), "q-root");
+    }
+
+    /// Renaming a project relabels its row and nothing else: the checkout on
+    /// disk keeps its name, `repo_path` keeps pointing at it, and an empty
+    /// name puts the row back on the folder's own name — the only way back
+    /// once a project has been renamed.
+    #[tokio::test]
+    async fn rename_project_relabels_the_row_and_leaves_the_folder_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("acme-api");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+
+        let daemon = test_daemon();
+        let id = match daemon.add_project(&repo, None, false, None).await.unwrap() {
+            EntityId::Project(id) => id,
+            other => panic!("expected a project id, got {other:?}"),
+        };
+        let named = |daemon: &Arc<Daemon>| daemon.store.get_project(&id).unwrap().unwrap();
+        assert_eq!(named(&daemon).name, "acme-api", "named after the folder");
+
+        daemon.rename_project(&id, "  Acme API  ").unwrap();
+        let project = named(&daemon);
+        assert_eq!(project.name, "Acme API", "trimmed and stored");
+        assert_eq!(project.repo_path, repo, "the folder is untouched");
+        assert!(repo.exists(), "and still on disk under its own name");
+        assert_eq!(
+            project.folder_subtitle().as_deref(),
+            Some("acme-api"),
+            "a renamed row still shows where it lives"
+        );
+
+        daemon.rename_project(&id, "   ").unwrap();
+        let project = named(&daemon);
+        assert_eq!(project.name, "acme-api", "empty resets to the folder name");
+        assert_eq!(project.folder_subtitle(), None, "nothing left to show");
     }
 
     /// `git rev-parse --show-toplevel` answers with the checkout it ran in, so

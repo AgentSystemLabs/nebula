@@ -574,6 +574,42 @@ fn tui_help_modal_grouped_keymap() {
 /// any panel, `r` edits it, Enter would open it, `d` removes it. The
 /// pull-request row is not exercised here — the test repo has no remote,
 /// so `gh` (installed or not) reports no PR.
+/// Renaming a project is a label change, and an empty name undoes it.
+/// Drives the real binary: the row picks up the new label with the folder
+/// name hanging off a `└` underneath, then clearing the field puts the row
+/// back on the folder's own name with nothing under it.
+#[test]
+fn tui_project_rename_shows_the_folder_and_empty_undoes_it() {
+    let mut tui = TuiHarness::spawn();
+    let repo = tui.make_repo("acme-repo");
+
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "acme-repo");
+
+    // ---- rename: the label leads, the folder hangs off a `└` ----
+    tui.send(b"r");
+    tui.wait_for_text("Rename project");
+    // The field is prefilled with the current name; clear it first.
+    tui.send(b"\x15"); // ^u
+    tui.type_str("Acme API");
+    tui.send(b"\r");
+    tui.wait_for_gone("Rename project");
+    tui.wait_for_text("Acme API");
+    tui.wait_for_text("└ acme-repo");
+
+    // ---- undo: an empty name puts the row back on the folder name ----
+    tui.send(b"r");
+    tui.wait_for_text("Rename project");
+    tui.send(b"\x15"); // ^u clears the prefill
+    tui.send(b"\r");
+    tui.wait_for_gone("Rename project");
+    // The chosen label is gone and so is the child row — the folder name is
+    // the row again, exactly as a freshly added project renders.
+    tui.wait_for_gone("Acme API");
+    tui.wait_for_gone("└ acme-repo");
+    tui.wait_for_text("acme-repo");
+}
+
 #[test]
 fn tui_link_crud_in_sessions_panel() {
     let mut tui = TuiHarness::spawn();

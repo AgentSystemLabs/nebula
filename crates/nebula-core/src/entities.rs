@@ -1,6 +1,6 @@
 use crate::ids::{AgentId, LinkId, ProjectId, TerminalId, WorkspaceId, WorktreeId};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -107,6 +107,25 @@ pub struct Project {
     pub workspace_id: WorkspaceId,
     pub repo_path: PathBuf,
     pub sort_order: i64,
+}
+
+impl Project {
+    /// The name a project takes from disk: the last component of its repo
+    /// path. This is the default `name`, and it stays the truth about where
+    /// the project lives no matter what the row is later renamed to.
+    pub fn folder_name(repo_path: &Path) -> String {
+        repo_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "project".into())
+    }
+
+    /// The folder name to show beneath a renamed row, or None while the row
+    /// still carries the folder's own name and repeating it would be noise.
+    pub fn folder_subtitle(&self) -> Option<String> {
+        let folder = Self::folder_name(&self.repo_path);
+        (folder != self.name).then_some(folder)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
