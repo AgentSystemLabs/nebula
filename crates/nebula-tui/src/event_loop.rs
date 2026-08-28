@@ -1,10 +1,11 @@
 //! The main TUI loop: terminal setup/teardown, message routing, update logic.
 
 use crate::app::{
-    App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder, Focus,
-    GrepView, HelpView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, Overlay, Palette,
-    PaletteTarget, PendingAction, PendingIntent, PointerShape, PromptDialog, PromptKind, RowKey,
-    SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection, WorktreeRollback,
+    clamp_selection, App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView,
+    FileFinder, Focus, GrepView, HelpView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView,
+    Overlay, Palette, PaletteTarget, PendingAction, PendingIntent, PointerShape, PromptDialog,
+    PromptKind, RowKey, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection,
+    WorktreeRollback,
 };
 use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
@@ -18,7 +19,7 @@ use crossterm::event::{
 use futures::StreamExt;
 use nebula_core::{
     AgentId, AgentKind, ClientRequest, EntityId, LinkId, ProjectId, ServerEvent, SessionRef,
-    WorkspaceId, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
+    TerminalId, WorkspaceId, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -32,6 +33,44 @@ const SESSIONS_WHEEL_STEP: usize = 2;
 /// Wheel step for the pull-request reading pane, in lines. Prose wants a
 /// bigger bite than a session list of two-row pills.
 const PR_PREVIEW_WHEEL_STEP: u16 = 3;
+
+/// Wheel step inside the diff and tree modals' reading panes, in lines.
+const MODAL_WHEEL_LINES: i32 = 3;
+
+/// Wheel step over the terminal pane, in lines: how far the scrollback
+/// offset moves, and how many arrow keys an alt-screen app that ignores
+/// the mouse is sent per notch.
+const TERM_WHEEL_LINES: usize = 3;
+
+/// Ceiling on a panel or file-list width read back from the persisted UI
+/// state — a coarse sanity clamp; the draw re-fits it to the real screen.
+const MAX_RESTORED_WIDTH: u16 = 300;
+
+/// Smallest grid worth sizing a PTY or vt100 parser to: below this a pane
+/// hasn't really been drawn yet.
+const MIN_PANE_DIM: u16 = 2;
+
+/// Terminal-pane grid assumed before the first draw, so a spawn or attach
+/// requested that early never boots a 0×0 PTY.
+const FALLBACK_PANE: (u16, u16) = (80, 24);
+
+/// Where a keyboard-invoked context menu is anchored: near the panels,
+/// where the selected row lives.
+const KEYBOARD_MENU_ANCHOR: (u16, u16) = (30, 4);
+
+/// Bracketed-paste markers around a pasted block, so the child (claude,
+/// vim…) takes it as one paste rather than typing to auto-indent.
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Flash for an action that needs a checkout to act on and has none.
+const SELECT_CONTEXT_FIRST: &str = "select a project or worktree first";
+
+/// Flash for a session pick that lost a race with its removal.
+const SESSION_GONE: &str = "session no longer exists";
+
+/// Flash for an action an archived agent refuses until it's unarchived.
+const AGENT_ARCHIVED: &str = "agent is archived — unarchive first (u)";
 
 /// Redraw cap (~60fps). Output bursts coalesce into one frame; input events
 /// are still handled immediately between frames.
@@ -623,10 +662,7 @@ fn note_open_prs_answer(
         }
     };
     let now = std::time::Instant::now();
-    let list = match list {
-        Some(list) => list,
-        None => previous.map(|o| o.list.clone()).unwrap_or_default(),
-    };
+    let list = list.unwrap_or_else(|| previous.map(|o| o.list.clone()).unwrap_or_default());
     app.dirty |= previous.map(|o| &o.list) != Some(&list);
     app.open_prs.insert(
         project,
@@ -883,8 +919,24 @@ fn request_metrics(app: &mut App, out: &mut Vec<ClientRequest>) {
     if let Some(Overlay::Metrics(view)) = &mut app.overlay {
         view.client_rss_bytes = app.client_rss_bytes;
     }
-    let req_id = app.alloc_req_id(PendingIntent::None);
-    out.push(ClientRequest::GetMetrics { req_id });
+    send(app, out, |req_id| ClientRequest::GetMetrics { req_id });
+}
+
+/// Queue a request that wants no follow-up when its Ack lands.
+fn send(app: &mut App, out: &mut Vec<ClientRequest>, make: impl FnOnce(u64) -> ClientRequest) {
+    send_with(app, out, PendingIntent::None, make);
+}
+
+/// Queue a request built around a fresh `req_id`, remembering `intent` to
+/// run when the Ack (or Error) for it arrives.
+fn send_with(
+    app: &mut App,
+    out: &mut Vec<ClientRequest>,
+    intent: PendingIntent,
+    make: impl FnOnce(u64) -> ClientRequest,
+) {
+    let req_id = app.alloc_req_id(intent);
+    out.push(make(req_id));
 }
 
 fn log_server_event(ev: &ServerEvent) {
@@ -929,8 +981,10 @@ fn apply_startup_workspace(app: &mut App, out: &mut Vec<ClientRequest>) {
             // Telling the daemon still matters — it scopes AddProject.
             if app.tree.active_workspace != id {
                 app.tree.active_workspace = id.clone();
-                let req_id = app.alloc_req_id(PendingIntent::None);
-                out.push(ClientRequest::OpenWorkspace { req_id, id });
+                send(app, out, |req_id| ClientRequest::OpenWorkspace {
+                    req_id,
+                    id,
+                });
             }
         }
         None => {
@@ -958,13 +1012,13 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
     };
     app.show_archived = state.show_archived;
     if let Some(w) = state.panel_widths {
-        // Coarse sanity clamp; normalize_panel_widths re-fits to the actual
-        // screen on the next draw.
-        app.panel_widths = w.map(|v| v.clamp(crate::app::MIN_PANEL_W, 300));
+        // normalize_panel_widths re-fits to the actual screen on the next
+        // draw.
+        app.panel_widths = w.map(|v| v.clamp(crate::app::MIN_PANEL_W, MAX_RESTORED_WIDTH));
     }
     if let Some(w) = state.diff_files_width {
-        // Coarse sanity clamp; the draw re-caps it to the actual modal width.
-        app.diff_files_width = w.clamp(crate::app::MIN_DIFF_FILES_W, 300);
+        // The draw re-caps it to the actual modal width.
+        app.diff_files_width = w.clamp(crate::app::MIN_DIFF_FILES_W, MAX_RESTORED_WIDTH);
     }
     if let Some(pid) = &state.project {
         let row = app
@@ -1001,7 +1055,7 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
 /// Keep the vt100 parser and the daemon PTY sized to the drawn pane.
 fn sync_pty_size(app: &mut App, out: &mut Vec<ClientRequest>) {
     let area = app.term_area;
-    if area.width < 2 || area.height < 2 {
+    if !pane_usable(area) {
         return;
     }
     if let Some(term) = &mut app.term {
@@ -1024,10 +1078,15 @@ fn sync_pty_size(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// (the `sync_pty_size` pattern, minus the daemon round-trip).
 fn sync_vim_size(app: &mut App) {
     if let Some(vim) = &mut app.vim {
-        if vim.area.width >= 2 && vim.area.height >= 2 {
+        if pane_usable(vim.area) {
             vim.resize(vim.area.width, vim.area.height);
         }
     }
+}
+
+/// Whether a rect has been drawn large enough to size a grid to.
+fn pane_usable(area: ratatui::layout::Rect) -> bool {
+    area.width >= MIN_PANE_DIM && area.height >= MIN_PANE_DIM
 }
 
 /// Editor reader-thread events. A stale generation (bytes buffered from an
@@ -1080,10 +1139,7 @@ fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientReques
         Event::Paste(text) if app.vim.is_some() => {
             if let Some(vim) = &mut app.vim {
                 // Bracketed paste so vim doesn't auto-indent it to mush.
-                let mut data = b"\x1b[200~".to_vec();
-                data.extend_from_slice(text.as_bytes());
-                data.extend_from_slice(b"\x1b[201~");
-                vim.input(&data);
+                vim.input(&bracketed(&text));
             }
         }
         // An overlay with a live text field takes the paste: ⌘V into a
@@ -1093,12 +1149,9 @@ fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientReques
             if app.focus == Focus::Terminal && app.term_locked {
                 if let Some(term) = &app.term {
                     // Bracketed paste so the child (claude, vim…) knows.
-                    let mut data = b"\x1b[200~".to_vec();
-                    data.extend_from_slice(text.as_bytes());
-                    data.extend_from_slice(b"\x1b[201~");
                     out.push(ClientRequest::Input {
                         session: term.sref.clone(),
-                        data,
+                        data: bracketed(&text),
                     });
                 }
             }
@@ -1106,6 +1159,14 @@ fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientReques
         Event::Resize(_, _) => app.dirty = true,
         _ => {}
     }
+}
+
+/// `text` wrapped in the bracketed-paste markers, ready for a PTY.
+fn bracketed(text: &str) -> Vec<u8> {
+    let mut data = PASTE_START.to_vec();
+    data.extend_from_slice(text.as_bytes());
+    data.extend_from_slice(PASTE_END);
+    data
 }
 
 /// Route a bracketed paste into whatever text field the open overlay has
@@ -1197,10 +1258,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             || app.keymap.lookup(crate::keymap::Scope::Terminal, &chord)
                 == Some(crate::keymap::Action::UnlockTerminal);
         if is_hatch {
-            // Escape hatch: also expands collapsed sidebars.
-            app.collapsed = false;
-            app.term_locked = false;
-            app.focus = Focus::Sessions;
+            leave_terminal_lock(app);
             return;
         }
         let exited = app.term.as_ref().is_some_and(|t| t.exited);
@@ -1226,9 +1284,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // keys. Esc/Enter/q go back to the session list; everything else
         // falls through to panel navigation.
         if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
-            app.collapsed = false;
-            app.term_locked = false;
-            app.focus = Focus::Sessions;
+            leave_terminal_lock(app);
             return;
         }
     }
@@ -1369,9 +1425,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             // choice survives a restart however it was made.
             let mut cfg = crate::config::Config::load();
             cfg.show_workspaces = app.show_workspaces;
-            if let Err(err) = cfg.save() {
-                app.flash = Some(format!("couldn't save settings: {err}"));
-            }
+            save_config(app, &cfg);
         }
         Action::ToggleProjects => {
             set_hide_projects(app, !app.hide_projects);
@@ -1486,13 +1540,12 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     app.flash = Some("links can't be pinned".into());
                 } else if let Some(a) = app.selected_session() {
                     if a.archived {
-                        app.flash = Some("agent is archived — unarchive first (u)".into());
+                        app.flash = Some(AGENT_ARCHIVED.into());
                     } else {
                         // Keep the selection on this agent after it jumps
                         // between the PINNED/UNPINNED groups.
                         app.select_when_seen = Some(SessionRef::Agent(a.id.clone()));
-                        let req_id = app.alloc_req_id(PendingIntent::None);
-                        out.push(ClientRequest::SetAgentPinned {
+                        send(app, out, |req_id| ClientRequest::SetAgentPinned {
                             req_id,
                             id: a.id,
                             pinned: !a.pinned,
@@ -1505,8 +1558,11 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 // (the handler re-finds the selected worktree by id).
                 if let Some(w) = app.selected_worktree() {
                     let (id, pinned) = (w.id.clone(), !w.pinned);
-                    let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::SetWorktreePinned { req_id, id, pinned });
+                    send(app, out, |req_id| ClientRequest::SetWorktreePinned {
+                        req_id,
+                        id,
+                        pinned,
+                    });
                 }
             }
             _ => {}
@@ -1515,8 +1571,10 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             if app.focus == Focus::Sessions {
                 if let Some(a) = app.selected_session() {
                     if a.archived {
-                        let req_id = app.alloc_req_id(PendingIntent::None);
-                        out.push(ClientRequest::UnarchiveAgent { req_id, id: a.id });
+                        send(app, out, |req_id| ClientRequest::UnarchiveAgent {
+                            req_id,
+                            id: a.id,
+                        });
                     }
                 }
             }
@@ -1605,22 +1663,23 @@ fn open_new_worktree_prompt(app: &mut App, project: nebula_core::ProjectId) {
 }
 
 fn open_prompt(app: &mut App, kind: PromptKind) {
-    let (title, label, input) = match &kind {
+    use std::borrow::Cow;
+    let (title, label, input): (Cow<'static, str>, Cow<'static, str>, String) = match &kind {
         // Starts at "~/" with the home listing already showing, so the
         // browser is one ↓ away; typing a leading '/' or '~' replaces the
         // prefill (see the Char arm), and Ctrl+u clears it.
         PromptKind::AddProject => (
-            "Add project".to_string(),
-            "path to a git repository".to_string(),
-            if std::env::var_os("HOME").is_some() {
+            "Add project".into(),
+            "path to a git repository".into(),
+            if nebula_core::env::home_dir().is_some() {
                 "~/".to_string()
             } else {
                 String::new()
             },
         ),
         PromptKind::NewWorktree { suggestion, .. } => (
-            "New worktree".to_string(),
-            format!("branch name (empty = {suggestion})"),
+            "New worktree".into(),
+            format!("branch name (empty = {suggestion})").into(),
             String::new(),
         ),
         PromptKind::NewAgent { model, effort, .. } => {
@@ -1632,24 +1691,24 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
                 .chain(effort.as_deref())
                 .collect();
             let title = if opts.is_empty() {
-                "New agent".to_string()
+                "New agent".into()
             } else {
-                format!("New agent ({})", opts.join(" · "))
+                format!("New agent ({})", opts.join(" · ")).into()
             };
             (
                 title,
-                format!("name (empty = {})", app.default_session_name("agent")),
+                format!("name (empty = {})", app.default_session_name("agent")).into(),
                 String::new(),
             )
         }
         PromptKind::ClaudeCloudTask { .. } => (
-            "Claude Cloud task".to_string(),
-            "what should Claude do?".to_string(),
+            "Claude Cloud task".into(),
+            "what should Claude do?".into(),
             String::new(),
         ),
         PromptKind::CloudMessage { .. } => (
-            "Send to cloud session".to_string(),
-            "message for the cloud agent".to_string(),
+            "Send to cloud session".into(),
+            "message for the cloud agent".into(),
             String::new(),
         ),
         PromptKind::RenameAgent { id } => {
@@ -1660,7 +1719,7 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
                 .find(|a| &a.id == id)
                 .map(|a| a.name.clone())
                 .unwrap_or_default();
-            ("Rename agent".to_string(), "name".to_string(), current)
+            ("Rename agent".into(), "name".into(), current)
         }
         PromptKind::RenameTerminal { id } => {
             let current = app
@@ -1670,7 +1729,7 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
                 .find(|t| &t.id == id)
                 .map(|t| t.name.clone())
                 .unwrap_or_default();
-            ("Rename terminal".to_string(), "name".to_string(), current)
+            ("Rename terminal".into(), "name".into(), current)
         }
         PromptKind::RenameProject { id } => {
             let current = app
@@ -1681,16 +1740,12 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
                 .map(|p| p.name.clone())
                 .unwrap_or_default();
             (
-                "Rename project".to_string(),
-                "name (empty resets to the folder name)".to_string(),
+                "Rename project".into(),
+                "name (empty resets to the folder name)".into(),
                 current,
             )
         }
-        PromptKind::NewWorkspace => (
-            "New workspace".to_string(),
-            "name".to_string(),
-            String::new(),
-        ),
+        PromptKind::NewWorkspace => ("New workspace".into(), "name".into(), String::new()),
         PromptKind::RenameWorkspace { id } => {
             let current = app
                 .tree
@@ -1699,11 +1754,11 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
                 .find(|w| &w.id == id)
                 .map(|w| w.name.clone())
                 .unwrap_or_default();
-            ("Rename workspace".to_string(), "name".to_string(), current)
+            ("Rename workspace".into(), "name".into(), current)
         }
         PromptKind::NewLink { .. } => (
-            "Add link".to_string(),
-            "URL (pull request, doc, ticket)".to_string(),
+            "Add link".into(),
+            "URL (pull request, doc, ticket)".into(),
             String::new(),
         ),
         PromptKind::EditLink { id } => {
@@ -1714,7 +1769,7 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
                 .find(|l| &l.id == id)
                 .map(|l| l.url.clone())
                 .unwrap_or_default();
-            ("Edit link".to_string(), "URL".to_string(), current)
+            ("Edit link".into(), "URL".into(), current)
         }
     };
     app.overlay = Some(Overlay::Prompt(PromptDialog::new(
@@ -1733,7 +1788,7 @@ fn open_repo_in_browser(app: &mut App) {
         .filter(|path| path.is_dir())
         .or_else(|| app.selected_project().map(|p| p.repo_path.clone()));
     let Some(root) = root else {
-        app.flash = Some("select a project or worktree first".into());
+        app.flash = Some(SELECT_CONTEXT_FIRST.into());
         return;
     };
     match crate::remote::repo_url(&root) {
@@ -1746,19 +1801,52 @@ fn open_repo_in_browser(app: &mut App) {
     }
 }
 
-fn open_diff_view(app: &mut App) {
+/// The selected worktree's checkout — path and branch — for the modals that
+/// read it. Flashes and returns None when no worktree is selected or its
+/// path is gone from disk.
+fn selected_checkout(app: &mut App) -> Option<(std::path::PathBuf, String)> {
     // Clone before touching app.overlay — selected_worktree borrows app.
     let Some((path, branch)) = app
         .selected_worktree()
         .map(|w| (w.path.clone(), w.branch.clone()))
     else {
         app.flash = Some("no worktree selected".into());
-        return;
+        return None;
     };
     if !path.is_dir() {
         app.flash = Some(format!("worktree path missing on disk: {}", path.display()));
-        return;
+        return None;
     }
+    Some((path, branch))
+}
+
+/// Every tracked + untracked file of a checkout, plus the configured editor
+/// command, for the finder and tree modals. Flashes and returns None when
+/// git fails or the checkout has no files.
+fn load_worktree_files(
+    app: &mut App,
+    path: &std::path::Path,
+    branch: &str,
+) -> Option<(Vec<String>, String)> {
+    let files = match crate::git_diff::list_files(path) {
+        Ok(files) => files,
+        Err(msg) => {
+            app.flash = Some(msg);
+            return None;
+        }
+    };
+    if files.is_empty() {
+        app.flash = Some(format!("no files in {branch}"));
+        return None;
+    }
+    let editor = crate::config::Config::load().editor_command();
+    Some((files, editor))
+}
+
+fn open_diff_view(app: &mut App) {
+    let Some((path, branch)) = selected_checkout(app) else {
+        return;
+    };
     let files = match crate::git_diff::changed_files(&path) {
         Ok(files) => files,
         Err(msg) => {
@@ -1818,30 +1906,12 @@ fn open_hosts_picker(app: &mut App) {
 }
 
 fn open_file_finder(app: &mut App) {
-    // Clone before touching app.overlay — selected_worktree borrows app.
-    let Some((path, branch)) = app
-        .selected_worktree()
-        .map(|w| (w.path.clone(), w.branch.clone()))
-    else {
-        app.flash = Some("no worktree selected".into());
+    let Some((path, branch)) = selected_checkout(app) else {
         return;
     };
-    if !path.is_dir() {
-        app.flash = Some(format!("worktree path missing on disk: {}", path.display()));
+    let Some((files, editor)) = load_worktree_files(app, &path, &branch) else {
         return;
-    }
-    let files = match crate::git_diff::list_files(&path) {
-        Ok(files) => files,
-        Err(msg) => {
-            app.flash = Some(msg);
-            return;
-        }
     };
-    if files.is_empty() {
-        app.flash = Some(format!("no files in {branch}"));
-        return;
-    }
-    let editor = crate::config::Config::load().editor_command();
     app.overlay = Some(Overlay::Files(FileFinder::new(path, branch, editor, files)));
 }
 
@@ -1850,48 +1920,21 @@ fn open_file_finder(app: &mut App) {
 /// flash instead of opening when there's no worktree, the path is gone, or
 /// git fails.
 fn open_tree_browser(app: &mut App) {
-    // Clone before touching app.overlay — selected_worktree borrows app.
-    let Some((path, branch)) = app
-        .selected_worktree()
-        .map(|w| (w.path.clone(), w.branch.clone()))
-    else {
-        app.flash = Some("no worktree selected".into());
+    let Some((path, branch)) = selected_checkout(app) else {
         return;
     };
-    if !path.is_dir() {
-        app.flash = Some(format!("worktree path missing on disk: {}", path.display()));
+    let Some((files, editor)) = load_worktree_files(app, &path, &branch) else {
         return;
-    }
-    let files = match crate::git_diff::list_files(&path) {
-        Ok(files) => files,
-        Err(msg) => {
-            app.flash = Some(msg);
-            return;
-        }
     };
-    if files.is_empty() {
-        app.flash = Some(format!("no files in {branch}"));
-        return;
-    }
-    let editor = crate::config::Config::load().editor_command();
     app.overlay = Some(Overlay::Tree(TreeBrowser::new(path, branch, editor, files)));
 }
 
 /// Find-in-files (`F`): live `git grep` over the selected worktree; Enter
 /// on a hit opens it in the editor modal. Same shell as `open_diff_view`.
 fn open_grep_view(app: &mut App) {
-    // Clone before touching app.overlay — selected_worktree borrows app.
-    let Some((path, branch)) = app
-        .selected_worktree()
-        .map(|w| (w.path.clone(), w.branch.clone()))
-    else {
-        app.flash = Some("no worktree selected".into());
+    let Some((path, branch)) = selected_checkout(app) else {
         return;
     };
-    if !path.is_dir() {
-        app.flash = Some(format!("worktree path missing on disk: {}", path.display()));
-        return;
-    }
     let editor = crate::config::Config::load().editor_command();
     app.overlay = Some(Overlay::Grep(GrepView::new(path, branch, editor)));
 }
@@ -1908,24 +1951,37 @@ fn open_selected_hit_in_editor(app: &mut App) {
     };
     let (root, editor) = (view.root.clone(), view.editor.clone());
     let (path, line) = (hit.path.clone(), hit.line);
-    let Some(tx) = app.vim_tx.clone() else {
-        return; // main loop not running (unit tests without a channel)
-    };
     // Size guess from the last-drawn body; the post-draw sync corrects it.
-    let (cols, rows) = vim_size_guess(app);
+    let size = vim_size_guess(app);
+    spawn_editor_modal(app, &editor, &root, &path, line, size);
+}
+
+/// Boot `editor` on `file` at `line` (cwd `root`) into the editor modal at
+/// grid `size`, replacing whatever it held; a spawn failure flashes. False
+/// when nothing was spawned — the main loop isn't running (unit tests
+/// without a channel) or the spawn failed.
+fn spawn_editor_modal(
+    app: &mut App,
+    editor: &str,
+    root: &std::path::Path,
+    file: &str,
+    line: u64,
+    size: (u16, u16),
+) -> bool {
+    let Some(tx) = app.vim_tx.clone() else {
+        return false;
+    };
+    let (cols, rows) = size;
     app.vim_generation += 1;
-    match VimTerm::spawn_editor(
-        &editor,
-        &root,
-        &path,
-        line,
-        cols,
-        rows,
-        app.vim_generation,
-        tx,
-    ) {
-        Ok(vim) => app.vim = Some(vim),
-        Err(msg) => app.flash = Some(msg),
+    match VimTerm::spawn_editor(editor, root, file, line, cols, rows, app.vim_generation, tx) {
+        Ok(vim) => {
+            app.vim = Some(vim);
+            true
+        }
+        Err(msg) => {
+            app.flash = Some(msg);
+            false
+        }
     }
 }
 
@@ -1940,16 +1996,9 @@ fn open_selected_file_in_editor(app: &mut App) {
         return;
     };
     let (root, editor) = (finder.root.clone(), finder.editor.clone());
-    let Some(tx) = app.vim_tx.clone() else {
-        return; // main loop not running (unit tests without a channel)
-    };
     // Size guess from the last-drawn body; the post-draw sync corrects it.
-    let (cols, rows) = vim_size_guess(app);
-    app.vim_generation += 1;
-    match VimTerm::spawn_editor(&editor, &root, &path, 1, cols, rows, app.vim_generation, tx) {
-        Ok(vim) => app.vim = Some(vim),
-        Err(msg) => app.flash = Some(msg),
-    }
+    let size = vim_size_guess(app);
+    spawn_editor_modal(app, &editor, &root, &path, 1, size);
 }
 
 /// Enter on a tree-browser file row: spawn the editor embedded in the
@@ -1969,21 +2018,15 @@ fn open_selected_tree_file_in_editor(app: &mut App) {
     let (root, editor) = (view.root.clone(), view.editor.clone());
     // Size from the last-drawn preview pane; the post-draw sync corrects it.
     let preview = view.preview_area;
-    let Some(tx) = app.vim_tx.clone() else {
-        return; // main loop not running (unit tests without a channel)
-    };
-    let (cols, rows) = if preview.width >= 2 && preview.height >= 2 {
+    let size = if pane_usable(preview) {
         (preview.width, preview.height)
     } else {
         vim_size_guess(app) // never drawn yet
     };
-    app.vim_generation += 1;
-    match VimTerm::spawn_editor(&editor, &root, &path, 1, cols, rows, app.vim_generation, tx) {
-        Ok(mut vim) => {
+    if spawn_editor_modal(app, &editor, &root, &path, 1, size) {
+        if let Some(vim) = &mut app.vim {
             vim.embedded = true;
-            app.vim = Some(vim);
         }
-        Err(msg) => app.flash = Some(msg),
     }
 }
 
@@ -1995,10 +2038,10 @@ fn vim_size_guess(app: &App) -> (u16, u16) {
     let frame_h = app.body_area.height + 2; // + footer row and its padding
     let cols = (frame_w * ui::VIM_MODAL_PCT.0 / 100)
         .saturating_sub(2)
-        .max(2);
+        .max(MIN_PANE_DIM);
     let rows = (frame_h * ui::VIM_MODAL_PCT.1 / 100)
         .saturating_sub(2)
-        .max(2);
+        .max(MIN_PANE_DIM);
     (cols, rows)
 }
 
@@ -2015,24 +2058,8 @@ fn open_file_link(app: &mut App, path: &str, line: Option<u64>) {
         return;
     };
     let editor = crate::config::Config::load().editor_command();
-    let Some(tx) = app.vim_tx.clone() else {
-        return; // main loop not running (unit tests without a channel)
-    };
-    let (cols, rows) = vim_size_guess(app);
-    app.vim_generation += 1;
-    match VimTerm::spawn_editor(
-        &editor,
-        &root,
-        &file,
-        line.unwrap_or(1),
-        cols,
-        rows,
-        app.vim_generation,
-        tx,
-    ) {
-        Ok(vim) => app.vim = Some(vim),
-        Err(msg) => app.flash = Some(msg),
-    }
+    let size = vim_size_guess(app);
+    spawn_editor_modal(app, &editor, &root, &file, line.unwrap_or(1), size);
 }
 
 /// Worktree root of the attached session; falls back to the selected
@@ -2058,25 +2085,24 @@ fn attached_worktree_root(app: &App) -> Option<std::path::PathBuf> {
 /// argument to hand the editor — relative paths stay relative, since the
 /// editor runs with the worktree as cwd.
 fn resolve_file_link(root: &std::path::Path, path: &str) -> Option<String> {
-    let mut candidates = vec![path.to_string()];
+    let mut candidates = vec![path];
     for prefix in ["a/", "b/"] {
         if let Some(rest) = path.strip_prefix(prefix) {
-            candidates.push(rest.to_string());
+            candidates.push(rest);
         }
     }
     for cand in candidates {
         let full = if let Some(rest) = cand.strip_prefix("~/") {
-            let home = std::env::var_os("HOME")?;
-            std::path::PathBuf::from(home).join(rest)
+            nebula_core::env::home_dir()?.join(rest)
         } else {
             // join() with an absolute candidate yields the candidate.
-            root.join(&cand)
+            root.join(cand)
         };
         if full.is_file() {
             return Some(if cand.starts_with("~/") {
                 full.to_string_lossy().into_owned()
             } else {
-                cand
+                cand.to_string()
             });
         }
     }
@@ -2105,8 +2131,10 @@ fn handle_vim_key(app: &mut App, key: KeyEvent) {
 /// Archive is cheap to undo (u), so it skips the confirm dialog.
 fn archive_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
     detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
-    let req_id = app.alloc_req_id(PendingIntent::None);
-    out.push(ClientRequest::ArchiveAgent { req_id, id });
+    send(app, out, |req_id| ClientRequest::ArchiveAgent {
+        req_id,
+        id,
+    });
 }
 
 /// Expand/collapse the ARCHIVED group (A key, header click, context menu).
@@ -2123,25 +2151,21 @@ fn toggle_archived(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// Projects panel has focus. The daemon names it (`term-N`) and the Ack
 /// attaches it, so one keypress lands in a ready shell.
 fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let worktree = match app.focus {
-        Focus::Projects => app.selected_project().and_then(|p| {
-            app.tree
-                .worktrees
-                .iter()
-                .find(|w| w.project_id == p.id && w.is_main)
-                .map(|w| w.id.clone())
-        }),
-        _ => app.selected_worktree().map(|w| w.id.clone()),
-    };
-    let Some(worktree) = worktree else {
-        app.flash = Some("select a project or worktree first".into());
+    let Some(worktree) = worktree_in_context(app) else {
+        app.flash = Some(SELECT_CONTEXT_FIRST.into());
         return;
     };
-    let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
-    out.push(ClientRequest::CreateTerminal {
-        req_id,
-        worktree,
-        name: None,
+    create_terminal(app, worktree, out);
+}
+
+/// Ask the daemon for a shell terminal in `worktree`; the Ack attaches it.
+fn create_terminal(app: &mut App, worktree: WorktreeId, out: &mut Vec<ClientRequest>) {
+    send_with(app, out, PendingIntent::AttachCreated, |req_id| {
+        ClientRequest::CreateTerminal {
+            req_id,
+            worktree,
+            name: None,
+        }
     });
 }
 
@@ -2149,7 +2173,16 @@ fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// selected project's main checkout when the Projects panel has focus (the
 /// same rule `t` uses for terminals).
 fn open_new_link_prompt(app: &mut App) {
-    let worktree = match app.focus {
+    match worktree_in_context(app) {
+        Some(worktree) => open_prompt(app, PromptKind::NewLink { worktree }),
+        None => app.flash = Some(SELECT_CONTEXT_FIRST.into()),
+    }
+}
+
+/// The worktree the selection stands for: the selected one, or the selected
+/// project's main checkout (root) when the Projects panel has focus.
+fn worktree_in_context(app: &App) -> Option<WorktreeId> {
+    match app.focus {
         Focus::Projects => app.selected_project().and_then(|p| {
             app.tree
                 .worktrees
@@ -2158,10 +2191,6 @@ fn open_new_link_prompt(app: &mut App) {
                 .map(|w| w.id.clone())
         }),
         _ => app.selected_worktree().map(|w| w.id.clone()),
-    };
-    match worktree {
-        Some(worktree) => open_prompt(app, PromptKind::NewLink { worktree }),
-        None => app.flash = Some("select a project or worktree first".into()),
     }
 }
 
@@ -2169,15 +2198,10 @@ fn open_delete_confirm(app: &mut App) {
     match app.focus {
         Focus::Projects => {
             if let Some(p) = app.selected_project() {
-                app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-                    title: "Remove project".into(),
-                    message: format!(
-                        "Remove '{}' from nebula? Nothing on disk is touched.",
-                        p.name
-                    ),
-                    action: PendingAction::RemoveProject(p.id.clone()),
-                    area: ratatui::layout::Rect::default(),
-                }));
+                app.overlay = Some(Overlay::Confirm(confirm_remove_project(
+                    &p.name,
+                    p.id.clone(),
+                )));
             }
         }
         Focus::Worktrees => {
@@ -2205,23 +2229,10 @@ fn open_delete_confirm(app: &mut App) {
         }
         Focus::Sessions => match app.selected_session_row() {
             Some(SessionRow::Agent(a)) => {
-                app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-                    title: "Delete agent".into(),
-                    message: format!(
-                        "Delete agent '{}'? Its session and history go away.",
-                        a.name
-                    ),
-                    action: PendingAction::DeleteAgent(a.id),
-                    area: ratatui::layout::Rect::default(),
-                }));
+                app.overlay = Some(Overlay::Confirm(confirm_delete_agent(&a.name, a.id)));
             }
             Some(SessionRow::Terminal(t)) => {
-                app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-                    title: "Close terminal".into(),
-                    message: format!("Close terminal '{}'? Its shell is killed.", t.name),
-                    action: PendingAction::CloseTerminal(t.id),
-                    area: ratatui::layout::Rect::default(),
-                }));
+                app.overlay = Some(Overlay::Confirm(confirm_close_terminal(&t.name, t.id)));
             }
             Some(SessionRow::Link(l)) => delete_link(app, &l),
             None => {}
@@ -2231,6 +2242,37 @@ fn open_delete_confirm(app: &mut App) {
             open_remove_workspace_confirm(app, id, None);
         }
         Focus::Terminal => {}
+    }
+}
+
+/// The confirm before an agent is deleted — from the `d` key and the row
+/// menu alike, so the two never drift apart in wording.
+fn confirm_delete_agent(name: &str, id: AgentId) -> ConfirmDialog {
+    ConfirmDialog {
+        title: "Delete agent".into(),
+        message: format!("Delete agent '{name}'? Its session and history go away."),
+        action: PendingAction::DeleteAgent(id),
+        area: ratatui::layout::Rect::default(),
+    }
+}
+
+/// The confirm before a terminal tab is closed (key and menu).
+fn confirm_close_terminal(name: &str, id: TerminalId) -> ConfirmDialog {
+    ConfirmDialog {
+        title: "Close terminal".into(),
+        message: format!("Close terminal '{name}'? Its shell is killed."),
+        action: PendingAction::CloseTerminal(id),
+        area: ratatui::layout::Rect::default(),
+    }
+}
+
+/// The confirm before a project is dropped from the list (key and menu).
+fn confirm_remove_project(name: &str, id: ProjectId) -> ConfirmDialog {
+    ConfirmDialog {
+        title: "Remove project".into(),
+        message: format!("Remove '{name}' from nebula? Nothing on disk is touched."),
+        action: PendingAction::RemoveProject(id),
+        area: ratatui::layout::Rect::default(),
     }
 }
 
@@ -2370,22 +2412,16 @@ fn open_delete_all_confirm(app: &mut App) {
 /// Row menu for a link: open it, and — unless it's the pull request nebula
 /// found in git — edit or delete it.
 fn menu_items_for_link(row: &LinkRow) -> Vec<MenuItem> {
-    let mut items = vec![MenuItem {
-        label: "Open in browser".into(),
-        action: MenuAction::OpenLink(row.url().to_string()),
-        destructive: false,
-    }];
+    let mut items = vec![MenuItem::new(
+        "Open in browser",
+        MenuAction::OpenLink(row.url().to_string()),
+    )];
     if let Some(id) = row.id() {
-        items.push(MenuItem {
-            label: "Edit URL".into(),
-            action: MenuAction::EditLink(id.clone()),
-            destructive: false,
-        });
-        items.push(MenuItem {
-            label: "Delete".into(),
-            action: MenuAction::DeleteLink(id.clone()),
-            destructive: true,
-        });
+        items.push(MenuItem::new("Edit URL", MenuAction::EditLink(id.clone())));
+        items.push(MenuItem::destructive(
+            "Delete",
+            MenuAction::DeleteLink(id.clone()),
+        ));
     }
     items
 }
@@ -2393,49 +2429,23 @@ fn menu_items_for_link(row: &LinkRow) -> Vec<MenuItem> {
 fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
     let mut items = if a.archived {
         vec![
-            MenuItem {
-                label: "Unarchive".into(),
-                action: MenuAction::UnarchiveAgent(a.id.clone()),
-                destructive: false,
-            },
-            MenuItem {
-                label: "Delete".into(),
-                action: MenuAction::DeleteAgent(a.id.clone()),
-                destructive: true,
-            },
+            MenuItem::new("Unarchive", MenuAction::UnarchiveAgent(a.id.clone())),
+            MenuItem::destructive("Delete", MenuAction::DeleteAgent(a.id.clone())),
         ]
     } else {
         vec![
-            MenuItem {
-                label: "Attach".into(),
-                action: MenuAction::Attach(SessionRef::Agent(a.id.clone())),
-                destructive: false,
-            },
-            MenuItem {
-                label: "Restart".into(),
-                action: MenuAction::RestartAgent(a.id.clone()),
-                destructive: false,
-            },
-            MenuItem {
-                label: if a.pinned { "Unpin" } else { "Pin" }.into(),
-                action: MenuAction::SetAgentPinned(a.id.clone(), !a.pinned),
-                destructive: false,
-            },
-            MenuItem {
-                label: "Rename".into(),
-                action: MenuAction::RenameAgent(a.id.clone()),
-                destructive: false,
-            },
-            MenuItem {
-                label: "Archive".into(),
-                action: MenuAction::ArchiveAgent(a.id.clone()),
-                destructive: false,
-            },
-            MenuItem {
-                label: "Delete".into(),
-                action: MenuAction::DeleteAgent(a.id.clone()),
-                destructive: true,
-            },
+            MenuItem::new(
+                "Attach",
+                MenuAction::Attach(SessionRef::Agent(a.id.clone())),
+            ),
+            MenuItem::new("Restart", MenuAction::RestartAgent(a.id.clone())),
+            MenuItem::new(
+                if a.pinned { "Unpin" } else { "Pin" },
+                MenuAction::SetAgentPinned(a.id.clone(), !a.pinned),
+            ),
+            MenuItem::new("Rename", MenuAction::RenameAgent(a.id.clone())),
+            MenuItem::new("Archive", MenuAction::ArchiveAgent(a.id.clone())),
+            MenuItem::destructive("Delete", MenuAction::DeleteAgent(a.id.clone())),
         ]
     };
     // A Cloud row can always be re-entered explicitly — even after a
@@ -2448,19 +2458,17 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
             .map_or(items.len(), |i| i + 1);
         items.insert(
             after_restart,
-            MenuItem {
-                label: "Attach cloud session".into(),
-                action: MenuAction::AttachCloudAgent(a.id.clone()),
-                destructive: false,
-            },
+            MenuItem::new(
+                "Attach cloud session",
+                MenuAction::AttachCloudAgent(a.id.clone()),
+            ),
         );
         items.insert(
             after_restart + 1,
-            MenuItem {
-                label: "Send to cloud session".into(),
-                action: MenuAction::SendCloudMessage(a.id.clone()),
-                destructive: false,
-            },
+            MenuItem::new(
+                "Send to cloud session",
+                MenuAction::SendCloudMessage(a.id.clone()),
+            ),
         );
     }
     items
@@ -2468,21 +2476,12 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
 
 fn menu_items_for_terminal(t: &nebula_core::TerminalTab) -> Vec<MenuItem> {
     vec![
-        MenuItem {
-            label: "Attach".into(),
-            action: MenuAction::Attach(SessionRef::Terminal(t.id.clone())),
-            destructive: false,
-        },
-        MenuItem {
-            label: "Rename".into(),
-            action: MenuAction::RenameTerminal(t.id.clone()),
-            destructive: false,
-        },
-        MenuItem {
-            label: "Close".into(),
-            action: MenuAction::CloseTerminal(t.id.clone()),
-            destructive: true,
-        },
+        MenuItem::new(
+            "Attach",
+            MenuAction::Attach(SessionRef::Terminal(t.id.clone())),
+        ),
+        MenuItem::new("Rename", MenuAction::RenameTerminal(t.id.clone())),
+        MenuItem::destructive("Close", MenuAction::CloseTerminal(t.id.clone())),
     ]
 }
 
@@ -2507,16 +2506,17 @@ fn open_menu(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
 /// Claude/Codex rows expand (→) into model and effort submenus; Enter
 /// anywhere takes the configured defaults for whatever wasn't drilled into.
 fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
-    let kind_row = |label: &str, kind: AgentKind| MenuItem {
-        label: label.into(),
-        action: MenuAction::NewAgentOfKind {
-            worktree: worktree.clone(),
-            kind,
-            model: None,
-            effort: None,
-            cloud: false,
-        },
-        destructive: false,
+    let kind_row = |label: &str, kind: AgentKind| {
+        MenuItem::new(
+            label,
+            MenuAction::NewAgentOfKind {
+                worktree: worktree.clone(),
+                kind,
+                model: None,
+                effort: None,
+                cloud: false,
+            },
+        )
     };
     app.overlay = Some(Overlay::Menu(ContextMenu {
         title: Some("New session".into()),
@@ -2524,11 +2524,7 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
             kind_row("Claude", AgentKind::Claude),
             kind_row("Codex", AgentKind::Codex),
             kind_row("Cursor", AgentKind::Cursor),
-            MenuItem {
-                label: "Terminal (shell)".into(),
-                action: MenuAction::NewTerminal(worktree),
-                destructive: false,
-            },
+            MenuItem::new("Terminal (shell)", MenuAction::NewTerminal(worktree)),
         ],
         at: None,
         hover: 0,
@@ -2569,26 +2565,27 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
     let configured = configured.unwrap_or_else(|| "default".into());
     let items: Vec<MenuItem> = choices
         .iter()
-        .map(|choice| MenuItem {
-            label: if *choice == configured {
-                format!("{choice} ✓")
-            } else {
-                (*choice).to_string()
-            },
-            action: MenuAction::NewAgentOfKind {
-                worktree: worktree.clone(),
-                kind: *kind,
-                model: match sub {
-                    SubmenuKind::Models => Some((*choice).to_string()),
-                    SubmenuKind::Efforts => model.clone(),
+        .map(|choice| {
+            MenuItem::new(
+                if *choice == configured {
+                    format!("{choice} ✓")
+                } else {
+                    (*choice).to_string()
                 },
-                effort: match sub {
-                    SubmenuKind::Models => None,
-                    SubmenuKind::Efforts => Some((*choice).to_string()),
+                MenuAction::NewAgentOfKind {
+                    worktree: worktree.clone(),
+                    kind: *kind,
+                    model: match sub {
+                        SubmenuKind::Models => Some((*choice).to_string()),
+                        SubmenuKind::Efforts => model.clone(),
+                    },
+                    effort: match sub {
+                        SubmenuKind::Models => None,
+                        SubmenuKind::Efforts => Some((*choice).to_string()),
+                    },
+                    cloud: *cloud,
                 },
-                cloud: *cloud,
-            },
-            destructive: false,
+            )
         })
         .collect();
     let hover = choices.iter().position(|c| *c == configured).unwrap_or(0);
@@ -2629,15 +2626,14 @@ fn open_workspace_picker(app: &mut App) {
                 .iter()
                 .filter(|p| p.workspace_id == w.id)
                 .count();
-            MenuItem {
-                label: format!(
+            MenuItem::new(
+                format!(
                     "{}{}  ({projects})",
                     w.name,
                     if &w.id == active { " ✓" } else { "" }
                 ),
-                action: MenuAction::OpenWorkspace(w.id.clone()),
-                destructive: false,
-            }
+                MenuAction::OpenWorkspace(w.id.clone()),
+            )
         })
         .collect();
     if items.is_empty() {
@@ -2712,8 +2708,10 @@ fn switch_workspace_inner(
     refresh_palette(app);
     // An open switcher keeps its ✓ on the now-open workspace.
     refresh_workspace_picker(app);
-    let req_id = app.alloc_req_id(PendingIntent::None);
-    out.push(ClientRequest::OpenWorkspace { req_id, id });
+    send(app, out, |req_id| ClientRequest::OpenWorkspace {
+        req_id,
+        id,
+    });
     app.dirty = true;
     true
 }
@@ -2746,9 +2744,7 @@ fn reseat_deleted_workspace(
     // With the row gone, its right-hand neighbor now sits at the deleted
     // tab's own index; an index past the end means it was the last tab,
     // so clamp onto the new last — its former left-hand neighbor.
-    let land = removed_tab
-        .unwrap_or(0)
-        .min(app.tree.workspaces.len() - 1);
+    let land = removed_tab.unwrap_or(0).min(app.tree.workspaces.len() - 1);
     let fallback = app.tree.workspaces[land].id.clone();
     switch_workspace(app, fallback, out);
 }
@@ -2785,8 +2781,10 @@ fn open_remove_workspace_confirm(app: &mut App, id: WorkspaceId, reopen_picker: 
 /// one does go the deletion delta reseats this instance
 /// (`reseat_deleted_workspace`).
 fn remove_workspace(app: &mut App, id: WorkspaceId, out: &mut Vec<ClientRequest>) {
-    let req_id = app.alloc_req_id(PendingIntent::None);
-    out.push(ClientRequest::RemoveWorkspace { req_id, id });
+    send(app, out, |req_id| ClientRequest::RemoveWorkspace {
+        req_id,
+        id,
+    });
 }
 
 /// Bring the `w` switcher back after a confirm that replaced it, on the
@@ -2806,21 +2804,9 @@ fn reopen_workspace_picker(app: &mut App, hover: usize) {
 fn workspace_menu(app: &App) -> Vec<MenuItem> {
     let id = app.tree.active_workspace.clone();
     vec![
-        MenuItem {
-            label: "New workspace".into(),
-            action: MenuAction::NewWorkspace,
-            destructive: false,
-        },
-        MenuItem {
-            label: "Rename workspace".into(),
-            action: MenuAction::RenameWorkspace(id.clone()),
-            destructive: false,
-        },
-        MenuItem {
-            label: "Delete workspace".into(),
-            action: MenuAction::RemoveWorkspace(id),
-            destructive: true,
-        },
+        MenuItem::new("New workspace", MenuAction::NewWorkspace),
+        MenuItem::new("Rename workspace", MenuAction::RenameWorkspace(id.clone())),
+        MenuItem::destructive("Delete workspace", MenuAction::RemoveWorkspace(id)),
     ]
 }
 
@@ -2840,71 +2826,46 @@ fn refresh_workspace_picker(app: &mut App) {
 }
 
 fn open_context_menu_for_selection(app: &mut App) {
-    // Keyboard-invoked menu: anchor near the selected row's panel.
-    let at = (30, 4);
+    let at = KEYBOARD_MENU_ANCHOR;
     match app.focus {
         Focus::Workspaces => {
             let items = workspace_menu(app);
             open_menu(app, items, at);
         }
         Focus::Projects => {
-            let mut items = vec![MenuItem {
-                label: "Add project".into(),
-                action: MenuAction::AddProject,
-                destructive: false,
-            }];
+            let mut items = vec![MenuItem::new("Add project", MenuAction::AddProject)];
             if let Some(p) = app.selected_project() {
                 items.insert(
                     0,
-                    MenuItem {
-                        label: "New worktree".into(),
-                        action: MenuAction::NewWorktree(p.id.clone()),
-                        destructive: false,
-                    },
+                    MenuItem::new("New worktree", MenuAction::NewWorktree(p.id.clone())),
                 );
-                items.push(MenuItem {
-                    label: "Rename".into(),
-                    action: MenuAction::RenameProject(p.id.clone()),
-                    destructive: false,
-                });
-                items.push(MenuItem {
-                    label: "Remove from list".into(),
-                    action: MenuAction::RemoveProject(p.id.clone()),
-                    destructive: true,
-                });
+                items.push(MenuItem::new(
+                    "Rename",
+                    MenuAction::RenameProject(p.id.clone()),
+                ));
+                items.push(MenuItem::destructive(
+                    "Remove from list",
+                    MenuAction::RemoveProject(p.id.clone()),
+                ));
             }
             open_menu(app, items, at);
         }
         Focus::Worktrees => {
             if let Some(w) = app.selected_worktree() {
                 let mut items = vec![
-                    MenuItem {
-                        label: "New agent".into(),
-                        action: MenuAction::NewAgent(w.id.clone()),
-                        destructive: false,
-                    },
-                    MenuItem {
-                        label: "New terminal".into(),
-                        action: MenuAction::NewTerminal(w.id.clone()),
-                        destructive: false,
-                    },
-                    MenuItem {
-                        label: "Add link".into(),
-                        action: MenuAction::NewLink(w.id.clone()),
-                        destructive: false,
-                    },
-                    MenuItem {
-                        label: if w.pinned { "Unpin" } else { "Pin" }.into(),
-                        action: MenuAction::SetWorktreePinned(w.id.clone(), !w.pinned),
-                        destructive: false,
-                    },
+                    MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
+                    MenuItem::new("New terminal", MenuAction::NewTerminal(w.id.clone())),
+                    MenuItem::new("Add link", MenuAction::NewLink(w.id.clone())),
+                    MenuItem::new(
+                        if w.pinned { "Unpin" } else { "Pin" },
+                        MenuAction::SetWorktreePinned(w.id.clone(), !w.pinned),
+                    ),
                 ];
                 if !w.is_main {
-                    items.push(MenuItem {
-                        label: "Delete worktree".into(),
-                        action: MenuAction::DeleteWorktree(w.id.clone()),
-                        destructive: true,
-                    });
+                    items.push(MenuItem::destructive(
+                        "Delete worktree",
+                        MenuAction::DeleteWorktree(w.id.clone()),
+                    ));
                 }
                 open_menu(app, items, at);
             }
@@ -2940,9 +2901,11 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
         Overlay::Metrics(view) => match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('M') => app.overlay = None,
             KeyCode::Char('j') | KeyCode::Down => {
-                view.selected = (view.selected + 1).min(view.rows.len().saturating_sub(1));
+                view.selected = clamp_selection(view.selected as i64 + (1), view.rows.len());
             }
-            KeyCode::Char('k') | KeyCode::Up => view.selected = view.selected.saturating_sub(1),
+            KeyCode::Char('k') | KeyCode::Up => {
+                view.selected = clamp_selection(view.selected as i64 + (-1), view.rows.len());
+            }
             KeyCode::Enter => {
                 // Nebula's own rows (daemon / this UI) carry no session.
                 if let Some(Some(sref)) = view.rows.get(view.selected).cloned() {
@@ -2979,9 +2942,11 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => app.overlay = None,
                 KeyCode::Char('j') | KeyCode::Down => {
-                    view.selected = (view.selected + 1).min(view.hosts.len().saturating_sub(1));
+                    view.selected = clamp_selection(view.selected as i64 + (1), view.hosts.len());
                 }
-                KeyCode::Char('k') | KeyCode::Up => view.selected = view.selected.saturating_sub(1),
+                KeyCode::Char('k') | KeyCode::Up => {
+                    view.selected = clamp_selection(view.selected as i64 + (-1), view.hosts.len());
+                }
                 // A destination the list doesn't have yet — typed here so an
                 // open nebula never needs a shell for `nebula ssh`.
                 KeyCode::Char('a') | KeyCode::Char('n') => view.input = Some(TextInput::new()),
@@ -3000,7 +2965,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Backspace | KeyCode::Delete => {
                     if view.selected < view.hosts.len() {
                         let entry = view.hosts.remove(view.selected);
-                        view.selected = view.selected.min(view.hosts.len().saturating_sub(1));
+                        view.selected = clamp_selection(view.selected as i64, view.hosts.len());
                         crate::hosts::remove(&entry);
                     }
                 }
@@ -3098,7 +3063,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 submit_prompt(app, prompt, out);
             }
             KeyCode::Tab if prompt.completes_paths() => {
-                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                let home = nebula_core::env::home_dir();
                 let result = crate::completion::complete_path(&prompt.input, home.as_deref());
                 if let Some(completed) = result.completed {
                     prompt.input.set_text(completed);
@@ -3236,22 +3201,22 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 // Enter picks per the config setting; Ctrl+O always opens
                 // (attach + terminal focus), Ctrl+F only focuses the row.
                 KeyCode::Enter => {
-                    let attach = palette.enter_attaches;
+                    let landing = Landing::for_enter(palette.enter_attaches);
                     if let Some(target) = palette.selected_target().cloned() {
                         app.overlay = None;
-                        jump_to_target(app, target, attach, out);
+                        jump_to_target(app, target, landing, out);
                     }
                 }
                 KeyCode::Char('o') if ctrl => {
                     if let Some(target) = palette.selected_target().cloned() {
                         app.overlay = None;
-                        jump_to_target(app, target, true, out);
+                        jump_to_target(app, target, Landing::Attach, out);
                     }
                 }
                 KeyCode::Char('f') if ctrl => {
                     if let Some(target) = palette.selected_target().cloned() {
                         app.overlay = None;
-                        jump_to_target(app, target, false, out);
+                        jump_to_target(app, target, Landing::FocusOnly, out);
                     }
                 }
                 // Everything else edits the query like a terminal line
@@ -3401,7 +3366,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
 /// mode the user has to remember. Tab / ⇧Tab / `[` / `]` / 1-9 switch tabs
 /// from anywhere and never mean anything else.
 fn handle_settings_key(app: &mut App, key: KeyEvent) {
-    let Some(Overlay::Settings(view)) = &app.overlay else {
+    let Some(view) = settings(app) else {
         return;
     };
     if view.capturing() {
@@ -3412,7 +3377,7 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
         // Holding a captured chord that already belongs to someone else.
         if key.code == KeyCode::Enter {
             commit_pending_hotkey(app);
-        } else if let Some(Overlay::Settings(view)) = &mut app.overlay {
+        } else if let Some(view) = settings_mut(app) {
             view.capture = None;
             view.info("kept the existing binding");
         }
@@ -3474,7 +3439,7 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
         SettingsCmd::Tab(next) => {
             app.settings_tab = next;
             let row = app.settings_row(next);
-            if let Some(Overlay::Settings(view)) = &mut app.overlay {
+            if let Some(view) = settings_mut(app) {
                 view.tab = next;
                 view.selected = row;
                 view.notice = None;
@@ -3483,27 +3448,27 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
         }
         SettingsCmd::FocusTabs => {
             app.remember_settings_focus(true);
-            if let Some(Overlay::Settings(view)) = &mut app.overlay {
+            if let Some(view) = settings_mut(app) {
                 view.on_tabs = true;
                 view.notice = None;
             }
         }
         SettingsCmd::EnterList => {
             app.remember_settings_focus(false);
-            if let Some(Overlay::Settings(view)) = &mut app.overlay {
+            if let Some(view) = settings_mut(app) {
                 view.on_tabs = false;
             }
         }
         SettingsCmd::Move(i) => {
             app.remember_settings_row(tab, i);
-            if let Some(Overlay::Settings(view)) = &mut app.overlay {
+            if let Some(view) = settings_mut(app) {
                 view.selected = i;
                 view.notice = None;
             }
         }
         SettingsCmd::Apply(i, delta) => apply_setting_at(app, tab, i, delta),
         SettingsCmd::Capture { add } => {
-            if let Some(Overlay::Settings(view)) = &mut app.overlay {
+            if let Some(view) = settings_mut(app) {
                 view.capture = Some(crate::app::HotkeyCapture {
                     action: selected,
                     add,
@@ -3513,26 +3478,22 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
             }
         }
         SettingsCmd::ResetHotkey => {
-            let mut keymap = app.keymap.clone();
-            keymap.reset(selected);
-            let label = keymap.display_at(selected);
-            if save_keymap(app, keymap) {
-                if let Some(Overlay::Settings(view)) = &mut app.overlay {
+            if edit_keymap(app, |keymap| keymap.reset(selected)) {
+                let label = app.keymap.display_at(selected);
+                if let Some(view) = settings_mut(app) {
                     view.info(format!("reset to the default binding: {label}"));
                 }
             }
         }
         SettingsCmd::ClearHotkey => {
-            let mut keymap = app.keymap.clone();
-            keymap.clear(selected);
-            if save_keymap(app, keymap) {
-                if let Some(Overlay::Settings(view)) = &mut app.overlay {
+            if edit_keymap(app, |keymap| keymap.clear(selected)) {
+                if let Some(view) = settings_mut(app) {
                     view.warn("unbound — ⌫ puts the default back");
                 }
             }
         }
         SettingsCmd::Nudge => {
-            if let Some(Overlay::Settings(view)) = &mut app.overlay {
+            if let Some(view) = settings_mut(app) {
                 view.info("Enter: rebind   a: add another key   ⌫: default   x: unbind");
             }
         }
@@ -3550,6 +3511,22 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
                 area: ratatui::layout::Rect::default(),
             }));
         }
+    }
+}
+
+/// The open settings overlay, for handlers that already know it's up.
+fn settings(app: &App) -> Option<&SettingsView> {
+    match &app.overlay {
+        Some(Overlay::Settings(view)) => Some(view),
+        _ => None,
+    }
+}
+
+/// `settings`, mutably.
+fn settings_mut(app: &mut App) -> Option<&mut SettingsView> {
+    match &mut app.overlay {
+        Some(Overlay::Settings(view)) => Some(view),
+        _ => None,
     }
 }
 
@@ -3578,7 +3555,7 @@ fn capture_hotkey(app: &mut App, key: KeyEvent) {
     {
         return;
     }
-    let Some(Overlay::Settings(view)) = &mut app.overlay else {
+    let Some(view) = settings_mut(app) else {
         return;
     };
     let Some(capture) = view.capture.clone() else {
@@ -3601,7 +3578,7 @@ fn capture_hotkey(app: &mut App, key: KeyEvent) {
             .map(|s| format!("\u{201c}{}\u{201d}", s.label))
             .collect::<Vec<_>>()
             .join(", ");
-        if let Some(Overlay::Settings(view)) = &mut app.overlay {
+        if let Some(view) = settings_mut(app) {
             view.warn(format!(
                 "{chord} is already {owners} — Enter to move it here, Esc to keep it there"
             ));
@@ -3616,7 +3593,7 @@ fn capture_hotkey(app: &mut App, key: KeyEvent) {
 
 /// Enter on the duplicate warning: take the chord anyway.
 fn commit_pending_hotkey(app: &mut App) {
-    let Some(Overlay::Settings(view)) = &app.overlay else {
+    let Some(view) = settings(app) else {
         return;
     };
     let Some(capture) = view.capture.clone() else {
@@ -3632,7 +3609,7 @@ fn commit_pending_hotkey(app: &mut App) {
         .collect::<Vec<_>>()
         .join(", ");
     bind_hotkey(app, capture.action, chord, capture.add);
-    if let Some(Overlay::Settings(view)) = &mut app.overlay {
+    if let Some(view) = settings_mut(app) {
         if !stolen_from.is_empty() {
             view.warn(format!(
                 "{chord} taken from {stolen_from}, which is now unbound there"
@@ -3644,10 +3621,8 @@ fn commit_pending_hotkey(app: &mut App) {
 /// Write one binding through to the config, then report how likely the
 /// host terminal is to actually deliver it.
 fn bind_hotkey(app: &mut App, action: usize, chord: crate::keymap::KeyChord, add: bool) {
-    let mut keymap = app.keymap.clone();
-    keymap.bind(action, chord, add);
-    let saved = save_keymap(app, keymap);
-    let Some(Overlay::Settings(view)) = &mut app.overlay else {
+    let saved = edit_keymap(app, |keymap| keymap.bind(action, chord, add));
+    let Some(view) = settings_mut(app) else {
         return;
     };
     view.capture = None;
@@ -3666,19 +3641,36 @@ fn bind_hotkey(app: &mut App, action: usize, chord: crate::keymap::KeyChord, add
 fn save_keymap(app: &mut App, keymap: crate::keymap::Keymap) -> bool {
     let mut cfg = crate::config::Config::load();
     cfg.keybindings = keymap.overrides();
-    if let Err(err) = cfg.save() {
-        app.flash = Some(format!("couldn't save settings: {err}"));
+    if !save_config(app, &cfg) {
         return false;
     }
     app.keymap = keymap;
     true
 }
 
+/// Clone the live keymap, let `edit` change it, and persist the result.
+/// False means the write failed and the live keymap is untouched.
+fn edit_keymap(app: &mut App, edit: impl FnOnce(&mut crate::keymap::Keymap)) -> bool {
+    let mut keymap = app.keymap.clone();
+    edit(&mut keymap);
+    save_keymap(app, keymap)
+}
+
+/// Write the config file, flashing the failure. False when it didn't land.
+fn save_config(app: &mut App, cfg: &crate::config::Config) -> bool {
+    match cfg.save() {
+        Ok(()) => true,
+        Err(err) => {
+            app.flash = Some(format!("couldn't save settings: {err}"));
+            false
+        }
+    }
+}
+
 fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i32) {
     let mut cfg = crate::config::Config::load();
     cfg.cycle(tab, index, delta);
-    if let Err(err) = cfg.save() {
-        app.flash = Some(format!("couldn't save settings: {err}"));
+    if !save_config(app, &cfg) {
         return;
     }
     apply_config(app, &cfg);
@@ -3708,7 +3700,7 @@ fn reset_settings(app: &mut App) {
         Ok(cfg) => {
             apply_config(app, &cfg);
             app.keymap = cfg.keymap();
-            if let Some(Overlay::Settings(view)) = &mut app.overlay {
+            if let Some(view) = settings_mut(app) {
                 view.info("every setting is back to its default");
             }
         }
@@ -3834,12 +3826,13 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 }));
                 return;
             }
-            let req_id = app.alloc_req_id(PendingIntent::SelectCreatedProject);
-            out.push(ClientRequest::AddProject {
-                req_id,
-                path: expanded,
-                name: None,
-                create_missing: false,
+            send_with(app, out, PendingIntent::SelectCreatedProject, |req_id| {
+                ClientRequest::AddProject {
+                    req_id,
+                    path: expanded,
+                    name: None,
+                    create_missing: false,
+                }
             });
         }
         PromptKind::NewWorktree {
@@ -3855,12 +3848,13 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             } else {
                 branch
             };
-            let req_id = app.alloc_req_id(PendingIntent::SelectCreatedWorktree);
-            out.push(ClientRequest::CreateWorktree {
-                req_id,
-                project,
-                branch,
-                base: None,
+            send_with(app, out, PendingIntent::SelectCreatedWorktree, |req_id| {
+                ClientRequest::CreateWorktree {
+                    req_id,
+                    project,
+                    branch,
+                    base: None,
+                }
             });
         }
         PromptKind::NewAgent {
@@ -3913,28 +3907,26 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             out,
         ),
         PromptKind::CloudMessage { id } => {
-            let req_id = app.alloc_req_id(PendingIntent::ReopenPromptOnError {
+            let intent = PendingIntent::ReopenPromptOnError {
                 kind: PromptKind::CloudMessage { id: id.clone() },
                 text: value.clone(),
                 note: "Sent to the cloud session — pulling the transcript".into(),
-            });
-            out.push(ClientRequest::SendCloudMessage {
+            };
+            send_with(app, out, intent, |req_id| ClientRequest::SendCloudMessage {
                 req_id,
                 id,
                 message: value,
             });
         }
         PromptKind::RenameAgent { id } => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::RenameAgent {
+            send(app, out, |req_id| ClientRequest::RenameAgent {
                 req_id,
                 id,
                 name: value,
             });
         }
         PromptKind::RenameTerminal { id } => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::RenameTerminal {
+            send(app, out, |req_id| ClientRequest::RenameTerminal {
                 req_id,
                 id,
                 name: value,
@@ -3950,15 +3942,15 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
         }
         PromptKind::NewWorkspace => {
             // Created from the switcher: open it as soon as the Ack lands.
-            let req_id = app.alloc_req_id(PendingIntent::OpenCreatedWorkspace);
-            out.push(ClientRequest::AddWorkspace {
-                req_id,
-                name: value,
+            send_with(app, out, PendingIntent::OpenCreatedWorkspace, |req_id| {
+                ClientRequest::AddWorkspace {
+                    req_id,
+                    name: value,
+                }
             });
         }
         PromptKind::RenameWorkspace { id } => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::RenameWorkspace {
+            send(app, out, |req_id| ClientRequest::RenameWorkspace {
                 req_id,
                 id,
                 name: value,
@@ -3967,16 +3959,16 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
         PromptKind::NewLink { worktree } => {
             // The new row lands at the end of LINKS; move the cursor there
             // so the link the user just typed is the one under it.
-            let req_id = app.alloc_req_id(PendingIntent::SelectCreatedLink);
-            out.push(ClientRequest::CreateLink {
-                req_id,
-                worktree,
-                url: value,
+            send_with(app, out, PendingIntent::SelectCreatedLink, |req_id| {
+                ClientRequest::CreateLink {
+                    req_id,
+                    worktree,
+                    url: value,
+                }
             });
         }
         PromptKind::EditLink { id } => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::UpdateLink {
+            send(app, out, |req_id| ClientRequest::UpdateLink {
                 req_id,
                 id,
                 url: value,
@@ -3988,27 +3980,19 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
 fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<ClientRequest>) {
     match action {
         PendingAction::CreateProjectDir(path) => {
-            let req_id = app.alloc_req_id(PendingIntent::SelectCreatedProject);
-            out.push(ClientRequest::AddProject {
-                req_id,
-                path,
-                name: None,
-                create_missing: true,
+            send_with(app, out, PendingIntent::SelectCreatedProject, |req_id| {
+                ClientRequest::AddProject {
+                    req_id,
+                    path,
+                    name: None,
+                    create_missing: true,
+                }
             });
         }
-        PendingAction::DeleteAgent(id) => {
-            detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::DeleteAgent { req_id, id });
-        }
-        PendingAction::CloseTerminal(id) => {
-            detach_if_attached(app, &SessionRef::Terminal(id.clone()), out);
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::CloseTerminal { req_id, id });
-        }
+        PendingAction::DeleteAgent(id) => delete_agent(app, id, out),
+        PendingAction::CloseTerminal(id) => close_terminal(app, id, out),
         PendingAction::DeleteLink(id) => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::DeleteLink { req_id, id });
+            send(app, out, |req_id| ClientRequest::DeleteLink { req_id, id });
         }
         PendingAction::DeleteWorktree(id) => {
             // Optimistic: drop the rows now (the daemon deletes in the
@@ -4016,16 +4000,7 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
             // eventual EntityRemoved is a no-op; an Error for this req_id
             // restores the rows via the rollback stashed in the intent.
             let before = selection_snapshot(app);
-            let intent = match remove_worktree_rows(app, &id) {
-                Some(rollback) => PendingIntent::DeleteWorktree(rollback),
-                None => PendingIntent::None,
-            };
-            let req_id = app.alloc_req_id(intent);
-            out.push(ClientRequest::DeleteWorktree {
-                req_id,
-                id,
-                force: true,
-            });
+            delete_worktree(app, id, out);
             // Deleting the selected worktree lands the cursor on a neighbor
             // — bring up that neighbor's session like a manual switch would.
             reconcile_selection(app, before, out);
@@ -4036,34 +4011,23 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
             // One reconcile at the end: the cursor settles on a survivor.
             let before = selection_snapshot(app);
             for id in ids {
-                let intent = match remove_worktree_rows(app, &id) {
-                    Some(rollback) => PendingIntent::DeleteWorktree(rollback),
-                    None => PendingIntent::None,
-                };
-                let req_id = app.alloc_req_id(intent);
-                out.push(ClientRequest::DeleteWorktree {
-                    req_id,
-                    id,
-                    force: true,
-                });
+                delete_worktree(app, id, out);
             }
             reconcile_selection(app, before, out);
         }
         PendingAction::DeleteAllSessions { agents, terminals } => {
             for id in agents {
-                detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
-                let req_id = app.alloc_req_id(PendingIntent::None);
-                out.push(ClientRequest::DeleteAgent { req_id, id });
+                delete_agent(app, id, out);
             }
             for id in terminals {
-                detach_if_attached(app, &SessionRef::Terminal(id.clone()), out);
-                let req_id = app.alloc_req_id(PendingIntent::None);
-                out.push(ClientRequest::CloseTerminal { req_id, id });
+                close_terminal(app, id, out);
             }
         }
         PendingAction::RemoveProject(id) => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::RemoveProject { req_id, id });
+            send(app, out, |req_id| ClientRequest::RemoveProject {
+                req_id,
+                id,
+            });
         }
         PendingAction::RemoveWorkspace { id, reopen_picker } => {
             remove_workspace(app, id, out);
@@ -4078,6 +4042,37 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
     }
 }
 
+/// Delete an agent for good, detaching the pane first if it's showing it.
+fn delete_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
+    detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
+    send(app, out, |req_id| ClientRequest::DeleteAgent { req_id, id });
+}
+
+/// Close a terminal tab, detaching the pane first if it's showing it.
+fn close_terminal(app: &mut App, id: TerminalId, out: &mut Vec<ClientRequest>) {
+    detach_if_attached(app, &SessionRef::Terminal(id.clone()), out);
+    send(app, out, |req_id| ClientRequest::CloseTerminal {
+        req_id,
+        id,
+    });
+}
+
+/// Delete a worktree optimistically: drop its rows now (the daemon deletes
+/// in the background — `git worktree remove` can take seconds). The
+/// eventual EntityRemoved is a no-op; an Error for this req_id restores the
+/// rows via the rollback stashed in the intent.
+fn delete_worktree(app: &mut App, id: WorktreeId, out: &mut Vec<ClientRequest>) {
+    let intent = match remove_worktree_rows(app, &id) {
+        Some(rollback) => PendingIntent::DeleteWorktree(rollback),
+        None => PendingIntent::None,
+    };
+    send_with(app, out, intent, |req_id| ClientRequest::DeleteWorktree {
+        req_id,
+        id,
+        force: true,
+    });
+}
+
 fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientRequest>) {
     match action {
         MenuAction::Attach(sref) => {
@@ -4086,12 +4081,16 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             app.term_locked = true;
         }
         MenuAction::RestartAgent(id) => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::RestartAgent { req_id, id });
+            send(app, out, |req_id| ClientRequest::RestartAgent {
+                req_id,
+                id,
+            });
         }
         MenuAction::AttachCloudAgent(id) => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::AttachCloudAgent { req_id, id });
+            send(app, out, |req_id| ClientRequest::AttachCloudAgent {
+                req_id,
+                id,
+            });
         }
         MenuAction::SendCloudMessage(id) => open_prompt(app, PromptKind::CloudMessage { id }),
         MenuAction::RenameAgent(id) => open_prompt(app, PromptKind::RenameAgent { id }),
@@ -4099,45 +4098,30 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             archive_agent(app, id, out);
         }
         MenuAction::UnarchiveAgent(id) => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::UnarchiveAgent { req_id, id });
+            send(app, out, |req_id| ClientRequest::UnarchiveAgent {
+                req_id,
+                id,
+            });
         }
         MenuAction::SetAgentPinned(id, pinned) => {
             app.select_when_seen = Some(SessionRef::Agent(id.clone()));
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::SetAgentPinned { req_id, id, pinned });
+            send(app, out, |req_id| ClientRequest::SetAgentPinned {
+                req_id,
+                id,
+                pinned,
+            });
         }
         MenuAction::DeleteAgent(id) => {
             if let Some(a) = app.tree.agents.iter().find(|a| a.id == id).cloned() {
-                app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-                    title: "Delete agent".into(),
-                    message: format!(
-                        "Delete agent '{}'? Its session and history go away.",
-                        a.name
-                    ),
-                    action: PendingAction::DeleteAgent(id),
-                    area: ratatui::layout::Rect::default(),
-                }));
+                app.overlay = Some(Overlay::Confirm(confirm_delete_agent(&a.name, id)));
             }
         }
         MenuAction::NewAgent(worktree) => open_new_agent_picker(app, worktree),
-        MenuAction::NewTerminal(worktree) => {
-            let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
-            out.push(ClientRequest::CreateTerminal {
-                req_id,
-                worktree,
-                name: None,
-            });
-        }
+        MenuAction::NewTerminal(worktree) => create_terminal(app, worktree, out),
         MenuAction::RenameTerminal(id) => open_prompt(app, PromptKind::RenameTerminal { id }),
         MenuAction::CloseTerminal(id) => {
             if let Some(t) = app.tree.terminals.iter().find(|t| t.id == id).cloned() {
-                app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-                    title: "Close terminal".into(),
-                    message: format!("Close terminal '{}'? Its shell is killed.", t.name),
-                    action: PendingAction::CloseTerminal(id),
-                    area: ratatui::layout::Rect::default(),
-                }));
+                app.overlay = Some(Overlay::Confirm(confirm_close_terminal(&t.name, id)));
             }
         }
         MenuAction::NewAgentOfKind {
@@ -4227,8 +4211,11 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             }
         }
         MenuAction::SetWorktreePinned(id, pinned) => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::SetWorktreePinned { req_id, id, pinned });
+            send(app, out, |req_id| ClientRequest::SetWorktreePinned {
+                req_id,
+                id,
+                pinned,
+            });
         }
         MenuAction::DeleteWorktree(id) => {
             if let Some(w) = app.tree.worktrees.iter().find(|w| w.id == id).cloned() {
@@ -4250,15 +4237,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::RemoveWorkspace(id) => open_remove_workspace_confirm(app, id, None),
         MenuAction::RemoveProject(id) => {
             if let Some(p) = app.tree.projects.iter().find(|p| p.id == id).cloned() {
-                app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-                    title: "Remove project".into(),
-                    message: format!(
-                        "Remove '{}' from nebula? Nothing on disk is touched.",
-                        p.name
-                    ),
-                    action: PendingAction::RemoveProject(id),
-                    area: ratatui::layout::Rect::default(),
-                }));
+                app.overlay = Some(Overlay::Confirm(confirm_remove_project(&p.name, id)));
             }
         }
         MenuAction::ToggleArchived => toggle_archived(app, out),
@@ -4290,8 +4269,8 @@ fn detach_if_attached(app: &mut App, sref: &SessionRef, out: &mut Vec<ClientRequ
 
 fn shellexpand_home(path: &str) -> std::path::PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return std::path::PathBuf::from(home).join(rest);
+        if let Some(home) = nebula_core::env::home_dir() {
+            return home.join(rest);
         }
     }
     std::path::PathBuf::from(path)
@@ -4313,8 +4292,11 @@ fn move_project(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
         return;
     }
     let id = app.tree.projects[index].id.clone();
-    let req_id = app.alloc_req_id(PendingIntent::None);
-    out.push(ClientRequest::MoveProject { req_id, id, delta });
+    send(app, out, |req_id| ClientRequest::MoveProject {
+        req_id,
+        id,
+        delta,
+    });
 }
 
 /// Snapshot the context being left — which project row this workspace was
@@ -4568,17 +4550,17 @@ fn target_workspace(app: &App, target: &PaletteTarget) -> Option<WorkspaceId> {
 fn jump_to_target(
     app: &mut App,
     target: PaletteTarget,
-    attach: bool,
+    landing: Landing,
     out: &mut Vec<ClientRequest>,
 ) {
-    jump_to_target_inner(app, target, attach, out);
+    jump_to_target_inner(app, target, landing, out);
     fire_pending_attach(app, out);
 }
 
 fn jump_to_target_inner(
     app: &mut App,
     target: PaletteTarget,
-    attach: bool,
+    landing: Landing,
     out: &mut Vec<ClientRequest>,
 ) {
     // Every panel cursor is scoped to the open workspace, so a target
@@ -4660,7 +4642,7 @@ fn jump_to_target_inner(
                 })
                 .flatten();
             let Some(wt_index) = wt_index else {
-                app.flash = Some("session no longer exists".into());
+                app.flash = Some(SESSION_GONE.into());
                 return;
             };
             app.sel_worktree = wt_index;
@@ -4673,15 +4655,16 @@ fn jump_to_target_inner(
                 // its worktree instead of attaching.
                 restore_session(app, out);
                 app.focus = Focus::Sessions;
-                app.flash = Some("session no longer exists".into());
+                app.flash = Some(SESSION_GONE.into());
                 return;
             };
             app.sel_session = index;
-            if attach {
-                attach_selected(app, out);
-            } else {
-                app.focus = Focus::Sessions;
-                preview_selected(app, out);
+            match landing {
+                Landing::Attach => attach_selected(app, out),
+                Landing::FocusOnly => {
+                    app.focus = Focus::Sessions;
+                    preview_selected(app, out);
+                }
             }
         }
         // A pull request isn't in any panel — picking it hands the URL to
@@ -4726,7 +4709,7 @@ fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
         })
         .flatten();
     let Some(wt_index) = wt_index else {
-        app.flash = Some("session no longer exists".into());
+        app.flash = Some(SESSION_GONE.into());
         return;
     };
     app.sel_worktree = wt_index;
@@ -4737,31 +4720,48 @@ fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     else {
         restore_session(app, out);
         app.focus = Focus::Sessions;
-        app.flash = Some("session no longer exists".into());
+        app.flash = Some(SESSION_GONE.into());
         return;
     };
     app.sel_session = index;
     attach_selected(app, out);
 }
 
+/// What a palette pick does once it has found its session row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Landing {
+    /// Open the session in the pane, exactly like Enter on its row.
+    Attach,
+    /// Only land the cursor on the row, previewing like ↑/↓ there.
+    FocusOnly,
+}
+
+impl Landing {
+    /// The palette's Enter: attaches when the setting says so.
+    fn for_enter(attaches: bool) -> Self {
+        if attaches {
+            Landing::Attach
+        } else {
+            Landing::FocusOnly
+        }
+    }
+}
+
 fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
-    let len = match app.focus {
-        Focus::Workspaces => app.tree.workspaces.len(),
-        Focus::Projects => app.project_rows().len(),
-        Focus::Worktrees => app.worktree_row_count(),
-        Focus::Sessions => app.visible_session_rows().len(),
+    // (row count, cursor) of the focused column.
+    let (len, sel) = match app.focus {
+        Focus::Workspaces => (
+            app.tree.workspaces.len(),
+            app.tree.active_workspace_index().unwrap_or(0),
+        ),
+        Focus::Projects => (app.project_rows().len(), app.sel_project),
+        Focus::Worktrees => (app.worktree_row_count(), app.sel_worktree),
+        Focus::Sessions => (app.visible_session_rows().len(), app.sel_session),
         Focus::Terminal => return,
     };
     if len == 0 {
         return;
     }
-    let sel = match app.focus {
-        Focus::Workspaces => app.tree.active_workspace_index().unwrap_or(0),
-        Focus::Projects => app.sel_project,
-        Focus::Worktrees => app.sel_worktree,
-        Focus::Sessions => app.sel_session,
-        Focus::Terminal => return,
-    };
     let new = (sel as i64 + delta).clamp(0, len as i64 - 1) as usize;
     if new == sel {
         return;
@@ -4775,34 +4775,41 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
             let id = app.tree.workspaces[new].id.clone();
             switch_workspace(app, id, out);
         }
-        Focus::Projects => {
-            // A manual move outranks any pending selection-follows.
-            app.select_worktree_when_seen = None;
-            remember_context(app);
-            let owner_before = app.selected_project().map(|p| p.id.clone());
-            app.sel_project = new;
-            if app.selected_project().map(|p| p.id.clone()) != owner_before {
-                restore_context(app, out);
-            }
-        }
-        Focus::Worktrees => {
-            app.select_worktree_when_seen = None;
-            remember_context(app);
-            app.sel_worktree = new;
-            // Stepping onto an open-PR row is not a worktree switch: it has
-            // no sessions to restore and nothing to attach, so the pane is
-            // left exactly as it was.
-            if app.selected_worktree().is_some() {
-                restore_session(app, out);
-            }
-            schedule_pr_detail(app);
-        }
+        Focus::Projects => select_project_row(app, new, out),
+        Focus::Worktrees => select_worktree_row(app, new, out),
         Focus::Sessions => {
             app.sel_session = new;
             preview_selected(app, out);
         }
         Focus::Terminal => {}
     }
+}
+
+/// Move the Projects cursor to a *different* row `i`: the context being
+/// left is remembered, and the new project's is restored.
+fn select_project_row(app: &mut App, i: usize, out: &mut Vec<ClientRequest>) {
+    // A manual move outranks any pending selection-follows.
+    app.select_worktree_when_seen = None;
+    remember_context(app);
+    let owner_before = app.selected_project().map(|p| p.id.clone());
+    app.sel_project = i;
+    if app.selected_project().map(|p| p.id.clone()) != owner_before {
+        restore_context(app, out);
+    }
+}
+
+/// Move the Worktrees cursor to a *different* row `i` and bring up its
+/// session. Stepping onto an open-PR row is not a worktree switch: it has
+/// no sessions to restore and nothing to attach, so the pane is left
+/// exactly as it was.
+fn select_worktree_row(app: &mut App, i: usize, out: &mut Vec<ClientRequest>) {
+    app.select_worktree_when_seen = None;
+    remember_context(app);
+    app.sel_worktree = i;
+    if app.selected_worktree().is_some() {
+        restore_session(app, out);
+    }
+    schedule_pr_detail(app);
 }
 
 /// Show the selected session in the terminal pane WITHOUT taking focus or
@@ -4850,6 +4857,14 @@ fn attach_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
     attach_now(app, sref, out);
     app.focus = Focus::Terminal;
     app.term_locked = true;
+}
+
+/// Leave a locked pane for the Sessions panel. Also expands collapsed
+/// sidebars, so there is something on screen to land in.
+fn leave_terminal_lock(app: &mut App) {
+    app.collapsed = false;
+    app.term_locked = false;
+    app.focus = Focus::Sessions;
 }
 
 /// Cross into the terminal pane and take the input lock, so what the user
@@ -5071,10 +5086,10 @@ fn detach_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// pre-first-draw requests from booting a 0×0 PTY.
 fn pane_size(app: &App) -> (u16, u16) {
     let area = app.term_area;
-    if area.width >= 2 && area.height >= 2 {
+    if pane_usable(area) {
         (area.width, area.height)
     } else {
-        (80, 24)
+        FALLBACK_PANE
     }
 }
 
@@ -5147,9 +5162,8 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
     } else {
         name
     };
-    let req_id = app.alloc_req_id(intent);
     let cloud = cloud_prompt.is_some();
-    out.push(ClientRequest::CreateAgent {
+    send_with(app, out, intent, |req_id| ClientRequest::CreateAgent {
         req_id,
         worktree: worktree.clone(),
         name,
@@ -5372,7 +5386,7 @@ fn copy_to_clipboard(text: &str) -> bool {
 
     #[cfg(target_os = "macos")]
     {
-        return copy_via("pbcopy", &[]);
+        copy_via("pbcopy", &[])
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -5416,6 +5430,20 @@ fn open_url(url: &str) -> bool {
 
 /// Two clicks on the same cell within this window make a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// Whether this click on `key` is the second of a double-click. The slot
+/// is consumed either way: a double-click is spent, so a third click starts
+/// over; a single click re-arms the slot with itself for the next one.
+fn is_double_click<T: PartialEq>(slot: &mut Option<(std::time::Instant, T)>, key: T) -> bool {
+    let now = std::time::Instant::now();
+    let double = slot
+        .take()
+        .is_some_and(|(at, id)| id == key && now.duration_since(at) <= DOUBLE_CLICK);
+    if !double {
+        *slot = Some((now, key));
+    }
+    double
+}
 
 /// The two touching border cells at a vertical panel boundary `bx`, bounded
 /// by `area` — the shared grab-zone rule for every splitter.
@@ -5477,6 +5505,7 @@ fn update_pointer(app: &mut App, mouse: &MouseEvent) {
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) {
+    let mouse_pos = ratatui::layout::Position::new(mouse.column, mouse.row);
     update_pointer(app, &mouse);
     // The editor modal swallows the mouse entirely — its selection/scroll
     // story is vim's, not ours.
@@ -5555,12 +5584,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let area = prompt.list_area;
-                if area.width > 0
-                    && mouse.column >= area.x
-                    && mouse.column < area.x + area.width
-                    && mouse.row >= area.y
-                    && mouse.row < area.y + area.height
-                {
+                if area.contains(mouse_pos) {
                     let i =
                         prompt.window_start(area.height as usize) + (mouse.row - area.y) as usize;
                     if i < prompt.dirs.len() {
@@ -5583,11 +5607,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     if let Some(Overlay::Diff(view)) = &mut app.overlay {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                view.scroll_by(-3);
+                view.scroll_by(-MODAL_WHEEL_LINES);
                 app.dirty = true;
             }
             MouseEventKind::ScrollDown => {
-                view.scroll_by(3);
+                view.scroll_by(MODAL_WHEEL_LINES);
                 app.dirty = true;
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -5599,12 +5623,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     return;
                 }
                 let area = view.list_area;
-                if area.width > 0
-                    && mouse.column >= area.x
-                    && mouse.column < area.x + area.width
-                    && mouse.row >= area.y
-                    && mouse.row < area.y + area.height
-                {
+                if area.contains(mouse_pos) {
                     let start = view.window_start(area.height as usize);
                     let index = start + (mouse.row - area.y) as usize;
                     if index < view.matches.len() && view.select(index as i64) {
@@ -5643,25 +5662,17 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = palette.list_area;
-                let inside_list = list.width > 0
-                    && mouse.column >= list.x
-                    && mouse.column < list.x + list.width
-                    && mouse.row >= list.y
-                    && mouse.row < list.y + list.height;
-                let area = palette.area;
-                let inside_modal = mouse.column >= area.x
-                    && mouse.column < area.x + area.width
-                    && mouse.row >= area.y
-                    && mouse.row < area.y + area.height;
+                let inside_list = list.contains(mouse_pos);
+                let inside_modal = palette.area.contains(mouse_pos);
                 if inside_list {
                     let start = palette.window_start(list.height as usize);
                     let index = start + (mouse.row - list.y) as usize;
                     if index < palette.matches.len() {
                         palette.select(index as i64);
-                        let attach = palette.enter_attaches;
+                        let landing = Landing::for_enter(palette.enter_attaches);
                         if let Some(target) = palette.selected_target().cloned() {
                             app.overlay = None;
-                            jump_to_target(app, target, attach, out);
+                            jump_to_target(app, target, landing, out);
                         }
                     }
                 } else if !inside_modal {
@@ -5688,16 +5699,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = finder.list_area;
-                let inside_list = list.width > 0
-                    && mouse.column >= list.x
-                    && mouse.column < list.x + list.width
-                    && mouse.row >= list.y
-                    && mouse.row < list.y + list.height;
-                let area = finder.area;
-                let inside_modal = mouse.column >= area.x
-                    && mouse.column < area.x + area.width
-                    && mouse.row >= area.y
-                    && mouse.row < area.y + area.height;
+                let inside_list = list.contains(mouse_pos);
+                let inside_modal = finder.area.contains(mouse_pos);
                 if inside_list {
                     let start = finder.window_start(list.height as usize);
                     let index = start + (mouse.row - list.y) as usize;
@@ -5729,16 +5732,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = view.list_area;
-                let inside_list = list.width > 0
-                    && mouse.column >= list.x
-                    && mouse.column < list.x + list.width
-                    && mouse.row >= list.y
-                    && mouse.row < list.y + list.height;
-                let area = view.area;
-                let inside_modal = mouse.column >= area.x
-                    && mouse.column < area.x + area.width
-                    && mouse.row >= area.y
-                    && mouse.row < area.y + area.height;
+                let inside_list = list.contains(mouse_pos);
+                let inside_modal = view.area.contains(mouse_pos);
                 if inside_list {
                     let start = view.window_start(list.height as usize);
                     let index = start + (mouse.row - list.y) as usize;
@@ -5762,11 +5757,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     if let Some(Overlay::Tree(view)) = &mut app.overlay {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                view.scroll_by(-3);
+                view.scroll_by(-MODAL_WHEEL_LINES);
                 app.dirty = true;
             }
             MouseEventKind::ScrollDown => {
-                view.scroll_by(3);
+                view.scroll_by(MODAL_WHEEL_LINES);
                 app.dirty = true;
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -5778,16 +5773,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     return;
                 }
                 let list = view.list_area;
-                let inside_list = list.width > 0
-                    && mouse.column >= list.x
-                    && mouse.column < list.x + list.width
-                    && mouse.row >= list.y
-                    && mouse.row < list.y + list.height;
-                let area = view.area;
-                let inside_modal = mouse.column >= area.x
-                    && mouse.column < area.x + area.width
-                    && mouse.row >= area.y
-                    && mouse.row < area.y + area.height;
+                let inside_list = list.contains(mouse_pos);
+                let inside_modal = view.area.contains(mouse_pos);
                 if inside_list {
                     let start = view.window_start(list.height as usize);
                     let index = start + (mouse.row - list.y) as usize;
@@ -5819,28 +5806,19 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     // (the context-menu convention — rows are actions, not editable items),
     // a click outside the modal closes; everything else is swallowed.
     if let Some(Overlay::Hosts(view)) = &mut app.overlay {
-        let max = view.hosts.len().saturating_sub(1) as i64;
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                view.selected = (view.selected as i64 - 1).clamp(0, max) as usize;
+                view.selected = clamp_selection(view.selected as i64 + (-1), view.hosts.len());
                 app.dirty = true;
             }
             MouseEventKind::ScrollDown => {
-                view.selected = (view.selected as i64 + 1).clamp(0, max) as usize;
+                view.selected = clamp_selection(view.selected as i64 + (1), view.hosts.len());
                 app.dirty = true;
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = view.list_area;
-                let area = view.area;
-                let inside_list = list.width > 0
-                    && mouse.column >= list.x
-                    && mouse.column < list.x + list.width
-                    && mouse.row >= list.y
-                    && mouse.row < list.y + list.height;
-                let inside_modal = mouse.column >= area.x
-                    && mouse.column < area.x + area.width
-                    && mouse.row >= area.y
-                    && mouse.row < area.y + area.height;
+                let inside_list = list.contains(mouse_pos);
+                let inside_modal = view.area.contains(mouse_pos);
                 if inside_list {
                     let start = view.window_start(list.height as usize);
                     let index = start + (mouse.row - list.y) as usize;
@@ -5865,7 +5843,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     // overlay is waiting for a key, and a stray click shouldn't answer it.
     if matches!(&app.overlay, Some(Overlay::Settings(_))) {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            let Some(Overlay::Settings(view)) = &app.overlay else {
+            let Some(view) = settings(app) else {
                 return;
             };
             if view.capture.is_some() {
@@ -5879,11 +5857,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 view.first_row,
             );
             let tab_hits = view.tab_hits.clone();
-            let inside = area.width > 0
-                && mouse.column >= area.x
-                && mouse.column < area.x + area.width
-                && mouse.row >= area.y
-                && mouse.row < area.y + area.height;
+            let inside = area.contains(mouse_pos);
             if !inside {
                 close_settings(app);
                 app.dirty = true;
@@ -5898,7 +5872,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     app.settings_tab = next;
                     let row = app.settings_row(next);
                     app.remember_settings_focus(false);
-                    if let Some(Overlay::Settings(view)) = &mut app.overlay {
+                    if let Some(view) = settings_mut(app) {
                         view.tab = next;
                         view.selected = row;
                         view.on_tabs = false;
@@ -5916,7 +5890,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     .get(row)
                     .and_then(|r| r.index())
                 {
-                    if let Some(Overlay::Settings(view)) = &mut app.overlay {
+                    if let Some(view) = settings_mut(app) {
                         view.selected = index;
                         view.on_tabs = false;
                         view.notice = None;
@@ -5927,7 +5901,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         if tab == crate::config::hotkeys_tab() {
                             // Second click on a hotkey row starts a rebind,
                             // the same as Enter would.
-                            if let Some(Overlay::Settings(view)) = &mut app.overlay {
+                            if let Some(view) = settings_mut(app) {
                                 view.capture = Some(crate::app::HotkeyCapture {
                                     action: index,
                                     add: false,
@@ -5948,29 +5922,20 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     // (a click on the selected row opens it), a click outside closes;
     // everything else is swallowed.
     if let Some(Overlay::Metrics(view)) = &mut app.overlay {
-        let max = view.rows.len().saturating_sub(1);
         let mut open: Option<SessionRef> = None;
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                view.selected = view.selected.saturating_sub(1);
+                view.selected = clamp_selection(view.selected as i64 + (-1), view.rows.len());
                 app.dirty = true;
             }
             MouseEventKind::ScrollDown => {
-                view.selected = (view.selected + 1).min(max);
+                view.selected = clamp_selection(view.selected as i64 + (1), view.rows.len());
                 app.dirty = true;
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = view.list_area;
-                let inside_list = list.width > 0
-                    && mouse.column >= list.x
-                    && mouse.column < list.x + list.width
-                    && mouse.row >= list.y
-                    && mouse.row < list.y + list.height;
-                let area = view.area;
-                let inside_modal = mouse.column >= area.x
-                    && mouse.column < area.x + area.width
-                    && mouse.row >= area.y
-                    && mouse.row < area.y + area.height;
+                let inside_list = list.contains(mouse_pos);
+                let inside_modal = view.area.contains(mouse_pos);
                 if inside_list {
                     let index = view.scroll + (mouse.row - list.y) as usize;
                     if index < view.rows.len() {
@@ -6059,27 +6024,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 Some(HitTarget::FooterWorkspace) => open_workspace_picker(app),
                 Some(HitTarget::Project(i)) => {
                     if app.sel_project != i {
-                        app.select_worktree_when_seen = None;
-                        remember_context(app);
-                        let owner_before = app.selected_project().map(|p| p.id.clone());
-                        app.sel_project = i;
-                        if app.selected_project().map(|p| p.id.clone()) != owner_before {
-                            restore_context(app, out);
-                        }
+                        select_project_row(app, i, out);
                     }
                     app.focus = app.first_sidebar_focus();
                 }
                 Some(HitTarget::Worktree(i)) => {
                     if app.sel_worktree != i {
-                        app.select_worktree_when_seen = None;
-                        remember_context(app);
-                        app.sel_worktree = i;
-                        // An open-PR row has no sessions of its own; leave
-                        // the pane alone (see move_selection).
-                        if app.selected_worktree().is_some() {
-                            restore_session(app, out);
-                        }
-                        schedule_pr_detail(app);
+                        select_worktree_row(app, i, out);
                     }
                     app.focus = Focus::Worktrees;
                     // A second click on a pull request opens it — the same
@@ -6090,14 +6041,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     match app.selected_worktree_pr().map(|pr| pr.url.clone()) {
                         Some(url) => {
                             let key = RowKey::Link(url.clone());
-                            let now = std::time::Instant::now();
-                            let double = app.last_session_click.take().is_some_and(|(at, id)| {
-                                id == key && now.duration_since(at) <= DOUBLE_CLICK
-                            });
-                            if double {
+                            if is_double_click(&mut app.last_session_click, key) {
                                 open_link(app, &url, out);
-                            } else {
-                                app.last_session_click = Some((now, key));
                             }
                         }
                         None => app.last_session_click = None,
@@ -6108,24 +6053,17 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     match app.selected_session_row() {
                         Some(row) if row.is_archived_agent() => {
                             app.focus = Focus::Sessions;
-                            app.flash = Some("agent is archived — unarchive first (u)".into());
+                            app.flash = Some(AGENT_ARCHIVED.into());
                         }
                         Some(row) => {
-                            let key = row.click_key();
-                            let now = std::time::Instant::now();
                             // Double-click attaches (a link row opens in the
-                            // browser); `last_session_click` was consumed, so
-                            // a third click starts over.
-                            let double = app.last_session_click.take().is_some_and(|(at, id)| {
-                                id == key && now.duration_since(at) <= DOUBLE_CLICK
-                            });
-                            if double {
+                            // browser).
+                            if is_double_click(&mut app.last_session_click, row.click_key()) {
                                 attach_selected(app, out);
                             } else {
                                 // Single click selects the row and previews its
                                 // terminal (no focus/lock); Enter or a second
                                 // click commits.
-                                app.last_session_click = Some((now, key));
                                 app.focus = Focus::Sessions;
                                 preview_selected_now(app, out);
                             }
@@ -6153,17 +6091,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                             app.term_locked = true;
                         }
                         let cell = pane_cell(app.term_area, mouse.column, mouse.row);
-                        let now = std::time::Instant::now();
-                        let double = app.last_term_click.take().is_some_and(|(at, c)| {
-                            c == cell && now.duration_since(at) <= DOUBLE_CLICK
-                        });
-                        if double {
+                        if is_double_click(&mut app.last_term_click, cell) {
                             // Double-click: select (and copy) the word under
-                            // the cursor. `last_term_click` was consumed, so
-                            // a third click starts over.
+                            // the cursor.
                             select_word_at(app, cell);
                         } else {
-                            app.last_term_click = Some((now, cell));
                             // Arm a drag-selection; it becomes visible (and
                             // copyable) once the drag leaves this cell.
                             app.term_selection = Some(TermSelection {
@@ -6293,21 +6225,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         });
                     } else if alternate {
                         // Full-screen apps that ignore the mouse (plain vim,
-                        // less, htop with mouse off) expect arrows.
-                        let arrow: &[u8] = if up {
-                            b"\x1b[A\x1b[A\x1b[A"
-                        } else {
-                            b"\x1b[B\x1b[B\x1b[B"
-                        };
+                        // less, htop with mouse off) expect arrows, one per
+                        // line the notch would have scrolled.
+                        let arrow: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
                         out.push(ClientRequest::Input {
                             session: term.sref.clone(),
-                            data: arrow.to_vec(),
+                            data: arrow.repeat(TERM_WHEEL_LINES),
                         });
                     } else {
                         let new_scroll = if up {
-                            term.scroll.saturating_add(3)
+                            term.scroll.saturating_add(TERM_WHEEL_LINES)
                         } else {
-                            term.scroll.saturating_sub(3)
+                            term.scroll.saturating_sub(TERM_WHEEL_LINES)
                         };
                         term.set_scroll(new_scroll);
                     }
@@ -6324,35 +6253,22 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     }
                     app.focus = Focus::Workspaces;
                     let items = workspace_menu(app);
-                    open_menu_at(app, items, at);
+                    open_menu(app, items, at);
                 }
                 Some(HitTarget::Project(i)) => {
                     app.sel_project = i;
                     app.focus = Focus::Projects;
                     if let Some(p) = app.selected_project() {
                         let items = vec![
-                            MenuItem {
-                                label: "New worktree".into(),
-                                action: MenuAction::NewWorktree(p.id.clone()),
-                                destructive: false,
-                            },
-                            MenuItem {
-                                label: "Add project".into(),
-                                action: MenuAction::AddProject,
-                                destructive: false,
-                            },
-                            MenuItem {
-                                label: "Rename".into(),
-                                action: MenuAction::RenameProject(p.id.clone()),
-                                destructive: false,
-                            },
-                            MenuItem {
-                                label: "Remove from list".into(),
-                                action: MenuAction::RemoveProject(p.id.clone()),
-                                destructive: true,
-                            },
+                            MenuItem::new("New worktree", MenuAction::NewWorktree(p.id.clone())),
+                            MenuItem::new("Add project", MenuAction::AddProject),
+                            MenuItem::new("Rename", MenuAction::RenameProject(p.id.clone())),
+                            MenuItem::destructive(
+                                "Remove from list",
+                                MenuAction::RemoveProject(p.id.clone()),
+                            ),
                         ];
-                        open_menu_at(app, items, at);
+                        open_menu(app, items, at);
                     }
                 }
                 Some(HitTarget::Worktree(i)) => {
@@ -6361,44 +6277,23 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     app.focus = Focus::Worktrees;
                     if let Some(pr) = app.selected_worktree_pr() {
                         let items = vec![
-                            MenuItem {
-                                label: "Open in browser".into(),
-                                action: MenuAction::OpenLink(pr.url.clone()),
-                                destructive: false,
-                            },
-                            MenuItem {
-                                label: "View diff".into(),
-                                action: MenuAction::ViewPrDiff,
-                                destructive: false,
-                            },
+                            MenuItem::new("Open in browser", MenuAction::OpenLink(pr.url.clone())),
+                            MenuItem::new("View diff", MenuAction::ViewPrDiff),
                         ];
-                        open_menu_at(app, items, at);
+                        open_menu(app, items, at);
                     } else if let Some(w) = app.selected_worktree() {
                         let mut items = vec![
-                            MenuItem {
-                                label: "New agent".into(),
-                                action: MenuAction::NewAgent(w.id.clone()),
-                                destructive: false,
-                            },
-                            MenuItem {
-                                label: "New terminal".into(),
-                                action: MenuAction::NewTerminal(w.id.clone()),
-                                destructive: false,
-                            },
-                            MenuItem {
-                                label: "Add link".into(),
-                                action: MenuAction::NewLink(w.id.clone()),
-                                destructive: false,
-                            },
+                            MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
+                            MenuItem::new("New terminal", MenuAction::NewTerminal(w.id.clone())),
+                            MenuItem::new("Add link", MenuAction::NewLink(w.id.clone())),
                         ];
                         if !w.is_main {
-                            items.push(MenuItem {
-                                label: "Delete worktree".into(),
-                                action: MenuAction::DeleteWorktree(w.id.clone()),
-                                destructive: true,
-                            });
+                            items.push(MenuItem::destructive(
+                                "Delete worktree",
+                                MenuAction::DeleteWorktree(w.id.clone()),
+                            ));
                         }
-                        open_menu_at(app, items, at);
+                        open_menu(app, items, at);
                     }
                 }
                 Some(HitTarget::Session(i)) => {
@@ -6406,63 +6301,46 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     app.focus = Focus::Sessions;
                     match app.selected_session_row() {
                         Some(SessionRow::Agent(a)) => {
-                            open_menu_at(app, menu_items_for_session(&a), at)
+                            open_menu(app, menu_items_for_session(&a), at)
                         }
                         Some(SessionRow::Terminal(t)) => {
-                            open_menu_at(app, menu_items_for_terminal(&t), at)
+                            open_menu(app, menu_items_for_terminal(&t), at)
                         }
-                        Some(SessionRow::Link(l)) => open_menu_at(app, menu_items_for_link(&l), at),
+                        Some(SessionRow::Link(l)) => open_menu(app, menu_items_for_link(&l), at),
                         None => {}
                     }
                 }
                 Some(HitTarget::PanelBg(focus)) => {
                     app.focus = focus;
                     let items = match focus {
-                        Focus::Workspaces => vec![MenuItem {
-                            label: "New workspace".into(),
-                            action: MenuAction::NewWorkspace,
-                            destructive: false,
-                        }],
-                        Focus::Projects => vec![MenuItem {
-                            label: "Add project".into(),
-                            action: MenuAction::AddProject,
-                            destructive: false,
-                        }],
+                        Focus::Workspaces => {
+                            vec![MenuItem::new("New workspace", MenuAction::NewWorkspace)]
+                        }
+                        Focus::Projects => {
+                            vec![MenuItem::new("Add project", MenuAction::AddProject)]
+                        }
                         Focus::Worktrees => app
                             .selected_project()
                             .map(|p| {
-                                vec![MenuItem {
-                                    label: "New worktree".into(),
-                                    action: MenuAction::NewWorktree(p.id.clone()),
-                                    destructive: false,
-                                }]
+                                vec![MenuItem::new(
+                                    "New worktree",
+                                    MenuAction::NewWorktree(p.id.clone()),
+                                )]
                             })
                             .unwrap_or_default(),
                         Focus::Sessions => app
                             .selected_worktree()
                             .map(|w| {
                                 vec![
-                                    MenuItem {
-                                        label: "New agent".into(),
-                                        action: MenuAction::NewAgent(w.id.clone()),
-                                        destructive: false,
-                                    },
-                                    MenuItem {
-                                        label: "Add link".into(),
-                                        action: MenuAction::NewLink(w.id.clone()),
-                                        destructive: false,
-                                    },
-                                    MenuItem {
-                                        label: "Show/hide archived".into(),
-                                        action: MenuAction::ToggleArchived,
-                                        destructive: false,
-                                    },
+                                    MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
+                                    MenuItem::new("Add link", MenuAction::NewLink(w.id.clone())),
+                                    MenuItem::new("Show/hide archived", MenuAction::ToggleArchived),
                                 ]
                             })
                             .unwrap_or_default(),
                         Focus::Terminal => vec![],
                     };
-                    open_menu_at(app, items, at);
+                    open_menu(app, items, at);
                 }
                 _ => {}
             }
@@ -6470,10 +6348,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         }
         _ => {}
     }
-}
-
-fn open_menu_at(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
-    open_menu(app, items, at);
 }
 
 fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequest>) {
@@ -6740,16 +6614,10 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
 fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
     use nebula_core::Entity;
     match entity {
-        Entity::Workspace(w) => match app.tree.workspaces.iter_mut().find(|x| x.id == w.id) {
-            Some(existing) => *existing = w,
-            None => app.tree.workspaces.push(w),
-        },
+        Entity::Workspace(w) => upsert_by(&mut app.tree.workspaces, w, |x, y| x.id == y.id),
         Entity::Project(p) => {
             let selected = app.selected_project().map(|p| p.id.clone());
-            match app.tree.projects.iter_mut().find(|x| x.id == p.id) {
-                Some(existing) => *existing = p,
-                None => app.tree.projects.push(p),
-            }
+            upsert_by(&mut app.tree.projects, p, |x, y| x.id == y.id);
             // Reorders arrive as plain upserts with new sort_orders; stable
             // sort keeps snapshot order for legacy all-zero ties. The
             // selection follows the project it was on, so children stay put.
@@ -6764,35 +6632,35 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
                 }
             }
         }
-        Entity::Worktree(w) => match app.tree.worktrees.iter_mut().find(|x| x.id == w.id) {
-            Some(existing) => *existing = w,
-            None => app.tree.worktrees.push(w),
-        },
+        Entity::Worktree(w) => upsert_by(&mut app.tree.worktrees, w, |x, y| x.id == y.id),
         Entity::Agent(a) => {
             // A row the daemon re-homed (`nebula worktree`, a hook cwd in
             // another checkout) takes the cursor with it when it was the
             // selected session — otherwise the selection would silently
             // land on whatever row slid into its place.
             let selected = app.selected_session().map(|s| s.id);
-            match app.tree.agents.iter_mut().find(|x| x.id == a.id) {
-                Some(existing) => {
-                    let moved = existing.worktree_id != a.worktree_id;
-                    *existing = a;
-                    if moved && selected.as_ref() == Some(&existing.id) {
-                        app.select_when_seen = Some(SessionRef::Agent(existing.id.clone()));
-                    }
-                }
-                None => app.tree.agents.push(a),
+            let moved = app
+                .tree
+                .agents
+                .iter()
+                .any(|x| x.id == a.id && x.worktree_id != a.worktree_id);
+            let id = a.id.clone();
+            upsert_by(&mut app.tree.agents, a, |x, y| x.id == y.id);
+            if moved && selected.as_ref() == Some(&id) {
+                app.select_when_seen = Some(SessionRef::Agent(id));
             }
         }
-        Entity::Terminal(t) => match app.tree.terminals.iter_mut().find(|x| x.id == t.id) {
-            Some(existing) => *existing = t,
-            None => app.tree.terminals.push(t),
-        },
-        Entity::Link(l) => match app.tree.links.iter_mut().find(|x| x.id == l.id) {
-            Some(existing) => *existing = l,
-            None => app.tree.links.push(l),
-        },
+        Entity::Terminal(t) => upsert_by(&mut app.tree.terminals, t, |x, y| x.id == y.id),
+        Entity::Link(l) => upsert_by(&mut app.tree.links, l, |x, y| x.id == y.id),
+    }
+}
+
+/// Replace the first entry of `list` that `same` pairs with `item`, or
+/// append `item` when there is none.
+fn upsert_by<T>(list: &mut Vec<T>, item: T, same: impl Fn(&T, &T) -> bool) {
+    match list.iter_mut().find(|x| same(x, &item)) {
+        Some(existing) => *existing = item,
+        None => list.push(item),
     }
 }
 
@@ -6803,14 +6671,11 @@ fn select_link_by_id(app: &mut App, id: &LinkId) -> bool {
         .visible_session_rows()
         .iter()
         .position(|r| r.as_link().and_then(|l| l.id()) == Some(id));
-    match found {
-        Some(i) => {
-            app.sel_session = i;
-            app.focus = Focus::Sessions;
-            true
-        }
-        None => false,
+    if let Some(i) = found {
+        app.sel_session = i;
+        app.focus = Focus::Sessions;
     }
+    found.is_some()
 }
 
 fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
@@ -7011,17 +6876,11 @@ fn reconcile_selection_inner(
 /// Keep selections valid after the tree shrinks.
 fn clamp_selections(app: &mut App) {
     let project_rows = app.project_rows().len();
-    if app.sel_project >= project_rows {
-        app.sel_project = project_rows.saturating_sub(1);
-    }
+    app.sel_project = clamp_selection(app.sel_project as i64, project_rows);
     let wt_len = app.worktree_row_count();
-    if app.sel_worktree >= wt_len {
-        app.sel_worktree = wt_len.saturating_sub(1);
-    }
+    app.sel_worktree = clamp_selection(app.sel_worktree as i64, wt_len);
     let sess_len = app.visible_session_rows().len();
-    if app.sel_session >= sess_len {
-        app.sel_session = sess_len.saturating_sub(1);
-    }
+    app.sel_session = clamp_selection(app.sel_session as i64, sess_len);
 }
 
 #[cfg(test)]
@@ -11162,6 +11021,99 @@ diff --git a/src/b.rs b/src/b.rs
             Some(ClientRequest::RenameTerminal { id, name, .. })
                 if id == &TerminalId("t1".into()) && name == "term-1"
         ));
+    }
+
+    /// The context menu's Delete / Close / Remove rows open the very confirm
+    /// the `d` key does — same title, same message, same pending action —
+    /// so the two routes can never drift apart in wording.
+    #[test]
+    fn menu_confirms_match_the_key_path_word_for_word() {
+        use nebula_core::{ProjectId, TerminalId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_terminal(&mut app, "t1", "term-1");
+
+        fn take_confirm(app: &mut App) -> ConfirmDialog {
+            match app.overlay.take() {
+                Some(Overlay::Confirm(c)) => c,
+                other => panic!("expected a confirm, got {other:?}"),
+            }
+        }
+        let via_key = |app: &mut App, focus: Focus, row: usize| {
+            app.focus = focus;
+            app.sel_session = row;
+            press(app, KeyCode::Char('d'), KeyModifiers::NONE, &mut Vec::new());
+            take_confirm(app)
+        };
+        let key_agent = via_key(&mut app, Focus::Sessions, 0);
+        let key_term = via_key(&mut app, Focus::Sessions, 1);
+        let key_project = via_key(&mut app, Focus::Projects, 0);
+
+        let via_menu = |app: &mut App, action: MenuAction| {
+            run_menu_action(app, action, &mut Vec::new());
+            take_confirm(app)
+        };
+        let menu_agent = via_menu(&mut app, MenuAction::DeleteAgent(AgentId("a1".into())));
+        let menu_term = via_menu(&mut app, MenuAction::CloseTerminal(TerminalId("t1".into())));
+        let menu_project = via_menu(&mut app, MenuAction::RemoveProject(ProjectId("p1".into())));
+
+        for (key, menu) in [
+            (&key_agent, &menu_agent),
+            (&key_term, &menu_term),
+            (&key_project, &menu_project),
+        ] {
+            assert_eq!(key.title, menu.title);
+            assert_eq!(key.message, menu.message);
+        }
+        assert_eq!(key_agent.title, "Delete agent");
+        assert_eq!(
+            key_agent.message,
+            "Delete agent 'agent-1'? Its session and history go away."
+        );
+        assert!(matches!(menu_agent.action, PendingAction::DeleteAgent(_)));
+        assert_eq!(key_term.title, "Close terminal");
+        assert_eq!(
+            key_term.message,
+            "Close terminal 'term-1'? Its shell is killed."
+        );
+        assert!(matches!(menu_term.action, PendingAction::CloseTerminal(_)));
+        assert_eq!(key_project.title, "Remove project");
+        assert_eq!(
+            key_project.message,
+            "Remove 'demo' from nebula? Nothing on disk is touched."
+        );
+        assert!(matches!(
+            menu_project.action,
+            PendingAction::RemoveProject(_)
+        ));
+    }
+
+    /// A paste into a locked pane reaches the PTY wrapped in the
+    /// bracketed-paste markers, so the child (claude, vim…) takes it as one
+    /// block instead of keystrokes to auto-indent. Unlocked, it goes nowhere.
+    #[test]
+    fn paste_into_a_locked_pane_is_bracketed() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        app.term = Some(AttachedTerm::new(sref.clone(), 80, 24));
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+
+        handle_terminal_event(&mut app, Event::Paste("fn main() {}\n".into()), &mut out);
+        match out.as_slice() {
+            [ClientRequest::Input { session, data }] => {
+                assert_eq!(session, &sref);
+                assert_eq!(data, b"\x1b[200~fn main() {}\n\x1b[201~");
+            }
+            other => panic!("expected one Input request, got {other:?}"),
+        }
+
+        out.clear();
+        app.term_locked = false;
+        handle_terminal_event(&mut app, Event::Paste("x".into()), &mut out);
+        assert!(out.is_empty(), "an unlocked pane takes no paste: {out:?}");
     }
 
     #[test]
@@ -16702,7 +16654,7 @@ diff --git a/src/b.rs b/src/b.rs
         jump_to_target(
             &mut app,
             PaletteTarget::Worktree(WorktreeId("w9".into())),
-            false,
+            Landing::FocusOnly,
             &mut out,
         );
         assert_eq!(
@@ -16771,7 +16723,7 @@ diff --git a/src/b.rs b/src/b.rs
         jump_to_target(
             &mut app,
             PaletteTarget::Session(AgentId("a9".into())),
-            true,
+            Landing::Attach,
             &mut out,
         );
         let attaches: Vec<&ClientRequest> = out
@@ -16812,7 +16764,7 @@ diff --git a/src/b.rs b/src/b.rs
         jump_to_target(
             &mut app,
             PaletteTarget::Workspace(nebula_core::WorkspaceId("ws2".into())),
-            false,
+            Landing::FocusOnly,
             &mut out,
         );
         assert_eq!(
@@ -18333,7 +18285,11 @@ diff --git a/src/b.rs b/src/b.rs
             Some(ClientRequest::AddWorkspace { req_id, .. }) => *req_id,
             other => panic!("expected AddWorkspace, got {other:?}"),
         };
-        assert_eq!(app.focus, Focus::Workspaces, "still on the bar until the Ack");
+        assert_eq!(
+            app.focus,
+            Focus::Workspaces,
+            "still on the bar until the Ack"
+        );
 
         let mut out = Vec::new();
         handle_server_event(
@@ -18526,7 +18482,8 @@ diff --git a/src/b.rs b/src/b.rs
         // Not the open one: nothing moves and nothing is sent.
         let out = check("default", "ws3", "default");
         assert!(
-            !out.iter().any(|r| matches!(r, ClientRequest::OpenWorkspace { .. })),
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::OpenWorkspace { .. })),
             "no switch for a workspace that wasn't open: {out:?}"
         );
     }

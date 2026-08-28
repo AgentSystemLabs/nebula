@@ -655,60 +655,72 @@ impl fmt::Display for KeyChord {
     }
 }
 
-fn parse_key_name(name: &str) -> Option<KeyCode> {
-    let code = match name {
-        "up" => KeyCode::Up,
-        "down" => KeyCode::Down,
-        "left" => KeyCode::Left,
-        "right" => KeyCode::Right,
-        "enter" | "return" | "cr" => KeyCode::Enter,
-        "tab" => KeyCode::Tab,
-        "backtab" => KeyCode::BackTab,
-        "esc" | "escape" => KeyCode::Esc,
-        "space" => KeyCode::Char(' '),
-        "bs" | "backspace" => KeyCode::Backspace,
-        "del" | "delete" => KeyCode::Delete,
-        "ins" | "insert" => KeyCode::Insert,
-        "home" => KeyCode::Home,
-        "end" => KeyCode::End,
-        "pgup" | "pageup" => KeyCode::PageUp,
-        "pgdn" | "pagedown" => KeyCode::PageDown,
-        _ => {
-            if let Some(n) = name.strip_prefix('f') {
-                if let Ok(n) = n.parse::<u8>() {
-                    if (1..=20).contains(&n) {
-                        return Some(KeyCode::F(n));
-                    }
-                }
-            }
-            let mut chars = name.chars();
-            let c = chars.next()?;
-            if chars.next().is_some() {
-                return None;
-            }
-            KeyCode::Char(c)
-        }
+/// The named keys, each with its config spelling, its on-screen glyph, and
+/// the alternate config spellings `parse` also accepts — one table so the
+/// three lookups below can never disagree about a key. Letters, function
+/// keys and BackTab are handled by the arms around the lookups instead.
+const KEY_NAMES: &[KeyRow] = &[
+    (KeyCode::Up, "up", "↑", &[]),
+    (KeyCode::Down, "down", "↓", &[]),
+    (KeyCode::Left, "left", "←", &[]),
+    (KeyCode::Right, "right", "→", &[]),
+    (KeyCode::Enter, "enter", "Enter", &["return", "cr"]),
+    (KeyCode::Tab, "tab", "Tab", &[]),
+    (KeyCode::Esc, "esc", "Esc", &["escape"]),
+    (KeyCode::Char(' '), "space", "Space", &[]),
+    (KeyCode::Backspace, "backspace", "⌫", &["bs"]),
+    (KeyCode::Delete, "delete", "Del", &["del"]),
+    (KeyCode::Insert, "insert", "Ins", &["ins"]),
+    (KeyCode::Home, "home", "Home", &[]),
+    (KeyCode::End, "end", "End", &[]),
+    (KeyCode::PageUp, "pgup", "PgUp", &["pageup"]),
+    (KeyCode::PageDown, "pgdn", "PgDn", &["pagedown"]),
+];
+
+/// One `KEY_NAMES` row: `(code, config spelling, glyph, alternate spellings)`.
+type KeyRow = (KeyCode, &'static str, &'static str, &'static [&'static str]);
+
+/// The `KEY_NAMES` row for `code`, with BackTab folded onto Tab — the
+/// shift bit carries the difference, so both spell and display as `tab`.
+fn key_row(code: KeyCode) -> Option<&'static KeyRow> {
+    let code = if code == KeyCode::BackTab {
+        KeyCode::Tab
+    } else {
+        code
     };
-    Some(code)
+    KEY_NAMES.iter().find(|(c, ..)| *c == code)
+}
+
+fn parse_key_name(name: &str) -> Option<KeyCode> {
+    if name == "backtab" {
+        return Some(KeyCode::BackTab);
+    }
+    if let Some((code, ..)) = KEY_NAMES
+        .iter()
+        .find(|(_, canonical, _, aliases)| *canonical == name || aliases.contains(&name))
+    {
+        return Some(*code);
+    }
+    if let Some(n) = name.strip_prefix('f') {
+        if let Ok(n) = n.parse::<u8>() {
+            if (1..=20).contains(&n) {
+                return Some(KeyCode::F(n));
+            }
+        }
+    }
+    let mut chars = name.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(KeyCode::Char(c))
 }
 
 fn key_name(code: KeyCode) -> String {
+    if let Some((_, name, ..)) = key_row(code) {
+        return (*name).into();
+    }
     match code {
-        KeyCode::Up => "up".into(),
-        KeyCode::Down => "down".into(),
-        KeyCode::Left => "left".into(),
-        KeyCode::Right => "right".into(),
-        KeyCode::Enter => "enter".into(),
-        KeyCode::Tab | KeyCode::BackTab => "tab".into(),
-        KeyCode::Esc => "esc".into(),
-        KeyCode::Backspace => "backspace".into(),
-        KeyCode::Delete => "delete".into(),
-        KeyCode::Insert => "insert".into(),
-        KeyCode::Home => "home".into(),
-        KeyCode::End => "end".into(),
-        KeyCode::PageUp => "pgup".into(),
-        KeyCode::PageDown => "pgdn".into(),
-        KeyCode::Char(' ') => "space".into(),
         KeyCode::Char(c) => c.to_lowercase().to_string(),
         KeyCode::F(n) => format!("f{n}"),
         other => format!("{other:?}").to_lowercase(),
@@ -716,22 +728,10 @@ fn key_name(code: KeyCode) -> String {
 }
 
 fn key_display(code: KeyCode) -> String {
+    if let Some((_, _, glyph, _)) = key_row(code) {
+        return (*glyph).into();
+    }
     match code {
-        KeyCode::Up => "↑".into(),
-        KeyCode::Down => "↓".into(),
-        KeyCode::Left => "←".into(),
-        KeyCode::Right => "→".into(),
-        KeyCode::Enter => "Enter".into(),
-        KeyCode::Tab | KeyCode::BackTab => "Tab".into(),
-        KeyCode::Esc => "Esc".into(),
-        KeyCode::Backspace => "⌫".into(),
-        KeyCode::Delete => "Del".into(),
-        KeyCode::Insert => "Ins".into(),
-        KeyCode::Home => "Home".into(),
-        KeyCode::End => "End".into(),
-        KeyCode::PageUp => "PgUp".into(),
-        KeyCode::PageDown => "PgDn".into(),
-        KeyCode::Char(' ') => "Space".into(),
         KeyCode::Char(c) => c.to_string(),
         KeyCode::F(n) => format!("F{n}"),
         other => format!("{other:?}"),
@@ -757,6 +757,28 @@ impl Reach {
         self == Reach::Fine
     }
 }
+
+/// Ctrl+letter chords whose legacy control byte is another key's, with the
+/// warning each earns — a table so adding one can't drift the wording.
+/// The message returns as `&'static str`, hence full strings per entry.
+const CTRL_COLLISIONS: &[(char, &str)] = &[
+    (
+        'm',
+        "^m is the same byte as Enter in terminals without the kitty protocol",
+    ),
+    (
+        'i',
+        "^i is the same byte as Tab in terminals without the kitty protocol",
+    ),
+    (
+        '[',
+        "^[ is the same byte as Esc in terminals without the kitty protocol",
+    ),
+    (
+        'h',
+        "^h is the same byte as ⌫ in terminals without the kitty protocol",
+    ),
+];
 
 /// Whether the host terminal is likely to swallow `chord` before nebula
 /// sees it, and why. nebula is always a guest inside Terminal.app, Ghostty,
@@ -791,32 +813,14 @@ pub fn host_warning(chord: &KeyChord) -> (Reach, Option<&'static str>) {
         );
     }
     if ctrl {
+        // Legacy control bytes that collide with a key of their own.
+        if let Some((_, why)) = CTRL_COLLISIONS
+            .iter()
+            .find(|(c, _)| chord.code == KeyCode::Char(*c))
+        {
+            return (Reach::Risky, Some(why));
+        }
         match chord.code {
-            // Legacy control bytes that collide with a key of their own.
-            KeyCode::Char('m') => {
-                return (
-                    Reach::Risky,
-                    Some("^m is the same byte as Enter in terminals without the kitty protocol"),
-                )
-            }
-            KeyCode::Char('i') => {
-                return (
-                    Reach::Risky,
-                    Some("^i is the same byte as Tab in terminals without the kitty protocol"),
-                )
-            }
-            KeyCode::Char('[') => {
-                return (
-                    Reach::Risky,
-                    Some("^[ is the same byte as Esc in terminals without the kitty protocol"),
-                )
-            }
-            KeyCode::Char('h') => {
-                return (
-                    Reach::Risky,
-                    Some("^h is the same byte as ⌫ in terminals without the kitty protocol"),
-                )
-            }
             KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace | KeyCode::Esc => {
                 return (
                     Reach::Risky,
@@ -851,6 +855,10 @@ pub fn host_warning(chord: &KeyChord) -> (Reach, Option<&'static str>) {
 }
 
 // ---- the map ----
+
+/// What an action with no chord shows in place of one, everywhere a chord
+/// list is rendered — the hotkeys tab and the help labels must agree.
+pub const UNBOUND: &str = "—";
 
 /// Resolved bindings: one chord list per entry of [`ACTIONS`], in the same
 /// order, so an index is a stable handle for both the UI and the config.
@@ -917,10 +925,7 @@ impl Keymap {
     }
 
     pub fn chords(&self, action: Action) -> &[KeyChord] {
-        match index_of(action) {
-            Some(i) => &self.binds[i],
-            None => &[],
-        }
+        index_of(action).map_or(&[], |i| self.binds[i].as_slice())
     }
 
     pub fn chords_at(&self, index: usize) -> &[KeyChord] {
@@ -931,7 +936,7 @@ impl Keymap {
     pub fn display_at(&self, index: usize) -> String {
         let chords = self.chords_at(index);
         if chords.is_empty() {
-            return "—".into();
+            return UNBOUND.into();
         }
         chords
             .iter()
@@ -947,10 +952,7 @@ impl Keymap {
 
     /// Help-style label for an action: every chord it answers to, or `—`.
     pub fn label(&self, action: Action) -> String {
-        match index_of(action) {
-            Some(i) => self.display_at(i),
-            None => "—".into(),
-        }
+        index_of(action).map_or_else(|| UNBOUND.into(), |i| self.display_at(i))
     }
 
     fn spec_list(&self, index: usize) -> String {
@@ -1279,5 +1281,53 @@ mod tests {
                 spec.id
             );
         }
+    }
+
+    // Pins every named key's config spelling, on-screen glyph, and the
+    // alternate spellings `parse` accepts, so a table rewrite can't drift
+    // a single string the hotkeys tab or a saved config depends on.
+    #[test]
+    fn named_keys_keep_their_spellings_and_glyphs() {
+        let table: &[(KeyCode, &str, &str, &[&str])] = &[
+            (KeyCode::Up, "up", "↑", &[]),
+            (KeyCode::Down, "down", "↓", &[]),
+            (KeyCode::Left, "left", "←", &[]),
+            (KeyCode::Right, "right", "→", &[]),
+            (KeyCode::Enter, "enter", "Enter", &["return", "cr"]),
+            (KeyCode::Tab, "tab", "Tab", &[]),
+            (KeyCode::BackTab, "tab", "Tab", &[]),
+            (KeyCode::Esc, "esc", "Esc", &["escape"]),
+            (KeyCode::Backspace, "backspace", "⌫", &["bs"]),
+            (KeyCode::Delete, "delete", "Del", &["del"]),
+            (KeyCode::Insert, "insert", "Ins", &["ins"]),
+            (KeyCode::Home, "home", "Home", &[]),
+            (KeyCode::End, "end", "End", &[]),
+            (KeyCode::PageUp, "pgup", "PgUp", &["pageup"]),
+            (KeyCode::PageDown, "pgdn", "PgDn", &["pagedown"]),
+            (KeyCode::Char(' '), "space", "Space", &[]),
+        ];
+        for (code, name, glyph, aliases) in table {
+            assert_eq!(key_name(*code), *name, "{code:?}");
+            assert_eq!(key_display(*code), *glyph, "{code:?}");
+            if *code != KeyCode::BackTab {
+                assert_eq!(parse_key_name(name), Some(*code), "{name}");
+            }
+            for alias in *aliases {
+                assert_eq!(parse_key_name(alias), Some(*code), "{alias}");
+            }
+        }
+        assert_eq!(parse_key_name("backtab"), Some(KeyCode::BackTab));
+        // The open-ended arms: letters, function keys, and crossterm's
+        // Debug spelling for anything else.
+        assert_eq!(key_name(KeyCode::Char('Q')), "q");
+        assert_eq!(key_display(KeyCode::Char('Q')), "Q");
+        assert_eq!(parse_key_name("q"), Some(KeyCode::Char('q')));
+        assert_eq!(parse_key_name("qq"), None);
+        assert_eq!(key_name(KeyCode::F(12)), "f12");
+        assert_eq!(key_display(KeyCode::F(12)), "F12");
+        assert_eq!(parse_key_name("f12"), Some(KeyCode::F(12)));
+        assert_eq!(parse_key_name("f21"), None);
+        assert_eq!(key_name(KeyCode::Null), "null");
+        assert_eq!(key_display(KeyCode::Null), "Null");
     }
 }

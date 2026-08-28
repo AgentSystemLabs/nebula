@@ -56,8 +56,9 @@ pub fn shutdown_daemon_if_idle() -> Result<ipc::IdleShutdown> {
 }
 
 /// `nebula rename` — agent-side session titling (see `ipc::rename_current_agent`).
-pub fn run_rename(title: String, force: bool) -> Result<()> {
-    runtime()?.block_on(ipc::rename_current_agent(title, force))
+/// `mode` is the CLI's `--force`, decided where the flag is parsed.
+pub fn run_rename(title: String, mode: RenameMode) -> Result<()> {
+    runtime()?.block_on(ipc::rename_current_agent(&title, mode))
 }
 
 /// `nebula worktree [name] [--base <ref>]` — move the current agent session
@@ -69,10 +70,10 @@ pub fn run_worktree(name: String, base: Option<String>) -> Result<()> {
 /// `nebula add <dir>` / bare `nebula <dir>` — register a directory as a
 /// project (see `ipc::add_project`).
 pub fn run_add_project(path: String) -> Result<()> {
-    runtime()?.block_on(ipc::add_project(path))
+    runtime()?.block_on(ipc::add_project(&path))
 }
 
-pub use ipc::WorkspaceOp;
+pub use ipc::{RenameMode, WorkspaceOp};
 
 /// `nebula workspace <add|open|list|delete|rename>` (see `ipc::run_workspace_op`).
 pub fn run_workspace(op: WorkspaceOp) -> Result<()> {

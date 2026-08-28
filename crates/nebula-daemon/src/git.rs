@@ -77,16 +77,48 @@ pub struct WorktreeEntry {
 /// checkout.
 pub async fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeEntry>> {
     let out = git(repo, &["worktree", "list", "--porcelain"]).await?;
-    // (path, branch, HEAD) as git printed them; the label is decided below.
-    let mut raw: Vec<(PathBuf, Option<String>, Option<String>)> = Vec::new();
+    let mut entries = parse_worktree_list(&out);
+    for entry in &mut entries {
+        if entry.branch != "(detached)" && !entry.branch.starts_with("detached @ ") {
+            continue;
+        }
+        if let Some(branch) = rebasing_branch(&entry.path).await {
+            entry.branch = branch;
+        }
+    }
+    Ok(entries)
+}
+
+/// The parse behind `list_worktrees`, kept free of git so it can be pinned
+/// against captured porcelain output: one stanza per checkout, `worktree
+/// <path>` first, then `HEAD <sha>` and either `branch refs/heads/<name>`
+/// or `detached`, separated by blank lines.
+fn parse_worktree_list(out: &str) -> Vec<WorktreeEntry> {
+    /// Close out the stanza in progress, if one is open: a `branch` line
+    /// named it, otherwise it is a detached HEAD. The next `worktree` line
+    /// closes one stanza and the end of the output closes the last.
+    fn close(
+        entries: &mut Vec<WorktreeEntry>,
+        path: Option<PathBuf>,
+        branch: &mut Option<String>,
+        head: Option<&str>,
+    ) {
+        if let Some(path) = path {
+            entries.push(WorktreeEntry {
+                path,
+                branch: branch.take().unwrap_or_else(|| detached_label(head)),
+            });
+        }
+    }
+
+    let mut entries = Vec::new();
     let mut path: Option<PathBuf> = None;
     let mut branch: Option<String> = None;
     let mut head: Option<String> = None;
     for line in out.lines() {
         if let Some(p) = line.strip_prefix("worktree ") {
-            if let Some(done_path) = path.take() {
-                raw.push((done_path, branch.take(), head.take()));
-            }
+            close(&mut entries, path.take(), &mut branch, head.as_deref());
+            head = None;
             path = Some(PathBuf::from(p));
         } else if let Some(sha) = line.strip_prefix("HEAD ") {
             head = Some(sha.to_string());
@@ -94,28 +126,8 @@ pub async fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeEntry>> {
             branch = Some(b.trim_start_matches("refs/heads/").to_string());
         }
     }
-    if let Some(done_path) = path {
-        raw.push((done_path, branch, head));
-    }
-    let mut entries = Vec::with_capacity(raw.len());
-    for (path, branch, head) in raw {
-        let branch = match branch {
-            Some(b) => b,
-            // No branch line: HEAD is detached. Usually that is a rebase
-            // parked on a conflict — HEAD sits on the commits being replayed
-            // for as long as the user takes to resolve it, and the branch
-            // comes back untouched when it finishes. The row is still that
-            // branch's row; renaming it "detached" for the duration makes a
-            // worktree look like it lost its identity, and breaks every
-            // lookup keyed on the branch name meanwhile.
-            None => match rebasing_branch(&path).await {
-                Some(b) => b,
-                None => detached_label(head.as_deref()),
-            },
-        };
-        entries.push(WorktreeEntry { path, branch });
-    }
-    Ok(entries)
+    close(&mut entries, path, &mut branch, head.as_deref());
+    entries
 }
 
 /// The branch a paused rebase in `checkout` is replaying, if there is one —
@@ -241,6 +253,43 @@ mod tests {
         git(dir, &["commit", "--allow-empty", "-m", "init"])
             .await
             .unwrap();
+    }
+
+    /// Captured `git worktree list --porcelain` shape: the main checkout
+    /// leads, a linked worktree on a branch follows, and a detached one
+    /// gets the short-sha label instead of a branch name.
+    #[test]
+    fn parse_worktree_list_reads_branches_and_detached_heads() {
+        let porcelain = "worktree /repo\n\
+                         HEAD 0123456789abcdef0123456789abcdef01234567\n\
+                         branch refs/heads/main\n\
+                         \n\
+                         worktree /repo-worktrees/feat\n\
+                         HEAD fedcba9876543210fedcba9876543210fedcba98\n\
+                         branch refs/heads/feat/x\n\
+                         \n\
+                         worktree /repo-worktrees/pinned\n\
+                         HEAD abcdef0123456789abcdef0123456789abcdef01\n\
+                         detached\n\
+                         \n";
+        let entries = parse_worktree_list(porcelain);
+        let got: Vec<(&Path, &str)> = entries
+            .iter()
+            .map(|e| (e.path.as_path(), e.branch.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Path::new("/repo"), "main"),
+                (Path::new("/repo-worktrees/feat"), "feat/x"),
+                (Path::new("/repo-worktrees/pinned"), "detached @ abcdef0"),
+            ]
+        );
+        // A trailing stanza with no blank line after it still closes.
+        let entries = parse_worktree_list("worktree /only\nHEAD 1234567890\nbranch refs/heads/b");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].branch, "b");
+        assert!(parse_worktree_list("").is_empty());
     }
 
     #[test]

@@ -28,19 +28,23 @@ pub const SESSION_IDLE_TIMEOUTS: &[&str] = &["off", "1m", "5m", "15m", "30m", "1
 /// models, hand-edited configs can name any command the list doesn't.
 pub const EDITORS: &[&str] = &["vim", "nvim", "nano", "emacs", "hx"];
 
+/// The model/effort sentinel meaning "don't pass the flag — let the CLI
+/// pick"; it heads every choice list and is what the daemon sees as None.
+pub const DEFAULT_CHOICE: &str = "default";
+
 /// Model/effort choices for the new-session submenus and the settings
-/// overlay. "default" everywhere means "don't pass the flag — let the CLI
-/// pick" and is what the daemon sees as None.
-pub const CLAUDE_MODELS: &[&str] = &["default", "fable", "opus", "sonnet", "haiku"];
-pub const CLAUDE_EFFORTS: &[&str] = &["default", "low", "medium", "high", "xhigh", "max"];
+/// overlay. [`DEFAULT_CHOICE`] everywhere means "don't pass the flag — let
+/// the CLI pick" and is what the daemon sees as None.
+pub const CLAUDE_MODELS: &[&str] = &[DEFAULT_CHOICE, "fable", "opus", "sonnet", "haiku"];
+pub const CLAUDE_EFFORTS: &[&str] = &[DEFAULT_CHOICE, "low", "medium", "high", "xhigh", "max"];
 pub const CODEX_MODELS: &[&str] = &[
-    "default",
+    DEFAULT_CHOICE,
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "gpt-5.5",
 ];
-pub const CODEX_EFFORTS: &[&str] = &["default", "minimal", "low", "medium", "high", "xhigh"];
+pub const CODEX_EFFORTS: &[&str] = &[DEFAULT_CHOICE, "minimal", "low", "medium", "high", "xhigh"];
 
 /// Model choices for a session kind; empty = no model submenu (Cursor).
 pub fn model_choices(kind: AgentKind) -> &'static [&'static str] {
@@ -418,10 +422,10 @@ impl Default for Config {
             show_workspaces: true,
             hide_projects: false,
             hide_worktrees: false,
-            claude_model: "default".into(),
-            claude_effort: "default".into(),
-            codex_model: "default".into(),
-            codex_effort: "default".into(),
+            claude_model: DEFAULT_CHOICE.into(),
+            claude_effort: DEFAULT_CHOICE.into(),
+            codex_model: DEFAULT_CHOICE.into(),
+            codex_effort: DEFAULT_CHOICE.into(),
             keybindings: BTreeMap::new(),
         }
     }
@@ -555,7 +559,10 @@ impl Config {
     /// The editor the file overlays launch: `NEBULA_EDITOR` when set,
     /// otherwise the `editor` setting, otherwise vim.
     pub fn editor_command(&self) -> String {
-        resolve_editor(std::env::var("NEBULA_EDITOR").ok().as_deref(), &self.editor)
+        resolve_editor(
+            nebula_core::env::non_empty(nebula_core::env::EDITOR).as_deref(),
+            &self.editor,
+        )
     }
 
     /// The configured default model for new sessions of `kind`, as the
@@ -680,10 +687,10 @@ fn resolve_editor(env: Option<&str>, configured: &str) -> String {
     "vim".into()
 }
 
-/// "default" (or blank) → None; anything else passes through.
+/// [`DEFAULT_CHOICE`] (or blank) → None; anything else passes through.
 fn non_default(value: &str) -> Option<String> {
     let value = value.trim();
-    (!value.is_empty() && !value.eq_ignore_ascii_case("default")).then(|| value.to_string())
+    (!value.is_empty() && !value.eq_ignore_ascii_case(DEFAULT_CHOICE)).then(|| value.to_string())
 }
 
 fn on_off(v: bool) -> &'static str {
@@ -1078,9 +1085,11 @@ mod tests {
     fn save_persists_model_effort_keys() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        let mut cfg = Config::default();
-        cfg.claude_model = "sonnet".into();
-        cfg.codex_effort = "xhigh".into();
+        let cfg = Config {
+            claude_model: "sonnet".into(),
+            codex_effort: "xhigh".into(),
+            ..Config::default()
+        };
         cfg.save_to(&path).unwrap();
         let reread = load_from(&path);
         assert_eq!(reread.claude_model, "sonnet");

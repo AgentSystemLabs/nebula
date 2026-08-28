@@ -20,7 +20,7 @@
 //! see `warn_if_exposed`.
 
 use anyhow::{anyhow, bail, Context, Result};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -193,7 +193,7 @@ pub(crate) fn free_port(bind: IpAddr) -> Result<u16> {
     Ok(port)
 }
 
-fn spawn_ttyd(exe: &OsString, port: u16, opts: &BrowserOpts) -> Result<Child> {
+fn spawn_ttyd(exe: &OsStr, port: u16, opts: &BrowserOpts) -> Result<Child> {
     Command::new("ttyd")
         .args(ttyd_args(port, opts))
         .arg(exe)

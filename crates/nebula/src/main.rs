@@ -5,6 +5,7 @@ mod upgrade;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::Path;
 
 #[derive(Parser)]
 #[command(
@@ -166,7 +167,7 @@ fn main() -> Result<()> {
             init_daemon_logging(foreground)?;
             log_fatal(
                 nebula_daemon::run_daemon(),
-                nebula_core::paths::daemon_log_path(),
+                &nebula_core::paths::daemon_log_path(),
             )
         }
         Some(Command::Add { path }) => nebula_tui::run_add_project(path),
@@ -184,7 +185,14 @@ fn main() -> Result<()> {
             nebula_tui::run_workspace(op)
         }
         Some(Command::Kill) => nebula_tui::run_kill(),
-        Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),
+        Some(Command::Rename { title, force }) => {
+            let mode = if force {
+                nebula_tui::RenameMode::Force
+            } else {
+                nebula_tui::RenameMode::Auto
+            };
+            nebula_tui::run_rename(title.join(" "), mode)
+        }
         Some(Command::Worktree { name, base }) => nebula_tui::run_worktree(name.join(" "), base),
         Some(Command::Browser {
             port,
@@ -220,9 +228,7 @@ fn main() -> Result<()> {
         Some(Command::StaleDaemonNote) => {
             if nebula_daemon::lifecycle::daemon_is_stale() {
                 println!("note: the running daemon was built from older code.");
-                println!(
-                    "      run 'nebula kill' to restart onto the new binary (stops ALL sessions)."
-                );
+                println!("{}", upgrade::KILL_HINT);
             }
             Ok(())
         }
@@ -233,7 +239,7 @@ fn main() -> Result<()> {
                 init_tui_logging()?;
                 let handoff = log_fatal(
                     nebula_tui::run_tui(cli.workspace),
-                    nebula_core::paths::tui_log_path(),
+                    &nebula_core::paths::tui_log_path(),
                 )?;
                 match handoff {
                     // Hosts-picker handoff: the TUI quit and restored the
@@ -252,53 +258,55 @@ fn main() -> Result<()> {
 
 /// Record a fatal top-level error in the log file before it goes to stderr —
 /// the TUI's stderr disappears with the terminal, the daemon's is /dev/null.
-fn log_fatal<T>(result: Result<T>, log_path: std::path::PathBuf) -> Result<T> {
+fn log_fatal<T>(result: Result<T>, log_path: &Path) -> Result<T> {
     if let Err(err) = &result {
-        nebula_core::crashlog::append(&log_path, &format!("FATAL {err:#}"));
+        nebula_core::crashlog::append(log_path, &format!("FATAL {err:#}"));
     }
     result
+}
+
+fn log_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_env(nebula_core::env::LOG)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+}
+
+/// Route tracing to `log_path` (created on demand, appended, no ANSI) —
+/// neither binary can log to the terminal: the TUI owns it and the daemon
+/// has no stderr.
+fn init_file_logging(log_path: &Path) -> Result<()> {
+    std::fs::create_dir_all(nebula_core::paths::log_dir())?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    tracing_subscriber::fmt()
+        .with_env_filter(log_filter())
+        .with_writer(file)
+        .with_ansi(false)
+        .init();
+    Ok(())
 }
 
 fn init_daemon_logging(foreground: bool) -> Result<()> {
     // The daemon runs detached with stderr on /dev/null — without this hook a
     // panic (on any thread, tokio workers included) leaves no trace.
-    nebula_core::crashlog::install_panic_hook(nebula_core::paths::daemon_log_path());
-    let filter = tracing_subscriber::EnvFilter::try_from_env("NEBULA_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let log_path = nebula_core::paths::daemon_log_path();
+    nebula_core::crashlog::install_panic_hook(log_path.clone());
     if foreground {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
-    } else {
-        std::fs::create_dir_all(nebula_core::paths::log_dir())?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(nebula_core::paths::daemon_log_path())?;
         tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(file)
-            .with_ansi(false)
+            .with_env_filter(log_filter())
             .init();
+        return Ok(());
     }
-    Ok(())
+    init_file_logging(&log_path)
 }
 
 fn init_tui_logging() -> Result<()> {
     // Panic output to stderr dies with the alternate screen — capture it to
     // the log file. The TUI later wraps this hook with its terminal-restore,
     // so the chain on panic is: restore terminal → log to file → stderr.
-    nebula_core::crashlog::install_panic_hook(nebula_core::paths::tui_log_path());
+    let log_path = nebula_core::paths::tui_log_path();
+    nebula_core::crashlog::install_panic_hook(log_path.clone());
     // stdout belongs to the UI — log to file only.
-    std::fs::create_dir_all(nebula_core::paths::log_dir())?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(nebula_core::paths::tui_log_path())?;
-    let filter = tracing_subscriber::EnvFilter::try_from_env("NEBULA_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(file)
-        .with_ansi(false)
-        .init();
-    Ok(())
+    init_file_logging(&log_path)
 }
