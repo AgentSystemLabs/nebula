@@ -133,6 +133,47 @@ to `ws2`, and shows the bar again. 685 workspace tests green, no new clippy warn
 - One existing assertion had to move: `shift_w_toggles_the_workspaces_bar_and_parks_focus` checked
   `lines[1].starts_with("   PROJECTS")` on the hidden path; it's `"   DEFAULT"` now.
 
+### A Paused Rebase Renamed The Worktree Row To `detached @ …` — 2026-08-27
+
+**Asked:** "something in this conversation caused the worktree to show up in the UI but then it switvhed
+yp detached at f816b5f.  I wouldn't have expected the wortree name to become detached"
+
+**Did:** Diagnosed, then fixed in `95c0a18`. The cause was the `git rebase origin/main` in the entry above
+pausing on conflicts: a rebase parks HEAD on the commits it replays, so `git worktree list --porcelain`
+prints `detached` (no `branch` line) for the checkout for as long as it sits there. The 2s worktree sync
+(`reconcile_project_worktrees`, `registry.rs`) saw `known.branch != entry.branch`, wrote `detached @
+f816b5f` into the row and broadcast it, then wrote the branch back on the tick after `rebase --continue`
+finished. `git::list_worktrees` (`crates/nebula-daemon/src/git.rs`) now resolves a branch-less entry
+through the new `rebasing_branch(checkout)`: `git rev-parse --absolute-git-dir`, then
+`<git-dir>/{rebase-merge,rebase-apply}/head-name` (`refs/heads/<branch>` — the same file `git status`
+reads to say "rebasing branch X"). Only a checkout with no rebase in progress, or one rebasing from an
+already-detached HEAD (`head-name` reads `detached HEAD`), still gets `detached_label`. Test
+`a_paused_rebase_keeps_the_worktree_on_its_branch` walks mid-rebase → `--abort` → `checkout --detach`.
+147 daemon tests green.
+
+**Gotchas:**
+- **The row heals itself, so the bug is easy to write off as cosmetic — it isn't.** `nebula worktree
+  <name>` finds its target by `w.branch == branch` (`registry.rs:~1377`) and *creates* a worktree when
+  nothing matches, so an agent running it mid-rebase would have tried to add a second checkout for a
+  branch that already has one. Anything keyed on the branch string is blind for the whole pause.
+- The rebase state lives in the **per-worktree** git dir (`<repo>/.git/worktrees/<name>/rebase-merge/`),
+  not the shared `.git` — `git_common_dir` in `lib.rs` deliberately hops *to* the shared one for the
+  mtime probe and is the wrong helper here; `rev-parse --absolute-git-dir` from the checkout is right.
+- `git worktree list` may print canonical paths while `add_worktree` returns the tempdir spelling
+  (`/var/…` vs `/private/var/…` on macOS): the existing `remove_worktree_*` tests only assert
+  `e.path != wt`, which passes trivially either way. Canonicalize both sides when a test needs to *find*
+  the entry.
+- `git::current_branch` is a second, uncalled copy of this label logic with its own `detached@` format.
+  Left alone, but don't reach for it thinking it agrees with `list_worktrees`.
+- **A "load race" can be a build-layout race.** After this change `workspace_scope_is_per_connection`
+  (e2e_pty) failed 7 of 11 *idle* runs while the pre-change `git.rs` passed 13 of 13 — yet a probe
+  showed `rebasing_branch` was never called and the porcelain parse was identical. Adding file I/O to
+  `list_worktrees` for the probe made it pass 3/3: pure timing. It was the documented Ack-beats-upsert
+  race, and a code change that never runs in the test still shifts the odds. Fixed on the test side
+  (`6638952`): wait for the upsert *and* the Ack, as `cli_add_project` does; the TUI never relied on the
+  order (`event_loop.rs` "usually lands just before this Ack; if not, …"). A/B the old file in place
+  (`git show <sha>:path > path`, run, `git checkout -- path`) before believing either verdict.
+
 ### Released v0.13.0 Off A Checkout Three Releases Stale — 2026-08-27
 
 **Asked:** "commit push and make a release for me" (after the `nebula ssh` clipboard fix in the entry
@@ -341,6 +382,94 @@ on the session row *and* the project row above it. 450 nebula-tui + 143 daemon +
   never again: another session was editing this shared checkout mid-build. Rerun before debugging (see
   [Shared tree races] in the user memory).
 
+### A Workspace Switch Cold-Booted A Fleet Of Claude CLIs — 2026-08-26
+
+**Asked:** "in a worktree, debug a performance issue when a user switches between workspaces sometimes it
+seems like it's lagging or stuck loading up multiple claude sessions as the terminal panel doesn't show for
+like 5-10 seconds"
+
+**Did:** Three compounding causes, all confirmed against the live `~/.nebula-dev` daemon log and DB, fixed
+in `327757f` (originally `7246a47`; the branch sat unmerged for a day and was rebased onto `origin/main`
+at v0.13.0 on 2026-08-27 — see the rebase notes at the end of this entry).
+
+1. **Every switch attaches a *dead* session.** `session_idle_timeout` defaults to `5m`
+   (`nebula-daemon/src/config.rs:44`), and `reap_idle_sessions` kills everything in a workspace nobody is
+   attached to — the dev `daemon.log` is wall-to-wall `reaping idle session … idle_secs=300`. So
+   `switch_workspace_inner` → `restore_context` → `restore_session` → `attach` lands on a dead sref and
+   the daemon's `Attach` arm cold-spawns `zsh -l -i -c 'exec claude --resume <sid>'`. The replay it sends
+   back is **empty** (fresh ring), so the pane rendered a blank vt100 grid with no indication of anything
+   happening.
+2. **250ms later the prewarm booted every *other* session in the worktree, inline.**
+   `PrewarmWorktreeSessions` was handled synchronously on the connection's request loop
+   (`server.rs:426`, the old comment said "Deliberately inline"), and `prewarm_worktree_sessions` called
+   `ensure_session` for every dead non-archived row. `main` in the dev DB has **5 agents** → 5 concurrent
+   login-shell + claude boots, plus a 6th from `PrewarmAgent`, all starving the one the user was waiting
+   on — and stalling that client's `Input` frames for the whole burst.
+3. **`attach` had no debounce**, unlike prewarm. In the Workspaces column `move_selection` runs a full
+   `switch_workspace` per row (`event_loop.rs`), so walking past four workspaces cold-spawned four CLIs
+   and abandoned three, each then living 5 more minutes.
+
+Fixes: `Daemon::spawn_gate` (`registry.rs`) makes `ensure_session`'s check-and-install atomic, which is
+what lets the sweep leave the request loop — `run_worktree_prewarm` is now its own task, boots one session
+per `PREWARM_STAGGER` (1.5s), skips `is_alive` rows, and `prewarm_sweep` aborts a superseded sweep.
+TUI-side, `attach` defers the request by `ATTACH_DEBOUNCE` (180ms) via `pending_attach`, with
+`attached_sref` tracking what the daemon actually holds while `term.sref` runs ahead; `attach_now` /
+`preview_selected_now` skip the wait for explicit picks. `AttachedTerm::painted` drives a `starting…` tag
+plus a centered notice in `draw_terminal`. 631 tests green when written; **657 green after the rebase**
+(exit 0, `--no-fail-fast`, all 7 binaries).
+
+**Gotchas:**
+- **Measure the boot before blaming the code.** One fresh `claude` under `zsh -l -i` on this machine is
+  **0.67s to first byte, 1.47s to a painted screen** — and that's without `--resume` reloading a
+  transcript. Six of those at once is the whole 5-10s. A pty-fork bench spawning 4 at once got the shell
+  OOM-killed (exit 137) and 3 at once never finished in 120s; benchmark agent CLIs **one at a time**.
+- **`app.term` and the daemon's attachment are now two different things.** Tests that set
+  `app.term = Some(AttachedTerm::new(…))` directly leave `attached_sref` unset, so a `detach_if_attached`
+  keyed only on `attached_sref` silently stopped emitting `Detach` and broke 4 tests. Both
+  `detach_if_attached` and `release_attachment` deliberately fall back to `term.sref` — a `Detach` the
+  daemon holds no attachment for is a no-op there (`server.rs` `attached.remove()` returns `None`).
+- **Debouncing `attach` breaks every test that asserts an immediate `Attach` after a selection move.** 10
+  failed. Only 2 were genuinely the new contract (`session_arrows_preview_without_focusing`,
+  `switching_contexts_restores_the_remembered_session` — both now call `fire_pending_attach` to settle).
+  The other 8 were paths that *should* stay immediate: wrap `reconcile_selection` and `jump_to_target`
+  (both have early `return`s, so wrapping beats appending) and route clicks through
+  `preview_selected_now`.
+- **Input is dropped for a session the daemon hasn't spawned**, so a pending attach must land before the
+  first keystroke. `handle_terminal_event` fires it up front when `term_locked`; the two paths that take
+  the lock without attaching (`Action::Activate` on an already-focused pane, `Action::Zoom`) fire it too.
+- The 100-col draw-test truncation trap from [A Workspaces Column Left Of Projects] bites again: the
+  `starting…` test asserts pane body text, so it needs `show_workspaces = false` **and**
+  `TestBackend::new(140, 30)` or the string is clipped mid-assert.
+- The `switch_workspace_quietly` double-attach gotcha below is unaffected — the debounce happens to mask
+  that churn now, but the quiet variant is still what makes a cross-workspace jump correct.
+
+**Rebase onto v0.13.0 (2026-08-27), 20 commits later:**
+- Only two files conflicted (`registry.rs`, `event_loop.rs`); `server.rs`, `app.rs` and `ui.rs` merged
+  clean. Both `registry.rs` conflicts were additive-on-both-sides (main's `pending_moves` /
+  `cloud_attach_gated` / `cloud_mirrors` vs. this branch's `spawn_gate` / `prewarm_sweep`) — keep both.
+- **The one semantic conflict is `attach`.** Main added `mark_agent_seen` to the top of it (see
+  [Unwatched Finishes Count On The Project And Worktree Rows]) on the reasoning that every path landing
+  the pane on a session goes through `attach`. After this branch's split that funnel is `attach_inner`,
+  so the call moves there — keyed to the **pane swap, not the Attach**, because the user is reading the
+  screen during the debounce just the same. Putting it in `attach` alone would have skipped
+  `attach_now` / `preview_selected_now` and leaked unread counts on every explicit pick.
+- Two of main's newer tests failed, and they are not the same kind of failure:
+  `switching_back_to_a_workspace_restores_project_worktree_and_session` is *exactly* the path the
+  debounce exists for, so the test was updated to the new contract (pane restores now, Attach after
+  `fire_pending_attach`). `snapshot_reattaches_the_remembered_session` is not — a boot restores one
+  remembered session once, with no cursor sweep to wait out, so the Snapshot arm moved to
+  `preview_selected_now` and main's assertion stands unchanged. **A failing attach-timing test is a
+  question about which path it is, not a licence to relax the assertion.**
+- Struct drift in the branch's new test only: `Project` lost the four `divider_*` fields (migration 18)
+  and `Agent` gained `unseen` / `cloud_session_id` / `cloud_mirroring`. `cargo build` was clean and only
+  `cargo test --no-run` surfaced it — test-only literals need the test compile to be checked.
+- The workspaces *column* became a top tab bar on main, but `move_selection` there still does a full
+  `switch_workspace` per step, so the premise of cause 3 survived the rework and
+  `walking_the_workspaces_column_attaches_only_where_it_stops` passes untouched.
+- `cargo fmt --check` and clippy are **dirty on `origin/main` itself** (a `base64_encode` line, 7 clippy
+  warnings incl. `needless_return` at `event_loop.rs:5197`). None are in this diff — confirm with
+  `git diff origin/main --stat -- <file>` before assuming a warning is yours.
+
 ### Released v0.11.0 Out Of A Shared Tree That Moved Mid-Release — 2026-08-26
 
 **Asked:** "commit push release"
@@ -519,7 +648,8 @@ HEAD = origin/main, working tree = v0.10.0 + the three features, still uncommitt
 - `git diff --quiet <commit>` only compares tracked files — it will say the tree matches even when
   untracked WIP is missing. `cmp` the untracked files separately.
 - `workspace_scope_is_per_connection` (e2e_pty) failed twice under a parallel clippy+test run and passed
-  alone: the Ack-beats-upsert load race the v0.10.0 entry describes, not the merge.
+  alone: the Ack-beats-upsert load race the v0.10.0 entry describes, not the merge (test fixed
+  2026-08-27, `6638952`).
 - The old Makefile's dev daemon lives at `/tmp/nebula-dev`; the new per-checkout slot is
   `/tmp/nebula-dev-<8 chars of shasum of $CURDIR>` (`2f3f877f` for the main checkout), so the new
   `dev-stop` cannot see a daemon the old recipe started. A `make dev` TUI that was already open keeps its
@@ -635,7 +765,8 @@ for the dot splitting violet (unread) from green (read) on the same `unseen` fla
   `cargo build --release` ran alongside, then passed alone and 2 of 2 idle full-suite runs. Its
   `expect("AddProject upserts the project")` only sees the broadcast upsert if it lands before the Ack —
   `server.rs` writes the Ack from the request loop and the upsert from the broadcast forwarder, so under
-  CPU contention the Ack can win. A load race, not a regression: rerun idle before debugging.
+  CPU contention the Ack can win. **Fixed 2026-08-27 (`6638952`):** the test now waits for the upsert as
+  well as the Ack, like `cli_add_project` always did — see [A Paused Rebase Renamed The Worktree Row].
 
 ### One Nebula Per Checkout: Auto-Port For `browser`, Per-Path Dev Slots — 2026-08-26
 

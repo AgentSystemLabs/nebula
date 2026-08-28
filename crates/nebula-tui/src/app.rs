@@ -1681,6 +1681,12 @@ pub struct AttachedTerm {
     /// The child's kitty keyboard flags (daemon-tracked); picks the key
     /// encoding dialect. 0 = legacy.
     pub kitty_flags: u8,
+    /// Whether any PTY bytes have reached this parser yet. False means the
+    /// grid is blank because the session is still booting — attaching to a
+    /// reaped session replays an empty ring, and an agent CLI takes seconds
+    /// to paint its first frame. The pane says so instead of showing an
+    /// unexplained void.
+    pub painted: bool,
 }
 
 impl AttachedTerm {
@@ -1693,6 +1699,7 @@ impl AttachedTerm {
             rows,
             scroll: 0,
             kitty_flags: 0,
+            painted: false,
         }
     }
 
@@ -1701,6 +1708,7 @@ impl AttachedTerm {
         self.parser = vt100::Parser::new(self.rows, self.cols, 10_000);
         self.exited = false;
         self.scroll = 0;
+        self.painted = false;
     }
 
     pub fn set_scroll(&mut self, scroll: usize) {
@@ -1907,6 +1915,16 @@ pub struct App {
     /// deadline — armed on every worktree context switch, so walking the
     /// list doesn't boot every CLI it passes.
     pub pending_prewarm: Option<(WorktreeId, std::time::Instant)>,
+    /// Debounced attach: the session the pane is showing but the daemon has
+    /// not been told about yet. Stepping a selection is not a decision to
+    /// boot a CLI — and in the Workspaces column every step is a full
+    /// workspace switch, so without this, walking past four workspaces
+    /// cold-spawns four agents and abandons three of them.
+    pub pending_attach: Option<(SessionRef, std::time::Instant)>,
+    /// What this connection is attached to daemon-side. Lags `term.sref`
+    /// while an attach waits out its debounce, so the Detach that precedes
+    /// the next Attach names the session the daemon actually holds.
+    pub attached_sref: Option<SessionRef>,
     /// Standing keep-warm: when to next re-assert the selected worktree's
     /// warm default-spec Claude session, so one is always ready to adopt.
     /// Re-armed after every send; disarmed when nothing is selected.
@@ -2111,6 +2129,8 @@ impl App {
             last_session_for_worktree: HashMap::new(),
             last_project_for_workspace: HashMap::new(),
             pending_prewarm: None,
+            pending_attach: None,
+            attached_sref: None,
             next_keepwarm: None,
             term_selection: None,
             last_term_click: None,
@@ -2637,6 +2657,12 @@ impl App {
     /// event loop can wake up and fire it. None when nothing is armed.
     pub fn prewarm_delay(&self) -> Option<std::time::Duration> {
         let (_, at) = self.pending_prewarm.as_ref()?;
+        Some(at.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// How long until the debounced attach should be sent, if one is armed.
+    pub fn attach_delay(&self) -> Option<std::time::Duration> {
+        let (_, at) = self.pending_attach.as_ref()?;
         Some(at.saturating_duration_since(std::time::Instant::now()))
     }
 

@@ -403,11 +403,11 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     cols,
                     rows,
                 } => {
-                    // Deliberately inline: an Attach for one of these
-                    // sessions is then ordered after it instead of racing it
-                    // (two concurrent ensure_session calls for the same sref
-                    // would double-spawn). Spawns are forkpty-fast; the
-                    // children boot in the background.
+                    // Returns at once: the sweep boots the worktree's dead
+                    // sessions on its own task, staggered, skipping the one
+                    // the Attach above already spawned. Racing that Attach is
+                    // safe — ensure_session's spawn gate makes the
+                    // check-and-spawn atomic, so neither can double-fork.
                     daemon.prewarm_worktree_sessions(&worktree, cols, rows);
                 }
                 ClientRequest::RenameAgent { req_id, id, name } => {

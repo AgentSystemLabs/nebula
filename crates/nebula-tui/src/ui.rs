@@ -3368,6 +3368,13 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
             format!("scroll {}", t.scroll),
             Style::default().fg(th.warn).add_modifier(Modifier::BOLD),
         )),
+        // Nothing has come off the PTY yet: the session was reaped while the
+        // user was elsewhere and its CLI is booting. Say so — the blank grid
+        // on its own reads as a hang.
+        Some(t) if !t.painted => Some(Span::styled(
+            "starting…".to_string(),
+            Style::default().fg(th.dim),
+        )),
         Some(_) if app.term_locked => Some(Span::styled(
             "INPUT".to_string(),
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
@@ -3385,6 +3392,26 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     app.hits.push((inner, HitTarget::TerminalPane));
 
     let links = match &app.term {
+        // Booting: the grid is empty because the CLI hasn't painted yet, so
+        // there is nothing to render and nothing to scan for links. A word
+        // in the middle of the pane beats an unexplained void.
+        Some(term) if !term.painted && !term.exited => {
+            let msg = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "starting session…",
+                    Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "booting — the screen appears as soon as it paints",
+                    Style::default().fg(th.dim),
+                )),
+            ])
+            .centered();
+            f.render_widget(msg, inner);
+            (Vec::new(), Vec::new())
+        }
         Some(term) => {
             let screen = term.parser.screen();
             let widget = tui_term::widget::PseudoTerminal::new(screen);

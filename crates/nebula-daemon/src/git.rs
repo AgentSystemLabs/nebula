@@ -77,21 +77,16 @@ pub struct WorktreeEntry {
 /// checkout.
 pub async fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeEntry>> {
     let out = git(repo, &["worktree", "list", "--porcelain"]).await?;
-    let mut entries = Vec::new();
+    // (path, branch, HEAD) as git printed them; the label is decided below.
+    let mut raw: Vec<(PathBuf, Option<String>, Option<String>)> = Vec::new();
     let mut path: Option<PathBuf> = None;
     let mut branch: Option<String> = None;
     let mut head: Option<String> = None;
     for line in out.lines() {
         if let Some(p) = line.strip_prefix("worktree ") {
             if let Some(done_path) = path.take() {
-                entries.push(WorktreeEntry {
-                    path: done_path,
-                    branch: branch
-                        .take()
-                        .unwrap_or_else(|| detached_label(head.as_deref())),
-                });
+                raw.push((done_path, branch.take(), head.take()));
             }
-            head = None;
             path = Some(PathBuf::from(p));
         } else if let Some(sha) = line.strip_prefix("HEAD ") {
             head = Some(sha.to_string());
@@ -100,12 +95,49 @@ pub async fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeEntry>> {
         }
     }
     if let Some(done_path) = path {
-        entries.push(WorktreeEntry {
-            path: done_path,
-            branch: branch.unwrap_or_else(|| detached_label(head.as_deref())),
-        });
+        raw.push((done_path, branch, head));
+    }
+    let mut entries = Vec::with_capacity(raw.len());
+    for (path, branch, head) in raw {
+        let branch = match branch {
+            Some(b) => b,
+            // No branch line: HEAD is detached. Usually that is a rebase
+            // parked on a conflict — HEAD sits on the commits being replayed
+            // for as long as the user takes to resolve it, and the branch
+            // comes back untouched when it finishes. The row is still that
+            // branch's row; renaming it "detached" for the duration makes a
+            // worktree look like it lost its identity, and breaks every
+            // lookup keyed on the branch name meanwhile.
+            None => match rebasing_branch(&path).await {
+                Some(b) => b,
+                None => detached_label(head.as_deref()),
+            },
+        };
+        entries.push(WorktreeEntry { path, branch });
     }
     Ok(entries)
+}
+
+/// The branch a paused rebase in `checkout` is replaying, if there is one —
+/// read from the same state file `git status` uses to say "rebasing branch
+/// X" while `git worktree list` calls the checkout detached. `None` for a
+/// checkout that is not rebasing, is rebasing a detached HEAD, or is gone.
+async fn rebasing_branch(checkout: &Path) -> Option<String> {
+    // Per-worktree git dir: the rebase state lives under
+    // `<repo>/.git/worktrees/<name>/` for a linked checkout, not in the
+    // shared `.git`.
+    let git_dir = git(checkout, &["rev-parse", "--absolute-git-dir"])
+        .await
+        .ok()?;
+    let git_dir = Path::new(git_dir.trim());
+    // `rebase-merge` is the default backend, `rebase-apply` the `--apply` one.
+    ["rebase-merge", "rebase-apply"]
+        .into_iter()
+        .find_map(|state| {
+            let name = std::fs::read_to_string(git_dir.join(state).join("head-name")).ok()?;
+            // Rebasing with HEAD already detached writes "detached HEAD" here.
+            Some(name.trim().strip_prefix("refs/heads/")?.to_string())
+        })
 }
 
 /// Display name for a checkout with no branch (detached HEAD).
@@ -238,6 +270,69 @@ mod tests {
         // A real git that says "not a repository" must keep saying so.
         let err = repo_toplevel(tmp.path()).await.unwrap_err();
         assert!(!is_missing(&err), "{err:#}");
+    }
+
+    /// A rebase parks HEAD on the commits it replays, so for as long as it
+    /// sits on a conflict `git worktree list` calls the checkout detached.
+    /// The row must keep its branch name through that: the branch is coming
+    /// back, and the worktree sync would otherwise rename the row twice per
+    /// rebase and hide it from every lookup keyed on the name meanwhile.
+    #[tokio::test]
+    async fn a_paused_rebase_keeps_the_worktree_on_its_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        std::fs::write(repo.join("f"), "base\n").unwrap();
+        git(&repo, &["add", "f"]).await.unwrap();
+        git(&repo, &["commit", "-m", "base"]).await.unwrap();
+        let wt = add_worktree(&repo, "topic", None).await.unwrap();
+        // Both sides rewrite the same line, so the rebase has to stop.
+        std::fs::write(wt.join("f"), "topic\n").unwrap();
+        git(&wt, &["commit", "-am", "topic"]).await.unwrap();
+        std::fs::write(repo.join("f"), "main\n").unwrap();
+        git(&repo, &["commit", "-am", "main"]).await.unwrap();
+        assert!(git(&wt, &["rebase", "main"]).await.is_err());
+        // Precondition: git itself now reports no current branch there.
+        let current = git(&wt, &["branch", "--show-current"]).await.unwrap();
+        assert!(
+            current.trim().is_empty(),
+            "expected a detached HEAD mid-rebase"
+        );
+
+        // Paths come back canonical from git; the tempdir may be a symlink.
+        let wt_canon = wt.canonicalize().unwrap();
+        let branch_of = |entries: &[WorktreeEntry]| {
+            entries
+                .iter()
+                .find(|e| e.path.canonicalize().ok() == Some(wt_canon.clone()))
+                .map(|e| e.branch.clone())
+                .expect("the worktree is listed")
+        };
+
+        let entries = list_worktrees(&repo).await.unwrap();
+        assert_eq!(
+            branch_of(&entries),
+            "topic",
+            "mid-rebase: still the branch's row"
+        );
+
+        git(&wt, &["rebase", "--abort"]).await.unwrap();
+        let entries = list_worktrees(&repo).await.unwrap();
+        assert_eq!(
+            branch_of(&entries),
+            "topic",
+            "after: the ordinary branch line"
+        );
+
+        // A checkout that genuinely detached still says so.
+        git(&wt, &["checkout", "--detach"]).await.unwrap();
+        let entries = list_worktrees(&repo).await.unwrap();
+        assert!(
+            branch_of(&entries).starts_with("detached @ "),
+            "a real detached HEAD is still labelled as one, got {:?}",
+            branch_of(&entries)
+        );
     }
 
     #[tokio::test]
