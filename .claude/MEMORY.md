@@ -14,6 +14,125 @@ about what is worth recording.
 
 ## Entries
 
+### The Root Worktree Row's Lower Half Wasn't Clickable — 2026-08-27
+
+**Asked:** "I can't seem to click on certain places of the root worktree row in some areas, other rows are
+fully clickable zones, fix it"
+
+**Did:** Every sidebar pill is a 3-row cell (pad, text, pad) stacked on a 2-row `PILL_H` stride, but its
+hit rect was `rows_rect_at(inner, y, PILL_H)` — top pad + text only. Stacked rows hide that because the
+next pill's top pad covers the gap; the root row sits over a quiet spacer row, so its bottom pad (the
+lower half of the pill as drawn) fell through to `PanelBg`. Same dangling pad on the last pill of any
+group and the last of the list, in both panels. New `pill_hit_height(top, next_top)` in
+`crates/nebula-tui/src/ui.rs` (next to `rows_rect_at`) sizes the target as `min(3, next_top - top)`:
+a shared pad row still goes to the lower pill (unchanged), an unshared one stays with its pill.
+`draw_worktrees` and `draw_sessions` iterate the layout with `enumerate()` to peek the next top;
+`draw_session_row` grew a `hit_h` arg. Tests: `ui.rs::worktree_pills_are_clickable_over_their_whole_height`
+and `session_pills_are_clickable_over_their_whole_height` (both fail on the old `PILL_H` rect).
+
+**Gotchas:**
+- **The "blank row" between the root row / a group's last pill and what follows is not an empty row —
+  it is that pill's un-overlapped bottom pad.** The layout only bumps `vrow` by 1 after such a pill, and
+  `WorktreeEntry::height()` is already `PILL_H + 1`, so `next_top - top` is 3 there, 2 when stacked.
+  My first sessions-panel test expected a real gap row before the UNPINNED header and was off by one.
+- `draw_column` returns rows starting at `area.y + 3` (spacer, title, spacer), so in a
+  `TestBackend` drawn from `Rect::new(0,0,..)` the first pill's rows are y=3..=5.
+
+### The Memory Modal's Unknown Agents Are The Prewarm Pool — 2026-08-27
+
+**Asked:** "I notice I have a BUNCH of unknown agents.. are these sub agents claude is spawning? is so
+display grouped in tree format.. also try to figure out a better label for them. find root cause what
+these are from"
+
+**Did:** They are not subagents (the Agent tool runs in-process inside `claude`). Every `(unknown agent)`
+row was a **prewarm-pool spare**: `Daemon::prewarm_agent` in `crates/nebula-daemon/src/registry.rs` boots
+a real `claude` CLI per (worktree, kind) with a fresh `NEBULA_AGENT_ID` and *no store row*, so the TUI's
+`app.tree.agents` lookup in the metrics modal missed. `SessionMetrics` (`nebula-core/src/protocol.rs`)
+gained `prewarm: Option<PrewarmInfo { worktree, kind, model }>` (`#[serde(default)]`, no protocol bump);
+`Daemon::session_pids` fills it from the `prewarmed` map; the modal in `nebula-tui/src/ui.rs`
+(`Overlay::Metrics`) now lists spares under a `warm spares (N)` header as a `├`/`└` tree, named
+`claude · opus`, placed in their worktree, inert on Enter, with their own `warm … pre-booted for new
+agents` rollup line; `footer_usage` counts them as `N warm` instead of agents. Test:
+`metrics_groups_prewarm_spares_under_their_own_header` in `event_loop.rs`.
+
+**Gotchas:**
+- **Root cause of the count, not just the label:** resting the sidebar cursor on a worktree for 250ms
+  (`PREWARM_DEBOUNCE`, `schedule_prewarm` → `fire_pending_prewarm` in `event_loop.rs`) prewarms it, and each
+  spare lives up to 15 min (`PREWARM_MAX_AGE`). Scrolling across 7 projects = 7 idle `claude`s at
+  150–300 MB each (the CLI plus its MCP children — python + MissionControl's `recall-mcp.mjs`) ≈ 1.7 GB.
+  Opt-out is the hand-added `"prewarm_agents": false` key in the data dir's `config.json`; the settings
+  modal does not expose it. Not changed — the user has not asked for the policy to move.
+- To identify a mystery daemon child, `ps -Eo command -p <pid>` shows its `NEBULA_AGENT_ID` /
+  `NEBULA_DATA_DIR` env, and `grep prewarm <data_dir>/state/daemon.log` maps the id to its spawn
+  (`prewarmed agent session agent=… worktree=<branch>` — the branch only, not the project, so `main`
+  repeats across projects).
+- `ps -axo … -p <pids>` on macOS ignores `-p` and dumps every process; drop `-a`.
+
+### The Panel Walk Stops At The Pane Going Forward And Locks It — 2026-08-27
+
+**Asked:** "when using control shift h or l it should auto focus on claude code session when focused.
+also we shouldn't loop the nav, if the hit terminal panel then control shift l stops" — then, after the
+first cut: "I think you misunderstood me, I liked the control shift h and control shift l, but now it
+doesn't work, I just wanted so if a user presses control shift l and gets to the terminal it should auto
+focus it and stop allowing the user to cycle next to the workspaces top nav"
+
+**Did:** `Action::FocusNext` / `Action::FocusPrev` in `crates/nebula-tui/src/event_loop.rs:1275`.
+Forward (Tab / `^⇧L`) from `Focus::Terminal` now stays put instead of wrapping to `first_focus()`, and
+landing on the pane goes through new `enter_terminal_pane(app)` (`event_loop.rs:4695`): `focus =
+Terminal` plus `term_locked = true` when `app.term` is live (an empty/exited pane is focused, never
+locked). `Action::Activate`'s `Focus::Terminal` arm reuses it. Back (⇧Tab / `^⇧H`) **still wraps** from
+the first panel — the bar when shown, Projects when hidden — into the pane, and that arrival locks too;
+`^⇧H` is also the hatch back out, so `^⇧H` alone cycles Projects → pane → Sessions → … Docs: keymap
+hints, help-overlay row, the locked-input comment, two README spots. Tests
+`ctrl_shift_hl_walk_forward_stops_at_the_pane_and_back_wraps_into_it`,
+`focus_walk_includes_the_workspaces_bar_only_when_shown`, and the e2e_tui walk section. 686 green.
+
+**Gotchas:**
+- **The first cut also removed the backward wrap, and the user read that as "^⇧H doesn't work".** The
+  ask named one direction only. `^⇧H` from the top panel is the one-key jump into the agent, and
+  taking it away broke a habit. Scope the no-wrap to the direction that was asked for.
+- **`Ctrl+→` is now the only unlocked way into the pane.** `FocusTerminal`'s documented purpose is
+  "cross without locking", so it was left alone — but the old comment claiming "Tab / Ctrl+arrows do not
+  lock, Enter does" was load-bearing prose in the escape-hatch block and had to be corrected.
+- **`^⇧L` pressed again on a locked pane is forwarded to the agent, not swallowed** — the locked path
+  only intercepts `UnlockTerminal` chords and the hardwired `^q`. Kitty terminals send a harmless
+  `CSI 108;6u`; legacy degrades it to `Ctrl+L` (0x0C), pre-existing and unavoidable.
+- **Proving a key does what the user sees, not what the unit test sees:** a throwaway e2e_tui test that
+  sent the raw kitty bytes (`\x1b[108;6u` / `\x1b[104;6u`) to the real binary settled "is it the code
+  or the build?" in one run. `strings target/debug/nebula | grep <new hint text>` settles which build
+  is running. Both were fine — the disagreement was about the spec.
+- The user is on **Ghostty** now (`TERM_PROGRAM=ghostty`), which is why `^⇧H`/`^⇧L` reach nebula at
+  all; the older note that they're on Terminal.app is stale.
+- In `crates/nebula/tests/e2e_tui.rs`, "the walk stops here" is untestable with `wait_for_text` alone —
+  it passes trivially if the footer is already up — so the stop is proved by pressing the extra key and
+  then walking one step the other way. ⇧Tab is `\x1b[Z`, Ctrl+→ is `\x1b[1;5C`.
+- `e2e_pty::external_worktrees_are_adopted_and_dropped` failed once mid-run and passed alone on rerun —
+  the usual e2e flake, unrelated to a TUI keymap change.
+
+### A Hidden Workspaces Bar Moves Its Name Onto The Projects Header — 2026-08-27
+
+**Asked:** "when a user has the workspaces top bar hidden, display the selected workspace name in place
+of where it says Projects inside the projects list"
+
+**Did:** `draw_projects` (`crates/nebula-tui/src/ui.rs:2475`) now computes its title instead of passing
+the literal: `"PROJECTS"` while `app.show_workspaces`, otherwise
+`app.tree.active_workspace_name().to_uppercase()`, truncated to `area.width - (ROW_GUTTER + 1 + " · n")`
+so a long workspace name can't run into the column rule. The ` · n` project count stays either way, and
+`draw_column` is untouched — WORKTREES/SESSIONS still pass literals. New test
+`a_hidden_bar_moves_the_workspace_name_onto_the_projects_header` (event_loop.rs) renders hidden, switches
+to `ws2`, and shows the bar again. 685 workspace tests green, no new clippy warnings.
+
+**Gotchas:**
+- Upper-cased on purpose — every other column header is all-caps, and a natural-case name in that slot
+  breaks the row. Verified by eye against a rendered `TestBackend` buffer, not just an assertion.
+- `Tree::active_workspace_name` falls back to `"default"` when no `Workspace` entity has arrived, so a
+  bar-hidden render reads `DEFAULT · 1` even with `tree.workspaces` empty. Several existing tests set
+  `app.show_workspaces = false` purely to size the panels (`embedded_terminal_renders_pty_output`,
+  `link_rows_render_under_a_links_header`, `archived_list_scrolls_by_wheel_and_follows_the_cursor`) and
+  now draw that header — harmless, but a future `text.contains("PROJECTS")` in one of them would fail.
+- One existing assertion had to move: `shift_w_toggles_the_workspaces_bar_and_parks_focus` checked
+  `lines[1].starts_with("   PROJECTS")` on the hidden path; it's `"   DEFAULT"` now.
+
 ### Released v0.13.0 Off A Checkout Three Releases Stale — 2026-08-27
 
 **Asked:** "commit push and make a release for me" (after the `nebula ssh` clipboard fix in the entry
