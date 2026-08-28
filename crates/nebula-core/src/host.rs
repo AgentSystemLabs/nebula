@@ -4,11 +4,13 @@
 /// Short machine hostname: gethostname(2), then the `HOSTNAME` env var, then
 /// "unknown". Domain suffix is stripped ("mbp.local" -> "mbp").
 pub fn hostname() -> String {
-    let raw = gethostname_syscall()
-        .or_else(|| std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()))
-        .unwrap_or_else(|| "unknown".to_string());
-    short_name(&raw).to_string()
+    gethostname_syscall()
+        .or_else(|| crate::env::non_empty("HOSTNAME"))
+        .map(|raw| short_name(&raw).to_string())
+        .unwrap_or_else(|| UNKNOWN_HOST.to_string())
 }
+
+const UNKNOWN_HOST: &str = "unknown";
 
 /// True when running inside an ssh session — sshd sets these for both
 /// `nebula ssh` launches and a manual `ssh host` followed by `nebula`.
