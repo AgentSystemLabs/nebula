@@ -2,7 +2,10 @@
 //! right, with an always-live fuzzy filter that narrows the tree to the
 //! matching files and the hierarchies containing them.
 
-use crate::app::{DEFAULT_DIFF_FILES_W, MIN_DIFF_FILES_W, MIN_DIFF_PANE_W};
+use crate::app::{
+    clamp_files_width, clamp_selection, max_scroll, scrolled_by, window_start, DEFAULT_DIFF_FILES_W,
+};
+use crate::git_diff::cap_lines;
 use crate::syntax::{Highlighter, TokenKind};
 use crate::text_input::TextInput;
 use ratatui::layout::Rect;
@@ -133,12 +136,12 @@ impl TreeBrowser {
     }
 
     pub fn max_scroll(&self) -> u16 {
-        (self.preview_line_count as u16).saturating_sub(self.view_height.max(1))
+        max_scroll(self.preview_line_count, self.view_height)
     }
 
     /// Clamped relative preview scroll.
     pub fn scroll_by(&mut self, delta: i32) {
-        self.scroll = (self.scroll as i32 + delta).clamp(0, self.max_scroll() as i32) as u16;
+        self.scroll = scrolled_by(self.scroll, delta, self.max_scroll());
     }
 
     /// Screen x of the tree/preview boundary — the column where the preview
@@ -150,24 +153,20 @@ impl TreeBrowser {
     /// Move the tree/preview boundary to `boundary_x`, clamped so the tree
     /// keeps `MIN_DIFF_FILES_W` and the preview keeps `MIN_DIFF_PANE_W`.
     pub fn set_files_width(&mut self, boundary_x: i32) {
-        let max = self.area.width.saturating_sub(MIN_DIFF_PANE_W);
-        if max < MIN_DIFF_FILES_W {
-            return; // modal too small to honor the minimums
+        if let Some(width) = clamp_files_width(self.area, boundary_x) {
+            self.files_width = width;
         }
-        let want = (boundary_x - self.area.x as i32).max(0) as u16;
-        self.files_width = want.clamp(MIN_DIFF_FILES_W, max);
     }
 
     /// First visible row of the tree's stateless follow-window for a list of
     /// `height` rows.
     pub fn window_start(&self, height: usize) -> usize {
-        (self.selected + 1).saturating_sub(height)
+        window_start(self.selected, height)
     }
 
     /// Clamped absolute selection; reloads the preview when it moved.
     pub fn select(&mut self, index: i64) {
-        let max = self.rows.len().saturating_sub(1) as i64;
-        let clamped = index.clamp(0, max) as usize;
+        let clamped = clamp_selection(index, self.rows.len());
         if clamped != self.selected {
             self.selected = clamped;
             self.load_preview();
@@ -410,15 +409,7 @@ fn read_preview(path: &std::path::Path) -> Result<String, String> {
     if text.trim().is_empty() {
         return Err("(empty file)".to_string());
     }
-    let mut lines = text.lines();
-    let mut out: String = lines
-        .by_ref()
-        .take(MAX_PREVIEW_LINES)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if lines.next().is_some() || byte_capped {
-        out.push_str("\n… (truncated)");
-    }
+    let out = cap_lines(&text, MAX_PREVIEW_LINES, byte_capped);
     // ratatui doesn't expand tabs; keep columns readable.
     Ok(out.replace('\t', "    "))
 }

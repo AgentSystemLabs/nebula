@@ -16,6 +16,34 @@ use ratatui::Frame;
 /// Outer size of the editor modal, as (width, height) percent of the frame.
 /// Shared with the event loop's pre-draw PTY size guess.
 pub const VIM_MODAL_PCT: (u16, u16) = (94, 92);
+/// Outer size of the two split modals (diff, tree), percent of the frame.
+const SPLIT_MODAL_PCT: (u16, u16) = (92, 90);
+/// Outer size of the find-in-files modal, percent of the frame.
+const GREP_MODAL_PCT: (u16, u16) = (88, 76);
+/// Fixed (width, height) of the jump palette.
+const PALETTE_SIZE: (u16, u16) = (64, 18);
+/// Fixed (width, height) of the find-file modal.
+const FILES_SIZE: (u16, u16) = (72, 20);
+/// Fixed (width, height) of the multi-line task prompt.
+const TASK_PROMPT_SIZE: (u16, u16) = (76, 14);
+/// Width of a one-line prompt, and of the wider one carrying a directory
+/// listing under its input.
+const PROMPT_W: u16 = 56;
+const PATH_PROMPT_W: u16 = 72;
+/// Narrowest a confirm dialog gets, so a short question still reads as one.
+const CONFIRM_MIN_W: u16 = 52;
+/// Widths of the modals whose height follows their content.
+const HELP_W: u16 = 92;
+const SETTINGS_W: u16 = 84;
+const MEMORY_W: u16 = 74;
+const HOSTS_W: u16 = 64;
+/// Layout floor for a split modal's right pane. Deliberately below
+/// `MIN_DIFF_PANE_W`: the file list is clamped to keep that minimum first,
+/// so on a tiny screen this lets the layout squeeze the diff/preview pane
+/// rather than the list.
+const SPLIT_PANE_LAYOUT_MIN: u16 = 20;
+/// What every filtered list says when nothing survives the filter.
+const NO_MATCHES: &str = "no matches";
 
 /// Columns the tree-browser preview must keep for the file text itself
 /// before a line-number gutter is worth drawing.
@@ -274,7 +302,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // lines — size the dialog to fit them.
             let msg_lines: Vec<&str> = confirm.message.lines().collect();
             let longest = msg_lines.iter().map(|l| l.chars().count()).max();
-            let width = (longest.unwrap_or(0) as u16 + 4).max(52);
+            let width = (longest.unwrap_or(0) as u16 + 4).max(CONFIRM_MIN_W);
             let height = msg_lines.len() as u16 + 4;
             let area = centered_rect(f.area(), width, height);
             f.render_widget(Clear, area);
@@ -301,7 +329,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             f.render_widget(Paragraph::new(lines), inner);
         }
         Overlay::Prompt(prompt) if prompt.is_multiline() => {
-            let area = centered_rect(f.area(), 76, 14);
+            let area = centered_rect(f.area(), TASK_PROMPT_SIZE.0, TASK_PROMPT_SIZE.1);
             f.render_widget(Clear, area);
             let hint = if area.width >= 64 {
                 " Enter: launch · Shift+Enter/^J: newline · Esc: cancel "
@@ -364,7 +392,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // listing between the input and the hint; the dialog grows to
             // fit the listing (at least one row, for the empty message).
             let is_path = prompt.completes_paths();
-            let width = if is_path { 72 } else { 56 };
+            let width = if is_path { PATH_PROMPT_W } else { PROMPT_W };
             let list_h = if is_path {
                 prompt.dirs.len().clamp(1, 8) as u16
             } else {
@@ -603,7 +631,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     + sections.len().saturating_sub(1) as u16
             };
             let height = rows(LEFT).max(rows(RIGHT)) + 2;
-            let area = centered_rect(f.area(), 92, height);
+            let area = centered_rect(f.area(), HELP_W, height);
             f.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -658,18 +686,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             const CHROME: u16 = 2 + 4;
             let want = rows.len() as u16 + CHROME + 2;
             let height = want.min(f.area().height.saturating_sub(2)).max(CHROME + 3);
-            let area = centered_rect(f.area(), 84, height);
-            f.render_widget(Clear, area);
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.accent))
-                .title(Span::styled(
-                    " Settings ",
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
+            let area = centered_rect(f.area(), SETTINGS_W, height);
+            let inner = render_modal_frame(f, area, " Settings ", th);
 
             let dim = Style::default().fg(th.dim);
             let capturing = view.capturing();
@@ -1114,18 +1132,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
 
             let height = (lines.len() as u16 + 2).min(f.area().height.saturating_sub(2));
-            let area = centered_rect(f.area(), 74, height);
-            f.render_widget(Clear, area);
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.accent))
-                .title(Span::styled(
-                    " Memory ",
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
+            let area = centered_rect(f.area(), MEMORY_W, height);
+            let inner = render_modal_frame(f, area, " Memory ", th);
             f.render_widget(Paragraph::new(lines), inner);
             if let Some(Overlay::Metrics(v)) = &mut app.overlay {
                 v.area = area;
@@ -1141,16 +1149,20 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
         }
         Overlay::Diff(view) => {
-            let area = centered_rect_pct(f.area(), 92, 90);
+            let area = centered_rect_pct(f.area(), SPLIT_MODAL_PCT.0, SPLIT_MODAL_PCT.1);
             f.render_widget(Clear, area);
             // Cap first, floor second: on a tiny screen the file list keeps
-            // its minimum and Min(20) squeezes the diff pane instead.
+            // its minimum and SPLIT_PANE_LAYOUT_MIN squeezes the diff pane
+            // instead.
             let files_w = view
                 .files_width
                 .min(area.width.saturating_sub(crate::app::MIN_DIFF_PANE_W))
                 .max(crate::app::MIN_DIFF_FILES_W);
-            let [files_a, diff_a] =
-                Layout::horizontal([Constraint::Length(files_w), Constraint::Min(20)]).areas(area);
+            let [files_a, diff_a] = Layout::horizontal([
+                Constraint::Length(files_w),
+                Constraint::Min(SPLIT_PANE_LAYOUT_MIN),
+            ])
+            .areas(area);
 
             // Left: changed-file list; a stateless follow-window keeps the
             // selected row visible.
@@ -1171,19 +1183,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 let line = search_line(&view.filter, "type to filter…", filter_area, th);
                 f.render_widget(Paragraph::new(line), filter_area);
             }
-            let list_inner = Rect {
-                y: files_inner.y + 1,
-                height: files_inner.height.saturating_sub(1),
-                ..files_inner
-            };
+            let list_inner = below_first_row(files_inner);
 
             if view.matches.is_empty() {
-                if let Some(row_area) = row_rect(list_inner, 0) {
-                    f.render_widget(
-                        Paragraph::new(Span::styled("no matches", Style::default().fg(th.dim))),
-                        row_area,
-                    );
-                }
+                empty_list_row(f, list_inner, NO_MATCHES, th);
             }
             let start = view.window_start(list_inner.height as usize);
             for (row, (i, m)) in view.matches.iter().enumerate().skip(start).enumerate() {
@@ -1280,8 +1283,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
         }
         Overlay::Palette(palette) => {
-            let area = centered_rect(f.area(), 64, 18);
-            f.render_widget(Clear, area);
+            let area = centered_rect(f.area(), PALETTE_SIZE.0, PALETTE_SIZE.1);
             let title = if palette.query.is_empty() {
                 " Jump to ".to_string()
             } else {
@@ -1291,35 +1293,17 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     palette.items.len()
                 )
             };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.accent))
-                .title(Span::styled(
-                    title,
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
+            let inner = render_modal_frame(f, area, title, th);
 
             // First row: the always-on fuzzy query input.
             if let Some(query_area) = row_rect(inner, 0) {
                 let line = search_line(&palette.query, "type to search…", query_area, th);
                 f.render_widget(Paragraph::new(line), query_area);
             }
-            let list_inner = Rect {
-                y: inner.y + 1,
-                height: inner.height.saturating_sub(1),
-                ..inner
-            };
+            let list_inner = below_first_row(inner);
 
             if palette.matches.is_empty() {
-                if let Some(row_area) = row_rect(list_inner, 0) {
-                    f.render_widget(
-                        Paragraph::new(Span::styled("no matches", Style::default().fg(th.dim))),
-                        row_area,
-                    );
-                }
+                empty_list_row(f, list_inner, NO_MATCHES, th);
             }
             let start = palette.window_start(list_inner.height as usize);
             for (row, (i, m)) in palette.matches.iter().enumerate().skip(start).enumerate() {
@@ -1367,19 +1351,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 };
                 let budget = (list_inner.width as usize).saturating_sub(4);
                 let shown = truncate(&item.text, budget);
-                // Truncation puts `…` at the last char of `shown`; a match
-                // landing on that index must not light the ellipsis.
-                let shown_len = shown.chars().count();
-                let positions = if shown_len < item.text.chars().count() {
-                    let keep = m
-                        .positions
-                        .iter()
-                        .take_while(|&&p| p + 1 < shown_len)
-                        .count();
-                    &m.positions[..keep]
-                } else {
-                    &m.positions[..]
-                };
+                let positions = visible_positions(&m.positions, &shown, &item.text);
                 let mut spans = vec![Span::styled(glyph, Style::default().fg(glyph_color))];
                 spans.extend(path_highlight_spans(
                     &shown,
@@ -1400,8 +1372,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
         }
         Overlay::Files(finder) => {
-            let area = centered_rect(f.area(), 72, 20);
-            f.render_widget(Clear, area);
+            let area = centered_rect(f.area(), FILES_SIZE.0, FILES_SIZE.1);
             let title = if finder.query.is_empty() {
                 format!(" Find file — {} ({}) ", finder.branch, finder.files.len())
             } else {
@@ -1412,35 +1383,17 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     finder.files.len()
                 )
             };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.accent))
-                .title(Span::styled(
-                    title,
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
+            let inner = render_modal_frame(f, area, title, th);
 
             // First row: the always-on fuzzy query input.
             if let Some(query_area) = row_rect(inner, 0) {
                 let line = search_line(&finder.query, "type to filter…", query_area, th);
                 f.render_widget(Paragraph::new(line), query_area);
             }
-            let list_inner = Rect {
-                y: inner.y + 1,
-                height: inner.height.saturating_sub(1),
-                ..inner
-            };
+            let list_inner = below_first_row(inner);
 
             if finder.matches.is_empty() {
-                if let Some(row_area) = row_rect(list_inner, 0) {
-                    f.render_widget(
-                        Paragraph::new(Span::styled("no matches", Style::default().fg(th.dim))),
-                        row_area,
-                    );
-                }
+                empty_list_row(f, list_inner, NO_MATCHES, th);
             }
             let start = finder.window_start(list_inner.height as usize);
             for (row, (i, m)) in finder.matches.iter().enumerate().skip(start).enumerate() {
@@ -1450,19 +1403,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 let path = &finder.files[m.file];
                 let budget = (list_inner.width as usize).saturating_sub(2);
                 let shown = truncate(path, budget);
-                // Truncation puts `…` at the last char of `shown`; a match
-                // landing on that index must not light the ellipsis.
-                let shown_len = shown.chars().count();
-                let positions = if shown_len < path.chars().count() {
-                    let keep = m
-                        .positions
-                        .iter()
-                        .take_while(|&&p| p + 1 < shown_len)
-                        .count();
-                    &m.positions[..keep]
-                } else {
-                    &m.positions[..]
-                };
+                let positions = visible_positions(&m.positions, &shown, path);
                 let mut spans = vec![Span::raw(" ")];
                 spans.extend(fuzzy_highlight_spans(&shown, positions, th));
                 render_row(f, row_area, spans, i == finder.selected, true, th);
@@ -1476,8 +1417,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
         }
         Overlay::Grep(view) => {
-            let area = centered_rect_pct(f.area(), 88, 76);
-            f.render_widget(Clear, area);
+            let area = centered_rect_pct(f.area(), GREP_MODAL_PCT.0, GREP_MODAL_PCT.1);
             let title = if view.query.chars().count() < crate::grep_search::MIN_QUERY_LEN {
                 format!(" Find in files — {} ", view.branch)
             } else if view.truncated {
@@ -1493,27 +1433,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     view.hits.len()
                 )
             };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.accent))
-                .title(Span::styled(
-                    title,
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
+            let inner = render_modal_frame(f, area, title, th);
 
             // First row: the always-live grep query.
             if let Some(query_area) = row_rect(inner, 0) {
                 let line = search_line(&view.query, "type to search…", query_area, th);
                 f.render_widget(Paragraph::new(line), query_area);
             }
-            let list_inner = Rect {
-                y: inner.y + 1,
-                height: inner.height.saturating_sub(1),
-                ..inner
-            };
+            let list_inner = below_first_row(inner);
 
             // Placeholder row: error, too-short query, or an empty result.
             let placeholder = if let Some(err) = &view.error {
@@ -1527,7 +1454,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     Style::default().fg(th.dim),
                 ))
             } else if view.hits.is_empty() {
-                Some(Span::styled("no matches", Style::default().fg(th.dim)))
+                Some(Span::styled(NO_MATCHES, Style::default().fg(th.dim)))
             } else {
                 None
             };
@@ -1572,35 +1499,20 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             let height = (list_rows as u16)
                 .saturating_add(2)
                 .clamp(5, f.area().height.max(5));
-            let area = centered_rect(f.area(), 64, height);
+            let area = centered_rect(f.area(), HOSTS_W, height);
             f.render_widget(Clear, area);
             let hint = if adding {
                 " type user@host [dir]  Enter: connect  Esc: cancel "
             } else {
                 " Enter: connect  a: new host  d: remove  Esc: close "
             };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.accent))
-                .title(Span::styled(
-                    " SSH Hosts ",
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ))
+            let block = modal_block(" SSH Hosts ", th)
                 .title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
             let inner = block.inner(area);
             f.render_widget(block, area);
 
             if total == 0 && !adding {
-                if let Some(row_area) = row_rect(inner, 0) {
-                    f.render_widget(
-                        Paragraph::new(Span::styled(
-                            "no hosts yet — a connects to a new one",
-                            Style::default().fg(th.dim),
-                        )),
-                        row_area,
-                    );
-                }
+                empty_list_row(f, inner, "no hosts yet — a connects to a new one", th);
             }
             // Follow-window keeps the cursor visible; while adding, pin the
             // window to the tail so the input row is always on screen.
@@ -1657,16 +1569,20 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
         }
         Overlay::Tree(view) => {
-            let area = centered_rect_pct(f.area(), 92, 90);
+            let area = centered_rect_pct(f.area(), SPLIT_MODAL_PCT.0, SPLIT_MODAL_PCT.1);
             f.render_widget(Clear, area);
             // Cap first, floor second: on a tiny screen the tree keeps its
-            // minimum and Min(20) squeezes the preview pane instead.
+            // minimum and SPLIT_PANE_LAYOUT_MIN squeezes the preview pane
+            // instead.
             let files_w = view
                 .files_width
                 .min(area.width.saturating_sub(crate::app::MIN_DIFF_PANE_W))
                 .max(crate::app::MIN_DIFF_FILES_W);
-            let [tree_a, preview_a] =
-                Layout::horizontal([Constraint::Length(files_w), Constraint::Min(20)]).areas(area);
+            let [tree_a, preview_a] = Layout::horizontal([
+                Constraint::Length(files_w),
+                Constraint::Min(SPLIT_PANE_LAYOUT_MIN),
+            ])
+            .areas(area);
 
             // Left: the file tree; a stateless follow-window keeps the
             // selected row visible.
@@ -1687,19 +1603,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 let line = search_line(&view.filter, "type to filter…", filter_area, th);
                 f.render_widget(Paragraph::new(line), filter_area);
             }
-            let list_inner = Rect {
-                y: tree_inner.y + 1,
-                height: tree_inner.height.saturating_sub(1),
-                ..tree_inner
-            };
+            let list_inner = below_first_row(tree_inner);
 
             if view.rows.is_empty() {
-                if let Some(row_area) = row_rect(list_inner, 0) {
-                    f.render_widget(
-                        Paragraph::new(Span::styled("no matches", Style::default().fg(th.dim))),
-                        row_area,
-                    );
-                }
+                empty_list_row(f, list_inner, NO_MATCHES, th);
             }
             let start = view.window_start(list_inner.height as usize);
             for (row, (i, r)) in view.rows.iter().enumerate().skip(start).enumerate() {
@@ -1718,19 +1625,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 };
                 let budget = (list_inner.width as usize).saturating_sub(indent.chars().count() + 3);
                 let shown = truncate(&node.name, budget);
-                // Truncation puts `…` at the last char of `shown`; a match
-                // landing on that index must not light the ellipsis.
-                let shown_len = shown.chars().count();
-                let positions = if shown_len < node.name.chars().count() {
-                    let keep = r
-                        .positions
-                        .iter()
-                        .take_while(|&&p| p + 1 < shown_len)
-                        .count();
-                    &r.positions[..keep]
-                } else {
-                    &r.positions[..]
-                };
+                let positions = visible_positions(&r.positions, &shown, &node.name);
                 let mut spans = vec![
                     Span::raw(format!(" {indent}")),
                     Span::styled(marker, Style::default().fg(th.accent)),
@@ -1862,6 +1757,30 @@ fn centered_rect_pct(frame: Rect, pct_w: u16, pct_h: u16) -> Rect {
     centered_rect(frame, frame.width * pct_w / 100, frame.height * pct_h / 100)
 }
 
+/// A modal's inner rect minus its first row — the list under an always-on
+/// filter input, which every fuzzy overlay lays out the same way.
+fn below_first_row(inner: Rect) -> Rect {
+    Rect {
+        y: inner.y + 1,
+        height: inner.height.saturating_sub(1),
+        ..inner
+    }
+}
+
+/// The match positions that still point at real characters once `full`
+/// was truncated to `shown`: truncation puts `…` at the last char of
+/// `shown`, and a match landing on that index must not light the ellipsis.
+/// Untruncated text keeps every position.
+fn visible_positions<'a>(positions: &'a [usize], shown: &str, full: &str) -> &'a [usize] {
+    let shown_len = shown.chars().count();
+    if shown_len < full.chars().count() {
+        let keep = positions.iter().take_while(|&&p| p + 1 < shown_len).count();
+        &positions[..keep]
+    } else {
+        positions
+    }
+}
+
 /// A sidebar column's rect minus its right rule column.
 fn shrink_r(area: Rect) -> Rect {
     Rect {
@@ -1918,6 +1837,61 @@ fn draw_focus_tint(buf: &mut ratatui::buffer::Buffer, area: Rect, th: Theme) {
             }
         }
     }
+}
+
+/// The frame every accent modal shares — rounded accent border, bold accent
+/// title — so the overlays can't drift apart one border style at a time.
+fn modal_block<'a>(title: impl Into<std::borrow::Cow<'a, str>>, th: Theme) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.accent))
+        .title(Span::styled(
+            title,
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ))
+}
+
+/// Clear `area` and draw a [`modal_block`] over it, returning the inner
+/// rect the modal's content goes in.
+fn render_modal_frame<'a>(
+    f: &mut Frame,
+    area: Rect,
+    title: impl Into<std::borrow::Cow<'a, str>>,
+    th: Theme,
+) -> Rect {
+    f.render_widget(Clear, area);
+    let block = modal_block(title, th);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    inner
+}
+
+/// A dim one-line placeholder on the first row of an otherwise empty list,
+/// when the list has a first row at all.
+fn empty_list_row(f: &mut Frame, list_inner: Rect, text: &str, th: Theme) {
+    if let Some(row_area) = row_rect(list_inner, 0) {
+        f.render_widget(
+            Paragraph::new(Span::styled(text, Style::default().fg(th.dim))),
+            row_area,
+        );
+    }
+}
+
+/// An empty panel's one-line nudge: accent keys and dim prose alternating,
+/// the first key sitting in the row gutter so it lines up with row text.
+fn hint_line(pairs: &[(&str, &str)], th: Theme) -> Line<'static> {
+    let mut spans = Vec::with_capacity(pairs.len() * 2);
+    for (i, (key, prose)) in pairs.iter().enumerate() {
+        let key = if i == 0 {
+            format!("{ROW_GUTTER}{key}")
+        } else {
+            key.to_string()
+        };
+        spans.push(Span::styled(key, Style::default().fg(th.accent)));
+        spans.push(Span::styled(prose.to_string(), Style::default().fg(th.dim)));
+    }
+    Line::from(spans)
 }
 
 /// Bordered panel frame: rounded corners everywhere for a softer, modern
@@ -2558,10 +2532,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                     format!("{ROW_GUTTER}no projects yet"),
                     Style::default().fg(th.dim),
                 )),
-                Line::from(vec![
-                    Span::styled(format!("{ROW_GUTTER}n"), Style::default().fg(th.accent)),
-                    Span::styled(" adds one", Style::default().fg(th.dim)),
-                ]),
+                hint_line(&[("n", " adds one")], th),
             ]),
             inner,
         );
@@ -2661,10 +2632,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     if worktrees.is_empty() && prs.is_empty() {
         if app.tree.has_visible_projects() {
             f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(format!("{ROW_GUTTER}n"), Style::default().fg(th.accent)),
-                    Span::styled(" starts a worktree", Style::default().fg(th.dim)),
-                ])),
+                Paragraph::new(hint_line(&[("n", " starts a worktree")], th)),
                 inner,
             );
         }
@@ -2885,12 +2853,7 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = app.visible_session_rows();
     if rows.is_empty() && app.selected_worktree().is_some() {
         f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(format!("{ROW_GUTTER}n"), Style::default().fg(th.accent)),
-                Span::styled(" agent · ", Style::default().fg(th.dim)),
-                Span::styled("t", Style::default().fg(th.accent)),
-                Span::styled(" terminal", Style::default().fg(th.dim)),
-            ])),
+            Paragraph::new(hint_line(&[("n", " agent · "), ("t", " terminal")], th)),
             inner,
         );
     }
@@ -4207,7 +4170,11 @@ fn fmt_mem(bytes: u64) -> String {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
+/// Clip `s` to `max` chars, spending the last one on `…` when it had to
+/// cut. Counts chars, not columns — wide glyphs are the caller's problem.
+/// The one clipper for every row, title and grep hit, so they all cut the
+/// same way.
+pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
@@ -4221,6 +4188,36 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn truncate_clips_to_max_chars_with_an_ellipsis() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("exact", 5), "exact");
+        assert_eq!(truncate("toolong", 5), "tool…");
+        assert_eq!(truncate("toolong", 5).chars().count(), 5);
+        assert_eq!(
+            truncate("héllo wörld", 6),
+            "héllo…",
+            "counts chars, not bytes"
+        );
+        // Degenerate budgets: nothing fits but the ellipsis itself.
+        assert_eq!(truncate("ab", 1), "…");
+        assert_eq!(truncate("ab", 0), "…");
+        assert_eq!(truncate("", 0), "");
+    }
+
+    #[test]
+    fn visible_positions_drops_matches_on_the_ellipsis() {
+        let full = "abcdefgh";
+        let positions = [0, 3, 4, 7];
+        // Truncated to 5 chars: "abcd…" — index 4 is the ellipsis, so only
+        // positions before it survive; 7 is off the end entirely.
+        assert_eq!(visible_positions(&positions, "abcd…", full), &[0, 3]);
+        // Untruncated keeps everything, even a match on the last char.
+        assert_eq!(visible_positions(&positions, full, full), &positions);
+        let none: [usize; 0] = [];
+        assert_eq!(visible_positions(&none, "abcd…", full), &none);
+    }
 
     const RAMP: [Color; 3] = [Color::Yellow, Color::Indexed(220), Color::Indexed(230)];
 

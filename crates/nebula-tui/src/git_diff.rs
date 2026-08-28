@@ -207,14 +207,21 @@ pub fn diff_for(root: &Path, file: &DiffFile, head_ok: bool) -> String {
     if text.trim().is_empty() {
         return "(no textual changes)".to_string();
     }
+    cap_lines(&text, MAX_DIFF_LINES, false)
+}
+
+/// What a capped text ends with, so the pane says why it stops short.
+pub const TRUNCATED_MARK: &str = "\n… (truncated)";
+
+/// The first `max` lines of `text`, joined, ending in [`TRUNCATED_MARK`]
+/// when lines were dropped — or when `already_cut` says the caller trimmed
+/// the text before handing it over (a byte cap), so the mark still shows.
+/// Shared by the diff pane and the tree preview so both stop the same way.
+pub fn cap_lines(text: &str, max: usize, already_cut: bool) -> String {
     let mut lines = text.lines();
-    let mut out: String = lines
-        .by_ref()
-        .take(MAX_DIFF_LINES)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if lines.next().is_some() {
-        out.push_str("\n… (truncated)");
+    let mut out: String = lines.by_ref().take(max).collect::<Vec<_>>().join("\n");
+    if lines.next().is_some() || already_cut {
+        out.push_str(TRUNCATED_MARK);
     }
     out
 }
@@ -241,6 +248,27 @@ pub fn load_selected_diff(view: &mut DiffView) {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn cap_lines_keeps_the_head_and_marks_what_it_dropped() {
+        assert_eq!(cap_lines("a\nb\nc", 5, false), "a\nb\nc");
+        assert_eq!(
+            cap_lines("a\nb\nc\n", 3, false),
+            "a\nb\nc",
+            "trailing newline is not a line"
+        );
+        assert_eq!(
+            cap_lines("a\nb\nc", 2, false),
+            format!("a\nb{TRUNCATED_MARK}")
+        );
+        assert_eq!(
+            cap_lines("a\nb", 2, true),
+            format!("a\nb{TRUNCATED_MARK}"),
+            "byte cap forces the mark"
+        );
+        assert_eq!(cap_lines("a\nb\nc", 0, false), TRUNCATED_MARK);
+        assert_eq!(cap_lines("", 3, false), "");
+    }
 
     #[test]
     fn parse_status_z_handles_all_statuses() {

@@ -14,6 +14,40 @@ about what is worth recording.
 
 ## Entries
 
+### Dedup Pass Over nebula-tui (Modal Frames, List Math, gh Wrapper, Key Table) — 2026-08-27
+
+**Asked:** "You are refactoring the Rust crate `crates/nebula-tui` in an isolated git worktree … edit ONLY
+these files under `crates/nebula-tui/src/`: ui.rs, app.rs, tree_browser.rs, grep_search.rs, ipc.rs,
+pull_request.rs, pr_preview.rs, config.rs, keymap.rs, git_diff.rs, lib.rs. Do NOT touch event_loop.rs …
+refactor with zero behavior change — identical rendered strings, widths, colors, argv."
+
+**Did:** Pure dedup, no behavior change (467 tests, was 458; e2e_tui 5/5). `ui.rs`: `modal_block` /
+`render_modal_frame` (the accent+BOLD frame — Help, Confirm, both Prompts and the vim chip differ and were
+left alone), `below_first_row`, `empty_list_row` + `NO_MATCHES`, `visible_positions`, `hint_line`, named
+popup-size consts beside `VIM_MODAL_PCT`, `SPLIT_PANE_LAYOUT_MIN = 20`, and `truncate` made `pub` so
+`grep_search::clip` could go. `app.rs`: free `window_start`, `clamp_selection`, `max_scroll`, `scrolled_by`,
+`clamp_files_width` that `DiffView`/`Palette`/`FileFinder`/`GrepView`/`HostsView`/`TreeBrowser` delegate to.
+`git_diff::cap_lines(text, max, already_cut)` + `TRUNCATED_MARK` shared with the tree preview. `ipc.rs`:
+`agent_id_from`/`current_agent_id`, `await_reply`/`await_ack`, `RenameMode { Auto, Force }` (lib.rs keeps the
+bool at the CLI boundary since `crates/nebula/src/main.rs` passes one). `pull_request.rs`: one `gh(dir, args,
+timeout)` process wrapper, `str_at`/`u64_at`/`bool_at`/`arr_at`/`state_at`/`web_url`, `STATE_OPEN`.
+`keymap.rs`: `KEY_NAMES` table behind `parse_key_name`/`key_name`/`key_display`, `CTRL_COLLISIONS`, `UNBOUND`.
+Skipped `bind(.., add: bool)` → enum because `event_loop.rs` (another agent's file) calls it.
+
+**Gotchas:**
+- `nebula_core::env` (`AGENT_ID`, `non_empty`) does not exist on this branch despite the brief saying it
+  does — `ipc.rs` carries its own `AGENT_ID_VAR` const. Fold it into core's if/when that module lands.
+- `key_name`/`key_display` map `KeyCode::BackTab` to `"tab"`/`"Tab"` (the shift bit carries the
+  difference) while `parse_key_name("backtab")` yields `BackTab` — a single table can't express that, so
+  `key_row` folds BackTab onto Tab and parse special-cases the word. `named_keys_keep_their_spellings_and_glyphs`
+  pins every string; run it before touching the table.
+- `host_warning` returns `Option<&'static str>`, so `CTRL_COLLISIONS` has to hold full message strings
+  per entry — a `format!` with the key name would need a leak or a `String` return.
+- `tree_browser::read_preview` marks truncation on `lines dropped || byte_capped`; `cap_lines` takes that
+  second condition as `already_cut` rather than the caller appending the mark twice.
+- The prompt's line numbers for `ui.rs` were ~100 lines stale (memory modal added since); re-locate by
+  content, not `:line`.
+
 ### The Root Worktree Row's Lower Half Wasn't Clickable — 2026-08-27
 
 **Asked:** "I can't seem to click on certain places of the root worktree row in some areas, other rows are

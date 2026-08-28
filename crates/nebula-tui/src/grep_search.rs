@@ -3,6 +3,7 @@
 //! Synchronous `std::process` on purpose (the git_diff.rs precedent): a
 //! search runs only on key events, and `git grep` over a checkout is fast.
 
+use crate::ui::truncate;
 use std::path::Path;
 use std::process::Command;
 
@@ -76,20 +77,10 @@ pub fn parse_grep_z(bytes: &[u8]) -> (Vec<GrepHit>, bool) {
         hits.push(GrepHit {
             path: String::from_utf8_lossy(path).into_owned(),
             line,
-            text: clip(text, MAX_TEXT_LEN),
+            text: truncate(text, MAX_TEXT_LEN),
         });
     }
     (hits, false)
-}
-
-fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
 }
 
 #[cfg(test)]
