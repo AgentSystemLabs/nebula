@@ -10,6 +10,7 @@
 # every worktree can run at once without sharing a daemon, a DB, or a port.
 # `make dev-ls` shows them all.
 #   make install  put it in ~/.cargo/bin for real use (then `make kill` to cut over)
+#   make cycle    install + kill + dev in one go — the re-runnable full cutover
 
 PREFIX      ?= $(HOME)/.cargo/bin
 RELEASE_BIN := target/release/nebula
@@ -47,7 +48,7 @@ DEV_ENV = NEBULA_RUNTIME_DIR=$(DEV_RUNTIME) NEBULA_DATA_DIR=$(DEV_DATA) \
 	$(if $(AGENT),NEBULA_AGENT_CMD=$(AGENT))
 
 .DEFAULT_GOAL := help
-.PHONY: help dev browser dev-prep dev-seed dev-reset dev-ls dev-stop build install kill check fmt lint test ci clean
+.PHONY: help dev browser dev-prep dev-seed dev-reset dev-ls dev-stop build install kill cycle check fmt lint test ci clean
 
 help: ## Show this help
 	@grep -hE '^[a-z][a-z-]*:.*?## ' $(MAKEFILE_LIST) \
@@ -159,6 +160,21 @@ install: build ## Install to $(PREFIX) — warns if the live daemon is now stale
 
 kill: ## Stop every session and the daemon — the cutover step after `make install`
 	$(PREFIX)/nebula kill
+
+# The whole cutover as one command, safe to re-run as often as you like:
+# install first, so a build that fails stops here with every session still
+# alive; then kill the real daemon (it is now running the old binary — the
+# STALE DAEMON NOTE `install` just printed says as much); then `dev`, which
+# builds the debug binary and hands the terminal to the isolated dev instance.
+# `nebula kill` exits 0 and says "no nebula daemon running" when there is
+# nothing to stop, so the first run on a cold machine goes through too. The
+# kill stops every real session — run this from a terminal outside nebula,
+# not from a session it would take down with it. Recipe lines rather than
+# prerequisites so `make -j` cannot reorder the three.
+cycle: ## Install, kill the real daemon, run the dev instance — re-run whenever
+	@$(MAKE) --no-print-directory install
+	@$(MAKE) --no-print-directory kill
+	@$(MAKE) --no-print-directory dev
 
 # --- checks ------------------------------------------------------------------
 

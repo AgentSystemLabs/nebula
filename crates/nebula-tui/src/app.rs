@@ -78,6 +78,10 @@ pub const MIN_TERM_W: u16 = 20;
 pub const DEFAULT_DIFF_FILES_W: u16 = 34;
 /// The diff modal's file list can't be dragged narrower than this.
 pub const MIN_DIFF_FILES_W: u16 = 16;
+/// How long the settings overlay remembers its tab / row / strip-vs-list
+/// after closing. Reopened within this, it lands where you left it; later
+/// than this the memory is stale and it opens fresh on the tab strip.
+pub const SETTINGS_MEMORY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// The diff pane always keeps at least this much width.
 pub const MIN_DIFF_PANE_W: u16 = 24;
 
@@ -296,6 +300,16 @@ pub struct ConfirmDialog {
     pub title: String,
     pub message: String,
     pub action: PendingAction,
+    /// Full dialog rect, written back during draw (the `ContextMenu::area`
+    /// pattern) so a click outside it can cancel like Esc.
+    pub area: Rect,
+}
+
+/// The `?` keymap overlay. Carries nothing but its drawn rect, so a click
+/// outside the box can close it.
+#[derive(Debug, Clone, Default)]
+pub struct HelpView {
+    pub area: Rect,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -372,6 +386,9 @@ pub struct PromptDialog {
     /// Screen rect of the listing rows, written during draw for click
     /// hit-testing.
     pub list_area: Rect,
+    /// Full dialog rect, written during draw so a click outside it can
+    /// abandon the prompt like Esc.
+    pub area: Rect,
 }
 
 impl PromptDialog {
@@ -389,6 +406,7 @@ impl PromptDialog {
             dirs: Vec::new(),
             hover: None,
             list_area: Rect::default(),
+            area: Rect::default(),
         };
         prompt.refresh_dirs();
         prompt
@@ -1277,7 +1295,7 @@ pub enum Overlay {
     Menu(ContextMenu),
     Confirm(ConfirmDialog),
     Prompt(PromptDialog),
-    Help,
+    Help(HelpView),
     Settings(SettingsView),
     Diff(DiffView),
     Palette(Palette),
@@ -1883,6 +1901,11 @@ pub struct App {
     /// process with a fresh connection.
     pub pending_ssh: Option<crate::hosts::HostEntry>,
     pub flash: Option<String>,
+    /// The last `h`/`l` (or ←/→) that landed on the end of the panel row
+    /// and stayed put, with when it arrived: a second press of the same
+    /// action inside `DOUBLE_TAP` jumps the boundary the way ⇧Tab / Tab
+    /// would. Any other key in between clears it.
+    pub edge_tap: Option<(crate::keymap::Action, std::time::Instant)>,
     pub overlay: Option<Overlay>,
     pub show_archived: bool,
     /// Sidebars collapsed (z) — terminal takes the full width.
@@ -1968,6 +1991,11 @@ pub struct App {
     /// puts it somewhere, so a fresh overlay opens with the strip focused
     /// and ←/→ immediately mean "walk the tabs".
     pub settings_on_tabs: bool,
+    /// When the settings overlay was last closed. The remembered position
+    /// above is only worth restoring while it's still fresh in the user's
+    /// head: a reopen more than [`SETTINGS_MEMORY_TTL`] after this forgets
+    /// it and starts over like a first open. `None` until the first close.
+    pub settings_closed_at: Option<std::time::Instant>,
     /// Hotkeys as the panels dispatch them: `config.keymap()`, cached here
     /// because a keymap lookup happens on every single key press. The
     /// event loop refreshes it at startup and whenever a binding changes.
@@ -2122,6 +2150,7 @@ impl App {
             should_quit: false,
             pending_ssh: None,
             flash: None,
+            edge_tap: None,
             overlay: None,
             show_archived: false,
             collapsed: false,
@@ -2150,6 +2179,7 @@ impl App {
             settings_tab: 0,
             settings_selected: vec![0; crate::config::tab_count()],
             settings_on_tabs: true,
+            settings_closed_at: None,
             keymap: crate::keymap::Keymap::default(),
             splitter_drag: None,
             hover_splitter: None,
@@ -2202,6 +2232,29 @@ impl App {
     /// in the same place.
     pub fn remember_settings_focus(&mut self, on_tabs: bool) {
         self.settings_on_tabs = on_tabs;
+    }
+
+    /// Stamp the moment the settings overlay went away, starting the
+    /// [`SETTINGS_MEMORY_TTL`] clock on the remembered position.
+    pub fn note_settings_closed(&mut self) {
+        self.settings_closed_at = Some(std::time::Instant::now());
+    }
+
+    /// The remembered settings position has gone stale: the overlay was
+    /// closed more than [`SETTINGS_MEMORY_TTL`] ago. Never true before the
+    /// first close — there's nothing to forget yet.
+    pub fn settings_memory_expired(&self) -> bool {
+        self.settings_closed_at
+            .is_some_and(|closed| closed.elapsed() >= SETTINGS_MEMORY_TTL)
+    }
+
+    /// Drop the remembered settings position so the next open looks like
+    /// the very first one: first tab, top row, cursor on the tab strip.
+    pub fn forget_settings_focus(&mut self) {
+        self.settings_tab = 0;
+        self.settings_selected = vec![0; crate::config::tab_count()];
+        self.settings_on_tabs = true;
+        self.settings_closed_at = None;
     }
 
     pub fn remember_settings_row(&mut self, tab: usize, row: usize) {
