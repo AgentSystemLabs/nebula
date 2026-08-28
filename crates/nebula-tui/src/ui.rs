@@ -574,7 +574,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 (
                     "WORKTREES",
                     &[
-                        (Act(&[New]), "new worktree"),
+                        (Act(&[New]), "new worktree (PR row: Claude)"),
                         (Act(&[GitDiff]), "git diff (^r: mark reviewed ✓)"),
                         (Act(&[OpenRepo]), "open the repo on GitHub"),
                         (Act(&[Pin]), "pin / unpin"),
@@ -597,7 +597,6 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     &[
                         (Act(&[New]), "new agent (pick CLI kind)"),
                         (Act(&[NewTerminal]), "new shell terminal"),
-                        (Act(&[NewLink]), "attach a link (PR, doc, ticket)"),
                         (Act(&[Activate]), "attach session / open link"),
                         (Act(&[Rename]), "rename agent / edit link URL"),
                         (Act(&[Pin]), "pin / unpin"),
@@ -2994,7 +2993,11 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         push_rows(&mut layout, &mut vrow, active_count, terminal_count);
     }
     if link_count > 0 {
-        header(&mut layout, &mut vrow, SessionEntry::Header("LINKS".into()));
+        header(
+            &mut layout,
+            &mut vrow,
+            SessionEntry::Header("OPEN PRS".into()),
+        );
         push_rows(
             &mut layout,
             &mut vrow,
@@ -3764,7 +3767,8 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             // An open-PR row answers to a different set of verbs than a
             // checkout does, so the hint follows the cursor into the group.
             Focus::Worktrees if app.selected_worktree_pr().is_some() => format!(
-                "{}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: search  {}: menu  {}: help",
+                "{}: claude session  {}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: search  {}: menu  {}: help",
+                k(Action::New),
                 k(Action::Activate),
                 k(Action::GitDiff),
                 k(Action::Palette),
@@ -3781,23 +3785,33 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::ContextMenu),
                 k(Action::Help)
             ),
-            // A link row answers to a different set of verbs than a
-            // session does, so the hint follows the cursor into the group.
+            // A discovered pull request only opens; it has no stored row to
+            // edit or delete. Previously saved rows retain those two verbs.
+            Focus::Sessions
+                if app
+                    .selected_link()
+                    .is_some_and(|row| row.id().is_none()) =>
+            {
+                format!(
+                    "{}: open in browser  {}: menu  {}: help",
+                    k(Action::Activate),
+                    k(Action::ContextMenu),
+                    k(Action::Help)
+                )
+            }
             Focus::Sessions if app.selected_link().is_some() => format!(
-                "{}: open in browser  {}: add link  {}: edit URL  {}: delete  {}: menu  {}: help",
+                "{}: open in browser  {}: edit URL  {}: delete  {}: menu  {}: help",
                 k(Action::Activate),
-                k(Action::NewLink),
                 k(Action::Rename),
                 k(Action::Delete),
                 k(Action::ContextMenu),
                 k(Action::Help)
             ),
             Focus::Sessions => format!(
-                "{}: focus  {}: agent  {}: terminal  {}: link  {}: rename  {}: archive  {}: del  {}: menu  {}: help",
+                "{}: focus  {}: agent  {}: terminal  {}: rename  {}: archive  {}: del  {}: menu  {}: help",
                 k(Action::Activate),
                 k(Action::New),
                 k(Action::NewTerminal),
-                k(Action::NewLink),
                 k(Action::Rename),
                 k(Action::Archive),
                 k(Action::Delete),

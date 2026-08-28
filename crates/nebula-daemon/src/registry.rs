@@ -83,6 +83,7 @@ pub(crate) struct CreateAgentSpec {
     pub effort: Option<String>,
     pub auto_title: bool,
     pub cloud_prompt: Option<String>,
+    pub pr_url: Option<String>,
 }
 
 /// A pre-spawned agent CLI waiting to be adopted by the next CreateAgent for
@@ -992,6 +993,7 @@ impl Daemon {
             effort,
             auto_title,
             cloud_prompt,
+            pr_url,
         } = spec;
         let cloud_prompt = match cloud_prompt {
             Some(_) if kind != AgentKind::Claude => {
@@ -1003,6 +1005,16 @@ impl Daemon {
             }
             None => None,
         };
+        let pr_url = match pr_url {
+            Some(_) if kind != AgentKind::Claude => {
+                bail!("PR launch context is only supported for Claude")
+            }
+            Some(_) if cloud_prompt.is_some() => {
+                bail!("PR launch context is not supported for Claude Cloud")
+            }
+            Some(url) => Some(validate_pr_url(&url)?),
+            None => None,
+        };
         let worktree = self
             .store
             .get_worktree(&worktree_id)?
@@ -1010,8 +1022,7 @@ impl Daemon {
         // A warm session for this (worktree, kind) hands over its PTY and
         // its pre-generated id — the CLI booted while the user typed the
         // name, so the create feels instant.
-        let adopted = cloud_prompt
-            .is_none()
+        let adopted = (cloud_prompt.is_none() && pr_url.is_none())
             .then(|| self.take_prewarmed(&worktree_id, kind, model.as_deref(), effort.as_deref()))
             .flatten();
         // Only the cold path needs asking: an adopted warm session is proof
@@ -1048,7 +1059,7 @@ impl Daemon {
             cloud_mirroring: false,
         };
         self.store
-            .insert_agent_with_auto_title(&agent, auto_title)?;
+            .insert_agent_with_launch_context(&agent, auto_title, pr_url.as_deref())?;
         if adopted.is_none() {
             // Cold path: boot the CLI right away.
             let spawned = self.spawn_agent_session_with(
@@ -2404,6 +2415,14 @@ impl Daemon {
 
         // NEBULA_AGENT_CMD overrides for tests; default is the kind's CLI.
         let cmd_override = std::env::var(env::AGENT_CMD).ok();
+        let pr_system_prompt = if cloud.is_none() {
+            self.store
+                .agent_pr_url(&agent.id)?
+                .as_deref()
+                .map(claude_pr_system_prompt)
+        } else {
+            None
+        };
         let (program, args, resumed) = match cloud {
             Some(launch) => claude_cloud_spawn_command(
                 launch,
@@ -2418,6 +2437,7 @@ impl Daemon {
                 agent.effort.as_deref(),
                 cmd_override.as_deref(),
                 initial_prompt,
+                pr_system_prompt.as_deref(),
                 true,
             ),
         };
@@ -2667,7 +2687,8 @@ impl Daemon {
 /// Model/effort choices follow: `claude --model m --effort e`,
 /// `codex -m m -c model_reasoning_effort=e` (cursor has neither knob).
 /// Claude then gets nebula's worktree guidance appended to its system
-/// prompt, and an `initial_prompt` — the relocation notice a `nebula
+/// prompt, any persisted PR scope is composed into that same system-prompt
+/// argument, and an `initial_prompt` — the relocation notice a `nebula
 /// worktree` respawn opens with — goes last, as Claude's positional prompt
 /// (codex and cursor take none; their resumes wait for the user).
 ///
@@ -2681,7 +2702,16 @@ fn agent_spawn_command(
     effort: Option<&str>,
     cmd_override: Option<&str>,
 ) -> (String, Vec<String>, bool) {
-    agent_spawn_command_with(kind, session_id, model, effort, cmd_override, None, true)
+    agent_spawn_command_with(
+        kind,
+        session_id,
+        model,
+        effort,
+        cmd_override,
+        None,
+        None,
+        true,
+    )
 }
 
 /// What nebula appends to Claude's system prompt: how to take a "do this
@@ -2715,6 +2745,22 @@ fn relocation_prompt(worktree: &Worktree) -> String {
     )
 }
 
+/// The invariant attached to a Claude AGENT created from an OPEN PRS row.
+/// It is regenerated from the persisted URL for every fresh process so a
+/// RESUME cannot silently lose the scope the user chose at creation time.
+fn claude_pr_system_prompt(pr_url: &str) -> String {
+    format!(
+        "[nebula] This session was created from the OPEN PRS row for {pr_url}. All work in this \
+         session must be scoped to that pull request. Inspect the PR before acting, and do not \
+         modify or report on unrelated work. Before editing, make sure changes are made on the \
+         PR's head branch (using a dedicated worktree if necessary), never in an unrelated \
+         checkout. Keep reviews, tests, commits, pushes, and GitHub actions limited to this PR."
+    )
+}
+
+// Eight positional knobs is one over clippy's line; the callers are the two
+// thin wrappers above and the tests, so a builder would only add ceremony.
+#[allow(clippy::too_many_arguments)]
 fn agent_spawn_command_with(
     kind: AgentKind,
     session_id: Option<&str>,
@@ -2722,6 +2768,7 @@ fn agent_spawn_command_with(
     effort: Option<&str>,
     cmd_override: Option<&str>,
     initial_prompt: Option<&str>,
+    additional_system_prompt: Option<&str>,
     guidance: bool,
 ) -> (String, Vec<String>, bool) {
     if let Some(cmd) = cmd_override {
@@ -2755,10 +2802,17 @@ fn agent_spawn_command_with(
             if let Some(e) = effort {
                 args.extend(["--effort".to_string(), e.to_string()]);
             }
+            let mut system_prompt = Vec::new();
             if guidance {
+                system_prompt.push(CLAUDE_WORKTREE_GUIDANCE);
+            }
+            if let Some(prompt) = additional_system_prompt {
+                system_prompt.push(prompt);
+            }
+            if !system_prompt.is_empty() {
                 args.extend([
                     "--append-system-prompt".to_string(),
-                    CLAUDE_WORKTREE_GUIDANCE.to_string(),
+                    system_prompt.join("\n\n"),
                 ]);
             }
             if let Some(p) = initial_prompt {
@@ -2819,6 +2873,21 @@ fn validate_cloud_text(raw: &str, what: &str) -> Result<String> {
     Ok(text)
 }
 
+/// Validate the persisted URL before it becomes part of Claude's argv on
+/// every spawn. OPEN PRS rows already supply HTTP(S), but the DAEMON treats
+/// IPC as a real boundary and rechecks the invariant itself.
+fn validate_pr_url(raw: &str) -> Result<String> {
+    const MAX_PR_URL_BYTES: usize = 4 * 1024;
+    let url = normalize_url(raw)?;
+    if url.len() > MAX_PR_URL_BYTES {
+        bail!("pull request URL is too long (max 4 KiB)");
+    }
+    if !url.contains("/pull/") {
+        bail!("not a pull request URL: {url}");
+    }
+    Ok(url)
+}
+
 /// Branch (and so directory) of the worktree a Cloud row is re-homed into
 /// before attaching: the CLI checks the cloud branch out on top of it, so
 /// the name only has to be stable per session and safe for git.
@@ -2852,6 +2921,7 @@ fn claude_cloud_spawn_command(
         model,
         effort,
         cmd_override,
+        None,
         None,
         false,
     );
@@ -3119,6 +3189,7 @@ mod tests {
             None,
             None,
             Some("carry on"),
+            None,
             true,
         );
         assert!(resumed);
@@ -3134,6 +3205,7 @@ mod tests {
                 None,
                 None,
                 Some("carry on"),
+                None,
                 true
             )
             .1,
@@ -3147,6 +3219,7 @@ mod tests {
                 None,
                 None,
                 Some("carry on"),
+                None,
                 true
             )
             .1,
@@ -3161,10 +3234,37 @@ mod tests {
                 None,
                 Some("/bin/sh -i"),
                 Some("carry on"),
+                None,
                 true
             ),
             ("/bin/sh".into(), vec!["-i".to_string()], false)
         );
+    }
+
+    #[test]
+    fn spawn_command_keeps_pr_scope_and_url_in_claudes_system_prompt() {
+        let pr_url = "https://github.com/AgentSystemLabs/nebula/pull/42";
+        let pr_prompt = claude_pr_system_prompt(pr_url);
+        let (_, args, resumed) = agent_spawn_command_with(
+            AgentKind::Claude,
+            Some("sid"),
+            None,
+            None,
+            None,
+            None,
+            Some(&pr_prompt),
+            true,
+        );
+        assert!(resumed);
+        let prompts = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--append-system-prompt")
+            .map(|pair| pair[1].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(prompts.len(), 1, "Claude gets one composed system prompt");
+        assert!(prompts[0].contains(CLAUDE_WORKTREE_GUIDANCE));
+        assert!(prompts[0].contains("All work in this session must be scoped"));
+        assert!(prompts[0].contains(pr_url));
     }
 
     #[test]
@@ -3322,6 +3422,7 @@ mod tests {
                 effort: None,
                 auto_title: false,
                 cloud_prompt: Some(" \n ".into()),
+                pr_url: None,
             })
             .await
             .unwrap_err();
@@ -3336,6 +3437,7 @@ mod tests {
                 effort: None,
                 auto_title: false,
                 cloud_prompt: Some("fix\0auth".into()),
+                pr_url: None,
             })
             .await
             .unwrap_err();
@@ -3350,6 +3452,7 @@ mod tests {
                 effort: None,
                 auto_title: false,
                 cloud_prompt: Some("x".repeat(MAX_CLOUD_PROMPT_BYTES + 1)),
+                pr_url: None,
             })
             .await
             .unwrap_err();
@@ -3364,6 +3467,7 @@ mod tests {
                 effort: None,
                 auto_title: false,
                 cloud_prompt: Some("Fix auth".into()),
+                pr_url: None,
             })
             .await
             .unwrap_err();
@@ -4142,6 +4246,11 @@ mod tests {
         ] {
             assert!(normalize_url(bad).is_err(), "expected refusal: {bad:?}");
         }
+        assert_eq!(
+            validate_pr_url("github.com/o/r/pull/7").unwrap(),
+            "https://github.com/o/r/pull/7"
+        );
+        assert!(validate_pr_url("https://github.com/o/r/issues/7").is_err());
     }
 
     #[test]

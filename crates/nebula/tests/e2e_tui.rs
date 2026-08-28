@@ -612,10 +612,6 @@ fn tui_hides_projects_and_worktrees_independently() {
     tui.wait_for_text(FOOTER_SESSIONS);
 }
 
-/// Links live in the Sessions panel's own LINKS group: `L` adds one from
-/// any panel, `r` edits it, Enter would open it, `d` removes it. The
-/// pull-request row is not exercised here — the test repo has no remote,
-/// so `gh` (installed or not) reports no PR.
 /// Renaming a project is a label change, and an empty name undoes it.
 /// Drives the real binary: the row picks up the new label with the folder
 /// name hanging off a `└` underneath, then clearing the field puts the row
@@ -652,57 +648,30 @@ fn tui_project_rename_shows_the_folder_and_empty_undoes_it() {
     tui.wait_for_text("acme-repo");
 }
 
+/// Manual LINK creation is intentionally absent: Shift+L is unbound and
+/// the HELP OVERLAY offers no attach-link action.
 #[test]
-fn tui_link_crud_in_sessions_panel() {
+fn tui_manual_link_add_is_unavailable() {
     let mut tui = TuiHarness::spawn();
     let repo = tui.make_repo("link-proj");
 
     tui.wait_for_text("create your first project");
     add_project(&mut tui, &repo, "link-proj");
-    // The root worktree row must exist before a link has an owner.
     tui.wait_for_text("⌂ root");
 
-    // ---- create: Shift+L prompts, the URL lands in a LINKS group ----
     tui.send(b"L");
-    tui.wait_for_text("Add link");
-    tui.type_str("https://example.dev/spec");
-    tui.send(ENTER);
-    tui.wait_for_text("LINKS");
-    // Rows show the URL without the scheme.
-    tui.wait_for_text("example.dev/spec");
-    // The cursor followed the new row into the Sessions panel.
-    tui.wait_for_selected("example.dev/spec");
-
-    // ---- update: r prefills the URL, so typing appends to it ----
-    tui.send(b"r");
-    tui.wait_for_text("Edit link");
-    tui.type_str("/v2");
-    tui.send(ENTER);
-    tui.wait_for_text("example.dev/spec/v2");
-
-    // ---- a second link: both list under the one header ----
-    tui.send(b"L");
-    tui.wait_for_text("Add link");
-    // Typed without a scheme — the daemon normalizes it to https://.
-    // Short on purpose: the Sessions panel truncates long rows.
-    tui.type_str("docs.dev/design");
-    tui.send(ENTER);
-    tui.wait_for_text("docs.dev/design");
-
-    // ---- delete: d confirms, y removes the row ----
-    tui.send(b"d");
-    tui.wait_for_text("Delete link");
-    tui.send(b"y");
-    tui.wait_for_sessions_row_gone("docs.dev/design");
-    // The other link is untouched.
-    tui.wait_for_text("example.dev/spec/v2");
+    tui.send(b"?");
+    // If Shift+L still opened a prompt, this `?` would type into it instead
+    // of opening HELP OVERLAY, so this heading proves the key was a no-op.
+    tui.wait_for_text("NAVIGATE & SEARCH");
+    tui.wait_for_gone("attach a link");
 }
 
-/// The pull request nebula finds on the branch leads the LINKS group. A
+/// The pull request nebula finds on the branch leads the OPEN PRS group. A
 /// stub `gh` on PATH stands in for GitHub: the real one is asked for exactly
 /// this JSON (`gh pr view --json number,url,title,state,isDraft`).
 #[test]
-fn tui_pull_request_row_leads_the_links_group() {
+fn tui_pull_request_row_leads_the_open_prs_group() {
     let stub_bin = tempfile::tempdir().unwrap();
     let gh = stub_bin.path().join("gh");
     std::fs::write(
@@ -724,7 +693,7 @@ fn tui_pull_request_row_leads_the_links_group() {
     tui.wait_for_text("⌂ root");
 
     // The lookup rides the git poll, so the row shows up on its own.
-    tui.wait_for_text("LINKS");
+    tui.wait_for_text("OPEN PRS");
     tui.wait_for_text("#7 Attach links");
 
     // It is not a stored row: d says so instead of opening a confirm.
@@ -734,14 +703,6 @@ fn tui_pull_request_row_leads_the_links_group() {
     tui.wait_for_selected("#7 Attach links");
     tui.send(b"d");
     tui.wait_for_text("can't be deleted");
-
-    // A link the user adds lands under it.
-    tui.send(b"L");
-    tui.wait_for_text("Add link");
-    tui.type_str("example.dev/spec");
-    tui.send(ENTER);
-    tui.wait_for_text("example.dev/spec");
-    tui.wait_for_text("#7 Attach links");
 }
 
 #[test]

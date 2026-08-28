@@ -345,6 +345,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             effort,
                             auto_title,
                             cloud_prompt,
+                            pr_url: None,
                         })
                         .await;
                     if is_cloud {
@@ -367,6 +368,48 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             ),
                             Ok(_) => unreachable!("CreateAgent returned a non-agent id"),
                         }
+                    }
+                    reply(&out_tx, req_id, result.map(Some)).await;
+                }
+                ClientRequest::CreatePrAgent {
+                    req_id,
+                    worktree,
+                    name,
+                    model,
+                    effort,
+                    auto_title,
+                    pr_url,
+                } => {
+                    let result = daemon
+                        .create_agent(CreateAgentSpec {
+                            worktree: worktree.clone(),
+                            name,
+                            kind: nebula_core::AgentKind::Claude,
+                            model,
+                            effort,
+                            auto_title,
+                            cloud_prompt: None,
+                            pr_url: Some(pr_url.clone()),
+                        })
+                        .await;
+                    match &result {
+                        Ok(nebula_core::EntityId::Agent(agent)) => tracing::info!(
+                            req_id,
+                            agent = %agent,
+                            worktree = %worktree,
+                            pr_url = %pr_url,
+                            launch_mode = "pull_request",
+                            "agent session spawned"
+                        ),
+                        Err(error) => tracing::warn!(
+                            req_id,
+                            error = %error,
+                            worktree = %worktree,
+                            pr_url = %pr_url,
+                            launch_mode = "pull_request",
+                            "agent session spawn failed"
+                        ),
+                        Ok(_) => unreachable!("CreatePrAgent returned a non-agent id"),
                     }
                     reply(&out_tx, req_id, result.map(Some)).await;
                 }

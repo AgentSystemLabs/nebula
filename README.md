@@ -40,7 +40,7 @@ nebula replaces that with a tree and a color:
 - **Real git worktrees, one keystroke.** Two agents in two directories don't collide.
 - **Every open pull request under them, readable in place.** Open a project and nebula asks `gh` what's
   still open on the repo. Hover one to read its description and comments in the pane, `g` for its diff,
-  `Enter` for the browser.
+  `Enter` for the browser, or `n` for a Claude SESSION scoped to that PR.
 
 No Electron, no server, no MCP. One ~4 MB Rust binary and a unix socket.
 
@@ -100,7 +100,10 @@ also how rows retire: merge or close a pull request and it stops coming back, so
 its own, and the one under your cursor goes the moment GitHub says it's merged. Rest the cursor on one
 and the right-hand pane reads it to you — description, stats and the whole conversation — without
 leaving nebula; `g` opens its diff in the same viewer your worktree diffs use, `Enter` or a double-click
-opens it in the browser, and `/` finds it by title. Only the row you actually stop on is fetched.
+opens it in the browser, and `/` finds it by title. Press `n` — or choose **New Claude session** from
+`m` / right-click — to start a Claude SESSION in the PROJECT's ROOT WORKTREE with an injected system
+prompt that limits all work to that PR and includes its URL. The URL is kept with the AGENT, so RESUME
+reapplies the same scope. Only the row you actually stop on is fetched.
 
 **4. Start the agent.** With a worktree selected, press `n` in the Sessions column. A menu asks what to
 run — **Claude**, **Codex**, **Cursor**, or a plain **Terminal (shell)**. `→` on Claude or Codex drills
@@ -178,8 +181,11 @@ The panels aren't the only view. With a worktree selected, from any panel:
 | **`f`** | **Find file.** Fuzzy finder over the worktree. `Enter` opens the file in an editor modal (vim by default; the `editor` setting or `NEBULA_EDITOR` picks another), `Ctrl+y` copies the path — ready to paste into an agent. |
 | **`F`** | **Find in files.** `git grep` into the same modal; `Enter` opens the hit at its line. |
 | **`b`** | **File tree browser.** Tree on the left, syntax-highlighted preview on the right, and an always-live filter that narrows the tree to matching files and the directories holding them. |
-| **`l`** | **Links.** Pin a PR, doc or ticket URL to the worktree; it shows up in the Sessions panel's LINKS group. nebula also finds the pull request already open on the branch with `gh` and lists it there on its own, with a count of the comments that landed while you were away. |
 | **`p`** | **Pin.** Pinned worktrees and agents sort to the top of their panel and are spared by the idle reaper. |
+
+nebula finds the pull request open on each branch with `gh` and shows it in the Sessions panel's
+OPEN PRS group, including a count of comments that landed while you were away. Manual link attachment
+is currently unavailable; previously saved links remain visible so the change does not discard data.
 
 ## How it works
 
@@ -195,7 +201,8 @@ The panels aren't the only view. With a worktree selected, from any panel:
   `claude --cloud <task>`; because Claude accepts that description as a process argument, don't put
   secrets in the Cloud task. Restored agents resume with `claude --resume <session-id>` /
   `codex resume <session-id>` / `cursor-agent --resume <session-id>` (falling back to a fresh session
-  when the old one is gone).
+  when the old one is gone). A Claude AGENT created from a PROJECT OPEN PRS row also receives the PR URL
+  through `--append-system-prompt`; nebula persists that URL and reapplies the constraint on every spawn.
 - **Status via agent-CLI hooks, not MCP.** At agent spawn, nebula merges managed hooks into the
   worktree's `.claude/settings.local.json` (Claude Code) or `.cursor/hooks.json` (Cursor CLI), and into
   `~/.codex/hooks.json` (Codex — codex records hook approvals against the hook file's path, so a
@@ -268,7 +275,8 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Add project | type + `Tab`, `↓↑` / `→` / `←` | browse for the repo: type to filter (bash-style Tab completion), arrows pick a directory, `→` steps in, `←` steps up, `Enter` adds the highlighted (or typed) path; `●` marks git repos |
 | Projects | `Shift+J/K` | move project up / down the list (`Shift+↑/↓` too, but Terminal.app never sends those) |
 | Projects | `r` | rename the row — a label, not a move: the folder on disk keeps its name and hangs off a `└` under the new one. A terminal cell has one font size (Kitty's OSC 66 renders half-size text, but WezTerm and Ghostty don't implement it), so the hierarchy is weight, opacity and position instead: the name you chose is bold, the folder is the dimmest theme color plus the faint attribute. An empty name puts the row back on the folder's name |
-| Worktrees | `n` / `d` | new worktree / delete (typed confirm — deletes files) |
+| Worktrees (checkout row) | `n` / `d` | new worktree / delete (typed confirm — deletes files) |
+| Worktrees (PROJECT OPEN PRS row) | `n`; `m` / right-click | new Claude SESSION scoped to that PR; the context menu also opens the PR or its diff |
 | New worktree | type a sentence, or `Enter` on the empty prompt | the branch name is slugified (`fix login redirect` → `fix-login-redirect`); empty takes a random `<adj>-<noun>-<verb>` |
 | Worktrees / Sessions | `p` | pin / unpin — pinned rows sort to the top and skip the idle reaper |
 | Sessions | `n` | new session (agent or shell terminal) |
@@ -279,8 +287,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Any panel | `g` | git diff for the selected worktree: filter, `↑↓` files, `Shift+↑↓`/`PgUp/PgDn`/`Ctrl+d/u` scroll, `Ctrl+r` marks a file reviewed ✓ |
 | Any panel | `Shift+G` | open the selected repo's page on its git host — the `origin` remote (`git@github.com:o/r.git`, `ssh://`, `https://`) turned into a browsable URL, credentials stripped |
 | Any panel | `f` / `F` / `b` | find file / find in files (`git grep`) / file tree browser, all scoped to the selected worktree — `Enter` opens the file in an editor modal (at the matched line, for `F`); in `f` and `b`, `Ctrl+y` copies the path |
-| Any panel | `Shift+L` | attach a link (pull request, doc, ticket) to the selected worktree — it lands in the Sessions panel's LINKS group, above any open pull request nebula finds with `gh` |
-| Sessions | `Enter` / `r` / `d` on a link | open it in the browser / edit its URL / delete it (the detected pull request opens but can't be edited or deleted) |
+| Sessions | `Enter` on an OPEN PRS row | open it in the browser (a previously saved link can still be edited with `r` or deleted with `d`; the detected pull request cannot) |
 | Any panel | `t` | new shell terminal in the selected worktree's directory (Projects panel: the repo root) |
 | Any panel | `w` or click the `◇ workspace` nameplate bottom-left | workspace switcher: `Enter` opens, `n`/`r`/`d` create/rename/delete; a created workspace opens with FOCUS on the first visible panel; delete asks first, and deleting the open one lands on the tab to its right, or the one to its left from the last tab (the panels scope to the open workspace; `/` doesn't, and switches for you). Per window, switching here leaves your other nebula instances on the workspace you left them on |
 | Any panel | `Shift+W` | show / hide the Workspaces bar across the top: `WORKSPACES` on the left, directly above `PROJECTS`, and one tab per workspace to its right with the rolled-up status of the agents under it (plus a count of the ones that finished unread), so a run in a workspace you don't have open still shows at the top level. The choice is remembered — it's the `Workspaces bar` setting, also in Settings → Appearance |
@@ -337,6 +344,9 @@ nebula tunnel <host> [dir] [--port N] [--remote-port N]
                           # nebula there if missing, runs `nebula browser` on its loopback, forwards
                           # the port, and opens the local URL. Nothing is exposed on the remote's
                           # network — the tunnel is the only way in — so it needs no --credential.
+                          # If that host already has a `nebula browser` on the port, the tunnel
+                          # reuses it instead of failing on the clash (a --credential one will ask
+                          # for it in the tab).
                           # Needs ttyd on the remote; Ctrl+C takes both ends down. --port is the
                           # local end (same rules as `nebula browser`), --remote-port the far end
                           # when something there already holds that number
