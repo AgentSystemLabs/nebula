@@ -14,17 +14,34 @@ use anyhow::{bail, Context, Result};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
+/// The opening half of every remote script: leave a usable `nebula` on the
+/// remote PATH, installing it first when there is none. `$1` is the install
+/// URL. A macro rather than a const because `concat!` only takes literals,
+/// and [`crate::tunnel`] builds a different tail onto the same head.
+macro_rules! install_prelude {
+    () => {
+        concat!(
+            // sshd hands a remote command a bare PATH — no login shell runs,
+            // so nothing the user configured applies. Prepend install.sh's
+            // default NEBULA_INSTALL_DIR, and append both Homebrew prefixes:
+            // on a macOS remote that is the only place ttyd (which
+            // `nebula browser` needs) or a brew-installed nebula lives.
+            "export PATH=\"$HOME/.local/bin:$PATH:/opt/homebrew/bin:/usr/local/bin\"; ",
+            "if ! command -v nebula >/dev/null 2>&1; then ",
+            "command -v curl >/dev/null 2>&1 || { ",
+            "echo \"nebula: curl is required on the remote to install nebula\" >&2; exit 127; }; ",
+            "echo \"nebula not found on remote; installing...\" >&2; ",
+            "curl -fsSL \"$1\" | sh || exit 1; ",
+            "fi; "
+        )
+    };
+}
+pub(crate) use install_prelude;
+
 /// Runs under `sh -c` on the remote: $1 = install URL, $2 = start dir
 /// (optional; defaults to the remote $HOME).
 const REMOTE_SCRIPT: &str = concat!(
-    // install.sh's default NEBULA_INSTALL_DIR — non-login shells won't have it.
-    "export PATH=\"$HOME/.local/bin:$PATH\"; ",
-    "if ! command -v nebula >/dev/null 2>&1; then ",
-    "command -v curl >/dev/null 2>&1 || { ",
-    "echo \"nebula ssh: curl is required on the remote to install nebula\" >&2; exit 127; }; ",
-    "echo \"nebula not found on remote; installing...\" >&2; ",
-    "curl -fsSL \"$1\" | sh || exit 1; ",
-    "fi; ",
+    install_prelude!(),
     "cd -- \"${2:-$HOME}\" || exit 1; ",
     "exec nebula"
 );
@@ -58,7 +75,7 @@ fn remote_command(install_url: &str, path: Option<&str>) -> String {
 }
 
 /// POSIX-quote for a remote shell: `it's` -> `'it'\''s'`.
-fn shell_single_quote(s: &str) -> String {
+pub(crate) fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 

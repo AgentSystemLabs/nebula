@@ -494,7 +494,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 (
                     "NAVIGATE & SEARCH",
                     &[
-                        (Act(&[FocusNext, FocusPrev]), "cycle focus between panels"),
+                        (
+                            Act(&[FocusNext, FocusPrev]),
+                            "walk panels (fwd locks input)",
+                        ),
                         (Act(&[FocusLeft, FocusRight]), "move focus left / right"),
                         (Act(&[MoveDown, MoveUp]), "move selection"),
                         (Act(&[Activate]), "drill in / attach session"),
@@ -846,21 +849,28 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
         }
         Overlay::Metrics(view) => {
-            // One row per live session (biggest first), then nebula's own
-            // two processes; above them, a rollup per agent kind so "how
-            // much is claude using?" reads off in one line.
+            // One row per live session (biggest first); then the prewarm
+            // pool's spares — CLIs booted ahead of a new-agent request,
+            // with no row of their own — grouped under one header so they
+            // can't pass for sessions; then nebula's own two processes.
+            // Above them, a rollup per agent kind so "how much is claude
+            // using?" reads off in one line.
             struct Row {
                 name: String,
                 context: String,
-                pid: u32,
+                /// None = a group header, which is no one process.
+                pid: Option<u32>,
                 procs: u32,
                 bytes: u64,
-                /// None = one of nebula's own processes (not openable).
+                /// None = not openable: nebula's own processes, a group
+                /// header, or a pool spare (nothing to open until a
+                /// CreateAgent adopts it).
                 sref: Option<SessionRef>,
             }
             let mut rows: Vec<Row> = Vec::new();
+            let mut spares: Vec<Row> = Vec::new();
             // kind label → (session count, procs, bytes); BTreeMap for a
-            // stable claude / codex / cursor / shells order.
+            // stable claude / codex / cursor / shells / warm order.
             let mut kinds: std::collections::BTreeMap<&'static str, (u32, u32, u64)> =
                 std::collections::BTreeMap::new();
             let mut sessions_total: u64 = 0;
@@ -886,6 +896,29 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             if let Some(snap) = &view.snapshot {
                 for m in &snap.sessions {
+                    // A pool spare: name it by what it booted as and where
+                    // it waits, and keep it out of the live-session rows.
+                    if let (SessionRef::Agent(_), Some(home)) = (&m.session, &m.prewarm) {
+                        let model = home
+                            .model
+                            .as_deref()
+                            .map(|model| format!(" · {model}"))
+                            .unwrap_or_default();
+                        let entry = kinds.entry("warm").or_default();
+                        entry.0 += 1;
+                        entry.1 += m.procs;
+                        entry.2 += m.rss_bytes;
+                        sessions_total += m.rss_bytes;
+                        spares.push(Row {
+                            name: format!("{}{model}", home.kind.as_str()),
+                            context: wt_context(&home.worktree),
+                            pid: Some(m.pid),
+                            procs: m.procs,
+                            bytes: m.rss_bytes,
+                            sref: None,
+                        });
+                        continue;
+                    }
                     let (name, context, kind) = match &m.session {
                         SessionRef::Agent(id) => {
                             let agent = app.tree.agents.iter().find(|a| &a.id == id);
@@ -916,17 +949,36 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     rows.push(Row {
                         name,
                         context,
-                        pid: m.pid,
+                        pid: Some(m.pid),
                         procs: m.procs,
                         bytes: m.rss_bytes,
                         sref: Some(m.session.clone()),
                     });
                 }
                 rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+                // The spares hang off one header row as a small tree:
+                // the header carries their sum, each leaf its own reading.
+                if !spares.is_empty() {
+                    spares.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+                    let count = spares.len();
+                    rows.push(Row {
+                        name: format!("warm spares ({count})"),
+                        context: String::new(),
+                        pid: None,
+                        procs: spares.iter().map(|r| r.procs).sum(),
+                        bytes: spares.iter().map(|r| r.bytes).sum(),
+                        sref: None,
+                    });
+                    for (i, mut spare) in spares.into_iter().enumerate() {
+                        let branch = if i + 1 == count { "└ " } else { "├ " };
+                        spare.name = format!("{branch}{}", spare.name);
+                        rows.push(spare);
+                    }
+                }
                 rows.push(Row {
                     name: "nebula daemon".into(),
                     context: String::new(),
-                    pid: snap.daemon_pid,
+                    pid: Some(snap.daemon_pid),
                     procs: 1,
                     bytes: snap.daemon_rss_bytes,
                     sref: None,
@@ -934,7 +986,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 rows.push(Row {
                     name: "nebula ui (this window)".into(),
                     context: String::new(),
-                    pid: std::process::id(),
+                    pid: Some(std::process::id()),
                     procs: 1,
                     bytes: view.client_rss_bytes,
                     sref: None,
@@ -962,13 +1014,16 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if let Some(snap) = &view.snapshot {
                 // Rollup: one line per agent kind, then nebula, then total.
                 for (kind, (n, procs, bytes)) in &kinds {
-                    let unit = if *kind == "shells" {
-                        "terminal"
-                    } else {
-                        "session"
+                    let unit = match *kind {
+                        "shells" => "terminal",
+                        "warm" => "spare",
+                        _ => "session",
                     };
-                    let detail =
+                    let mut detail =
                         format!("{n} {unit}{} · {procs} proc{}", plural(*n), plural(*procs));
+                    if *kind == "warm" {
+                        detail.push_str(" · pre-booted for new agents");
+                    }
                     lines.push(Line::from(vec![
                         Span::styled(format!(" {kind:<8} "), header),
                         Span::styled(format!("{detail:<42}"), dim),
@@ -1037,7 +1092,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             sel(name_style),
                         ),
                         Span::styled(format!("{:<15} ", truncate(&row.context, 15)), sel(dim)),
-                        Span::styled(format!("{:>6} {:>5} ", row.pid, row.procs), sel(dim)),
+                        Span::styled(
+                            format!(
+                                "{:>6} {:>5} ",
+                                row.pid.map(|p| p.to_string()).unwrap_or_default(),
+                                row.procs
+                            ),
+                            sel(dim),
+                        ),
                         Span::styled(format!("{:>9}", fmt_mem(row.bytes)), sel(mem_style)),
                     ]));
                 }
@@ -2475,7 +2537,19 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Projects;
     let count = Some(app.tree.visible_project_count()).filter(|n| *n > 0);
-    let inner = draw_column(f, area, "PROJECTS", count, focused, th);
+    // With the Workspaces bar hidden nothing else on screen names the open
+    // workspace, so this header takes the job — the column only ever lists
+    // that workspace's projects anyway. Upper-cased to stay in the header
+    // voice the other columns speak in, and trimmed to what's left of the
+    // row once the gutter, the ` · n` count and the column rule are paid for.
+    let title = if app.show_workspaces {
+        "PROJECTS".to_string()
+    } else {
+        let room = (area.width as usize)
+            .saturating_sub(ROW_GUTTER.len() + 1 + count.map_or(0, |n| 3 + n.to_string().len()));
+        truncate(&app.tree.active_workspace_name().to_uppercase(), room)
+    };
+    let inner = draw_column(f, area, &title, count, focused, th);
 
     if !app.tree.has_visible_projects() {
         f.render_widget(
@@ -2691,11 +2765,12 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     // The main checkout renders as `branch ⌂ root` (dim badge — the branch
     // is live, the badge marks root-ness).
     const ROOT_BADGE: &str = " ⌂ root";
-    for (top, entry) in &layout {
+    for (pos, (top, entry)) in layout.iter().enumerate() {
         let y = *top as isize - scroll;
         if y >= view_h as isize {
             break;
         }
+        let hit_h = pill_hit_height(*top, layout.get(pos + 1).map(|(t, _)| *t));
         match entry {
             WorktreeEntry::Header(text) => {
                 if let Some(r) = row_rect_at(inner, y) {
@@ -2735,7 +2810,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     spans.push(Span::styled(text, style));
                 }
                 render_pill(f, inner, y, spans, *i == app.sel_worktree, focused, th);
-                if let Some(hit) = rows_rect_at(inner, y, PILL_H) {
+                if let Some(hit) = rows_rect_at(inner, y, hit_h) {
                     app.hits.push((hit, HitTarget::Worktree(*i)));
                 }
             }
@@ -2761,7 +2836,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     spans.push(Span::styled(badge, Style::default().fg(th.dim)));
                 }
                 render_pill(f, inner, y, spans, *i == app.sel_worktree, focused, th);
-                if let Some(hit) = rows_rect_at(inner, y, PILL_H) {
+                if let Some(hit) = rows_rect_at(inner, y, hit_h) {
                     app.hits.push((hit, HitTarget::Worktree(*i)));
                 }
             }
@@ -2949,11 +3024,12 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     let scroll = app.sessions_scroll as isize;
 
     // ---- draw ----
-    for (top, entry) in &layout {
+    for (pos, (top, entry)) in layout.iter().enumerate() {
         let y = *top as isize - scroll;
         if y >= view_h as isize {
             break;
         }
+        let hit_h = pill_hit_height(*top, layout.get(pos + 1).map(|(t, _)| *t));
         match entry {
             SessionEntry::Header(text) => {
                 if let Some(r) = row_rect_at(inner, y) {
@@ -2968,7 +3044,9 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
                     app.hits.push((r, HitTarget::ArchivedHeader));
                 }
             }
-            SessionEntry::Row(i) => draw_session_row(f, app, inner, y, *i, &rows[*i], focused),
+            SessionEntry::Row(i) => {
+                draw_session_row(f, app, inner, y, hit_h, *i, &rows[*i], focused)
+            }
         }
     }
 
@@ -2976,11 +3054,14 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     app.hits.push((inner, HitTarget::PanelBg(Focus::Sessions)));
 }
 
+/// `hit_h` is the row's click target height (see [`pill_hit_height`]).
+#[allow(clippy::too_many_arguments)]
 fn draw_session_row(
     f: &mut Frame,
     app: &mut App,
     inner: Rect,
     top: isize,
+    hit_h: u16,
     index: usize,
     row: &SessionRow,
     focused: bool,
@@ -3107,7 +3188,7 @@ fn draw_session_row(
         }
     };
     render_pill(f, inner, top, spans, index == app.sel_session, focused, th);
-    if let Some(hit) = rows_rect_at(inner, top, PILL_H) {
+    if let Some(hit) = rows_rect_at(inner, top, hit_h) {
         app.hits.push((hit, HitTarget::Session(index)));
     }
 }
@@ -3775,18 +3856,26 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
 /// process subtree). None until the first metrics reply arrives.
 fn footer_usage(app: &App) -> Option<String> {
     let m = app.last_metrics.as_ref()?;
+    // Prewarm-pool spares are agent CLIs but not agents anyone opened;
+    // they get their own count so the agent figure matches the sidebar.
+    let spares = m.sessions.iter().filter(|s| s.prewarm.is_some()).count();
     let agents = m
         .sessions
         .iter()
-        .filter(|s| matches!(s.session, SessionRef::Agent(_)))
+        .filter(|s| matches!(s.session, SessionRef::Agent(_)) && s.prewarm.is_none())
         .count();
-    let terms = m.sessions.len() - agents;
+    let terms = m.sessions.len() - agents - spares;
     let total = m.daemon_rss_bytes
         + app.client_rss_bytes
         + m.sessions.iter().map(|s| s.rss_bytes).sum::<u64>();
     let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let warm = if spares > 0 {
+        format!(" · {spares} warm")
+    } else {
+        String::new()
+    };
     Some(format!(
-        "{agents} agent{} · {terms} term{} · {}",
+        "{agents} agent{} · {terms} term{}{warm} · {}",
         plural(agents),
         plural(terms),
         fmt_mem(total)
@@ -4069,6 +4158,19 @@ fn rows_rect_at(inner: Rect, i: isize, height: u16) -> Option<Rect> {
         return None;
     }
     rows_rect(inner, i.max(0) as usize, visible as u16)
+}
+
+/// Rows a pill's click target spans. A pill is a 3-row cell stacked on
+/// a `PILL_H` stride, so its bottom pad is usually the next pill's top
+/// pad; that shared row goes to the lower pill (whose selection fill
+/// owns the cell's bottom half), and the upper one's target stops at
+/// `PILL_H`. A pill with nothing stacked under it — the root checkout
+/// over its quiet row, the last of a group, the last of the list — keeps
+/// its bottom pad, or the lower half of the pill would be a click on the
+/// panel background.
+fn pill_hit_height(top: usize, next_top: Option<usize>) -> u16 {
+    let cell = PILL_H as usize + 1;
+    next_top.map_or(cell, |n| n.saturating_sub(top).min(cell)) as u16
 }
 
 /// A rect `height` rows tall starting at the i-th row inside `inner`:
@@ -4358,5 +4460,117 @@ mod tests {
         let mut buf = ratatui::buffer::Buffer::empty(tiny);
         draw_splitter_grips(&mut buf, &app, tiny);
         assert!(buf.content().iter().all(|c| c.symbol() == " "));
+    }
+
+    /// A test tree: one project, `branches` as its worktrees (the first is
+    /// the root checkout), `agents` under the first worktree — pinned ones
+    /// as `(name, true)`.
+    fn hit_test_app(branches: &[&str], agents: &[(&str, bool)]) -> App {
+        use nebula_core::{Agent, AgentId, AgentStatus, Project, ProjectId, Worktree, WorktreeId};
+        let mut app = App::new();
+        let project_id = ProjectId("p1".into());
+        app.tree.projects.push(Project {
+            workspace_id: Default::default(),
+            id: project_id.clone(),
+            name: "demo".into(),
+            repo_path: "/tmp/demo".into(),
+            sort_order: 0,
+        });
+        for (i, branch) in branches.iter().enumerate() {
+            app.tree.worktrees.push(Worktree {
+                id: WorktreeId(format!("w{i}")),
+                project_id: project_id.clone(),
+                path: format!("/tmp/{branch}").into(),
+                branch: (*branch).into(),
+                is_main: i == 0,
+                pinned: false,
+                sort_order: i as i64,
+            });
+        }
+        for (i, (name, pinned)) in agents.iter().enumerate() {
+            app.tree.agents.push(Agent {
+                id: AgentId(format!("a{i}")),
+                worktree_id: WorktreeId("w0".into()),
+                name: (*name).into(),
+                status: AgentStatus::Fresh,
+                archived: false,
+                archived_at: 0,
+                pinned: *pinned,
+                unseen: false,
+                status_changed_at: 0,
+                kind: nebula_core::AgentKind::Claude,
+                model: None,
+                effort: None,
+                session_id: None,
+                cloud_session_id: None,
+                sort_order: i as i64,
+                alive: false,
+                cloud_mirroring: false,
+            });
+        }
+        app
+    }
+
+    /// Pills are 3-row cells on a 2-row stride, so a pill's bottom pad is
+    /// normally the next pill's top pad and clicks there select the lower
+    /// one. The root checkout sits over a quiet row and the last pill
+    /// over nothing: their bottom pads — the lower half of the pill as
+    /// drawn — must still hit the pill, not the panel background.
+    #[test]
+    fn worktree_pills_are_clickable_over_their_whole_height() {
+        let mut app = hit_test_app(&["main", "feature", "other"], &[]);
+        let area = Rect::new(0, 0, 30, 20);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 20)).unwrap();
+        terminal
+            .draw(|f| draw_worktrees(f, &mut app, area))
+            .unwrap();
+
+        // `draw_column` hands the list rows from y=3: root at 3..=5, then a
+        // quiet row, `feature` at 6..=8 sharing its bottom pad with
+        // `other` at 8..=10.
+        let at = |y: u16| app.hit_at(1, y);
+        for y in 3..=5 {
+            assert_eq!(at(y), Some(HitTarget::Worktree(0)), "root row y={y}");
+        }
+        assert_eq!(at(6), Some(HitTarget::Worktree(1)));
+        assert_eq!(at(7), Some(HitTarget::Worktree(1)));
+        assert_eq!(
+            at(8),
+            Some(HitTarget::Worktree(2)),
+            "shared pad goes to the lower pill"
+        );
+        assert_eq!(at(9), Some(HitTarget::Worktree(2)));
+        assert_eq!(
+            at(10),
+            Some(HitTarget::Worktree(2)),
+            "last pill keeps its bottom pad"
+        );
+        assert_eq!(at(11), Some(HitTarget::PanelBg(Focus::Worktrees)));
+    }
+
+    /// The same rule in the Sessions panel: the last pill of a group has
+    /// a header under it instead of another pill, and keeps its bottom pad.
+    #[test]
+    fn session_pills_are_clickable_over_their_whole_height() {
+        let mut app = hit_test_app(&["main"], &[("pinned-one", true), ("plain", false)]);
+        let area = Rect::new(0, 0, 30, 20);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 20)).unwrap();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+
+        // PINNED header at 3, its pill at 4..=6 (the "blank" row above
+        // the next header is that pill's bottom pad), UNPINNED header at
+        // 7, its pill at 8..=10.
+        let at = |y: u16| app.hit_at(1, y);
+        assert_eq!(at(3), Some(HitTarget::PanelBg(Focus::Sessions)), "header");
+        for y in 4..=6 {
+            assert_eq!(at(y), Some(HitTarget::Session(0)), "pinned row y={y}");
+        }
+        assert_eq!(at(7), Some(HitTarget::PanelBg(Focus::Sessions)), "header");
+        for y in 8..=10 {
+            assert_eq!(at(y), Some(HitTarget::Session(1)), "unpinned row y={y}");
+        }
+        assert_eq!(at(11), Some(HitTarget::PanelBg(Focus::Sessions)));
     }
 }

@@ -4,7 +4,7 @@
 //! is highlighted and which panel has focus.
 //!
 //! Flow under test:
-//!   add two projects → Tab-cycle focus → create two worktrees →
+//!   add two projects → Tab-walk focus → create two worktrees →
 //!   j/k selection between worktrees → Enter into the sessions panel →
 //!   create an agent (auto-attach) → per-worktree session isolation →
 //!   j/k toggling between projects updates the worktree panel.
@@ -409,7 +409,7 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"k");
     tui.wait_for_selected("alpha-proj");
 
-    // ---- Tab cycles focus across all five panes and back ----
+    // ---- Tab walks focus out to the terminal pane and stops there ----
     tui.send(b"\t");
     tui.wait_for_text(FOOTER_WORKTREES);
     tui.send(b"\t");
@@ -417,9 +417,23 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"\t");
     // Terminal pane focused with nothing attached: no panel footer, no lock.
     tui.wait_for_gone(FOOTER_SESSIONS);
+    // Forward has nowhere left to go, so this Tab is a no-op — proved by
+    // the ⇧Tab after it landing on Sessions, not on a wrapped-round bar.
     tui.send(b"\t");
-    // Wrapped around to the first stop: the Workspaces bar, then Projects.
+    tui.send(b"\x1b[Z");
+    tui.wait_for_text(FOOTER_SESSIONS);
+
+    // ---- ⇧Tab walks back and stops dead on the workspaces bar ----
+    tui.send(b"\x1b[Z");
+    tui.wait_for_text(FOOTER_WORKTREES);
+    tui.send(b"\x1b[Z");
+    tui.wait_for_text(FOOTER_PROJECTS);
+    tui.send(b"\x1b[Z");
     tui.wait_for_text(FOOTER_WORKSPACES);
+    // The bar is the top of the walk, so this ⇧Tab is a no-op — proved by
+    // the Tab after it stepping down to Projects. Had it wrapped into the
+    // pane, forward would have stayed there and Projects never returned.
+    tui.send(b"\x1b[Z");
     tui.send(b"\t");
     tui.wait_for_text(FOOTER_PROJECTS);
 
@@ -466,12 +480,18 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(&[0x11]);
     tui.wait_for_text(FOOTER_SESSIONS);
 
-    // ---- Tab merely focuses the live pane (no lock); Enter locks it ----
-    tui.send(b"\t");
+    // ---- Ctrl+→ focuses the live pane without locking; Enter locks it ----
+    tui.send(b"\x1b[1;5C");
     tui.wait_for_text(FOOTER_TERMINAL_FOCUSED);
     tui.send(b"\r");
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
     tui.send(&[0x1d]); // Ctrl+] fallback (legacy byte, what Terminal.app sends)
+    tui.wait_for_text(FOOTER_SESSIONS);
+
+    // ---- Tab walks onto the live pane and takes its input in one step ----
+    tui.send(b"\t");
+    tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
+    tui.send(&[0x1d]);
     tui.wait_for_text(FOOTER_SESSIONS);
 
     // ---- Shift+T: a shell terminal in the worktree dir, auto-attached ----

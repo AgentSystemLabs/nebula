@@ -1,5 +1,6 @@
 mod browser;
 mod ssh;
+mod tunnel;
 mod upgrade;
 
 use anyhow::Result;
@@ -71,7 +72,8 @@ enum Command {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
-    /// Serve this TUI in a web browser via ttyd (loopback only) and open it.
+    /// Serve this TUI in a web browser via ttyd and open it (loopback
+    /// unless --bind/--public widens it).
     Browser {
         /// Port for ttyd to listen on. Omit to take 7681 when it's free and
         /// a free one otherwise — so a checkout per worktree can each serve
@@ -79,6 +81,25 @@ enum Command {
         /// explicitly is used or the command fails.
         #[arg(long)]
         port: Option<u16>,
+        /// Address to listen on (default 127.0.0.1). Name a specific
+        /// interface address to reach this nebula from another host —
+        /// e.g. `--bind 10.0.1.7`. See --public for every interface.
+        #[arg(long, value_name = "ADDR", conflicts_with = "public")]
+        bind: Option<std::net::IpAddr>,
+        /// Listen on every interface (0.0.0.0), for a nebula on a remote
+        /// box. This serves a live, writable terminal to anything that can
+        /// reach the port — put a firewall, security group, or VPN in front
+        /// of it, and consider --credential.
+        #[arg(long)]
+        public: bool,
+        /// HTTP basic auth for the served terminal, as USER:PASSWORD.
+        #[arg(long, value_name = "USER:PASSWORD")]
+        credential: Option<String>,
+        /// Serve the URL but do not hand it to a desktop browser — for a
+        /// machine with no desktop to open it on (`nebula tunnel` runs the
+        /// remote half this way).
+        #[arg(long)]
+        no_open: bool,
     },
     /// Open nebula on a remote host over ssh (installs it there if missing).
     Ssh {
@@ -86,6 +107,24 @@ enum Command {
         host: String,
         /// Remote directory to start in (default: remote $HOME).
         path: Option<String>,
+    },
+    /// Open a remote host's nebula in a browser tab here, over an ssh tunnel
+    /// (installs nebula there if missing; needs ttyd on the remote). The
+    /// remote serves on its own loopback only — the tunnel is the way in.
+    Tunnel {
+        /// ssh destination, passed verbatim (e.g. user@server).
+        host: String,
+        /// Remote directory to start in (default: remote $HOME).
+        path: Option<String>,
+        /// Local end of the tunnel, and the port the browser opens. Omit to
+        /// take 7681 when it is free and a free port otherwise; `--port 0`
+        /// always picks a free one.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Port the remote serves on (default: the same number as --port).
+        /// Name one when something on the remote already holds that port.
+        #[arg(long, value_name = "PORT")]
+        remote_port: Option<u16>,
     },
     /// Install the latest published nebula over this one.
     Upgrade {
@@ -147,8 +186,36 @@ fn main() -> Result<()> {
         Some(Command::Kill) => nebula_tui::run_kill(),
         Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),
         Some(Command::Worktree { name, base }) => nebula_tui::run_worktree(name.join(" "), base),
-        Some(Command::Browser { port }) => browser::run_browser(port),
+        Some(Command::Browser {
+            port,
+            bind,
+            public,
+            credential,
+            no_open,
+        }) => browser::run_browser(browser::BrowserOpts {
+            port,
+            // --public is --bind 0.0.0.0 with a name; clap keeps the two
+            // from being given at once.
+            bind: bind.unwrap_or(if public {
+                browser::PUBLIC_BIND
+            } else {
+                browser::DEFAULT_BIND
+            }),
+            credential,
+            open: !no_open,
+        }),
         Some(Command::Ssh { host, path }) => ssh::run_ssh(&host, path.as_deref()),
+        Some(Command::Tunnel {
+            host,
+            path,
+            port,
+            remote_port,
+        }) => tunnel::run_tunnel(tunnel::TunnelOpts {
+            host,
+            path,
+            port,
+            remote_port,
+        }),
         Some(Command::Upgrade { force }) => upgrade::run_upgrade(force),
         Some(Command::StaleDaemonNote) => {
             if nebula_daemon::lifecycle::daemon_is_stale() {

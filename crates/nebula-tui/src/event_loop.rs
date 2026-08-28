@@ -1154,19 +1154,24 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     }
 
     // Terminal input-locked with a live session: forward everything except
-    // the escape hatches. Merely focusing the pane (Tab / Ctrl+arrows) does
-    // not lock — Enter does — so an unlocked pane falls through to panel
-    // navigation and the user is never trapped.
+    // the escape hatches. Enter and the panel walk (Tab / ^⇧L forward,
+    // ⇧Tab / ^⇧H wrapping round from the first panel) lock; Ctrl+→ is the
+    // way to stand in the pane without locking, and an unlocked pane falls
+    // through to panel navigation, so the user always has a way back that
+    // isn't a hatch.
     if app.focus == Focus::Terminal && app.term.is_some() && app.term_locked {
         // Ctrl+q is the primary hatch: a plain control byte (0x11) that
         // every emulator delivers — Terminal.app included, no kitty protocol
         // needed — unbound in macOS and unused by Claude Code. The inner
         // session loses XON (unfreeze after an accidental Ctrl+S), which
         // nobody will miss.
-        // Fallback hatches: Ctrl+] (telnet's escape char — byte 0x1D, which
-        // crossterm spells Ctrl+5 in legacy mode), Ctrl+Esc (kitty-only),
-        // and Ctrl+← (stolen by Mission Control on stock macOS).
-        // All four are rebindable in Settings → Hotkeys, but Ctrl+q stays
+        // Fallback hatches: Ctrl+Shift+H (the walk-back-a-panel key, which
+        // doubles as the way out of a locked pane — needs the kitty
+        // protocol, so Ghostty/kitty only, never Terminal.app), Ctrl+]
+        // (telnet's escape char — byte 0x1D, which crossterm spells Ctrl+5
+        // in legacy mode), Ctrl+Esc (kitty-only), and Ctrl+← (stolen by
+        // Mission Control on stock macOS).
+        // All five are rebindable in Settings → Hotkeys, but Ctrl+q stays
         // wired in on top of whatever is bound: unbinding your way out of
         // a locked session would trap you in it with no way back.
         let chord = crate::keymap::KeyChord::from_event(&key);
@@ -1268,27 +1273,32 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             app.splash_preview = true;
             app.collapsed = false;
         }
-        // The Workspaces bar is in the Tab walk only while it's shown
-        // (`first_focus`); hidden, the walk starts and stops at Projects.
-        Action::FocusNext => {
-            app.focus = match app.focus {
-                Focus::Workspaces => Focus::Projects,
-                Focus::Projects => Focus::Worktrees,
-                Focus::Worktrees => Focus::Sessions,
-                Focus::Sessions => Focus::Terminal,
-                Focus::Terminal => app.first_focus(),
-            }
-        }
-        Action::FocusPrev => {
-            app.focus = match app.focus {
-                Focus::Workspaces => Focus::Terminal,
-                Focus::Projects if app.show_workspaces => Focus::Workspaces,
-                Focus::Projects => Focus::Terminal,
-                Focus::Worktrees => Focus::Projects,
-                Focus::Sessions => Focus::Worktrees,
-                Focus::Terminal => Focus::Sessions,
-            }
-        }
+        // Tab / ^⇧L walk forward and stop dead at the terminal pane —
+        // leaning on the key can't spill past the pane and back round to
+        // the Workspaces bar. Landing on the pane takes the input lock:
+        // walking that far means the user is going to type at the agent,
+        // and the preview under the Sessions cursor is already the session
+        // they picked.
+        Action::FocusNext => match app.focus {
+            Focus::Workspaces => app.focus = Focus::Projects,
+            Focus::Projects => app.focus = Focus::Worktrees,
+            Focus::Worktrees => app.focus = Focus::Sessions,
+            Focus::Sessions | Focus::Terminal => enter_terminal_pane(app),
+        },
+        // ⇧Tab / ^⇧H walk back and stop dead at the first column — the
+        // Workspaces bar while it's shown, Projects when it's hidden.
+        // Neither wraps into the pane: ^⇧H is also the unlock hatch out of
+        // a locked pane, so a wrap made the key cycle first column → pane
+        // → Sessions → … → first column forever, with nothing to stop
+        // against. Forward (Tab / ^⇧L) is the way into the pane, and
+        // Ctrl+→ crosses into it without taking the input lock.
+        Action::FocusPrev => match app.focus {
+            Focus::Projects if app.show_workspaces => app.focus = Focus::Workspaces,
+            Focus::Workspaces | Focus::Projects => {}
+            Focus::Worktrees => app.focus = Focus::Projects,
+            Focus::Sessions => app.focus = Focus::Worktrees,
+            Focus::Terminal => app.focus = Focus::Sessions,
+        },
         // Inside the Workspaces bar, ←/→ walk the tabs rather than the
         // panels: the bar spans the top, so there is nothing horizontally
         // beside it to move to. j/↓ and Enter are the way out (below).
@@ -1389,12 +1399,8 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 None => app.focus = Focus::Sessions,
             },
             Focus::Sessions => attach_selected(app, out),
-            Focus::Terminal => {
-                // Lock input into an already-focused live pane.
-                if app.term.as_ref().is_some_and(|t| !t.exited) {
-                    app.term_locked = true;
-                }
-            }
+            // Lock input into an already-focused live pane.
+            Focus::Terminal => enter_terminal_pane(app),
         },
         // First run (or an empty workspace): with no visible projects every
         // panel is empty and the splash is up — New creates a project no
@@ -4689,6 +4695,17 @@ fn attach_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.term_locked = true;
 }
 
+/// Cross into the terminal pane and take the input lock, so what the user
+/// types after the walk reaches the agent instead of the panels. An empty
+/// or dead pane is focused but never locked: there is nothing to type into,
+/// and a lock would only send them hunting for an escape hatch.
+fn enter_terminal_pane(app: &mut App) {
+    app.focus = Focus::Terminal;
+    if app.term.as_ref().is_some_and(|t| !t.exited) {
+        app.term_locked = true;
+    }
+}
+
 /// Open a saved link in the browser, reporting either way — the browser
 /// comes up in front of the terminal, so a silent failure would read as
 /// "nebula did nothing". A pull request is marked read on the way out: the
@@ -5021,8 +5038,7 @@ fn copy_and_flash(app: &mut App, text: &str, label: &str) {
 /// Base64 (RFC 4648, padded) for OSC 52 payloads — one call site does not
 /// justify a dependency.
 fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let n = u32::from(chunk[0]) << 16
@@ -7294,6 +7310,95 @@ mod tests {
         assert!(app.overlay.is_none(), "h no longer opens the hosts picker");
     }
 
+    /// ^⇧L / ^⇧H are Tab / ⇧Tab under another name, in the one modifier
+    /// space Ghostty leaves alone (it claims only ctrl+shift+tab) — unlike
+    /// ⌘, which every macOS emulator either swallows or binds itself.
+    /// Needs the kitty protocol, so Ghostty/kitty yes, Terminal.app never.
+    /// Forward stops dead at the terminal pane; back stops dead at the
+    /// first column — the workspaces bar when shown, Projects when hidden.
+    /// Neither direction wraps. Landing on a live pane forward takes input.
+    #[test]
+    fn ctrl_shift_hl_walk_stops_at_the_pane_forward_and_the_first_column_back() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        let cs = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        let fwd = move |app: &mut App, out: &mut Vec<ClientRequest>| {
+            press(app, KeyCode::Char('L'), cs, out)
+        };
+        let back = move |app: &mut App, out: &mut Vec<ClientRequest>| {
+            press(app, KeyCode::Char('H'), cs, out)
+        };
+
+        // Nothing in the pane yet, so the far end is reachable twice over
+        // without the input lock swallowing the second press.
+        assert!(app.term.is_none());
+        app.focus = Focus::Projects;
+        fwd(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Worktrees);
+        fwd(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Sessions);
+        fwd(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Terminal);
+        fwd(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Terminal, "stops at the pane, no wrap");
+        assert!(!app.term_locked, "an empty pane is focused, never locked");
+
+        back(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Sessions);
+        back(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Worktrees);
+        back(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Projects);
+        back(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Workspaces);
+        back(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Workspaces, "stops at the bar, no wrap");
+        assert!(app.overlay.is_none(), "no overlay claims ^⇧H / ^⇧L");
+
+        // With a live session in the pane, arriving there — by either
+        // walk — hands it the keyboard: the whole point is to end up
+        // typing at the agent. ^⇧H is then the hatch back out.
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            80,
+            24,
+        ));
+        app.focus = Focus::Sessions;
+        fwd(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked, "landing on a live pane takes input");
+        back(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Sessions, "^⇧H is the hatch out");
+        assert!(!app.term_locked);
+
+        // The loop this stop exists to kill: with the pane live, wrapping
+        // off the bar landed in it locked, where ^⇧H is the unlock hatch —
+        // so the key walked bar → pane → Sessions → … → bar forever.
+        // Leaning on it at the top must now sit still and keep the pane
+        // untouched.
+        app.focus = Focus::Workspaces;
+        for _ in 0..4 {
+            back(&mut app, &mut out);
+            assert_eq!(app.focus, Focus::Workspaces, "^⇧H cannot cycle off the bar");
+            assert!(!app.term_locked, "and never steals the pane's input lock");
+        }
+
+        // Bar toggled away: Projects is the first column, so the walk
+        // back stops there too and the same lean can't fall into the pane.
+        app.show_workspaces = false;
+        app.focus = Focus::Projects;
+        for _ in 0..4 {
+            back(&mut app, &mut out);
+            assert_eq!(
+                app.focus,
+                Focus::Projects,
+                "bar hidden: ^⇧H stops at the projects list"
+            );
+            assert!(!app.term_locked, "and never grabs the pane's input lock");
+        }
+    }
+
     #[test]
     fn shift_l_adds_a_link_to_the_selected_worktree() {
         let mut app = App::new();
@@ -8719,12 +8824,14 @@ diff --git a/src/b.rs b/src/b.rs
                     pid: 10,
                     rss_bytes: 700 * 1024 * 1024,
                     procs: 3,
+                    prewarm: None,
                 },
                 SessionMetrics {
                     session: SessionRef::Terminal(TerminalId("t1".into())),
                     pid: 11,
                     rss_bytes: 24 * 1024 * 1024,
                     procs: 2,
+                    prewarm: None,
                 },
             ],
         });
@@ -10640,6 +10747,43 @@ diff --git a/src/b.rs b/src/b.rs
             assert!(!app.term_locked, "Ctrl+{code:?} clears the input lock");
             assert!(out.is_empty(), "Ctrl+{code:?} must not reach the pty");
         }
+
+        // Ctrl+Shift+H is the same key that walks back a panel when nothing
+        // is locked, so inside a locked session it means the same thing:
+        // leave. Kitty-protocol emulators only — crossterm may spell it
+        // either as 'H' or as shift + 'h', and `from_event` folds both.
+        for code in [KeyCode::Char('H'), KeyCode::Char('h')] {
+            app.focus = Focus::Terminal;
+            app.term_locked = true;
+            handle_key(
+                &mut app,
+                KeyEvent::new(code, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+                &mut out,
+            );
+            assert_eq!(
+                app.focus,
+                Focus::Sessions,
+                "Ctrl+Shift+{code:?} leaves terminal input"
+            );
+            assert!(!app.term_locked, "Ctrl+Shift+{code:?} clears the lock");
+            assert!(out.is_empty(), "Ctrl+Shift+{code:?} must not reach the pty");
+        }
+
+        // Ctrl+Shift+L is not a hatch — it walks forward, and forward from a
+        // locked pane is nowhere. It stays in the session.
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        handle_key(
+            &mut app,
+            KeyEvent::new(
+                KeyCode::Char('L'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            &mut out,
+        );
+        assert_eq!(app.focus, Focus::Terminal, "Ctrl+Shift+L does not escape");
+        assert!(app.term_locked, "Ctrl+Shift+L keeps the input lock");
+        out.clear();
 
         // Bare Esc is NOT a hatch: it forwards to the pty untouched — Claude
         // Code owns Esc (interrupt) and double-Esc (clear input / jump back).
@@ -14038,7 +14182,10 @@ diff --git a/src/b.rs b/src/b.rs
             press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE, &mut out);
             assert_eq!(app.keymap.label(crate::keymap::Action::FocusNext), "—");
             press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
-            assert_eq!(app.keymap.label(crate::keymap::Action::FocusNext), "Tab");
+            assert_eq!(
+                app.keymap.label(crate::keymap::Action::FocusNext),
+                "Tab ^⇧L"
+            );
             assert!(
                 crate::config::Config::load().keybindings.is_empty(),
                 "back to the default = nothing left to write down"
@@ -14055,7 +14202,10 @@ diff --git a/src/b.rs b/src/b.rs
             open_settings_on(&mut app, crate::config::hotkeys_tab(), &mut out);
             press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::F(7), KeyModifiers::NONE, &mut out);
-            assert_eq!(app.keymap.label(crate::keymap::Action::FocusNext), "Tab F7");
+            assert_eq!(
+                app.keymap.label(crate::keymap::Action::FocusNext),
+                "Tab ^⇧L F7"
+            );
         });
     }
 
@@ -14071,7 +14221,10 @@ diff --git a/src/b.rs b/src/b.rs
             matches!(app.overlay, Some(Overlay::Settings(_))),
             "Esc left the capture, not the overlay"
         );
-        assert_eq!(app.keymap.label(crate::keymap::Action::FocusNext), "Tab");
+        assert_eq!(
+            app.keymap.label(crate::keymap::Action::FocusNext),
+            "Tab ^⇧L"
+        );
     }
 
     /// A capture swallows the overlay's own keys — otherwise half the
@@ -14321,6 +14474,7 @@ diff --git a/src/b.rs b/src/b.rs
                         pid: 4321,
                         rss_bytes: 1_610_612_736, // 1.5 GB
                         procs: 3,
+                        prewarm: None,
                     }],
                 },
             },
@@ -14364,6 +14518,111 @@ diff --git a/src/b.rs b/src/b.rs
         assert!(app.overlay.is_none());
     }
 
+    /// Prewarm-pool spares have no agent row; without the home the daemon
+    /// reports they'd render as "(unknown agent)". They group under one
+    /// header as a small tree, named by kind/model and placed by worktree,
+    /// with their own rollup line — and stay out of the live-agent counts.
+    #[test]
+    fn metrics_groups_prewarm_spares_under_their_own_header() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('M'), KeyModifiers::SHIFT, &mut out);
+        let req_id = match out.last() {
+            Some(ClientRequest::GetMetrics { req_id }) => *req_id,
+            other => panic!("expected GetMetrics, got {other:?}"),
+        };
+        let spare =
+            |id: &str, pid: u32, mb: u64, model: Option<&str>| nebula_core::SessionMetrics {
+                session: SessionRef::Agent(AgentId(id.into())),
+                pid,
+                rss_bytes: mb * 1024 * 1024,
+                procs: 3,
+                prewarm: Some(nebula_core::PrewarmInfo {
+                    worktree: nebula_core::WorktreeId("w1".into()),
+                    kind: nebula_core::AgentKind::Claude,
+                    model: model.map(str::to_string),
+                }),
+            };
+        hse(
+            &mut app,
+            ServerEvent::Metrics {
+                req_id,
+                snapshot: nebula_core::MetricsSnapshot {
+                    daemon_pid: 42,
+                    daemon_rss_bytes: 40 * 1024 * 1024,
+                    system_total_bytes: 0,
+                    sessions: vec![
+                        nebula_core::SessionMetrics {
+                            session: SessionRef::Agent(AgentId("a1".into())),
+                            pid: 4321,
+                            rss_bytes: 500 * 1024 * 1024,
+                            procs: 4,
+                            prewarm: None,
+                        },
+                        spare("warm-1", 7001, 300, Some("opus")),
+                        spare("warm-2", 7002, 250, None),
+                    ],
+                },
+            },
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            !text.contains("(unknown agent)"),
+            "spares are named, not unknown:\n{text}"
+        );
+        assert!(
+            text.contains("1 session · 4 procs"),
+            "claude rollup counts live sessions only:\n{text}"
+        );
+        assert!(
+            text.contains("2 spares · 6 procs · pre-booted for new agents"),
+            "spares get their own rollup line:\n{text}"
+        );
+        let pos = |s: &str| {
+            text.find(s)
+                .unwrap_or_else(|| panic!("{s} missing:\n{text}"))
+        };
+        assert!(
+            pos("agent-1 (claude)") < pos("warm spares (2)")
+                && pos("warm spares (2)") < pos("├ claude · opus")
+                && pos("├ claude · opus") < pos("└ claude")
+                && pos("└ claude") < pos("nebula daemon"),
+            "live rows, then the spares tree, then nebula's own:\n{text}"
+        );
+        let leaf = text
+            .lines()
+            .find(|l| l.contains("├ claude · opus"))
+            .expect("spare row");
+        assert!(
+            leaf.contains("demo/main") && leaf.contains("7001") && leaf.contains("300 MB"),
+            "a spare is placed in its worktree with its own reading: {leaf}"
+        );
+        let header = text
+            .lines()
+            .find(|l| l.contains("warm spares (2)"))
+            .expect("header row");
+        assert!(
+            header.contains("550 MB") && !header.contains("7001"),
+            "the header sums its spares and points at no pid: {header}"
+        );
+
+        // Enter on a spare opens nothing: there's no agent row to attach
+        // until a CreateAgent adopts it.
+        let Some(Overlay::Metrics(view)) = &mut app.overlay else {
+            panic!("metrics closed");
+        };
+        view.selected = 2;
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Metrics(_))) && out.is_empty(),
+            "a spare row is inert: {out:?}"
+        );
+    }
+
     #[test]
     fn metrics_enter_opens_selected_session() {
         let mut app = App::new();
@@ -14384,6 +14643,7 @@ diff --git a/src/b.rs b/src/b.rs
                 pid: 4321,
                 rss_bytes: 2048,
                 procs: 1,
+                prewarm: None,
             }],
         };
         hse(
@@ -16076,11 +16336,50 @@ diff --git a/src/b.rs b/src/b.rs
             let text = buffer_text(&terminal);
             let lines: Vec<&str> = text.lines().collect();
             assert!(
-                lines[1].starts_with("   PROJECTS"),
-                "hidden: projects take the top row:\n{text}"
+                lines[1].starts_with("   DEFAULT"),
+                "hidden: the projects column takes the top row, under the \
+                 open workspace's name:\n{text}"
             );
             assert!(!text.contains("WORKSPACES"), "{text}");
         });
+    }
+
+    /// Hiding the bar leaves nothing on screen naming the open workspace,
+    /// so the Projects header takes the job: `PROJECTS` becomes the
+    /// workspace's own name, it retitles on a switch, and showing the bar
+    /// again hands the header back.
+    #[test]
+    fn a_hidden_bar_moves_the_workspace_name_onto_the_projects_header() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_default_workspace(&mut app);
+        seed_other_workspace(&mut app);
+        let mut out = Vec::new();
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        let draw = |app: &mut App, terminal: &mut Terminal<TestBackend>| {
+            terminal.draw(|f| ui::draw(f, app)).unwrap();
+            buffer_text(terminal)
+        };
+
+        app.show_workspaces = false;
+        let text = draw(&mut app, &mut terminal);
+        assert!(
+            text.contains("DEFAULT \u{b7} 1"),
+            "the header names the open workspace, count intact:\n{text}"
+        );
+        assert!(!text.contains("PROJECTS"), "{text}");
+
+        switch_workspace(&mut app, nebula_core::WorkspaceId("ws2".into()), &mut out);
+        let text = draw(&mut app, &mut terminal);
+        assert!(text.contains("CLIENT"), "a switch retitles it:\n{text}");
+        assert!(!text.contains("DEFAULT"), "{text}");
+
+        // Shown again, the bar names the workspace and the column goes back
+        // to naming itself.
+        app.show_workspaces = true;
+        let text = draw(&mut app, &mut terminal);
+        assert!(text.contains("PROJECTS"), "{text}");
+        assert!(text.contains("WORKSPACES"), "{text}");
     }
 
     /// The bar lists every workspace with the rollup of the agents under
@@ -16434,9 +16733,11 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(app.splitter_x(0), 20);
     }
 
-    /// Tab / Shift+Tab walk through the bar only while it's shown. ← and →
-    /// never reach it — it is above the panels, not beside them — so inside
-    /// the bar they walk the tabs instead, and ↓ is the way out.
+    /// Tab / Shift+Tab walk through the bar only while it's shown. The walk
+    /// back stops dead at whichever column is first — the bar, or Projects
+    /// when it's hidden. ← and → never reach the bar at
+    /// all — it is above the panels, not beside them — so inside it they
+    /// walk the tabs instead, and ↓ is the way out.
     #[test]
     fn focus_walk_includes_the_workspaces_bar_only_when_shown() {
         let mut app = App::new();
@@ -16465,9 +16766,16 @@ diff --git a/src/b.rs b/src/b.rs
             "↓ steps out of the bar"
         );
         assert_eq!(go(&mut app, &mut out, KeyCode::BackTab), Focus::Workspaces);
-        assert_eq!(go(&mut app, &mut out, KeyCode::BackTab), Focus::Terminal);
-        assert_eq!(go(&mut app, &mut out, KeyCode::Tab), Focus::Workspaces);
-        assert_eq!(go(&mut app, &mut out, KeyCode::Tab), Focus::Projects);
+        assert_eq!(
+            go(&mut app, &mut out, KeyCode::BackTab),
+            Focus::Workspaces,
+            "shown: the walk back stops dead on the bar"
+        );
+        assert_eq!(
+            go(&mut app, &mut out, KeyCode::Tab),
+            Focus::Projects,
+            "and forward steps down out of it"
+        );
 
         app.show_workspaces = false;
         app.focus = Focus::Projects;
@@ -16476,8 +16784,11 @@ diff --git a/src/b.rs b/src/b.rs
             Focus::Projects,
             "hidden: ← stops"
         );
-        assert_eq!(go(&mut app, &mut out, KeyCode::BackTab), Focus::Terminal);
-        assert_eq!(go(&mut app, &mut out, KeyCode::Tab), Focus::Projects);
+        assert_eq!(
+            go(&mut app, &mut out, KeyCode::BackTab),
+            Focus::Projects,
+            "hidden: Projects is the first column, so the walk back stops there"
+        );
     }
 
     /// n / r / d in the bar act on the open workspace the way the

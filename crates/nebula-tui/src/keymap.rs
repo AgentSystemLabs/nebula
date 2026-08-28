@@ -135,19 +135,19 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::FocusNext,
         id: "focus_next",
         label: "Next panel",
-        hint: "Cycle focus forward: projects → worktrees → sessions → terminal",
+        hint: "Walk focus forward: projects → worktrees → sessions → terminal, where it stops and takes input (^⇧L needs the kitty protocol)",
         group: "NAVIGATE",
         scope: Scope::Global,
-        defaults: &["tab"],
+        defaults: &["tab", "ctrl+shift+l"],
     },
     ActionSpec {
         action: Action::FocusPrev,
         id: "focus_prev",
         label: "Previous panel",
-        hint: "Cycle focus backward through the panels",
+        hint: "Walk focus back through the panels, stopping at the first column — the workspaces bar, or Projects while the bar is hidden (^⇧H needs the kitty protocol)",
         group: "NAVIGATE",
         scope: Scope::Global,
-        defaults: &["shift+tab"],
+        defaults: &["shift+tab", "ctrl+shift+h"],
     },
     ActionSpec {
         action: Action::FocusLeft,
@@ -403,7 +403,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         hint: "Leave the locked pane and go back to the panels (^q always works)",
         group: "TERMINAL",
         scope: Scope::Terminal,
-        defaults: &["ctrl+q", "ctrl+]", "ctrl+esc", "ctrl+left"],
+        defaults: &["ctrl+q", "ctrl+shift+h", "ctrl+]", "ctrl+esc", "ctrl+left"],
     },
     // ---- GENERAL ----
     ActionSpec {

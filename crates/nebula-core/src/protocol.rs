@@ -330,6 +330,20 @@ pub struct SessionMetrics {
     pub rss_bytes: u64,
     /// Live processes in the subtree, the root included.
     pub procs: u32,
+    /// Set when the session is a prewarm-pool spare: an agent CLI the
+    /// daemon booted ahead of time for this worktree, waiting for the next
+    /// new-agent request there to adopt it. It has no agent row yet, so
+    /// this is the only handle a client has for naming and placing it.
+    #[serde(default)]
+    pub prewarm: Option<PrewarmInfo>,
+}
+
+/// Where a prewarm-pool spare is homed and what it booted as.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrewarmInfo {
+    pub worktree: WorktreeId,
+    pub kind: AgentKind,
+    pub model: Option<String>,
 }
 
 /// Daemon-side half of the metrics modal's data; the client stacks its own

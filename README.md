@@ -78,7 +78,9 @@ nebula
 
 Four columns, left to right: **Projects → Worktrees → Sessions → Terminal**. `Tab` / `Shift+Tab` (or
 `h` / `l`, or `←` / `→`) move focus between columns, `j` / `k` move the selection inside one, and `Enter`
-drills in.
+drills in. `Tab` stops at the terminal pane rather than wrapping back round to the first column, and `Shift+Tab`
+stops at the first column rather than wrapping into the pane — neither direction cycles. Landing on a
+live pane hands it the keyboard, so `Tab` all the way right and start typing at the agent.
 With no projects yet you get the splash instead — press `n` to add one without leaving the TUI.
 
 **3. Choose where the agent runs.** Select your project, then a worktree. Every project starts with one:
@@ -252,8 +254,8 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 
 | Context | Key | Action |
 |---|---|---|
-| Panels | `Tab`/`Shift+Tab`, `h/l` or `←/→`, `j/k` | move focus / selection |
-| Panels | `Ctrl+→` | cross into the terminal pane without attaching (plain `l`/`→` stops at Sessions) |
+| Panels | `Tab`/`Shift+Tab`, `h/l` or `←/→`, `j/k` | move focus / selection — the walk stops at both ends (`Tab` at the terminal pane, `Shift+Tab` at the first column) instead of cycling, and landing on a live pane takes its input |
+| Panels | `Ctrl+→` | cross into the terminal pane *without* taking its input (`Tab` takes it; plain `l`/`→` stops at Sessions) |
 | Panels | `Enter` | drill in; on a session: attach |
 | Any panel | `/` | fuzzy jump across every workspace, project, worktree and session — in *every* workspace, each row pathed `workspace/project/branch/session`, so typing another workspace's name jumps you into it (`Ctrl+n/p` move, `Ctrl+o` opens the hit, `Ctrl+f` just lands the selection on it) |
 | Projects | `n` / `d` | add project / remove from list |
@@ -278,7 +280,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Any panel | `Shift+W` | show / hide the Workspaces bar across the top: `WORKSPACES` on the left, directly above `PROJECTS`, and one tab per workspace to its right with the rolled-up status of the agents under it (plus a count of the ones that finished unread), so a run in a workspace you don't have open still shows at the top level. The choice is remembered — it's the `Workspaces bar` setting, also in Settings → Appearance |
 | Any panel | `1`–`9` (or `⌘1`–`⌘9`) | open that numbered tab in the Workspaces bar without leaving the panel you're in. `⌘` is what the tabs advertise, but Terminal.app and most other emulators never encode it into pty bytes — the bare digit is the one that always arrives. Rebindable per slot in Settings → Hotkeys |
 | Workspaces | `←/→`, `↓`/`Enter`, `n`/`r`/`d`, `m` | the cursor is the open workspace, so `←/→` switches; `↓` or `Enter` steps down into Projects; create / rename / delete the open one (delete asks first, and refuses a non-empty workspace); `m` or right-click lists the same verbs |
-| Any panel | `Shift+H` | ssh hosts: every `nebula ssh` destination, newest first. `Enter`/click reconnects (quits this TUI and execs a fresh `nebula ssh` — local sessions keep running), `a` types a new `user@host [dir]`, `d` removes |
+| Any panel | `Shift+H` | ssh hosts: every `nebula ssh` / `nebula tunnel` destination, newest first. `Enter`/click reconnects (quits this TUI and execs a fresh `nebula ssh` — local sessions keep running), `a` types a new `user@host [dir]`, `d` removes |
 | Any panel | `m` or right-click | context menu |
 | Any panel | `z` | full-screen terminal: collapse the sidebars and lock input into the attached session |
 | Any panel | `s` | settings overlay (theme, editor, agent defaults, timeouts) — its Hotkeys tab rebinds every key in this table; `R` inside it resets everything to the defaults (with a confirmation) |
@@ -320,11 +322,26 @@ nebula workspace rename <a> <b> # rename a workspace
 nebula workspace delete <name>  # delete an empty workspace
 nebula ssh <host> [dir]   # open nebula on a remote machine over ssh (installs it there if
                           # missing); destinations are remembered for the TUI's `h` picker
-nebula browser [--port N] # serve this TUI in a browser tab via ttyd (loopback only) and open
-                          # it; needs ttyd on PATH. With no --port it takes 7681 when that's
-                          # free and a free port otherwise, saying which — so one per checkout
-                          # can serve at once. --port 0 always picks a free one; --port N is
-                          # that port or an error, which is what you want behind an ssh tunnel
+nebula tunnel <host> [dir] [--port N] [--remote-port N]
+                          # that host's nebula in a browser tab here, over one ssh tunnel: installs
+                          # nebula there if missing, runs `nebula browser` on its loopback, forwards
+                          # the port, and opens the local URL. Nothing is exposed on the remote's
+                          # network — the tunnel is the only way in — so it needs no --credential.
+                          # Needs ttyd on the remote; Ctrl+C takes both ends down. --port is the
+                          # local end (same rules as `nebula browser`), --remote-port the far end
+                          # when something there already holds that number
+nebula browser [--port N] [--bind ADDR | --public] [--credential USER:PASSWORD] [--no-open]
+                          # serve this TUI in a browser tab via ttyd and open it; needs ttyd on
+                          # PATH. With no --port it takes 7681 when that's free and a free port
+                          # otherwise, saying which — so one per checkout can serve at once.
+                          # --port 0 always picks a free one; --port N is that port or an error,
+                          # which is what you want behind an ssh tunnel. Listens on 127.0.0.1
+                          # unless --bind names an interface address or --public takes them all
+                          # (0.0.0.0) — for a nebula on a remote box, where the access control
+                          # is the firewall/security group in front of the port. That serves a
+                          # live, writable terminal, so put something in front of it and use
+                          # --credential to add ttyd's HTTP basic auth on top. --no-open serves
+                          # without launching a desktop browser, for a box that has none
 nebula upgrade            # install the latest release (--force on a dev build)
 ```
 

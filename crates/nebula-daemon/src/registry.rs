@@ -8,9 +8,9 @@ use crate::status::{AgentStatusMachine, Effect, HookEvent};
 use crate::store::Store;
 use anyhow::{bail, Context, Result};
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, EnterOutcome, Entity, EntityId, Link, LinkId, Project,
-    ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree,
-    WorktreeId, MAX_CLOUD_PROMPT_BYTES,
+    Agent, AgentId, AgentKind, AgentStatus, EnterOutcome, Entity, EntityId, Link, LinkId,
+    PrewarmInfo, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Workspace,
+    WorkspaceId, Worktree, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -278,13 +278,41 @@ impl Daemon {
         self.sessions.lock().unwrap().contains_key(sref)
     }
 
-    /// (session, child pid) for every live PTY — the metrics reading's input.
-    pub fn session_pids(&self) -> Vec<(SessionRef, u32)> {
+    /// (session, child pid, prewarm-pool home) for every live PTY — the
+    /// metrics reading's input. A pool spare has no agent row, so the only
+    /// way a client can name or place it is the home reported here.
+    pub fn session_pids(&self) -> Vec<(SessionRef, u32, Option<PrewarmInfo>)> {
+        // Snapshot the pool first and drop its lock: `prewarm_agent` holds
+        // the pool lock while it asks the sessions map, so the two are
+        // never held together here in the other order.
+        let prewarmed: HashMap<AgentId, PrewarmInfo> = self
+            .prewarmed
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((worktree, kind), e)| {
+                (
+                    e.agent_id.clone(),
+                    PrewarmInfo {
+                        worktree: worktree.clone(),
+                        kind: *kind,
+                        model: e.model.clone(),
+                    },
+                )
+            })
+            .collect();
         self.sessions
             .lock()
             .unwrap()
             .iter()
-            .filter_map(|(sref, s)| s.child_pid.map(|pid| (sref.clone(), pid)))
+            .filter_map(|(sref, s)| {
+                let pid = s.child_pid?;
+                let prewarm = match sref {
+                    SessionRef::Agent(id) => prewarmed.get(id).cloned(),
+                    SessionRef::Terminal(_) => None,
+                };
+                Some((sref.clone(), pid, prewarm))
+            })
             .collect()
     }
 
