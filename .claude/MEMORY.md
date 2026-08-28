@@ -63,6 +63,14 @@ the three key-name fns; `ipc::await_ack`/`current_agent_id`/`RenameMode`; `pull_
   that shadowed the new free fn silently — grep for the name before adding a test helper.
 - A worktree-isolated agent's Bash refuses `for` loops, heredocs and `&&` chains ("too complex to verify
   it stays inside the worktree") — write the script with the Write tool and run it as one command.
+- **Parallel dedup agents dedupe past each other.** The event-loop agent wrote `step_selection`/
+  `clamp_index`/`home_dir` while the tui agent wrote `app::clamp_selection` and app.rs already had
+  `home()`; `pr_preview::fit` and `grep_search`'s git call survived as third copies of `truncate` and
+  `git_diff::run_git`. A `/code-review main high` pass caught all of it — budget one after any fan-out.
+- A `COALESCE(workspace_id, ?1)` inside a shared `*_COLUMNS` const made every query using it bind a
+  hidden first parameter (`get_project` had to number its id `?2`); rusqlite only checks bind *counts*,
+  so a future `WHERE workspace_id = ?1` would silently COALESCE NULL rows into the queried workspace.
+  Select the bare column and apply `DEFAULT_WORKSPACE_ID` in `row_to_project` instead.
 
 ### The Root Worktree Row's Lower Half Wasn't Clickable — 2026-08-27
 
