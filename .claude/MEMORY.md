@@ -262,6 +262,25 @@ serde bools, layout/focus arithmetic, no new `ClientRequest`, no path or process
 - The dedup pass left clippy at zero warnings; the "pre-existing warnings" the PR description mentions are gone,
   so a warning after a merge with main is yours.
 
+**Follow-up (2026-08-28):** "fix the conflicts on the pr in a worktree and push" (a PR SESSION off the PROJECT
+OPEN PRS GROUP row; → refined: merge `origin/main` into `lnmunhoz:toggle-column` in a dedicated WORKTREE, keep
+the PR's behavior, fmt/clippy/test green, push to the fork). PR #20 had gone CONFLICTING again once v0.15.0
+and the PR SESSION work landed. This time the branch was checked out via nebula's own WORKTREE DIR rather
+than a scratch `git worktree add`: `git fetch origin pull/20/head:toggle-column` (local branch named after
+the fork's head ref) → `nebula worktree toggle-column` adopts the existing branch and relocates the session
+→ `git merge origin/main` → resolve → `cargo fmt` / `clippy -D warnings` / `test --workspace` (741 green)
+→ `git commit -F` → `git push git@github.com:lnmunhoz/nebula.git HEAD:toggle-column` (merge `7c46cb8`) →
+`MERGEABLE CLEAN` within 10 s. No worktree cleanup needed; it is a real WORKTREE row.
+- **Round two of a long-lived PR conflicts on the SELF-IMPROVING LOOP's files, not the code.** Every branch
+  prepends to `.claude/MEMORY.md` and edits `TERMS.md` rows, so `MEMORY.md` (keep both sides, PR entry
+  first), the `PROTOCOL VERSION` row (take main's number) and the three panel rows (merge column by
+  column: main's PROJECT OPEN PRS GROUP / WORKTREE OPEN PRS GROUP wording + the PR's `Config::hide_*`,
+  `Shift+P` / `Shift+B` cells) were the whole conflict; `app.rs`, `event_loop.rs`, `keymap.rs`, `ui.rs`
+  auto-merged clean.
+- `e2e_tui.rs` conflicted only because the PR's new `tui_hides_projects_and_worktrees_independently` sat
+  directly above the links test main deleted — the hunk carried the new test plus the dead test's doc
+  comment. Keep the test, drop the comment.
+
 ### The SESSIONS PANEL Shows OPEN PRS And Cannot Create LINKS — 2026-08-28
 
 **Asked:** "instead of it saying \"Links\" in the sessions list, just have it says OPEN PRS, and remove
