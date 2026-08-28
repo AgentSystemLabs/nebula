@@ -14,6 +14,205 @@ about what is worth recording.
 
 ## Entries
 
+### NEBULA TUNNEL Reuses A ttyd Already On The Remote Port — 2026-08-28
+
+**Asked:** "when I run nebula tunnel my console says port is already in use... figure out how to refactor
+so if nebula is already running, maybe skip certain tasks so it'll just work" (asked: which line →
+"port N is not free", i.e. the remote NEBULA BROWSER's clash) → refined: if a ttyd/NEBULA BROWSER already
+answers on the remote's 127.0.0.1:N, skip starting a second one and reuse it, keep the session open for
+the forward, open the local URL as usual; fresh-start path, loopback-only forward and Ctrl+C/hang-up
+teardown unchanged.
+
+**Did:** `crates/nebula/src/tunnel.rs`: new `reuse_existing_ttyd!()` shell fragment spliced into
+`REMOTE_SCRIPT` between the install prelude and the `--no-open` version gate: `curl -sI --max-time 2
+http://127.0.0.1:$2/ | grep -qi "^server: ttyd"` → print "a nebula browser is already serving on this
+host at port $2; reusing it" and `exec sleep 2147483647` so ssh's `-L` has something to reach and
+Ctrl+C / hang-up still ends the session. Tests: script-order assertions plus two that run `REMOTE_SCRIPT`
+under `sh -c` against a fake ttyd listener (`fake_ttyd`, answers 200 and 401 with ttyd's `server:`
+header) and against a free port (falls through to the gate, which a stub `nebula` fails). 17 unit +
+3 `tunnel_cli` tests green; also checked by hand against a real `ttyd -c u:p` (401 → reuse). Docs:
+ARCHITECTURE.md tunnel paragraph, README `nebula tunnel` block. Rejected: a new `nebula browser` flag
+for the probe (would re-trip the version gate on every remote that has today's nebula); auto-picking a
+different remote port (the `-L` remote end is fixed before the remote can choose, and a second ttyd
+was the thing to avoid).
+
+**Gotchas:**
+- ttyd sends `server: ttyd/1.7.7 (libwebsockets/…)` on every response, 401 included, so the header is
+  the identity check; `curl -sI` (HEAD) is enough and needs no body.
+- With `-tt` the remote's stderr rides the pty into ssh's *stdout*, not the stderr pipe
+  `forward_ssh_stderr` reads — the "reusing it" line reaches the console either way, but do not
+  expect it in that thread.
+- The behavioral tests must set `HOME` to a temp dir: the prelude prepends `$HOME/.local/bin`, and a
+  real nebula found there would pass the gate and `exec nebula browser` for real from inside a test.
+- `sleep infinity` is GNU-only; `sleep 2147483647` works on macOS, GNU and busybox.
+- The installed `~/.cargo/bin/nebula` (0.13.0) still has the old script; the user must reinstall to get
+  the reuse (and the shared tree has other sessions' uncommitted protocol changes — see "Shared tree
+  races"), so the install was left to them.
+
+### Prompt Daddy: One Rewrite, Ask Only For Missing Context, Log It And Go — 2026-08-28
+
+**Asked:** "update prompt doctor to not give 3 examples to pick from, instead it should just do it's best to
+rephrase the prompt and present questions if the original prompt seems to be lacking context to even convert
+it to a good prompt, if the original prompt doesn't have enough context to successfully implement the
+request, such as (who, what, when, where, why, how), then just ask the user for it and show them the final
+prompt in logs (do not ask if that prompt is ok, just assume it's good after we run it through prompt doctor
+and get some clarification."
+→ refined: Rewrite PROMPT DADDY so it produces one best rewrite in TERMS; ask — one `AskUserQuestion`, one
+question per gap — only for who/what/when/where/why/how the implementation hinges on; print the final
+prompt in the chat and proceed on it, never asking whether it is OK; update `CLAUDE.md`, OUTPUT DOCTOR,
+`TERMS.md` and the memory convention to match. (assumed: "in logs" = the chat stream)
+
+**Did:** Rewrote `.claude/skills/prompt-daddy/SKILL.md`. Steps 3–5 are now: a *decide whether to ask* test
+("a who/what/when/where/why/how the implementation hinges on that the prompt, MEMORY LOG, `TERMS.md` and
+one grep cannot fill" — the bar is *cannot implement without it*), one `AskUserQuestion` with one question
+per gap (header names the gap, options are the readings in TERMS, recommended first), one rewrite in the
+user's voice with filled judgments written as "(assuming …)" in parentheses, and a fixed log shape —
+`Refined prompt:` + the text as a `>` quote — after which work starts with no confirmation. The
+three-readings / Tight-Grounded-Staged split and the **Keep original** option are gone; a two-TERM alias
+is now a question's options instead of competing prompts. Headless: still rewrites and logs, questions
+become stated assumptions. Two worked examples (one that asks, one that does not). Mirrored: `CLAUDE.md`
+§ "Refine the prompt before acting on it" and the two-TERMS line in § "Before you start a task"; OUTPUT
+DOCTOR's `YOU ASKED` is now "the refined prompt `prompt-daddy` logged, verbatim" (a mid-task correction
+is applied to it; no **Keep original** / *Other* cases); the PROMPT DADDY and OUTPUT DOCTOR rows and the
+Alias index in `TERMS.md` ("prompt doctor" added as an alias). `AGENTS.md` never named the pick ("the
+prompt you worked from") and was left alone. The MEMORY LOG correction line is now `→ refined: ‹text›`
+plus `(asked: ‹gap› → ‹answer›)` per question, replacing `→ picked:`.
+
+**Gotchas:**
+- This prompt was itself refined the new way, not the old: running the three-option picker on "stop
+  giving me three options" would have been the wrong tool. When a prompt changes the protocol, apply the
+  protocol the prompt asks for.
+- **The prompt-refinement protocol lives in four places** — the skill, `CLAUDE.md` (two spots: the
+  two-TERMS line near the top and the "Refine the prompt" section), `output-doctor`'s `YOU ASKED` rules
+  (description + section), and `TERMS.md` (PROMPT DADDY row, OUTPUT DOCTOR row, Alias index). A behavior
+  change is all of them; grep `pick` afterwards to catch the strays.
+- The skill listing's description refreshed mid-session the moment the frontmatter was rewritten (same
+  live discovery the 2026-08-27 entry records) — the new description was in effect before `CLAUDE.md` was.
+- `.claude/MEMORY.md` is ~2800 lines against the skill's ~300-line pruning rule; not pruned here (shared
+  tree, out of scope) — whoever prunes should merge the four PROMPT DADDY / OUTPUT DOCTOR / PROJECT
+  TERMS entries first, they circle the same protocol.
+
+### NEBULA TUNNEL "Asks For A Password" Is ssh Login Auth, Not Nebula — 2026-08-28
+
+**Asked:** "when I run ssh tunnel, it seems to require a password? why is this? isn't a tunnel secure enough
+where I wouldn't need a password" → picked: Which password, and why — explain which layer prompts (ssh
+login / key passphrase / ttyd) and what setup stops it; change nothing.
+
+**Did:** Diagnosis only. NEBULA TUNNEL (`crates/nebula/src/tunnel.rs::spawn_ssh`) runs a plain
+`ssh -tt -o ExitOnForwardFailure=yes -L 127.0.0.1:L:127.0.0.1:R -- HOST 'sh -c …'` and its remote tail is
+`nebula browser --no-open --port R` with **no** `--credential`, so ttyd never asks and nebula supplies no
+password of its own. The prompt is OpenSSH's `user@host's password:` — publickey was refused by the remote
+and sshd fell back to password auth. The tunnel's security *is* that authentication; the forward only opens
+after it, so "the tunnel is secure" is the reason ssh insists on proving who you are, not a reason to skip it.
+Fix is on the ssh side: put the local pubkey in the remote's `~/.ssh/authorized_keys` (`ssh-copy-id`) or
+name the right key in `~/.ssh/config` (`IdentityFile`); `ssh -o BatchMode=yes HOST true` printing nothing is
+the check, and NEBULA TUNNEL / NEBULA SSH pass HOST verbatim so config aliases apply.
+
+**Gotchas:**
+- On this Mac all three keys (`id_ed25519`, `id_rsa`, `stn_ed25519`) are passphrase-free, there is no
+  `~/.ssh/config`, and the agent is empty — so ssh only offers the default-named keys. A box whose
+  `authorized_keys` holds `stn_ed25519.pub` (or a cloud `.pem`) gets password auth every time until an
+  `IdentityFile` line names it.
+- Could not verify live: both hosts in `known_hosts` (`107.21.158.162`, `10.0.0.213`) timed out /
+  "Host is down" on 2026-08-28, and no `ssh_hosts.json` exists in the DATA DIR or `~/.nebula-dev`.
+- ssh writes the password prompt to `/dev/tty`, so it shows even though NEBULA TUNNEL pipes ssh's stderr
+  through `forward_ssh_stderr`.
+- Follow-up: the user reported plain `ssh` to the same box works with a key, and asked whether the NEBULA
+  BROWSER `--bind`/`--public` work (commit `8698abf`) could be the cause. It cannot: those flags only widen
+  the bind and print a warning (`browser.rs::warn_if_exposed`), the tunnel's remote tail never passes them,
+  and nothing in any crate prompts for a password (`grep -rni password crates/*/src` → only the clap
+  `--credential` value name). Left open until the user reports the exact command and prompt text; the
+  discriminator is the tunnel's own ssh line with an `echo` tail (see the reply of 2026-08-28).
+
+### Finishing The Codex Session's OPEN PRS → Claude SESSION Launch — 2026-08-28
+
+**Asked:** "there is a codex session id of 01a046d2-b160-7800-9af2-1c403d000114 that never finished because I
+ran out of credits, please try to load that session and finish up the work on it" (headless — `prompt-daddy`
+skipped). The codex session's own prompt: "add the ability for a user to create sessions off of the open PRS
+rows, so they can create claude sessions which would already have a system prompt defining all work must be
+done on that PR already injected and include pr url".
+
+**Did:** The transcript is `~/.codex/sessions/<Y>/<M>/<D>/rollout-<stamp>-<session id>.jsonl` (JSONL;
+`payload.type` is `message` / `function_call` / `custom_tool_call_output` / `agent_message`; the final
+`task_complete` line carried `usage_limit_exceeded`). The feature was already built and green in the SHARED
+CHECKOUT when it died: `ClientRequest::CreatePrAgent` (`protocol.rs`, PROTOCOL VERSION 28 → 29), MIGRATION 22
+`agents.pr_url`, `store.rs::insert_agent_with_launch_context` / `agent_pr_url`, `registry.rs::
+claude_pr_system_prompt` + `validate_pr_url` composed into the one `--append-system-prompt` on every cold spawn
+and RESUME, PREWARM POOL adoption bypassed when `pr_url` is set, `server.rs` routing; TUI `n` / `m` /
+right-click on a PROJECT OPEN PRS row → `event_loop.rs::open_pr_agent_picker` (Claude only, in the ROOT
+WORKTREE) through the normal MODEL / EFFORT + name flow; README and ARCHITECTURE patched. Left undone and
+finished here: `cargo fmt --all`; the simplify review (its three sub-agents died on the limit — re-read the
+hunks by hand, nothing to change); the FOOTER and HELP OVERLAY hint for `n` on the PR row
+(`ui.rs::draw_footer_bar`, `ui.rs` WORKTREES help group); clippy — `agent_spawn_command_with` grew to 8 args
+(`#[allow(clippy::too_many_arguments)]`), plus five pre-existing rustc 1.92 lints in `e2e_tui.rs`,
+`e2e_pty.rs`, `config.rs` cleared on the way. `cargo test --workspace`: 705 green. **Not committed** — the
+tree also holds other sessions' uncommitted work (LINK removal, click-outside dismiss, settings memory, the
+new skills).
+
+**Gotchas:**
+- Codex sub-agent prompts are stored encrypted in the transcript (`spawn_agent`'s `message` is opaque) and
+  their results arrive as `agent_message` rows; here all three were just the usage-limit error, so the
+  review had to be redone rather than recovered.
+- `cargo clippy … | tail -40` hides earlier crates' warnings: the daemon's two only showed on a per-crate
+  run. Grep `^warning:` over the full output instead.
+- Two pre-existing clippy warnings were left alone: `hooks/mod.rs:194` items-after-test-module and the
+  cfg-gated `return copy_via("pbcopy", &[])` in `event_loop.rs` (fixing it means restructuring the
+  non-macOS branch).
+
+### Fixing A Fork PR's Conflicts From The Shared Tree, Then A Security Audit Of Its Diff — 2026-08-28
+
+**Asked:** "fix the conflicts on https://github.com/AgentSystemLabs/nebula/pull/20, then do a pr security audit
+review skill" (headless session — `prompt-daddy` skipped, worked from the prompt as typed).
+
+**Did:** PR #20 (`lnmunhoz:toggle-column`, the PROJECTS PANEL / WORKTREES PANEL toggles) was CONFLICTING
+against the dedup pass (PR #18). Recipe, without touching the dirty shared tree: `git fetch origin
+pull/20/head:pr-20-toggle-column` → `git worktree add <scratchpad>/pr20 pr-20-toggle-column` → `git merge
+origin/main` there → resolve → `cargo fmt/clippy/test --workspace` with `CARGO_TARGET_DIR` in the scratchpad
+(734 green, zero clippy warnings) → `git commit -F` → `git push git@github.com:lnmunhoz/nebula.git
+HEAD:toggle-column` (no remote needed; `maintainerCanModify` was true) → `gh pr view --json mergeable` read
+`MERGEABLE` ~8 s later → `git worktree remove` + `git branch -D`. Two files conflicted: `config.rs` (keep the
+PR's `hide_projects` / `hide_worktrees` defaults + main's `DEFAULT_CHOICE`) and `event_loop.rs`, where #18's
+extracted `next_focus() -> Option<Focus>` and the PR's `App::next_visible_focus` (skips hidden panels) landed on
+the same lines in `Action::FocusTerminal` and `walk_focus_forward` — the PR's wins, and the now-unused
+`next_focus` was deleted (merge `9c3a4df`). The `security-review` pass over the PR's diff found nothing: two
+serde bools, layout/focus arithmetic, no new `ClientRequest`, no path or process construction.
+
+**Gotchas:**
+- **`security-review` snapshots the checkout it runs in.** Invoked from the shared tree on `main` it produced
+  an empty diff and a commit list for `main`, not the PR. Write the PR's diff yourself (`git diff origin/main
+  <merge-sha> -- . ':!.claude/MEMORY.md' ':!TERMS.md' ':!README.md'`) and hand that path, plus the scratch
+  worktree, to the audit sub-agent.
+- A scratch `git worktree add` registers in the shared repo's worktree list, so WORKTREE SYNC would surface it
+  as a row within 2 s — remove it (`--force`, the target dir was built in) when the push is done.
+- `cargo test --workspace --tests --bins --doc` prints nothing and runs nothing; plain `cargo test --workspace`
+  covers all seven binaries plus doc-tests.
+- The dedup pass left clippy at zero warnings; the "pre-existing warnings" the PR description mentions are gone,
+  so a warning after a merge with main is yours.
+
+### The SESSIONS PANEL Shows OPEN PRS And Cannot Create LINKS — 2026-08-28
+
+**Asked:** "instead of it saying \"Links\" in the sessions list, just have it says OPEN PRS, and remove
+the ability for a user to even add links manually for now"
+
+**Did:** `crates/nebula-tui/src/ui.rs::draw_sessions` now titles the selected WORKTREE's group `OPEN
+PRS`. Removed the TUI's full NEW LINK creation chain: `Action::NewLink` / HOTKEYS TAB row, HELP OVERLAY
+and FOOTER hints, keyboard and mouse CONTEXT MENU rows, `MenuAction::NewLink`, `PromptKind::NewLink`,
+submit dispatch, and the select-created-LINK PENDING INTENT/state. The DAEMON protocol/store and
+existing LINK rows stay intact; old rows still open/edit/delete, while the PR ROW only opens and its
+FOOTER no longer advertises edit/delete. README, ARCHITECTURE and focused unit/E2E assertions updated.
+`cargo check -p nebula-tui --lib`, all 471 `nebula-tui` unit tests, and both focused E2E TUI tests
+(`tui_manual_link_add_is_unavailable`, `tui_pull_request_row_leads_the_open_prs_group`) passed.
+
+**Gotchas:**
+- Two surfaces now render `OPEN PRS`: the repo-wide group in the WORKTREES PANEL and the branch-local
+  group in the SESSIONS PANEL. TERMS calls them PROJECT OPEN PRS GROUP and WORKTREE OPEN PRS GROUP.
+- An E2E absence check can pass before a key is processed. The NEW LINK regression sends `Shift+L`,
+  then `?`, and waits for HELP OVERLAY's unique `NAVIGATE & SEARCH` heading; if the prompt still opened,
+  `?` would type into it and the test would time out.
+- The shared checkout moved during the first verification pass and temporarily produced unrelated
+  PR-agent compile errors (`pr_url` / `CreatePrAgent` / `validate_pr_url` mismatches). That work settled
+  and the final suites passed; do not misattribute the transient errors to the LINK removal if they recur.
+
 ### `r` Renames A Project Row Without Touching Its Folder — 2026-08-28
 
 **Asked:** "Allow me to rename a project from the projects section, by using hte shortcut "r" if a project
@@ -139,7 +338,7 @@ paused-rebase relabel), which landed on origin after v0.13.0.
 - `gh run list` right after `git push` of the tag can return the *previous* release's run; a `sleep 20`
   (or checking `headBranch` equals the tag) before `gh run watch` avoids watching v0.13.0 again.
 
-### Output Doctor: Every Reply Is YOU ASKED / OVERVIEW / TECHNICAL OVERVIEW — 2026-08-28
+### Output Doctor: Every Reply Is YOU ASKED / OVERVIEW / [ACTION REQUIRED] / TECHNICAL OVERVIEW — 2026-08-28
 
 **Asked:** "what 3 features would you recommend I remove" → picked (prompt-daddy): *Cost vs. value audit*
 → then, on the answer: "rewrite this in a format like this: ==== YOU ASKED ==== … ==== OVERVIEW ==== …
@@ -147,6 +346,11 @@ paused-rebase relabel), which landed on origin after v0.13.0.
 by prompt-daddy" → "use this final output structure as a skill called output-doctor which prompts the
 agent to use that format I provided for all output. update claude.md to always use this skill before it
 outputs anything"
+→ later the same day: "update the output-doctor to include a section for ==== ACTION REQUIRED ==== if and
+only if the llm is expecting a user to do something" → picked (prompt-daddy): *After OVERVIEW, strict
+trigger* — between OVERVIEW and TECHNICAL OVERVIEW, present iff the user must do something before the work
+is complete (run a command, flip a setting, restart, decide, approve); numbered imperative steps, exact
+commands in code blocks; optional follow-up offers do not count.
 
 **Did:** New `.claude/skills/output-doctor/SKILL.md` (user-invocable): three fixed headers, four `=` each
 side, in order — `YOU ASKED` (the `prompt-daddy` pick verbatim, only the pick; the original/Other/as-typed
@@ -159,9 +363,19 @@ question. `CLAUDE.md` gained a "Before you reply" step after the `project-terms`
 the matching "Then shape the reply" paragraph. The audit that preceded it — CLAUDE CLOUD sessions,
 `nebula browser`/`tunnel`, the PREWARM POOL as the three costliest features — was recommendation only;
 nothing was cut and no decision was taken.
+Follow-up: the skill gained a conditional fourth section, `==== ACTION REQUIRED ====`, between OVERVIEW and
+TECHNICAL OVERVIEW — its own `###` block with the iff test ("a step you could not take yourself that the
+outcome depends on"), a *counts* list (user-only commands such as NEBULA KILL / MAKE CYCLE from a terminal
+outside nebula, settings, restarts, blocked decisions, approvals, manual checks) and a *does not count*
+list (follow-up offers, gotchas, scaled-down scope, anything the agent could still do itself), the shape
+(numbered imperative steps, exact command in a code block, no prose above), and a second worked example.
+OVERVIEW's closing rule now says it tells the reader *whether* anything needs them, ACTION REQUIRED the
+*what*. Mirrored in `CLAUDE.md` § "Before you reply", `AGENTS.md` "Then shape the reply", and the OUTPUT
+DOCTOR row of `TERMS.md`.
 
 **Gotchas:**
-- **`YOU ASKED` is the pick alone.** The first cut showed the original prompt with a `→ picked:` line
+- **`YOU ASKED` is the rewrite alone** (since 2026-08-28 the refined prompt, before that the pick). The
+  first cut showed the original prompt with a `→ picked:` line
   under it (the `nebula-memory` convention) and the user rejected it: the memory entry keeps both, the
   reply keeps only the rewrite that was worked from.
 - The user's template had three `=` on the `TECHNICAL OVERVIEW` header and four on the other two;
@@ -170,7 +384,13 @@ nothing was cut and no decision was taken.
   protocol for non-Claude agents, and it references the skills by file path. A protocol change has to be
   written twice, once per file, in each file's own register.
 - Skill discovery is live (as the prompt-daddy entry says): `output-doctor` appeared in the session's
-  skill listing the moment the file existed, before `CLAUDE.md` was edited.
+  skill listing the moment the file existed, before `CLAUDE.md` was edited — and the listing's description
+  refreshed the moment the frontmatter changed, mid-session.
+- **The reply shape lives in four places**, not two: the skill, `CLAUDE.md`, `AGENTS.md`, *and* the OUTPUT
+  DOCTOR row in `TERMS.md` all spell out the section list. A section change is four edits; grep
+  `==== TECHNICAL OVERVIEW ====` to find them all.
+- A worked example that itself contains a code block (the ACTION REQUIRED step's command) needs a
+  four-backtick outer fence — the triple-fenced examples in the skill can't nest one.
 
 ### Deleting The OPEN WORKSPACE Lands On The Tab To Its Right, Then Its Left — 2026-08-28
 
@@ -441,6 +661,9 @@ Projects with the bar hidden neither arms nor flashes. Docs: `focus_left`/`focus
 
 ### Prompt Daddy: Every New Prompt Gets Three Rewrites To Pick From — 2026-08-27
 
+> **Superseded 2026-08-28** — the three-rewrites pick is gone; see "Prompt Daddy: One Rewrite, Ask Only For
+> Missing Context, Log It And Go" above. The failure-table patterns below still hold.
+
 **Asked:** "analyze memory.md for how i normally prompt and give me patterns you see, good or bad" → "using
 this info, create a skill called prompt-daddy which will take your original prompt and give you 3 examples
 to pick from that improve the original prompt, add prompt daddy to claude.md instructions so my agent uses
@@ -464,8 +687,8 @@ corrections, slash-commands / skill triggers ("commit push release"), and headle
   with the exact on-screen text and a "works in X, not in Y" contrast were diagnosed in one session every
   time. Escalated re-asks carried no new spec; the fix arrived with the next constraint, not the next tone.
 - When writing the memory entry for a task that went through prompt-daddy, quote the **original** prompt
-  (this skill's rule) and put the picked rewrite on the correction line underneath — the refinement is the
-  data the next analysis of prompting needs.
+  (this skill's rule) and put the rewrite on the correction line underneath (now `→ refined:`, was
+  `→ picked:`) — the refinement is the data the next analysis of prompting needs.
 - Skill discovery is live: the new `SKILL.md` appeared in the session's skill listing as soon as the file
   existed, no restart needed.
 

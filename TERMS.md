@@ -35,17 +35,17 @@ Everything nests: WORKSPACE → PROJECT → WORKTREE → SESSION. The DAEMON own
 | **PROJECT** | A git checkout registered with nebula (`nebula add <dir>`), named after its root directory, filed under whichever WORKSPACE was open. | "repo", "project" | `entities.rs::Project` · `nebula add` · `n` in PROJECTS PANEL, `o` anywhere |
 | **WORKTREE** | Where a SESSION runs: the ROOT WORKTREE or a real `git worktree` created under the WORKTREE DIR. Two agents in two worktrees never collide. | "worktree", "branch" | `entities.rs::Worktree` · `n` in WORKTREES PANEL |
 | **ROOT WORKTREE** | The PROJECT's own checkout — the worktree row badged ROOT BADGE (`⌂ root`). Every project has exactly one. | "root worktree row", "main checkout", "the checkout", "root row", "main root worktree", "main worktree root" | `ui.rs::draw_worktrees` (`ROOT_BADGE`) |
-| **WORKTREE DIR** | The convention for new worktrees: `<repo>/../<repo-name>-worktrees/<branch>`. Claude's own `EnterWorktree` lands elsewhere (`<repo>/.claude/worktrees/`), which is why WORKTREE RELOCATION exists. | — | `nebula-daemon/src/git.rs::worktree_dir` |
+| **WORKTREE DIR** | The convention for new worktrees: `<repo>/../<repo-name>-worktrees/<branch>` (`/` in the branch becomes `-`). Claude's own `EnterWorktree` lands elsewhere (`<repo>/.claude/worktrees/`), which is why WORKTREE RELOCATION exists. | "<project>-worktrees", "sibling of my project dir" | `nebula-daemon/src/git.rs::worktree_dir` |
 | **BRANCH NAME GENERATOR** | A new WORKTREE's name is slugified from whatever you type (`fix login redirect` → `fix-login-redirect`); an empty prompt takes a random `<adj>-<noun>-<verb>`. | "random branch name using three words", "slugify" | `nebula-tui/src/branch_name.rs` |
 | **WORKTREE DELETE** | `d` on a WORKTREE takes a typed confirm (files go), applies optimistically with a rollback PENDING INTENT, and force-unlocks a stale `git worktree` lock (usually Claude's own `EnterWorktree`). | "delete the worktree", "cannot remove a locked working tree" | `app.rs::PendingIntent::DeleteWorktree`, `WorktreeRollback` |
 | **SESSION** | One row in the SESSIONS PANEL: an AGENT or a TERMINAL SESSION, bound to a WORKTREE, backed by a PTY SESSION in the DAEMON. | "session", "terminal", "tab" | `entities.rs::Agent` / `Terminal` |
 | **AGENT** | A SESSION running an agent CLI (`claude`, `codex`, `cursor-agent`) — see AGENT KIND. Restored with RESUME. | "agent", "claude code session", "the claude" | `entities.rs::Agent` · `n` in SESSIONS PANEL |
 | **TERMINAL SESSION** | A SESSION that is a plain shell in the WORKTREE's directory, not an agent. Listed under the TERMINALS group. | "shell", "terminal tab" | `entities.rs::Terminal` · `t` |
-| **LINK** | A URL (PR, doc, ticket) pinned to a WORKTREE, shown in the LINKS GROUP. Stored daemon-side, URL normalised to http(s). | "link", "attach a link" | `entities.rs::Link` · `Shift+L` |
-| **PR ROW** | The pull request open on a WORKTREE's branch, found client-side with `gh pr view` on the GIT POLL and shown above the LINKS as a row nothing stores — opens, can't be edited or deleted. Carries an unread-comment count. | "the PR", "pull request row", "pull request link", "NEW comments" | `nebula-tui/src/pull_request.rs` · `app.rs::LinkRow` |
-| **OPEN PRS GROUP** | The `OPEN PRS · n` group at the bottom of the WORKTREES PANEL: every PR still open on the repo (drafts badged), from one `gh pr list` per PROJECT about once a minute. Resting on one shows the PR PREVIEW; `g` shows its diff. | "open prs", "open pr list", "open pull requests" | `app.rs::OpenPrs` · `ui.rs::draw_worktrees` |
-| **LINKS GROUP** | The `LINKS` group in the SESSIONS PANEL holding the PR ROW and the WORKTREE's LINKS. | "links" | `ui.rs::draw_sessions` |
-| **SESSION GROUPS** | The SESSIONS PANEL's headers: PINNED, RECENT (the RECENT WINDOW), UNPINNED, TERMINALS, LINKS, ARCHIVED (hidden until `Shift+A`, see ARCHIVE). The WORKTREES PANEL has PINNED / UNPINNED / OPEN PRS. | "the groups", "unpinned header" | `ui.rs::draw_sessions` |
+| **LINK** | A URL previously pinned to a WORKTREE and stored daemon-side, normalised to http(s). Existing rows remain visible and editable in the WORKTREE OPEN PRS GROUP, but the TUI no longer creates them. | "link", "attach a link", "add links manually" | `entities.rs::Link` |
+| **PR ROW** | The pull request open on a WORKTREE's branch, found client-side with `gh pr view` on the GIT POLL and shown first in the WORKTREE OPEN PRS GROUP as a row nothing stores — opens, can't be edited or deleted. Carries an unread-comment count. | "the PR", "pull request row", "pull request link", "NEW comments" | `nebula-tui/src/pull_request.rs` · `app.rs::LinkRow` |
+| **PROJECT OPEN PRS GROUP** | The `OPEN PRS · n` group at the bottom of the WORKTREES PANEL: every PR still open on the repo (drafts badged), from one `gh pr list` per PROJECT about once a minute. Resting on one shows the PR PREVIEW; `g` shows its diff; `n` (or the CONTEXT MENU's **New Claude session**) starts a Claude AGENT in the ROOT WORKTREE whose system prompt scopes all work to that PR. | "open prs", "open pr list", "open pull requests", "open prs rows" | `app.rs::OpenPrs` · `ui.rs::draw_worktrees` |
+| **WORKTREE OPEN PRS GROUP** | The `OPEN PRS` group in the SESSIONS PANEL: the selected WORKTREE's PR ROW followed by previously saved LINK rows. Manual LINK creation is not exposed. | "links", "open prs" | `ui.rs::draw_sessions` |
+| **SESSION GROUPS** | The SESSIONS PANEL's headers: PINNED, RECENT (the RECENT WINDOW), UNPINNED, TERMINALS, OPEN PRS, ARCHIVED (hidden until `Shift+A`, see ARCHIVE). The WORKTREES PANEL has PINNED / UNPINNED / OPEN PRS. | "the groups", "unpinned header" | `ui.rs::draw_sessions` |
 | **PIN** | Pinned WORKTREES and SESSIONS sort to the top of their panel and are spared by the IDLE REAPER. | "pin", "pinned" | `keymap.rs::Action::Pin` · `p` |
 | **ARCHIVE** | Archiving an AGENT releases its PTY and moves it to the ARCHIVED group; UNARCHIVE brings it back (RESUME on next attach). | "archive", "archived" | `Action::Archive` / `Unarchive` / `ToggleArchived` · `a` / `u` / `Shift+A` |
 
@@ -59,11 +59,11 @@ Everything nests: WORKSPACE → PROJECT → WORKTREE → SESSION. The DAEMON own
 | **RUNTIME DIR** | Socket + PIDFILE directory: `$NEBULA_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/nebula`, else `/tmp/nebula-<uid>`. | — | `paths.rs::runtime_dir` |
 | **DATA DIR** | Where the SQLITE STORE, CONFIG.JSON, REVIEWED.JSON and the SSH HOSTS file live: `$NEBULA_DATA_DIR` or the platform app-support dir (`~/.local/share/nebula`, `~/Library/Application Support/dev.nebula.nebula`). | "data dir" | `paths.rs::data_dir` · `NEBULA_DATA_DIR` |
 | **DAEMON LOG** | `daemon.log` (beside `tui.log`) in the state dir — `~/.local/state/nebula/`, or `<DATA DIR>/state` when `NEBULA_DATA_DIR` is set. `NEBULA_LOG=debug` for more. No `daemon.log` at all means the daemon never started. | "daemon.log", "the logs" | `paths.rs::daemon_log_path` · `NEBULA_LOG` |
-| **SQLITE STORE** | `nebula.db` in the DATA DIR: workspaces, projects, worktrees, agents (kind + CLI session id), terminals, links, `pr_seen`, `ui_state`. Schema advanced by MIGRATIONS. | "the db", "sqlite" | `nebula-daemon/src/store.rs::Store` |
-| **MIGRATION** | A numbered `PRAGMA user_version` step in the store (21 so far). Adding a column = a migration; adding a field to an entity usually also = a PROTOCOL VERSION bump. | "migration" | `store.rs::MIGRATIONS` |
+| **SQLITE STORE** | `nebula.db` in the DATA DIR: workspaces, projects, worktrees, agents (kind + CLI session id + the `pr_url` an OPEN PRS launch carries), terminals, links, `pr_seen`, `ui_state`. Schema advanced by MIGRATIONS. | "the db", "sqlite" | `nebula-daemon/src/store.rs::Store` |
+| **MIGRATION** | A numbered `PRAGMA user_version` step in the store (22 so far). Adding a column = a migration; adding a field to an entity usually also = a PROTOCOL VERSION bump. | "migration" | `store.rs::MIGRATIONS` |
 | **PIDFILE LOCK** | `flock` on `<RUNTIME DIR>/daemon.pid` is daemon liveness; clients probe it by trying the lock. | "pidfile" | `nebula-daemon/src/lifecycle.rs::PidfileLock` |
 | **BUILDSTAMP** | A content hash of the running daemon binary written to `daemon.build` at start. Installers compare it to detect a stale daemon (STALE DAEMON NOTE); it cannot name the binary's path. | "buildstamp" | `lifecycle.rs::write_buildstamp` · `paths.rs::buildstamp_path` |
-| **PROTOCOL VERSION** | `PROTOCOL_VERSION` (28) exchanged in the HANDSHAKE. Frames are positional msgpack, so any new field on a shared struct bumps it. | "protocol", "v26/v27/v28" | `nebula-core/src/protocol.rs::PROTOCOL_VERSION` |
+| **PROTOCOL VERSION** | `PROTOCOL_VERSION` (29) exchanged in the HANDSHAKE. Frames are positional msgpack, so any new field on a shared struct bumps it. | "protocol", "v26/v27/v28/v29" | `nebula-core/src/protocol.rs::PROTOCOL_VERSION` |
 | **HANDSHAKE** | `Hello{protocol_version}` → `HelloOk{daemon_pid}` or `Incompatible`, then `Subscribe` → `Snapshot`. | "handshake" | `protocol.rs` · `nebula-daemon/src/server.rs::handle_client` |
 | **VERSION SKEW** | A DAEMON and a client built from different PROTOCOL VERSIONS. The client's message names both binaries and says which side is older: `make install` when the client is, `nebula kill` when the daemon is. | "daemon speaks protocol v26, this client v24", "the hook still seems to fail" | `nebula-tui/src/ipc.rs::version_skew_message` |
 | **CLIENT REQUEST** | The request family the TUI sends: Attach, Input, Resize, CRUD on every entity, `MarkAgentSeen`, `GetMetrics`, `Shutdown`, … | — | `protocol.rs::ClientRequest` |
@@ -87,8 +87,8 @@ Everything nests: WORKSPACE → PROJECT → WORKTREE → SESSION. The DAEMON own
 | **WORKSPACE TAB** | One tab in the WORKSPACES BAR: the workspace name, its ROLLUP STATUS DOT and a DONE BADGE count. Selectable by SELECT WORKSPACE N. | "tab", "header workspace name" | `ui.rs::draw_workspaces_bar` · `1`–`9` |
 | **TAB UNDERLINE** | The accent `▀` under the open WORKSPACE TAB, flush with the tab's fill (a `━` left a half-cell gap). | "the bottom bar", "the underline", "gap under the tab" | `ui.rs::draw_workspaces_bar` |
 | **PROJECTS PANEL** | Leftmost column, listing the OPEN WORKSPACE's PROJECTS. Its header reads `PROJECTS` while the WORKSPACES BAR is shown and the workspace's name (upper-cased) when it is hidden. | "projects list", "projects column", "projects", "projects worktrees and sessions lists" | `ui.rs::draw_projects` · `Focus::Projects` |
-| **WORKTREES PANEL** | Middle column: the selected PROJECT's WORKTREES (PINNED / UNPINNED) plus the OPEN PRS GROUP. | "worktrees column", "worktrees list", "worktrees row" | `ui.rs::draw_worktrees` · `Focus::Worktrees` |
-| **SESSIONS PANEL** | Third column: the selected WORKTREE's SESSIONS in SESSION GROUPS, plus LINKS. | "sessions list", "sessions column", "session list", "sessions", "recent list" | `ui.rs::draw_sessions` · `Focus::Sessions` |
+| **WORKTREES PANEL** | Middle column: the selected PROJECT's WORKTREES (PINNED / UNPINNED) plus the PROJECT OPEN PRS GROUP. | "worktrees column", "worktrees list", "worktrees row" | `ui.rs::draw_worktrees` · `Focus::Worktrees` |
+| **SESSIONS PANEL** | Third column: the selected WORKTREE's SESSIONS in SESSION GROUPS, plus the WORKTREE OPEN PRS GROUP. | "sessions list", "sessions column", "session list", "sessions", "recent list" | `ui.rs::draw_sessions` · `Focus::Sessions` |
 | **TERMINAL PANE** | The right-hand pane showing the attached SESSION (title `TERMINAL`), or the PR PREVIEW (`PULL REQUEST`). Its chips: `INPUT` (LOCKED PANE), `scroll N`, `exited`. | "terminal panel", "the pane", "the terminal", "claude code session", "focused session terminal" | `ui.rs::draw_terminal` · `Focus::Terminal` |
 | **PANEL** | Any of the four columns (WORKSPACES BAR counts when shown). The panels are 20 cells wide; a badge that grows clips instead of reflowing. | "panel", "column", "sidebar" | `app.rs::Focus` |
 | **PR PREVIEW** | The TERMINAL PANE rendering an OPEN PRS row's description, stats and conversation as wrapped text while the cursor rests on it. Only the row you stop on is fetched. | "pr preview", "read the PR in the pane", "show the contents of the PR directly in nebula", "hover over a PR" | `nebula-tui/src/pr_preview.rs` |
@@ -125,7 +125,7 @@ Everything nests: WORKSPACE → PROJECT → WORKTREE → SESSION. The DAEMON own
 | **ROOT BADGE** | ` ⌂ root` on the ROOT WORKTREE row. Decoration: it yields before the branch name would truncate. | "root" | `ui.rs::ROOT_BADGE` |
 | **AGO BADGE** | `23m ago` after a session name, from `status_changed_at`. | "ago", "23m ago" | `ui.rs::ago_badge` |
 | **WARM COUNT** | ` · N warm` in the FOOTER: the WARM SPARES in the PREWARM POOL, counted apart from agents. | "warm" | `ui.rs::draw_footer_bar` |
-| **DRAFT BADGE** | The `draft` mark on a draft PR in the OPEN PRS GROUP. | "draft" | `ui.rs::draw_worktrees` |
+| **DRAFT BADGE** | The `draft` mark on a draft PR in the PROJECT OPEN PRS GROUP. | "draft" | `ui.rs::draw_worktrees` |
 | **STATUS MACHINE** | The per-agent pure state machine turning HOOK EVENTS and PROGRESS into AGENT STATUS: the STOP GATE with its 180 s drain grace, a 30 s subagent heal window, foreign session ids ignored. | "status engine", "state machine" | `nebula-daemon/src/status.rs::AgentStatusMachine` |
 | **STOP GATE** | A `Stop` hook is held while `SubagentStart`s outnumber `SubagentStop`s, so a turn is not FINISHED while workers still run; the 180 s drain grace releases it if a SubagentStop never comes. | "stop is gated on subagents" | `status.rs::DRAIN_GRACE`, `SUBAGENT_TTL` |
 | **PROGRESS SCANNER** | Reads OSC 9;4 busy/idle escapes off the PTY — the only end-of-turn signal after a user cancel (Esc fires no Stop), and one that stays busy during a permission prompt. | "progress bar", "osc 9;4", "cancel Claude code never changed the status back to green" | `nebula-daemon/src/pty/progress.rs::ProgressScanner` |
@@ -156,12 +156,11 @@ Everything nests: WORKSPACE → PROJECT → WORKTREE → SESSION. The DAEMON own
 | **KITTY PROTOCOL** | The kitty keyboard protocol (`CSI … u`) that lets `Ctrl+Shift+…` chords reach nebula at all — Ghostty speaks it, Terminal.app does not. The KITTY SCANNER answers the child's queries. | "kitty", "csi u" | `nebula-daemon/src/pty/kitty.rs::KittyScanner` |
 | **HOTKEY CAPTURE** | Pressing a new CHORD on a HOTKEYS TAB row; a duplicate shows `already X — Enter to move it here`. | "rebind" | `app.rs::HotkeyCapture` · `event_loop.rs::bind_hotkey` |
 | **LINE EDITOR** | Every typed field (prompt, filter, query) is the same editor: `←→`/`⌥←→`, `Ctrl+a`/`Ctrl+e`, `⌥⌫`, `Ctrl+u`/`Ctrl+k`. | "the input", "the text field" | `nebula-tui/src/text_input.rs` |
-| **NEW** | `n`: new PROJECT / WORKTREE / SESSION depending on FOCUS (opens the NEW SESSION PICKER in Sessions). ADD PROJECT (`o`) adds a project from anywhere. | "n", "new" | `Action::New` · `n` / `Action::AddProject` · `o` |
+| **NEW** | `n`: new PROJECT / WORKTREE / SESSION depending on FOCUS (opens the NEW SESSION PICKER in Sessions; on a PROJECT OPEN PRS GROUP row, a PR-scoped Claude AGENT). ADD PROJECT (`o`) adds a project from anywhere. | "n", "new" | `Action::New` · `n` / `Action::AddProject` · `o` |
 | **MOVE PROJECT** | `Shift+J` / `Shift+K` reorder the selected PROJECT in the list (`Shift+↑/↓` too, where the terminal sends them). | "move project up/down", "reorder", "hold shift and move projects up and down" | `Action::MoveProjectUp` / `MoveProjectDown` |
 | **RENAME** | `r`: rename the selected SESSION or edit a LINK's URL. A typed name clears AUTO-TITLE for good. | "rename", "r" | `Action::Rename` · `r` |
 | **DELETE / DELETE ALL** | `d`: remove the selected row behind a CONFIRM DIALOG (worktrees take a typed confirm — files go). `Shift+D`: every row of the focused panel, casualties listed. | "delete", "remove" | `Action::Delete` / `DeleteAll` · `d` / `Shift+D` |
 | **NEW TERMINAL** | `t`: a TERMINAL SESSION in the selected WORKTREE (repo root from the PROJECTS PANEL). | "open a shell", "terminal", "new terminal hotkey to t" | `Action::NewTerminal` · `t` |
-| **NEW LINK** | `Shift+L`: attach a LINK to the selected WORKTREE. | "attach a link", "pin a url" | `Action::NewLink` · `Shift+L` |
 | **OPEN REPO** | `Shift+G`: open the repo's page on its git host (the `origin` remote turned into a browsable URL). | "open on github" | `Action::OpenRepo` · `nebula-tui/src/remote.rs` · `Shift+G` |
 | **SELECT WORKSPACE N** | `1`–`9` (or `⌘1`–`⌘9` where delivered): open that WORKSPACE TAB without leaving the panel. Rebindable per slot. | "number keys", "cmd 1", "cmd + [1-9] to select the workspace" | `Action::SelectWorkspace(n)` · `1`–`9` |
 | **TOGGLE WORKSPACES BAR** | `Shift+W`: show / hide the WORKSPACES BAR and save the choice as the `show_workspaces` SETTING (a hotkey that writes CONFIG.JSON — tests wrap it in `with_default_config`). | "capital W shift + w to toggle that entire panel", "hide the top bar" | `Action::ToggleWorkspaces` · `Config::show_workspaces` · `Shift+W` |
@@ -244,7 +243,7 @@ Everything nests: WORKSPACE → PROJECT → WORKTREE → SESSION. The DAEMON own
 | **IDLE REAPER** | Every 15 s, kill PTYs in WORKTREES no client is viewing once they pass the IDLE TIMEOUT; spares PINNED, RUNNING and NEEDS FEEDBACK agents and terminals with a command running. A reaped agent RESUMES on the next ATTACH. | "the reaper", "idle timeout kills", "auto suspend or kill claude sessions that are not in focus", "reap process" | `registry.rs::reap_idle_sessions` · `NEBULA_IDLE_REAP_MS` |
 | **IDLE TIMEOUT** | The `session_idle_timeout` setting (`off`/`1m`/`5m`/`15m`/`30m`/`1h`, default 5m) the IDLE REAPER uses. | "idle timeout" | `config.rs::SESSION_IDLE_TIMEOUTS` |
 | **WORKTREE SYNC** | Every 2 s the DAEMON mtime-probes each repo and reconciles `git worktree list`, so worktrees made outside nebula appear and removed ones drop. | "git poll", "external worktrees", "directory watcher on .worktrees" | `registry.rs::sync_project_worktrees` · `NEBULA_WORKTREE_SYNC_MS` |
-| **GIT POLL** | The TUI-side tick that looks up the PR ROW (`gh pr view`) per worktree and the OPEN PRS GROUP (`gh pr list`) per project, about once a minute. | "the gh poll", "pr refresh" | `nebula-tui/src/pull_request.rs` |
+| **GIT POLL** | The TUI-side tick that looks up the PR ROW (`gh pr view`) per worktree and the PROJECT OPEN PRS GROUP (`gh pr list`) per project, about once a minute. | "the gh poll", "pr refresh" | `nebula-tui/src/pull_request.rs` |
 | **BOOT SWEEP** | On daemon start, agents persisted as live are marked DISCONNECTED. | — | `store.rs::sweep_disconnected` |
 | **KITTY SCANNER** | Answers the child's KITTY PROTOCOL queries off the PTY stream and reports its flag stack to clients (`KittyFlags`). | — | `pty/kitty.rs::KittyScanner` |
 | **CLOUD SCANNER** | Reads the `session_…` id and the attach refusal off a `claude --cloud` child's output; replays the ring first so arming after spawn cannot miss it. | — | `pty/cloud.rs::CloudScanner` |
@@ -274,8 +273,8 @@ Everything nests: WORKSPACE → PROJECT → WORKTREE → SESSION. The DAEMON own
 | **NEBULA WORKTREE** | Move the current SESSION into a WORKTREE of its PROJECT (WORKTREE RELOCATION); no name invents one, `--base <ref>` picks a new branch's start. | "nebula worktree", "do this in a worktree" | `nebula worktree [name] [--base ref]` · `ipc.rs::run_worktree` |
 | **NEBULA WORKSPACE** | `add` / `open` / `list` / `rename` / `delete` WORKSPACES from the shell; `open` sets what the next instance launches into. | — | `nebula workspace <sub>` |
 | **NEBULA SSH** | `ssh -t <host> '… exec nebula'`: run nebula *on* a remote box over this terminal, self-installing it there if missing; records the destination in the SSH HOSTS FILE. The whole TUI — copy included — runs remotely. | "nebula ssh", "ssh into the ubuntu machine" | `crates/nebula/src/ssh.rs::run_ssh` · `nebula ssh <host> [dir]` |
-| **NEBULA TUNNEL** | One `ssh -tt -L` whose remote command runs `nebula browser --no-open` on the remote's loopback; the local URL opens once bytes come back. Nothing is exposed on the remote network. Needs ttyd there. | "tunnel" | `crates/nebula/src/tunnel.rs::run_tunnel` · `nebula tunnel <host> [dir] [--port N] [--remote-port N]` |
-| **NEBULA BROWSER** | Serve this TUI in a browser tab via ttyd (`--port`, `--bind`, `--public`, `--credential USER:PASSWORD`, `--no-open`). Loopback and unauthenticated by default — a live writable terminal, so widen it deliberately. | "browser mode", "ttyd" | `crates/nebula/src/browser.rs::run_browser` · `nebula browser` |
+| **NEBULA TUNNEL** | One `ssh -tt -L` whose remote command runs `nebula browser --no-open` on the remote's loopback; the local URL opens once bytes come back. Nothing is exposed on the remote network. Needs ttyd there. Authentication is ssh's own — nebula adds no password of its own and passes no `--credential`; a password prompt means the remote refused your key. | "tunnel", "ssh tunnel", "run ssh tunnel", "port is already in use" | `crates/nebula/src/tunnel.rs::run_tunnel` · `nebula tunnel <host> [dir] [--port N] [--remote-port N]` |
+| **NEBULA BROWSER** | Serve this TUI in a browser tab via ttyd (`--port`, `--bind`, `--public`, `--credential USER:PASSWORD`, `--no-open`). Loopback and unauthenticated by default — a live writable terminal, so widen it deliberately. | "browser mode", "ttyd", "run on loopback or public" | `crates/nebula/src/browser.rs::run_browser` · `nebula browser` |
 | **NEBULA UPGRADE** | Run INSTALL.SH over this binary; refuses a local cargo build without `--force`; a running daemon keeps its old binary until NEBULA KILL. | "upgrade", "update nebula" | `crates/nebula/src/upgrade.rs` · `nebula upgrade [--force]` |
 | **RAW ATTACH** | Hidden debug client: raw passthrough to a session, `Ctrl+\` detaches. | — | `nebula _raw-attach [name]` |
 | **STALE DAEMON NOTE** | Hidden installer hook printing the cutover note when the live daemon's BUILDSTAMP differs from this binary — what MAKE INSTALL prints. | "the cutover note" | `nebula _stale-daemon-note` · `lifecycle.rs::daemon_is_stale` |
@@ -303,9 +302,10 @@ Everything nests: WORKSPACE → PROJECT → WORKTREE → SESSION. The DAEMON own
 
 | TERM | What it is | Also called | Where · key |
 |---|---|---|---|
-| **SHARED CHECKOUT** | This repo's main working tree, which several nebula sessions edit at once. Assume it is behind `origin/main` (releases are cut from a RELEASE WORKTREE and PRs merge on GitHub; neither fast-forwards it), and that compile errors or test-count drift may be another session's. Baseline `cargo check` before starting. | "shared tree", "the main checkout", "this", "the tree" | `git diff origin/main` (not HEAD) |
-| **RELEASE WORKTREE** | The private `release-vX.Y.Z` worktree off `origin/main` the RELEASE SKILL builds in: the SHARED CHECKOUT's `git diff HEAD` applied with `git apply --3way` (untracked files copied in — a copy by content reverts whatever origin merged since), tests in an isolated `CARGO_TARGET_DIR`, three commits (feature / `.claude/MEMORY.md` / `Release vX.Y.Z`), pushed as `main`, tagged. | "release branch" | `.claude/skills/release/SKILL.md` |
-| **RELEASE SKILL** | `/release`: verify green, commit, bump `[workspace.package].version`, tag, push, replace the GitHub notes with a real changelog. Triggered by "commit push release". | "commit push release", "cut a release", "ship it", "do a release", "commit and push and release", "commit push and release" | `.claude/skills/release/SKILL.md` |
+| **SHARED CHECKOUT** | This repo's main working tree, which several nebula sessions edit at once. Assume it is behind `origin/main` (releases are cut from a RELEASE WORKTREE and never fast-forward it), and that compile errors or test-count drift may be another session's. Baseline `cargo check` before starting. | "shared tree", "the main checkout", "this", "the tree" | `git diff origin/main` (not HEAD) |
+| **RELEASE WORKTREE** | The private `release-vX.Y.Z` worktree off `origin/main` the RELEASE SKILL builds in: files copied in by content, tests in an isolated `CARGO_TARGET_DIR`, three commits (feature / `.claude/MEMORY.md` / `Release vX.Y.Z`), pushed as `main`, tagged. | "release branch" | `.claude/skills/release/SKILL.md` |
+| **SCRATCH WORKTREE** | A throwaway `git worktree add` in the session scratchpad, off whatever ref the job needs (a stash commit, `pull/N/head`), where a merge or a PR is resolved, built and tested with `CARGO_TARGET_DIR` outside the repo so the SHARED CHECKOUT's dirty tree is never touched. It registers in the repo's worktree list, so remove it when done or WORKTREE SYNC shows it as a row. The RELEASE WORKTREE is the release-shaped one. | "scratch", "scratch merge" | `git worktree add <scratchpad>/<name> <ref>` · MEMORY "Fixing A Fork PR's Conflicts From The Shared Tree, Then A Security Audit Of Its Diff" |
+| **RELEASE SKILL** | `/release`: verify green, commit, bump `[workspace.package].version`, tag, push, replace the GitHub notes with a real changelog. Triggered by "commit push release". | "commit push release", "cut a release", "ship it", "do a release", "commit and push and release" | `.claude/skills/release/SKILL.md` |
 | **RELEASE WORKFLOW** | CI on a `v*` tag: darwin arm/intel + linux x64/arm64 (musl) tarballs attached to a GitHub release — what INSTALL.SH downloads. | "the release action", "CI" | `.github/workflows/release.yml` |
 | **INSTALL.SH** | The curl-able installer: prebuilt tarball per target into `NEBULA_INSTALL_DIR`, `cargo install --git` fallback. Repo slug is `AgentSystemLabs/nebula`. | "the install script", "one command for anyone to install" | `install.sh` |
 | **MAKE DEV** | Run this checkout's build as an isolated DEV INSTANCE (own daemon and data, seeded from the real DB; `SEED=0`, `AGENT=/bin/cat`). Its daemon spawns from `current_exe()`, so it is always this build — but a bare `nebula rename` from an agent still resolves on PATH (see VERSION SKEW). | "make dev", "dev instance", "run nebula without port conflicts as i run in various worktrees" | `Makefile::dev` · `make dev` |
@@ -322,9 +322,9 @@ Everything nests: WORKSPACE → PROJECT → WORKTREE → SESSION. The DAEMON own
 | **SCREENSHOT HARNESS** | An isolated demo daemon + STUB AGENTS + tmux → PNG pipeline for design shots; a glyph question is settled faster with Pillow + Menlo. | "screenshot", "design shot" | `design-screenshots/` |
 | **MEMORY LOG** | `.claude/MEMORY.md`: one entry per task (Asked / Did / Gotchas), newest first, written by the NEBULA-MEMORY SKILL. Read before every task. | "memory.md", "the memory", "log this" | `.claude/MEMORY.md` · `.claude/skills/nebula-memory/SKILL.md` |
 | **NEBULA-MEMORY SKILL** | Appends or updates a MEMORY LOG entry at the end of a task. | "remember this", "write this to memory" | `.claude/skills/nebula-memory/SKILL.md` |
-| **PROMPT DADDY** | The skill that rewrites every new prompt three ways in TERMS and asks the user to pick before work begins; the pick is the request. | "prompt daddy", "improve my prompt" | `.claude/skills/prompt-daddy/SKILL.md` |
+| **PROMPT DADDY** | The skill that rewrites every new prompt once, into its best fully specified version in TERMS, asks the user only for context the work cannot proceed without (who / what / when / where / why / how), logs the final prompt (`Refined prompt:` + a quote) and proceeds on it without asking whether it is right; the refined prompt is the request. | "prompt daddy", "prompt doctor", "improve my prompt" | `.claude/skills/prompt-daddy/SKILL.md` |
 | **PROJECT TERMS** | This file, and the skill that keeps it true after every task: it detects the vocabulary each task surfaced, records aliases, renames and retirements at once, and promotes a new name to a TERM only after it recurs across separate tasks (the Candidates ledger, section 14). | "the glossary", "terms", "the defined terms" | `TERMS.md` · `.claude/skills/project-terms/SKILL.md` |
-| **OUTPUT DOCTOR** | The skill every reply that answers or closes a request goes through last, after the NEBULA-MEMORY SKILL and PROJECT TERMS: it shapes the reply into three fixed sections — `==== YOU ASKED ====` (the PROMPT DADDY pick, verbatim), `==== OVERVIEW ====` (what happened, plain sentences), `==== TECHNICAL OVERVIEW ====` (the details, kept short). | "output doctor", "format this", "use the output format" | `.claude/skills/output-doctor/SKILL.md` · `CLAUDE.md` § "Before you reply" |
+| **OUTPUT DOCTOR** | The skill every reply that answers or closes a request goes through last, after the NEBULA-MEMORY SKILL and PROJECT TERMS: it shapes the reply into three fixed sections — `==== YOU ASKED ====` (the PROMPT DADDY refined prompt, verbatim), `==== OVERVIEW ====` (what happened, plain sentences), `==== TECHNICAL OVERVIEW ====` (the details, kept short) — plus `==== ACTION REQUIRED ====` between OVERVIEW and TECHNICAL OVERVIEW, present if and only if the user must do something before the work is complete (numbered steps, exact commands). | "output doctor", "format this", "use the output format", "action required" (the section) | `.claude/skills/output-doctor/SKILL.md` · `CLAUDE.md` § "Before you reply" |
 | **CRATES** | `nebula-core` (protocol, entities, ids, paths, codec), `nebula-daemon` (registry, PTYs, hooks, status, store), `nebula-tui` (app, event loop, ui, keymap, config, overlays, IPC client), `nebula` (the binary: CLI dispatch, browser/ssh/tunnel/upgrade). | "the crates" | `Cargo.toml` members |
 
 ## 13. Retired
@@ -334,6 +334,7 @@ Names that old prompts and MEMORY LOG entries still use. Do not bring them back 
 | TERM | What it was | Retired |
 |---|---|---|
 | **NOTES** | Per-owner note lists (`e` key, `Overlay::Notes`, `notes` table, `note_badge`). Removed entirely at the user's choice; `e` is unbound. | 2026-08-26 |
+| **NEW LINK** | The `Shift+L` action and prompt that manually created a LINK. Removed from the TUI; existing LINK rows remain readable/editable and `Shift+L` is unbound. | 2026-08-28 |
 | **NEW BADGE** | The DONE BADGE's earlier wording ` n new` in green `ok` — renamed to ` n done` in violet, on the UNSEEN flag. The PR ROW's ` n new` (unread comments) is *not* this and stays. | 2026-08-27 |
 | **WORKSPACE RUNNING COUNT** | The WORKSPACE TAB briefly counted RUNNING sessions (`workspace_running`); it counts UNSEEN now (`workspace_unseen`). | 2026-08-27 |
 | **WRAPPING WALK** | The PANEL WALK used to cycle in both directions; forward now stops at the TERMINAL PANE. | 2026-08-27 |
@@ -342,7 +343,7 @@ Names that old prompts and MEMORY LOG entries still use. Do not bring them back 
 | **MOVE TO WORKTREE** | The CONTEXT MENU verb + picker (`MenuAction::MoveAgent`) that re-homed a session — replaced by NEBULA WORKTREE and WORKTREE RELOCATION. | 2026-08-26 |
 | **TODOS** | The first name of NOTES. | 2026-08-21 |
 | **KILL-SERVER** | `nebula kill-server`, renamed to NEBULA KILL. | 2026-08-20 |
-| **OLD `h` / `l` / `o` / `t` BINDINGS** | `h` was HOSTS PICKER and `l` was NEW LINK until issue #8 moved them to `Shift+H` / `Shift+L` and gave the letters to FOCUS LEFT / FOCUS RIGHT; before 2026-08-21 `o` opened NOTES and `t` the TREE BROWSER. | 2026-08-24 |
+| **OLD `h` / `l` / `o` / `t` BINDINGS** | `h` was HOSTS PICKER and `l` was NEW LINK until issue #8 moved them to `Shift+H` / `Shift+L` and gave the letters to FOCUS LEFT / FOCUS RIGHT. NEW LINK was later removed and `Shift+L` unbound; before 2026-08-21 `o` opened NOTES and `t` the TREE BROWSER. | 2026-08-24 |
 | **ACTIVE WORKSPACE CHANGED** | `ServerEvent::ActiveWorkspaceChanged` — deleted when the OPEN WORKSPACE became per-connection (STARTUP WORKSPACE). | 2026-08-24 |
 | **SECOND PRESS** | The untimed first cut of DOUBLE TAP: any `h`/`l` at a WALK EDGE walked on, so a single `l` at Sessions crossed into the pane. Lived one build; the user wanted the gesture, not the state. | 2026-08-27 |
 
@@ -355,8 +356,12 @@ is pruned. Do not cross-reference a candidate in caps from a TERM row.
 
 | CANDIDATE | What it seems to be | Seen | Where |
 |---|---|---|---|
+| **TUNNEL REUSE** | The NEBULA TUNNEL remote-script branch that, when a ttyd already answers on the remote port (`server: ttyd` header), holds the ssh session open with a long sleep instead of starting a second NEBULA BROWSER. | 2026-08-28 prompt ("if nebula is already running, maybe skip certain tasks so it'll just work") · 2026-08-28 MEMORY "NEBULA TUNNEL Reuses A ttyd Already On The Remote Port" | `crates/nebula/src/tunnel.rs::reuse_existing_ttyd!` |
 | **CANDIDATES LEDGER** | This section: the holding pen between a name's first sighting and its promotion to a TERM. | 2026-08-28 prompt ("detect vocabulary discoveries … only promote concepts that have actually become canonical") · 2026-08-28 MEMORY "Project Terms: Detect Every Session, Promote Only What Recurred" | `TERMS.md` § 14 · `.claude/skills/project-terms/SKILL.md` |
 | **SELF-IMPROVING LOOP** | The per-task cycle every agent runs: read the MEMORY LOG and `TERMS.md` → PROMPT DADDY → do the work → NEBULA-MEMORY SKILL → PROJECT TERMS → the `output-doctor` skill shapes the reply, so each task leaves the next one better grounded. | 2026-08-28 prompt ("the self improving look [loop]") · 2026-08-28 MEMORY "Project Terms: Detect Every Session, Promote Only What Recurred" | `CLAUDE.md` § "Project memory and vocabulary" · `AGENTS.md` |
+| **SECURITY REVIEW** | The built-in `security-review` skill run over a PR's diff: one audit sub-agent, then a false-positive pass per finding, reporting only high-confidence vulnerabilities. It snapshots the checkout it runs in — hand it the PR's diff explicitly. | 2026-08-28 prompt ("pr security audit review skill") · 2026-08-28 MEMORY "Fixing A Fork PR's Conflicts From The Shared Tree, Then A Security Audit Of Its Diff" | `Skill(skill: "security-review")` |
+| **PR SESSION** | A Claude AGENT created from a PROJECT OPEN PRS GROUP row: the DAEMON persists the PR URL (`agents.pr_url`), refuses a PREWARM POOL adoption for it, and composes a PR-only work rule plus the URL into `--append-system-prompt` on every spawn and RESUME. The picker is titled `New PR session · #N`. | 2026-08-28 codex prompt ("create sessions off of the open PRS rows") · 2026-08-28 MEMORY "Finishing The Codex Session's OPEN PRS → Claude SESSION Launch" (same piece of work, two sessions) | `protocol.rs::ClientRequest::CreatePrAgent` · `registry.rs::claude_pr_system_prompt` · `event_loop.rs::open_pr_agent_picker` |
+| **REFINED PROMPT** | The one rewrite PROMPT DADDY produces from a new prompt — aliases swapped for TERMS, gaps closed, judgments marked "(assuming …)" — logged in the chat as `Refined prompt:` + a `>` quote, then worked from as the request; OUTPUT DOCTOR quotes it as `YOU ASKED` and the MEMORY LOG carries it on a `→ refined:` line. | 2026-08-28 prompt ("show them the final prompt in logs") · 2026-08-28 MEMORY "Prompt Daddy: One Rewrite, Ask Only For Missing Context, Log It And Go" | `.claude/skills/prompt-daddy/SKILL.md` § "5. Log it and go" |
 
 ---
 
@@ -387,6 +392,7 @@ The user's word → the TERM. A word under two TERMS is ambiguous: settle it (PR
 | "auto focus" (the pane) | ACTIVATE / LOCKED PANE via the PANEL WALK |
 | "row", "pill", "clickable zone" | PILL ROW |
 | "root worktree row", "main checkout", "the checkout" | ROOT WORKTREE |
+| "<project>-worktrees", "sibling of my project dir" | WORKTREE DIR |
 | "repo", "project" | PROJECT |
 | "branch", "worktree" | WORKTREE |
 | "session", "terminal", "tab" (a row) | SESSION |
@@ -420,9 +426,9 @@ The user's word → the TERM. A word under two TERMS is ambiguous: settle it (PR
 | "new workspace", "makes a new workspace" | `n` in the WORKSPACE SWITCHER or the WORKSPACES BAR — both create; the new one opens with focus on the PROJECTS PANEL |
 | "remember the last selection", "remember the last agent that was selected" | SELECTION MEMORY |
 | "selected workspace", "current workspace" | OPEN WORKSPACE |
-| "links", "attach a link", "pin a url" | LINK / LINKS GROUP / NEW LINK |
+| "links", "attach a link", "pin a url", "add links manually" | LINK / WORKTREE OPEN PRS GROUP / NEW LINK (retired) |
 | "the PR", "pull request row" | PR ROW |
-| "open prs" | OPEN PRS GROUP |
+| "open prs", "open prs rows" | PROJECT OPEN PRS GROUP / WORKTREE OPEN PRS GROUP — settle by whether the user means the WORKTREES PANEL or SESSIONS PANEL |
 | "pr preview", "read the PR in the pane" | PR PREVIEW |
 | "hook", "the stop hook", "hooks endpoint" | HOOK EVENT / HOOK RECEIVER |
 | "auto title", "name themselves", "the rename hook", "the title hook" | AUTO-TITLE / NEBULA RENAME |
@@ -435,24 +441,25 @@ The user's word → the TERM. A word under two TERMS is ambiguous: settle it (PR
 | "config", "settings file" | CONFIG.JSON |
 | "daemon.log", "the logs" | DAEMON LOG |
 | "nebula ssh", "ssh into the machine" | NEBULA SSH |
-| "tunnel" | NEBULA TUNNEL |
-| "browser mode", "ttyd" | NEBULA BROWSER |
+| "tunnel", "ssh tunnel", "run ssh tunnel", "the tunnel requires a password", "port is already in use" | NEBULA TUNNEL |
+| "browser mode", "ttyd", "run on loopback or public" | NEBULA BROWSER |
 | "copy failed (clipboard unavailable)", "copy text", "drag to copy" | CLIPBOARD ROUTE / DRAG SELECT |
 | "upgrade", "update nebula" | NEBULA UPGRADE |
 | "kill the daemon" | NEBULA KILL |
 | "shared tree", "the main checkout" (git), "pull latest from main into this" | SHARED CHECKOUT |
+| "scratch", "scratch merge" | SCRATCH WORKTREE |
 | "make dev", "dev instance", "dev slot", "the dev daemon" | MAKE DEV / DEV INSTANCE |
 | "make install", "install the build" | MAKE INSTALL |
 | "kill & install & dev all in one", "make cycle" | MAKE CYCLE |
-| "commit push release", "commit push and release", "cut a release", "ship it", "make a release" | RELEASE SKILL |
+| "commit push release", "cut a release", "ship it", "make a release" | RELEASE SKILL |
 | "e2e_pty", "e2e_tui", "the e2e tests" | E2E PTY / E2E TUI |
 | "buffer_text", "the render tests" | TESTBACKEND |
 | "stub", "fake agent" | STUB AGENT |
 | "screenshot", "design shot" | SCREENSHOT HARNESS |
 | "memory.md", "the memory", "log this", "remember this" | MEMORY LOG / NEBULA-MEMORY SKILL |
-| "prompt daddy", "improve my prompt" | PROMPT DADDY |
+| "prompt daddy", "prompt doctor", "improve my prompt" | PROMPT DADDY |
+| "output doctor", "format this", "use the output format", "action required" (the section) | OUTPUT DOCTOR |
 | "the glossary", "terms", "the defined terms" | PROJECT TERMS |
-| "output doctor", "format this", "use the output format" | OUTPUT DOCTOR |
 | "theme", "color scheme" | THEME |
 | "the animation", "the shimmer" | STATUS SWEEP |
 | "splash", "startup screen" | SPLASH |

@@ -1,14 +1,14 @@
 ---
 name: output-doctor
-description: "Shape every reply to the user into one fixed three-section layout — ==== YOU ASKED ==== (the prompt-daddy pick, verbatim), ==== OVERVIEW ==== (what happened, a few plain sentences), ==== TECHNICAL OVERVIEW ==== (the details, kept short) — so a reply can be read top-down and stopped at any line. Use before writing the reply that answers or closes any request: features, bug fixes, questions, refactors, releases, recommendations. Also use when the user says \"output doctor\", \"format this\", \"use the output format\", or \"rewrite this in the format\"."
+description: "Shape every reply to the user into one fixed layout — ==== YOU ASKED ==== (the refined prompt prompt-daddy logged, verbatim), ==== OVERVIEW ==== (what happened, a few plain sentences), ==== ACTION REQUIRED ==== (present if and only if the user must do something before the work is complete: numbered steps, exact commands), ==== TECHNICAL OVERVIEW ==== (the details, kept short) — so a reply can be read top-down and stopped at any line. Use before writing the reply that answers or closes any request: features, bug fixes, questions, refactors, releases, recommendations. Also use when the user says \"output doctor\", \"format this\", \"use the output format\", or \"rewrite this in the format\"."
 user-invocable: true
 ---
 
 The reply is the part of the task the user actually reads. Everything else — the grep, the build, the
 test run — is scaffolding they see a few lines of. A reply that opens with a file path, or with a
 paragraph that mixes the headline with the mechanism, makes the user do the sorting. This skill puts
-the sorting on you: what they asked, what happened, then how — in that order, under fixed headers, so
-they can stop reading the moment they have what they need.
+the sorting on you: what they asked, what happened, what they must do (only when they must), then
+how — in that order, under fixed headers, so they can stop reading the moment they have what they need.
 
 ## When to run it
 
@@ -29,14 +29,19 @@ When in doubt, use the format. A reply that is short is fine; a reply that is sh
 
 ## The format
 
-Three sections, these exact headers, this order, nothing before the first and nothing after the last:
+Three sections, these exact headers, this order, nothing before the first and nothing after the last —
+plus a fourth, `ACTION REQUIRED`, between `OVERVIEW` and `TECHNICAL OVERVIEW`, that is present **if and
+only if** the reply needs the user to do something:
 
 ```
 ==== YOU ASKED ====
-"<the prompt-daddy pick, verbatim>"
+"<the refined prompt prompt-daddy logged, verbatim>"
 
 ==== OVERVIEW ====
 <what happened, at a glance>
+
+==== ACTION REQUIRED ====
+1. <one imperative step, with the exact command — only when the user must act>
 
 ==== TECHNICAL OVERVIEW ====
 <the details, simplified>
@@ -44,20 +49,18 @@ Three sections, these exact headers, this order, nothing before the first and no
 
 Four `=` on each side of every header. Blank line under each header. No title above `YOU ASKED`, no
 sign-off below the technical section — an offer of follow-up work goes in the last line of the
-technical section if it goes anywhere.
+technical section if it goes anywhere, never under `ACTION REQUIRED`.
 
 ### `==== YOU ASKED ====`
 
-One quoted prompt: **the rewrite the user picked in `prompt-daddy`**, verbatim, in double quotes. Only
-the pick — not the original beside it, not the option's label, no `→ picked:` prefix. That line belongs
-in the memory entry, not here.
+One quoted prompt: **the refined prompt `prompt-daddy` logged**, verbatim, in double quotes — the text
+under its `Refined prompt:` line, stated assumptions and all. Only the rewrite — not the original beside
+it, not the questions it asked, no `→ refined:` prefix. Those belong in the memory entry, not here.
 
-When there was no pick, quote the prompt you actually worked from:
-
-- the user chose **Keep original** → the original, as typed
-- `prompt-daddy` skipped itself (a mid-task correction, a confirmation, a skill trigger, a headless run)
-  → the user's message, as typed
-- the user typed something under *Other* → that text
+When there was no rewrite — `prompt-daddy` skipped itself (a mid-task correction, a confirmation, a
+skill trigger) — quote the user's message you actually worked from, as typed. If the user corrected the
+refined prompt mid-task, quote the refined prompt with the correction applied to it, so the section
+still shows the request the work answered.
 
 Never paraphrase it and never improve it here. This section exists so the user can check the reply
 against the request without scrolling up.
@@ -73,7 +76,38 @@ line stretched to a short paragraph or a numbered list of at most five items. Ru
 - if anything was left out, blocked, or scaled down, say so **here**, not buried below
 - if nothing changed (a question, a diagnosis, a recommendation), open with that: "No code changed."
 
-A reader who stops after this section should know the outcome and what, if anything, still needs them.
+A reader who stops after this section should know the outcome and *whether* anything still needs them;
+*what* they must do is the next section, which exists only when the answer is yes.
+
+### `==== ACTION REQUIRED ====`
+
+Present **if and only if** the work cannot be complete until the user does something. The test: is
+there a step you could not take yourself that the outcome depends on? Then the section is there.
+Otherwise it is not — no empty section, no "nothing required" placeholder, no header without steps.
+
+Counts, and so creates the section:
+
+- a command only they can run — an interactive login, NEBULA KILL / MAKE CYCLE (they take every live
+  session down, this one included, so they run from a terminal outside nebula), a call that was denied
+  or needs their terminal — offered in the `! <command>` form where its output should land in the session
+- a setting they must flip, a process they must restart, a tool they must install or upgrade
+- a decision you are blocked on that an `AskUserQuestion` did not settle, stated as the choice to make
+- an approval for a destructive or outward-facing step you did not take without it
+- a check only they can do — a manual test in their terminal, a look at a screenshot, a review before
+  a merge
+
+Does not count, and so does not create the section:
+
+- an offer of optional follow-up work ("I can also…") — the last line of the technical section
+- a gotcha or a behavior that changed which they only need to *know* — the technical section
+- something left out or scaled down — the overview says so; it becomes a step here only if finishing
+  it needs them
+- anything you could do yourself but have not — do it, then reply
+
+Shape: a numbered list, one imperative step per item, in the order to do them, the exact command or
+setting in a code block. No prose above the list; the *why* is one clause on the step, or lives in the
+technical section. Two or three steps is typical — a longer list is usually a task you should have
+finished.
 
 ### `==== TECHNICAL OVERVIEW ====`
 
@@ -124,3 +158,29 @@ Cutting all three removes roughly 3,500 lines, one external dependency, and need
 
 The original reply had the same content in prose that opened with a heading and a rationale paragraph;
 the user asked for it twice more before it had this shape. Start with the shape.
+
+A second, hypothetical and condensed, showing the conditional section — a DAEMON change that the
+running daemon cannot pick up without the user:
+
+````
+==== YOU ASKED ====
+"Make the HOOK RECEIVER accept the Cursor dialect's camelCase `stop` event so Cursor sessions turn
+FINISHED instead of sticking on RUNNING."
+
+==== OVERVIEW ====
+The HOOK RECEIVER now maps Cursor's `stop` to the same FINISHED transition as Claude's `Stop`; 690
+tests green and MAKE INSTALL has run. The live DAEMON is still the old build, so nothing changes on
+screen until it is restarted — and that restart is yours to run.
+
+==== ACTION REQUIRED ====
+1. From a terminal outside nebula (it stops every live session, this one included), restart the daemon:
+   ```
+   nebula kill && nebula
+   ```
+
+==== TECHNICAL OVERVIEW ====
+…
+````
+
+Had MAKE INSTALL been the only step left, the reply would have run it and carried no `ACTION REQUIRED`
+at all — the section is for what the user must do, not for what you could still do.

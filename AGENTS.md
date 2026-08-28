@@ -37,8 +37,11 @@ task uses it again.
 **Then shape the reply** by reading `.claude/skills/output-doctor/SKILL.md` and following it, before
 you write the reply that answers or closes the request: three fixed sections — `==== YOU ASKED ====`
 (the prompt you worked from, verbatim), `==== OVERVIEW ====` (what happened, in plain sentences), and
-`==== TECHNICAL OVERVIEW ====` (the details, kept short). Every reply, every kind of task; only the
-one-line preamble and mid-task progress notes sit outside it.
+`==== TECHNICAL OVERVIEW ====` (the details, kept short) — with `==== ACTION REQUIRED ====` between the
+overview and the technical section if and only if the user must do something before the work is
+complete (run a command, flip a setting, restart, decide, approve), as numbered steps with the exact
+command. Every reply, every kind of task; only the one-line preamble and mid-task progress notes sit
+outside it.
 
 (Claude Code sessions get this same protocol from `CLAUDE.md`, and can invoke the skills directly as
 `Skill(skill: "nebula-memory")`, `Skill(skill: "project-terms")` and `Skill(skill: "output-doctor")`.)

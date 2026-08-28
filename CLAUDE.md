@@ -25,7 +25,7 @@ related, fold its context into how you work:
 
 Then map every noun in the prompt onto `TERMS.md`: the **Alias index** at the bottom turns the user's
 words ("top nav", "locked layer", "done") into the TERM they mean, and the TERM's row tells you where
-that thing lives. If a word maps to two TERMS, that is the ambiguity `prompt-daddy` has to split on.
+that thing lives. If a word maps to two TERMS, that is the ambiguity `prompt-daddy` has to ask about.
 
 Both files describe what was true when they were written. If one names a file, function, or flag,
 confirm it still exists before you rely on it, and correct the entry if it has gone stale.
@@ -67,15 +67,20 @@ earnest, or answering, invoke the `prompt-daddy` skill on the user's prompt:
 Skill(skill: "prompt-daddy")
 ```
 
-It rewrites the prompt three ways — each closing a gap the original left open (an ambiguous word like
-"done" or "move", an unstated "keep X as-is", a missing why, a bug report without its evidence) — with
-the user's aliases replaced by the TERMS they map to, and asks the user to pick one or keep the
-original. **The pick is the request you work from.**
+It rewrites the prompt once, into its best fully specified version — the gaps the original left open
+closed (an ambiguous word like "done" or "move", an unstated "keep X as-is", a missing why, a bug report
+without its evidence), the user's aliases replaced by the TERMS they map to. It asks the user **only**
+for context the work cannot proceed without — a who / what / when / where / why / how that neither the
+prompt, the memory log, the glossary nor a quick grep can fill — in one `AskUserQuestion`, then folds
+the answers in. It logs the final prompt in the chat (`Refined prompt:` + the text as a quote) and
+proceeds on it at once; it never asks whether the rewrite is right. **The refined prompt is the
+request you work from.**
 
 Run it on every new prompt: features, bug reports, questions, refactors, "debug this". The skill lists
 the few cases it skips on its own — a reply to a question you asked, a bare confirmation, a mid-task
-correction that is already specific, a slash-command or skill trigger like "commit push release", and
-headless runs where nobody can pick.
+correction that is already specific, and a slash-command or skill trigger like "commit push release".
+In headless runs it still rewrites and logs, but writes its questions into the prompt as stated
+assumptions instead of asking.
 
 ### After you finish a task
 
@@ -115,9 +120,12 @@ after `nebula-memory` and `project-terms` have run, and before you write a word 
 Skill(skill: "output-doctor")
 ```
 
-It fixes the reply's shape to three sections in this order: `==== YOU ASKED ====` (the prompt the user
-picked in `prompt-daddy`, verbatim — only the pick), `==== OVERVIEW ====` (what happened, in a few
+It fixes the reply's shape to three sections in this order: `==== YOU ASKED ====` (the refined prompt
+`prompt-daddy` logged, verbatim — only the rewrite), `==== OVERVIEW ====` (what happened, in a few
 plain sentences a reader can stop after), and `==== TECHNICAL OVERVIEW ====` (the details, kept short
-enough that the user asks for more rather than skims). Use it on every kind of reply — a feature, a
-bug fix, a question, a recommendation, a release. The only text outside it is the one-line "about to"
+enough that the user asks for more rather than skims) — plus `==== ACTION REQUIRED ====` between the
+overview and the technical section, present if and only if the user must do something before the work
+is complete (run a command, flip a setting, restart, decide, approve): numbered imperative steps with
+the exact command. Use it on every kind of reply — a feature, a bug fix, a question, a recommendation,
+a release. The only text outside it is the one-line "about to"
 preamble, mid-task progress notes, and `AskUserQuestion` prompts; the skill lists those exceptions.
