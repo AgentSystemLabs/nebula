@@ -8,6 +8,8 @@
 //! kitty query then DA1, protocol is supported iff the kitty reply arrives
 //! before the DA1 reply", which needs a DA1 reply to terminate promptly.
 
+use super::ESC;
+
 /// Max nesting the spec suggests implementations may cap the stack at.
 const MAX_STACK: usize = 32;
 /// A real kitty sequence has short params; anything longer is not for us.
@@ -77,7 +79,7 @@ impl KittyScanner {
     fn step(&mut self, b: u8, actions: &mut ScanActions) {
         match self.state {
             State::Ground => {
-                if b == 0x1b {
+                if b == ESC {
                     self.state = State::Esc;
                 }
             }
@@ -87,7 +89,7 @@ impl KittyScanner {
                     self.state = State::Csi { poisoned: false };
                 } else {
                     // Includes ESC ESC; any other escape kind is not a CSI.
-                    self.state = if b == 0x1b { State::Esc } else { State::Ground };
+                    self.state = if b == ESC { State::Esc } else { State::Ground };
                 }
             }
             State::Csi { poisoned } => match b {

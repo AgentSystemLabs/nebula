@@ -198,19 +198,7 @@ impl AgentStatusMachine {
                 self.finished_at = None;
                 self.set_status(AgentStatus::Running, &mut effects);
             }
-            HookEvent::Stop => {
-                self.subagents.prune_expired(now);
-                if self.subagents.is_empty() {
-                    self.stop_held = false;
-                    self.finished_at = Some(now);
-                    self.set_status(AgentStatus::Finished, &mut effects);
-                } else {
-                    // Foreground turn ended but subagents are still working.
-                    self.stop_held = true;
-                    self.drain_idle_since = None;
-                    self.set_status(AgentStatus::Running, &mut effects);
-                }
-            }
+            HookEvent::Stop => self.end_turn(now, &mut effects),
             HookEvent::SessionStart { source } => {
                 if source.as_deref() == Some("clear") {
                     // Same session id, but /clear killed any live subagents.
@@ -288,16 +276,7 @@ impl AgentStatusMachine {
                     // however it ended. Same bookkeeping as `Stop`, so a
                     // real Stop arriving either side of this is a no-op and
                     // the subagent drain hold still applies.
-                    self.subagents.prune_expired(now);
-                    if self.subagents.is_empty() {
-                        self.stop_held = false;
-                        self.finished_at = Some(now);
-                        self.set_status(AgentStatus::Finished, &mut effects);
-                    } else {
-                        self.stop_held = true;
-                        self.drain_idle_since = None;
-                        self.set_status(AgentStatus::Running, &mut effects);
-                    }
+                    self.end_turn(now, &mut effects);
                 }
                 // Fresh / Terminated / Disconnected are left alone: a CLI
                 // clears its progress bar on startup and on exit too, and
@@ -349,6 +328,24 @@ impl AgentStatusMachine {
             self.drain_idle_since = None;
         }
         effects
+    }
+
+    /// The foreground turn ended — a `Stop`, or the CLI clearing its
+    /// progress bar. Finished outright when no subagent is still tracked;
+    /// otherwise the stop is held at running and `tick` promotes it once
+    /// the set has drained and stayed empty for the grace period.
+    fn end_turn(&mut self, now: Instant, effects: &mut Vec<Effect>) {
+        self.subagents.prune_expired(now);
+        if self.subagents.is_empty() {
+            self.stop_held = false;
+            self.finished_at = Some(now);
+            self.set_status(AgentStatus::Finished, effects);
+        } else {
+            // Foreground turn ended but subagents are still working.
+            self.stop_held = true;
+            self.drain_idle_since = None;
+            self.set_status(AgentStatus::Running, effects);
+        }
     }
 
     /// Claude reports itself idle at the input box. This is the only end-of-

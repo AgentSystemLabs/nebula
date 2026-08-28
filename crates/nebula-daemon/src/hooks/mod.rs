@@ -46,6 +46,23 @@ pub fn auto_title_injection() -> String {
     .to_string()
 }
 
+/// Diagnostic bodies for the route whose responses a hook discards. Never
+/// sent where a body would reach the model's context (see `HookDialect`).
+pub const HOOK_OK: &str = r#"{"ok": true}"#;
+pub const HOOK_NOT_OK: &str = r#"{"ok": false}"#;
+
+/// What a CLI's hook command does with this server's response body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookDialect {
+    /// Claude and Codex: the UserPromptSubmit hook pipes the body to the
+    /// CLI's stdout, where it lands in the model's context — so on that
+    /// event the body must be empty or the instruction, never diagnostics.
+    Injectable,
+    /// Cursor: every hook answers with its own gating JSON and drops the
+    /// body, so the `{"ok": …}` diagnostics can stay.
+    Plain,
+}
+
 #[derive(Clone)]
 pub struct HookEnv {
     pub port: u16,
@@ -190,6 +207,98 @@ fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Claude/Codex route: the UserPromptSubmit hook command pipes this
+/// response's body to stdout, so it must be empty or the injected
+/// instruction — never diagnostic JSON.
+async fn receive_injectable_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(HookDialect::Injectable, state, query, headers, body).await
+}
+
+/// Cursor route: every hook command answers cursor with its own gating JSON
+/// and discards this body, so the `{"ok": ...}` diagnostics stay.
+async fn receive_plain_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(HookDialect::Plain, state, query, headers, body).await
+}
+
+async fn receive_hook(
+    dialect: HookDialect,
+    state: Arc<HookServerState>,
+    query: HookQuery,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    // On this path the response body reaches the model's context, so every
+    // outcome (auth failure included) must answer with empty-or-instruction.
+    let injectable = dialect == HookDialect::Injectable && query.hook_event == "UserPromptSubmit";
+    let quiet_or = |status: StatusCode, diag: &str| {
+        let body = if injectable {
+            String::new()
+        } else {
+            diag.to_string()
+        };
+        (status, body)
+    };
+
+    let authorized = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|presented| presented.as_bytes().ct_eq(state.token.as_bytes()).into())
+        .unwrap_or(false);
+    if !authorized {
+        return quiet_or(StatusCode::UNAUTHORIZED, HOOK_NOT_OK);
+    }
+
+    // Parse failures still 200 — never fault a hook.
+    let payload: HookPayload = serde_json::from_str(&body).unwrap_or_default();
+    let Some(event) = parse_event(&query.hook_event, &payload) else {
+        return quiet_or(StatusCode::OK, HOOK_NOT_OK);
+    };
+    let agent_id = AgentId(query.agent_id.clone());
+    tracing::debug!(agent = %agent_id, event = ?event, "hook received");
+    // A subagent's tool traffic reports the payload's cwd too, but that is
+    // the Task's position, not the session's — an isolated subagent working
+    // in a scratch checkout must never drag the row out from under the
+    // conversation. Only foreground payloads carry a cwd onward.
+    let cwd = payload.cwd().filter(|_| payload.subagent_id().is_none());
+    let _ = state
+        .tx
+        .send(HookDelivery {
+            agent_id: agent_id.clone(),
+            event,
+            session_id: payload.session_id(),
+            cwd,
+        })
+        .await;
+
+    if injectable {
+        // Prompt submitted on a still-untitled session: hand the CLI the
+        // titling instruction. Unknown ids (prewarm, stale env) and store
+        // errors degrade to no injection.
+        let inject = state
+            .store
+            .agent_auto_title_pending(&agent_id)
+            .unwrap_or(false);
+        let body = if inject {
+            auto_title_injection()
+        } else {
+            String::new()
+        };
+        return (StatusCode::OK, body);
+    }
+    (StatusCode::OK, HOOK_OK.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,7 +441,7 @@ mod tests {
             payload,
         )
         .await;
-        assert_eq!(body, r#"{"ok": true}"#);
+        assert_eq!(body, HOOK_OK);
 
         // Cursor's dialect can't inject — no instruction even while pending.
         let (_, body) = http_post(
@@ -342,7 +451,7 @@ mod tests {
             payload,
         )
         .await;
-        assert_eq!(body, r#"{"ok": true}"#);
+        assert_eq!(body, HOOK_OK);
 
         // Bad token on the injectable path: 401 and an EMPTY body, so a
         // misconfigured hook can't inject diagnostics as context.
@@ -435,96 +544,4 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
     }
-}
-
-/// Claude/Codex route: the UserPromptSubmit hook command pipes this
-/// response's body to stdout, so it must be empty or the injected
-/// instruction — never diagnostic JSON.
-async fn receive_injectable_hook(
-    State(state): State<Arc<HookServerState>>,
-    Query(query): Query<HookQuery>,
-    headers: HeaderMap,
-    body: String,
-) -> (StatusCode, String) {
-    receive_hook(true, state, query, headers, body).await
-}
-
-/// Cursor route: every hook command answers cursor with its own gating JSON
-/// and discards this body, so the `{"ok": ...}` diagnostics stay.
-async fn receive_plain_hook(
-    State(state): State<Arc<HookServerState>>,
-    Query(query): Query<HookQuery>,
-    headers: HeaderMap,
-    body: String,
-) -> (StatusCode, String) {
-    receive_hook(false, state, query, headers, body).await
-}
-
-async fn receive_hook(
-    inject_capable: bool,
-    state: Arc<HookServerState>,
-    query: HookQuery,
-    headers: HeaderMap,
-    body: String,
-) -> (StatusCode, String) {
-    // On this path the response body reaches the model's context, so every
-    // outcome (auth failure included) must answer with empty-or-instruction.
-    let injectable = inject_capable && query.hook_event == "UserPromptSubmit";
-    let quiet_or = |status: StatusCode, diag: &str| {
-        let body = if injectable {
-            String::new()
-        } else {
-            diag.to_string()
-        };
-        (status, body)
-    };
-
-    let authorized = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|presented| presented.as_bytes().ct_eq(state.token.as_bytes()).into())
-        .unwrap_or(false);
-    if !authorized {
-        return quiet_or(StatusCode::UNAUTHORIZED, r#"{"ok": false}"#);
-    }
-
-    // Parse failures still 200 — never fault a hook.
-    let payload: HookPayload = serde_json::from_str(&body).unwrap_or_default();
-    let Some(event) = parse_event(&query.hook_event, &payload) else {
-        return quiet_or(StatusCode::OK, r#"{"ok": false}"#);
-    };
-    let agent_id = AgentId(query.agent_id.clone());
-    tracing::debug!(agent = %agent_id, event = ?event, "hook received");
-    // A subagent's tool traffic reports the payload's cwd too, but that is
-    // the Task's position, not the session's — an isolated subagent working
-    // in a scratch checkout must never drag the row out from under the
-    // conversation. Only foreground payloads carry a cwd onward.
-    let cwd = payload.cwd().filter(|_| payload.subagent_id().is_none());
-    let _ = state
-        .tx
-        .send(HookDelivery {
-            agent_id: agent_id.clone(),
-            event,
-            session_id: payload.session_id(),
-            cwd,
-        })
-        .await;
-
-    if injectable {
-        // Prompt submitted on a still-untitled session: hand the CLI the
-        // titling instruction. Unknown ids (prewarm, stale env) and store
-        // errors degrade to no injection.
-        let inject = state
-            .store
-            .agent_auto_title_pending(&agent_id)
-            .unwrap_or(false);
-        let body = if inject {
-            auto_title_injection()
-        } else {
-            String::new()
-        };
-        return (StatusCode::OK, body);
-    }
-    (StatusCode::OK, r#"{"ok": true}"#.to_string())
 }

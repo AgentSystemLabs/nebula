@@ -85,6 +85,48 @@ pub const SETTINGS_MEMORY_TTL: std::time::Duration = std::time::Duration::from_s
 /// The diff pane always keeps at least this much width.
 pub const MIN_DIFF_PANE_W: u16 = 24;
 
+// ---- list-view arithmetic shared by every overlay with a cursor ----
+
+/// First visible row of a stateless follow-window over a list: the window
+/// slides only as far as it must to keep `selected` on its last row. One
+/// definition so every overlay list scrolls the same way.
+pub fn window_start(selected: usize, height: usize) -> usize {
+    (selected + 1).saturating_sub(height)
+}
+
+/// Clamp an absolute cursor request onto a list of `len` rows: negative
+/// lands on the first row, past-the-end on the last, and an empty list on
+/// 0 — the same rule every overlay applies before indexing.
+pub fn clamp_selection(index: i64, len: usize) -> usize {
+    let max = len.saturating_sub(1) as i64;
+    index.clamp(0, max) as usize
+}
+
+/// Furthest a pane of `view_height` rows can scroll into `lines` lines —
+/// the scroll that puts the last line on the bottom row. Zero when it all
+/// fits. Shared by the diff pane and the tree preview.
+pub fn max_scroll(lines: usize, view_height: u16) -> u16 {
+    (lines as u16).saturating_sub(view_height.max(1))
+}
+
+/// `scroll` moved by `delta` and held within `0..=max`.
+pub fn scrolled_by(scroll: u16, delta: i32, max: u16) -> u16 {
+    (scroll as i32 + delta).clamp(0, max as i32) as u16
+}
+
+/// Width of a split modal's left list when its boundary is dragged to
+/// screen column `boundary_x`, clamped so the list keeps `MIN_DIFF_FILES_W`
+/// and the right pane keeps `MIN_DIFF_PANE_W`. `None` when `area` is too
+/// narrow to honor both minimums — the caller leaves the width alone.
+pub fn clamp_files_width(area: Rect, boundary_x: i32) -> Option<u16> {
+    let max = area.width.saturating_sub(MIN_DIFF_PANE_W);
+    if max < MIN_DIFF_FILES_W {
+        return None; // modal too small to honor the minimums
+    }
+    let want = (boundary_x - area.x as i32).max(0) as u16;
+    Some(want.clamp(MIN_DIFF_FILES_W, max))
+}
+
 // ---- overlays ----
 
 #[derive(Debug, Clone, PartialEq)]
@@ -191,6 +233,26 @@ pub struct MenuItem {
     pub label: String,
     pub action: MenuAction,
     pub destructive: bool,
+}
+
+impl MenuItem {
+    /// A plain menu row.
+    pub fn new(label: impl Into<String>, action: MenuAction) -> Self {
+        Self {
+            label: label.into(),
+            action,
+            destructive: false,
+        }
+    }
+
+    /// A row drawn in the warning color: it deletes, closes, or removes.
+    pub fn destructive(label: impl Into<String>, action: MenuAction) -> Self {
+        Self {
+            label: label.into(),
+            action,
+            destructive: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -427,7 +489,7 @@ impl PromptDialog {
     }
 
     fn home() -> Option<std::path::PathBuf> {
-        std::env::var_os("HOME").map(std::path::PathBuf::from)
+        nebula_core::env::home_dir()
     }
 
     /// Recompute `dirs` from `input` after any edit; the hover returns to
@@ -591,7 +653,7 @@ impl DiffView {
     }
 
     pub fn max_scroll(&self) -> u16 {
-        (self.diff_line_count as u16).saturating_sub(self.view_height.max(1))
+        max_scroll(self.diff_line_count, self.view_height)
     }
 
     /// Screen x of the files/diff boundary — the column where the diff panel
@@ -603,24 +665,20 @@ impl DiffView {
     /// Move the files/diff boundary to `boundary_x`, clamped so the file list
     /// keeps `MIN_DIFF_FILES_W` and the diff pane keeps `MIN_DIFF_PANE_W`.
     pub fn set_files_width(&mut self, boundary_x: i32) {
-        let max = self.area.width.saturating_sub(MIN_DIFF_PANE_W);
-        if max < MIN_DIFF_FILES_W {
-            return; // modal too small to honor the minimums
+        if let Some(width) = clamp_files_width(self.area, boundary_x) {
+            self.files_width = width;
         }
-        let want = (boundary_x - self.area.x as i32).max(0) as u16;
-        self.files_width = want.clamp(MIN_DIFF_FILES_W, max);
     }
 
     /// Clamped relative scroll.
     pub fn scroll_by(&mut self, delta: i32) {
-        self.scroll = (self.scroll as i32 + delta).clamp(0, self.max_scroll() as i32) as u16;
+        self.scroll = scrolled_by(self.scroll, delta, self.max_scroll());
     }
 
     /// Clamped absolute selection in the filtered list; true when it changed
     /// (the caller reloads the diff).
     pub fn select(&mut self, index: i64) -> bool {
-        let max = self.matches.len().saturating_sub(1) as i64;
-        let clamped = index.clamp(0, max) as usize;
+        let clamped = clamp_selection(index, self.matches.len());
         let changed = clamped != self.selected;
         self.selected = clamped;
         changed
@@ -634,7 +692,7 @@ impl DiffView {
     /// First visible row of the file list's stateless follow-window for a
     /// list of `height` rows.
     pub fn window_start(&self, height: usize) -> usize {
-        (self.selected + 1).saturating_sub(height)
+        window_start(self.selected, height)
     }
 
     /// Recompute `matches` from `filter` and reset the selection to the top
@@ -819,13 +877,12 @@ impl Palette {
     /// First visible row of the result list's stateless follow-window for a
     /// list of `height` rows.
     pub fn window_start(&self, height: usize) -> usize {
-        (self.selected + 1).saturating_sub(height)
+        window_start(self.selected, height)
     }
 
     /// Clamped absolute selection in the filtered list.
     pub fn select(&mut self, index: i64) {
-        let max = self.matches.len().saturating_sub(1) as i64;
-        self.selected = index.clamp(0, max) as usize;
+        self.selected = clamp_selection(index, self.matches.len());
     }
 
     /// The jump target behind the current selection, if any row is visible.
@@ -1025,13 +1082,12 @@ impl FileFinder {
     /// First visible row of the result list's stateless follow-window for a
     /// list of `height` rows.
     pub fn window_start(&self, height: usize) -> usize {
-        (self.selected + 1).saturating_sub(height)
+        window_start(self.selected, height)
     }
 
     /// Clamped absolute selection in the filtered list.
     pub fn select(&mut self, index: i64) {
-        let max = self.matches.len().saturating_sub(1) as i64;
-        self.selected = index.clamp(0, max) as usize;
+        self.selected = clamp_selection(index, self.matches.len());
     }
 
     /// The path behind the current selection, if any row is visible.
@@ -1121,13 +1177,12 @@ impl GrepView {
     /// First visible row of the result list's stateless follow-window for a
     /// list of `height` rows.
     pub fn window_start(&self, height: usize) -> usize {
-        (self.selected + 1).saturating_sub(height)
+        window_start(self.selected, height)
     }
 
     /// Clamped absolute selection.
     pub fn select(&mut self, index: i64) {
-        let max = self.hits.len().saturating_sub(1) as i64;
-        self.selected = index.clamp(0, max) as usize;
+        self.selected = clamp_selection(index, self.hits.len());
     }
 
     /// The hit behind the current selection, if any row is visible.
@@ -1170,7 +1225,7 @@ impl HostsView {
     /// First visible row of the list's stateless follow-window for a list of
     /// `height` rows.
     pub fn window_start(&self, height: usize) -> usize {
-        (self.selected + 1).saturating_sub(height)
+        window_start(self.selected, height)
     }
 }
 
@@ -2835,6 +2890,54 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- shared list arithmetic ----
+
+    #[test]
+    fn window_start_slides_only_to_keep_the_cursor_visible() {
+        assert_eq!(window_start(0, 5), 0);
+        assert_eq!(window_start(4, 5), 0, "last row still fits");
+        assert_eq!(window_start(5, 5), 1);
+        assert_eq!(window_start(12, 5), 8);
+        assert_eq!(window_start(3, 0), 4, "a zero-height list still computes");
+    }
+
+    #[test]
+    fn clamp_selection_pins_to_the_list() {
+        assert_eq!(clamp_selection(3, 0), 0, "empty list");
+        assert_eq!(clamp_selection(-2, 4), 0);
+        assert_eq!(clamp_selection(2, 4), 2);
+        assert_eq!(clamp_selection(9, 4), 3);
+    }
+
+    #[test]
+    fn max_scroll_and_scrolled_by_pin_the_pane() {
+        assert_eq!(max_scroll(10, 4), 6);
+        assert_eq!(max_scroll(3, 4), 0, "everything fits");
+        assert_eq!(max_scroll(3, 0), 2, "a zero-height pane counts as one row");
+        assert_eq!(scrolled_by(2, 3, 6), 5);
+        assert_eq!(scrolled_by(2, 10, 6), 6);
+        assert_eq!(scrolled_by(2, -10, 6), 0);
+    }
+
+    #[test]
+    fn clamp_files_width_honors_both_minimums() {
+        let area = Rect::new(10, 0, 100, 20);
+        // Boundary at column 50 → 40 columns of list.
+        assert_eq!(clamp_files_width(area, 50), Some(40));
+        assert_eq!(
+            clamp_files_width(area, 0),
+            Some(MIN_DIFF_FILES_W),
+            "left of the modal"
+        );
+        assert_eq!(
+            clamp_files_width(area, 200),
+            Some(100 - MIN_DIFF_PANE_W),
+            "the right pane keeps its minimum"
+        );
+        let tiny = Rect::new(0, 0, MIN_DIFF_FILES_W + MIN_DIFF_PANE_W - 1, 20);
+        assert_eq!(clamp_files_width(tiny, 5), None, "too small to honor both");
+    }
 
     // ---- worktree links ----
 

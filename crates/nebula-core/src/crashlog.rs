@@ -6,6 +6,10 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+const SECS_PER_MIN: u64 = 60;
+const SECS_PER_HOUR: u64 = 60 * SECS_PER_MIN;
+const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
+
 /// Install a panic hook that appends the panic message and a backtrace to
 /// `path`, then delegates to the previously installed hook. Fires for panics
 /// on any thread, including tokio worker threads.
@@ -41,13 +45,18 @@ fn timestamp() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let (y, m, d) = civil_from_days((secs / 86400) as i64);
-    let tod = secs % 86400;
+    format_timestamp(secs)
+}
+
+/// Seconds since the Unix epoch as `YYYY-MM-DDTHH:MM:SSZ`.
+fn format_timestamp(secs: u64) -> String {
+    let (y, m, d) = civil_from_days((secs / SECS_PER_DAY) as i64);
+    let tod = secs % SECS_PER_DAY;
     format!(
         "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        tod / 3600,
-        (tod % 3600) / 60,
-        tod % 60
+        tod / SECS_PER_HOUR,
+        (tod % SECS_PER_HOUR) / SECS_PER_MIN,
+        tod % SECS_PER_MIN
     )
 }
 
@@ -74,6 +83,19 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_723), (2024, 1, 1));
         assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+    }
+
+    #[test]
+    fn timestamps_are_rfc3339_utc() {
+        assert_eq!(format_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_timestamp(1_704_067_200), "2024-01-01T00:00:00Z");
+        // 2024-02-29 23:59:59
+        assert_eq!(format_timestamp(1_709_251_199), "2024-02-29T23:59:59Z");
+        // Mid-day: every field below the day is exercised.
+        assert_eq!(
+            format_timestamp(1_704_067_200 + 13 * SECS_PER_HOUR + 7 * SECS_PER_MIN + 9),
+            "2024-01-01T13:07:09Z"
+        );
     }
 
     #[test]

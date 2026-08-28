@@ -10,7 +10,27 @@ pub mod status;
 pub mod store;
 
 use anyhow::{bail, Context, Result};
-use nebula_core::paths;
+use nebula_core::{env, paths};
+
+/// Floor on any env-tunable loop period: the overrides exist to make tests
+/// fast, and a zero or near-zero tick would just spin the daemon.
+const MIN_TICK_MS: u64 = 50;
+
+/// A loop period from an env override's value: unset or unparseable falls
+/// back to `default_ms`, and nothing goes below [`MIN_TICK_MS`].
+fn env_period_ms(value: Option<&str>, default_ms: u64) -> u64 {
+    value
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default_ms)
+        .max(MIN_TICK_MS)
+}
+
+/// The ticker for a background loop whose period the env var `var` may
+/// override (see [`env_period_ms`]).
+fn env_interval(var: &str, default_ms: u64) -> tokio::time::Interval {
+    let period = env_period_ms(std::env::var(var).ok().as_deref(), default_ms);
+    tokio::time::interval(std::time::Duration::from_millis(period))
+}
 
 /// Entry point for the daemon process (already detached by the launcher,
 /// or running with --foreground).
@@ -120,12 +140,7 @@ async fn serve() -> Result<()> {
     {
         let daemon = daemon.clone();
         tokio::spawn(async move {
-            let period = std::env::var("NEBULA_IDLE_REAP_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(15_000)
-                .max(50);
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(period));
+            let mut interval = env_interval(env::IDLE_REAP_MS, 15_000);
             loop {
                 tokio::select! {
                     _ = daemon.shutdown.cancelled() => break,
@@ -143,12 +158,7 @@ async fn serve() -> Result<()> {
     {
         let daemon = daemon.clone();
         tokio::spawn(async move {
-            let period = std::env::var("NEBULA_WORKTREE_SYNC_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(2_000)
-                .max(50);
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(period));
+            let mut interval = env_interval(env::WORKTREE_SYNC_MS, 2_000);
             let mut seen: std::collections::HashMap<nebula_core::ProjectId, std::time::SystemTime> =
                 std::collections::HashMap::new();
             loop {
@@ -275,6 +285,34 @@ fn rebase_on(base: &std::path::Path, target: &str) -> std::path::PathBuf {
         target
     } else {
         base.join(target)
+    }
+}
+
+#[cfg(test)]
+mod period_tests {
+    use super::*;
+
+    #[test]
+    fn env_period_ms_defaults_parses_and_floors() {
+        assert_eq!(env_period_ms(None, 15_000), 15_000, "unset → default");
+        assert_eq!(
+            env_period_ms(Some("soon"), 15_000),
+            15_000,
+            "garbage → default"
+        );
+        assert_eq!(
+            env_period_ms(Some("-5"), 2_000),
+            2_000,
+            "negative → default"
+        );
+        assert_eq!(
+            env_period_ms(Some("10"), 15_000),
+            MIN_TICK_MS,
+            "too fast → floor"
+        );
+        assert_eq!(env_period_ms(Some("200"), 15_000), 200);
+        // The floor applies to the default too — a caller can't dodge it.
+        assert_eq!(env_period_ms(None, 1), MIN_TICK_MS);
     }
 }
 

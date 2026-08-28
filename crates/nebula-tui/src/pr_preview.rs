@@ -14,13 +14,16 @@
 //! one concession is that hard line breaks are honored, because a PR
 //! description written as a list reads as a list.
 
-use crate::pull_request::{PrComment, PrDetail};
+use crate::pull_request::{PrComment, PrDetail, STATE_OPEN};
 use crate::theme::Theme;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 /// Left inset of the body text, so prose doesn't hug the pane rule.
 const INDENT: &str = " ";
+/// Narrowest the body wraps to: below this, wrapping yields a word per line
+/// and overflowing the pane reads better than that.
+const MIN_BODY_W: usize = 20;
 
 /// Wrap `text` to `width` columns on word boundaries, honoring the hard
 /// line breaks already in it. A word longer than the whole width (a URL, a
@@ -91,13 +94,10 @@ fn fit(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
         }
         let room = width - used;
         if room > 1 {
-            let text: String = span
-                .content
-                .chars()
-                .take(room - 1)
-                .chain(std::iter::once('…'))
-                .collect();
-            kept.push(Span::styled(text, span.style));
+            kept.push(Span::styled(
+                crate::ui::truncate(&span.content, room),
+                span.style,
+            ));
         }
         break;
     }
@@ -107,7 +107,7 @@ fn fit(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
 /// The preview as styled lines, ready to slice by the scroll offset.
 /// `width` is the pane's inner width.
 pub fn lines(detail: &PrDetail, width: usize, th: Theme) -> Vec<Line<'static>> {
-    let body_w = width.saturating_sub(INDENT.len() + 1).max(20);
+    let body_w = width.saturating_sub(INDENT.len() + 1).max(MIN_BODY_W);
     let dim = Style::default().fg(th.dim);
     let muted = Style::default().fg(th.muted);
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -124,8 +124,8 @@ pub fn lines(detail: &PrDetail, width: usize, th: Theme) -> Vec<Line<'static>> {
         width,
     ));
     let state = match (detail.state.as_str(), detail.is_draft) {
-        ("OPEN", true) => ("draft", th.dim),
-        ("OPEN", false) => ("open", th.ok),
+        (STATE_OPEN, true) => ("draft", th.dim),
+        (STATE_OPEN, false) => ("open", th.ok),
         ("MERGED", _) => ("merged", th.special),
         ("CLOSED", _) => ("closed", th.err),
         _ => (detail.state.as_str(), th.dim),

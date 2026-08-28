@@ -3,9 +3,19 @@
 
 use anyhow::{bail, Context, Result};
 use nebula_core::codec::{read_frame, write_frame};
-use nebula_core::{paths, AgentId, ClientRequest, EnterOutcome, ServerEvent, PROTOCOL_VERSION};
+use nebula_core::{
+    env, paths, AgentId, ClientRequest, EnterOutcome, ServerEvent, PROTOCOL_VERSION,
+};
 use std::time::Duration;
 use tokio::net::UnixStream;
+
+/// Request id for the one-shot CLIs: each opens a fresh connection, sends a
+/// single request and waits for its reply, so there is never a second id.
+const ONE_SHOT_REQ_ID: u64 = 1;
+/// The daemon hung up mid-request — the message every one-shot client shows.
+const CLOSED_BEFORE_REPLY: &str = "daemon closed the connection before replying";
+/// How often the connect and shutdown waits re-check the daemon.
+const POLL_STEP: Duration = Duration::from_millis(50);
 
 pub struct Connection {
     pub stream: UnixStream,
@@ -28,7 +38,7 @@ pub async fn connect_or_spawn() -> Result<Connection> {
         match try_connect(&sock).await {
             Ok(conn) => return handshake(conn).await,
             Err(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(POLL_STEP).await;
             }
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -191,6 +201,67 @@ pub fn split_connection(conn: Connection) -> IpcChannels {
     }
 }
 
+/// The agent id a one-shot CLI runs as, from the raw `NEBULA_AGENT_ID`
+/// value. Unset and empty are the same miss, and the error names the
+/// `nebula <verb>` that needs it. Pure so the message is testable.
+fn agent_id_from(value: Option<String>, verb: &str) -> Result<String> {
+    value.filter(|v| !v.is_empty()).with_context(|| {
+        format!(
+            "{} is not set — `nebula {verb}` only works from inside a \
+             nebula agent session",
+            env::AGENT_ID
+        )
+    })
+}
+
+/// [`agent_id_from`] over the live environment.
+fn current_agent_id(verb: &str) -> Result<String> {
+    agent_id_from(env::non_empty(env::AGENT_ID), verb)
+}
+
+/// What the daemon said back to a one-shot request.
+enum Reply {
+    Ack,
+    /// The daemon's own message for a request it declined.
+    Error(String),
+}
+
+/// Read events until the daemon answers `req_id` — an Ack or an Error —
+/// skipping anything else it broadcasts meanwhile. Only the hang-up is an
+/// `Err`; the daemon's refusal comes back as a [`Reply::Error`] so each
+/// caller can decide whether that is a failure.
+async fn await_reply(conn: &mut Connection, req_id: u64) -> Result<Reply> {
+    loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::Ack { req_id: r, .. }) if r == req_id => return Ok(Reply::Ack),
+            Some(ServerEvent::Error {
+                req_id: Some(r),
+                message,
+            }) if r == req_id => return Ok(Reply::Error(message)),
+            Some(_) => continue,
+            None => bail!("{CLOSED_BEFORE_REPLY}"),
+        }
+    }
+}
+
+/// [`await_reply`] for the callers where the daemon declining *is* the
+/// failure: its message becomes the error.
+async fn await_ack(conn: &mut Connection, req_id: u64) -> Result<()> {
+    match await_reply(conn, req_id).await? {
+        Reply::Ack => Ok(()),
+        Reply::Error(message) => bail!("{message}"),
+    }
+}
+
+/// How `nebula rename` treats a session that already carries a title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameMode {
+    /// Title only an untitled session; the daemon declines otherwise.
+    Auto,
+    /// Overwrite whatever title the session has (`--force`).
+    Force,
+}
+
 /// One-shot client for `nebula rename`, run from inside an agent session's
 /// CLI: resolve the agent from NEBULA_AGENT_ID and ask the daemon to title
 /// it. Never spawns a daemon — no daemon means no session worth titling.
@@ -198,52 +269,26 @@ pub fn split_connection(conn: Connection) -> IpcChannels {
 /// Daemon-reported outcomes (renamed, or "already titled" on the non-force
 /// path) both print and exit 0: for the model running this, a declined
 /// auto-title is a settled answer, not a failure to retry.
-pub async fn rename_current_agent(title: String, force: bool) -> Result<()> {
-    let agent_id = std::env::var("NEBULA_AGENT_ID")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .context(
-            "NEBULA_AGENT_ID is not set — `nebula rename` only works from inside a \
-             nebula agent session",
-        )?;
+pub async fn rename_current_agent(title: &str, mode: RenameMode) -> Result<()> {
+    let agent_id = current_agent_id("rename")?;
     let sock = paths::socket_path();
     let Ok(stream) = try_connect(&sock).await else {
         bail!("no nebula daemon is running — title unchanged");
     };
     let mut conn = handshake(stream).await?;
-    let req_id = 1u64;
+    let req_id = ONE_SHOT_REQ_ID;
     let id = AgentId(agent_id);
-    let request = if force {
-        ClientRequest::RenameAgent {
-            req_id,
-            id,
-            name: title.clone(),
-        }
-    } else {
-        ClientRequest::AutoRenameAgent {
-            req_id,
-            id,
-            name: title.clone(),
-        }
+    let name = title.to_string();
+    let request = match mode {
+        RenameMode::Force => ClientRequest::RenameAgent { req_id, id, name },
+        RenameMode::Auto => ClientRequest::AutoRenameAgent { req_id, id, name },
     };
     write_frame(&mut conn.stream, &request).await?;
-    loop {
-        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
-            Some(ServerEvent::Ack { req_id: r, .. }) if r == req_id => {
-                println!("session renamed to \"{title}\"");
-                return Ok(());
-            }
-            Some(ServerEvent::Error {
-                req_id: Some(r),
-                message,
-            }) if r == req_id => {
-                println!("nebula: {message}");
-                return Ok(());
-            }
-            Some(_) => continue,
-            None => bail!("daemon closed the connection before replying"),
-        }
+    match await_reply(&mut conn, req_id).await? {
+        Reply::Ack => println!("session renamed to \"{title}\""),
+        Reply::Error(message) => println!("nebula: {message}"),
     }
+    Ok(())
 }
 
 /// CLI: `nebula worktree [name] [--base <ref>]` from inside an agent
@@ -259,13 +304,7 @@ pub async fn rename_current_agent(title: String, force: bool) -> Result<()> {
 /// then. A daemon-side failure is a nonzero exit — the model reports it and
 /// stays put.
 pub async fn enter_worktree_for_current_agent(name: &str, base: Option<String>) -> Result<()> {
-    let agent_id = std::env::var("NEBULA_AGENT_ID")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .context(
-            "NEBULA_AGENT_ID is not set — `nebula worktree` only works from inside a \
-             nebula agent session",
-        )?;
+    let agent_id = current_agent_id("worktree")?;
     let branch = match crate::branch_name::slugify(name) {
         slug if slug.is_empty() => crate::branch_name::random_name(&[]),
         slug => slug,
@@ -275,7 +314,7 @@ pub async fn enter_worktree_for_current_agent(name: &str, base: Option<String>) 
         bail!("no nebula daemon is running — nothing to move");
     };
     let mut conn = handshake(stream).await?;
-    let req_id = 1u64;
+    let req_id = ONE_SHOT_REQ_ID;
     write_frame(
         &mut conn.stream,
         &ClientRequest::EnterWorktree {
@@ -327,7 +366,7 @@ pub async fn enter_worktree_for_current_agent(name: &str, base: Option<String>) 
                 message,
             }) if r == req_id => bail!("{message}"),
             Some(_) => continue,
-            None => bail!("daemon closed the connection before replying"),
+            None => bail!("{CLOSED_BEFORE_REPLY}"),
         }
     }
 }
@@ -338,10 +377,10 @@ pub async fn enter_worktree_for_current_agent(name: &str, base: Option<String>) 
 /// daemon owns the rest: normalizing to the repo toplevel, naming the project
 /// after the directory, rejecting non-repos and duplicates. Spawns a daemon
 /// when none is running, same as launching the TUI would.
-pub async fn add_project(path: String) -> Result<()> {
-    let expanded = match (path.strip_prefix("~/"), std::env::var("HOME")) {
-        (Some(rest), Ok(home)) => std::path::PathBuf::from(home).join(rest),
-        _ => std::path::PathBuf::from(&path),
+pub async fn add_project(path: &str) -> Result<()> {
+    let expanded = match (path.strip_prefix("~/"), env::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => std::path::PathBuf::from(path),
     };
     let dir = std::fs::canonicalize(&expanded)
         .with_context(|| format!("{} does not exist", expanded.display()))?;
@@ -349,7 +388,7 @@ pub async fn add_project(path: String) -> Result<()> {
         bail!("{} is not a directory", dir.display());
     }
     let mut conn = connect_or_spawn().await?;
-    let req_id = 1u64;
+    let req_id = ONE_SHOT_REQ_ID;
     write_frame(
         &mut conn.stream,
         &ClientRequest::AddProject {
@@ -360,20 +399,9 @@ pub async fn add_project(path: String) -> Result<()> {
         },
     )
     .await?;
-    loop {
-        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
-            Some(ServerEvent::Ack { req_id: r, .. }) if r == req_id => {
-                println!("added project {}", dir.display());
-                return Ok(());
-            }
-            Some(ServerEvent::Error {
-                req_id: Some(r),
-                message,
-            }) if r == req_id => bail!("{message}"),
-            Some(_) => continue,
-            None => bail!("daemon closed the connection before replying"),
-        }
-    }
+    await_ack(&mut conn, req_id).await?;
+    println!("added project {}", dir.display());
+    Ok(())
 }
 
 /// One `nebula workspace <op>` invocation, resolved and executed against the
@@ -419,7 +447,7 @@ pub async fn run_workspace_op(op: WorkspaceOp) -> Result<()> {
                 )
             })
     };
-    let req_id = 1u64;
+    let req_id = ONE_SHOT_REQ_ID;
     let (request, done): (ClientRequest, String) = match op {
         WorkspaceOp::List => {
             for w in &workspaces {
@@ -467,20 +495,9 @@ pub async fn run_workspace_op(op: WorkspaceOp) -> Result<()> {
         ),
     };
     write_frame(&mut conn.stream, &request).await?;
-    loop {
-        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
-            Some(ServerEvent::Ack { req_id: r, .. }) if r == req_id => {
-                println!("{done}");
-                return Ok(());
-            }
-            Some(ServerEvent::Error {
-                req_id: Some(r),
-                message,
-            }) if r == req_id => bail!("{message}"),
-            Some(_) => continue,
-            None => bail!("daemon closed the connection before replying"),
-        }
-    }
+    await_ack(&mut conn, req_id).await?;
+    println!("{done}");
+    Ok(())
 }
 
 /// Ask a running daemon to shut down. Ok(false) when none is running.
@@ -590,7 +607,7 @@ async fn wait_for_daemon_exit() {
     let path = paths::pidfile_path();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while daemon_holds_pidfile_lock(&path) && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(POLL_STEP).await;
     }
 }
 
@@ -615,6 +632,20 @@ fn send_sigterm(pid: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Unset and empty are the same miss, and the error has to name the
+    // command the model just ran so it knows why it can't work here.
+    #[test]
+    fn agent_id_requires_a_non_empty_value_and_names_the_verb() {
+        let err = agent_id_from(None, "rename").unwrap_err().to_string();
+        assert!(err.contains("`nebula rename`"), "{err}");
+        assert!(err.contains(env::AGENT_ID), "{err}");
+        let err = agent_id_from(Some(String::new()), "worktree")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`nebula worktree`"), "{err}");
+        assert_eq!(agent_id_from(Some("a1".into()), "rename").unwrap(), "a1");
+    }
 
     // The whole point of the message: `nebula kill` is the fix for exactly
     // one of the two skews, and recommending it for the other sends the user
