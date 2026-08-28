@@ -2,7 +2,7 @@
 
 use crate::app::{
     App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder, Focus,
-    GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, Overlay, Palette,
+    GrepView, HelpView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, Overlay, Palette,
     PaletteTarget, PendingAction, PendingIntent, PointerShape, PromptDialog, PromptKind, RowKey,
     SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection, WorktreeRollback,
 };
@@ -1172,11 +1172,11 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     }
 
     // Terminal input-locked with a live session: forward everything except
-    // the escape hatches. Enter and the panel walk (Tab / ^⇧L forward,
-    // ⇧Tab / ^⇧H wrapping round from the first panel) lock; Ctrl+→ is the
-    // way to stand in the pane without locking, and an unlocked pane falls
-    // through to panel navigation, so the user always has a way back that
-    // isn't a hatch.
+    // the escape hatches. Enter and the forward panel walk (Tab / ^⇧L, or
+    // l/→ double-tapped at Sessions) lock; Ctrl+→ is the way to stand in
+    // the pane without locking, and an unlocked pane falls through to
+    // panel navigation, so the user always has a way back that isn't a
+    // hatch.
     if app.focus == Focus::Terminal && app.term.is_some() && app.term_locked {
         // Ctrl+q is the primary hatch: a plain control byte (0x11) that
         // every emulator delivers — Terminal.app included, no kitty protocol
@@ -1264,21 +1264,18 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     // so the dispatch is a table lookup rather than a KeyCode match — an
     // unbound press simply falls through.
     let chord = crate::keymap::KeyChord::from_event(&key);
+    // A double tap is two of the same key in a row: whatever else arrives
+    // in between — bound or not — breaks it, so the arm is taken here and
+    // only the edge arms below put one back.
+    let armed = app.edge_tap.take();
     let Some(action) = app.keymap.lookup(crate::keymap::Scope::Global, &chord) else {
         return;
     };
     use crate::keymap::Action;
     match action {
         Action::Quit => app.should_quit = true,
-        Action::Help => app.overlay = Some(Overlay::Help),
-        Action::Settings => {
-            let tab = app.settings_tab;
-            app.overlay = Some(Overlay::Settings(SettingsView::new(
-                tab,
-                app.settings_row(tab),
-                app.settings_on_tabs,
-            )))
-        }
+        Action::Help => app.overlay = Some(Overlay::Help(HelpView::default())),
+        Action::Settings => open_settings(app),
         // Request a reading right away — the main loop's poll may be up to
         // FOOTER_METRICS_POLL out.
         Action::Metrics => {
@@ -1297,12 +1294,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // walking that far means the user is going to type at the agent,
         // and the preview under the Sessions cursor is already the session
         // they picked.
-        Action::FocusNext => match app.focus {
-            Focus::Workspaces => app.focus = Focus::Projects,
-            Focus::Projects => app.focus = Focus::Worktrees,
-            Focus::Worktrees => app.focus = Focus::Sessions,
-            Focus::Sessions | Focus::Terminal => enter_terminal_pane(app, out),
-        },
+        Action::FocusNext => walk_focus_forward(app, out),
         // ⇧Tab / ^⇧H walk back and stop dead at the first column — the
         // Workspaces bar while it's shown, Projects when it's hidden.
         // Neither wraps into the pane: ^⇧H is also the unlock hatch out of
@@ -1310,27 +1302,27 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // → Sessions → … → first column forever, with nothing to stop
         // against. Forward (Tab / ^⇧L) is the way into the pane, and
         // Ctrl+→ crosses into it without taking the input lock.
-        Action::FocusPrev => match app.focus {
-            Focus::Projects if app.show_workspaces => app.focus = Focus::Workspaces,
-            Focus::Workspaces | Focus::Projects => {}
-            Focus::Worktrees => app.focus = Focus::Projects,
-            Focus::Sessions => app.focus = Focus::Worktrees,
-            Focus::Terminal => app.focus = Focus::Sessions,
-        },
+        Action::FocusPrev => walk_focus_back(app),
         // Inside the Workspaces bar, ←/→ walk the tabs rather than the
         // panels: the bar spans the top, so there is nothing horizontally
         // beside it to move to. j/↓ and Enter are the way out (below).
         Action::FocusLeft if app.focus == Focus::Workspaces => move_selection(app, -1, out),
         Action::FocusRight if app.focus == Focus::Workspaces => move_selection(app, 1, out),
-        Action::FocusLeft => {
-            app.focus = match app.focus {
-                // Nothing sits left of Projects any more — the bar is above.
-                Focus::Workspaces | Focus::Projects => Focus::Projects,
-                Focus::Worktrees => Focus::Projects,
-                Focus::Sessions => Focus::Worktrees,
-                Focus::Terminal => Focus::Sessions,
+        // h/← and l/→ are the vim twins of the ⇧Tab/Tab walk: one panel
+        // at a time, stopping at the ends of the row. A single press at an
+        // end stays put — leaning on the key can't spill over — and a
+        // double tap jumps the boundary the way ^⇧H / ^⇧L would: h,h at the
+        // leftmost column steps up into the Workspaces bar (only while it's
+        // shown; hidden, there is nothing above to jump to), l,l at Sessions
+        // crosses into the pane and takes its input.
+        Action::FocusLeft => match app.focus {
+            Focus::Projects => {
+                if app.show_workspaces && double_tapped(app, action, armed, &chord, "workspaces") {
+                    walk_focus_back(app);
+                }
             }
-        }
+            _ => walk_focus_back(app),
+        },
         // ⌘N / N: open the Nth tab in the Workspaces bar from any panel.
         // Focus stays where it is — the switch re-scopes the panels under
         // the cursor, and yanking focus up to the bar would undo that.
@@ -1359,18 +1351,22 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 Focus::Terminal => Focus::Terminal,
             }
         }
-        Action::FocusRight => {
-            // Stops at Sessions: entering the terminal pane means the user
-            // chose a session, which is Enter's job — plain focus movement
-            // never crosses into the pane (Tab/Ctrl+→ do).
-            app.focus = match app.focus {
-                Focus::Workspaces => Focus::Projects,
-                Focus::Projects => Focus::Worktrees,
-                Focus::Worktrees => Focus::Sessions,
-                Focus::Sessions => Focus::Sessions,
-                Focus::Terminal => Focus::Terminal,
+        Action::FocusRight => match app.focus {
+            Focus::Sessions => {
+                if double_tapped(app, action, armed, &chord, "enter pane") {
+                    walk_focus_forward(app, out);
+                }
             }
-        }
+            // Standing in the pane unlocked (Ctrl+→): l,l takes the lock,
+            // as ^⇧L does. A dead or empty pane has nothing to lock into.
+            Focus::Terminal => {
+                let live = app.term.as_ref().is_some_and(|t| !t.exited);
+                if live && double_tapped(app, action, armed, &chord, "type into terminal") {
+                    walk_focus_forward(app, out);
+                }
+            }
+            _ => walk_focus_forward(app, out),
+        },
         // Show/hide the Workspaces bar. Hiding it moves a cursor parked
         // there onto Projects — there'd be nothing on screen to drive.
         Action::ToggleWorkspaces => {
@@ -2159,6 +2155,7 @@ fn open_delete_confirm(app: &mut App) {
                         p.name
                     ),
                     action: PendingAction::RemoveProject(p.id.clone()),
+                    area: ratatui::layout::Rect::default(),
                 }));
             }
         }
@@ -2181,6 +2178,7 @@ fn open_delete_confirm(app: &mut App) {
                         w.branch
                     ),
                     action: PendingAction::DeleteWorktree(w.id.clone()),
+                    area: ratatui::layout::Rect::default(),
                 }));
             }
         }
@@ -2193,6 +2191,7 @@ fn open_delete_confirm(app: &mut App) {
                         a.name
                     ),
                     action: PendingAction::DeleteAgent(a.id),
+                    area: ratatui::layout::Rect::default(),
                 }));
             }
             Some(SessionRow::Terminal(t)) => {
@@ -2200,6 +2199,7 @@ fn open_delete_confirm(app: &mut App) {
                     title: "Close terminal".into(),
                     message: format!("Close terminal '{}'? Its shell is killed.", t.name),
                     action: PendingAction::CloseTerminal(t.id),
+                    area: ratatui::layout::Rect::default(),
                 }));
             }
             Some(SessionRow::Link(l)) => delete_link(app, &l),
@@ -2240,6 +2240,7 @@ fn delete_link(app: &mut App, row: &LinkRow) {
             row.label()
         ),
         action: PendingAction::DeleteLink(id.clone()),
+        area: ratatui::layout::Rect::default(),
     }));
 }
 
@@ -2300,6 +2301,7 @@ fn open_delete_all_confirm(app: &mut App) {
                     bulk_confirm_listing(&names),
                 ),
                 action: PendingAction::DeleteAllWorktrees(ids),
+                area: ratatui::layout::Rect::default(),
             }));
         }
         Focus::Sessions => {
@@ -2337,6 +2339,7 @@ fn open_delete_all_confirm(app: &mut App) {
                     bulk_confirm_listing(&names),
                 ),
                 action: PendingAction::DeleteAllSessions { agents, terminals },
+                area: ratatui::layout::Rect::default(),
             }));
         }
         Focus::Workspaces | Focus::Projects | Focus::Terminal => {}
@@ -2694,11 +2697,20 @@ fn switch_workspace_inner(
     true
 }
 
-/// Re-scope after a workspace disappeared from under us — deleted from
-/// another instance, or from `nebula workspace delete`. The daemon refuses
-/// to delete a non-empty workspace, so there is nothing on screen to lose;
-/// it's the scope itself that has to move somewhere real.
-fn reseat_deleted_workspace(app: &mut App, out: &mut Vec<ClientRequest>) {
+/// Re-scope after the OPEN WORKSPACE disappeared from under us — deleted
+/// here (`d` in the WORKSPACES BAR or the WORKSPACE SWITCHER), from another
+/// instance, or from `nebula workspace delete`. The daemon refuses to
+/// delete a non-empty workspace, so there is nothing on screen to lose;
+/// it's the scope itself that has to move somewhere real. It lands on the
+/// WORKSPACE TAB that sat to the deleted one's right; the last tab falls
+/// back to the one on its left. `removed_tab` is the position the deleted
+/// workspace held in the bar before `apply_removal` dropped its row.
+/// Deleting a workspace that is not the open one changes nothing.
+fn reseat_deleted_workspace(
+    app: &mut App,
+    removed_tab: Option<usize>,
+    out: &mut Vec<ClientRequest>,
+) {
     if app
         .tree
         .workspaces
@@ -2707,9 +2719,16 @@ fn reseat_deleted_workspace(app: &mut App, out: &mut Vec<ClientRequest>) {
     {
         return;
     }
-    let Some(fallback) = app.tree.workspaces.first().map(|w| w.id.clone()) else {
+    if app.tree.workspaces.is_empty() {
         return; // never expected: the daemon refuses to delete the last one
-    };
+    }
+    // With the row gone, its right-hand neighbor now sits at the deleted
+    // tab's own index; an index past the end means it was the last tab,
+    // so clamp onto the new last — its former left-hand neighbor.
+    let land = removed_tab
+        .unwrap_or(0)
+        .min(app.tree.workspaces.len() - 1);
+    let fallback = app.tree.workspaces[land].id.clone();
     switch_workspace(app, fallback, out);
 }
 
@@ -2736,6 +2755,7 @@ fn open_remove_workspace_confirm(app: &mut App, id: WorkspaceId, reopen_picker: 
             "Delete workspace '{name}'?\nOnly an empty workspace can go — nothing on disk is touched."
         ),
         action: PendingAction::RemoveWorkspace { id, reopen_picker },
+        area: ratatui::layout::Rect::default(),
     }));
 }
 
@@ -2883,7 +2903,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
     };
     match overlay {
         Overlay::Settings(_) => {}
-        Overlay::Help => {
+        Overlay::Help(_) => {
             if matches!(
                 key.code,
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
@@ -3424,7 +3444,7 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
     };
 
     match cmd {
-        SettingsCmd::Close => app.overlay = None,
+        SettingsCmd::Close => close_settings(app),
         SettingsCmd::Tab(next) => {
             app.settings_tab = next;
             let row = app.settings_row(next);
@@ -3501,6 +3521,7 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
                           bindings.\nYour config.json is rewritten — this can't be undone."
                     .into(),
                 action: PendingAction::ResetSettings,
+                area: ratatui::layout::Rect::default(),
             }));
         }
     }
@@ -3667,8 +3688,21 @@ fn reset_settings(app: &mut App) {
     }
 }
 
-/// Put the settings overlay back up on its remembered tab and row, the
-/// same way `Action::Settings` opens it.
+/// Open the settings overlay from the panels. The remembered tab / row /
+/// strip-vs-list is restored only while it's fresh: closed more than
+/// [`crate::app::SETTINGS_MEMORY_TTL`] ago, it's forgotten and the overlay
+/// comes up like a first open — first tab, top row, cursor on the strip.
+fn open_settings(app: &mut App) {
+    if app.settings_memory_expired() {
+        app.forget_settings_focus();
+    }
+    reopen_settings(app);
+}
+
+/// Put the settings overlay back up on its remembered tab and row, no
+/// questions asked. `open_settings` is the from-the-panels entry that
+/// checks the memory's age first; this one is for mid-visit round trips
+/// (the reset confirmation) where the position can't have gone stale.
 fn reopen_settings(app: &mut App) {
     let tab = app.settings_tab;
     app.overlay = Some(Overlay::Settings(SettingsView::new(
@@ -3676,6 +3710,14 @@ fn reopen_settings(app: &mut App) {
         app.settings_row(tab),
         app.settings_on_tabs,
     )));
+}
+
+/// Take the settings overlay down and start the clock on its remembered
+/// position (see `open_settings`). Both ways out — Esc/`q`/`s` and a click
+/// outside the modal — go through here.
+fn close_settings(app: &mut App) {
+    app.overlay = None;
+    app.note_settings_closed();
 }
 
 /// Show or hide the Workspaces bar, moving a cursor parked there onto
@@ -3732,6 +3774,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                         expanded.display()
                     ),
                     action: PendingAction::CreateProjectDir(expanded),
+                    area: ratatui::layout::Rect::default(),
                 }));
                 return;
             }
@@ -4009,6 +4052,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                         a.name
                     ),
                     action: PendingAction::DeleteAgent(id),
+                    area: ratatui::layout::Rect::default(),
                 }));
             }
         }
@@ -4028,6 +4072,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     title: "Close terminal".into(),
                     message: format!("Close terminal '{}'? Its shell is killed.", t.name),
                     action: PendingAction::CloseTerminal(id),
+                    area: ratatui::layout::Rect::default(),
                 }));
             }
         }
@@ -4127,6 +4172,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     title: "Delete worktree".into(),
                     message: format!("Delete worktree '{}' from disk?", w.branch),
                     action: PendingAction::DeleteWorktree(id),
+                    area: ratatui::layout::Rect::default(),
                 }));
             }
         }
@@ -4146,6 +4192,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                         p.name
                     ),
                     action: PendingAction::RemoveProject(id),
+                    area: ratatui::layout::Rect::default(),
                 }));
             }
         }
@@ -4755,6 +4802,65 @@ fn enter_terminal_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
     }
 }
 
+/// Two presses of the same edge key this close together are one gesture.
+/// Matches `DOUBLE_CLICK`: the row's double-click is the same "again,
+/// deliberately" and the two shouldn't feel different.
+const DOUBLE_TAP: Duration = Duration::from_millis(400);
+
+/// `h`/`l` (or ←/→) has landed on the end of the panel row. The first
+/// press arms and stays put, telling the user in the footer what a second
+/// one does; a second press of the same action inside `DOUBLE_TAP` — with
+/// nothing else in between, see the `take()` in `handle_key` — reports
+/// `true` so the caller can jump the boundary. A slow second press re-arms
+/// rather than jumping: the gap says it was two single presses.
+fn double_tapped(
+    app: &mut App,
+    action: crate::keymap::Action,
+    armed: Option<(crate::keymap::Action, std::time::Instant)>,
+    chord: &crate::keymap::KeyChord,
+    does: &str,
+) -> bool {
+    let now = std::time::Instant::now();
+    if armed.is_some_and(|(a, at)| a == action && now.duration_since(at) <= DOUBLE_TAP) {
+        return true;
+    }
+    app.edge_tap = Some((action, now));
+    app.flash = Some(format!("{} again: {does}", chord.display()));
+    false
+}
+
+/// The forward panel walk — Tab / ^⇧L, and l/→ (double-tapped at the
+/// end) — one column right, stopping dead at the terminal pane so leaning
+/// on the key can't spill past it and back round to the Workspaces bar.
+/// Landing on the pane takes the input lock: walking that far means the
+/// user is going to type at the agent, and the preview under the Sessions
+/// cursor is already the session they picked.
+fn walk_focus_forward(app: &mut App, out: &mut Vec<ClientRequest>) {
+    match app.focus {
+        Focus::Workspaces => app.focus = Focus::Projects,
+        Focus::Projects => app.focus = Focus::Worktrees,
+        Focus::Worktrees => app.focus = Focus::Sessions,
+        Focus::Sessions | Focus::Terminal => enter_terminal_pane(app, out),
+    }
+}
+
+/// The backward panel walk — ⇧Tab / ^⇧H, and h/← (double-tapped at the
+/// end) — one column left, stopping dead at the first column: the Workspaces bar while it's shown,
+/// Projects when it's hidden. Never wraps into the pane: ^⇧H is also the
+/// unlock hatch out of a locked pane, so a wrap made the key cycle first
+/// column → pane → Sessions → … forever, with nothing to stop against.
+/// Forward is the way into the pane, and Ctrl+→ crosses into it without
+/// taking the input lock.
+fn walk_focus_back(app: &mut App) {
+    app.focus = match app.focus {
+        Focus::Projects if app.show_workspaces => Focus::Workspaces,
+        Focus::Workspaces | Focus::Projects => app.focus,
+        Focus::Worktrees => Focus::Projects,
+        Focus::Sessions => Focus::Worktrees,
+        Focus::Terminal => Focus::Sessions,
+    };
+}
+
 /// Open a saved link in the browser, reporting either way — the browser
 /// comes up in front of the terminal, so a silent failure would read as
 /// "nebula did nothing". A pull request is marked read on the way out: the
@@ -5344,6 +5450,40 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         }
         return;
     }
+    // Help, confirm, prompt, diff: a left-click outside the modal's box
+    // dismisses it the way Esc does — a confirm cancels (and lands back in
+    // the settings overlay / workspace switcher it came from), a prompt is
+    // abandoned (restoring the warm slot's spec), help and the diff viewer
+    // just close — and the click is swallowed rather than landing on the
+    // panel underneath. The other modals hit-test the same way in their own
+    // arms below. An undrawn box (zero width) can't be clicked outside of.
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+        let boxed = match &app.overlay {
+            Some(Overlay::Help(v)) => Some(v.area),
+            Some(Overlay::Confirm(c)) => Some(c.area),
+            Some(Overlay::Prompt(p)) => Some(p.area),
+            Some(Overlay::Diff(v)) => Some(v.area),
+            _ => None,
+        };
+        if let Some(area) = boxed {
+            let inside = mouse.column >= area.x
+                && mouse.column < area.x + area.width
+                && mouse.row >= area.y
+                && mouse.row < area.y + area.height;
+            if area.width > 0 && !inside {
+                match &app.overlay {
+                    Some(Overlay::Help(_)) | Some(Overlay::Diff(_)) => app.overlay = None,
+                    _ => handle_overlay_key(
+                        app,
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        out,
+                    ),
+                }
+                app.dirty = true;
+                return;
+            }
+        }
+    }
     // A prompt dialog is modal too: the wheel and clicks drive the
     // Add-project directory listing (click highlights, a second click on
     // the highlighted row steps in); everything else is swallowed.
@@ -5689,7 +5829,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 && mouse.row >= area.y
                 && mouse.row < area.y + area.height;
             if !inside {
-                app.overlay = None;
+                close_settings(app);
                 app.dirty = true;
                 return;
             }
@@ -6433,8 +6573,15 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     }
                 }
                 (Some(PendingIntent::OpenCreatedWorkspace), Some(EntityId::Workspace(id))) => {
-                    // Switcher-created workspace: show it right away.
+                    // A workspace created from the WORKSPACE SWITCHER or the
+                    // WORKSPACES BAR: show it right away, with the cursor on
+                    // the PROJECTS PANEL. The new workspace is empty, so the
+                    // next thing to do is add its first PROJECT — and `n`
+                    // there does exactly that — rather than leave focus on
+                    // the bar (or wherever the switcher was opened from).
                     switch_workspace(app, id, out);
+                    app.term_locked = false;
+                    app.focus = Focus::Projects;
                 }
                 _ => {}
             }
@@ -6475,13 +6622,22 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         }
         ServerEvent::EntityRemoved { id } => {
             let before = selection_snapshot(app);
+            // Where a deleted workspace sat in the WORKSPACES BAR: the
+            // reseat below lands on its neighbor, and the row is gone
+            // once `apply_removal` runs.
+            let removed_tab = match &id {
+                nebula_core::EntityId::Workspace(ws) => {
+                    app.tree.workspaces.iter().position(|w| &w.id == ws)
+                }
+                _ => None,
+            };
             apply_removal(app, &id);
             // The cursor that was on the removed row now sits on its
             // neighbor — show that neighbor's session/context.
             reconcile_selection(app, before, out);
             // ...and if what went was the workspace we were scoped to, land
-            // somewhere that still exists.
-            reseat_deleted_workspace(app, out);
+            // on the tab to its right (or, from the last tab, its left).
+            reseat_deleted_workspace(app, removed_tab, out);
             refresh_palette(app);
             refresh_workspace_picker(app);
             app.dirty = true;
@@ -7409,9 +7565,12 @@ mod tests {
             .expect("link row");
     }
 
-    /// `h`/`l` are the vim twins of `←`/`→`: same focus walk, same stops at
-    /// the ends. The plain letters used to open the hosts picker and the
-    /// add-link prompt, which now live on the shifted keys.
+    /// `h`/`l` are the vim twins of `←`/`→`: same focus walk, same stops
+    /// at the ends — and a double tap at an end jumps the boundary the way
+    /// ^⇧H / ^⇧L would: `l`,`l` at Sessions goes on into the pane, `h`,`h`
+    /// at Projects steps up into the Workspaces bar. The plain letters used
+    /// to open the hosts picker and the add-link prompt, which now live on
+    /// the shifted keys.
     #[test]
     fn h_and_l_walk_panel_focus_like_the_arrows() {
         let mut app = App::new();
@@ -7429,12 +7588,33 @@ mod tests {
         l(&mut app, &mut out);
         assert_eq!(app.focus, Focus::Sessions);
         l(&mut app, &mut out);
-        assert_eq!(app.focus, Focus::Sessions, "stops at sessions, as → does");
+        assert_eq!(
+            app.focus,
+            Focus::Sessions,
+            "a single l at sessions stays, as → does"
+        );
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("l again: enter pane"),
+            "and the footer says what a second one does"
+        );
+        l(&mut app, &mut out);
+        assert_eq!(
+            app.focus,
+            Focus::Terminal,
+            "l,l at sessions jumps on into the pane, as ^⇧L does"
+        );
+        assert!(!app.term_locked, "an empty pane is focused, never locked");
+        l(&mut app, &mut out);
+        l(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Terminal, "and the walk stops there");
         assert!(
             app.overlay.is_none(),
             "l no longer opens the add-link prompt"
         );
 
+        h(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Sessions);
         h(&mut app, &mut out);
         assert_eq!(app.focus, Focus::Worktrees);
         h(&mut app, &mut out);
@@ -7443,9 +7623,68 @@ mod tests {
         assert_eq!(
             app.focus,
             Focus::Projects,
-            "stops at projects — the Workspaces bar is above, not left"
+            "a single h at projects stays — the bar takes a double tap"
+        );
+        assert_eq!(app.flash.as_deref(), Some("h again: workspaces"));
+        h(&mut app, &mut out);
+        assert_eq!(
+            app.focus,
+            Focus::Workspaces,
+            "h,h at projects steps up into the bar, as ^⇧H does"
+        );
+        h(&mut app, &mut out);
+        assert_eq!(
+            app.focus,
+            Focus::Workspaces,
+            "in the bar, h walks the tabs and stays put"
         );
         assert!(app.overlay.is_none(), "h no longer opens the hosts picker");
+
+        app.show_workspaces = false;
+        app.focus = Focus::Projects;
+        app.flash = None;
+        h(&mut app, &mut out);
+        h(&mut app, &mut out);
+        assert_eq!(
+            app.focus,
+            Focus::Projects,
+            "bar hidden: projects is the first column, so h,h stops there too"
+        );
+        assert!(
+            app.edge_tap.is_none(),
+            "nothing above to jump to, so nothing arms"
+        );
+        assert!(app.flash.is_none(), "and no hint promises one");
+    }
+
+    /// The double tap is a gesture, not a state: a second press that comes
+    /// too late, or after any other key, is a fresh single press.
+    #[test]
+    fn a_slow_or_interrupted_second_tap_at_the_edge_stays_put() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        let l = |app: &mut App, out: &mut Vec<ClientRequest>| {
+            press(app, KeyCode::Char('l'), KeyModifiers::NONE, out)
+        };
+
+        app.focus = Focus::Sessions;
+        l(&mut app, &mut out);
+        let (armed, _) = app.edge_tap.expect("the first press arms");
+        assert_eq!(armed, crate::keymap::Action::FocusRight);
+        app.edge_tap = Some((
+            armed,
+            std::time::Instant::now() - DOUBLE_TAP - Duration::from_millis(100),
+        ));
+        l(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Sessions, "too slow: two single presses");
+        assert!(app.edge_tap.is_some(), "but the late one arms again");
+
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+        assert!(app.edge_tap.is_none(), "any other key breaks the pair");
+        l(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Sessions, "so this is a first press again");
+        l(&mut app, &mut out);
+        assert_eq!(app.focus, Focus::Terminal, "and this one completes it");
     }
 
     /// ^⇧L / ^⇧H are Tab / ⇧Tab under another name, in the one modifier
@@ -11011,11 +11250,12 @@ diff --git a/src/b.rs b/src/b.rs
         assert!(app.term_locked, "Enter on the focused pane locks input");
     }
 
-    /// Plain → stops at the Sessions panel: crossing into the terminal
-    /// pane means the user chose a session, which is Enter's job (Tab and
-    /// Ctrl+→ still reach the pane deliberately).
+    /// Plain → stops at the Sessions panel; double-tapped there it jumps
+    /// on into the terminal pane and takes its input, exactly as Tab / ^⇧L
+    /// do — the preview under the cursor is already the session the user
+    /// picked. Once in, an unlocked pane (Ctrl+→) locks on →,→ too.
     #[test]
-    fn plain_right_stops_at_sessions() {
+    fn double_tapped_right_at_sessions_enters_the_pane_and_locks_it() {
         let mut app = App::new();
         seed_tree(&mut app);
         app.term = Some(AttachedTerm::new(
@@ -11027,7 +11267,29 @@ diff --git a/src/b.rs b/src/b.rs
         let mut out = Vec::new();
 
         press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
-        assert_eq!(app.focus, Focus::Sessions, "→ must not enter the pane");
+        assert_eq!(
+            app.focus,
+            Focus::Sessions,
+            "a single → must not enter the pane"
+        );
+        assert_eq!(app.flash.as_deref(), Some("→ again: enter pane"));
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            app.focus,
+            Focus::Terminal,
+            "→,→ at sessions enters the pane"
+        );
+        assert!(app.term_locked, "and takes the input lock, like Tab");
+
+        app.term_locked = false;
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+        assert!(!app.term_locked, "one → on an unlocked pane stays unlocked");
+        assert_eq!(app.flash.as_deref(), Some("→ again: type into terminal"));
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+        assert!(
+            app.term_locked,
+            "→,→ on an unlocked pane takes the lock, like ^⇧L"
+        );
     }
 
     /// ↑/↓ in the Sessions panel previews the selected session in the
@@ -13982,6 +14244,97 @@ diff --git a/src/b.rs b/src/b.rs
         assert!(!settings_view(&app).on_tabs, "reopen restores list focus");
     }
 
+    /// The remembered position has a shelf life. Closed and reopened within
+    /// `SETTINGS_MEMORY_TTL` it's restored as usual; reopened later than
+    /// that it's forgotten and the overlay looks exactly like a first open.
+    #[test]
+    fn settings_memory_expires_a_minute_after_closing() {
+        use crate::app::SETTINGS_MEMORY_TTL;
+        let mut app = App::new();
+        let mut out = Vec::new();
+        assert!(
+            app.settings_closed_at.is_none() && !app.settings_memory_expired(),
+            "nothing to forget before the first close"
+        );
+        // Park the cursor somewhere distinctive: tab 1, second row, in the list.
+        open_settings_on(&mut app, 1, &mut out);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        let (tab, row) = (settings_view(&app).tab, settings_view(&app).selected);
+        assert_eq!((tab, row), (1, 1));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.settings_closed_at.is_some(), "Esc stamps the close");
+
+        // Straight back in: everything restored.
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        assert_eq!(settings_view(&app).tab, 1, "within the minute, the tab");
+        assert_eq!(settings_view(&app).selected, 1, "…the row");
+        assert!(!settings_view(&app).on_tabs, "…and the list focus survive");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+        // Pretend the close was a minute ago.
+        app.settings_closed_at = std::time::Instant::now().checked_sub(SETTINGS_MEMORY_TTL);
+        assert!(app.settings_memory_expired());
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        assert_eq!(settings_view(&app).tab, 0, "stale memory: first tab");
+        assert_eq!(settings_view(&app).selected, 0, "…top row");
+        assert!(settings_view(&app).on_tabs, "…cursor on the strip");
+        assert_eq!(
+            app.settings_row(1),
+            0,
+            "the other tabs' rows are forgotten too"
+        );
+        assert!(
+            app.settings_closed_at.is_none(),
+            "the stale stamp is cleared, so the visit is a fresh one"
+        );
+    }
+
+    /// The reset confirmation swaps the overlay out and back mid-visit;
+    /// that round trip must not consult the clock, or a stale stamp from an
+    /// earlier close would reset the cursor under the user's hands.
+    #[test]
+    fn settings_reset_round_trip_ignores_the_memory_clock() {
+        use crate::app::SETTINGS_MEMORY_TTL;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        crate::config::with_config_path(path, || {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            open_settings_on(&mut app, 1, &mut out);
+            // A stamp that would expire the memory if it were consulted.
+            app.settings_closed_at = std::time::Instant::now().checked_sub(SETTINGS_MEMORY_TTL);
+            press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
+            assert!(matches!(app.overlay, Some(Overlay::Confirm(_))));
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert_eq!(settings_view(&app).tab, 1, "back on the same tab");
+            assert!(!settings_view(&app).on_tabs, "…still in the list");
+        });
+    }
+
+    /// A click outside the modal is the other way out, and it starts the
+    /// same clock as Esc does.
+    #[test]
+    fn clicking_outside_settings_stamps_the_close() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        if let Some(Overlay::Settings(view)) = &mut app.overlay {
+            view.area = ratatui::layout::Rect::new(10, 5, 40, 20);
+        }
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut out,
+        );
+        assert!(app.overlay.is_none(), "click outside closes");
+        assert!(app.settings_closed_at.is_some(), "…and stamps the close");
+    }
+
     #[test]
     fn settings_enter_persists_toggle_to_config_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -14228,7 +14581,7 @@ diff --git a/src/b.rs b/src/b.rs
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
             assert!(app.overlay.is_none());
             press(&mut app, KeyCode::F(6), KeyModifiers::NONE, &mut out);
-            assert!(matches!(app.overlay, Some(Overlay::Help)));
+            assert!(matches!(app.overlay, Some(Overlay::Help(_))));
             // …and the old one no longer does.
             let mut fresh = App::new();
             fresh.keymap = crate::config::Config::load().keymap();
@@ -14295,7 +14648,7 @@ diff --git a/src/b.rs b/src/b.rs
             seed_tree(&mut app);
             app.focus = Focus::Worktrees;
             press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
-            assert!(matches!(app.overlay, Some(Overlay::Help)));
+            assert!(matches!(app.overlay, Some(Overlay::Help(_))));
         });
     }
 
@@ -17100,8 +17453,14 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(
             go(&mut app, &mut out, KeyCode::Left),
             Focus::Projects,
-            "the bar is above, not left"
+            "a single ← at the first column stays: the bar takes ←,← or ⇧Tab"
         );
+        assert_eq!(
+            go(&mut app, &mut out, KeyCode::Left),
+            Focus::Workspaces,
+            "←,← jumps up into the bar, as ⇧Tab does"
+        );
+        assert_eq!(go(&mut app, &mut out, KeyCode::Down), Focus::Projects);
         assert_eq!(go(&mut app, &mut out, KeyCode::BackTab), Focus::Workspaces);
         assert_eq!(
             go(&mut app, &mut out, KeyCode::Left),
@@ -17470,6 +17829,7 @@ diff --git a/src/b.rs b/src/b.rs
             },
         );
         seed_tree(&mut app);
+        app.focus = Focus::Sessions;
 
         let mut out = Vec::new();
         let press = |app: &mut App, code, out: &mut Vec<ClientRequest>| {
@@ -17512,6 +17872,60 @@ diff --git a/src/b.rs b/src/b.rs
             ),
             "created workspace gets opened: {out:?}"
         );
+        assert_eq!(
+            app.focus,
+            Focus::Projects,
+            "the new workspace lands focus on the PROJECTS PANEL, not back on Sessions"
+        );
+    }
+
+    /// `n` in the WORKSPACES BAR creates a workspace too; when the Ack opens
+    /// it, focus moves down off the bar onto the PROJECTS PANEL — the
+    /// workspace is empty, and `n` there adds its first project.
+    #[test]
+    fn a_workspace_created_from_the_bar_lands_focus_on_projects() {
+        use nebula_core::{EntityId, WorkspaceId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_default_workspace(&mut app);
+        app.focus = Focus::Workspaces;
+
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Prompt(p)) if p.kind == PromptKind::NewWorkspace),
+            "{:?}",
+            app.overlay
+        );
+        for c in "acme".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let req_id = match out.last() {
+            Some(ClientRequest::AddWorkspace { req_id, .. }) => *req_id,
+            other => panic!("expected AddWorkspace, got {other:?}"),
+        };
+        assert_eq!(app.focus, Focus::Workspaces, "still on the bar until the Ack");
+
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(EntityId::Workspace(WorkspaceId("ws-new".into()))),
+            },
+            &mut out,
+        );
+        assert_eq!(app.tree.active_workspace.as_str(), "ws-new");
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::OpenWorkspace { id, .. }) if id.as_str() == "ws-new"
+            ),
+            "created workspace gets opened: {out:?}"
+        );
+        assert_eq!(app.focus, Focus::Projects);
+        assert!(!app.term_locked);
     }
 
     /// `r` and `d` in the switcher act on the hovered workspace (footer
@@ -17620,6 +18034,73 @@ diff --git a/src/b.rs b/src/b.rs
             }
             other => panic!("switcher should stay open, got {other:?}"),
         }
+    }
+
+    /// When the OPEN WORKSPACE is deleted — from here, another instance, or
+    /// `nebula workspace delete` — the reseat lands on the WORKSPACE TAB to
+    /// its right; from the last tab it falls back to the one on its left.
+    /// It never jumps to the first tab, and deleting a workspace that is
+    /// not the open one leaves the OPEN WORKSPACE alone.
+    #[test]
+    fn deleting_the_open_workspace_lands_on_its_right_neighbor_then_its_left() {
+        use nebula_core::{Entity, EntityId, Workspace, WorkspaceId};
+        // Three tabs, in bar order: default, ws2, ws3.
+        let seed = || {
+            let mut app = App::new();
+            for (id, name) in [("default", "default"), ("ws2", "client"), ("ws3", "lab")] {
+                hse(
+                    &mut app,
+                    ServerEvent::EntityUpserted {
+                        entity: Entity::Workspace(Workspace {
+                            id: WorkspaceId(id.into()),
+                            name: name.into(),
+                        }),
+                    },
+                );
+            }
+            app
+        };
+        // Open `open`, delete `gone`, expect to land on `want`.
+        let check = |open: &str, gone: &str, want: &str| {
+            let mut app = seed();
+            let mut out = Vec::new();
+            switch_workspace(&mut app, WorkspaceId(open.into()), &mut out);
+            assert_eq!(app.tree.active_workspace.as_str(), open);
+            let mut out = Vec::new();
+            handle_server_event(
+                &mut app,
+                ServerEvent::EntityRemoved {
+                    id: EntityId::Workspace(WorkspaceId(gone.into())),
+                },
+                &mut out,
+            );
+            assert_eq!(
+                app.tree.active_workspace.as_str(),
+                want,
+                "open {open}, delete {gone}"
+            );
+            assert!(
+                app.tree.workspaces.iter().all(|w| w.id.as_str() != gone),
+                "row dropped"
+            );
+            out
+        };
+        // First tab: the one to its right.
+        let out = check("default", "default", "ws2");
+        assert!(
+            matches!(out.last(), Some(ClientRequest::OpenWorkspace { id, .. }) if id.as_str() == "ws2"),
+            "{out:?}"
+        );
+        // Middle tab: the one to its right, not back to the first.
+        check("ws2", "ws2", "ws3");
+        // Last tab: the one to its left.
+        check("ws3", "ws3", "ws2");
+        // Not the open one: nothing moves and nothing is sent.
+        let out = check("default", "ws3", "default");
+        assert!(
+            !out.iter().any(|r| matches!(r, ClientRequest::OpenWorkspace { .. })),
+            "no switch for a workspace that wasn't open: {out:?}"
+        );
     }
 
     // ---- ssh hosts picker ----
@@ -17745,6 +18226,137 @@ diff --git a/src/b.rs b/src/b.rs
             assert!(app.overlay.is_none(), "outside click closes");
             assert!(!app.should_quit);
         });
+    }
+
+    // ---- a click outside any modal dismisses it ----
+
+    /// Draw once so the modal writes back its hit-test rect, and return it.
+    fn drawn_modal_area(app: &mut App) -> ratatui::layout::Rect {
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, app)).unwrap();
+        let area = match &app.overlay {
+            Some(Overlay::Help(v)) => v.area,
+            Some(Overlay::Confirm(c)) => c.area,
+            Some(Overlay::Prompt(p)) => p.area,
+            Some(Overlay::Diff(v)) => v.area,
+            other => panic!("no boxed modal open: {other:?}"),
+        };
+        assert!(area.width > 0 && area.x > 0 && area.y > 0, "{area:?}");
+        area
+    }
+
+    fn click(app: &mut App, column: u16, row: u16, out: &mut Vec<ClientRequest>) {
+        handle_mouse(
+            app,
+            mev(MouseEventKind::Down(MouseButton::Left), column, row),
+            out,
+        );
+    }
+
+    #[test]
+    fn help_click_outside_closes_and_inside_stays() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE, &mut out);
+        let area = drawn_modal_area(&mut app);
+        click(&mut app, area.x + 2, area.y + 2, &mut out);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Help(_))),
+            "inside click keeps it"
+        );
+        click(&mut app, 0, 0, &mut out);
+        assert!(app.overlay.is_none(), "outside click closes");
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn confirm_click_outside_cancels_without_confirming() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_link(&mut app, "https://example.dev/spec");
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('D'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Confirm(_))),
+            "{:?}",
+            app.overlay
+        );
+        let area = drawn_modal_area(&mut app);
+        out.clear();
+        click(&mut app, area.x + 2, area.y + 1, &mut out);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Confirm(_))),
+            "inside click keeps it"
+        );
+        click(&mut app, 0, 0, &mut out);
+        assert!(app.overlay.is_none(), "outside click cancels");
+        assert!(out.is_empty(), "nothing was confirmed: {out:?}");
+    }
+
+    /// The outside click is Esc, not a bare close: backing out of the
+    /// settings-reset confirm lands back in the settings overlay.
+    #[test]
+    fn confirm_click_outside_lands_where_esc_would() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
+            assert!(
+                matches!(app.overlay, Some(Overlay::Confirm(_))),
+                "{:?}",
+                app.overlay
+            );
+            drawn_modal_area(&mut app);
+            click(&mut app, 0, 0, &mut out);
+            assert!(
+                matches!(app.overlay, Some(Overlay::Settings(_))),
+                "back to the overlay, not the panels: {:?}",
+                app.overlay
+            );
+        });
+    }
+
+    #[test]
+    fn prompt_click_outside_abandons_it() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Prompt(_))),
+            "{:?}",
+            app.overlay
+        );
+        let area = drawn_modal_area(&mut app);
+        click(&mut app, area.x + 2, area.y + 1, &mut out);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Prompt(_))),
+            "inside click keeps it"
+        );
+        click(&mut app, 0, 0, &mut out);
+        assert!(app.overlay.is_none(), "outside click abandons the prompt");
+    }
+
+    #[test]
+    fn diff_click_outside_closes_and_inside_stays() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.overlay = Some(Overlay::Diff(fake_diff_view(10)));
+        let mut out = Vec::new();
+        let area = drawn_modal_area(&mut app);
+        click(
+            &mut app,
+            area.x + area.width / 2,
+            area.y + area.height / 2,
+            &mut out,
+        );
+        assert!(
+            matches!(app.overlay, Some(Overlay::Diff(_))),
+            "inside click keeps it"
+        );
+        click(&mut app, 0, 0, &mut out);
+        assert!(app.overlay.is_none(), "outside click closes");
     }
 
     #[test]

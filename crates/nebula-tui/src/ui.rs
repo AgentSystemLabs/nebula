@@ -299,6 +299,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 Span::styled("[Esc/n] cancel", Style::default().fg(th.dim)),
             ]));
             f.render_widget(Paragraph::new(lines), inner);
+            // Record the drawn area for click hit-testing.
+            if let Some(Overlay::Confirm(c)) = &mut app.overlay {
+                c.area = area;
+            }
         }
         Overlay::Prompt(prompt) if prompt.is_multiline() => {
             let area = centered_rect(f.area(), 76, 14);
@@ -358,6 +362,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             let start = caret_row.saturating_sub(visible / 2).min(max_start);
             let shown: Vec<Line> = lines.into_iter().skip(start).take(visible).collect();
             f.render_widget(Paragraph::new(shown), editor_inner);
+            // Record the drawn area for click hit-testing.
+            if let Some(Overlay::Prompt(p)) = &mut app.overlay {
+                p.area = area;
+            }
         }
         Overlay::Prompt(prompt) => {
             // Path prompts get a wide dialog with the live directory
@@ -469,12 +477,13 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     r,
                 );
             }
-            // Record the listing rect for click hit-testing.
+            // Record the listing and dialog rects for click hit-testing.
             if let Some(Overlay::Prompt(p)) = &mut app.overlay {
                 p.list_area = list_area;
+                p.area = area;
             }
         }
-        Overlay::Help => {
+        Overlay::Help(_) => {
             // Grouped keymap in two columns: reads by task instead of one
             // giant list, and at ~24 rows it fits a stock terminal window
             // (the old single list clipped its tail on short screens).
@@ -498,7 +507,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             Act(&[FocusNext, FocusPrev]),
                             "walk panels (fwd locks input)",
                         ),
-                        (Act(&[FocusLeft, FocusRight]), "move focus left / right"),
+                        (
+                            Act(&[FocusLeft, FocusRight]),
+                            "focus left / right (2×: jump)",
+                        ),
                         (Act(&[MoveDown, MoveUp]), "move selection"),
                         (Act(&[Activate]), "drill in / attach session"),
                         (Act(&[Palette]), "fuzzy jump to anything"),
@@ -563,6 +575,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Lit("⌥click"), "open URL / file under cursor"),
                         (Lit("⇧drag"), "select via your terminal"),
                         (Lit("drag border"), "resize panels"),
+                        (Lit("click outside"), "dismiss any modal (= Esc)"),
                     ],
                 ),
                 (
@@ -644,6 +657,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             };
             f.render_widget(Paragraph::new(column(LEFT, left_a.width)), left_a);
             f.render_widget(Paragraph::new(column(RIGHT, right_a.width)), right_a);
+            // Record the drawn area for click hit-testing.
+            if let Some(Overlay::Help(h)) = &mut app.overlay {
+                h.area = area;
+            }
         }
         Overlay::Settings(view) => {
             // A tab strip over a scrolling list. Splitting the settings by
