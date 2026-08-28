@@ -1,10 +1,10 @@
 //! The main TUI loop: terminal setup/teardown, message routing, update logic.
 
 use crate::app::{
-    App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder, Focus,
-    GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, Overlay, Palette,
-    PaletteTarget, PendingAction, PendingIntent, PointerShape, PromptDialog, PromptKind, RowKey,
-    SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection, WorktreeRollback,
+    clamp_selection, App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView,
+    FileFinder, Focus, GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, Overlay,
+    Palette, PaletteTarget, PendingAction, PendingIntent, PointerShape, PromptDialog, PromptKind,
+    RowKey, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection, WorktreeRollback,
 };
 use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
@@ -1634,7 +1634,7 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
         PromptKind::AddProject => (
             "Add project".into(),
             "path to a git repository".into(),
-            if home_dir().is_some() {
+            if nebula_core::env::home_dir().is_some() {
                 "~/".to_string()
             } else {
                 String::new()
@@ -2042,7 +2042,7 @@ fn resolve_file_link(root: &std::path::Path, path: &str) -> Option<String> {
     }
     for cand in candidates {
         let full = if let Some(rest) = cand.strip_prefix("~/") {
-            home_dir()?.join(rest)
+            nebula_core::env::home_dir()?.join(rest)
         } else {
             // join() with an absolute candidate yields the candidate.
             root.join(cand)
@@ -2056,11 +2056,6 @@ fn resolve_file_link(root: &std::path::Path, path: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// `$HOME`, when the environment has one.
-fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
 /// Keys while the editor modal is open: Ctrl+Q force-closes (the terminal
@@ -2829,10 +2824,10 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
         Overlay::Metrics(view) => match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('M') => app.overlay = None,
             KeyCode::Char('j') | KeyCode::Down => {
-                step_selection(&mut view.selected, view.rows.len(), 1);
+                view.selected = clamp_selection(view.selected as i64 + (1), view.rows.len());
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                step_selection(&mut view.selected, view.rows.len(), -1);
+                view.selected = clamp_selection(view.selected as i64 + (-1), view.rows.len());
             }
             KeyCode::Enter => {
                 // Nebula's own rows (daemon / this UI) carry no session.
@@ -2870,10 +2865,10 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') => app.overlay = None,
                 KeyCode::Char('j') | KeyCode::Down => {
-                    step_selection(&mut view.selected, view.hosts.len(), 1);
+                    view.selected = clamp_selection(view.selected as i64 + (1), view.hosts.len());
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    step_selection(&mut view.selected, view.hosts.len(), -1);
+                    view.selected = clamp_selection(view.selected as i64 + (-1), view.hosts.len());
                 }
                 // A destination the list doesn't have yet — typed here so an
                 // open nebula never needs a shell for `nebula ssh`.
@@ -2893,7 +2888,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Backspace | KeyCode::Delete => {
                     if view.selected < view.hosts.len() {
                         let entry = view.hosts.remove(view.selected);
-                        clamp_index(&mut view.selected, view.hosts.len());
+                        view.selected = clamp_selection(view.selected as i64, view.hosts.len());
                         crate::hosts::remove(&entry);
                     }
                 }
@@ -2991,7 +2986,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 submit_prompt(app, prompt, out);
             }
             KeyCode::Tab if prompt.completes_paths() => {
-                let home = home_dir();
+                let home = nebula_core::env::home_dir();
                 let result = crate::completion::complete_path(&prompt.input, home.as_deref());
                 if let Some(completed) = result.completed {
                     prompt.input.set_text(completed);
@@ -4126,7 +4121,7 @@ fn detach_if_attached(app: &mut App, sref: &SessionRef, out: &mut Vec<ClientRequ
 
 fn shellexpand_home(path: &str) -> std::path::PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
+        if let Some(home) = nebula_core::env::home_dir() {
             return home.join(rest);
         }
     }
@@ -4698,10 +4693,6 @@ fn attach_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.term_locked = true;
 }
 
-/// Cross into the terminal pane and take the input lock, so what the user
-/// types after the walk reaches the agent instead of the panels. An empty
-/// or dead pane is focused but never locked: there is nothing to type into,
-/// and a lock would only send them hunting for an escape hatch.
 /// Leave a locked pane for the Sessions panel. Also expands collapsed
 /// sidebars, so there is something on screen to land in.
 fn leave_terminal_lock(app: &mut App) {
@@ -4722,6 +4713,10 @@ fn next_focus(focus: Focus) -> Option<Focus> {
     }
 }
 
+/// Cross into the terminal pane and take the input lock, so what the user
+/// types after the walk reaches the agent instead of the panels. An empty
+/// or dead pane is focused but never locked: there is nothing to type into,
+/// and a lock would only send them hunting for an escape hatch.
 fn enter_terminal_pane(app: &mut App) {
     app.focus = Focus::Terminal;
     if app.term.as_ref().is_some_and(|t| !t.exited) {
@@ -5171,11 +5166,6 @@ fn is_double_click<T: PartialEq>(slot: &mut Option<(std::time::Instant, T)>, key
     double
 }
 
-/// Whether the cell at (`column`, `row`) lies inside `area`.
-fn contains(area: ratatui::layout::Rect, column: u16, row: u16) -> bool {
-    column >= area.x && column < area.x + area.width && row >= area.y && row < area.y + area.height
-}
-
 /// The two touching border cells at a vertical panel boundary `bx`, bounded
 /// by `area` — the shared grab-zone rule for every splitter.
 fn on_vsplit(bx: u16, area: ratatui::layout::Rect, column: u16, row: u16) -> bool {
@@ -5236,6 +5226,7 @@ fn update_pointer(app: &mut App, mouse: &MouseEvent) {
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) {
+    let mouse_pos = ratatui::layout::Position::new(mouse.column, mouse.row);
     update_pointer(app, &mouse);
     // The editor modal swallows the mouse entirely — its selection/scroll
     // story is vim's, not ours.
@@ -5280,7 +5271,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let area = prompt.list_area;
-                if area.width > 0 && contains(area, mouse.column, mouse.row) {
+                if area.contains(mouse_pos) {
                     let i =
                         prompt.window_start(area.height as usize) + (mouse.row - area.y) as usize;
                     if i < prompt.dirs.len() {
@@ -5319,7 +5310,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     return;
                 }
                 let area = view.list_area;
-                if area.width > 0 && contains(area, mouse.column, mouse.row) {
+                if area.contains(mouse_pos) {
                     let start = view.window_start(area.height as usize);
                     let index = start + (mouse.row - area.y) as usize;
                     if index < view.matches.len() && view.select(index as i64) {
@@ -5358,8 +5349,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = palette.list_area;
-                let inside_list = list.width > 0 && contains(list, mouse.column, mouse.row);
-                let inside_modal = contains(palette.area, mouse.column, mouse.row);
+                let inside_list = list.contains(mouse_pos);
+                let inside_modal = palette.area.contains(mouse_pos);
                 if inside_list {
                     let start = palette.window_start(list.height as usize);
                     let index = start + (mouse.row - list.y) as usize;
@@ -5395,8 +5386,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = finder.list_area;
-                let inside_list = list.width > 0 && contains(list, mouse.column, mouse.row);
-                let inside_modal = contains(finder.area, mouse.column, mouse.row);
+                let inside_list = list.contains(mouse_pos);
+                let inside_modal = finder.area.contains(mouse_pos);
                 if inside_list {
                     let start = finder.window_start(list.height as usize);
                     let index = start + (mouse.row - list.y) as usize;
@@ -5428,8 +5419,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = view.list_area;
-                let inside_list = list.width > 0 && contains(list, mouse.column, mouse.row);
-                let inside_modal = contains(view.area, mouse.column, mouse.row);
+                let inside_list = list.contains(mouse_pos);
+                let inside_modal = view.area.contains(mouse_pos);
                 if inside_list {
                     let start = view.window_start(list.height as usize);
                     let index = start + (mouse.row - list.y) as usize;
@@ -5469,8 +5460,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     return;
                 }
                 let list = view.list_area;
-                let inside_list = list.width > 0 && contains(list, mouse.column, mouse.row);
-                let inside_modal = contains(view.area, mouse.column, mouse.row);
+                let inside_list = list.contains(mouse_pos);
+                let inside_modal = view.area.contains(mouse_pos);
                 if inside_list {
                     let start = view.window_start(list.height as usize);
                     let index = start + (mouse.row - list.y) as usize;
@@ -5504,17 +5495,17 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     if let Some(Overlay::Hosts(view)) = &mut app.overlay {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                step_selection(&mut view.selected, view.hosts.len(), -1);
+                view.selected = clamp_selection(view.selected as i64 + (-1), view.hosts.len());
                 app.dirty = true;
             }
             MouseEventKind::ScrollDown => {
-                step_selection(&mut view.selected, view.hosts.len(), 1);
+                view.selected = clamp_selection(view.selected as i64 + (1), view.hosts.len());
                 app.dirty = true;
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = view.list_area;
-                let inside_list = list.width > 0 && contains(list, mouse.column, mouse.row);
-                let inside_modal = contains(view.area, mouse.column, mouse.row);
+                let inside_list = list.contains(mouse_pos);
+                let inside_modal = view.area.contains(mouse_pos);
                 if inside_list {
                     let start = view.window_start(list.height as usize);
                     let index = start + (mouse.row - list.y) as usize;
@@ -5553,7 +5544,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 view.first_row,
             );
             let tab_hits = view.tab_hits.clone();
-            let inside = area.width > 0 && contains(area, mouse.column, mouse.row);
+            let inside = area.contains(mouse_pos);
             if !inside {
                 app.overlay = None;
                 app.dirty = true;
@@ -5621,17 +5612,17 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         let mut open: Option<SessionRef> = None;
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                step_selection(&mut view.selected, view.rows.len(), -1);
+                view.selected = clamp_selection(view.selected as i64 + (-1), view.rows.len());
                 app.dirty = true;
             }
             MouseEventKind::ScrollDown => {
-                step_selection(&mut view.selected, view.rows.len(), 1);
+                view.selected = clamp_selection(view.selected as i64 + (1), view.rows.len());
                 app.dirty = true;
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = view.list_area;
-                let inside_list = list.width > 0 && contains(list, mouse.column, mouse.row);
-                let inside_modal = contains(view.area, mouse.column, mouse.row);
+                let inside_list = list.contains(mouse_pos);
+                let inside_modal = view.area.contains(mouse_pos);
                 if inside_list {
                     let index = view.scroll + (mouse.row - list.y) as usize;
                     if index < view.rows.len() {
@@ -6539,26 +6530,11 @@ fn reconcile_selection(app: &mut App, before: SelectionSnapshot, out: &mut Vec<C
 /// Keep selections valid after the tree shrinks.
 fn clamp_selections(app: &mut App) {
     let project_rows = app.project_rows().len();
-    clamp_index(&mut app.sel_project, project_rows);
+    app.sel_project = clamp_selection(app.sel_project as i64, project_rows);
     let wt_len = app.worktree_row_count();
-    clamp_index(&mut app.sel_worktree, wt_len);
+    app.sel_worktree = clamp_selection(app.sel_worktree as i64, wt_len);
     let sess_len = app.visible_session_rows().len();
-    clamp_index(&mut app.sel_session, sess_len);
-}
-
-/// Pull a cursor that fell off the end of a list back onto its last row
-/// (row 0 when the list is empty).
-fn clamp_index(sel: &mut usize, len: usize) {
-    if *sel >= len {
-        *sel = len.saturating_sub(1);
-    }
-}
-
-/// Move a list cursor by `delta`, stopping at either end (row 0 when the
-/// list is empty).
-fn step_selection(sel: &mut usize, len: usize, delta: i64) {
-    let max = len.saturating_sub(1) as i64;
-    *sel = (*sel as i64 + delta).clamp(0, max) as usize;
+    app.sel_session = clamp_selection(app.sel_session as i64, sess_len);
 }
 
 #[cfg(test)]

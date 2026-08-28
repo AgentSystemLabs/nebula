@@ -28,7 +28,7 @@ for `AgentStatus`, table-driving `Config::write_into`) were left, listed in the 
 gated on a test run green against the *old* code first. Highlights: new `nebula_core::env` (`AGENT_ID`,
 `API_URL`, `API_TOKEN`, `RUNTIME_DIR`, `DATA_DIR`, `AGENT_SESSION_VARS`, `non_empty()`) used by
 `paths.rs`, `registry.rs`, `ipc.rs`, `upgrade.rs`; `store.rs` `*_COLUMNS` + `row_to_*` shared by point
-lookups and `load_tree` (its ~40 `.unwrap()`s now propagate); `registry::broadcast_agent` (15 sites),
+lookups and `load_tree` (the point lookups' ~41 `.unwrap()`s now propagate via `?`); `registry::broadcast_agent` (15 sites),
 `kill_sessions_in`, `pty::DEFAULT_COLS/ROWS`; `status::end_turn`; installer `root_object_mut`/`object_mut`/
 `array_mut` + `purge_nebula_groups`; `hooks::HookDialect` for the `bool`; `server::reply_done` (21 arms);
 `ui::modal_block`/`render_modal_frame`, `app::window_start`/`clamp_selection`; `keymap::KEY_NAMES` behind

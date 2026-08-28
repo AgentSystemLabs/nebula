@@ -463,7 +463,7 @@ impl PromptDialog {
     }
 
     fn home() -> Option<std::path::PathBuf> {
-        std::env::var_os("HOME").map(std::path::PathBuf::from)
+        nebula_core::env::home_dir()
     }
 
     /// Recompute `dirs` from `input` after any edit; the hover returns to

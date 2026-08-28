@@ -378,8 +378,8 @@ pub async fn enter_worktree_for_current_agent(name: &str, base: Option<String>) 
 /// after the directory, rejecting non-repos and duplicates. Spawns a daemon
 /// when none is running, same as launching the TUI would.
 pub async fn add_project(path: &str) -> Result<()> {
-    let expanded = match (path.strip_prefix("~/"), std::env::var("HOME")) {
-        (Some(rest), Ok(home)) => std::path::PathBuf::from(home).join(rest),
+    let expanded = match (path.strip_prefix("~/"), env::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest),
         _ => std::path::PathBuf::from(path),
     };
     let dir = std::fs::canonicalize(&expanded)

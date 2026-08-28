@@ -14,10 +14,9 @@ const INSTALL_URL: &str =
 /// The published install script, with `NEBULA_INSTALL_URL` as the override
 /// hook (tests point it at a file:// URL). Shared with `nebula ssh`.
 pub(crate) fn install_url() -> String {
-    nebula_core::env::non_empty(INSTALL_URL_ENV).unwrap_or_else(|| INSTALL_URL.to_string())
+    nebula_core::env::non_empty(nebula_core::env::INSTALL_URL)
+        .unwrap_or_else(|| INSTALL_URL.to_string())
 }
-
-const INSTALL_URL_ENV: &str = "NEBULA_INSTALL_URL";
 
 /// Printed whenever a daemon from an older binary is left running: the only
 /// way onto the new code is a restart, and a restart takes the sessions.

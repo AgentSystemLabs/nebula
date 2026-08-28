@@ -3,6 +3,7 @@
 //! across a daemon restart.
 
 use nebula_core::codec::{read_frame, write_frame};
+use nebula_core::env;
 use nebula_core::{
     AgentKind, ClientRequest, Entity, EntityId, ServerEvent, SessionRef, PROTOCOL_VERSION,
 };
@@ -35,6 +36,15 @@ impl TestEnv {
         self.runtime_dir.join("daemon.sock")
     }
 
+    /// The `nebula` binary under test, pointed at this env's runtime and
+    /// data dirs — the base every daemon spawn and one-shot CLI run shares.
+    fn cli(&self) -> std::process::Command {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+        cmd.env(env::RUNTIME_DIR, &self.runtime_dir)
+            .env(env::DATA_DIR, self.tmp.path().join("data"));
+        cmd
+    }
+
     fn spawn_daemon(&self) -> DaemonProc {
         self.spawn_daemon_with_agent_cmd("/bin/sh") // no real claude in tests
     }
@@ -44,36 +54,36 @@ impl TestEnv {
     }
 
     fn spawn_daemon_with(&self, agent_cmd: &str, envs: &[(&str, &str)]) -> DaemonProc {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
-        cmd.args(["daemon", "--foreground"])
-            .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
-            .env("NEBULA_DATA_DIR", self.tmp.path().join("data"))
-            .env("SHELL", "/bin/sh")
-            .env("NEBULA_AGENT_CMD", agent_cmd)
-            .env("NEBULA_WORKTREE_SYNC_MS", "100") // fast external-worktree pickup
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        for (k, v) in envs {
-            cmd.env(k, v);
-        }
-        DaemonProc(cmd.spawn().unwrap())
+        self.spawn_daemon_in(Path::new("/bin/sh"), Some(agent_cmd), envs)
     }
 
     /// Daemon with no `NEBULA_AGENT_CMD` override, so agent spawns take the
     /// real login-shell path, and `$SHELL` set to `shell`. Lets a test decide
     /// what the daemon can find on PATH.
     fn spawn_daemon_with_shell(&self, shell: &Path) -> DaemonProc {
-        let child = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-            .args(["daemon", "--foreground"])
-            .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
-            .env("NEBULA_DATA_DIR", self.tmp.path().join("data"))
+        self.spawn_daemon_in(shell, None, &[])
+    }
+
+    fn spawn_daemon_in(
+        &self,
+        shell: &Path,
+        agent_cmd: Option<&str>,
+        envs: &[(&str, &str)],
+    ) -> DaemonProc {
+        let mut cmd = self.cli();
+        cmd.args(["daemon", "--foreground"])
             .env("SHELL", shell)
-            .env_remove("NEBULA_AGENT_CMD")
+            .env(env::WORKTREE_SYNC_MS, "100") // fast external-worktree pickup
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        DaemonProc(child)
+            .stderr(std::process::Stdio::null());
+        match agent_cmd {
+            Some(agent_cmd) => cmd.env(env::AGENT_CMD, agent_cmd),
+            None => cmd.env_remove(env::AGENT_CMD),
+        };
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        DaemonProc(cmd.spawn().unwrap())
     }
 
     /// A `$SHELL` that answers `-l -i -c` but sees no agent CLI on PATH.
@@ -1688,11 +1698,9 @@ async fn upgrade_shuts_down_idle_daemon_but_spares_live_sessions() {
     let script = env.tmp.path().join("stub-install.sh");
     std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
     let run_upgrade = || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        env.cli()
             .args(["upgrade", "--force"])
-            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
-            .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
-            .env("NEBULA_INSTALL_URL", format!("file://{}", script.display()))
+            .env(env::INSTALL_URL, format!("file://{}", script.display()))
             .output()
             .unwrap()
     };
@@ -2627,7 +2635,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     let env = TestEnv::new();
     let repo = env.make_repo();
     env.write_config(r#"{"session_idle_timeout": "2s"}"#);
-    let mut daemon = env.spawn_daemon_with("/bin/sh", &[("NEBULA_IDLE_REAP_MS", "200")]);
+    let mut daemon = env.spawn_daemon_with("/bin/sh", &[(env::IDLE_REAP_MS, "200")]);
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
     let worktree = add_project_get_main_worktree(&mut c, &repo).await;
@@ -2852,7 +2860,7 @@ async fn read_env_file(path: &Path) -> std::collections::HashMap<String, String>
                 .filter_map(|l| l.split_once('='))
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
-            if map.contains_key("NEBULA_API_URL") && map.contains_key("NEBULA_API_TOKEN") {
+            if map.contains_key(env::API_URL) && map.contains_key(env::API_TOKEN) {
                 return map;
             }
         }
@@ -2949,13 +2957,13 @@ async fn auto_title_instruction_and_rename_flow() {
     let agent_id = agent_id.clone();
 
     let agent_env = read_env_file(&env_dir.join(format!("{}.env", agent_id.0))).await;
-    let port: u16 = agent_env["NEBULA_API_URL"]
+    let port: u16 = agent_env[env::API_URL]
         .rsplit(':')
         .next()
         .unwrap()
         .parse()
         .unwrap();
-    let token = agent_env["NEBULA_API_TOKEN"].clone();
+    let token = agent_env[env::API_TOKEN].clone();
     let submit_path = format!(
         "/api/hooks/claude?agentId={}&hookEvent=UserPromptSubmit",
         agent_id.0
@@ -3049,13 +3057,13 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
     };
     let agent_id = agent_id.clone();
     let agent_env = read_env_file(&env_dir.join(format!("{}.env", agent_id.0))).await;
-    let port: u16 = agent_env["NEBULA_API_URL"]
+    let port: u16 = agent_env[env::API_URL]
         .rsplit(':')
         .next()
         .unwrap()
         .parse()
         .unwrap();
-    let token = agent_env["NEBULA_API_TOKEN"].clone();
+    let token = agent_env[env::API_TOKEN].clone();
     let pwd_log = env_dir.join(format!("{}.pwd", agent_id.0));
     let boots = |path: &Path| -> Vec<String> {
         std::fs::read_to_string(path)
@@ -3364,8 +3372,8 @@ fn agent_cli(
 ) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
         .args(args)
-        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
-        .env("NEBULA_AGENT_ID", &agent_id.0)
+        .env(env::RUNTIME_DIR, &env.runtime_dir)
+        .env(env::AGENT_ID, &agent_id.0)
         .output()
         .unwrap()
 }
@@ -3379,15 +3387,8 @@ async fn cli_add_project() {
     handshake(&mut c).await;
     subscribe(&mut c).await;
 
-    let run_cli = |args: &[&str], cwd: &Path| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-            .args(args)
-            .current_dir(cwd)
-            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
-            .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
-            .output()
-            .unwrap()
-    };
+    let run_cli =
+        |args: &[&str], cwd: &Path| env.cli().args(args).current_dir(cwd).output().unwrap();
 
     // `nebula add .` from inside the repo: cwd-relative resolution, project
     // named after the directory.
@@ -3559,7 +3560,7 @@ esac
             .unwrap_or(0)
     };
     let mut daemon =
-        env.spawn_daemon_with(stub.to_str().unwrap(), &[("NEBULA_CLOUD_MIRROR_SECS", "2")]);
+        env.spawn_daemon_with(stub.to_str().unwrap(), &[(env::CLOUD_MIRROR_SECS, "2")]);
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
@@ -3710,7 +3711,7 @@ esac
             .unwrap_or(0)
     };
     let mut daemon =
-        env.spawn_daemon_with(stub.to_str().unwrap(), &[("NEBULA_CLOUD_MIRROR_SECS", "2")]);
+        env.spawn_daemon_with(stub.to_str().unwrap(), &[(env::CLOUD_MIRROR_SECS, "2")]);
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
@@ -3830,10 +3831,8 @@ esac
     // A cadence long enough that no mirror tick lands inside the test: the
     // run counts here are about the re-entry chain, not the refresh loop
     // (which `cloud_mirror_refreshes_until_the_pane_is_typed_into` covers).
-    let mut daemon = env.spawn_daemon_with(
-        stub.to_str().unwrap(),
-        &[("NEBULA_CLOUD_MIRROR_SECS", "600")],
-    );
+    let mut daemon =
+        env.spawn_daemon_with(stub.to_str().unwrap(), &[(env::CLOUD_MIRROR_SECS, "600")]);
 
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;

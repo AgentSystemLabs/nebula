@@ -5,7 +5,6 @@
 
 use crate::ui::truncate;
 use std::path::Path;
-use std::process::Command;
 
 /// Queries shorter than this don't search — one character would light up
 //  half the repo.
@@ -36,12 +35,7 @@ pub fn search(root: &Path, query: &str) -> Result<(Vec<GrepHit>, bool), String> 
         args.push("-i");
     }
     args.extend(["-e", query, "--", "."]);
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(&args)
-        .output()
-        .map_err(|e| format!("failed to run git: {e}"))?;
+    let output = crate::git_diff::run_git(root, &args)?;
     // git grep exits 1 for "no matches" — only >= 2 is an error.
     match output.status.code() {
         Some(0) => Ok(parse_grep_z(&output.stdout)),
@@ -87,6 +81,7 @@ pub fn parse_grep_z(bytes: &[u8]) -> (Vec<GrepHit>, bool) {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::process::Command;
 
     #[test]
     fn parse_grep_z_splits_path_line_text() {

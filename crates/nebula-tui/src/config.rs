@@ -530,7 +530,10 @@ impl Config {
     /// The editor the file overlays launch: `NEBULA_EDITOR` when set,
     /// otherwise the `editor` setting, otherwise vim.
     pub fn editor_command(&self) -> String {
-        resolve_editor(std::env::var("NEBULA_EDITOR").ok().as_deref(), &self.editor)
+        resolve_editor(
+            nebula_core::env::non_empty(nebula_core::env::EDITOR).as_deref(),
+            &self.editor,
+        )
     }
 
     /// The configured default model for new sessions of `kind`, as the

@@ -18,6 +18,10 @@ use std::time::{Duration, Instant};
 const COLS: u16 = 120;
 const ROWS: u16 = 36;
 const WAIT: Duration = Duration::from_secs(20);
+/// How long the daemon gets to answer a one-shot CLI call.
+const CLI_TIMEOUT: Duration = Duration::from_secs(5);
+/// Sleep between polls of the screen or a child.
+const POLL_STEP: Duration = Duration::from_millis(50);
 
 // Raw key bytes as the PTY sees them — the name replaces a trailing comment.
 const ENTER: &[u8] = b"\r";
@@ -83,11 +87,11 @@ impl TuiHarness {
             })
             .unwrap();
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_nebula"));
-        cmd.env("NEBULA_RUNTIME_DIR", &runtime_dir);
-        cmd.env("NEBULA_DATA_DIR", &data_dir);
-        cmd.env("NEBULA_AGENT_CMD", "/bin/sh"); // stand-in for claude
-        cmd.env("NEBULA_WORKTREE_SYNC_MS", "100"); // fast external-change pickup
-        cmd.env("NEBULA_LOG", "debug");
+        cmd.env(nebula_core::env::RUNTIME_DIR, &runtime_dir);
+        cmd.env(nebula_core::env::DATA_DIR, &data_dir);
+        cmd.env(nebula_core::env::AGENT_CMD, "/bin/sh"); // stand-in for claude
+        cmd.env(nebula_core::env::WORKTREE_SYNC_MS, "100"); // fast external-change pickup
+        cmd.env(nebula_core::env::LOG, "debug");
         cmd.env("SHELL", "/bin/sh");
         cmd.env("TERM", "xterm-256color");
         // Agent/CI shells often export NO_COLOR; crossterm then strips the
@@ -188,7 +192,7 @@ impl TuiHarness {
                     self.screen_text()
                 );
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(POLL_STEP);
         }
     }
 
@@ -229,8 +233,8 @@ impl Drop for TuiHarness {
         // Stop the auto-spawned daemon and clean the short-lived dirs.
         let _ = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
             .arg("kill")
-            .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
-            .env("NEBULA_DATA_DIR", &self.data_dir)
+            .env(nebula_core::env::RUNTIME_DIR, &self.runtime_dir)
+            .env(nebula_core::env::DATA_DIR, &self.data_dir)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
@@ -540,11 +544,11 @@ fn tui_projects_worktrees_agents_navigation() {
 
     // ---- clean quit ----
     tui.send(b"q");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + CLI_TIMEOUT;
     loop {
         match tui.child.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_STEP),
             _ => panic!(
                 "TUI did not exit after q\n--- screen ---\n{}",
                 tui.screen_text()

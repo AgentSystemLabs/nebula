@@ -54,7 +54,7 @@ pub fn data_dir() -> PathBuf {
     }
     project_dirs()
         .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".nebula"))
+        .unwrap_or_else(|| env::home_dir().unwrap_or_default().join(".nebula"))
 }
 
 pub fn db_path() -> PathBuf {
@@ -94,10 +94,31 @@ pub fn tui_log_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    /// Restores an env var to what it was when the guard was made, so a
+    /// failed assertion can't leak an override into the next test.
+    struct EnvRestore(&'static str, Option<std::ffi::OsString>);
+    impl EnvRestore {
+        fn new(var: &'static str) -> Self {
+            Self(var, std::env::var_os(var))
+        }
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
     // One test owns both override vars: env is process-global, and splitting
     // this into several `#[test]`s would race them across threads.
     #[test]
     fn overrides_win_only_when_non_empty() {
+        let _restore = (
+            EnvRestore::new(crate::env::RUNTIME_DIR),
+            EnvRestore::new(crate::env::DATA_DIR),
+        );
         let runtime = std::env::temp_dir().join(format!("nebula-paths-rt-{}", std::process::id()));
         let data = std::env::temp_dir().join(format!("nebula-paths-data-{}", std::process::id()));
 
@@ -127,8 +148,5 @@ mod tests {
             runtime_dir().display(),
             data_dir().display()
         );
-
-        std::env::remove_var(crate::env::RUNTIME_DIR);
-        std::env::remove_var(crate::env::DATA_DIR);
     }
 }

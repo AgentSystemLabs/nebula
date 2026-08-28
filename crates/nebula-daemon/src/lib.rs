@@ -10,14 +10,8 @@ pub mod status;
 pub mod store;
 
 use anyhow::{bail, Context, Result};
-use nebula_core::paths;
+use nebula_core::{env, paths};
 
-/// Env override (ms) for the idle-session reaper's sweep period; tests
-/// shorten it so a walked-away-from session ages out in the same second.
-const IDLE_REAP_MS: &str = "NEBULA_IDLE_REAP_MS";
-/// Env override (ms) for the external-worktree sync probe, likewise a test
-/// knob.
-const WORKTREE_SYNC_MS: &str = "NEBULA_WORKTREE_SYNC_MS";
 /// Floor on any env-tunable loop period: the overrides exist to make tests
 /// fast, and a zero or near-zero tick would just spin the daemon.
 const MIN_TICK_MS: u64 = 50;
@@ -146,7 +140,7 @@ async fn serve() -> Result<()> {
     {
         let daemon = daemon.clone();
         tokio::spawn(async move {
-            let mut interval = env_interval(IDLE_REAP_MS, 15_000);
+            let mut interval = env_interval(env::IDLE_REAP_MS, 15_000);
             loop {
                 tokio::select! {
                     _ = daemon.shutdown.cancelled() => break,
@@ -164,7 +158,7 @@ async fn serve() -> Result<()> {
     {
         let daemon = daemon.clone();
         tokio::spawn(async move {
-            let mut interval = env_interval(WORKTREE_SYNC_MS, 2_000);
+            let mut interval = env_interval(env::WORKTREE_SYNC_MS, 2_000);
             let mut seen: std::collections::HashMap<nebula_core::ProjectId, std::time::SystemTime> =
                 std::collections::HashMap::new();
             loop {

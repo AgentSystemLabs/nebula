@@ -41,12 +41,6 @@ const CLOUD_MIRROR_REFRESH: Duration = Duration::from_secs(45);
 /// checkout plus a CLI boot; below this the row would spend its life
 /// respawning.
 const CLOUD_MIRROR_MIN: Duration = Duration::from_secs(2);
-/// Env override for the mirror cadence, in seconds; `0` turns it off.
-const CLOUD_MIRROR_SECS: &str = "NEBULA_CLOUD_MIRROR_SECS";
-/// Env override replacing every agent CLI with one command line (tests
-/// stand in `/bin/cat` or a stub script for `claude`). Taken verbatim —
-/// no login-shell wrap, no model flags.
-const AGENT_CMD: &str = "NEBULA_AGENT_CMD";
 /// `$SHELL -l -i -c <cmd>`: a login *and* interactive shell, so zsh sources
 /// ~/.zprofile and ~/.zshrc both and the child sees the PATH the user's
 /// terminal has. The CLI probe and the spawn wrapper share it so they can
@@ -64,7 +58,7 @@ const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 fn cloud_mirror_refresh() -> Option<Duration> {
     static CADENCE: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
     *CADENCE.get_or_init(|| {
-        match std::env::var(CLOUD_MIRROR_SECS)
+        match std::env::var(env::CLOUD_MIRROR_SECS)
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
         {
@@ -740,13 +734,13 @@ impl Daemon {
 
     pub fn remove_project(self: &Arc<Self>, id: &ProjectId) -> Result<()> {
         // Kill any live sessions under this project first.
-        let (_, worktrees, _, _) = self.store.load_tree()?;
+        let (_, worktrees, agents, terminals) = self.store.load_tree()?;
         let wt_ids: Vec<WorktreeId> = worktrees
             .into_iter()
             .filter(|w| &w.project_id == id)
             .map(|w| w.id)
             .collect();
-        self.kill_sessions_in(&wt_ids)?;
+        self.kill_sessions_in(&wt_ids, &agents, &terminals);
         // Removing a project only forgets it in nebula — never touches disk.
         self.store.delete_project(id)?;
         self.broadcast(ServerEvent::EntityRemoved {
@@ -840,7 +834,8 @@ impl Daemon {
             .context("project not found")?;
 
         // Kill sessions living in this worktree.
-        self.kill_sessions_in(std::slice::from_ref(id))?;
+        let (_, _, agents, terminals) = self.store.load_tree()?;
+        self.kill_sessions_in(std::slice::from_ref(id), &agents, &terminals);
 
         git::remove_worktree(&project.repo_path, &worktree.path, force).await?;
         self.store.delete_worktree(id)?;
@@ -1200,8 +1195,12 @@ impl Daemon {
     /// Kill every live agent and terminal PTY homed in these worktrees, and
     /// the warm spares with them — the prelude to dropping their rows
     /// (worktree delete, project remove).
-    fn kill_sessions_in(&self, worktree_ids: &[WorktreeId]) -> Result<()> {
-        let (_, _, agents, terminals) = self.store.load_tree()?;
+    fn kill_sessions_in(
+        &self,
+        worktree_ids: &[WorktreeId],
+        agents: &[Agent],
+        terminals: &[TerminalTab],
+    ) {
         for a in agents
             .iter()
             .filter(|a| worktree_ids.contains(&a.worktree_id))
@@ -1215,7 +1214,6 @@ impl Daemon {
             self.kill_session(&SessionRef::Terminal(t.id.clone()));
         }
         self.kill_prewarmed_in(worktree_ids);
-        Ok(())
     }
 
     /// Kill warm sessions homed in any of these worktrees (worktree delete,
@@ -1243,7 +1241,7 @@ impl Daemon {
     /// gets picked up quickly. Probe trouble (timeout, spawn error) fails
     /// open — a doomed warm spawn is still graceful.
     async fn cli_available(&self, kind: AgentKind) -> bool {
-        if std::env::var(AGENT_CMD).is_ok() {
+        if std::env::var(env::AGENT_CMD).is_ok() {
             return true; // test override is spawned verbatim
         }
         const OK_TTL: Duration = Duration::from_secs(3600);
@@ -1941,7 +1939,7 @@ impl Daemon {
             .get_worktree(&agent.worktree_id)?
             .context("worktree not found")?;
 
-        let cmd_override = std::env::var(AGENT_CMD).ok();
+        let cmd_override = std::env::var(env::AGENT_CMD).ok();
         let (program, args) = match cmd_override.as_deref() {
             Some(over) => (over.to_string(), Vec::new()),
             None => login_shell_wrap(
@@ -2327,7 +2325,7 @@ impl Daemon {
         }
 
         // NEBULA_AGENT_CMD overrides for tests; default is the kind's CLI.
-        let cmd_override = std::env::var(AGENT_CMD).ok();
+        let cmd_override = std::env::var(env::AGENT_CMD).ok();
         let (program, args, resumed) = match cloud {
             Some(launch) => claude_cloud_spawn_command(
                 launch,

@@ -803,9 +803,9 @@ impl Store {
     pub fn get_project(&self, id: &ProjectId) -> Result<Option<Project>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {PROJECT_COLUMNS} FROM projects WHERE id = ?2"
+            "SELECT {PROJECT_COLUMNS} FROM projects WHERE id = ?1"
         ))?;
-        let mut rows = stmt.query(params![DEFAULT_WORKSPACE_ID, id.as_str()])?;
+        let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(row_to_project).transpose()?)
     }
 
@@ -852,7 +852,7 @@ impl Store {
             .prepare(&format!(
                 "SELECT {PROJECT_COLUMNS} FROM projects ORDER BY sort_order, created_at"
             ))?
-            .query_map(params![DEFAULT_WORKSPACE_ID], row_to_project)?
+            .query_map([], row_to_project)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let worktrees = conn
@@ -904,11 +904,12 @@ impl Store {
 // lookups and `load_tree`, so a row can never read differently depending
 // on which path fetched it. The column order is the mapper's contract.
 
+// Column orders the `row_to_*` mappers below read.
 const WORKSPACE_COLUMNS: &str = "id, name";
-/// Binds the default workspace id as `?1` (rows from before workspaces
-/// existed have a NULL `workspace_id`), so a query over these columns
-/// numbers its own parameters from `?2`.
-const PROJECT_COLUMNS: &str = "id, name, repo_path, sort_order, COALESCE(workspace_id, ?1)";
+/// `workspace_id` is NULL on rows that predate workspaces; `row_to_project`
+/// fills in the default rather than a `COALESCE(.., ?1)` in the column list,
+/// which would hide a positional bind every query had to remember.
+const PROJECT_COLUMNS: &str = "id, name, repo_path, sort_order, workspace_id";
 const WORKTREE_COLUMNS: &str = "id, project_id, path, branch, is_main, pinned, sort_order";
 const AGENT_COLUMNS: &str = "id, worktree_id, name, status, archived, pinned, kind, \
                              claude_session_id, sort_order, status_changed_at, model, effort, \
@@ -929,7 +930,10 @@ fn row_to_project(r: &rusqlite::Row) -> rusqlite::Result<Project> {
         name: r.get(1)?,
         repo_path: PathBuf::from(r.get::<_, String>(2)?),
         sort_order: r.get(3)?,
-        workspace_id: WorkspaceId(r.get(4)?),
+        workspace_id: WorkspaceId(
+            r.get::<_, Option<String>>(4)?
+                .unwrap_or_else(|| DEFAULT_WORKSPACE_ID.to_string()),
+        ),
     })
 }
 

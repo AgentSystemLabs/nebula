@@ -259,10 +259,13 @@ fn array_mut<'a>(v: &'a mut Value, what: &str, path: &Path) -> Result<&'a mut Ve
 /// Codex's home (`$CODEX_HOME`, else `~/.codex`) — where its hooks live so
 /// one trust approval covers every worktree. See the module header.
 pub fn codex_home() -> PathBuf {
-    match std::env::var("CODEX_HOME") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(CODEX_DIR),
-    }
+    nebula_core::env::non_empty("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            nebula_core::env::home_dir()
+                .unwrap_or_default()
+                .join(CODEX_DIR)
+        })
 }
 
 /// Merge nebula's managed hooks for Codex into `<codex_home>/hooks.json`.
@@ -644,7 +647,9 @@ mod tests {
         std::env::set_var("CODEX_HOME", "");
         assert_eq!(
             codex_home(),
-            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".codex")
+            nebula_core::env::home_dir()
+                .unwrap_or_default()
+                .join(".codex")
         );
         match saved {
             Some(v) => std::env::set_var("CODEX_HOME", v),

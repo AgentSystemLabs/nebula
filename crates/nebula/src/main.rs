@@ -185,7 +185,14 @@ fn main() -> Result<()> {
             nebula_tui::run_workspace(op)
         }
         Some(Command::Kill) => nebula_tui::run_kill(),
-        Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),
+        Some(Command::Rename { title, force }) => {
+            let mode = if force {
+                nebula_tui::RenameMode::Force
+            } else {
+                nebula_tui::RenameMode::Auto
+            };
+            nebula_tui::run_rename(title.join(" "), mode)
+        }
         Some(Command::Worktree { name, base }) => nebula_tui::run_worktree(name.join(" "), base),
         Some(Command::Browser {
             port,
@@ -258,11 +265,8 @@ fn log_fatal<T>(result: Result<T>, log_path: &Path) -> Result<T> {
     result
 }
 
-/// `RUST_LOG`-style filter for both binaries' tracing output.
-const LOG_FILTER_ENV: &str = "NEBULA_LOG";
-
 fn log_filter() -> tracing_subscriber::EnvFilter {
-    tracing_subscriber::EnvFilter::try_from_env(LOG_FILTER_ENV)
+    tracing_subscriber::EnvFilter::try_from_env(nebula_core::env::LOG)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
 }
 

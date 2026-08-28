@@ -12,7 +12,7 @@ fn tunnel(args: &[&str]) -> std::process::Output {
         .arg("tunnel")
         .args(args)
         .env("PATH", "")
-        .env("NEBULA_DATA_DIR", data.path())
+        .env(nebula_core::env::DATA_DIR, data.path())
         .output()
         .expect("failed to run nebula tunnel")
 }

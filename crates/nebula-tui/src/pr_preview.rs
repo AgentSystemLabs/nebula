@@ -94,13 +94,10 @@ fn fit(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
         }
         let room = width - used;
         if room > 1 {
-            let text: String = span
-                .content
-                .chars()
-                .take(room - 1)
-                .chain(std::iter::once('…'))
-                .collect();
-            kept.push(Span::styled(text, span.style));
+            kept.push(Span::styled(
+                crate::ui::truncate(&span.content, room),
+                span.style,
+            ));
         }
         break;
     }

@@ -56,13 +56,8 @@ pub fn shutdown_daemon_if_idle() -> Result<ipc::IdleShutdown> {
 }
 
 /// `nebula rename` — agent-side session titling (see `ipc::rename_current_agent`).
-/// The `force` flag is the CLI's `--force`; it becomes a [`ipc::RenameMode`] here.
-pub fn run_rename(title: String, force: bool) -> Result<()> {
-    let mode = if force {
-        ipc::RenameMode::Force
-    } else {
-        ipc::RenameMode::Auto
-    };
+/// `mode` is the CLI's `--force`, decided where the flag is parsed.
+pub fn run_rename(title: String, mode: RenameMode) -> Result<()> {
     runtime()?.block_on(ipc::rename_current_agent(&title, mode))
 }
 
@@ -78,7 +73,7 @@ pub fn run_add_project(path: String) -> Result<()> {
     runtime()?.block_on(ipc::add_project(&path))
 }
 
-pub use ipc::WorkspaceOp;
+pub use ipc::{RenameMode, WorkspaceOp};
 
 /// `nebula workspace <add|open|list|delete|rename>` (see `ipc::run_workspace_op`).
 pub fn run_workspace(op: WorkspaceOp) -> Result<()> {

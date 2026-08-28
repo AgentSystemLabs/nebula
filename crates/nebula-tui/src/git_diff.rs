@@ -72,7 +72,7 @@ pub fn classify_diff_line(line: &str) -> DiffLineKind {
     }
 }
 
-fn run_git(root: &Path, args: &[&str]) -> Result<Output, String> {
+pub(crate) fn run_git(root: &Path, args: &[&str]) -> Result<Output, String> {
     Command::new("git")
         .arg("-C")
         .arg(root)

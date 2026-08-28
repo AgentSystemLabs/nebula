@@ -1,5 +1,9 @@
 //! Names of the environment variables nebula reads and sets, so the daemon,
-//! the TUI, the CLI and the hook installers all spell them from one place.
+//! the TUI, the CLI, the hook installers and the e2e tests all spell them
+//! from one place — a typo here fails to build instead of silently falling
+//! back to a default.
+
+use std::path::PathBuf;
 
 /// Id of the agent a hook or CLI invocation is running inside. Set on every
 /// agent PTY, scrubbed from plain terminals.
@@ -12,6 +16,21 @@ pub const API_TOKEN: &str = "NEBULA_API_TOKEN";
 pub const RUNTIME_DIR: &str = "NEBULA_RUNTIME_DIR";
 /// Overrides the data dir holding the database, config and logs.
 pub const DATA_DIR: &str = "NEBULA_DATA_DIR";
+/// Replaces every agent CLI with one command line, taken verbatim (tests
+/// stand in `/bin/sh` or a stub script for `claude`).
+pub const AGENT_CMD: &str = "NEBULA_AGENT_CMD";
+/// Idle-session reaper sweep period in ms; tests shorten it.
+pub const IDLE_REAP_MS: &str = "NEBULA_IDLE_REAP_MS";
+/// External-worktree sync probe period in ms; tests shorten it.
+pub const WORKTREE_SYNC_MS: &str = "NEBULA_WORKTREE_SYNC_MS";
+/// Cloud-mirror refresh cadence in seconds; `0` turns it off.
+pub const CLOUD_MIRROR_SECS: &str = "NEBULA_CLOUD_MIRROR_SECS";
+/// `RUST_LOG`-style tracing filter for both the daemon and the TUI.
+pub const LOG: &str = "NEBULA_LOG";
+/// Overrides the install script URL `nebula upgrade` / `nebula ssh` fetch.
+pub const INSTALL_URL: &str = "NEBULA_INSTALL_URL";
+/// Editor command the file modals open, ahead of the config's `editor`.
+pub const EDITOR: &str = "NEBULA_EDITOR";
 
 /// Env vars that identify an agent session to the daemon. They are set on
 /// every agent PTY and must never leak into plain terminals.
@@ -21,6 +40,12 @@ pub const AGENT_SESSION_VARS: &[&str] = &[AGENT_ID, API_URL, API_TOKEN];
 /// override is how a caller says "use the default".
 pub fn non_empty(var: &str) -> Option<String> {
     std::env::var(var).ok().filter(|v| !v.is_empty())
+}
+
+/// `$HOME`, when the environment has one. Read as an `OsString` so a
+/// non-UTF-8 home still resolves — every `~/` expansion goes through here.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 #[cfg(test)]
