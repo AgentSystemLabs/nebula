@@ -2629,7 +2629,10 @@ impl Daemon {
 /// cursor always get their skip-permissions flag (`--yolo` / `--force`),
 /// appended after the resume args — same convention as Mission Control.
 /// Model/effort choices follow: `claude --model m --effort e`,
-/// `codex -m m -c model_reasoning_effort=e` (cursor has neither knob).
+/// `codex -m m -c model_reasoning_effort=e`, and for cursor one flat id
+/// joined from the two — `cursor-agent --model m-e` (`--model m` when
+/// effort is None; the CLI's catalogue bakes the effort into the id and
+/// rejects the `m[effort=e]` form its `--help` advertises).
 /// Claude then gets nebula's worktree guidance appended to its system
 /// prompt, any persisted PR scope is composed into that same system-prompt
 /// argument, and an `initial_prompt` — the relocation notice a `nebula
@@ -2738,7 +2741,7 @@ fn agent_spawn_command_with(
     }
     // Claude and codex spell the model flag the same way, and it follows
     // the skip-permissions flag in both (`codex --yolo --model …`). Cursor
-    // has no model knob at all — a choice for it is simply ignored.
+    // composes its own below: family and effort become one id.
     if let (Some(m), AgentKind::Claude | AgentKind::Codex) = (model, kind) {
         args.extend(["--model".to_string(), m.to_string()]);
     }
@@ -2775,6 +2778,17 @@ fn agent_spawn_command_with(
             }
         }
         AgentKind::Cursor => {
+            // `--model <family>-<effort>`: the TUI keeps the family and the
+            // effort suffix apart (`claude-opus-5` + `high`) and only sends
+            // an effort the family ships; an effort without a family has
+            // nothing to hang off and is dropped.
+            if let Some(m) = model {
+                let id = match effort {
+                    Some(e) => format!("{m}-{e}"),
+                    None => m.to_string(),
+                };
+                args.extend(["--model".to_string(), id]);
+            }
             // `cursor-agent [options] [prompt...]` — the trailing positional.
             if let Some(p) = initial_prompt {
                 args.push(p.to_string());
@@ -3147,9 +3161,43 @@ mod tests {
                 true
             )
         );
-        // Cursor has no model/effort knobs — choices are ignored.
+        // Cursor joins family and effort into the CLI's one flat id; a
+        // family alone is passed bare, an effort alone has nothing to
+        // join and is dropped.
         assert_eq!(
-            agent_spawn_command(AgentKind::Cursor, None, Some("m"), Some("e"), None),
+            agent_spawn_command(
+                AgentKind::Cursor,
+                None,
+                Some("claude-opus-5-thinking"),
+                Some("high"),
+                None
+            ),
+            (
+                "cursor-agent".into(),
+                vec![
+                    "--force".to_string(),
+                    "--model".to_string(),
+                    "claude-opus-5-thinking-high".to_string()
+                ],
+                false
+            )
+        );
+        assert_eq!(
+            agent_spawn_command(AgentKind::Cursor, Some("sid"), Some("auto"), None, None),
+            (
+                "cursor-agent".into(),
+                vec![
+                    "--resume".to_string(),
+                    "sid".to_string(),
+                    "--force".to_string(),
+                    "--model".to_string(),
+                    "auto".to_string()
+                ],
+                true
+            )
+        );
+        assert_eq!(
+            agent_spawn_command(AgentKind::Cursor, None, None, Some("high"), None),
             ("cursor-agent".into(), vec!["--force".to_string()], false)
         );
         // Override still wins over everything.

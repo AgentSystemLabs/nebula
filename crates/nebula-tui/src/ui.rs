@@ -221,8 +221,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
     };
     match overlay {
         Overlay::Menu(menu) => {
-            let title_width = menu
-                .title
+            // A type-ahead submenu shows its query in the title: `Cursor
+            // model ⌕ opus`, the bare ⌕ while nothing is typed yet.
+            let title_text = menu.title.as_deref().map(|t| match &menu.filter {
+                Some(f) if !f.query.is_empty() => format!("{t} ⌕ {}", f.query),
+                Some(_) => format!("{t} ⌕"),
+                None => t.to_string(),
+            });
+            let title_width = title_text
                 .as_deref()
                 .map(|t| t.chars().count() + 2)
                 .unwrap_or(0);
@@ -239,6 +245,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // border; the modal widens to fit.
             let hint = if menu.is_workspace_picker() {
                 Some(" n: new  r: rename  d: delete ")
+            } else if menu.filter.is_some() {
+                Some(" type to filter  ↑↓: move  Backspace  Esc: back ")
             } else {
                 menu.hovered_claude_cloud().map(|cloud| {
                     if cloud {
@@ -275,7 +283,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th.accent));
-            if let Some(title) = &menu.title {
+            if let Some(title) = &title_text {
                 block = block.title(Span::styled(
                     format!(" {title} "),
                     Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
@@ -2073,15 +2081,38 @@ fn fit_ago(ago: String, free: usize) -> (String, usize) {
 /// green once the cursor has been on it, which is a result filed away, not
 /// a job. Every other status ignores the flag.
 fn status_dot(status: Option<AgentStatus>, unseen: bool, th: Theme) -> Span<'static> {
-    let finished = if unseen { th.done } else { th.ok };
+    let glyph = match status {
+        Some(AgentStatus::Disconnected) | None => "○ ",
+        Some(_) => "● ",
+    };
+    Span::styled(glyph, Style::default().fg(status_color(status, unseen, th)))
+}
+
+/// The STATUS DOT's color on its own, for the marks that answer to it:
+/// the selection rail of a PILL ROW, the `▌` of a PROJECT button and the
+/// TAB UNDERLINE all take the row's dot color, so the cursor carries the
+/// row's status rather than the theme accent.
+fn status_color(status: Option<AgentStatus>, unseen: bool, th: Theme) -> Color {
     match status {
-        Some(AgentStatus::Fresh) => Span::styled("● ", Style::default().fg(th.dim)),
-        Some(AgentStatus::Running) => Span::styled("● ", Style::default().fg(th.warn)),
-        Some(AgentStatus::Finished) => Span::styled("● ", Style::default().fg(finished)),
-        Some(AgentStatus::NeedsFeedback) => Span::styled("● ", Style::default().fg(th.err)),
-        Some(AgentStatus::Terminated) => Span::styled("● ", Style::default().fg(th.special)),
-        Some(AgentStatus::Disconnected) => Span::styled("○ ", Style::default().fg(th.dim)),
-        None => Span::styled("○ ", Style::default().fg(th.dim)),
+        Some(AgentStatus::Fresh) => th.dim,
+        Some(AgentStatus::Running) => th.warn,
+        Some(AgentStatus::Finished) if unseen => th.done,
+        Some(AgentStatus::Finished) => th.ok,
+        Some(AgentStatus::NeedsFeedback) => th.err,
+        Some(AgentStatus::Terminated) => th.special,
+        Some(AgentStatus::Disconnected) | None => th.dim,
+    }
+}
+
+/// The selection mark's color on a focused selection: the row's `mark`
+/// (its STATUS DOT color, or the accent for a row that has no dot),
+/// lifted from dim to muted the way a dim dot is lifted on the fill — a
+/// FRESH row's mark is gray, but not the gray of an unfocused panel.
+fn selection_mark(mark: Color, th: Theme) -> Color {
+    if mark == th.dim {
+        th.muted
+    } else {
+        mark
     }
 }
 
@@ -2102,6 +2133,8 @@ fn row_bar(selected: bool, focused: bool, th: Theme) -> Style {
 /// selection in the focused panel; every other row gets a plain 1-cell
 /// gutter so text stays aligned. Dim spans (idle dots, archived names)
 /// would sink into the selection fill, so they get lifted to muted there.
+/// These rows (overlay lists) carry no STATUS DOT, so the mark is the
+/// accent.
 pub(crate) fn render_row(
     f: &mut Frame,
     area: Rect,
@@ -2110,16 +2143,18 @@ pub(crate) fn render_row(
     focused: bool,
     th: Theme,
 ) {
-    render_button(f, area, vec![spans], selected, focused, th, 0);
+    render_button(f, area, vec![spans], selected, focused, th, 0, th.accent);
 }
 
 /// Render one list entry as a button `area.height` rows tall: the
 /// selection fill covers the whole rect, the `▌` marker runs down its
-/// left edge, and `text` takes consecutive rows starting at `text_row`
-/// (0-based, inside the rect). A second entry is a terminal's answer to a
-/// smaller line under the first, so the caller must size `area` for it.
-/// Dim spans (idle dots, archived names, subtitles) would sink into the
-/// selection fill, so they get lifted to muted there.
+/// left edge in `mark` (the row's STATUS DOT color — see
+/// `selection_mark`), and `text` takes consecutive rows starting at
+/// `text_row` (0-based, inside the rect). A second entry is a terminal's
+/// answer to a smaller line under the first, so the caller must size
+/// `area` for it. Dim spans (idle dots, archived names, subtitles) would
+/// sink into the selection fill, so they get lifted to muted there.
+#[allow(clippy::too_many_arguments)]
 fn render_button<'a>(
     f: &mut Frame,
     area: Rect,
@@ -2128,6 +2163,7 @@ fn render_button<'a>(
     focused: bool,
     th: Theme,
     text_row: u16,
+    mark: Color,
 ) {
     if selected {
         for s in text.iter_mut().flatten() {
@@ -2138,7 +2174,7 @@ fn render_button<'a>(
     }
     let marker = || {
         if selected && focused {
-            Span::styled("▌", Style::default().fg(th.accent))
+            Span::styled("▌", Style::default().fg(selection_mark(mark, th)))
         } else if selected {
             Span::styled("▌", Style::default().fg(th.dim))
         } else {
@@ -2235,8 +2271,11 @@ const PILL_RAIL: &str = "█";
 /// width so the fill has no dark notch beside the status dot, and the
 /// `PILL_RAIL` column carries the pad's own half-block in the rail color
 /// so the rail spans the pill's full visual height without stranding a
-/// bare-background quarter at either left corner. Dim spans get lifted
-/// to muted on the fill, same as `render_button`.
+/// bare-background quarter at either left corner. On a focused selection
+/// the rail is `mark` — the row's STATUS DOT color, or the accent for a
+/// row without one (see `selection_mark`). Dim spans get lifted to muted
+/// on the fill, same as `render_button`.
+#[allow(clippy::too_many_arguments)]
 fn render_pill(
     f: &mut Frame,
     inner: Rect,
@@ -2245,10 +2284,12 @@ fn render_pill(
     selected: bool,
     focused: bool,
     th: Theme,
+    mark: Color,
 ) {
     let Some(text_area) = row_rect_at(inner, top + 1) else {
         return;
     };
+    let mark = selection_mark(mark, th);
     if selected {
         for s in &mut spans {
             if s.style.fg == Some(th.dim) {
@@ -2256,7 +2297,7 @@ fn render_pill(
             }
         }
         let fill = if focused { th.sel_bg } else { th.sel_bg_dim };
-        let rail = if focused { th.accent } else { th.dim };
+        let rail = if focused { mark } else { th.dim };
         let mut pad = |glyph: char, row: isize| {
             if let Some(r) = row_rect_at(inner, row) {
                 f.render_widget(
@@ -2279,7 +2320,7 @@ fn render_pill(
         pad(PILL_HALF.1, top + 2);
     }
     let marker = if selected && focused {
-        Span::styled(PILL_RAIL, Style::default().fg(th.accent))
+        Span::styled(PILL_RAIL, Style::default().fg(mark))
     } else if selected {
         Span::styled(PILL_RAIL, Style::default().fg(th.dim))
     } else {
@@ -2397,7 +2438,10 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     let (phase, anim) = (app.sweep_phase(), app.animations);
-    let tabs: Vec<(Vec<Span<'static>>, u16)> = rows
+    // Each tab: its spans, their width, and the rollup dot's color — the
+    // TAB UNDERLINE takes it, so the open tab's underline says what the
+    // dot says.
+    let tabs: Vec<(Vec<Span<'static>>, u16, Color)> = rows
         .iter()
         .enumerate()
         .map(|(i, (name, roll, done))| {
@@ -2437,7 +2481,7 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
                 .iter()
                 .map(|s| s.content.chars().count())
                 .sum::<usize>() as u16;
-            (spans, w)
+            (spans, w, status_color(*roll, *done > 0, th))
         })
         .collect();
 
@@ -2448,7 +2492,7 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let right = (area.x + area.width).saturating_sub(1);
     let budget = right.saturating_sub(tabs_x);
     let active_i = active.unwrap_or(0);
-    let stride = |t: &(Vec<Span<'static>>, u16)| t.1 + TAB_SEP;
+    let stride = |t: &(Vec<Span<'static>>, u16, Color)| t.1 + TAB_SEP;
     let mut start = 0usize;
     while start < active_i && tabs[start..=active_i].iter().map(stride).sum::<u16>() > budget {
         start += 1;
@@ -2456,7 +2500,7 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     let mut x = tabs_x;
     let mut drawn = start;
-    for (i, (spans, w)) in tabs.iter().enumerate().skip(start) {
+    for (i, (spans, w, mark)) in tabs.iter().enumerate().skip(start) {
         if x + w > right {
             break;
         }
@@ -2494,11 +2538,15 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
             // as a join rather than a hole. It is a half block, not a
             // heavy rule: a line glyph draws at the cell's midline, which
             // leaves a strip of unpainted background between the tab's
-            // fill and the accent and reads as a gap. `▀` paints from the
-            // cell's top edge, flush against the block above it.
+            // fill and the underline and reads as a gap. `▀` paints from
+            // the cell's top edge, flush against the block above it. Its
+            // color is the tab's rollup STATUS DOT — yellow while anything
+            // under the workspace runs, violet while a finish is UNSEEN —
+            // not the theme accent.
+            let underline = selection_mark(*mark, th);
             for cx in x..x + w {
                 if let Some(cell) = f.buffer_mut().cell_mut((cx, rule_y)) {
-                    cell.set_symbol("▀").set_fg(th.accent);
+                    cell.set_symbol("▀").set_fg(underline);
                 }
             }
         }
@@ -2667,6 +2715,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
             focused,
             th,
             PROJECT_BTN_H / 2,
+            status_color(*roll, *unseen > 0, th),
         );
         app.hits.push((row_area, HitTarget::Project(row_idx)));
         screen_row += height as usize;
@@ -2873,7 +2922,16 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 for (text, style) in badges {
                     spans.push(Span::styled(text, style));
                 }
-                render_pill(f, inner, y, spans, *i == app.sel_worktree, focused, th);
+                render_pill(
+                    f,
+                    inner,
+                    y,
+                    spans,
+                    *i == app.sel_worktree,
+                    focused,
+                    th,
+                    status_color(*roll, *unseen > 0, th),
+                );
                 if let Some(hit) = rows_rect_at(inner, y, hit_h) {
                     app.hits.push((hit, HitTarget::Worktree(*i)));
                 }
@@ -2899,7 +2957,17 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 if let Some(badge) = badge {
                     spans.push(Span::styled(badge, Style::default().fg(th.dim)));
                 }
-                render_pill(f, inner, y, spans, *i == app.sel_worktree, focused, th);
+                // No STATUS DOT on a pull request, so the rail is the accent.
+                render_pill(
+                    f,
+                    inner,
+                    y,
+                    spans,
+                    *i == app.sel_worktree,
+                    focused,
+                    th,
+                    th.accent,
+                );
                 if let Some(hit) = rows_rect_at(inner, y, hit_h) {
                     app.hits.push((hit, HitTarget::Worktree(*i)));
                 }
@@ -3008,9 +3076,9 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     }
     if archived_count > 0 {
         let text = if app.show_archived {
-            format!(" ARCHIVED · {archived_count} (A hides)")
+            format!(" ARCHIVED · {archived_count}")
         } else {
-            format!(" … {archived_count} archived (A shows)")
+            format!(" … {archived_count} archived")
         };
         header(&mut layout, &mut vrow, SessionEntry::ArchivedHeader(text));
         if app.show_archived {
@@ -3101,7 +3169,9 @@ fn draw_session_row(
 ) {
     let th = app.theme;
     let width = inner.width;
-    let spans = match row {
+    // Each arm yields its spans and the rail color: the STATUS DOT's on an
+    // agent row, the accent on the rows that have no dot.
+    let (spans, mark) = match row {
         SessionRow::Agent(a) => {
             let dot = if a.archived {
                 Span::styled("⊘ ", Style::default().fg(th.dim))
@@ -3164,19 +3234,25 @@ fn draw_session_row(
                 spans.push(Span::styled(ago, Style::default().fg(th.dim)));
             }
             spans.push(Span::styled(badge, badge_style));
-            spans
+            let mark = if a.archived {
+                th.dim
+            } else {
+                status_color(Some(a.status), a.unseen, th)
+            };
+            (spans, mark)
         }
         SessionRow::Terminal(t) => {
             // Shell prompt glyph instead of a status dot; dim once the
             // shell has exited (re-attach respawns it).
             let glyph_color = if t.alive { th.ok } else { th.dim };
-            vec![
+            let spans = vec![
                 Span::styled("❯ ", Style::default().fg(glyph_color)),
                 Span::styled(
                     truncate(&t.name, width.saturating_sub(3) as usize),
                     Style::default().fg(th.muted),
                 ),
-            ]
+            ];
+            (spans, th.accent)
         }
         SessionRow::Link(l) => {
             // Same shape as an agent row — glyph, name, trailing badge — so
@@ -3212,10 +3288,19 @@ fn draw_session_row(
             if let Some((badge, color)) = badge {
                 spans.push(Span::styled(badge, Style::default().fg(color)));
             }
-            spans
+            (spans, th.accent)
         }
     };
-    render_pill(f, inner, top, spans, index == app.sel_session, focused, th);
+    render_pill(
+        f,
+        inner,
+        top,
+        spans,
+        index == app.sel_session,
+        focused,
+        th,
+        mark,
+    );
     if let Some(hit) = rows_rect_at(inner, top, hit_h) {
         app.hits.push((hit, HitTarget::Session(index)));
     }
@@ -4518,7 +4603,16 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(8, 3)).unwrap();
         terminal
             .draw(|f| {
-                render_pill(f, inner, 0, vec![Span::raw("● ok")], true, true, th);
+                render_pill(
+                    f,
+                    inner,
+                    0,
+                    vec![Span::raw("● ok")],
+                    true,
+                    true,
+                    th,
+                    th.warn,
+                );
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -4530,7 +4624,7 @@ mod tests {
             let glyph = glyph.to_string();
             let c = cell(0, y);
             assert_eq!(c.symbol(), glyph, "pad row {y} rail glyph");
-            assert_eq!(c.fg, th.accent, "pad row {y} rail color");
+            assert_eq!(c.fg, th.warn, "pad row {y} rail color");
             // The rail cell covers exactly what the fill cells beside it
             // do; a narrower glyph there is the notch coming back.
             for x in 1..8 {
@@ -4542,11 +4636,88 @@ mod tests {
                 assert_eq!(cell(x, y).fg, th.sel_bg, "pad row {y} fill color at x={x}");
             }
         }
-        // Text row: a solid block, sitting on the fill.
+        // Text row: a solid block, sitting on the fill, in the mark the
+        // caller passed (a RUNNING row's yellow here), not the accent.
         let c = cell(0, 1);
         assert_eq!(c.symbol(), PILL_RAIL);
-        assert_eq!(c.fg, th.accent);
+        assert_eq!(c.fg, th.warn);
         assert_eq!(c.bg, th.sel_bg);
+    }
+
+    /// The selection rail of the focused SESSION row is its STATUS DOT's
+    /// color, not the accent: yellow while it runs, violet while its
+    /// finish is UNSEEN, green once read, and a FRESH row's gray lifted
+    /// to muted so it still reads as the cursor on the fill.
+    #[test]
+    fn session_rail_takes_the_status_dot_color() {
+        use nebula_core::AgentStatus;
+        let mut app = hit_test_app(&["main"], &["agent"], &[]);
+        app.focus = Focus::Sessions;
+        let th = app.theme;
+        let area = Rect::new(0, 0, 30, 12);
+        let rail = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 12)).unwrap();
+            terminal.draw(|f| draw_sessions(f, app, area)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            // The agent's pill sits at rows 3..=5: pad, text, pad.
+            let text = buf.cell((0, 4)).unwrap().clone();
+            assert_eq!(text.symbol(), PILL_RAIL);
+            let pads = [buf.cell((0, 3)).unwrap().fg, buf.cell((0, 5)).unwrap().fg];
+            assert_eq!(pads, [text.fg, text.fg], "the pad caps match the rail");
+            text.fg
+        };
+        for (status, unseen, want) in [
+            (AgentStatus::Fresh, false, th.muted),
+            (AgentStatus::Running, false, th.warn),
+            (AgentStatus::Finished, true, th.done),
+            (AgentStatus::Finished, false, th.ok),
+            (AgentStatus::NeedsFeedback, false, th.err),
+        ] {
+            app.tree.agents[0].status = status;
+            app.tree.agents[0].unseen = unseen;
+            assert_eq!(rail(&mut app), want, "{status:?} unseen={unseen}");
+        }
+        // Unfocused, the rail is the quiet gray whatever the status.
+        app.focus = Focus::Worktrees;
+        assert_eq!(rail(&mut app), th.dim, "unfocused panel");
+    }
+
+    /// The TAB UNDERLINE under the open WORKSPACE TAB is the tab's rollup
+    /// STATUS DOT color — the same color the dot in the tab shows.
+    #[test]
+    fn tab_underline_takes_the_rollup_dot_color() {
+        use nebula_core::{AgentStatus, Workspace, WorkspaceId};
+        let mut app = hit_test_app(&["main"], &["agent"], &[]);
+        app.tree.workspaces.push(Workspace {
+            id: WorkspaceId::default(),
+            name: "default".into(),
+        });
+        let th = app.theme;
+        let area = Rect::new(0, 0, 60, crate::app::WORKSPACES_BAR_H);
+        let underline = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 4)).unwrap();
+            terminal
+                .draw(|f| draw_workspaces_bar(f, app, area))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let rule = area.height - 1;
+            let x = (0..60)
+                .find(|&x| buf.cell((x, rule)).unwrap().symbol() == "▀")
+                .expect("an underline under the open tab");
+            buf.cell((x, rule)).unwrap().fg
+        };
+        for (status, unseen, want) in [
+            (AgentStatus::Fresh, false, th.muted),
+            (AgentStatus::Running, false, th.warn),
+            (AgentStatus::Finished, true, th.done),
+            (AgentStatus::NeedsFeedback, false, th.err),
+        ] {
+            app.tree.agents[0].status = status;
+            app.tree.agents[0].unseen = unseen;
+            assert_eq!(underline(&mut app), want, "{status:?} unseen={unseen}");
+        }
     }
 
     /// Each grip sits on its rule column (one left of the boundary), three

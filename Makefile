@@ -10,7 +10,8 @@
 # every worktree can run at once without sharing a daemon, a DB, or a port.
 # `make dev-ls` shows them all.
 #   make install  put it in ~/.cargo/bin for real use (then `make kill` to cut over)
-#   make cycle    install + kill + dev in one go — the re-runnable full cutover
+#   make cycle    install + kill + prune + dev in one go — the re-runnable full cutover
+#   make prune    drop stale build artifacts (every hash of a crate but the newest KEEP)
 
 PREFIX      ?= $(HOME)/.cargo/bin
 RELEASE_BIN := target/release/nebula
@@ -32,6 +33,9 @@ DEV_RUNTIME := /tmp/nebula-dev-$(DEV_SLOT)
 DEV_DATA    := $(HOME)/.nebula-dev/$(notdir $(CURDIR))-$(DEV_SLOT)
 # `make dev SEED=0` skips the first-run copy and starts the dev instance empty.
 SEED ?= 1
+# `make prune KEEP=1` keeps only the newest build of every crate (default 3: the
+# `cargo build`, `cargo test` and `cargo check` variants all stay warm).
+KEEP ?= 3
 # `make dev AGENT=/bin/cat` stubs agents out, so nothing spawns a real claude —
 # including the warm-slot prewarm, which launches one before you create any
 # agent at all. Unset (the default) means real agents, exactly like production.
@@ -48,7 +52,7 @@ DEV_ENV = NEBULA_RUNTIME_DIR=$(DEV_RUNTIME) NEBULA_DATA_DIR=$(DEV_DATA) \
 	$(if $(AGENT),NEBULA_AGENT_CMD=$(AGENT))
 
 .DEFAULT_GOAL := help
-.PHONY: help dev browser dev-prep dev-seed dev-reset dev-ls dev-stop build install kill cycle check fmt lint test memory-check ci clean
+.PHONY: help dev browser dev-prep dev-seed dev-reset dev-ls dev-stop build install kill prune cycle check fmt lint test memory-check ci clean
 
 help: ## Show this help
 	@grep -hE '^[a-z][a-z-]*:.*?## ' $(MAKEFILE_LIST) \
@@ -161,19 +165,36 @@ install: build ## Install to $(PREFIX) — warns if the live daemon is now stale
 kill: ## Stop every session and the daemon — the cutover step after `make install`
 	$(PREFIX)/nebula kill
 
+# Every distinct build configuration gets its own hash under target/: a
+# version bump at release re-hashes every workspace crate, and `cargo build`,
+# `cargo test`, `cargo check` and `cargo clippy` each hash separately again.
+# On macOS every hash also keeps its object files beside the binary
+# (`split-debuginfo=unpacked`, the dev default) — ~200MB per build of
+# nebula_tui alone — and nothing ever removes the old ones: ten days of
+# sessions grew target/ to 41GB and filled the disk (2026-08-29). This keeps
+# the newest KEEP builds of every crate and drops the rest, under cargo's own
+# build lock so it waits for a running build instead of deleting under it.
+# An evicted build that was still in use costs one recompile of that crate,
+# nothing worse; `make clean` is still the full reset.
+prune: ## Drop stale build artifacts — all but the newest KEEP (3) builds of every crate
+	python3 scripts/prune-target.py --keep $(KEEP)
+
 # The whole cutover as one command, safe to re-run as often as you like:
 # install first, so a build that fails stops here with every session still
 # alive; then kill the real daemon (it is now running the old binary — the
-# STALE DAEMON NOTE `install` just printed says as much); then `dev`, which
-# builds the debug binary and hands the terminal to the isolated dev instance.
-# `nebula kill` exits 0 and says "no nebula daemon running" when there is
-# nothing to stop, so the first run on a cold machine goes through too. The
-# kill stops every real session — run this from a terminal outside nebula,
-# not from a session it would take down with it. Recipe lines rather than
-# prerequisites so `make -j` cannot reorder the three.
-cycle: ## Install, kill the real daemon, run the dev instance — re-run whenever
+# STALE DAEMON NOTE `install` just printed says as much); then `prune`, now
+# that the release build just made is the newest and the killed sessions
+# hold no build lock; then `dev`, which builds the debug binary and hands the
+# terminal to the isolated dev instance. `nebula kill` exits 0 and says "no
+# nebula daemon running" when there is nothing to stop, so the first run on a
+# cold machine goes through too. The kill stops every real session — run
+# this from a terminal outside nebula, not from a session it would take down
+# with it. Recipe lines rather than prerequisites so `make -j` cannot
+# reorder the four.
+cycle: ## Install, kill the real daemon, prune stale builds, run the dev instance — re-run whenever
 	@$(MAKE) --no-print-directory install
 	@$(MAKE) --no-print-directory kill
+	@$(MAKE) --no-print-directory prune
 	@$(MAKE) --no-print-directory dev
 
 # --- checks ------------------------------------------------------------------

@@ -205,7 +205,9 @@ pub enum SubmenuKind {
 impl MenuAction {
     /// The submenu this action's row expands into, if any. Drives both the
     /// `▸` indicator and the → key. New-session rows drill kind → model →
-    /// effort; a row that already carries an effort is a leaf.
+    /// effort; a row that already carries an effort is a leaf, and so is
+    /// a model row whose effort list is empty (a Cursor family with no
+    /// effort variants, like `auto`).
     pub fn submenu(&self) -> Option<SubmenuKind> {
         match self {
             MenuAction::NewAgentOfKind {
@@ -219,7 +221,11 @@ impl MenuAction {
                 }
                 match (model, effort) {
                     (None, None) => Some(SubmenuKind::Models),
-                    (Some(_), None) => Some(SubmenuKind::Efforts),
+                    (Some(m), None)
+                        if !crate::config::effort_choices(*kind, Some(m)).is_empty() =>
+                    {
+                        Some(SubmenuKind::Efforts)
+                    }
                     _ => None,
                 }
             }
@@ -268,9 +274,71 @@ pub struct ContextMenu {
     pub area: Rect,
     /// The menu ← returns to when this one is a submenu.
     pub parent: Option<Box<ContextMenu>>,
+    /// Type-ahead over the rows — set on the MODEL / EFFORT submenus, where
+    /// letters filter instead of moving (↑/↓ move there); None elsewhere.
+    pub filter: Option<MenuFilter>,
+}
+
+/// A picker submenu's type-ahead: the query typed so far and the full row
+/// set it narrows (`items` holds the visible subset, best match first).
+#[derive(Debug, Clone)]
+pub struct MenuFilter {
+    pub query: String,
+    pub all: Vec<MenuItem>,
 }
 
 impl ContextMenu {
+    /// Narrow the rows to `query` (fuzzy, best match first; the full list
+    /// in its own order when empty, hovering the ✓ row). Returns false —
+    /// and changes nothing — when no row matches, so the list never
+    /// empties; a no-op on a menu without a filter.
+    pub fn set_filter(&mut self, query: &str) -> bool {
+        let Some(filter) = &self.filter else {
+            return false;
+        };
+        let labels: Vec<&str> = filter.all.iter().map(|i| i.label.as_str()).collect();
+        let ranked = crate::fuzzy::rank(query, labels.iter().copied());
+        if ranked.is_empty() {
+            return false;
+        }
+        let items: Vec<MenuItem> = ranked.iter().map(|(i, _)| filter.all[*i].clone()).collect();
+        self.hover = if query.trim().is_empty() {
+            items
+                .iter()
+                .position(|i| i.label.ends_with(" ✓"))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        self.items = items;
+        if let Some(filter) = &mut self.filter {
+            filter.query = query.to_string();
+        }
+        true
+    }
+
+    /// Append one typed character to the filter; false when it would leave
+    /// no rows (nothing changes).
+    pub fn type_filter(&mut self, c: char) -> bool {
+        let query = format!("{}{c}", self.filter_query());
+        self.set_filter(&query)
+    }
+
+    /// Backspace: drop the last character (widens, so it always succeeds).
+    pub fn pop_filter(&mut self) {
+        let mut query = self.filter_query().to_string();
+        query.pop();
+        self.set_filter(&query);
+    }
+
+    pub fn filter_query(&self) -> &str {
+        self.filter.as_ref().map_or("", |f| f.query.as_str())
+    }
+
+    pub fn has_filter_text(&self) -> bool {
+        !self.filter_query().is_empty()
+    }
+
     /// Is this the `w` workspace switcher? Its rows are all OpenWorkspace,
     /// which gates the switcher-only keys (n/r/d) and its footer hint.
     pub fn is_workspace_picker(&self) -> bool {
@@ -774,273 +842,9 @@ impl DiffView {
     }
 }
 
-/// What a `/` palette row jumps to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PaletteTarget {
-    /// A whole workspace: picking it switches this instance to it, the
-    /// same as the `w` switcher's Enter.
-    Workspace(WorkspaceId),
-    Project(ProjectId),
-    Worktree(WorktreeId),
-    Session(AgentId),
-    /// An open pull request on some project's repo, addressed by URL — the
-    /// only identity it has, since nothing about a PR is stored. Picking it
-    /// opens a browser instead of moving any panel cursor.
-    PullRequest(String),
-}
-
-/// One searchable row of the `/` palette. `text` is both the string the
-/// fuzzy filter runs over and the string rendered after the kind badge, so
-/// match highlighting always lines up. Every row carries its full path
-/// from the workspace down — `workspace` for workspaces,
-/// `workspace/project` for projects, `workspace/project/branch` for
-/// worktrees, `workspace/project/branch/name` for sessions — so a query
-/// can narrow by any ancestor, a workspace name included.
-#[derive(Debug, Clone)]
-pub struct PaletteItem {
-    pub target: PaletteTarget,
-    pub text: String,
-    pub archived: bool,
-    /// The status this row's panel row would show: a rollup for projects
-    /// and worktrees, its own status for a session. Drives the glyph color
-    /// and the text sweep, so a running session reads as running in the
-    /// palette too. Refreshed by [`Palette::rebuild`] as upserts land.
-    pub status: Option<AgentStatus>,
-    /// Whether anything under this row finished a turn nobody has read.
-    /// Splits a finished dot green (read) from violet (waiting on you),
-    /// exactly as the panel rows do.
-    pub unseen: bool,
-}
-
-/// One visible palette row: an index into `items` plus the char positions of
-/// `text` the query matched, for highlighting.
-#[derive(Debug, Clone)]
-pub struct PaletteMatch {
-    pub item: usize,
-    pub positions: Vec<usize>,
-}
-
-/// Fuzzy-search palette over every workspace, project, worktree, and
-/// session (`/`), across all workspaces — not just the open one.
-#[derive(Debug, Clone)]
-pub struct Palette {
-    pub items: Vec<PaletteItem>,
-    /// Type-to-filter query over `items` texts; always live.
-    pub query: TextInput,
-    /// Visible rows: `items` narrowed by `query`, best matches first (build
-    /// order when the query is empty).
-    pub matches: Vec<PaletteMatch>,
-    /// Index into `matches` (not `items`).
-    pub selected: usize,
-    /// Whether Enter (and a click) on a session row attaches to it, or only
-    /// lands on its Sessions-panel row. Snapshot of the config setting at
-    /// open time; Ctrl+O / Ctrl+F pick explicitly either way.
-    pub enter_attaches: bool,
-    /// Whole modal rect, written back during draw so clicks outside close.
-    pub area: Rect,
-    /// Screen rect of the result rows (query row excluded), written back
-    /// during draw so clicks can hit-test rows.
-    pub list_area: Rect,
-}
-
-impl Palette {
-    pub fn new(
-        tree: &Tree,
-        show_archived: bool,
-        enter_attaches: bool,
-        open_prs: &HashMap<ProjectId, OpenPrs>,
-    ) -> Self {
-        let mut palette = Self {
-            items: build_palette_items(tree, show_archived, open_prs),
-            query: TextInput::new(),
-            matches: Vec::new(),
-            selected: 0,
-            enter_attaches,
-            area: Rect::default(),
-            list_area: Rect::default(),
-        };
-        palette.apply_filter();
-        palette
-    }
-
-    /// Re-derive `items` after the tree changed under an open palette,
-    /// keeping the query — and the cursor: agent status flips arrive as
-    /// upserts every few seconds, and a rebuild must not yank the user's
-    /// ↑/↓ position to the top. The selection follows its target's row;
-    /// only a vanished target falls back to the best match.
-    pub fn rebuild(
-        &mut self,
-        tree: &Tree,
-        show_archived: bool,
-        open_prs: &HashMap<ProjectId, OpenPrs>,
-    ) {
-        let keep = self.selected_target().cloned();
-        self.items = build_palette_items(tree, show_archived, open_prs);
-        self.apply_filter();
-        if let Some(target) = keep {
-            if let Some(row) = self
-                .matches
-                .iter()
-                .position(|m| self.items[m.item].target == target)
-            {
-                self.selected = row;
-            }
-        }
-    }
-
-    /// First visible row of the result list's stateless follow-window for a
-    /// list of `height` rows.
-    pub fn window_start(&self, height: usize) -> usize {
-        window_start(self.selected, height)
-    }
-
-    /// Clamped absolute selection in the filtered list.
-    pub fn select(&mut self, index: i64) {
-        self.selected = clamp_selection(index, self.matches.len());
-    }
-
-    /// The jump target behind the current selection, if any row is visible.
-    pub fn selected_target(&self) -> Option<&PaletteTarget> {
-        Some(
-            &self
-                .items
-                .get(self.matches.get(self.selected)?.item)?
-                .target,
-        )
-    }
-
-    /// Recompute `matches` from `query` and reset the selection to the top
-    /// row. Best matches first, build order when the query is empty.
-    pub fn apply_filter(&mut self) {
-        self.matches = crate::fuzzy::rank(&self.query, self.items.iter().map(|i| i.text.as_str()))
-            .into_iter()
-            .map(|(item, positions)| PaletteMatch { item, positions })
-            .collect();
-        self.selected = 0;
-    }
-}
-
-/// Every jumpable entity, across every workspace: the workspaces
-/// themselves, then each one's projects in tree order, then their
-/// worktrees, then their sessions, then the open pull requests nebula has
-/// fetched. Archived sessions appear only when the archived toggle is on
-/// (the Sessions panel rule).
-///
-/// The open workspace comes first, so with an empty query `/` still opens
-/// on what's on screen; the rest follow in tree order. Every row's text is
-/// prefixed with its workspace, which is both what keeps the paths
-/// unambiguous once two workspaces can hold the same project name and what
-/// lets a query cross over (`/` then the other workspace's name).
-fn build_palette_items(
-    tree: &Tree,
-    show_archived: bool,
-    open_prs: &HashMap<ProjectId, OpenPrs>,
-) -> Vec<PaletteItem> {
-    let mut items = Vec::new();
-    for id in palette_workspace_order(tree) {
-        // A project can outlive knowledge of its workspace — its upsert can
-        // land before the workspace's, and a workspace can go while a stale
-        // project row is still in the tree. Such a project still belongs in
-        // `/` (vanishing from the find-anything tool is the worst failure
-        // it has); it just has no name to path it under, and no row of its
-        // own to jump to.
-        let workspace = tree.workspaces.iter().find(|w| w.id == id);
-        if let Some(ws) = workspace {
-            items.push(PaletteItem {
-                target: PaletteTarget::Workspace(ws.id.clone()),
-                text: ws.name.clone(),
-                archived: false,
-                status: workspace_rollup(tree, &ws.id),
-                unseen: workspace_unseen(tree, &ws.id) > 0,
-            });
-        }
-        let at = match workspace {
-            Some(ws) => format!("{}/", ws.name),
-            None => String::new(),
-        };
-        let projects: Vec<&Project> = tree
-            .projects
-            .iter()
-            .filter(|p| p.workspace_id == id)
-            .collect();
-        // Within a workspace the kinds stay grouped project → worktree →
-        // session, so a bare query still ranks the shallowest match first.
-        for p in &projects {
-            items.push(PaletteItem {
-                target: PaletteTarget::Project(p.id.clone()),
-                text: format!("{at}{}", p.name),
-                archived: false,
-                status: project_rollup(tree, &p.id),
-                unseen: project_unseen(tree, &p.id) > 0,
-            });
-        }
-        for p in &projects {
-            for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
-                items.push(PaletteItem {
-                    target: PaletteTarget::Worktree(w.id.clone()),
-                    text: format!("{at}{}/{}", p.name, w.branch),
-                    archived: false,
-                    status: worktree_rollup(tree, &w.id),
-                    unseen: worktree_unseen(tree, &w.id) > 0,
-                });
-            }
-        }
-        for p in &projects {
-            for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
-                for a in tree.agents.iter().filter(|a| a.worktree_id == w.id) {
-                    if a.archived && !show_archived {
-                        continue;
-                    }
-                    items.push(PaletteItem {
-                        target: PaletteTarget::Session(a.id.clone()),
-                        text: format!("{at}{}/{}/{}", p.name, w.branch, a.name),
-                        archived: a.archived,
-                        status: Some(a.status),
-                        unseen: a.unseen && !a.archived,
-                    });
-                }
-            }
-        }
-        // Pull requests go last so a query that also matches a session
-        // still lands on the session first — the panels are what `/` is
-        // mostly for. Only projects whose list has actually been fetched
-        // contribute; the rest simply have nothing to offer yet.
-        for p in &projects {
-            let Some(open) = open_prs.get(&p.id) else {
-                continue;
-            };
-            for pr in &open.list {
-                items.push(PaletteItem {
-                    target: PaletteTarget::PullRequest(pr.url.clone()),
-                    text: format!("{at}{}/{}", p.name, pr.label()),
-                    archived: false,
-                    status: None,
-                    unseen: false,
-                });
-            }
-        }
-    }
-    items
-}
-
-/// The workspaces `/` walks, in row order: the open one first (so an empty
-/// query opens on what's already on screen), then the rest in tree order,
-/// then any workspace only a project still refers to — see the orphan note
-/// in [`build_palette_items`].
-fn palette_workspace_order(tree: &Tree) -> Vec<WorkspaceId> {
-    let mut order = vec![tree.active_workspace.clone()];
-    let ids = tree
-        .workspaces
-        .iter()
-        .map(|w| w.id.clone())
-        .chain(tree.projects.iter().map(|p| p.workspace_id.clone()));
-    for id in ids {
-        if !order.contains(&id) {
-            order.push(id);
-        }
-    }
-    order
-}
+// The `/` PALETTE lives in `palette.rs`; re-exported so the callers and
+// tests that always reached it through `app::` keep working.
+pub use crate::palette::{Palette, PaletteItem, PaletteMatch, PaletteTarget};
 
 /// One visible row of the file finder: an index into `files` plus the char
 /// positions of the path the query matched, for highlighting.
@@ -1717,6 +1521,19 @@ pub fn project_recency(tree: &Tree, project_id: &ProjectId, now: i64) -> Recency
     )
 }
 
+/// The same over every project of a workspace — what lets the `/` PALETTE
+/// put the workspace you were just in back within reach.
+pub fn workspace_recency(tree: &Tree, workspace_id: &WorkspaceId, now: i64) -> Recency {
+    tree.projects
+        .iter()
+        .filter(|p| &p.workspace_id == workspace_id)
+        .map(|p| project_recency(tree, &p.id, now))
+        .fold(Recency::default(), |r, p| Recency {
+            interacted: r.interacted.max(p.interacted),
+            stamped: r.stamped.max(p.stamped),
+        })
+}
+
 /// Priority-ordered aggregate: needs-feedback > running > finished > fresh.
 fn rollup(statuses: impl Iterator<Item = AgentStatus>) -> Option<AgentStatus> {
     let mut best: Option<AgentStatus> = None;
@@ -1743,7 +1560,7 @@ fn rollup(statuses: impl Iterator<Item = AgentStatus>) -> Option<AgentStatus> {
 /// [`App::project_rows`]), so a workspace switch is a pure re-filter — no
 /// refetch, and background workspaces keep receiving status updates. The
 /// `/` palette deliberately doesn't scope: it searches the whole tree (see
-/// [`build_palette_items`]), which is the same data either way.
+/// [`crate::palette::Palette`]), which is the same data either way.
 #[derive(Debug, Clone, Default)]
 pub struct Tree {
     pub workspaces: Vec<Workspace>,
@@ -2704,11 +2521,10 @@ impl App {
         }
     }
 
-    /// Worktrees of the selected project, most recently interacted with
-    /// first (mirrors the sessions list). The stamp is the newest of the
-    /// checkout's sessions, so the root checkout moves like any other row;
-    /// a stable sort keeps never-run worktrees — the root among them, which
-    /// the daemon lists first — in tree order at the bottom.
+    /// Worktrees of the selected project: the root checkout first, always,
+    /// then the rest most recently interacted with first (mirrors the
+    /// sessions list). The stamp is the newest of the checkout's sessions;
+    /// a stable sort keeps never-run worktrees in tree order at the bottom.
     pub fn visible_worktrees(&self) -> Vec<&Worktree> {
         let Some(project) = self.selected_project() else {
             return vec![];
@@ -2721,7 +2537,10 @@ impl App {
             .filter(|w| w.project_id == project.id)
             .collect();
         rows.sort_by_key(|w| {
-            std::cmp::Reverse(worktree_recency(&self.tree, &w.id, now).interacted)
+            (
+                std::cmp::Reverse(w.is_main),
+                std::cmp::Reverse(worktree_recency(&self.tree, &w.id, now).interacted),
+            )
         });
         rows
     }

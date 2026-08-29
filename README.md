@@ -35,7 +35,8 @@ nebula replaces that with a tree and a color:
 - **Lists that order themselves.** Projects, worktrees and sessions all sit most-recent-first, with a dim
   `23m ago` after the name saying why the row is where it is: a session is stamped when it last did
   anything, a worktree carries the newest stamp of its sessions, a project the newest of its worktrees.
-  Nothing is pinned or dragged into place by hand.
+  The one fixed seat is the root checkout, always the first worktree row; nothing else is pinned or
+  dragged into place by hand.
 - **A dot per session that says what it's doing.** ● yellow is mid-turn, ● violet is done and waiting
   to be read, ● green is done and read, ● red wants you. Parents roll up their children, so a red dot
   on a collapsed project tells you exactly where to look without opening anything.
@@ -112,8 +113,13 @@ reapplies the same scope. Only the row you actually stop on is fetched.
 
 **4. Start the agent.** With a worktree selected, press `n` in the Sessions column. A menu asks what to
 run — **Claude**, **Codex**, or **Cursor** (a plain shell is `t`, see below); a CLI you never use can be
-switched off on the settings overlay's Agents tab and drops out of the menu entirely. `→` on Claude or Codex drills
-into model and reasoning-effort submenus; `Enter` anywhere takes your configured defaults. On the
+switched off on the settings overlay's Agents tab and drops out of the menu entirely. `→` on any row drills
+into model and reasoning-effort submenus (Cursor's model is a family such as `claude-opus-5-thinking`, and
+its effort list follows the family, `-fast` variants included — `cursor-agent --list-models` bakes both
+into the id, so nebula launches `--model claude-opus-5-thinking-high-fast`; the list is a built-in seed
+merged with `--list-models`, cached in `cursor_models.json` beside `config.json` and refreshed daily);
+In those submenus you type to filter — `opus` narrows the rows to the Opus families, `↑`/`↓` move, `Backspace` widens, `Esc` clears — and the preset editor's Harness / Model / Effort rows take the same type-ahead.
+`Enter` anywhere takes your configured defaults. On the
 Claude row, `Tab` toggles Cloud mode: after the optional name, enter the task in the wrapped editor
 (`Shift+Enter` or `Ctrl+J` adds a line) and nebula launches `claude --cloud <task>`. On accounts without
 Claude's live-attach rollout the CLI prints the session URL and exits — so nebula reads the session id off
@@ -295,7 +301,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Panels | `Tab`/`Shift+Tab`, `h/l` or `←/→`, `j/k` | move FOCUS / selection through visible panels; the walk stops at both ends (`Tab` at the TERMINAL PANE, `Shift+Tab` at the first visible panel) instead of cycling, and landing on a live pane takes its input; `h`/`l` stop one short of each end, and a double tap there (`l`,`l` at Sessions, `h`,`h` at the first visible panel) jumps the boundary; so do `k`,`k` on a panel's first row (up into the workspaces bar) and `j`,`j` in the bar (back down to the panel you came from) |
 | Panels | `Ctrl+→` | cross into the terminal pane *without* taking its input (`Tab`, or a double tap of `l`/`→` at Sessions, takes it) |
 | Panels | `Enter` | drill in; on a session: attach |
-| Any panel | `/` | fuzzy jump across every workspace, project, worktree and session — in *every* workspace, each row pathed `workspace/project/branch/session`, so typing another workspace's name jumps you into it (`Ctrl+n/p` move, `Ctrl+o` opens the hit, `Ctrl+f` just lands the selection on it) |
+| Any panel | `/` | fuzzy jump across every workspace, project, worktree and session — in *every* workspace, each row pathed `workspace/project/branch/session`, so typing another workspace's name jumps you into it (`Ctrl+n/p` move, `Ctrl+o` opens the hit, `Ctrl+f` just lands the selection on it). Until you type, the rows sit in attention order — sessions waiting on you, then running ones, then unread finishes, then everything else by last interaction — so `/` `Enter` is the fastest way back to what needs you or to the worktree you just left |
 | Projects | `n` / `d` | add project / remove from list |
 | Any panel | `o` | add ("open") a project — same prompt as `n`, from any focus |
 | Add project | type + `Tab`, `↓↑` / `→` / `←` | browse for the repo: type to filter (bash-style Tab completion), arrows pick a directory, `→` steps in, `←` steps up, `Enter` adds the highlighted (or typed) path; `●` marks git repos |

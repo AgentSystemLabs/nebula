@@ -522,14 +522,15 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.wait_for_text(FOOTER_SESSIONS);
 
     // ---- sessions are per-worktree: main has no agent-1 ----
-    // feat-a is the only stamped worktree now, so RECENCY ORDER has it on
-    // top: [feat-a, main, feat-b]. j from it lands on the root checkout.
+    // The root checkout keeps the first row no matter what; feat-a is the
+    // only stamped worktree, so RECENCY ORDER puts it right under it:
+    // [main, feat-a, feat-b]. k from it lands on the root checkout.
     tui.send(LEFT); // back to Worktrees (feat-a still selected)
     tui.wait_for_text(FOOTER_WORKTREES);
-    tui.send(b"j"); // main
+    tui.send(b"k"); // main
     tui.wait_for_selected("main ⌂ root");
     tui.wait_for_sessions_row_gone("agent-1");
-    tui.send(b"k"); // back to feat-a
+    tui.send(b"j"); // back to feat-a
     tui.wait_for_selected("feat-a");
     tui.wait_for_text("agent-1");
 

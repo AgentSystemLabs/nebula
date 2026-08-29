@@ -79,6 +79,8 @@ pub enum PresetField {
     Postfix,
 }
 
+use crate::config::fits;
+
 impl PresetField {
     pub const ALL: [PresetField; 6] = [
         PresetField::Name,
@@ -90,25 +92,26 @@ impl PresetField {
     ];
 
     /// The field `delta` steps away in Tab order, wrapping, and skipping
-    /// Model / Effort for a kind that has no such choice (Cursor).
-    pub fn step(self, kind: AgentKind, delta: i32) -> PresetField {
+    /// an Effort the (kind, model) pair has no choice for — a Cursor
+    /// family without effort variants, or no Cursor model yet.
+    pub fn step(self, kind: AgentKind, model: &str, delta: i32) -> PresetField {
         let n = Self::ALL.len() as i32;
         let mut pos = Self::ALL.iter().position(|f| *f == self).unwrap_or(0) as i32;
         for _ in 0..n {
             pos = (pos + delta).rem_euclid(n);
             let next = Self::ALL[pos as usize];
-            if next.available(kind) {
+            if next.available(kind, model) {
                 return next;
             }
         }
         self
     }
 
-    /// Whether the field applies to `kind` at all.
-    pub fn available(self, kind: AgentKind) -> bool {
+    /// Whether the field applies to `kind` (with `model` chosen) at all.
+    pub fn available(self, kind: AgentKind, model: &str) -> bool {
         match self {
             PresetField::Model => !crate::config::model_choices(kind).is_empty(),
-            PresetField::Effort => !crate::config::effort_choices(kind).is_empty(),
+            PresetField::Effort => !crate::config::effort_choices(kind, Some(model)).is_empty(),
             _ => true,
         }
     }
@@ -152,6 +155,10 @@ pub struct AgentPresetEditor {
     pub postfix: TextInput,
     /// The field with the caret / cycle focus.
     pub field: PresetField,
+    /// Type-ahead on the focused choice row (Harness / Model / Effort): the
+    /// letters typed so far; the row jumps to the best fuzzy match and ←/→
+    /// cycle the matches only. Cleared on leaving the row.
+    pub filter: String,
     /// Whole modal rect, written back during draw so a click outside can
     /// back out like Esc.
     pub area: Rect,
@@ -171,6 +178,7 @@ impl AgentPresetEditor {
             postfix: TextInput::new(),
             field: PresetField::Name,
             area: Rect::default(),
+            filter: String::new(),
         }
     }
 
@@ -191,6 +199,7 @@ impl AgentPresetEditor {
             postfix: TextInput::with_text(preset.postfix.clone()),
             field: PresetField::Name,
             area: Rect::default(),
+            filter: String::new(),
         }
     }
 
@@ -202,43 +211,126 @@ impl AgentPresetEditor {
     /// back to the default so the form never holds a choice it can't show.
     pub fn set_kind(&mut self, kind: AgentKind) {
         self.kind = kind;
-        let fits = |value: &str, choices: &[&str]| {
-            choices.iter().any(|c| c.eq_ignore_ascii_case(value.trim()))
-        };
         if !fits(&self.model, crate::config::model_choices(kind)) {
             self.model = crate::config::DEFAULT_CHOICE.into();
         }
-        if !fits(&self.effort, crate::config::effort_choices(kind)) {
-            self.effort = crate::config::DEFAULT_CHOICE.into();
-        }
-        if !self.field.available(kind) {
+        self.fit_effort();
+        if !self.field.available(kind, &self.model) {
             self.field = PresetField::Prefix;
         }
     }
 
-    /// `←` / `→` on a choice field: rotate it by `delta`.
-    pub fn cycle(&mut self, delta: i32) {
+    /// Drop an effort the current (kind, model) pair doesn't list — Cursor's
+    /// list follows the family — to what "default" would launch: the
+    /// family's fallback for a Cursor family with no bare id, else default.
+    fn fit_effort(&mut self) {
+        let choices = crate::config::effort_choices(self.kind, Some(&self.model));
+        if !fits(&self.effort, choices) {
+            self.effort = crate::config::fit_effort(self.kind, Some(&self.model), None)
+                .unwrap_or_else(|| crate::config::DEFAULT_CHOICE.into());
+        }
+    }
+
+    /// The choices the focused row cycles: harness names, the kind's
+    /// models, or the (kind, model) pair's efforts. Empty on a text row and
+    /// on an `n/a` row.
+    fn row_choices(&self) -> Vec<String> {
+        match self.field {
+            PresetField::Kind => AgentKind::ALL
+                .iter()
+                .map(|k| k.as_str().to_string())
+                .collect(),
+            PresetField::Model => crate::config::model_choices(self.kind)
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            PresetField::Effort => crate::config::effort_choices(self.kind, Some(&self.model))
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn row_value(&self) -> String {
+        match self.field {
+            PresetField::Kind => self.kind.as_str().to_string(),
+            PresetField::Model => self.model.clone(),
+            PresetField::Effort => self.effort.clone(),
+            _ => String::new(),
+        }
+    }
+
+    fn set_row_value(&mut self, value: &str) {
         match self.field {
             PresetField::Kind => {
-                let all = AgentKind::ALL;
-                let pos = all.iter().position(|k| *k == self.kind).unwrap_or(0) as i32;
-                let next = all[(pos + delta).rem_euclid(all.len() as i32) as usize];
-                self.set_kind(next);
+                if let Some(kind) = AgentKind::parse(value) {
+                    self.set_kind(kind);
+                }
             }
             PresetField::Model => {
-                let choices = crate::config::model_choices(self.kind);
-                if !choices.is_empty() {
-                    self.model = crate::config::cycle_choice(&self.model, choices, delta).into();
-                }
+                self.model = value.to_string();
+                self.fit_effort();
             }
-            PresetField::Effort => {
-                let choices = crate::config::effort_choices(self.kind);
-                if !choices.is_empty() {
-                    self.effort = crate::config::cycle_choice(&self.effort, choices, delta).into();
-                }
-            }
+            PresetField::Effort => self.effort = value.to_string(),
             _ => {}
         }
+    }
+
+    /// The row's choices narrowed to the filter, best match first; all of
+    /// them, in list order, while nothing is typed.
+    pub fn filtered_choices(&self) -> Vec<String> {
+        let all = self.row_choices();
+        crate::fuzzy::rank(&self.filter, all.iter().map(String::as_str))
+            .into_iter()
+            .map(|(i, _)| all[i].clone())
+            .collect()
+    }
+
+    /// A typed letter on a choice row: extend the filter and jump to its
+    /// best match. False — and nothing changes — when no choice would
+    /// match, so the row always shows something the filter names.
+    pub fn type_filter(&mut self, c: char) -> bool {
+        let query = format!("{}{c}", self.filter);
+        let all = self.row_choices();
+        let Some((best, _)) = crate::fuzzy::rank(&query, all.iter().map(String::as_str))
+            .into_iter()
+            .next()
+        else {
+            return false;
+        };
+        self.filter = query;
+        let best = all[best].clone();
+        self.set_row_value(&best);
+        true
+    }
+
+    /// Backspace on a choice row: shorten the filter; the value stays
+    /// unless it no longer matches, then the best match takes over.
+    pub fn pop_filter(&mut self) {
+        self.filter.pop();
+        let matches = self.filtered_choices();
+        let current = self.row_value();
+        if !matches.iter().any(|m| m.eq_ignore_ascii_case(&current)) {
+            if let Some(first) = matches.first().cloned() {
+                self.set_row_value(&first);
+            }
+        }
+    }
+
+    /// `←` / `→` on a choice field: rotate it by `delta` — through the
+    /// filter's matches while one is typed, else the whole list.
+    pub fn cycle(&mut self, delta: i32) {
+        if self.field.is_text() {
+            return;
+        }
+        let choices = self.filtered_choices();
+        if choices.is_empty() {
+            return;
+        }
+        let refs: Vec<&str> = choices.iter().map(String::as_str).collect();
+        let next = crate::config::cycle_choice(&self.row_value(), &refs, delta).to_string();
+        self.set_row_value(&next);
     }
 
     /// Shift+Enter / Ctrl+J in the prefix or postfix: a hard line break.
@@ -454,13 +546,22 @@ pub(crate) fn handle_editor_key(app: &mut App, key: KeyEvent) {
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let multiline = matches!(editor.field, PresetField::Prefix | PresetField::Postfix);
     match key.code {
+        // Esc first clears a choice row's type-ahead, then backs out.
+        KeyCode::Esc if !editor.filter.is_empty() => editor.filter.clear(),
         // Back to the list, unsaved.
         KeyCode::Esc => {
             let (worktree, index) = (editor.worktree.clone(), editor.editing.unwrap_or(0));
             reopen_agent_presets(app, worktree, index);
         }
-        KeyCode::Tab | KeyCode::Down => editor.field = editor.field.step(editor.kind, 1),
-        KeyCode::BackTab | KeyCode::Up => editor.field = editor.field.step(editor.kind, -1),
+        // Leaving a choice row drops its type-ahead.
+        KeyCode::Tab | KeyCode::Down => {
+            editor.filter.clear();
+            editor.field = editor.field.step(editor.kind, &editor.model, 1)
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            editor.filter.clear();
+            editor.field = editor.field.step(editor.kind, &editor.model, -1)
+        }
         // A hard line in the prefix / postfix, as in the task editor.
         KeyCode::Char('j') if multiline && ctrl => editor.prefix_or_postfix_newline(),
         KeyCode::Enter if multiline && shift => editor.prefix_or_postfix_newline(),
@@ -470,9 +571,16 @@ pub(crate) fn handle_editor_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Left if !editor.field.is_text() => editor.cycle(-1),
         KeyCode::Right | KeyCode::Char(' ') if !editor.field.is_text() => editor.cycle(1),
-        // `h` / `l` only cycle where no text is being typed.
-        KeyCode::Char('h') if !editor.field.is_text() => editor.cycle(-1),
-        KeyCode::Char('l') if !editor.field.is_text() => editor.cycle(1),
+        // Letters on a choice row type ahead: the row jumps to the best
+        // match and ←/→ cycle the matches. A letter nothing matches is
+        // refused, so the row never shows a choice the filter denies.
+        KeyCode::Backspace if !editor.field.is_text() => editor.pop_filter(),
+        KeyCode::Char(c) if !editor.field.is_text() && !ctrl => {
+            let query = format!("{}{c}", editor.filter);
+            if !editor.type_filter(c) {
+                app.flash = Some(format!("no choice matches '{query}'"));
+            }
+        }
         _ => {
             if let Some(input) = editor.text_field_mut() {
                 input.handle_key(&key);
@@ -589,9 +697,9 @@ pub(crate) fn draw_editor(f: &mut Frame, app: &mut App, editor: &AgentPresetEdit
     let area = centered_rect(f.area(), PRESET_EDITOR_W, height);
     f.render_widget(Clear, area);
     let hint = if area.width >= 72 {
-        " Tab/↑↓: field  ←/→: choose  ⇧Enter/^J: newline  Enter: save  Esc: back "
+        " Tab/↑↓: field  ←/→ or type: choose  ⇧Enter: newline  Enter: save  Esc "
     } else {
-        " Tab: field  ←/→: choose  Enter: save  Esc "
+        " Tab: field  ←/→ or type: choose  Enter: save  Esc "
     };
     let title = if editor.is_edit() {
         format!(" Edit preset — {} ", editor.name.trim())
@@ -615,7 +723,7 @@ pub(crate) fn draw_editor(f: &mut Frame, app: &mut App, editor: &AgentPresetEdit
             break;
         };
         let focused = editor.field == *field;
-        let available = field.available(editor.kind);
+        let available = field.available(editor.kind, &editor.model);
         let label_style = if focused {
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
         } else if available {
@@ -654,6 +762,16 @@ pub(crate) fn draw_editor(f: &mut Frame, app: &mut App, editor: &AgentPresetEdit
                         Style::default().add_modifier(Modifier::BOLD),
                     ));
                     spans.push(Span::styled(" ▸", Style::default().fg(th.accent)));
+                    if !editor.filter.is_empty() {
+                        spans.push(Span::styled(
+                            format!("  ⌕ {}", editor.filter),
+                            Style::default().fg(th.accent),
+                        ));
+                        spans.push(Span::styled(
+                            format!(" ({})", editor.filtered_choices().len()),
+                            Style::default().fg(th.dim),
+                        ));
+                    }
                 } else {
                     spans.push(Span::raw(value));
                 }

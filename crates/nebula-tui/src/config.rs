@@ -69,21 +69,63 @@ pub const CODEX_MODELS: &[&str] = &[
 ];
 pub const CODEX_EFFORTS: &[&str] = &[DEFAULT_CHOICE, "minimal", "low", "medium", "high", "xhigh"];
 
-/// Model choices for a session kind; empty = no model submenu (Cursor).
+/// Model choices for a session kind. Cursor's come from the CURSOR
+/// CATALOGUE (`cursor_catalogue.rs`): a seed plus a cached
+/// `cursor-agent --list-models`.
 pub fn model_choices(kind: AgentKind) -> &'static [&'static str] {
     match kind {
         AgentKind::Claude => CLAUDE_MODELS,
         AgentKind::Codex => CODEX_MODELS,
-        AgentKind::Cursor => &[],
+        AgentKind::Cursor => crate::cursor_catalogue::models(),
     }
 }
 
-/// Effort choices for a session kind; empty = no effort submenu (Cursor).
-pub fn effort_choices(kind: AgentKind) -> &'static [&'static str] {
+/// Effort choices for a session kind given its chosen model (None or
+/// "default" = the CLI's pick). Claude and Codex take any effort with any
+/// model; Cursor's list follows the family (`-fast` variants ride in the
+/// effort, `high-fast`), leads with "default" only when the bare family id
+/// exists, and is empty — no Effort row, no effort submenu — when the model
+/// is unset or the family has no effort variants (`auto`).
+pub fn effort_choices(kind: AgentKind, model: Option<&str>) -> &'static [&'static str] {
     match kind {
         AgentKind::Claude => CLAUDE_EFFORTS,
         AgentKind::Codex => CODEX_EFFORTS,
-        AgentKind::Cursor => &[],
+        AgentKind::Cursor => crate::cursor_catalogue::efforts(model),
+    }
+}
+
+/// Whether `value` is one of `choices`, case-insensitively and trimmed —
+/// how a form decides a saved or cycled choice still has a row.
+pub(crate) fn fits(value: &str, choices: &[&str]) -> bool {
+    choices.iter().any(|c| c.eq_ignore_ascii_case(value.trim()))
+}
+
+/// The effort to launch `kind` with, given its model and the picked effort.
+/// Claude and Codex pass through. For Cursor: no family → None; an effort
+/// the family ships → itself; anything else ("default", unset, a suffix the
+/// family lacks) → None when the bare family id exists, otherwise the
+/// family's fallback (`high` > `medium` > first) — most families have no
+/// bare id, and `--model claude-fable-5` alone is refused at spawn.
+pub fn fit_effort(kind: AgentKind, model: Option<&str>, effort: Option<String>) -> Option<String> {
+    match kind {
+        AgentKind::Claude | AgentKind::Codex => effort,
+        AgentKind::Cursor => {
+            let family = model
+                .map(str::trim)
+                .filter(|m| !m.eq_ignore_ascii_case(DEFAULT_CHOICE))?;
+            let choices = crate::cursor_catalogue::efforts(Some(family));
+            if choices.is_empty() {
+                return None;
+            }
+            let picked = effort
+                .map(|e| e.trim().to_ascii_lowercase())
+                .filter(|e| e != DEFAULT_CHOICE);
+            match picked {
+                Some(e) if fits(&e, choices) => Some(e),
+                _ if choices[0] == DEFAULT_CHOICE => None,
+                _ => crate::cursor_catalogue::fallback_effort(family).map(String::from),
+            }
+        }
     }
 }
 
@@ -134,6 +176,8 @@ pub enum SettingKind {
     CodexModel,
     CodexEffort,
     CursorEnabled,
+    CursorModel,
+    CursorEffort,
 }
 
 /// The tab strip, left to right. Ordered by how often a setting gets
@@ -252,6 +296,16 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::CursorEnabled,
                 label: "Cursor enabled",
                 hint: "Offer Cursor in the New session picker (off hides it; existing sessions keep running)",
+            },
+            SettingSpec {
+                kind: SettingKind::CursorModel,
+                label: "Cursor model",
+                hint: "Default model family for new Cursor sessions (default = CLI's pick)",
+            },
+            SettingSpec {
+                kind: SettingKind::CursorEffort,
+                label: "Cursor effort",
+                hint: "Effort (and -fast) variant of the chosen Cursor model; n/a while it is default or auto",
             },
         ]),
     },
@@ -434,14 +488,17 @@ pub struct Config {
     /// Hide the Worktrees panel and give its width to the terminal pane.
     /// Independent from `hide_projects`; Sessions always remains visible.
     pub hide_worktrees: bool,
-    /// Default model/effort for new Claude / Codex sessions. "default"
-    /// means "don't pass the flag" (the CLI picks); any other value is
-    /// passed through verbatim, so hand-edited configs can name models the
-    /// pickers don't list.
+    /// Default model/effort for new Claude / Codex / Cursor sessions.
+    /// "default" means "don't pass the flag" (the CLI picks); any other
+    /// value is passed through verbatim, so hand-edited configs can name
+    /// models the pickers don't list. Cursor's pair is a family plus the
+    /// effort suffix the daemon joins onto it (see `cursor_catalogue.rs`).
     pub claude_model: String,
     pub claude_effort: String,
     pub codex_model: String,
     pub codex_effort: String,
+    pub cursor_model: String,
+    pub cursor_effort: String,
     /// Which AGENT KINDS the NEW SESSION PICKER offers. Off leaves that
     /// harness out of the picker (and, for Claude, out of the PR SESSION
     /// launch and the standing PREWARM POOL slot); sessions that already
@@ -477,6 +534,8 @@ impl Default for Config {
             claude_effort: DEFAULT_CHOICE.into(),
             codex_model: DEFAULT_CHOICE.into(),
             codex_effort: DEFAULT_CHOICE.into(),
+            cursor_model: DEFAULT_CHOICE.into(),
+            cursor_effort: DEFAULT_CHOICE.into(),
             claude_enabled: true,
             codex_enabled: true,
             cursor_enabled: true,
@@ -585,6 +644,11 @@ impl Config {
         );
         obj.insert("codex_model".into(), serde_json::json!(self.codex_model));
         obj.insert("codex_effort".into(), serde_json::json!(self.codex_effort));
+        obj.insert("cursor_model".into(), serde_json::json!(self.cursor_model));
+        obj.insert(
+            "cursor_effort".into(),
+            serde_json::json!(self.cursor_effort),
+        );
         obj.insert(
             "claude_enabled".into(),
             serde_json::json!(self.claude_enabled),
@@ -629,20 +693,21 @@ impl Config {
         let value = match kind {
             AgentKind::Claude => &self.claude_model,
             AgentKind::Codex => &self.codex_model,
-            AgentKind::Cursor => return None,
+            AgentKind::Cursor => &self.cursor_model,
         };
         non_default(value)
     }
 
     /// The configured default effort for new sessions of `kind`;
-    /// None = "default" = don't pass the flag.
+    /// None = "default" = don't pass the flag. For Cursor an effort the
+    /// configured family does not ship is None too ([`fit_effort`]).
     pub fn default_effort(&self, kind: AgentKind) -> Option<String> {
         let value = match kind {
             AgentKind::Claude => &self.claude_effort,
             AgentKind::Codex => &self.codex_effort,
-            AgentKind::Cursor => return None,
+            AgentKind::Cursor => &self.cursor_effort,
         };
-        non_default(value)
+        fit_effort(kind, Some(&self.cursor_model), non_default(value))
     }
 
     /// Whether the NEW SESSION PICKER offers `kind` at all.
@@ -688,6 +753,14 @@ impl Config {
             SettingKind::ClaudeEffort => self.claude_effort.clone(),
             SettingKind::CodexModel => self.codex_model.clone(),
             SettingKind::CodexEffort => self.codex_effort.clone(),
+            SettingKind::CursorModel => self.cursor_model.clone(),
+            SettingKind::CursorEffort => {
+                if effort_choices(AgentKind::Cursor, Some(&self.cursor_model)).is_empty() {
+                    "n/a".into()
+                } else {
+                    self.cursor_effort.clone()
+                }
+            }
             SettingKind::ClaudeEnabled => on_off(self.claude_enabled).into(),
             SettingKind::CodexEnabled => on_off(self.codex_enabled).into(),
             SettingKind::CursorEnabled => on_off(self.cursor_enabled).into(),
@@ -760,6 +833,26 @@ impl Config {
             }
             SettingKind::CursorEnabled => {
                 self.cursor_enabled = !self.cursor_enabled;
+            }
+            SettingKind::CursorModel => {
+                self.cursor_model =
+                    cycle_choice(&self.cursor_model, crate::cursor_catalogue::models(), step)
+                        .into();
+                // The effort list follows the family: an effort the new
+                // family lacks becomes its fallback (or default), never an
+                // id the CLI would refuse.
+                let choices = effort_choices(AgentKind::Cursor, Some(&self.cursor_model));
+                if !fits(&self.cursor_effort, choices) {
+                    self.cursor_effort =
+                        fit_effort(AgentKind::Cursor, Some(&self.cursor_model), None)
+                            .unwrap_or_else(|| DEFAULT_CHOICE.into());
+                }
+            }
+            SettingKind::CursorEffort => {
+                let choices = effort_choices(AgentKind::Cursor, Some(&self.cursor_model));
+                if !choices.is_empty() {
+                    self.cursor_effort = cycle_choice(&self.cursor_effort, choices, step).into();
+                }
             }
         }
     }
@@ -1264,9 +1357,42 @@ mod tests {
             cfg.default_effort(AgentKind::Codex).as_deref(),
             Some("high")
         );
-        // Cursor has no model/effort knobs regardless of settings.
+        // Cursor: the family is the model; the effort only counts when
+        // that family ships it.
         assert_eq!(cfg.default_model(AgentKind::Cursor), None);
         assert_eq!(cfg.default_effort(AgentKind::Cursor), None);
+        cfg.cursor_effort = "high".into();
+        assert_eq!(
+            cfg.default_effort(AgentKind::Cursor),
+            None,
+            "no family, no suffix to join"
+        );
+        cfg.cursor_model = "claude-opus-5".into();
+        assert_eq!(
+            cfg.default_model(AgentKind::Cursor).as_deref(),
+            Some("claude-opus-5")
+        );
+        assert_eq!(
+            cfg.default_effort(AgentKind::Cursor).as_deref(),
+            Some("high")
+        );
+        cfg.cursor_effort = "max".into();
+        assert_eq!(
+            cfg.default_effort(AgentKind::Cursor).as_deref(),
+            Some("high"),
+            "Opus 5 has no max variant and no bare id: its fallback launches"
+        );
+        cfg.cursor_model = "gpt-5.3-codex".into();
+        assert_eq!(
+            cfg.default_effort(AgentKind::Cursor),
+            None,
+            "a family with a bare id: default really is no suffix"
+        );
+        cfg.cursor_effort = "high-fast".into();
+        assert_eq!(
+            cfg.default_effort(AgentKind::Cursor).as_deref(),
+            Some("high-fast")
+        );
 
         // The settings rows walk the same choice lists the submenus show.
         let (tab, row) = locate(SettingKind::ClaudeModel).unwrap();
@@ -1284,12 +1410,96 @@ mod tests {
     }
 
     #[test]
+    fn cursor_settings_rows_follow_the_family() {
+        let mut cfg = Config::default();
+        let (tab, model_row) = locate(SettingKind::CursorModel).unwrap();
+        let (_, effort_row) = locate(SettingKind::CursorEffort).unwrap();
+        // No family: the effort row is n/a and does not cycle.
+        assert_eq!(cfg.value_label(SettingKind::CursorEffort), "n/a");
+        cfg.cycle(tab, effort_row, 1);
+        assert_eq!(cfg.cursor_effort, "default");
+        // default → auto (still no efforts) → claude-fable-5, which has no
+        // bare id, so the effort lands on its fallback at once.
+        cfg.cycle(tab, model_row, 1);
+        assert_eq!(cfg.cursor_model, "auto");
+        assert_eq!(cfg.value_label(SettingKind::CursorEffort), "n/a");
+        cfg.cycle(tab, model_row, 1);
+        assert_eq!(cfg.cursor_model, "claude-fable-5");
+        assert_eq!(cfg.cursor_effort, "high");
+        cfg.cycle(tab, effort_row, 1);
+        assert_eq!(cfg.cursor_effort, "xhigh");
+        cfg.cycle(tab, effort_row, 1);
+        assert_eq!(cfg.cursor_effort, "max");
+        // fable-5-thinking has max; Opus 5 doesn't → back to its fallback.
+        cfg.cycle(tab, model_row, 1);
+        assert_eq!(cfg.cursor_model, "claude-fable-5-thinking");
+        assert_eq!(cfg.cursor_effort, "max", "a shared effort survives");
+        cfg.cycle(tab, model_row, 1);
+        assert_eq!(cfg.cursor_model, "claude-opus-5");
+        assert_eq!(cfg.cursor_effort, "high");
+        cfg.cycle(tab, effort_row, 1);
+        assert_eq!(cfg.cursor_effort, "high-fast", "-fast rides in the effort");
+        // A family with a bare id offers default again, and ← wraps onto
+        // its last fast variant.
+        cfg.cursor_model = "gpt-5.3-codex".into();
+        cfg.cursor_effort = "default".into();
+        cfg.cycle(tab, effort_row, -1);
+        assert_eq!(cfg.cursor_effort, "xhigh-fast");
+    }
+
+    #[test]
+    fn fit_effort_resolves_cursor_pairs() {
+        let fit = |m: Option<&str>, e: Option<&str>| {
+            fit_effort(AgentKind::Cursor, m, e.map(String::from))
+        };
+        assert_eq!(fit(None, Some("high")), None, "no family, nothing to join");
+        assert_eq!(fit(Some("default"), Some("high")), None);
+        assert_eq!(
+            fit(Some("auto"), Some("high")),
+            None,
+            "auto has no variants"
+        );
+        assert_eq!(fit(Some("nope"), Some("high")), None);
+        assert_eq!(fit(Some("gpt-5.3-codex"), None), None, "bare id exists");
+        assert_eq!(fit(Some("gpt-5.3-codex"), Some("bogus")), None);
+        assert_eq!(
+            fit(Some("gpt-5.3-codex"), Some("fast")).as_deref(),
+            Some("fast")
+        );
+        assert_eq!(fit(Some("claude-fable-5"), None).as_deref(), Some("high"));
+        assert_eq!(
+            fit(Some("claude-fable-5"), Some("default")).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            fit(Some("claude-fable-5"), Some("MAX ")).as_deref(),
+            Some("max")
+        );
+        assert_eq!(
+            fit(Some("gpt-5.5"), Some("xhigh")).as_deref(),
+            Some("high"),
+            "spelled extra-high there"
+        );
+        assert_eq!(
+            fit(Some("gpt-5.5"), Some("extra-high-fast")).as_deref(),
+            Some("extra-high-fast")
+        );
+        assert_eq!(
+            fit_effort(AgentKind::Codex, None, Some("high".into())).as_deref(),
+            Some("high"),
+            "claude/codex pass through"
+        );
+    }
+
+    #[test]
     fn save_persists_model_effort_keys() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let cfg = Config {
             claude_model: "sonnet".into(),
             codex_effort: "xhigh".into(),
+            cursor_model: "gpt-5.6-sol".into(),
+            cursor_effort: "none".into(),
             ..Config::default()
         };
         cfg.save_to(&path).unwrap();
@@ -1298,6 +1508,8 @@ mod tests {
         assert_eq!(reread.claude_effort, "default");
         assert_eq!(reread.codex_model, "default");
         assert_eq!(reread.codex_effort, "xhigh");
+        assert_eq!(reread.cursor_model, "gpt-5.6-sol");
+        assert_eq!(reread.cursor_effort, "none");
     }
 
     #[test]

@@ -127,14 +127,41 @@ where
             .map(|(i, _)| (i, Vec::new()))
             .collect();
     }
-    let mut scored: Vec<(i32, usize, usize, Vec<usize>)> = candidates
+    rank_by(query, candidates, |i, text| (text.chars().count(), i))
+}
+
+/// [`rank`] with the caller's own tiebreak: equal scores sort by ascending
+/// `key(index, text)`, and an empty (or all-whitespace) query lists every
+/// candidate in key order with no positions. For a list that has an order
+/// of its own — the `/` PALETTE's attention order — the key keeps that
+/// order wherever the score has nothing to say.
+pub fn rank_by<'a, I, K>(
+    query: &str,
+    candidates: I,
+    key: impl Fn(usize, &str) -> K,
+) -> Vec<(usize, Vec<usize>)>
+where
+    I: IntoIterator<Item = &'a str>,
+    K: Ord,
+{
+    if query.split_whitespace().next().is_none() {
+        let mut all: Vec<(K, usize)> = candidates
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| (key(i, text), i))
+            .collect();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        return all.into_iter().map(|(_, i)| (i, Vec::new())).collect();
+    }
+    let mut scored: Vec<(i32, K, usize, Vec<usize>)> = candidates
         .into_iter()
         .enumerate()
         .filter_map(|(i, text)| {
-            fuzzy_match(query, text).map(|m| (m.score, text.chars().count(), i, m.positions))
+            fuzzy_match(query, text).map(|m| (m.score, key(i, text), i, m.positions))
         })
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    // Stable, so original order is the final fallback under an equal key.
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     scored.into_iter().map(|(_, _, i, p)| (i, p)).collect()
 }
 
@@ -249,5 +276,24 @@ mod tests {
         let ranked = rank("neb #10", rows.clone());
         assert_eq!(ranked.len(), 1, "only the #10 row has both terms");
         assert_eq!(ranked[0].0, 2);
+    }
+
+    #[test]
+    fn rank_by_lists_an_empty_query_in_key_order_and_breaks_ties_by_key() {
+        // Empty query: pure key order, no positions.
+        let ranked = rank_by("", vec!["b", "a", "c"], |i, _| [2usize, 0, 1][i]);
+        assert_eq!(
+            ranked,
+            vec![(1, vec![]), (2, vec![]), (0, vec![])],
+            "key order, not original order"
+        );
+        // Equal scores: the key decides, not the text length.
+        let ranked = rank_by("main", vec!["demo/main", "demo/main/agent-1"], |i, _| {
+            [1usize, 0][i]
+        });
+        assert_eq!(ranked[0].0, 1, "the longer row wins on key");
+        // A better score still beats a better key.
+        let ranked = rank_by("read", vec!["feat/unread", "feat/read"], |i, _| i);
+        assert_eq!(ranked[0].0, 1, "the boundary match outranks the key");
     }
 }

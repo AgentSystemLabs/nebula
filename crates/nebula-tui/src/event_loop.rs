@@ -2,10 +2,10 @@
 
 use crate::app::{
     clamp_selection, App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView,
-    FileFinder, Focus, GrepView, HelpView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView,
-    Overlay, Palette, PaletteTarget, PendingAction, PendingIntent, PointerShape, PromptDialog,
-    PromptKind, RowKey, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection,
-    WorktreeRollback,
+    FileFinder, Focus, GrepView, HelpView, HitTarget, LinkRow, MenuAction, MenuFilter, MenuItem,
+    MetricsView, Overlay, Palette, PaletteTarget, PendingAction, PendingIntent, PointerShape,
+    PromptDialog, PromptKind, RowKey, SessionRow, SettingsView, SplitterDrag, SubmenuKind,
+    TermSelection, WorktreeRollback,
 };
 use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
@@ -277,6 +277,9 @@ async fn main_loop(
     let cfg = crate::config::Config::load();
     apply_config(&mut app, &cfg);
     app.keymap = cfg.keymap();
+    // The Cursor MODEL / EFFORT lists: cached `cursor-agent --list-models`
+    // now, a background refresh when the cache is a day old.
+    crate::cursor_catalogue::bootstrap(cfg.cursor_enabled);
     let mut input = crossterm::event::EventStream::new();
     let mut out: Vec<ClientRequest> = Vec::new();
     // Pointer shape last sent to the terminal (OSC 22), so hover over a
@@ -2520,6 +2523,7 @@ fn open_menu(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
         hover: 0,
         area: ratatui::layout::Rect::default(),
         parent: None,
+        filter: None,
     }));
 }
 
@@ -2564,6 +2568,7 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
         hover: 0,
         area: ratatui::layout::Rect::default(),
         parent: None,
+        filter: None,
     }));
 }
 
@@ -2626,6 +2631,7 @@ fn open_pr_agent_picker(app: &mut App) {
         hover: 0,
         area: ratatui::layout::Rect::default(),
         parent: None,
+        filter: None,
     }));
 }
 
@@ -2655,7 +2661,7 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
         ),
         SubmenuKind::Efforts => (
             format!("{} effort", kind_label(*kind)),
-            crate::config::effort_choices(*kind),
+            crate::config::effort_choices(*kind, model.as_deref()),
             cfg.default_effort(*kind),
         ),
     };
@@ -2687,6 +2693,11 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
         })
         .collect();
     let hover = choices.iter().position(|c| *c == configured).unwrap_or(0);
+    // Both lists take type-ahead: letters narrow the rows, ↑/↓ move.
+    let filter = Some(MenuFilter {
+        query: String::new(),
+        all: items.clone(),
+    });
     Some(ContextMenu {
         title: Some(title),
         items,
@@ -2694,6 +2705,7 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
         hover,
         area: ratatui::layout::Rect::default(),
         parent: None,
+        filter,
     })
 }
 
@@ -2753,6 +2765,7 @@ fn open_workspace_picker(app: &mut App) {
         hover,
         area: ratatui::layout::Rect::default(),
         parent: None,
+        filter: None,
     }));
 }
 
@@ -3082,6 +3095,24 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
         Overlay::AgentPresets(_) => crate::preset_overlays::handle_list_key(app, key),
         Overlay::AgentPresetEditor(_) => crate::preset_overlays::handle_editor_key(app, key),
         Overlay::Menu(menu) => match key.code {
+            // Type-ahead in the MODEL / EFFORT submenus: letters narrow the
+            // rows (so ↑/↓ move there, not j/k), Backspace widens, and Esc
+            // clears the text before it backs out. A letter no row matches
+            // is refused, so the list never empties.
+            KeyCode::Char(c)
+                if menu.filter.is_some()
+                    && c != ' '
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let query = format!("{}{c}", menu.filter_query());
+                if !menu.type_filter(c) {
+                    app.flash = Some(format!("no row matches '{query}'"));
+                }
+            }
+            KeyCode::Backspace if menu.filter.is_some() => menu.pop_filter(),
+            KeyCode::Esc if menu.has_filter_text() => {
+                menu.set_filter("");
+            }
             // Esc in a submenu backs out one level; at the top it closes.
             KeyCode::Esc => match menu.parent.take() {
                 Some(parent) => *menu = *parent,
@@ -4076,7 +4107,11 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             let cfg = crate::config::Config::load();
             let kind = preset.kind;
             let model = preset.model.clone().or_else(|| cfg.default_model(kind));
-            let effort = preset.effort.clone().or_else(|| cfg.default_effort(kind));
+            let effort = crate::config::fit_effort(
+                kind,
+                model.as_deref(),
+                preset.effort.clone().or_else(|| cfg.default_effort(kind)),
+            );
             create_agent(
                 app,
                 AgentLaunchDraft {
@@ -4326,7 +4361,13 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 some => some,
             };
             let model = resolve(model, cfg.default_model(kind));
-            let effort = resolve(effort, cfg.default_effort(kind));
+            // A Cursor effort only counts for the family it belongs to: a
+            // stale setting behind a freshly picked model drops to none.
+            let effort = crate::config::fit_effort(
+                kind,
+                model.as_deref(),
+                resolve(effort, cfg.default_effort(kind)),
+            );
             // No name prompt means no typing window to warm through, so
             // create straight from the picker: the standing default-spec
             // warm slot gets adopted where it matches, and the refill
@@ -10802,8 +10843,9 @@ diff --git a/src/b.rs b/src/b.rs
                 .iter()
                 .position(|i| i.label.starts_with("opus"))
                 .expect("opus row");
+            // Letters type ahead in a model submenu, so move with ↓.
             for _ in 0..opus {
-                press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
             }
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(app.overlay.is_none(), "no name prompt: {:?}", app.overlay);
@@ -10831,11 +10873,11 @@ diff --git a/src/b.rs b/src/b.rs
             let Some(Overlay::Menu(menu)) = &app.overlay else {
                 panic!("expected picker, got {:?}", app.overlay);
             };
-            // Claude/Codex rows advertise a submenu (the ▸ affordance);
-            // Cursor doesn't.
+            // Every row advertises a model submenu (the ▸ affordance) —
+            // Cursor too, since `cursor-agent --model` grew a catalogue.
             assert_eq!(menu.items[0].action.submenu(), Some(SubmenuKind::Models));
             assert_eq!(menu.items[1].action.submenu(), Some(SubmenuKind::Models));
-            assert_eq!(menu.items[2].action.submenu(), None);
+            assert_eq!(menu.items[2].action.submenu(), Some(SubmenuKind::Models));
 
             // → opens the model list; nothing configured, so the "default"
             // row is checked and highlighted, and the parent is kept for ←.
@@ -13345,8 +13387,9 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(app.sel_project, 1, "still on \"two\"");
     }
 
-    /// Worktrees sort most-recently-interacted first; the root checkout
-    /// moves like any other row, and the cursor follows.
+    /// Worktrees sort most-recently-interacted first below the root
+    /// checkout, which stays the first row no matter what; the cursor
+    /// follows its row across the re-sort.
     #[test]
     fn worktrees_sort_by_last_interaction() {
         use nebula_core::AgentStatus;
@@ -13386,24 +13429,25 @@ diff --git a/src/b.rs b/src/b.rs
         };
         assert_eq!(
             branches(&app),
-            ["feat", "older", "main"],
-            "newest first; the never-run root sinks below the active worktrees"
+            ["main", "feat", "older"],
+            "the never-run root stays on top; the rest sit newest first"
         );
 
-        // Rest on the root, then its session finishes: it overtakes both.
+        // Rest on "older", then its session finishes: it overtakes "feat"
+        // but never the root, and the cursor follows it.
         app.focus = Focus::Worktrees;
         app.sel_worktree = 2;
         hse(
             &mut app,
             ServerEvent::StatusChanged {
-                agent: AgentId("a1".into()),
+                agent: AgentId("a3".into()),
                 status: AgentStatus::Finished,
                 changed_at: now,
                 unseen: false,
             },
         );
-        assert_eq!(branches(&app), ["main", "feat", "older"]);
-        assert_eq!(app.sel_worktree, 0, "selection follows the root row");
+        assert_eq!(branches(&app), ["main", "older", "feat"]);
+        assert_eq!(app.sel_worktree, 1, "selection follows the \"older\" row");
     }
 
     /// Project and worktree rows carry the same "23m ago" label the session
@@ -14841,8 +14885,9 @@ diff --git a/src/b.rs b/src/b.rs
             let p = palette(&app);
             assert_eq!(p.query, "main");
             let top = &p.items[p.matches[0].item];
-            // Same boundary match, but the worktree text is shorter than its
-            // session's — the tighter candidate wins the tie.
+            // Same boundary match; the attention order breaks the tie, and
+            // for two never-run rows that is build order — the worktree
+            // before its session.
             assert_eq!(top.text, "demo/main");
             assert!(p
                 .matches
@@ -18151,14 +18196,15 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(buffer[(x - 2, y)].fg, app.theme.muted, "fresh dot:\n{text}");
 
         // The rule under the bar stays unbroken beneath the open tab — it
-        // becomes that tab's accent underline, so the tab reads as
-        // attached to the panels below it.
+        // becomes that tab's underline, in the tab's rollup STATUS DOT
+        // color (the fresh dot's gray, lifted to muted like the dot), so
+        // the tab reads as attached to the panels below it.
         // A half block, not a line glyph: it paints from the cell's top
         // edge, flush against the tab's fill. A `━` draws at the midline
         // and leaves a strip of background above it — a visible gap
         // between the tab and its own underline.
         assert_eq!(buffer[(x, y + 2)].symbol(), "▀", "tab join:\n{text}");
-        assert_eq!(buffer[(x, y + 2)].fg, app.theme.accent, "{text}");
+        assert_eq!(buffer[(x, y + 2)].fg, app.theme.muted, "{text}");
         assert_eq!(buffer[(0, y + 2)].symbol(), "─", "{text}");
         assert_eq!(buffer[(0, y + 2)].fg, app.theme.edge, "{text}");
     }
@@ -19681,7 +19727,7 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
-    fn cursor_preset_hides_model_and_effort() {
+    fn cursor_preset_effort_follows_the_model_family() {
         use crate::preset_overlays::PresetField;
         with_seeded_presets(|| {
             let mut app = App::new();
@@ -19697,33 +19743,342 @@ diff --git a/src/b.rs b/src/b.rs
                 panic!("editor should stay open, got {:?}", app.overlay);
             };
             assert_eq!(editor.kind, AgentKind::Cursor);
-            assert_eq!(
-                editor.field,
-                PresetField::Prefix,
-                "Tab skips model and effort"
-            );
-            press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
-            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
-                unreachable!()
-            };
-            assert_eq!(editor.field, PresetField::Kind, "and so does Shift+Tab");
-
+            assert_eq!(editor.field, PresetField::Model, "cursor has a model row");
+            // With the model still default there is no suffix to pick:
+            // Effort reads n/a and Tab skips it.
             let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
             terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
             let text = buffer_text(&terminal);
-            assert!(
-                text.contains("Model  n/a"),
-                "cursor has no model knob:\n{text}"
+            assert!(text.contains("Effort  n/a"), "no family yet:\n{text}");
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(
+                editor.field,
+                PresetField::Prefix,
+                "Tab skips the n/a effort"
             );
+            press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
+
+            // → → : default → auto → claude-fable-5, whose efforts exist.
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(editor.model, "claude-fable-5");
+            assert_eq!(
+                editor.field,
+                PresetField::Effort,
+                "a family with efforts gets the row"
+            );
+            // No bare `claude-fable-5` id exists, so the effort lands on the
+            // family's fallback at once; → → walks up to max.
+            assert_eq!(editor.effort, "high");
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(editor.effort, "max");
+            // Stepping the model past fable-5-thinking (has max) onto Opus 5
+            // (no max variant) drops it back to that family's fallback.
+            press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(editor.model, "claude-opus-5");
+            assert_eq!(editor.effort, "high", "max dropped with the family");
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(editor.effort, "high-fast", "-fast is the next effort row");
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE, &mut out);
 
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             let saved = crate::agent_presets::load();
             assert_eq!(saved[2].kind, AgentKind::Cursor);
-            assert_eq!(saved[2].model, None);
-            assert_eq!(saved[2].effort, None);
+            assert_eq!(saved[2].model.as_deref(), Some("claude-opus-5"));
+            assert_eq!(saved[2].effort.as_deref(), Some("high"));
             terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
             let text = buffer_text(&terminal);
-            assert!(text.contains("cur  cursor"), "bare cursor row:\n{text}");
+            assert!(
+                text.contains("cur  cursor · claude-opus-5 · high"),
+                "spec label names family and effort:\n{text}"
+            );
+        });
+    }
+
+    #[test]
+    fn picker_model_submenu_types_to_filter() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected cursor model submenu, got {:?}", app.overlay);
+            };
+            let all = menu.items.len();
+            assert!(menu.filter.is_some(), "model submenus take type-ahead");
+
+            // The title shows the affordance before anything is typed.
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("Cursor model ⌕"),
+                "bare ⌕ in the title:\n{text}"
+            );
+            assert!(
+                text.contains("type to filter"),
+                "hint on the border:\n{text}"
+            );
+
+            // "opus" narrows to the two Opus families, best first, hover
+            // on the first; the letters did not move the hover as j/k.
+            type_text(&mut app, "opus", &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(
+                menu.items
+                    .iter()
+                    .map(|i| i.label.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["claude-opus-5", "claude-opus-5-thinking"]
+            );
+            assert_eq!(menu.hover, 0);
+            assert_eq!(menu.filter_query(), "opus");
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("Cursor model ⌕ opus"),
+                "query in the title:\n{text}"
+            );
+
+            // A letter no row matches is refused and flashed.
+            type_text(&mut app, "z", &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(menu.filter_query(), "opus");
+            assert_eq!(menu.items.len(), 2);
+            assert!(app.flash.as_deref().is_some_and(|f| f.contains("opusz")));
+
+            // ↓ moves within the matches; → drills the hovered family into
+            // its efforts, which start with an empty filter of their own.
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(menu.title.as_deref(), Some("Cursor effort"));
+            assert_eq!(menu.filter_query(), "");
+            type_text(&mut app, "hf", &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                unreachable!()
+            };
+            assert!(
+                menu.items.iter().all(|i| i.label.ends_with("-fast")),
+                "hf keeps only fast rows: {:?}",
+                menu.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+            );
+            assert_eq!(menu.items[0].label, "high-fast");
+            assert!(matches!(
+                &menu.items[0].action,
+                MenuAction::NewAgentOfKind { kind: AgentKind::Cursor, model: Some(m), effort: Some(e), .. }
+                    if m == "claude-opus-5-thinking" && e == "high-fast"
+            ));
+
+            // Backspace widens; Esc clears the text first, then backs out
+            // to the (still filtered) model list.
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(menu.filter_query(), "h");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(menu.title.as_deref(), Some("Cursor effort"));
+            assert_eq!(menu.filter_query(), "");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(menu.title.as_deref(), Some("Cursor model"));
+            assert_eq!(menu.filter_query(), "opus");
+            assert_eq!(menu.hover, 1, "← restores the parent's hover");
+            // Clearing the filter brings every row back, hovering the ✓.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(menu.items.len(), all);
+            assert_eq!(menu.items[menu.hover].label, "default ✓");
+        });
+    }
+
+    #[test]
+    fn preset_editor_types_to_filter_choice_rows() {
+        use crate::preset_overlays::PresetField;
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            open_presets(&mut app, &mut out);
+            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+            type_text(&mut app, "typed", &mut out);
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            // Harness: "cu" jumps to cursor; h/l no longer cycle.
+            type_text(&mut app, "cu", &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                panic!("editor should stay open, got {:?}", app.overlay);
+            };
+            assert_eq!(editor.field, PresetField::Kind);
+            assert_eq!(editor.kind, AgentKind::Cursor);
+            assert_eq!(editor.filter, "cu");
+            // Tab drops the filter and lands on Model.
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(editor.field, PresetField::Model);
+            assert_eq!(editor.filter, "");
+            // "sol" → gpt-5.6-sol at once, effort on its fallback; → cycles
+            // only the matches (one), so it stays.
+            type_text(&mut app, "sol", &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(editor.model, "gpt-5.6-sol");
+            assert_eq!(editor.effort, "high");
+            assert_eq!(editor.filtered_choices(), vec!["gpt-5.6-sol"]);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(editor.model, "gpt-5.6-sol");
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("gpt-5.6-sol ▸  ⌕ sol (1)"),
+                "filter beside the value:\n{text}"
+            );
+
+            // A refused letter leaves everything as it was and flashes.
+            type_text(&mut app, "q", &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(editor.filter, "sol");
+            assert!(app.flash.as_deref().is_some_and(|f| f.contains("solq")));
+            // Backspace to "so": sol still matches, so the value stays;
+            // Esc clears the filter but keeps the value; a second Esc
+            // backs out to the list as before.
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(editor.filter, "so");
+            assert_eq!(editor.model, "gpt-5.6-sol");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                panic!("first Esc only clears the filter, got {:?}", app.overlay);
+            };
+            assert_eq!(editor.filter, "");
+            assert_eq!(editor.model, "gpt-5.6-sol");
+            // On the Effort row, "xf" lands on xhigh-fast.
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            type_text(&mut app, "xf", &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                unreachable!()
+            };
+            assert_eq!(editor.field, PresetField::Effort);
+            assert_eq!(editor.effort, "xhigh-fast");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(app.overlay, Some(Overlay::AgentPresets(_))),
+                "second Esc backs out: {:?}",
+                app.overlay
+            );
+        });
+    }
+
+    #[test]
+    fn picker_cursor_drills_into_family_then_effort_and_auto_is_a_leaf() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected cursor model submenu, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("Cursor model"));
+            assert_eq!(
+                menu.items.len(),
+                crate::config::model_choices(AgentKind::Cursor).len()
+            );
+            assert_eq!(menu.items[0].label, "default ✓");
+            assert_eq!(menu.items[1].label, "auto");
+            // `auto` has no effort variants: a leaf. Opus 5 thinking drills.
+            assert_eq!(menu.items[1].action.submenu(), None);
+            assert_eq!(menu.items[5].label, "claude-opus-5-thinking");
+            assert_eq!(menu.items[5].action.submenu(), Some(SubmenuKind::Efforts));
+
+            for _ in 0..5 {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            }
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected cursor effort submenu, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("Cursor effort"));
+            // No bare `claude-opus-5-thinking` id, so no default row; the
+            // -fast twins follow their base.
+            assert_eq!(
+                menu.items
+                    .iter()
+                    .map(|i| i.label.as_str())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "low",
+                    "low-fast",
+                    "medium",
+                    "medium-fast",
+                    "high",
+                    "high-fast",
+                    "xhigh",
+                    "xhigh-fast",
+                    "max",
+                    "max-fast"
+                ]
+            );
+            assert!(matches!(
+                &menu.items[9].action,
+                MenuAction::NewAgentOfKind { kind: AgentKind::Cursor, model: Some(m), effort: Some(e), .. }
+                    if m == "claude-opus-5-thinking" && e == "max-fast"
+            ));
+            assert_eq!(menu.items[9].action.submenu(), None);
         });
     }
 
