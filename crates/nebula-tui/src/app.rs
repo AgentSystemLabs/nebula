@@ -2060,10 +2060,6 @@ pub struct App {
     /// and the splash's motion (off = fewer repaints). Mirrors the config,
     /// refreshed at startup and when the settings overlay applies a change.
     pub animations: bool,
-    /// The `focus_tint` setting: paints the focused panel's background
-    /// with a faint accent tint. Off by default; mirrors the config,
-    /// refreshed at startup and when the settings overlay applies a change.
-    pub focus_tint: bool,
 }
 
 impl Default for App {
@@ -2158,7 +2154,6 @@ impl App {
             splash_epoch: std::time::Instant::now(),
             splash_preview: false,
             animations: true,
-            focus_tint: false,
         }
     }
 

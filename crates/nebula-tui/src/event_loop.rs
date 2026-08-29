@@ -3853,7 +3853,6 @@ fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i32) {
 fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.theme = cfg.theme();
     app.animations = cfg.animations;
-    app.focus_tint = cfg.focus_tint;
     set_show_workspaces(app, cfg.show_workspaces);
     set_hide_projects(app, cfg.hide_projects);
     set_hide_worktrees(app, cfg.hide_worktrees);

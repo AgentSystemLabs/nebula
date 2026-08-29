@@ -59,7 +59,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     if app.collapsed {
         draw_terminal(f, app, body);
-        if app.focus_tint && app.focus == Focus::Terminal {
+        if app.focus == Focus::Terminal {
             draw_focus_tint(f.buffer_mut(), body, app.theme);
         }
         draw_footer(f, app, footer);
@@ -135,23 +135,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     );
     draw_terminal(f, app, term_a);
     draw_splitter_grips(f.buffer_mut(), app, panels_a);
-    // Focus cue (opt-in, `focus_tint` setting): the focused panel's whole
-    // background picks up a faint accent tint. The sidebar columns stop
-    // one cell short of their right rule so the tint stays inside the
-    // panel.
-    if app.focus_tint {
-        let tinted = match app.focus {
-            // The bar's last row is its rule, which belongs to the boundary
-            // rather than to the bar — leave it untinted.
-            Focus::Workspaces => Some(shrink_b(workspaces_a)),
-            Focus::Projects => panel_areas[0].map(shrink_r),
-            Focus::Worktrees => panel_areas[1].map(shrink_r),
-            Focus::Sessions => panel_areas[2].map(shrink_r),
-            Focus::Terminal => Some(term_a),
-        };
-        if let Some(tinted) = tinted {
-            draw_focus_tint(f.buffer_mut(), tinted, app.theme);
-        }
+    // Focus cue (always on): the focused panel's whole background picks
+    // up a faint accent tint. The sidebar columns stop one cell short of
+    // their right rule so the tint stays inside the panel.
+    let tinted = match app.focus {
+        // The bar's last row is its rule, which belongs to the boundary
+        // rather than to the bar — leave it untinted.
+        Focus::Workspaces => Some(shrink_b(workspaces_a)),
+        Focus::Projects => panel_areas[0].map(shrink_r),
+        Focus::Worktrees => panel_areas[1].map(shrink_r),
+        Focus::Sessions => panel_areas[2].map(shrink_r),
+        Focus::Terminal => Some(term_a),
+    };
+    if let Some(tinted) = tinted {
+        draw_focus_tint(f.buffer_mut(), tinted, app.theme);
     }
     draw_footer(f, app, footer);
     draw_overlay(f, app);
