@@ -61,9 +61,11 @@ pub struct Theme {
     /// Needs-feedback counterpart of `warn_sweep`. Red family, paired
     /// with `err`.
     pub err_sweep: [Color; 3],
-    /// Focused-panel background: the accent at roughly 5% opacity over
-    /// a dark ground, filling the whole focused panel so it reads as a
-    /// faintly lit surface. Truecolor by necessity (see module docs).
+    /// Focused-panel background: a dark neutral-gray floor with a faint
+    /// lean toward the accent, filling the whole focused panel (and the
+    /// rounded corners of a selected PILL ROW's pad rows) so it reads as
+    /// a faintly lit gray surface rather than plain black. Truecolor by
+    /// necessity (see module docs).
     pub focus_tint: Color,
 }
 
@@ -86,7 +88,7 @@ impl Default for Theme {
             edge: Color::Indexed(238),
             warn_sweep: [Color::Yellow, Color::Indexed(220), Color::Indexed(230)],
             err_sweep: [Color::Red, Color::Indexed(203), Color::Indexed(217)],
-            focus_tint: Color::Rgb(4, 15, 16),
+            focus_tint: Color::Rgb(22, 33, 34),
         }
     }
 }
@@ -98,13 +100,13 @@ impl Theme {
             "ocean" => Self {
                 accent: Color::Indexed(39),  // deep sky blue
                 special: Color::Indexed(75), // steel blue
-                focus_tint: Color::Rgb(3, 13, 20),
+                focus_tint: Color::Rgb(21, 31, 38),
                 ..base
             },
             "forest" => Self {
                 accent: Color::Indexed(114),  // pale green
                 special: Color::Indexed(108), // sage
-                focus_tint: Color::Rgb(8, 16, 9),
+                focus_tint: Color::Rgb(26, 34, 27),
                 ..base
             },
             "rose" => Self {
@@ -113,13 +115,13 @@ impl Theme {
                 // Violet is spoken for here, so done goes turquoise — the
                 // one hue this preset leaves free.
                 done: Color::Indexed(45),
-                focus_tint: Color::Rgb(19, 10, 14),
+                focus_tint: Color::Rgb(37, 28, 32),
                 ..base
             },
             "amber" => Self {
                 accent: Color::Indexed(214),  // orange
                 special: Color::Indexed(173), // copper
-                focus_tint: Color::Rgb(19, 14, 4),
+                focus_tint: Color::Rgb(37, 32, 22),
                 ..base
             },
             _ => base,
@@ -154,6 +156,26 @@ mod tests {
             assert_ne!(th.done, th.err, "{name}: done reads as needs-feedback");
             assert_ne!(th.done, th.special, "{name}: done reads as terminated");
             assert_ne!(th.done, th.dim, "{name}: done reads as fresh");
+        }
+    }
+
+    /// `focus_tint` paints over every untouched cell of the focused panel,
+    /// including the rounded pad-row corners of a selected PILL ROW — a
+    /// channel much below this floor reads as plain black there instead of
+    /// a gray tint (issue #6).
+    #[test]
+    fn focus_tint_has_a_visible_gray_floor() {
+        const MIN_CHANNEL: u8 = 18;
+        for name in THEMES {
+            let th = Theme::by_name(name);
+            let Color::Rgb(r, g, b) = th.focus_tint else {
+                panic!("{name}: focus_tint must be truecolor RGB");
+            };
+            assert!(
+                r >= MIN_CHANNEL && g >= MIN_CHANNEL && b >= MIN_CHANNEL,
+                "{name}: focus_tint {:?} is too close to black",
+                (r, g, b)
+            );
         }
     }
 }
