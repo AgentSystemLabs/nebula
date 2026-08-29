@@ -9,7 +9,7 @@ or write one if not, then refactor, make pr when done"
 **Did:** Six commits on `clean-up`, one per area, all behavior-preserving; 710 tests (was 690), clippy
 warning-free workspace-wide (was 7), `fmt --check` clean. Four read-only survey agents produced ~100
 candidates; the low-risk, tested ones were done and the medium-risk ones (list-modal mouse/key arm
-folding, `jump_to_target` vs `open_session`, the Diff/Tree two-pane scaffold in `ui.rs`, a `str_enum!`
+folding, `jump_to_target` vs `open_session`, the DIFF VIEWER / TREE BROWSER two-pane scaffold in `ui.rs`, a `str_enum!`
 for `AgentStatus`, table-driving `Config::write_into`) were left, listed in the PR. Every extraction was
 gated on a test run green against the *old* code first. Highlights: new `nebula_core::env` (`AGENT_ID`,
 `API_URL`, `API_TOKEN`, `RUNTIME_DIR`, `DATA_DIR`, `AGENT_SESSION_VARS`, `non_empty()`) used by
@@ -37,8 +37,8 @@ merge: 728 workspace tests, `cargo fmt --check`, and workspace clippy with warni
   likewise keeps `EVENT_TIMEOUT` while waiting for both the Ack and the project upsert; Ack and broadcast
   order is deliberately unspecified.
 - **Agent worktrees (`isolation: "worktree"`) branch from `main`, not from the lead's branch.** All three
-  builders reported `nebula_core::env` "does not exist" and found `ui.rs` ~100 lines shifted (a memory
-  modal had landed on main meanwhile). Commit the shared groundwork, then either rebase your branch onto
+  builders reported `nebula_core::env` "does not exist" and found `ui.rs` ~100 lines shifted (a MEMORY
+  MODAL had landed on main meanwhile). Commit the shared groundwork, then either rebase your branch onto
   `main` before spawning or tell agents to `git cherry-pick <sha>` (their sandbox blocks `git merge`).
   Cherry-picking their commits back in then applies cleanly; only `.claude/MEMORY.md` conflicted.
 - Main had reworked `browser.rs` (configurable `bind: IpAddr`) under my `LOOPBACK` const — the rebase
@@ -51,7 +51,7 @@ merge: 728 workspace tests, `cargo fmt --check`, and workspace clippy with warni
 - `host_warning` returns `Option<&'static str>`, so `CTRL_COLLISIONS` holds full messages per entry.
 - `tree_browser::read_preview` marks truncation on `lines dropped || byte_capped`; `cap_lines` takes the
   second as `already_cut` rather than the caller appending the mark twice.
-- `step_selection` (clamp form) replaced the metrics modal's unclamped `saturating_sub(1)`: a cursor left
+- `step_selection` (clamp form) replaced the MEMORY MODAL's unclamped `saturating_sub(1)`: a cursor left
   past a shrunken `rows` now snaps to the last row. `home_dir()` is `var_os("HOME")` where
   `shellexpand_home` used `var` — a non-UTF-8 `$HOME` now expands. Both accepted, noted in the PR.
 - A regex dedupe of the `agent_entity + broadcast` pair also rewrote the body of the new

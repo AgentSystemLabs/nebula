@@ -12,14 +12,14 @@ somehow a worktree row is labeled as main" — then "yes fix them".
 entry instead of `rev-parse --show-toplevel`, and derives `is_main` as `entry.path == repo_path`.
 `worktree_probe_stamp` (`crates/nebula-daemon/src/lib.rs:221`) goes through the new `git_common_dir`,
 which follows a `gitdir:` file and its `commondir` hop. `reconcile_project_worktrees`
-(`registry.rs:~1010`) re-derives root-ness every pass from `entries.first()` via the new
+(`registry.rs:~1010`, the WORKTREE SYNC) re-derives root-ness every pass from `entries.first()` via the new
 `Store::set_worktree_main`, and its delete pass dropped the `w.is_main ||` reprieve. 6 new tests
 (4 in `registry::tests`, 2 in the new `nebula_daemon::probe_tests`); workspace suite 621 green.
 
 **Gotchas:**
 - **`git rev-parse --show-toplevel` inside a linked worktree returns the worktree, not the repo.** So
   `nebula add .` from a worktree made the *worktree* the project: named `gentle-narwahl-files`,
-  `repo_path` pointing at it, and a ⌂ root row for `…/repo` — a directory the project didn't own.
+  `repo_path` pointing at it, and a ⌂ ROOT WORKTREE row for `…/repo` — a directory the project didn't own.
   `git worktree list --porcelain` always puts the main checkout first (verified: main first, then linked
   ones sorted by path), so it is the cheaper and more reliable root oracle, and it's already being called
   two lines later.
@@ -27,7 +27,7 @@ which follows a `gitdir:` file and its `commondir` hop. `reconcile_project_workt
   `repo_path.join(".git").join("HEAD")`; in a worktree `.git` is a *file*, so every stamp was `None`,
   `None == None`, and the project **never synced again after boot**. That alone is the "root row isn't
   matching my actual branch" half — confirmed live: root on `feature-x`, row still saying `main`
-  indefinitely, while a normally-rooted control picked up its new branch within one 2s tick. The sync loop
+  indefinitely, while a normally-rooted control picked up its new branch within one 2s tick. The WORKTREE SYNC loop
   now refuses to cache a `None` stamp.
 - **`is_main` was written once at insert and never updated** — no `UPDATE` of it existed anywhere. Nothing
   could repair a project seeded with the badge on the wrong row.
@@ -36,9 +36,9 @@ which follows a `gitdir:` file and its `commondir` hop. `reconcile_project_workt
   (plain `checkout` refuses), which frees `main` for the worktree to take. Check `git worktree list` before
   blaming the row.
 - **The pre-fix breakage self-heals but only halfway.** Forged the old state in sqlite and restarted: the
-  ⌂ root badge moves back onto the repo's checkout and the branch goes live again, but `repo_path` and the
+  ⌂ ROOT BADGE moves back onto the repo's checkout and the branch goes live again, but `repo_path` and the
   project `name` still point at the worktree (deliberately not migrated — it would silently repoint a
   project, and could collide with the repo added separately in the same workspace). Remove + re-add is the
   remedy for those two fields.
-- `crates/nebula-tui/*` was already dirty with another session's in-flight work when this started; the
+- `crates/nebula-tui/*` in the SHARED CHECKOUT was already dirty with another session's in-flight work when this started; the
   whole change is confined to `nebula-daemon`. See [Shared Working Tree Is Raced By Other Sessions].

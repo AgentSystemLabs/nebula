@@ -4,19 +4,19 @@
 the projects, worktrees row so I know how many terminals I need to check, as I navigate down into rows it
 should decrement and eventually hide the notification counts"
 
-**Did:** New `Agent::unseen` flag (`crates/nebula-core/src/entities.rs`), owned by the daemon.
+**Did:** New UNSEEN flag `Agent::unseen` (`crates/nebula-core/src/entities.rs`), owned by the DAEMON.
 `Store::set_agent_status` (`crates/nebula-daemon/src/store.rs`) now returns `(stamp, unseen)` and keeps
 the flag in the same `UPDATE`: running/needs_feedback → finished raises it, staying finished keeps it,
-leaving finished clears it, archived rows never raise it and `set_agent_archived` clears it; migration 19
+leaving finished clears it, archived rows never raise it and `set_agent_archived` clears it; MIGRATION 19
 adds the column. `ServerEvent::StatusChanged` carries `unseen`; new fire-and-forget
 `ClientRequest::MarkAgentSeen { id }` → `Daemon::mark_agent_seen` (`registry.rs`) broadcasts the agent
 upsert only when the flag actually flipped. `PROTOCOL_VERSION` 24 → 25. TUI:
-`event_loop.rs::mark_agent_seen` runs from `attach()` (every path that lands the pane on a session goes
-through it — cursor walk, restore, palette, snapshot re-attach) and from the `StatusChanged` arm when the
+MARK SEEN (`event_loop.rs::mark_agent_seen`) runs from `attach()` (every path that lands the pane on a session goes
+through it — cursor walk, restore, PALETTE, snapshot re-attach) and from the `StatusChanged` arm when the
 flip is for the session already in the pane; `app.rs::worktree_unseen` / `project_unseen` count;
-`ui.rs::row_badges` draws ` n done` (`th.done`) on project and worktree rows (it also carried a note badge
-until notes were removed 2026-08-26), and a
-session row swaps its ` claude` harness badge for ` done` (the link row's unread-count idiom). The badge
+`ui.rs::row_badges` draws the DONE BADGE ` n done` (`th.done`) on project and worktree rows (it also carried a note badge
+until NOTES were removed 2026-08-26), and a
+session row swaps its ` claude` HARNESS BADGE for ` done` (the link row's unread-count idiom). The badge
 read ` n new` in `th.ok` until 2026-08-27 — see [Done Reads Violet And Says "done"] for the rename and
 for the dot splitting violet (unread) from green (read) on the same `unseen` flag this entry added. README
 "Status dots" documents it. Tests: store `unseen_follows_the_status_and_clears_on_seen`; registry
@@ -28,7 +28,7 @@ for the dot splitting violet (unread) from green (read) on the same `unseen` fla
 - Daemon-side on purpose: the counter's whole point is turns that finished while no TUI was open, which a
   TUI-side set (even persisted in `UiState`) can never see — and two clients would clobber one blob.
   `pr_seen` / `MarkPrSeen` was the template.
-- The rule lives in the SQL `CASE` of `set_agent_status`, not in `AgentStatusMachine`: the machine dedups
+- The rule lives in the SQL `CASE` of `set_agent_status`, not in the STATUS MACHINE (`AgentStatusMachine`): the machine dedups
   unchanged statuses (`set_status` only emits on change), and the flag has to be atomic with the status
   it qualifies. Red → green counts (NeedsFeedback → Finished happens directly on a Stop / `idle_prompt`
   after a prompt); Fresh → Finished does not — a Stop nebula never saw the prompt for is not a

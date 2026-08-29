@@ -8,13 +8,13 @@ it more than 1 minute later, discard the remembered position and open fresh exac
 (first tab, row 0, focused on the tab strip). Reopening within the minute restores the position as it
 does now."
 
-**Did:** The first-open-on-strip + retain half already existed ([Settings Opens On The Tab Strip]);
+**Did:** The SETTINGS OVERLAY's first-open-on-strip + retain half already existed ([Settings Opens On The Tab Strip]);
 this adds the expiry on top. `App::settings_closed_at: Option<Instant>` and
 `SETTINGS_MEMORY_TTL` (60s) in `crates/nebula-tui/src/app.rs`, with `note_settings_closed` /
 `settings_memory_expired` / `forget_settings_focus` (tab 0, every tab's row 0, `on_tabs = true`, stamp
 cleared). In `event_loop.rs`, `Action::Settings` now goes through new `open_settings(app)` = expiry
 check + the existing `reopen_settings`; both ways out — `SettingsCmd::Close` (Esc/`q`/`s`) and the
-click-outside mouse path — go through new `close_settings(app)`, which stamps the time. README `s` row
+CLICK OUTSIDE mouse path — go through new `close_settings(app)`, which stamps the time. README `s` row
 mentions the minute. Tests: `settings_memory_expires_a_minute_after_closing`,
 `settings_reset_round_trip_ignores_the_memory_clock`, `clicking_outside_settings_stamps_the_close`.
 
@@ -24,7 +24,7 @@ mentions the minute. Tests: `settings_memory_expires_a_minute_after_closing`,
   user's hands whenever an old stamp had aged out. `open_settings` is the only from-the-panels entry.
 - Backdating in tests is `Instant::now().checked_sub(SETTINGS_MEMORY_TTL)` — `Option<Instant>` is the
   field type, so it drops straight in.
-- Another session's uncommitted work was in the tree the whole time (Help/Confirm click-outside,
+- Another session's uncommitted work was in the SHARED CHECKOUT the whole time (Help/Confirm click-outside,
   `Overlay::Help(HelpView)`, delete confirms): `confirm_click_outside_cancels_without_confirming` was
   failing and clippy flagged `event_loop.rs` `copy_via`'s `return` + `config.rs:1007` — none of it
   mine. See [Shared Working Tree Is Raced By Other Sessions] before chasing a red test you didn't cause.

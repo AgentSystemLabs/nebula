@@ -31,5 +31,5 @@ green, clippy and fmt clean; `make install` done.
   "focus changed" — there are ~135 `app.focus = Focus::…` assignments; hook there, not per assignment.
 - `schedule_pr_detail` still zeroes `pr_preview_scroll`; the focus paths deliberately don't call it. A
   closed PR under the cursor is still retired by the list reconcile (`reconcile_open_pr_cursor`).
-- The change is TUI-only (no protocol bump), so `make install`'s STALE DAEMON NOTE is generic here:
+- The change is TUI-only (no PROTOCOL VERSION bump), so `make install`'s STALE DAEMON NOTE is generic here:
   relaunching the `nebula` TUI picks it up, `nebula kill` isn't needed.

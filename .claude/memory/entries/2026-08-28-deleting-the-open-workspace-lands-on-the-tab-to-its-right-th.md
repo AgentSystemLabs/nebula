@@ -15,7 +15,7 @@ the first workspace' reseat."
 position with `workspaces.iter().position(..)` **before** `apply_removal`. Every delete path — bar, switcher,
 CONTEXT MENU, other instance, CLI — arrives through that one delta, so nothing else changed. Test
 `deleting_the_open_workspace_lands_on_its_right_neighbor_then_its_left` (first / middle / last / not-open).
-README rows for the switcher and the Workspaces keymap note it. 469 nebula-tui tests green.
+README rows for the WORKSPACE SWITCHER and the Workspaces keymap note it. 469 nebula-tui tests green.
 
 **Gotchas:**
 - The prompt's first sentence ("select the previous") contradicts its third ("to the right"); the pick

@@ -1,11 +1,11 @@
-# The Root Worktree Row's Lower Half Wasn't Clickable — 2026-08-27
+# The ROOT WORKTREE Row's Lower Half Wasn't Clickable — 2026-08-27
 
 **Asked:** "I can't seem to click on certain places of the root worktree row in some areas, other rows are
 fully clickable zones, fix it"
 
-**Did:** Every sidebar pill is a 3-row cell (pad, text, pad) stacked on a 2-row `PILL_H` stride, but its
+**Did:** Every sidebar PILL ROW is a 3-row cell (pad, text, pad) stacked on a 2-row `PILL_H` stride, but its
 hit rect was `rows_rect_at(inner, y, PILL_H)` — top pad + text only. Stacked rows hide that because the
-next pill's top pad covers the gap; the root row sits over a quiet spacer row, so its bottom pad (the
+next pill's top pad covers the gap; the ROOT WORKTREE row sits over a quiet spacer row, so its bottom pad (the
 lower half of the pill as drawn) fell through to `PanelBg`. Same dangling pad on the last pill of any
 group and the last of the list, in both panels. New `pill_hit_height(top, next_top)` in
 `crates/nebula-tui/src/ui.rs` (next to `rows_rect_at`) sizes the target as `min(3, next_top - top)`:

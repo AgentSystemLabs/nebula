@@ -1,4 +1,4 @@
-# Project Terms: Detect Every Session, Promote Only What Recurred — 2026-08-28
+# PROJECT TERMS: Detect Every Session, Promote Only What Recurred — 2026-08-28
 
 **Asked:** "update the project-terms skills: keep the architecture around the self improving look, but the
 main improvement I'd make is changing project-terms from \"harvest words from every session\" to \"detect
@@ -20,7 +20,7 @@ TERM, an ambiguity split, a rename, a retirement, a stale *Where*. "name this" /
 (not retired). `TERMS.md` got the § 14 section (between Retired and the Alias index, so the index stays
 "at the bottom" as `CLAUDE.md` says), an intro sentence about the ledger, and a reworded PROJECT TERMS row;
 `CLAUDE.md` (the "no TERM yet" sentence and the `project-terms` paragraph) and `AGENTS.md` (the "keep the
-glossary true" paragraph) now describe detect-then-promote instead of add-on-sight. The loop itself
+glossary true" paragraph) now describe detect-then-promote instead of add-on-sight. The SELF-IMPROVING LOOP itself
 (MEMORY LOG + `TERMS.md` → PROMPT DADDY → work → NEBULA-MEMORY SKILL → PROJECT TERMS) is unchanged.
 
 **Gotchas:**

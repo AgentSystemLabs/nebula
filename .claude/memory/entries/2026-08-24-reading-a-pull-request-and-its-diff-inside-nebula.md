@@ -4,31 +4,31 @@
 the PR directly in nebula for me to read? also the ability to just view the git diff of that PR directly
 in nebula?" (follow-on to the OPEN PRS group below.)
 
-**Did:** Hover (cursor rests on an open-PR row) → the terminal pane becomes a reader: headline, state,
+**Did:** Hover (cursor rests on an open-PR row) → the TERMINAL PANE becomes a reader (the PR PREVIEW): headline, state,
 `+adds -dels · N files`, description, then the whole conversation. New
 `crates/nebula-tui/src/pr_preview.rs` (`wrap`, `fit`, `lines`) builds it as a flat `Vec<Line>` so
 scrolling is a slice. Fetch is `pull_request::detail()` (`gh pr view <n> --json …`), debounced
 `PR_DETAIL_DEBOUNCE = 300ms` via `schedule_pr_detail`/`lookup_pr_detail`, cached per URL for the
 session. `g` on a PR row runs `pull_request::diff()` (`gh pr diff <n>`), `split_unified_diff()` cuts it
-per file, and `open_pr_diff_view` opens the **existing** `DiffView` on it via a new
+per file, and `open_pr_diff_view` opens the **existing** DIFF VIEWER (`DiffView`) on it via a new
 `DiffView::prefetched: Option<HashMap<String,String>>` that `git_diff::load_selected_diff` reads instead
 of shelling out. `ui::terminal_frame` now delegates to `titled_frame(title, …)` so the pane can be
 called PULL REQUEST.
 
 **Gotchas:**
 - **`draw_terminal` returning early on a PR row is the whole trick** — the attachment underneath stays
-  live, so walking into the OPEN PRS group and back never churns detach/attach. (It was modeled on the
-  project-divider branch that sat above it until dividers were removed on 2026-08-25; it is now the only
+  live, so walking into the PROJECT OPEN PRS GROUP and back never churns detach/attach. (It was modeled on the
+  PROJECT DIVIDERS branch that sat above it until dividers were removed on 2026-08-25; it is now the only
   early return there.) Do not try to "clear" the terminal for this.
 - **ratatui silently clips an overwide `Line`, taking the rest of the row with it.** A header row built
   from spans (state · author · base ← head) blew past the pane at width 24 and the test
   `no_rendered_line_overflows_the_pane` is what caught it. Everything the preview emits now goes through
   `wrap` (prose) or `fit` (span rows); `fit` drops whole segments from the end, then ellipsises.
-- Reviewed ✓ marks are **deliberately not persisted** for a PR diff: `review::store_marks` prunes any
+- Reviewed ✓ marks (the REVIEWED MARK) are **deliberately not persisted** for a PR diff: `review::store_marks` prunes any
   key that isn't a directory on disk (`store.worktrees.retain(|root, _| Path::new(root).is_dir())`), and
   a pull request has no path. In-session marks still sink files to the bottom, which is the useful half.
-- `shift+up`/`shift+down` were `move_project_up/down` at the time (unbound since 2026-08-28), so the preview scrolls on
-  **PgUp/PgDn/Home/End** (+ wheel) only — handled as raw `KeyCode`s *before* the keymap lookup in
+- `shift+up`/`shift+down` were `move_project_up/down` (MOVE PROJECT) at the time (unbound since 2026-08-28), so the preview scrolls on
+  **PgUp/PgDn/Home/End** (+ wheel) only — handled as raw `KeyCode`s *before* the KEYMAP lookup in
   `handle_key`, since those chords are unbound at panel scope.
 - Key handlers can't reach the loop's channels, so the `gh pr diff` sender lives on
   `App::pr_diff_tx` — the `vim_tx` precedent. Without it `request_pr_diff` silently no-ops (which is

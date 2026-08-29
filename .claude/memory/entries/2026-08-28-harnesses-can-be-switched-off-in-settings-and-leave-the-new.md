@@ -9,7 +9,7 @@ also blocks the PR SESSION launch with a FLASH. (no questions asked)
 
 **Did:** `crates/nebula-tui/src/config.rs`: `claude_enabled` / `codex_enabled` / `cursor_enabled: bool`
 (default true), `SettingKind::{ClaudeEnabled, CodexEnabled, CursorEnabled}` as `on_off` toggles, the
-Agents tab regrouped per kind (enabled / model / effort), `Config::kind_enabled(kind)` and
+AGENTS TAB regrouped per kind (enabled / model / effort), `Config::kind_enabled(kind)` and
 `enabled_kinds()` (filters `AgentKind::ALL`), three `write_into` inserts. `event_loop.rs`:
 `open_new_agent_picker` builds its rows from `enabled_kinds()` via `kind_label` and flashes instead of
 opening when the list is empty; `apply_setting_at` refuses to turn off the last harness with
@@ -23,7 +23,7 @@ callers `out.extend(..)`. Six new tests (`harness_toggles_default_on_and_persist
 `agents_tab_toggles_a_harness_and_refuses_the_last_one`) plus a `with_config_json` test helper. README
 (picker walkthrough, settings list, `s` row) and TERMS (NEW SESSION PICKER, SETTINGS OVERLAY, SETTING)
 updated. nebula-tui 496 green, clippy and fmt clean, e2e `tui_projects_worktrees_agents_navigation` green.
-TUI-only: no PROTOCOL VERSION bump, no daemon change. Not committed (shared tree).
+TUI-only: no PROTOCOL VERSION bump, no daemon change. Not committed (SHARED CHECKOUT).
 
 **Gotchas:**
 - **A test that never pinned the config passes only until the code under it starts calling
@@ -41,7 +41,7 @@ TUI-only: no PROTOCOL VERSION bump, no daemon change. Not committed (shared tree
   `PrewarmAgent` in `run_menu_action` already uses the picked kind). Its keep-warm re-arm
   (`app.next_keepwarm`) is deliberately left alone so re-enabling Claude warms on the next tick; an
   already-warm spare simply ages out — disabling kills nothing.
-- Another session removed the picker's Terminal row the same day (the refined prompt's "Terminal row
+- Another session removed the NEW SESSION PICKER's Terminal row the same day (the refined prompt's "Terminal row
   stays" clause was moot by the time work started), and the one red test in the run
   (`project_and_worktree_rows_show_time_since_last_interaction`) is that or another session's
   uncommitted test — it is not in `HEAD`. Check `git grep <test> HEAD` before blaming your change.

@@ -5,18 +5,18 @@
 **Did:** Nothing to commit. Both are environmental, and telling them apart saves hours.
 
 **Gotchas:**
-- **Cold-exec flake.** All 16 `e2e_pty` tests fail with `daemon socket never appeared`. First exec of a
+- **Cold-exec flake.** All 16 E2E PTY (`e2e_pty`) tests fail with `daemon socket never appeared`. First exec of a
   freshly relinked `target/debug/nebula` can stall for seconds on macOS signature validation, so the test
   panics at its 5s deadline, `TempDir` drop deletes the runtime dir, and the late daemon logs
   `FATAL bind …/daemon.sock: No such file or directory`. Fingerprint: orphaned
   `$TMPDIR/.tmp*/data/state/daemon.log` files. **Just rerun** — it passes clean the second time.
-- **Orphaned daemons — leak fixed at the source 2026-08-24.** Same generic error, but **no `daemon.log`
+- **ORPHAN DAEMONS — leak fixed at the source 2026-08-24.** Same generic error, but **no `daemon.log`
   is written at all** and reruns don't help; a test that passes in the full suite fails alone, seemingly
   at random. Cause: dozens of stray `nebula daemon --foreground` processes, each holding watchers/fds.
   The leak was `e2e_pty.rs`'s `TestEnv` having **no `Drop`** — a test that panicked before its closing
-  `Shutdown` dropped the `std::process::Child` without killing it, and the daemon detaches and outlives
+  `Shutdown` dropped the `std::process::Child` without killing it, and the DAEMON detaches and outlives
   the whole `cargo test` run. `DaemonProc` (a `Deref`/`DerefMut` newtype around the `Child`, defined just
-  above `connect()`) now SIGTERMs on drop, so panicking tests clean up. `e2e_tui.rs`'s `TuiHarness`
+  above `connect()`) now SIGTERMs on drop, so panicking tests clean up. E2E TUI's `TuiHarness` (`e2e_tui.rs`)
   always had its own `Drop`. Nothing should accumulate any more — **62 had piled up before this**, so a
   machine that predates the fix may still need one reap.
 - Diagnosing a suspected orphan pile: `ps -eo pid,command | grep -c "[n]ebula daemon"`. Anything past a

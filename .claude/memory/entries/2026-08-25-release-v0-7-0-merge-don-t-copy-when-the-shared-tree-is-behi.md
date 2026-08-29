@@ -2,13 +2,13 @@
 
 **Asked:** "commit and push and make a next version release"
 
-**Did:** Released the shared tree's uncommitted Workspaces column and the new `nebula browser`
+**Did:** Released the SHARED CHECKOUT's uncommitted WORKSPACES COLUMN and the new NEBULA BROWSER `nebula browser`
 (`crates/nebula/src/browser.rs`, ttyd on loopback) as `v0.7.0`. Commits `1e0c093` (feature), `71e2035`
 (memory), `ead231d` (merge), `d9239d1` (focus-walk fix), `3306dc8` (bump). All 4 matrix targets built;
-notes rewritten.
+RELEASE NOTES rewritten.
 
 **Gotchas:**
-- **The release skill's "copy files by content into a worktree cut from `origin/main`" is wrong when
+- **The RELEASE SKILL's "copy files by content into a RELEASE WORKTREE cut from `origin/main`" is wrong when
   local `main` is behind.** It was 12 commits behind here, and the dirty files predate all of them, so
   copying would have silently reverted the `h`/`l` panel remap (#12), the Linux clipboard (#11), and the
   pill-corner fix. What works: `git worktree add -b release-vX.Y.Z "$W" <local HEAD>` — the dirty files
@@ -16,7 +16,7 @@ notes rewritten.
   `git merge origin/main`. Only `.claude/MEMORY.md` and `README.md` conflicted.
 - **A textually clean merge is not a green one.** Every code file auto-merged, and
   `event_loop.rs::h_and_l_walk_panel_focus_like_the_arrows` still failed: it asserts `h` from Projects
-  "stops at projects", written before the Workspaces column made `App::leftmost_focus()`
+  "stops at projects", written before the WORKSPACES COLUMN made `App::leftmost_focus()`
   (`crates/nebula-tui/src/app.rs:2701`) return `Focus::Workspaces`. The `Action::FocusLeft` hint in
   `keymap.rs` carried the same stale wording. Merge conflicts flag the text collisions, not the
   semantic ones — run the suite before you tag, not after.

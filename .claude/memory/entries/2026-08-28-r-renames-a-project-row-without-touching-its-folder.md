@@ -1,4 +1,4 @@
-# `r` Renames A Project Row Without Touching Its Folder — 2026-08-28
+# `r` Renames A PROJECT Row Without Touching Its Folder — 2026-08-28
 
 **Asked:** "Allow me to rename a project from the projects section, by using hte shortcut "r" if a project
 is selected. Currently the project name is the folder name. We don't want to changhe the folder name, is
@@ -17,12 +17,12 @@ carried the folder, so a rename is one `UPDATE`. `nebula-core/src/entities.rs` g
 folder name only while it differs from `name`. That derived check *is* the "has it been renamed?" flag;
 no new field, no migration. Daemon: `Store::rename_project`, `Daemon::rename_project`
 (`registry.rs:~739`, trims, and an **empty name resets the row to the folder name** — the only way back
-from a rename), `ClientRequest::RenameProject` + **protocol 28 → 29**, `server.rs` dispatch. TUI:
+from a rename), `ClientRequest::RenameProject` + **PROTOCOL VERSION 28 → 29**, `server.rs` dispatch. TUI:
 `PromptKind::RenameProject` / `MenuAction::RenameProject`, the previously-empty
 `Action::Rename => Focus::Projects => {}` arm in `event_loop.rs:1455`, a "Rename" row in both project
-context menus (keyboard `m` and right-click), footer hint, help-overlay PROJECTS row, README keymap row.
+CONTEXT MENUs (keyboard `m` and right-click), FOOTER hint, HELP OVERLAY PROJECTS row, README keymap row.
 `ui.rs::draw_projects` grows a renamed row to `PROJECT_BTN_H + 1` and renders the folder name on the row
-under the name as `└ <folder>` — the `└` flush with the name's first column (not the status dot), the
+under the name as `└ <folder>` — the `└` flush with the name's first column (not the STATUS DOT), the
 whole line `th.dim` **plus `Modifier::DIM`**. Three signals, because a fourth is not available: see the
 font-size gotcha below. Tests:
 `rename_project_relabels_the_row_and_leaves_the_folder_alone` (registry),
@@ -78,7 +78,7 @@ clean.
   both fixes it but then trips `clippy::too_many_arguments` (8/7). The shape that satisfies both is one
   `text: Vec<Vec<Span<'a>>>` param whose entries take consecutive rows from `text_row` — 7 args, no
   chain. `render_row` passes `vec![spans]`.
-- **The Projects panel does not scroll** — `rows_rect` returns None past the bottom and `draw_projects`
+- **The PROJECTS PANEL does not scroll** — `rows_rect` returns None past the bottom and `draw_projects`
   `break`s — and `PROJECT_BTN_H` has no callers outside that one function. So a variable row height is
   contained entirely in `draw_projects`; nothing in `event_loop.rs` does row math for this panel.
 - **`seed_tree` names its project `demo` at `/tmp/demo`**, so `folder_subtitle()` is None and not one of
@@ -87,5 +87,5 @@ clean.
   alone won't do it, since that helper derives `repo_path` as `/tmp/{name}`.
 - **A `TestBackend` buffer line can't be byte-sliced** (`&line[..30]` panics inside `●`/`▌`); use
   `line.chars().take(n)` when dumping the buffer to eyeball a column.
-- Protocol 29 means a **v28 daemon still running from before the build refuses the new client** until it
+- PROTOCOL VERSION 29 means a **v28 daemon still running from before the build refuses the new client** until it
   is restarted — expected, and the client already offers the kill-and-restart.

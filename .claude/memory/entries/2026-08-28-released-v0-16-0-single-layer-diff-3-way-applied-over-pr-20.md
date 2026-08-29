@@ -9,7 +9,7 @@ SHARED CHECKOUT's HEAD (`31d3add`) was the v0.15.0 tip itself and `origin/main` 
 -b release-v0.16.0 … origin/main`, `git apply --3way local.patch`, `cp` the 125 untracked files (`while
 IFS= read -r`). Five conflicts, all mechanical except one: `config.rs` (keep `HideProjects`/`HideWorktrees`
 *and* `ClaudeEnabled`; `shown_hidden` + `pub(crate) cycle_choice`), `event_loop.rs` (keep the ⇧P/⇧B arms,
-drop the retired `MoveProject*` arms, take the `j`,`j` MoveDown arm; delete the old walk functions),
+drop the retired `MoveProject*` arms, take the `j`,`j` MoveDown arm; delete the old PANEL WALK functions),
 README / TERMS.md column-by-column, `.claude/MEMORY.md` (take the local index, extract origin's PR #20
 block into `entries/2026-08-28-independent-projects-panel-and-worktrees-panel-visibility.md` +
 `index_line.py`). The non-mechanical one: PR #20's `next_visible_focus` / `previous_visible_focus` walk
@@ -17,7 +17,7 @@ had to be ported by hand into `crates/nebula-tui/src/event_loop/focus_walk.rs` (
 new `bar_return_target` so `j`,`j` never lands on a hidden panel). Gate in the RELEASE WORKTREE on the
 v0.15.0 `vtarget`: `make memory-check` ok, fmt, clippy `-D warnings`, **772 passed, 0 failed**. Three
 commits (`0225eac` feature / `bad8ea4` scaffolding / `bbe8bf0` Release), `git push origin
-release-v0.16.0:main`, tag, all four matrix targets green, notes via `gh release edit --notes-file`.
+release-v0.16.0:main`, tag, all four matrix targets green, RELEASE NOTES via `gh release edit --notes-file`.
 PROTOCOL VERSION 30 → **32** (origin never touched `protocol.rs`; no collision; no MIGRATION). Then
 reconciled the SHARED CHECKOUT: `git diff HEAD | shasum` and the untracked count still matched the
 snapshot, so `git stash push -u -m "pre-v0.16.0-release shared-tree state"` + `git pull --ff-only origin

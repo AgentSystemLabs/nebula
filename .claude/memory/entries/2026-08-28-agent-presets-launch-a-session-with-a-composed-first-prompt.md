@@ -29,7 +29,7 @@ DIR beside CONFIG.JSON, tmp+rename save, `compose`, `spec_label`, `with_presets_
 `crates/nebula-tui/src/preset_overlays.rs` (`AgentPresetsView`, `PresetField`, `AgentPresetEditor`,
 open/reopen/save/confirm/task fns, `handle_list_key` / `handle_editor_key` / `handle_list_mouse`,
 `draw_list` / `draw_editor`) — extracted out of `app.rs` / `event_loop.rs` / `ui.rs` under CLAUDE.md's
-new "Keep modules small" rule, which landed mid-task. `Action::AgentPresets` (`agent_presets`, SESSIONS
+new KEEP MODULES SMALL rule, which landed mid-task. `Action::AgentPresets` (`agent_presets`, SESSIONS
 group, default `e`), `Overlay::AgentPresets` / `AgentPresetEditor`, `PromptKind::AgentPresetTask`
 (multi-line, reuses the CLOUD TASK EDITOR draw arm and validation), `PendingAction::DeleteAgentPreset`
 (both answers reopen the list), `AgentLaunchDraft { starting_prompt, reopen_on_error }` with the

@@ -2,7 +2,7 @@
 
 **Asked:** (follow-on from the Aug 14 codex work — codex sessions still weren't reporting status)
 
-**Did:** `22f1b24` moved codex's hooks to `$CODEX_HOME/hooks.json` and started trusting `idle_prompt`.
+**Did:** `22f1b24` moved codex's MANAGED HOOKS (the CODEX HOOK DIALECT) to `$CODEX_HOME/hooks.json` and started trusting the IDLE PROMPT `idle_prompt`.
 
 **Gotchas:**
 - Codex gates hooks behind a trust modal keyed by the **hook file's absolute path**, recorded in

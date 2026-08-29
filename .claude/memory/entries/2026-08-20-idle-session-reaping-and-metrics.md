@@ -9,10 +9,10 @@ never reap pinned sessions, also make this entire reap process a setting configu
 off." Alongside: "add some type of metrics modal which will show the overal usage of nebula combined with
 all the other terminals open, including memory usage for individual and overall."
 
-**Did:** `e11f838` — idle reaping, metrics tracking, memory stats in the footer.
+**Did:** `e11f838` — the IDLE REAPER (idle reaping), METRICS SNAPSHOT tracking (the MEMORY MODAL), memory stats in the FOOTER.
 
 **Gotchas:**
-- **Pinned sessions are never reaped**, and reaping is switchable off entirely. That constraint came from
+- **Pinned sessions are never reaped by the IDLE REAPER**, and reaping is switchable off entirely. That constraint came from
   the user realizing mid-feature that agents may be running long jobs — treat it as load-bearing.
   *(Superseded 2026-08-28: PIN was removed outright, and its reap exemption with it; the off switch is the
   remaining protection — see `2026-08-28-pin-and-the-recent-group-are-gone-one-flat-list-in-recency`.)*

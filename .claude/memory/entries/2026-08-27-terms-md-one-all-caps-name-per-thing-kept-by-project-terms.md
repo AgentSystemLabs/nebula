@@ -7,21 +7,21 @@ with useful new terms after every prompt like we do for nebula-memory. update th
 always speak in those terms. update the prompt-daddy to use those terms when rewrighting your prompt"
 → prompt-daddy: no option picked; the note said *"make sure terms are always all caps"*.
 
-**Did:** New `TERMS.md` at the repo root — 254 TERMS in 13 sections (the tree, plumbing, layout, status,
+**Did:** New `TERMS.md` (PROJECT TERMS) at the repo root — 254 TERMS in 13 sections (the tree, plumbing, layout, status,
 focus/keys, overlays, agents/hooks, daemon mechanisms, cloud, CLI, config/env, dev workflow, retired) plus
 an **Alias index** mapping the user's words to TERMS; every row is `TERM | meaning | "aliases" | where`,
 with the aliases quoted from the **Asked:** lines of this log and the *where* symbols verified by grep.
 Built from two parallel sweeps (this log lines 705–2425 for vocabulary; the code for keymap actions,
 overlays, CLI, routes, env vars, Makefile) plus README/ARCHITECTURE. New
-`.claude/skills/project-terms/SKILL.md` (runs after `nebula-memory` on every task; edits only for a new,
+`.claude/skills/project-terms/SKILL.md` (runs after the NEBULA-MEMORY SKILL (`nebula-memory`) on every task; edits only for a new,
 renamed, retired, or newly-aliased TERM — *superseded 2026-08-28*: new names now wait in the Candidates
 ledger until a separate task uses them again, see "Project Terms: Detect Every Session, Promote Only
 What Recurred"). `CLAUDE.md` rewritten: read `TERMS.md` with the memory log, a
 "Speak in the project's terms" section (ALL CAPS in replies, `AskUserQuestion` options, commits, memory
 entries; alias → TERM on first use; never rename code to match), and the `project-terms` call after
-`nebula-memory`. `prompt-daddy` gained a TERMS row in its failure table, a TERMS lookup in the grounding
+`nebula-memory`. PROMPT DADDY (`prompt-daddy`) gained a TERMS row in its failure table, a TERMS lookup in the grounding
 step, an "in the project's TERMS" rewrite rule, and a worked example in caps. `AGENTS.md` mirrors the
-protocol for codex/cursor; the `release` skill's scaffolding-commit list now includes `TERMS.md`.
+protocol for codex/cursor; the RELEASE SKILL's scaffolding-commit list now includes `TERMS.md`.
 
 **Gotchas:**
 - **The memory-mining subagent stopped without reporting once and had to be resumed with `SendMessage`**;

@@ -4,29 +4,29 @@
 prompts for a worktree, claude via a skill + system prompt or something knows to create the proper
 worktree in nebula and assiocate the sesion with it"
 
-**Did:** The Sessions context-menu verb "Move to worktree" and its picker are gone
+**Did:** The SESSIONS PANEL CONTEXT MENU verb "Move to worktree" (MOVE TO WORKTREE) and its picker are gone
 (`MenuAction::MoveAgent`/`MoveAgentToWorktree`, `open_move_agent_picker` in
 `crates/nebula-tui/src/event_loop.rs`); `ClientRequest::MoveAgent` stays as the daemon primitive
 (e2e `move_agent_respawns_live_session_in_target_worktree` still covers it). In its place:
 
-- **CLI** `nebula worktree [name…] [--base <ref>]` (`crates/nebula/src/main.rs`,
+- **CLI** NEBULA WORKTREE — `nebula worktree [name…] [--base <ref>]` (`crates/nebula/src/main.rs`,
   `ipc::enter_worktree_for_current_agent`) — same `NEBULA_AGENT_ID` + socket path as `nebula rename`;
   spaces slugify, no name = `branch_name::random_name`. Sends the new `ClientRequest::EnterWorktree`,
   gets `ServerEvent::WorktreeEntered { worktree, outcome: EnterOutcome }` back. Its stdout is written
   for the model that ran it ("finish now, you'll be resumed inside the worktree").
-- **Daemon** `Daemon::enter_worktree` (`registry.rs`): existing branch row or `create_worktree` (nebula's
-  `<repo>-worktrees/<branch>` layout), `set_agent_worktree` + broadcast **immediately**, and — only if
+- **Daemon** WORKTREE RELOCATION — `Daemon::enter_worktree` (`registry.rs`): existing branch row or `create_worktree` (the WORKTREE DIR layout,
+  `<repo>-worktrees/<branch>`), `set_agent_worktree` + broadcast **immediately**, and — only if
   the PTY is alive — an entry in the new `pending_moves` map. `complete_pending_move`, called from the
   hook drain loop in `lib.rs`, does the kill + `claude --resume <sid> … "<relocation prompt>"` respawn on
   `Stop` (or `Notification idle_prompt`). Any other spawn of the agent clears its pending entry.
-- **Claude guidance** rides `--append-system-prompt` on every non-cloud claude spawn
+- **Claude guidance** (WORKTREE GUIDANCE) rides `--append-system-prompt` on every non-cloud claude spawn
   (`CLAUDE_WORKTREE_GUIDANCE`, `agent_spawn_command_with`): don't use `EnterWorktree`, run
   `nebula worktree <name>`, then end the turn. Installer adds `Bash(nebula worktree:*)` to the allow list
   next to the rename rule (`CLAUDE_ALLOW_RULES`). Rejected a `~/.claude/skills` install: a skill is only
   loaded on description match and would live outside nebula's per-spawn hook management.
 - **TUI** follows a daemon-initiated re-home: an agent upsert whose `worktree_id` changed for the
-  *selected* session sets `select_when_seen` (event_loop.rs `Entity::Agent` arm), so the cursor and pane
-  ride along instead of landing on whatever slid into the slot. Also helps the hook-cwd reparent.
+  *selected* session sets `select_when_seen` (SELECT-WHEN-SEEN, event_loop.rs `Entity::Agent` arm), so the cursor and pane
+  ride along instead of landing on whatever slid into the slot. Also helps the CWD REPARENT.
 
 Tests: `enter_worktree_*` + `pending_relocation_ignores_the_old_cwd_until_the_turn_ends` (registry),
 `spawn_command_initial_prompt_is_claudes_positional_argument`,
@@ -48,7 +48,7 @@ Tests: `enter_worktree_*` + `pending_relocation_ignores_the_old_cwd_until_the_tu
   `claude --help` (2.1.246); the argv shape is unit-tested, but **the live auto-continue after a resume
   was not exercised in this session** — first thing to watch when trying it for real. Codex/cursor get no
   continuation prompt (unknown whether their resume takes one); they come back idle.
-- **Proving a respawn landed in the right directory without attaching:** the e2e stub agent does
+- **Proving a respawn landed in the right directory without attaching:** the E2E PTY STUB AGENT does
   `pwd >> $NEBULA_AGENT_ID.pwd` on every boot, so "one line, then two lines with the second ending in
   `repo-worktrees/feat-x`" is the whole assertion — cheaper than the Attach/Input/`pwd` dance the
   MoveAgent e2e uses.

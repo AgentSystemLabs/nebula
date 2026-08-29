@@ -9,7 +9,7 @@ hotkey for t which shows a full tree browser modal with a view of the file conte
 refined to "in the file preview, it should be syntax highlighted, also when I select the file, it
 shouldn't open a new vim modal, the right panel should just focus and let editing with vim."
 
-**Did:** `998901f` (file finder, grep overlay, path links, in-TUI editor via
-`crates/nebula-tui/src/vim_term.rs`) and `7ebc264` (tree browser with live filter and syntax preview).
-Later `6787999` numbered the lines in file previews but not directory listings. The editor command is
+**Did:** `998901f` (FILE FINDER, GREP VIEW, OPTION CLICK path links, the VIM MODAL via
+`crates/nebula-tui/src/vim_term.rs`) and `7ebc264` (TREE BROWSER with live filter and syntax preview).
+Later `6787999` numbered the lines in file previews but not directory listings. The EDITOR command is
 configurable — the user asked for neovim support explicitly.

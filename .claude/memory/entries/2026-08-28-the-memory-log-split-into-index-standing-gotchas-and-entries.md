@@ -1,4 +1,4 @@
-# The MEMORY LOG Split Into Index, Standing Gotchas And Entries — 2026-08-28
+# The MEMORY LOG Split Into Index, STANDING GOTCHAS And Entries — 2026-08-28
 
 **Asked:** "is our custom shared memory system seem useful? is it possible to verify it's improving my ai
 harnesses output?" → "what is a better approach to this memory system?" → "implement this"
@@ -14,7 +14,7 @@ except for the pure-question short form.
 - **Layout.** `.claude/MEMORY.md` is the index: one line per entry (`- DATE · [Title](memory/entries/…)
   · TERMS: … · files: … · gotchas: N`), newest first. `.claude/memory/entries/<date>-<slug>.md` hold the
   116 entries verbatim — 113 split out of the monolith by a scratchpad script plus two a concurrent
-  session wrote mid-migration and this one. `.claude/memory/gotchas.md` holds the standing gotchas:
+  session wrote mid-migration and this one. `.claude/memory/gotchas.md` holds the STANDING GOTCHAS:
   three subagents condensed the monolith's 428 bullets a slice each (12 dropped as already enforced by a
   named test), merged with the nine lines a concurrent session had started, regrouped by TERMS.md
   section with the TERM inline (96 per-TERM groups cost as many header lines as gotchas), three
@@ -36,7 +36,7 @@ except for the pure-question short form.
 - **Skills and rules.** NEBULA-MEMORY SKILL rewritten for the three layers (entry file → index line →
   standing-gotcha promotion, `· re-hit ×N date`, `· retire: <test or hook>`, `**Corrections:** N`);
   PROMPT DADDY skips a pure question; OUTPUT DOCTOR gained the two-section question form; `CLAUDE.md`,
-  `AGENTS.md`, `.cursor/rules/nebula-memory.mdc`, project-terms and the RELEASE SKILL point at the new
+  `AGENTS.md`, `.cursor/rules/nebula-memory.mdc`, PROJECT TERMS and the RELEASE SKILL point at the new
   files. `TERMS.md`: MEMORY LOG row rewritten; RECALL HOOK, GUARD HOOK, STANDING GOTCHAS, MEMORY CHECK
   ledgered as candidates.
 - **Not done:** the replay ablation from the assessment (headless `claude -p` over past entries with and

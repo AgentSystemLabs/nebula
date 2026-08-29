@@ -3,7 +3,7 @@
 **Asked:** "when running nebula browser, there is a bunch of empty space in the right side of the terminal
 panel... fix this. running nebula in iterm or ghostty doesn't have this extra space"
 
-**Did:** One line of ttyd args: `ttyd_args` (`crates/nebula/src/browser.rs:87`) now passes
+**Did:** One line of NEBULA BROWSER's ttyd args: `ttyd_args` (`crates/nebula/src/browser.rs:87`) now passes
 `-t fontSize=13`, plus a test `a_font_client_option_is_passed_so_ttyd_refits_after_the_renderer_swap`.
 The TUI was never at fault — it filled every column it was given; the xterm.js **grid** was too narrow.
 Measured before/after through the real `nebula browser` at a 1600px window: 201 cols / 1407px grid /
@@ -37,5 +37,5 @@ the DOM renderer never rounds — but it is the slow renderer for a TUI that red
   container has no framework keys). `window.term._core._renderService.dimensions` and
   `_charSizeService.width` are what prove a measure/render mismatch; the `.xterm-helper-textarea`'s inline
   `width`/`height` are the rendered cell dimensions if you only need a quick read.
-- A `make browser` run of your own leaves a `ttyd … ~/.cargo/bin/nebula` on 7681 that is **the user's**,
+- A `make browser` (MAKE BROWSER) run of your own leaves a `ttyd … ~/.cargo/bin/nebula` on 7681 that is **the user's**,
   not test residue. Match on the port you started before `pkill`.

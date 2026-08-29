@@ -33,7 +33,7 @@ DEV INSTANCE daemon still runs the old build (MAKE CYCLE is the user's).
   *does* deliver SubagentStop (Stop after it → FINISHED at once). **`TaskStop`-killing a subagent delivers
   no SubagentStop at all** — that orphan is what the 30 min quiet grace is for; under the old code it
   went green at +60 s, now it stays yellow ≤30 min. Worth knowing before "stuck on yellow" gets reported.
-- The daemon log records no hook traffic at `info` (`hook received` is `debug`, and `hookEvent=` never
+- The DAEMON LOG records no hook traffic at `info` (`hook received` is `debug`, and `hookEvent=` never
   appears in `daemon.log`), so the store row is the only cheap live oracle for status timing.
 - When a background subagent finishes, Claude re-invokes the main turn (task-notification) — that is
   `Progress{busy:true}` (a no-op while held) followed by a real Stop, so the drain grace is rarely what

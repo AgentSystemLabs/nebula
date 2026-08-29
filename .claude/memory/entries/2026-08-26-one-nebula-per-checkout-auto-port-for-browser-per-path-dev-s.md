@@ -3,8 +3,8 @@
 **Asked:** "merge latest from origin main into this and verify it works, find a way to be able to run nebula
 without port conflicts as i run in various worktrees"
 
-**Did:** Surveyed what actually binds anything first — the answer is *one* thing. The daemon uses a unix
-socket (`paths::socket_path()`), and the hook receiver already binds `127.0.0.1:0`
+**Did:** Surveyed what actually binds anything first — the answer is *one* thing. The DAEMON uses a unix
+socket (`paths::socket_path()`), and the HOOK RECEIVER already binds `127.0.0.1:0`
 (`nebula-daemon/src/hooks/mod.rs:156`), so neither can ever clash. The only fixed port in the tree is
 ttyd's, so that plus the Makefile is the whole fix.
 
@@ -32,14 +32,14 @@ directly above `set_show_workspaces`; both sides prepended a memory entry).
   drove the other checkout's binary — the exact "I rebuilt and my change isn't there" the Makefile warns
   about elsewhere. Worse, `dev-prep` calls `dev-stop`, so starting one worktree SIGTERMed the other's
   daemon out from under it. Nothing reports either; it looks like your build didn't take.
-- **The runtime dir gets the hash alone, not the worktree name.** It holds the unix socket and SUN_LEN is
+- **The RUNTIME DIR gets the hash alone, not the worktree name.** It holds the unix socket and SUN_LEN is
   104 bytes on macOS; `/tmp/nebula-dev-<8hex>/daemon.sock` is 36 and safe for any checkout name. The
   readable name goes in `DEV_DATA`, which has no such limit.
 - **The old flat `~/.nebula-dev/{nebula.db,config.json,state/}` is now orphaned** beside the new
   `<name>-<slot>/` dirs. `dev-seed` re-copies from the real DB per slot, so nothing is lost — but the old
   files are dead weight and can be deleted.
 - **`~/.nebula-dev/config.json` has `show_workspaces: false`.** A `make dev` in a fresh slot inherits it
-  through `dev-seed`, so the Workspaces bar starts hidden and looks broken. `Shift+W`.
+  through `dev-seed`, so the WORKSPACES BAR starts hidden and looks broken. `Shift+W`.
 - **A merge that compiles can still be semantically stale.** `cargo build` passed; `cargo test` then failed
   on `Project has no field named divider_after` — main had removed the divider fields
   (see [Project Dividers Removed]) and a *test helper* I'd added still set them. Build the tests, not just

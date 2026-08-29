@@ -1,4 +1,4 @@
-# Removed The Notes Feature Outright — 2026-08-26
+# Removed The NOTES Feature Outright — 2026-08-26
 
 **Asked:** "remove the ability to add notes" — asked twice, identically. The literal words name only the
 *add* path, so I put the scope to the user before cutting: remove adding only (leaving a list that can
@@ -8,11 +8,11 @@ shrink but never grow) vs. remove the feature entirely. They chose **entirely**.
 (`entities.rs`), `id_newtype!(NoteId)` (`ids.rs`), the four `ClientRequest::{Create,Update,Delete}Note` /
 `SetNoteDone` variants and `Snapshot.notes` (`protocol.rs`), `PROTOCOL_VERSION` 26 → 27. `nebula-daemon`:
 the `// ---- notes ----` blocks in `store.rs` (7 fns) and `registry.rs` (4 fns), the 4 `server.rs` arms,
-plus **migration 21 `DROP TABLE IF EXISTS notes`**. `nebula-tui`: `Action::Notes` and its `e` binding
+plus **MIGRATION 21 `DROP TABLE IF EXISTS notes`**. `nebula-tui`: `Action::Notes` and its `e` binding
 (`keymap.rs`), `NoteView`/`NoteInput`/`Overlay::Notes`/`PendingIntent::SelectCreatedNote`/`Tree.notes`
-(`app.rs`), the modal draw + `note_badge` + both footer hints (`ui.rs`), and in `event_loop.rs` the
+(`app.rs`), the modal draw + `note_badge` + both FOOTER hints (`ui.rs`), and in `event_loop.rs` the
 `NoteCmd` key handler, the mouse handler, `open_note_view`/`open_notes_for_owner`/`select_note_by_id`,
-both context-menu rows, and the two delete-cascade `retain`s. Docs: README key table x2 + the SQLite
+both CONTEXT MENU rows, and the two delete-cascade `retain`s. Docs: README key table x2 + the SQLite
 bullet, ARCHITECTURE.md's note-list paragraph. Tests: deleted `store::note_crud_roundtrip_and_cascade`,
 the 3 `event_loop` note tests, and e2e `tui_note_modal_crud_and_badge`. 645 tests green, clippy clean
 (7 pre-existing warning sites, none mine), `cargo fmt` applied.
@@ -34,7 +34,7 @@ the 3 `event_loop` note tests, and e2e `tui_note_modal_crud_and_badge`. 645 test
 - **A stale `"keybindings": {"notes": "…"}` in a user's `config.json` is harmless** — `Keymap::from_overrides`
   already ignores unknown action ids, covered by `a_broken_override_falls_back_instead_of_stranding_the_user`.
 - `e` is now **unbound**. `splash_footer_lists_only_keys_that_work` asserted `"e: notes"` was *absent*
-  from the splash; that string can never appear now, so it came out of the dead-key list.
-- The tree carried ~1700 lines of another session's uncommitted work (including a new
+  from the SPLASH; that string can never appear now, so it came out of the dead-key list.
+- The SHARED CHECKOUT carried ~1700 lines of another session's uncommitted work (including a new
   `crates/nebula-daemon/src/pty/cloud.rs`). Baseline `cargo check` was green **before** starting, which is
-  what made it safe to attribute every later error to my own edits — do that check first in a shared tree.
+  what made it safe to attribute every later error to my own edits — do that check first in the SHARED CHECKOUT.

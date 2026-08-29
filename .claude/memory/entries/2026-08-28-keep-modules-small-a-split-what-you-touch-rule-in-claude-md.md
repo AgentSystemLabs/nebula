@@ -1,4 +1,4 @@
-# Keep Modules Small: A Split-What-You-Touch Rule In CLAUDE.md And AGENTS.md — 2026-08-28
+# KEEP MODULES SMALL: A Split-What-You-Touch Rule In CLAUDE.md And AGENTS.md — 2026-08-28
 
 **Asked:** "update the claude and agents to instruct it to try and split up larger files, classes,
 functions, into smaller modules when it makes sense. too long of files is a refactoring smell"

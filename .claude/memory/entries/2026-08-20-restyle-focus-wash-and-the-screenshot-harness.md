@@ -1,4 +1,4 @@
-# Restyle, Focus Wash, And The Screenshot Harness — 2026-08-20 → 08-21
+# Restyle, Focus Wash, And The SCREENSHOT HARNESS — 2026-08-20 → 08-21
 
 **Asked:** A run of visual passes: "would it be possible to space out the items in the projects worktrees
 and sessions lists? like to make them feel like larger buttons, also visual hieachy…", "when a list panel
@@ -7,14 +7,14 @@ gradient looks like shit... let's think of a differnt indicator… maybe just ma
 lightly colored (like 10% opactiy) theme color", and "when a session is running (when it's yellow status
 or red), make the text animate with colors… it should be a sweeping animation."
 
-**Did:** `d704da7` (borderless columns, raised-fill selection, quiet chrome) plus the animation pass, with
-a settings toggle to disable animations for CPU.
+**Did:** `d704da7` (borderless columns, raised-fill PILL ROW selection, quiet chrome) plus the STATUS SWEEP animation pass, with
+a SETTING toggle to disable animations for CPU.
 
 **Gotchas (recipe for screenshotting the TUI with demo data):**
 - Isolate with `NEBULA_RUNTIME_DIR=/tmp/<short>` (SUN_LEN!) and `NEBULA_DATA_DIR=<scratch>/demo/data`.
-  Never touch the real daemon — and note the daemon **detaches and outlives the tmux server**, so
+  Never touch the real DAEMON — and note the daemon **detaches and outlives the tmux server**, so
   `kill $(cat $NEBULA_RUNTIME_DIR/daemon.pid)` when done.
-- **Set `NEBULA_AGENT_CMD` even if you never create an agent** — the warm-slot prewarm launches a real
+- **Set `NEBULA_AGENT_CMD` even if you never create an agent** — the PREWARM POOL's warm slot launches a real
   `claude` on its own (shows as "1 agent · ~600MB" with zero agent rows in the DB). `/bin/cat` works.
 - **One Bash call per drive**: the sandbox kills the private tmux server when the tool call ends, so
   new-session, send-keys, captures and kill-server must all happen in a single call. Send one key per

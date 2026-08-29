@@ -14,7 +14,7 @@ AUTO-TITLE like any `n`-created row, and appears in the SESSIONS PANEL of the WO
 stealing FOCUS or the TERMINAL PANE from the session I'm typing in. Keep NEBULA RENAME and NEBULA
 WORKTREE exactly as they are. (no questions asked — headless-style assumptions)
 
-**Did:** A third agent-side CLI verb beside NEBULA RENAME and NEBULA WORKTREE. `ClientRequest::
+**Did:** NEBULA SPAWN, a third agent-side CLI verb beside NEBULA RENAME and NEBULA WORKTREE. `ClientRequest::
 SpawnSiblingAgent { req_id, id, kind: Option<AgentKind>, starting_prompt }` (`nebula-core/src/
 protocol.rs`), PROTOCOL VERSION 32 → **33**, answered with the ordinary `Ack { created }`. Daemon side is
 a **new module** `crates/nebula-daemon/src/sibling.rs` — `impl Daemon` from outside `registry.rs` works
@@ -36,7 +36,7 @@ TUI needed nothing: the row arrives as an `EntityUpserted` and lands in the SESS
 SELECT-WHEN-SEEN, so FOCUS stays where it was. The guidance is Claude-only like WORKTREE GUIDANCE (codex
 and cursor can run the command but nothing tells them to). README feature bullet + CLI list. Tests:
 `sibling.rs` ×5, `guided()` / PR-prompt tests in `registry.rs` updated, e2e
-`nebula_spawn_cli_starts_a_sibling_session_in_the_same_worktree` (stub agent logs its env per boot:
+`nebula_spawn_cli_starts_a_sibling_session_in_the_same_worktree` (STUB AGENT logs its env per boot:
 sibling row `agent-2` alive in the caller's worktree, `--kind codex` → `agent-3`, `--kind gemini` and a
 blank task fail, caller never rebooted). Gate: nebula-daemon 162, nebula-tui 520, nebula-core 12, E2E
 PTY 26/26, clippy `-D warnings` and fmt clean. **Not done:** a live run against the real `claude` — the

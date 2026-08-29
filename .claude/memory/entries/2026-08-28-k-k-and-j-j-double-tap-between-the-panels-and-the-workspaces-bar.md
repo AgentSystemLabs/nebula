@@ -13,7 +13,7 @@ stays put and flashes, no longer dropping into Projects, matching the `h`/`l` co
 MOVE DOWN inside the panels, the WORKSPACES BAR `←`/`→` tab switching, and the existing `h`/`l` DOUBLE TAP
 exactly as they are.
 
-**Did:** Two steps, per the new "Keep modules small" rule. (1) Behavior-preserving extraction: the PANEL
+**Did:** Two steps, per the new KEEP MODULES SMALL rule. (1) Behavior-preserving extraction: the PANEL
 WALK / DOUBLE TAP functions (`next_focus`, `enter_terminal_pane`, `DOUBLE_TAP`, `double_tapped`,
 `walk_focus_forward`, `walk_focus_back`) moved out of `event_loop.rs` into the child module
 `crates/nebula-tui/src/event_loop/focus_walk.rs` (`mod focus_walk;` + `use focus_walk::{…}` at the top

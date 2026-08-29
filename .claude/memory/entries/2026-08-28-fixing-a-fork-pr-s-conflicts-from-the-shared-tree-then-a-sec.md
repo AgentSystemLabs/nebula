@@ -4,7 +4,7 @@
 review skill" (headless session — `prompt-daddy` skipped, worked from the prompt as typed).
 
 **Did:** PR #20 (`lnmunhoz:toggle-column`, the PROJECTS PANEL / WORKTREES PANEL toggles) was CONFLICTING
-against the dedup pass (PR #18). Recipe, without touching the dirty shared tree: `git fetch origin
+against the dedup pass (PR #18). Recipe, without touching the dirty SHARED CHECKOUT: `git fetch origin
 pull/20/head:pr-20-toggle-column` → `git worktree add <scratchpad>/pr20 pr-20-toggle-column` → `git merge
 origin/main` there → resolve → `cargo fmt/clippy/test --workspace` with `CARGO_TARGET_DIR` in the scratchpad
 (734 green, zero clippy warnings) → `git commit -F` → `git push git@github.com:lnmunhoz/nebula.git
@@ -17,10 +17,10 @@ the same lines in `Action::FocusTerminal` and `walk_focus_forward` — the PR's 
 serde bools, layout/focus arithmetic, no new `ClientRequest`, no path or process construction.
 
 **Gotchas:**
-- **`security-review` snapshots the checkout it runs in.** Invoked from the shared tree on `main` it produced
+- **`security-review` snapshots the checkout it runs in.** Invoked from the SHARED CHECKOUT on `main` it produced
   an empty diff and a commit list for `main`, not the PR. Write the PR's diff yourself (`git diff origin/main
-  <merge-sha> -- . ':!.claude/MEMORY.md' ':!TERMS.md' ':!README.md'`) and hand that path, plus the scratch
-  worktree, to the audit sub-agent.
+  <merge-sha> -- . ':!.claude/MEMORY.md' ':!TERMS.md' ':!README.md'`) and hand that path, plus the SCRATCH
+  WORKTREE, to the audit sub-agent.
 - A scratch `git worktree add` registers in the shared repo's worktree list, so WORKTREE SYNC would surface it
   as a row within 2 s — remove it (`--force`, the target dir was built in) when the push is done.
 - `cargo test --workspace --tests --bins --doc` prints nothing and runs nothing; plain `cargo test --workspace`

@@ -6,8 +6,8 @@ Claude / Codex / Cursor, because NEW TERMINAL (`t`) already opens a TERMINAL SES
 and the CONTEXT MENU's **New terminal** item exactly as they are."
 
 **Did:** `open_new_agent_picker` (`crates/nebula-tui/src/event_loop.rs`, ~2525) builds three
-`kind_row`s and no `MenuAction::NewTerminal` item; doc comment says why. Decision: the picker is for
-AGENT kinds only — a shell has `t` and the CONTEXT MENU's **New terminal** (`MenuAction::NewTerminal`
+`kind_row`s and no `MenuAction::NewTerminal` item; doc comment says why. Decision: the NEW SESSION PICKER is for
+AGENT KINDs only — a shell has `t` and the CONTEXT MENU's **New terminal** (`MenuAction::NewTerminal`
 still exists for those). README step 4 and the TERMS.md row updated. 489 nebula-tui unit tests green.
 
 **Gotchas:**

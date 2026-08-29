@@ -1,4 +1,4 @@
-# Prompt Daddy: One Rewrite, Ask Only For Missing Context, Log It And Go — 2026-08-28
+# PROMPT DADDY: One Rewrite, Ask Only For Missing Context, Log It And Go — 2026-08-28
 
 **Asked:** "update prompt doctor to not give 3 examples to pick from, instead it should just do it's best to
 rephrase the prompt and present questions if the original prompt seems to be lacking context to even convert
@@ -37,6 +37,6 @@ plus `(asked: ‹gap› → ‹answer›)` per question, replacing `→ picked:`
   change is all of them; grep `pick` afterwards to catch the strays.
 - The skill listing's description refreshed mid-session the moment the frontmatter was rewritten (same
   live discovery the 2026-08-27 entry records) — the new description was in effect before `CLAUDE.md` was.
-- `.claude/MEMORY.md` is ~2800 lines against the skill's ~300-line pruning rule; not pruned here (shared
-  tree, out of scope) — whoever prunes should merge the four PROMPT DADDY / OUTPUT DOCTOR / PROJECT
+- `.claude/MEMORY.md` is ~2800 lines against the skill's ~300-line pruning rule; not pruned here (SHARED
+  CHECKOUT, out of scope) — whoever prunes should merge the four PROMPT DADDY / OUTPUT DOCTOR / PROJECT
   TERMS entries first, they circle the same protocol.

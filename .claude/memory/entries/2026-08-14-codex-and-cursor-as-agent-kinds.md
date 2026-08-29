@@ -11,8 +11,10 @@ permissions always skipped for both (`89f9860`).
 
 **Gotchas:**
 - `claude` takes `--model <alias>` and `--effort <low|…|max>`; `codex` takes `-m/--model` but effort only
-  via `-c model_reasoning_effort=<…>`; `cursor-agent` has no model/effort knobs. Pick lists are hardcoded
-  in `crates/nebula-tui/src/config.rs` (`CLAUDE_MODELS`, `CODEX_MODELS`) — "default" always means
-  "pass no flag".
+  via `-c model_reasoning_effort=<…>`; `cursor-agent` had no model/effort knobs **until cursor-agent
+  2026.08.25 grew `--model <family>-<effort>` — superseded 2026-08-28, see
+  `2026-08-28-cursor-agent-model-takes-a-family-effort-id-so-cursor-gets-mo`.** Pick lists are hardcoded
+  in `crates/nebula-tui/src/config.rs` (`CLAUDE_MODELS`, `CODEX_MODELS`, `CURSOR_MODELS`) — "default"
+  always means "pass no flag".
 - Cursor has no PermissionRequest hook and nebula runs `cursor-agent --force`, so cursor agents report
   busy/idle but **never** needs-feedback. That is expected, not a bug.

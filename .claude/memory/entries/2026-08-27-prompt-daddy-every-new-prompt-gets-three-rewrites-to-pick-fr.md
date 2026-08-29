@@ -1,4 +1,4 @@
-# Prompt Daddy: Every New Prompt Gets Three Rewrites To Pick From — 2026-08-27
+# PROMPT DADDY: Every New Prompt Gets Three Rewrites To Pick From — 2026-08-27
 
 > **Superseded 2026-08-28** — the three-rewrites pick is gone; see "Prompt Daddy: One Rewrite, Ask Only For
 > Missing Context, Log It And Go" above. The failure-table patterns below still hold.
@@ -8,7 +8,7 @@ this info, create a skill called prompt-daddy which will take your original prom
 to pick from that improve the original prompt, add prompt daddy to claude.md instructions so my agent uses
 it on every new prompt"
 
-**Did:** New `.claude/skills/prompt-daddy/SKILL.md` (user-invocable). It runs after the MEMORY.md read and
+**Did:** New `.claude/skills/prompt-daddy/SKILL.md` (user-invocable). It runs after the MEMORY LOG read and
 before any planning: read the prompt against an eleven-row failure table distilled from this log, write
 three rewrites in the user's voice, present them with `AskUserQuestion` (three previews + **Keep
 original**, recommended one first), and take the pick as the request. Ambiguous prompt → the three are the
@@ -26,7 +26,7 @@ corrections, slash-commands / skill triggers ("commit push release"), and headle
   with the exact on-screen text and a "works in X, not in Y" contrast were diagnosed in one session every
   time. Escalated re-asks carried no new spec; the fix arrived with the next constraint, not the next tone.
 - When writing the memory entry for a task that went through prompt-daddy, quote the **original** prompt
-  (this skill's rule) and put the rewrite on the correction line underneath (now `→ refined:`, was
+  (this skill's rule) and put the REFINED PROMPT on the correction line underneath (now `→ refined:`, was
   `→ picked:`) — the refinement is the data the next analysis of prompting needs.
 - Skill discovery is live: the new `SKILL.md` appeared in the session's skill listing as soon as the file
   existed, no restart needed.

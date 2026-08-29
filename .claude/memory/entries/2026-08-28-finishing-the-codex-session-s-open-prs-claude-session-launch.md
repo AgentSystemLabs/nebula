@@ -13,14 +13,14 @@ CHECKOUT when it died: `ClientRequest::CreatePrAgent` (`protocol.rs`, PROTOCOL V
 `agents.pr_url`, `store.rs::insert_agent_with_launch_context` / `agent_pr_url`, `registry.rs::
 claude_pr_system_prompt` + `validate_pr_url` composed into the one `--append-system-prompt` on every cold spawn
 and RESUME, PREWARM POOL adoption bypassed when `pr_url` is set, `server.rs` routing; TUI `n` / `m` /
-right-click on a PROJECT OPEN PRS row → `event_loop.rs::open_pr_agent_picker` (Claude only, in the ROOT
+right-click on a PROJECT OPEN PRS GROUP row → `event_loop.rs::open_pr_agent_picker` (Claude only, in the ROOT
 WORKTREE) through the normal MODEL / EFFORT + name flow; README and ARCHITECTURE patched. Left undone and
 finished here: `cargo fmt --all`; the simplify review (its three sub-agents died on the limit — re-read the
 hunks by hand, nothing to change); the FOOTER and HELP OVERLAY hint for `n` on the PR row
 (`ui.rs::draw_footer_bar`, `ui.rs` WORKTREES help group); clippy — `agent_spawn_command_with` grew to 8 args
 (`#[allow(clippy::too_many_arguments)]`), plus five pre-existing rustc 1.92 lints in `e2e_tui.rs`,
 `e2e_pty.rs`, `config.rs` cleared on the way. `cargo test --workspace`: 705 green. **Not committed** — the
-tree also holds other sessions' uncommitted work (LINK removal, click-outside dismiss, settings memory, the
+SHARED CHECKOUT also holds other sessions' uncommitted work (LINK removal, CLICK OUTSIDE dismiss, settings memory, the
 new skills).
 
 **Gotchas:**

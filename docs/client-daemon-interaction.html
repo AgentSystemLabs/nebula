@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nebula — Client ↔ Daemon Interaction</title>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'dark',
+      themeVariables: {
+        primaryColor: '#1e3a5f',
+        primaryTextColor: '#e2e8f0',
+        primaryBorderColor: '#3b82f6',
+        lineColor: '#64748b',
+        secondaryColor: '#1e293b',
+        tertiaryColor: '#0f172a',
+        fontFamily: 'ui-sans-serif, system-ui, sans-serif',
+      },
+      flowchart: { curve: 'basis' },
+      sequence: { mirrorActors: false, messageMargin: 40 },
+    });
+  </script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1120;
+      --surface: #111827;
+      --border: #1f2937;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #60a5fa;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+    header {
+      padding: 2.5rem 2rem 1.5rem;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(180deg, #0f172a 0%, var(--bg) 100%);
+    }
+    header h1 {
+      margin: 0 0 0.5rem;
+      font-size: 1.75rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+    header p {
+      margin: 0;
+      max-width: 52rem;
+      color: var(--muted);
+    }
+    main {
+      max-width: 56rem;
+      margin: 0 auto;
+      padding: 2rem;
+    }
+    section {
+      margin-bottom: 3rem;
+    }
+    h2 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin: 0 0 0.75rem;
+      color: var(--accent);
+    }
+    p, ul {
+      color: var(--muted);
+      margin: 0 0 1rem;
+    }
+    ul { padding-left: 1.25rem; }
+    li { margin-bottom: 0.35rem; }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.875em;
+      background: var(--surface);
+      padding: 0.15em 0.4em;
+      border-radius: 4px;
+      color: #fbbf24;
+    }
+    .diagram {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem 1rem;
+      overflow-x: auto;
+      margin-bottom: 1rem;
+    }
+    .mermaid { text-align: center; }
+    footer {
+      padding: 1.5rem 2rem 3rem;
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.875rem;
+      border-top: 1px solid var(--border);
+    }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Nebula — Client ↔ Daemon Interaction</h1>
+    <p>
+      How the <strong>TUI</strong> (and one-shot CLI commands) talk to the background
+      <strong>DAEMON</strong> over the <strong>DAEMON SOCKET</strong>, plus the separate
+      <strong>HOOK RECEIVER</strong> path agents use for status.
+    </p>
+  </header>
+
+  <main>
+    <section>
+      <h2>1. Process model</h2>
+      <p>Same binary, two roles. Quitting the TUI does not kill sessions — the DAEMON owns every PTY.</p>
+      <div class="diagram">
+        <pre class="mermaid">
+flowchart LR
+  subgraph clients["Clients (same binary)"]
+    TUI["TUI<br/>(nebula)"]
+    CLI["One-shot CLIs<br/>(rename, add, …)"]
+    BROWSER["Browser client<br/>(nebula browser → ttyd)"]
+  end
+
+  subgraph transport["Transport"]
+    SOCK["DAEMON SOCKET<br/>$XDG_RUNTIME_DIR/nebula/daemon.sock<br/>mode 0700"]
+    CODEC["IPC CODEC<br/>length-prefixed MessagePack<br/>4 MiB max frame"]
+  end
+
+  subgraph daemon["DAEMON (nebula daemon)"]
+    SERVER["server.rs<br/>accept loop + handle_client"]
+    REG["Registry<br/>entity tree + SQLite STORE"]
+    PTY["PTY SESSIONs<br/>ring buffers + portable-pty"]
+    HOOKS["HOOK RECEIVER<br/>127.0.0.1 HTTP + bearer token"]
+    STATUS["STATUS MACHINE"]
+  end
+
+  subgraph agents["Agent CLIs in worktrees"]
+    CLAUDE["claude / codex / cursor-agent"]
+  end
+
+  TUI --> SOCK
+  CLI --> SOCK
+  BROWSER --> SOCK
+  SOCK --> CODEC
+  CODEC --> SERVER
+  SERVER --> REG
+  SERVER --> PTY
+  REG --> PTY
+  CLAUDE -->|"curl hook POSTs"| HOOKS
+  HOOKS --> STATUS
+  STATUS --> REG
+  PTY -->|"Output / Scrollback"| SERVER
+        </pre>
+      </div>
+    </section>
+
+    <section>
+      <h2>2. Connect &amp; handshake</h2>
+      <p>
+        On launch the client connects to the socket. If nothing listens, it auto-spawns
+        <code>nebula daemon</code> with <strong>DAEMON SETSID</strong> (new session, no controlling tty).
+        Then it runs the <strong>HANDSHAKE</strong> and checks <strong>PROTOCOL VERSION</strong>.
+      </p>
+      <div class="diagram">
+        <pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant C as Client (TUI / CLI)
+  participant S as DAEMON (server.rs)
+  participant R as Registry + SQLite
+
+  C->>S: UnixStream connect (daemon.sock)
+  alt socket missing / refused
+    C->>C: spawn_daemon() — setsid + nebula daemon
+    C->>S: poll connect (up to 3s)
+  end
+
+  C->>S: ClientRequest::Hello { protocol_version }
+  alt versions match
+    S-->>C: ServerEvent::HelloOk { daemon_pid }
+  else VERSION SKEW
+    S-->>C: ServerEvent::Incompatible
+    C-->>C: bail with fix hint (make install vs nebula kill)
+  end
+
+  Note over C,S: TUI only — split socket into reader/writer tasks (IpcChannels)
+
+  C->>S: ClientRequest::Subscribe
+  S->>R: snapshot()
+  S-->>C: ServerEvent::Snapshot (full tree + ui_state)
+  S-->>C: stream ServerEvents via broadcast (deltas forever)
+
+  Note over C: Client pins workspace scope at first Subscribe
+        </pre>
+      </div>
+    </section>
+
+    <section>
+      <h2>3. Request / event planes</h2>
+      <p>
+        <strong>CLIENT REQUEST</strong>s go client → daemon. <strong>SERVER EVENT</strong>s push
+        daemon → client(s). RPC-style CRUD replies with <code>Ack</code> / <code>Error</code> matching
+        <code>req_id</code>; PTY traffic is session-scoped.
+      </p>
+      <div class="diagram">
+        <pre class="mermaid">
+flowchart TB
+  subgraph outbound["Client → Daemon (ClientRequest)"]
+    direction TB
+    HS["Hello / Subscribe"]
+    PTY_REQ["Attach · Detach · Input · Resize"]
+    CRUD["Entity CRUD<br/>AddProject, CreateAgent, CreateWorktree, …"]
+    CTRL["MarkAgentSeen · GetMetrics · SaveUiState · Shutdown"]
+    PRE["PrewarmAgent · PrewarmWorktreeSessions (fire-and-forget)"]
+  end
+
+  subgraph inbound["Daemon → Client (ServerEvent)"]
+    direction TB
+    SNAP["Snapshot (once after Subscribe)"]
+    DELTA["EntityUpserted / EntityRemoved"]
+    STAT["StatusChanged { status, unseen }"]
+    RPC["Ack / Error / WorktreeEntered"]
+    TERM["Scrollback → Output → SessionExited"]
+    META["KittyFlags · Metrics"]
+  end
+
+  outbound --> DAEMON["DAEMON handle_client<br/>single writer task per connection"]
+  DAEMON --> inbound
+
+  subgraph broadcast["All subscribed clients"]
+    DELTA
+    STAT
+  end
+
+  subgraph attached_only["Only clients attached to session"]
+    TERM
+  end
+        </pre>
+      </div>
+      <ul>
+        <li><strong>Subscribe</strong> → one <code>Snapshot</code>, then a broadcast fan-out of entity/status deltas to every connected TUI.</li>
+        <li><strong>OpenWorkspace</strong> scopes <em>this connection only</em> — two TUIs can view different workspaces.</li>
+        <li>One-shot CLIs send a single request (e.g. <code>AutoRenameAgent</code>) and exit; no Subscribe.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>4. Attach path (terminal pane)</h2>
+      <p>
+        When you drill into a <strong>SESSION</strong>, the TUI sends <strong>ATTACH</strong>.
+        The DAEMON replays the scrollback ring, then streams live bytes. Keystrokes go back as
+        <code>Input</code>. Detach never kills the child.
+      </p>
+      <div class="diagram">
+        <pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant TUI
+  participant S as DAEMON server
+  participant P as PTY SESSION
+  participant A as Agent CLI
+
+  TUI->>S: Attach { session, from_seq, cols, rows }
+  S->>P: ensure_session (spawn/resume if dead)
+  S-->>TUI: Scrollback { base_seq, data }
+  Note over TUI: reset vt100 parser, apply replay
+
+  S->>S: spawn forward task (subscribe PTY events)
+  loop live session
+    A->>P: stdout/stderr bytes
+    P->>S: coalesced Output { seq, data }
+    S-->>TUI: Output (attached clients only)
+    TUI->>S: Input { data } (keystrokes / paste)
+    S->>P: write to PTY master
+    TUI->>S: Resize { cols, rows }
+    S->>P: resize PTY
+  end
+
+  opt user focuses finished agent
+    TUI->>S: MarkAgentSeen
+    S-->>TUI: StatusChanged (unseen cleared)
+  end
+
+  TUI->>S: Detach
+  Note over P,A: PTY + agent keep running
+        </pre>
+      </div>
+    </section>
+
+    <section>
+      <h2>5. Status path (hooks — not over the socket)</h2>
+      <p>
+        Agent status dots are driven by the <strong>HOOK RECEIVER</strong>, a loopback HTTP server
+        the DAEMON starts at boot. Managed hooks in each worktree <code>curl</code> events here;
+        the <strong>STATUS MACHINE</strong> updates <strong>AGENT STATUS</strong> and broadcasts
+        <code>StatusChanged</code> to all TUIs.
+      </p>
+      <div class="diagram">
+        <pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant CLI as Agent CLI
+  participant H as HOOK RECEIVER
+  participant SM as STATUS MACHINE
+  participant R as Registry
+  participant TUI as TUI (subscribed)
+
+  Note over CLI: spawn installs hooks<br/>.claude/settings.local.json<br/>.codex/hooks.json<br/>.cursor/hooks.json
+
+  CLI->>H: POST UserPromptSubmit / Stop / PermissionRequest / …
+  H->>SM: HookEvent
+  SM->>R: set_agent_status (RUNNING / FINISHED / NEEDS FEEDBACK / …)
+  R-->>TUI: StatusChanged (+ unseen flag)
+
+  Note over CLI,H: Auto-title: UserPromptSubmit reply<br/>injects nebula rename instruction
+
+  Note over CLI,H: Separate from DAEMON SOCKET —<br/>unversioned, fail-soft by design
+        </pre>
+      </div>
+    </section>
+
+    <section>
+      <h2>6. Domain tree (what the Snapshot carries)</h2>
+      <div class="diagram">
+        <pre class="mermaid">
+flowchart TB
+  WS["WORKSPACE"]
+  PR["PROJECT (git repo)"]
+  WT["WORKTREE (checkout)"]
+  SESS["SESSION"]
+
+  WS --> PR
+  PR --> WT
+  WT --> SESS
+
+  SESS --> AGENT["AGENT<br/>(claude / codex / cursor-agent)"]
+  SESS --> TERM["TERMINAL SESSION<br/>(plain shell tab)"]
+
+  DAEMON["DAEMON owns tree + SQLite STORE"]
+  DAEMON --- WS
+
+  TUI["TUI draws panels<br/>client-side: gh pr view, git diff, fuzzy find"]
+  TUI -.->|"Subscribe + deltas"| DAEMON
+        </pre>
+      </div>
+      <p>
+        The DAEMON is the source of truth for the tree and sessions. Some UI (PR rows, diff viewer)
+        runs client-side and never hits the socket except for entity CRUD the user triggers.
+      </p>
+    </section>
+  </main>
+
+  <footer>
+    Generated from <code>ARCHITECTURE.md</code>, <code>TERMS.md</code>, and
+    <code>nebula-core/src/protocol.rs</code> · Nebula client–daemon interaction
+  </footer>
+</body>
+</html>

@@ -7,7 +7,7 @@ updates …" — then: "go through all previous sessions for this project and in
 skill starting with oldest last so we can document how we grew this project."
 
 **Did:** Created `CLAUDE.md` (none existed — only an empty `CLAUDE.local.md`), the
-`.claude/skills/nebula-memory/` skill, and this file. Backfilled the entries below.
+NEBULA-MEMORY SKILL (`.claude/skills/nebula-memory/`), and this file (the MEMORY LOG). Backfilled the entries below.
 
 **Gotchas:**
 - Real user prompts are recoverable from the transcripts by filtering `type=="user"` **and**

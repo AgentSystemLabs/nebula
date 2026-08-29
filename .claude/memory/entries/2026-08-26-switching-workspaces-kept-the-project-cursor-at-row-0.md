@@ -3,7 +3,7 @@
 **Asked:** "when i switch between workspaces it should remember the last project, worktree, session
 slection"
 
-**Did:** Two of the three were already implemented and simply unreachable. `remember_context` /
+**Did:** Two of the three (SELECTION MEMORY) were already implemented and simply unreachable. `remember_context` /
 `restore_context` (`crates/nebula-tui/src/event_loop.rs`) have kept `App::last_worktree_for_project` and
 `App::last_session_for_worktree` since the panel work — but `switch_workspace_inner` hard-set
 `app.sel_project = 0`, and both maps are keyed off the project the cursor lands on, so coming back to a

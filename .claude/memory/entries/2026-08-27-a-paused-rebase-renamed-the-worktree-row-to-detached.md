@@ -5,7 +5,7 @@ yp detached at f816b5f.  I wouldn't have expected the wortree name to become det
 
 **Did:** Diagnosed, then fixed in `95c0a18`. The cause was the `git rebase origin/main` in the entry above
 pausing on conflicts: a rebase parks HEAD on the commits it replays, so `git worktree list --porcelain`
-prints `detached` (no `branch` line) for the checkout for as long as it sits there. The 2s worktree sync
+prints `detached` (no `branch` line) for the checkout for as long as it sits there. The 2s WORKTREE SYNC
 (`reconcile_project_worktrees`, `registry.rs`) saw `known.branch != entry.branch`, wrote `detached @
 f816b5f` into the row and broadcast it, then wrote the branch back on the tick after `rebase --continue`
 finished. `git::list_worktrees` (`crates/nebula-daemon/src/git.rs`) now resolves a branch-less entry
@@ -17,8 +17,8 @@ already-detached HEAD (`head-name` reads `detached HEAD`), still gets `detached_
 147 daemon tests green.
 
 **Gotchas:**
-- **The row heals itself, so the bug is easy to write off as cosmetic — it isn't.** `nebula worktree
-  <name>` finds its target by `w.branch == branch` (`registry.rs:~1377`) and *creates* a worktree when
+- **The row heals itself, so the bug is easy to write off as cosmetic — it isn't.** NEBULA WORKTREE (`nebula worktree
+  <name>`) finds its target by `w.branch == branch` (`registry.rs:~1377`) and *creates* a worktree when
   nothing matches, so an agent running it mid-rebase would have tried to add a second checkout for a
   branch that already has one. Anything keyed on the branch string is blind for the whole pause.
 - The rebase state lives in the **per-worktree** git dir (`<repo>/.git/worktrees/<name>/rebase-merge/`),
@@ -31,7 +31,7 @@ already-detached HEAD (`head-name` reads `detached HEAD`), still gets `detached_
 - `git::current_branch` is a second, uncalled copy of this label logic with its own `detached@` format.
   Left alone, but don't reach for it thinking it agrees with `list_worktrees`.
 - **A "load race" can be a build-layout race.** After this change `workspace_scope_is_per_connection`
-  (e2e_pty) failed 7 of 11 *idle* runs while the pre-change `git.rs` passed 13 of 13 — yet a probe
+  (E2E PTY) failed 7 of 11 *idle* runs while the pre-change `git.rs` passed 13 of 13 — yet a probe
   showed `rebasing_branch` was never called and the porcelain parse was identical. Adding file I/O to
   `list_worktrees` for the probe made it pass 3/3: pure timing. It was the documented Ack-beats-upsert
   race, and a code change that never runs in the test still shifts the odds. Fixed on the test side

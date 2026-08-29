@@ -18,6 +18,6 @@ FOOTER no longer advertises edit/delete. README, ARCHITECTURE and focused unit/E
 - An E2E absence check can pass before a key is processed. The NEW LINK regression sends `Shift+L`,
   then `?`, and waits for HELP OVERLAY's unique `NAVIGATE & SEARCH` heading; if the prompt still opened,
   `?` would type into it and the test would time out.
-- The shared checkout moved during the first verification pass and temporarily produced unrelated
+- The SHARED CHECKOUT moved during the first verification pass and temporarily produced unrelated
   PR-agent compile errors (`pr_url` / `CreatePrAgent` / `validate_pr_url` mismatches). That work settled
   and the final suites passed; do not misattribute the transient errors to the LINK removal if they recur.

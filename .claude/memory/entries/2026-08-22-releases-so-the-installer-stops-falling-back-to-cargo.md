@@ -3,8 +3,8 @@
 **Asked:** "no prebuilt binary for this platform yet — falling back to cargo... fix. also update readme to
 walk user how to use this"
 
-**Did:** Cut real GitHub releases with binaries (`bcaa104`, then `4ddcc7e` v0.1.1, `0c178e2` v0.1.2) so
-`install.sh` finds an artifact instead of building from source.
+**Did:** Cut real GitHub releases with binaries via the RELEASE WORKFLOW (`bcaa104`, then `4ddcc7e` v0.1.1, `0c178e2` v0.1.2) so
+INSTALL.SH (`install.sh`) finds an artifact instead of building from source.
 
 **Gotchas:**
 - Two `gh` accounts are logged in. `webdevcody` is the admin; `codyseibert` has only READ on

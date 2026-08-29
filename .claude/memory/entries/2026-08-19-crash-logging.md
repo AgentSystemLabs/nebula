@@ -4,9 +4,9 @@
 it crashes. so far i've seen nebula randomly close out and crash twice now when trying to create a new
 claude session, but I'm not sure how to debug"
 
-**Did:** `71e62c7` — panic logging for both the TUI and the daemon.
+**Did:** `71e62c7` — the CRASH LOG (panic logging) for both the TUI and the DAEMON.
 
 **Gotchas:**
 - Worth knowing that the "random crashes on new claude session" the user was chasing here were most likely
-  the two separate problems diagnosed the next day: the stale code signature and the controlling-terminal
-  fight. Crash logging is what made both findable.
+  the two separate problems diagnosed the next day: the stale code signature (MAKE INSTALL) and the controlling-terminal
+  fight (DAEMON SETSID). The CRASH LOG is what made both findable.

@@ -3,7 +3,7 @@
 # nebula-managed agent hook files installed at agent spawn
 /.codex/
 
-# Mission Control Recall (project memory) — private, do not commit
+# Local-only files — do not commit
 CLAUDE.local.md
 design-screenshots/
 .DS_Store

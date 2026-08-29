@@ -30,5 +30,5 @@ was the thing to avoid).
   real nebula found there would pass the gate and `exec nebula browser` for real from inside a test.
 - `sleep infinity` is GNU-only; `sleep 2147483647` works on macOS, GNU and busybox.
 - The installed `~/.cargo/bin/nebula` (0.13.0) still has the old script; the user must reinstall to get
-  the reuse (and the shared tree has other sessions' uncommitted protocol changes — see "Shared tree
+  the reuse (and the SHARED CHECKOUT has other sessions' uncommitted protocol changes — see "Shared tree
   races"), so the install was left to them.

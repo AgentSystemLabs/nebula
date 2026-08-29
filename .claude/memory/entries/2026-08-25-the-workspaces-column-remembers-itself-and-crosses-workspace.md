@@ -1,4 +1,4 @@
-# The Workspaces Column Remembers Itself, And `/` Crosses Workspaces — 2026-08-25
+# The WORKSPACES COLUMN Remembers Itself, And `/` Crosses Workspaces — 2026-08-25
 
 **Asked:** "remember if someone had the workspaces panel collapsed so you don't show it the next time,
 also allow to configure showing it or not in the settings" — then, mid-task: "also allow the jump to to
@@ -6,15 +6,15 @@ include the entire workspaces path so I can quickly jump between workspaces when
 
 **Did:** Two things.
 
-(1) **Visibility moved out of the UI blob into the config file.** `UiState::show_workspaces` is deleted
+(1) **Visibility moved out of the UI STATE BLOB into CONFIG.JSON.** `UiState::show_workspaces` is deleted
 (`crates/nebula-tui/src/app.rs`); the home is now `Config::show_workspaces` (default true), with a
-`SettingKind::ShowWorkspaces` row at the bottom of the **Appearance** tab. `Action::ToggleWorkspaces`
+`SettingKind::ShowWorkspaces` row at the bottom of the SETTINGS OVERLAY's **Appearance** tab. `Action::ToggleWorkspaces`
 (`event_loop.rs:~1330`) saves the file as it flips, so the choice survives a kill, a crash, or a closed
 `nebula browser` tab — `ui_state_json` is only sent on `app.should_quit`, which is exactly why the old
 one didn't stick. New `apply_config(app, &cfg)` + `set_show_workspaces(app, shown)` are shared by startup
 and `apply_setting_at`, so the settings row and the hotkey are the same code path.
 
-(2) **`/` is no longer workspace-scoped.** `build_palette_items` (`app.rs:~824`) now walks
+(2) **The `/` PALETTE is no longer workspace-scoped.** `build_palette_items` (`app.rs:~824`) now walks
 `palette_workspace_order(tree)` — active workspace first, then tree order — emitting a
 `PaletteTarget::Workspace` row per workspace plus every project/worktree/session/PR under it, each
 pathed `workspace/project/branch/session`. `jump_to_target` switches workspace first via the new
@@ -24,10 +24,10 @@ pathed `workspace/project/branch/session`. `jump_to_target` switches workspace f
 629 tests green, fmt clean, no new clippy warnings. README + the `palette` keymap hint updated.
 
 **Gotchas:**
-- **A hotkey that writes `Config::save()` makes the test suite edit the dev's real settings file.**
+- **A hotkey that writes `Config::save()` makes the test suite edit the dev's real CONFIG.JSON.**
   `shift_w_toggles_the_workspaces_column_and_parks_focus` had no path override, so the run wrote
   `show_workspaces: false` into a live `config.json` — and because an agent working inside `make dev`
-  has `NEBULA_DATA_DIR=~/.nebula-dev` exported, it lands in the dev instance's config, not the one you'd
+  has `NEBULA_DATA_DIR=~/.nebula-dev` exported, it lands in the DEV INSTANCE's config, not the one you'd
   think to check. It also correlated with `e2e_pty::workspace_scope_is_per_connection` failing 4 of 5
   full-suite runs (0 of 7 on a clean tree, and never when e2e_pty ran alone); the failure went away for
   good once the test was pinned. `Config::save()` now `assert!`s in `#[cfg(test)]` that

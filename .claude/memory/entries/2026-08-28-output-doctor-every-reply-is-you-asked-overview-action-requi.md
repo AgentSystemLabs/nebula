@@ -1,4 +1,4 @@
-# Output Doctor: Every Reply Is YOU ASKED / OVERVIEW / [ACTION REQUIRED] / TECHNICAL OVERVIEW — 2026-08-28
+# OUTPUT DOCTOR: Every Reply Is YOU ASKED / OVERVIEW / [ACTION REQUIRED] / TECHNICAL OVERVIEW — 2026-08-28
 
 **Asked:** "what 3 features would you recommend I remove" → picked (prompt-daddy): *Cost vs. value audit*
 → then, on the answer: "rewrite this in a format like this: ==== YOU ASKED ==== … ==== OVERVIEW ==== …
@@ -20,7 +20,7 @@ refs, err short — the user asks for more). It runs *after* `nebula-memory` and
 one-line results close the technical section. Exceptions it lists: the "about to" preamble, mid-task
 progress notes, `AskUserQuestion`, file-bound text (commits, memory, TERMS), a reply that is only a
 question. `CLAUDE.md` gained a "Before you reply" step after the `project-terms` one; `AGENTS.md` gained
-the matching "Then shape the reply" paragraph. The audit that preceded it — CLAUDE CLOUD sessions,
+the matching "Then shape the reply" paragraph. The audit that preceded it — CLOUD SESSIONS,
 `nebula browser`/`tunnel`, the PREWARM POOL as the three costliest features — was recommendation only;
 nothing was cut and no decision was taken.
 Follow-up: the skill gained a conditional fourth section, `==== ACTION REQUIRED ====`, between OVERVIEW and

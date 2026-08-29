@@ -4,15 +4,15 @@
 and fix, verify it has hooks, if not, then setup some type of skill that is injected to cursor as a system
 prompt or something so that it knows how to phone home to nebula to update the status"
 
-**Did:** `install_cursor_hooks` in `hooks/installer.rs:260` is its own writer (plus a migration purge of
+**Did:** The CURSOR HOOK DIALECT — `install_cursor_hooks` in `hooks/installer.rs:260` is its own writer (plus a migration purge of
 nebula groups under every key), and the installer maps cursor event names onto Claude-equivalent
-`hookEvent` query values so `parse_event` stays single-dialect. `HookPayload` in `hooks/mod.rs` grew
+`hookEvent` HOOK ROUTE query values so `parse_event` stays single-dialect. `HookPayload` in `hooks/mod.rs` grew
 aliases.
 
 **Gotchas:**
 - The installer originally assumed "same hooks JSON shape across all three CLIs". Cursor **silently
-  ignored** the PascalCase Claude-shaped groups, so no status ever phoned home — no error, just nothing.
-- Cursor's dialect: camelCase events (`sessionStart`, `beforeSubmitPrompt`, `stop`, `subagentStart/Stop`,
+  ignored** the PascalCase Claude-shaped groups, so no AGENT STATUS ever phoned home to the HOOK RECEIVER — no error, just nothing.
+- The CURSOR HOOK DIALECT: camelCase events (`sessionStart`, `beforeSubmitPrompt`, `stop`, `subagentStart/Stop`,
   `sessionEnd`), **flat** `{"command": …}` entries (no nested `hooks` array, no `type`), and a required
   top-level `"version": 1`. Hooks must print `{"continue": true}` to stdout or gating events degrade.
 - Payloads carry `session_id` == `conversation_id` (the `--resume` chatId), have **no `cwd`** (use

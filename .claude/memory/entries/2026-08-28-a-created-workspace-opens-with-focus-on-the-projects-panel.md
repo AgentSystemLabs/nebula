@@ -19,5 +19,5 @@ README rows for the WORKSPACE SWITCHER and Workspaces keymap note it. 468 nebula
   Ack, not on submit. A test that asserts `Focus::Projects` right after Enter fails; feed the `Ack` with
   `created: Some(EntityId::Workspace(..))` first (the existing switcher test shows the shape).
 - The two clippy warnings the crate prints (`event_loop.rs:5183` unneeded return, `config.rs:1007` field
-  assignment after `Default::default()`) predate this task — they are other sessions' hunks in the shared
-  tree, not this one's.
+  assignment after `Default::default()`) predate this task — they are other sessions' hunks in the SHARED
+  CHECKOUT, not this one's.

@@ -4,15 +4,15 @@
 and relaunch I've ran kill but the hook still seems to fail" — then "why doesn't make dev do this
 already though", and after the diagnosis "what do you recomend" → fix the message, not the plumbing.
 
-**Did:** Diagnosis: `make dev` runs `target/debug/nebula`, which spawns its daemon from `current_exe()`
-(`nebula-tui/src/ipc.rs:52`), so the daemon is always this checkout's build. But the auto-title hook
-injects a **bare** `nebula rename` (`AUTO_TITLE_INSTRUCTION`, `nebula-daemon/src/hooks/mod.rs:29`), and
+**Did:** Diagnosis: `make dev` (MAKE DEV) runs `target/debug/nebula`, which spawns its daemon from `current_exe()`
+(`nebula-tui/src/ipc.rs:52`), so the daemon is always this checkout's build. But the AUTO-TITLE hook
+injects a **bare** `nebula rename` (the AUTO-TITLE INSTRUCTION `AUTO_TITLE_INSTRUCTION`, `nebula-daemon/src/hooks/mod.rs:29`), and
 the agent's shell resolves that on PATH to `~/.cargo/bin/nebula` — 0.9.0/v24 there against the daemon's
-v26. Fix: `handshake()` in `nebula-tui/src/ipc.rs` now calls a new `version_skew_message()`, which
-compares the two versions, prints both binaries' paths, and recommends `make install` when the *client*
-is older and `nebula kill` only when the *daemon* is; new `daemon_exe_path()` resolves the daemon's
+v26. Fix: the HANDSHAKE's `handshake()` in `nebula-tui/src/ipc.rs` now calls a new VERSION SKEW message, `version_skew_message()`, which
+compares the two versions, prints both binaries' paths, and recommends MAKE INSTALL (`make install`) when the *client*
+is older and NEBULA KILL (`nebula kill`) only when the *daemon* is; new `daemon_exe_path()` resolves the daemon's
 binary from `paths::pidfile_path()` via `/proc/<pid>/exe` or `ps -p <pid> -o comm=`. Two tests in a new
-`mod tests`. Then `make install` (0.9.0 → 0.10.0). Rejected: a daemon-side PATH shim (agents run through
+`mod tests`. Then `make install` (0.9.0 → 0.10.0). Rejected: a daemon-side PATH shim (agents run through the LOGIN SHELL WRAP,
 `$SHELL -l -i -c`, `registry.rs:2015`, and this user's `.zshrc` prepends to PATH on ~11 lines, so a
 prepended dir lands behind them and breaks silently later), and an absolute path in the instruction
 (`CLAUDE_ALLOW_RULES` is `Bash(nebula rename:*)` — an absolute path stops matching and every auto-title
@@ -25,18 +25,18 @@ turns into a permission prompt).
 - Do **not** add a field to `ServerEvent::Incompatible` to carry the daemon's path. That frame is what a
   *newer* daemon sends an *older* client and rmp is positional, so the clients that need the information
   most would fail to decode it and report "unexpected handshake reply" instead.
-- `paths::buildstamp_path()` is a **content hash** (`lifecycle.rs::fingerprint_file`), not a path — it
+- The BUILDSTAMP (`paths::buildstamp_path()`) is a **content hash** (`lifecycle.rs::fingerprint_file`), not a path — it
   can prove the daemon is stale but cannot name its binary. Pidfile + `ps` is the way.
-- Only the *model-facing* instruction goes through the CLI. The real hooks are `curl` to
+- Only the *model-facing* instruction goes through the CLI. The real hooks are `curl` to the HOOK RECEIVER at
   `$NEBULA_API_URL/api/hooks/...` (`hooks/installer.rs:100`) — loopback HTTP, unversioned, fail-soft. So
-  a protocol bump can only ever break the auto-title and `nebula worktree` instructions, never status
+  a PROTOCOL VERSION bump can only ever break the auto-title and `nebula worktree` instructions, never status
   reporting. Note the `silence` branch there: `UserPromptSubmit` keeps stdout precisely so the injected
   instruction reaches the model; every other event is fully silenced.
-- The dev instance's isolation is *inherited*, not propagated: `NEBULA_RUNTIME_DIR`/`NEBULA_DATA_DIR`
+- The DEV INSTANCE's isolation is *inherited*, not propagated: `NEBULA_RUNTIME_DIR`/`NEBULA_DATA_DIR`
   come from the Makefile's `DEV_ENV` and flow down make → TUI → daemon → agent PTY. The daemon itself
   only ever adds `NEBULA_AGENT_ID`/`NEBULA_API_URL`/`NEBULA_API_TOKEN` (`registry.rs:2023`). Nothing
   propagates *which binary*, which is the entire hole.
-- The shared tree moved 26 → 27 under me mid-task (the notes-removal entry below), flipping the skew:
+- The SHARED CHECKOUT moved 26 → 27 under me mid-task (the notes-removal entry below), flipping the skew:
   after `make install` the PATH binary is v27 and the still-running dev daemon is v26, so the hook stays
   broken — now correctly reported as "The daemon is the older build". Restarting that daemon stops live
   sessions, so it was left to the user.

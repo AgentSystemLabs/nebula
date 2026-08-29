@@ -2,4 +2,4 @@
 
 **Asked:** (session ran on branch `fixing-input-ux`, merged as PR #1)
 
-**Did:** `cd07baa` gave every typed field real terminal line-editing.
+**Did:** `cd07baa` gave every typed field real terminal line-editing (the LINE EDITOR).

@@ -6,14 +6,14 @@ even point to a separate host - verify that is possible)" Then: "please verify t
 happen again when I'm doing development" and "update nebula-memory as well after you've confirmed this
 is fixed."
 
-**Did:** The open workspace was daemon-global: `store.set_active_workspace` plus a
+**Did:** The OPEN WORKSPACE was daemon-global: `store.set_active_workspace` plus a
 `ServerEvent::ActiveWorkspaceChanged` broadcast every client applied. Deleted that event outright
 (PROTOCOL_VERSION **22 → 23**) and moved the scope onto the connection — `handle_client` in
 `crates/nebula-daemon/src/server.rs` holds `workspace: Option<WorkspaceId>`, `OpenWorkspace` sets it,
 and `add_project` takes it as a new 4th arg. `registry.rs::open_workspace` became
 `set_default_workspace` (persists, notifies nobody). TUI-side, `switch_workspace` and
 `reseat_deleted_workspace` in `event_loop.rs` replaced the removed `ActiveWorkspaceChanged` arm, and
-`apply_startup_workspace` lands the new `nebula --workspace <name>` flag on the first snapshot.
+`apply_startup_workspace` lands the new `nebula --workspace <name>` flag (STARTUP WORKSPACE) on the first snapshot.
 Separate hosts already worked and needed no change (see gotchas).
 
 **Gotchas:**
@@ -29,14 +29,14 @@ Separate hosts already worked and needed no change (see gotchas).
 - Semantics that changed and are now documented: **`nebula workspace open <name>` no longer switches a
   running TUI.** It sets where the *next* instance boots. Aiming one live window is `nebula --workspace
   <name>`. Removing the broadcast is exactly the reported bug, so there was no way to keep both.
-- **Separate hosts already work and are fully independent** — `nebula ssh HOST` (`crates/nebula/src/ssh.rs`)
+- **Separate hosts already work and are fully independent** — NEBULA SSH (`nebula ssh HOST`, `crates/nebula/src/ssh.rs`)
   `exec`s `ssh -t` and runs a whole remote nebula with its own daemon, socket and SQLite. Two local
   instances against different daemons also work via `NEBULA_RUNTIME_DIR` + `NEBULA_DATA_DIR`. Note the
-  TUI's `h` picker is a *handoff*: it quits the local TUI and execs over it rather than opening a second
+  TUI's `h` picker (HOSTS PICKER) is a *handoff* (HOSTS HANDOFF): it quits the local TUI and execs over it rather than opening a second
   window.
 - `crates/nebula/tests/e2e_tui.rs`'s `FOOTER_TERMINAL_LOCKED` had been stale since `87d2b24` — it
   expected `"Ctrl+q: panels"` while `KeyChord::display()` renders `^q`. Six e2e_tui tests were failing on
-  main for that alone; fixed to `"^q: panels"`. If e2e_tui fails on a footer string, suspect the constant
+  main for that alone; fixed to `"^q: panels"`. If E2E TUI fails on a FOOTER string, suspect the constant
   before the code.
 - Verified live, not just by unit test: two TUIs in one tmux server against an isolated daemon
   (`NEBULA_RUNTIME_DIR=/tmp/nbws`, short for SUN_LEN). Pane 0 pressed `w j Enter` → footer `◇ client`

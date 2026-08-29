@@ -15,7 +15,7 @@ rev-parse origin/main)" = 36f7149 ] && git push …` — because origin had move
 `claude.yml` / `claude-code-review.yml` workflows, PR #22 `theme.rs` from the `claude/issue-6-…` branch).
 No file overlap → `git rebase origin/main`, re-gate **778 passed**, `git push origin
 release-v0.17.0:main`, tag, all four matrix targets green, `gh release edit --notes-file` with the FOCUS
-TINT fix folded into the notes under *Shape the screen*. PROTOCOL VERSION 32 → **34** (origin never
+TINT fix folded into the RELEASE NOTES under *Shape the screen*. PROTOCOL VERSION 32 → **34** (origin never
 touched `protocol.rs`; no collision). Reconciled the SHARED CHECKOUT: all 37 files `cmp`-identical to the
 RELEASE WORKTREE → `git stash push -u -m "pre-v0.17.0-release …"` + `git pull --ff-only origin main` →
 clean at `11233a4`; RELEASE WORKTREE removed, branch kept. Re-hit the `for f in $(…)` zsh trap (×2) →

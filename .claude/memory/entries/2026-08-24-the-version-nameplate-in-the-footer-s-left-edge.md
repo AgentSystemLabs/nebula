@@ -1,10 +1,10 @@
-# The Version Nameplate In The Footer's Left Edge — 2026-08-24
+# The VERSION NAMEPLATE In The FOOTER's Left Edge — 2026-08-24
 
 **Asked:** "display the version number of nebula in the bottom bar somewhere, I think bottom left should
 say nebula vx.y.z"
 
 **Did:** `draw_footer` (`crates/nebula-tui/src/ui.rs`) now splices `nebula v{env!("CARGO_PKG_VERSION")}`
-+ `"  ·  "` in at span index 1 (after the leading pad, ahead of `◇ workspace`), styled `th.dim`. The
++ `"  ·  "` in at span index 1 (after the leading pad, ahead of the WORKSPACE NAMEPLATE `◇ workspace`), styled `th.dim`. The
 splice happens **after** `left` is computed, not where the workspace span is pushed, because the decision
 needs the width the usage readout left behind: it is skipped when `app.flash.is_some()` **and** the spans
 already measure wider than `left.width`. New unit test
@@ -12,11 +12,11 @@ already measure wider than `left.width`. New unit test
 (clap, `crates/nebula/src/main.rs:10`) reads the same workspace version, so the two agree by construction.
 
 **Gotchas:**
-- **The footer's left edge is a fixed column budget and it was already full.** The nameplate costs 18
+- **The FOOTER's left edge is a fixed column budget and it was already full.** The VERSION NAMEPLATE costs 18
   columns (`nebula v0.2.0` + separator) and everything downstream of it — workspace, hostname, conn,
   breadcrumb, hints/flash — just shifts right and clips off the end. Anything else added here pays the
   same toll.
-- **A clipped flash is a broken feature, a clipped hint list is not.** The e2e
+- **A clipped FLASH is a broken feature, a clipped hint list is not.** The e2e
   `tui_pull_request_row_leads_the_links_group` caught this: at `COLS = 120` the bar rendered
   `… #7 Attach links    the pull request link c` — the flash lost `an't be deleted`. Hint lists are
   ordered by importance and truncate harmlessly; flashes are sentences. Hence the flash-only yield rather

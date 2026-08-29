@@ -14,12 +14,11 @@ WINDOW exactly as they are; the cursor must follow its row across a re-sort. (No
 **Did:** MOVE PROJECT is gone: `Action::MoveProjectUp/Down` and their `ActionSpec`s (`keymap.rs`), the
 handler arms and `move_project()` (`event_loop.rs`), `ClientRequest::MoveProject` (`protocol.rs`, PROTOCOL
 VERSION 30 → 31), the `server.rs` arm, `Daemon::move_project` + its two tests (`registry.rs`),
-`Store::set_project_position` (`store.rs`), the help-overlay row and the `{}/{}: move` FOOTER hint (`ui.rs`),
+`Store::set_project_position` (`store.rs`), the HELP OVERLAY row and the `{}/{}: move` FOOTER hint (`ui.rs`),
 the README key row. The `sort_order` column and `Project.sort_order` stay — they're still the insertion
 order and the tiebreak; not worth a migration. New in `app.rs`: `Recency { interacted, stamped }` with
 `worktree_recency()` / `project_recency()` (free-standing, mirroring `worktree_rollup`), `interacted` being
-the newest `last_interaction_ms` (RUNNING = now) and `stamped` the newest raw `status_changed_at` the "23m
-ago" label reads. `project_rows()` sorts by it (stable, so never-run rows keep tree order at the bottom);
+the newest `last_interaction_ms` (RUNNING = now) and `stamped` the newest raw `status_changed_at` the AGO BADGE reads. `project_rows()` sorts by it (stable, so never-run rows keep tree order at the bottom);
 `visible_worktrees()` sorts each of PINNED / UNPINNED by it, so the ROOT WORKTREE moves like any row. `ui.rs`
 grew `fit_ago()` (the sessions rule — the label drops before the name goes under `MIN_NAME_W`, renamed from
 `MIN_SESSION_NAME_W`) used by all three panels; project rows render `name 23m ago  badges`, worktree rows
@@ -34,7 +33,7 @@ that order themselves" bullet. Tests: `shifted_keys_no_longer_reorder_projects`,
 
 **Gotchas:**
 - **The default WORKTREES PANEL is 22 columns (`DEFAULT_PANEL_WIDTHS[1]`), and `main ⌂ root 23m ago` does
-  not fit in it.** First cut dropped the whole root badge whenever the root had a stamp — i.e. always, in
+  not fit in it.** First cut dropped the whole ROOT BADGE whenever the root had a stamp — i.e. always, in
   the default layout. Fix: the badge degrades to its bare glyph (`ROOT_GLYPH = " ⌂"`) before it goes, so
   the default width shows `main ⌂ 23m ago`; a 34-column panel gets the word back. Yield order on a
   worktree row is now: ago label (if the name would drop under 8 columns), then the word "root", then the

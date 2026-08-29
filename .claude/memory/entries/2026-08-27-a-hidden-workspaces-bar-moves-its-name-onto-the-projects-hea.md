@@ -1,9 +1,9 @@
-# A Hidden Workspaces Bar Moves Its Name Onto The Projects Header — 2026-08-27
+# A Hidden WORKSPACES BAR Moves Its Name Onto The Projects Header — 2026-08-27
 
 **Asked:** "when a user has the workspaces top bar hidden, display the selected workspace name in place
 of where it says Projects inside the projects list"
 
-**Did:** `draw_projects` (`crates/nebula-tui/src/ui.rs:2475`) now computes its title instead of passing
+**Did:** The PROJECTS PANEL's `draw_projects` (`crates/nebula-tui/src/ui.rs:2475`) now computes its title instead of passing
 the literal: `"PROJECTS"` while `app.show_workspaces`, otherwise
 `app.tree.active_workspace_name().to_uppercase()`, truncated to `area.width - (ROW_GUTTER + 1 + " · n")`
 so a long workspace name can't run into the column rule. The ` · n` project count stays either way, and

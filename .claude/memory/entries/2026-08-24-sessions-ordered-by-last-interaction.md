@@ -7,5 +7,5 @@ Follow-up: "commit and push, then release with good change log with detials on w
 skill when done to follow these steps." Related earlier ask (2c58d9c1): running / awaiting-feedback
 sessions always pin to the top of the Recent list.
 
-**Did:** Sessions sort by last-interaction timestamp with a relative age label; released as `c340baf`
+**Did:** Sessions sort by last-interaction timestamp (RECENCY ORDER) with a relative age label (the AGO BADGE); released as `c340baf`
 (v0.2.0).
