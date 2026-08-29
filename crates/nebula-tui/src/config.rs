@@ -28,6 +28,35 @@ pub const SESSION_IDLE_TIMEOUTS: &[&str] = &["off", "1m", "5m", "15m", "30m", "1
 /// models, hand-edited configs can name any command the list doesn't.
 pub const EDITORS: &[&str] = &["vim", "nvim", "nano", "emacs", "hx"];
 
+/// Values the settings overlay cycles through for `done_sound` — what rings
+/// when a turn reaches FINISHED. `off` is silence, `bell` the terminal BEL
+/// (the one sound that reaches the local terminal over `nebula ssh` — but
+/// silent in Ghostty out of the box, whose `bell-features` default to
+/// `no-audio`), the rest are macOS system sounds in `/System/Library/Sounds`,
+/// played with `afplay`; see [`Config::done_sound`] for where a name falls
+/// back to the bell. Hand-edited configs can name any sound in that folder.
+pub const DONE_SOUNDS: &[&str] = &[
+    "off",
+    "bell",
+    "Glass",
+    "Ping",
+    "Pop",
+    "Hero",
+    "Purr",
+    "Tink",
+    "Submarine",
+    "Funk",
+    "Blow",
+    "Bottle",
+    "Frog",
+    "Morse",
+    "Sosumi",
+    "Basso",
+];
+
+/// Where the macOS system sounds live; `<name>.aiff` inside it.
+const MACOS_SOUNDS_DIR: &str = "/System/Library/Sounds";
+
 /// The model/effort sentinel meaning "don't pass the flag — let the CLI
 /// pick"; it heads every choice list and is what the daemon sees as None.
 pub const DEFAULT_CHOICE: &str = "default";
@@ -98,16 +127,20 @@ pub enum SettingKind {
     SkipSessionNaming,
     RecentWindow,
     SessionIdleTimeout,
+    DoneSound,
     Theme,
     Animations,
     FocusTint,
     ShowWorkspaces,
     HideProjects,
     HideWorktrees,
+    ClaudeEnabled,
     ClaudeModel,
     ClaudeEffort,
+    CodexEnabled,
     CodexModel,
     CodexEffort,
+    CursorEnabled,
 }
 
 /// The tab strip, left to right. Ordered by how often a setting gets
@@ -152,6 +185,11 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 label: "Idle session timeout",
                 hint: "Kill idle sessions in unviewed worktrees (pinned/busy spared; off disables)",
             },
+            SettingSpec {
+                kind: SettingKind::DoneSound,
+                label: "Done sound",
+                hint: "Ding when a turn finishes: off, the terminal bell, or a macOS system sound",
+            },
         ]),
     },
     SettingsTab {
@@ -193,6 +231,11 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
         title: "Agents",
         body: TabBody::Values(&[
             SettingSpec {
+                kind: SettingKind::ClaudeEnabled,
+                label: "Claude enabled",
+                hint: "Offer Claude in the New session picker (off hides it; existing sessions keep running)",
+            },
+            SettingSpec {
                 kind: SettingKind::ClaudeModel,
                 label: "Claude model",
                 hint: "Default model for new Claude sessions (default = CLI's pick)",
@@ -203,6 +246,11 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 hint: "Default reasoning effort for new Claude sessions",
             },
             SettingSpec {
+                kind: SettingKind::CodexEnabled,
+                label: "Codex enabled",
+                hint: "Offer Codex in the New session picker (off hides it; existing sessions keep running)",
+            },
+            SettingSpec {
                 kind: SettingKind::CodexModel,
                 label: "Codex model",
                 hint: "Default model for new Codex sessions (default = CLI's pick)",
@@ -211,6 +259,11 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::CodexEffort,
                 label: "Codex effort",
                 hint: "Default reasoning effort for new Codex sessions",
+            },
+            SettingSpec {
+                kind: SettingKind::CursorEnabled,
+                label: "Cursor enabled",
+                hint: "Offer Cursor in the New session picker (off hides it; existing sessions keep running)",
             },
         ]),
     },
@@ -368,6 +421,12 @@ pub struct Config {
     /// disables. Owned by the daemon (which does the parsing and reaping);
     /// the TUI writes it so the settings overlay can cycle it.
     pub session_idle_timeout: String,
+    /// What rings when a turn reaches FINISHED: "off", "bell" (terminal
+    /// BEL) or the name of a macOS system sound (`Glass` by default,
+    /// `Ping`, …; see [`DONE_SOUNDS`]). Resolved by [`Config::done_sound`],
+    /// which falls back to the bell wherever `afplay` can't reach the
+    /// user's speakers.
+    pub done_sound: String,
     /// Color theme name (see `theme::THEMES`). Unknown names fall back to
     /// the default theme.
     pub theme: String,
@@ -399,6 +458,14 @@ pub struct Config {
     pub claude_effort: String,
     pub codex_model: String,
     pub codex_effort: String,
+    /// Which AGENT KINDS the NEW SESSION PICKER offers. Off leaves that
+    /// harness out of the picker (and, for Claude, out of the PR SESSION
+    /// launch and the standing PREWARM POOL slot); sessions that already
+    /// exist keep attaching, resuming and restarting as before. All on by
+    /// default, so a config predating the keys hides nothing.
+    pub claude_enabled: bool,
+    pub codex_enabled: bool,
+    pub cursor_enabled: bool,
     /// Hotkey overrides, keyed by `keymap::ActionSpec::id`; the value is a
     /// comma-separated chord list (`"j, down"`), and an empty string means
     /// deliberately unbound. Only rows that differ from the defaults are
@@ -416,6 +483,7 @@ impl Default for Config {
             skip_session_naming: false,
             recent_window: "30m".into(),
             session_idle_timeout: "5m".into(),
+            done_sound: "Glass".into(),
             theme: "default".into(),
             animations: true,
             focus_tint: false,
@@ -426,6 +494,9 @@ impl Default for Config {
             claude_effort: DEFAULT_CHOICE.into(),
             codex_model: DEFAULT_CHOICE.into(),
             codex_effort: DEFAULT_CHOICE.into(),
+            claude_enabled: true,
+            codex_enabled: true,
+            cursor_enabled: true,
             keybindings: BTreeMap::new(),
         }
     }
@@ -512,6 +583,7 @@ impl Config {
             "session_idle_timeout".into(),
             serde_json::json!(self.session_idle_timeout),
         );
+        obj.insert("done_sound".into(), serde_json::json!(self.done_sound));
         obj.insert("theme".into(), serde_json::json!(self.theme));
         obj.insert("animations".into(), serde_json::json!(self.animations));
         obj.insert("focus_tint".into(), serde_json::json!(self.focus_tint));
@@ -534,6 +606,18 @@ impl Config {
         );
         obj.insert("codex_model".into(), serde_json::json!(self.codex_model));
         obj.insert("codex_effort".into(), serde_json::json!(self.codex_effort));
+        obj.insert(
+            "claude_enabled".into(),
+            serde_json::json!(self.claude_enabled),
+        );
+        obj.insert(
+            "codex_enabled".into(),
+            serde_json::json!(self.codex_enabled),
+        );
+        obj.insert(
+            "cursor_enabled".into(),
+            serde_json::json!(self.cursor_enabled),
+        );
         obj.insert("keybindings".into(), serde_json::json!(self.keybindings));
         let mut bytes = serde_json::to_vec_pretty(&root)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
@@ -587,6 +671,25 @@ impl Config {
         non_default(value)
     }
 
+    /// Whether the NEW SESSION PICKER offers `kind` at all.
+    pub fn kind_enabled(&self, kind: AgentKind) -> bool {
+        match kind {
+            AgentKind::Claude => self.claude_enabled,
+            AgentKind::Codex => self.codex_enabled,
+            AgentKind::Cursor => self.cursor_enabled,
+        }
+    }
+
+    /// The AGENT KINDS the picker lists, in `AgentKind::ALL` order. Empty
+    /// only from a hand-edited config: the overlay refuses to switch off
+    /// the last one.
+    pub fn enabled_kinds(&self) -> Vec<AgentKind> {
+        AgentKind::ALL
+            .into_iter()
+            .filter(|kind| self.kind_enabled(*kind))
+            .collect()
+    }
+
     /// Hotkeys as the event loop dispatches them: defaults with this
     /// config's overrides applied.
     pub fn keymap(&self) -> crate::keymap::Keymap {
@@ -601,6 +704,7 @@ impl Config {
             SettingKind::SkipSessionNaming => on_off(self.skip_session_naming).into(),
             SettingKind::RecentWindow => self.recent_window.clone(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
+            SettingKind::DoneSound => self.done_sound.clone(),
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
             SettingKind::FocusTint => on_off(self.focus_tint).into(),
@@ -611,6 +715,9 @@ impl Config {
             SettingKind::ClaudeEffort => self.claude_effort.clone(),
             SettingKind::CodexModel => self.codex_model.clone(),
             SettingKind::CodexEffort => self.codex_effort.clone(),
+            SettingKind::ClaudeEnabled => on_off(self.claude_enabled).into(),
+            SettingKind::CodexEnabled => on_off(self.codex_enabled).into(),
+            SettingKind::CursorEnabled => on_off(self.cursor_enabled).into(),
         }
     }
 
@@ -642,6 +749,9 @@ impl Config {
                 self.session_idle_timeout =
                     cycle_choice(&self.session_idle_timeout, SESSION_IDLE_TIMEOUTS, step).into();
             }
+            SettingKind::DoneSound => {
+                self.done_sound = cycle_choice(&self.done_sound, DONE_SOUNDS, step).into();
+            }
             SettingKind::Theme => {
                 self.theme = cycle_choice(&self.theme, crate::theme::THEMES, step).into();
             }
@@ -672,7 +782,63 @@ impl Config {
             SettingKind::CodexEffort => {
                 self.codex_effort = cycle_choice(&self.codex_effort, CODEX_EFFORTS, step).into();
             }
+            SettingKind::ClaudeEnabled => {
+                self.claude_enabled = !self.claude_enabled;
+            }
+            SettingKind::CodexEnabled => {
+                self.codex_enabled = !self.codex_enabled;
+            }
+            SettingKind::CursorEnabled => {
+                self.cursor_enabled = !self.cursor_enabled;
+            }
         }
+    }
+}
+
+/// What the TUI plays when a turn reaches FINISHED — the `done_sound`
+/// SETTING resolved against where the TUI is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DoneSound {
+    /// The terminal BEL (`\x07`), written through the attached terminal,
+    /// which decides whether that is a sound, a flash, or a dock bounce.
+    Bell,
+    /// A sound file to hand to `afplay`.
+    File(PathBuf),
+}
+
+impl Config {
+    /// The sound to play for a finish, or `None` for silence. A named
+    /// system sound only resolves to its file on macOS, on a local
+    /// terminal, and when the file exists — over ssh `afplay` would ring
+    /// the *remote* box, so the bell stands in there, as it does off
+    /// macOS and for a name the sound folder doesn't hold.
+    pub fn done_sound(&self) -> Option<DoneSound> {
+        resolve_done_sound(
+            &self.done_sound,
+            nebula_core::host::is_remote_session(),
+            cfg!(target_os = "macos"),
+        )
+    }
+}
+
+fn resolve_done_sound(configured: &str, remote: bool, macos: bool) -> Option<DoneSound> {
+    let name = configured.trim();
+    if name.is_empty() || name.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    if name.eq_ignore_ascii_case("bell") || remote || !macos {
+        return Some(DoneSound::Bell);
+    }
+    // A sound name is a bare file stem; anything else (a path, a dot) is
+    // not one, and the bell covers the typo.
+    if !name.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Some(DoneSound::Bell);
+    }
+    let path = Path::new(MACOS_SOUNDS_DIR).join(format!("{name}.aiff"));
+    if path.is_file() {
+        Some(DoneSound::File(path))
+    } else {
+        Some(DoneSound::Bell)
     }
 }
 
@@ -688,7 +854,7 @@ fn resolve_editor(env: Option<&str>, configured: &str) -> String {
 }
 
 /// [`DEFAULT_CHOICE`] (or blank) → None; anything else passes through.
-fn non_default(value: &str) -> Option<String> {
+pub(crate) fn non_default(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty() && !value.eq_ignore_ascii_case(DEFAULT_CHOICE)).then(|| value.to_string())
 }
@@ -709,7 +875,7 @@ fn shown_hidden(hidden: bool) -> &'static str {
     }
 }
 
-fn cycle_choice<'a>(current: &str, choices: &[&'a str], delta: i32) -> &'a str {
+pub(crate) fn cycle_choice<'a>(current: &str, choices: &[&'a str], delta: i32) -> &'a str {
     let n = choices.len() as i32;
     let pos = choices
         .iter()
@@ -870,6 +1036,68 @@ mod tests {
         assert_eq!(
             Config::default().recent_window_ms(),
             DEFAULT_RECENT_WINDOW_MS
+        );
+    }
+
+    #[test]
+    fn done_sound_defaults_to_bell_cycles_persists_and_resolves() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.done_sound, "Glass");
+        // A config predating the key dings too.
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.done_sound, "Glass");
+
+        let (tab, row) = locate(SettingKind::DoneSound).unwrap();
+        cfg.cycle(tab, row, -1);
+        assert_eq!(cfg.done_sound, "bell");
+        cfg.cycle(tab, row, -1);
+        assert_eq!(cfg.done_sound, "off");
+        cfg.cycle(tab, row, -1);
+        assert_eq!(cfg.done_sound, "Basso", "the list wraps");
+        cfg.cycle(tab, row, 0);
+        assert_eq!(cfg.done_sound, "off");
+        cfg.cycle(tab, row, 1);
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.done_sound, "Glass");
+        assert_eq!(cfg.value_label(SettingKind::DoneSound), "Glass");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert_eq!(load_from(&path).done_sound, "Glass");
+
+        // Silence, the bell, and every reason a name falls back to it.
+        assert_eq!(resolve_done_sound("off", false, true), None);
+        assert_eq!(resolve_done_sound("OFF", false, true), None);
+        assert_eq!(resolve_done_sound("", false, true), None);
+        assert_eq!(
+            resolve_done_sound("bell", false, true),
+            Some(DoneSound::Bell)
+        );
+        assert_eq!(
+            resolve_done_sound("Glass", true, true),
+            Some(DoneSound::Bell),
+            "over ssh afplay would ring the remote box"
+        );
+        assert_eq!(
+            resolve_done_sound("Glass", false, false),
+            Some(DoneSound::Bell),
+            "no system sounds off macOS"
+        );
+        assert_eq!(
+            resolve_done_sound("NoSuchSound", false, true),
+            Some(DoneSound::Bell)
+        );
+        assert_eq!(
+            resolve_done_sound("../etc/passwd", false, true),
+            Some(DoneSound::Bell)
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            resolve_done_sound("Glass", false, true),
+            Some(DoneSound::File(
+                Path::new(MACOS_SOUNDS_DIR).join("Glass.aiff")
+            ))
         );
     }
 
@@ -1039,6 +1267,46 @@ mod tests {
         // A config predating the key keeps the tint off.
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(!cfg.focus_tint);
+    }
+
+    #[test]
+    fn harness_toggles_default_on_and_persist() {
+        let mut cfg = Config::default();
+        assert!(cfg.claude_enabled && cfg.codex_enabled && cfg.cursor_enabled);
+        assert_eq!(cfg.enabled_kinds(), AgentKind::ALL.to_vec());
+
+        let (tab, row) = locate(SettingKind::CodexEnabled).unwrap();
+        cfg.cycle(tab, row, 0);
+        assert!(!cfg.codex_enabled);
+        assert!(!cfg.kind_enabled(AgentKind::Codex));
+        assert_eq!(
+            cfg.enabled_kinds(),
+            vec![AgentKind::Claude, AgentKind::Cursor],
+            "the disabled kind drops out, order kept"
+        );
+        // ←/→ toggle a bool just like Enter does.
+        cfg.cycle(tab, row, -1);
+        assert!(cfg.codex_enabled);
+        cfg.cycle(tab, row, 1);
+        assert!(!cfg.codex_enabled);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let loaded = load_from(&path);
+        assert!(loaded.claude_enabled);
+        assert!(!loaded.codex_enabled);
+        assert!(loaded.cursor_enabled);
+        // A config predating the keys offers every harness.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.enabled_kinds().len(), 3);
+
+        // Every kind off is representable (a hand edit), and reads as empty.
+        let cfg: Config = serde_json::from_str(
+            r#"{"claude_enabled":false,"codex_enabled":false,"cursor_enabled":false}"#,
+        )
+        .unwrap();
+        assert!(cfg.enabled_kinds().is_empty());
     }
 
     #[test]

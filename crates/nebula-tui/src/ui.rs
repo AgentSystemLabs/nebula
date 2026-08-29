@@ -553,7 +553,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             Act(&[FocusLeft, FocusRight]),
                             "focus left / right (2×: jump)",
                         ),
-                        (Act(&[MoveDown, MoveUp]), "move selection"),
+                        (Act(&[MoveDown, MoveUp]), "move selection (2×: bar)"),
                         (Act(&[Activate]), "drill in / attach session"),
                         (Act(&[Palette]), "fuzzy jump to anything"),
                         (Lit("^o / ^f"), "jump pick: open / focus row"),
@@ -567,7 +567,6 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     &[
                         (Act(&[New, AddProject]), "add project (2nd: from anywhere)"),
                         (Act(&[Rename]), "rename row (folder keeps its name)"),
-                        (Act(&[MoveProjectDown, MoveProjectUp]), "reorder project"),
                         (Act(&[Delete]), "remove from list"),
                     ],
                 ),
@@ -596,6 +595,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "SESSIONS",
                     &[
                         (Act(&[New]), "new agent (pick CLI kind)"),
+                        (Act(&[AgentPresets]), "agent presets: launch with a task"),
                         (Act(&[NewTerminal]), "new shell terminal"),
                         (Act(&[Activate]), "attach session / open link"),
                         (Act(&[Rename]), "rename agent / edit link URL"),
@@ -1603,6 +1603,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 v.selected = selected;
             }
         }
+        Overlay::AgentPresets(view) => crate::preset_overlays::draw_list(f, app, &view, th),
+        Overlay::AgentPresetEditor(editor) => {
+            crate::preset_overlays::draw_editor(f, app, &editor, th)
+        }
         Overlay::Tree(view) => {
             let area = centered_rect_pct(f.area(), SPLIT_MODAL_PCT.0, SPLIT_MODAL_PCT.1);
             f.render_widget(Clear, area);
@@ -1776,7 +1780,7 @@ fn settings_keys_hint(view: &crate::app::SettingsView) -> &'static str {
     "↑/↓: move  Enter: toggle  ←/→: cycle  R: reset all  Tab: next tab  ↑ at top: tabs"
 }
 
-fn centered_rect(frame: Rect, width: u16, height: u16) -> Rect {
+pub(crate) fn centered_rect(frame: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(frame.width);
     let height = height.min(frame.height);
     Rect {
@@ -1876,7 +1880,7 @@ fn draw_focus_tint(buf: &mut ratatui::buffer::Buffer, area: Rect, th: Theme) {
 
 /// The frame every accent modal shares — rounded accent border, bold accent
 /// title — so the overlays can't drift apart one border style at a time.
-fn modal_block<'a>(title: impl Into<std::borrow::Cow<'a, str>>, th: Theme) -> Block<'a> {
+pub(crate) fn modal_block<'a>(title: impl Into<std::borrow::Cow<'a, str>>, th: Theme) -> Block<'a> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1904,7 +1908,7 @@ fn render_modal_frame<'a>(
 
 /// A dim one-line placeholder on the first row of an otherwise empty list,
 /// when the list has a first row at all.
-fn empty_list_row(f: &mut Frame, list_inner: Rect, text: &str, th: Theme) {
+pub(crate) fn empty_list_row(f: &mut Frame, list_inner: Rect, text: &str, th: Theme) {
     if let Some(row_area) = row_rect(list_inner, 0) {
         f.render_widget(
             Paragraph::new(Span::styled(text, Style::default().fg(th.dim))),
@@ -2037,14 +2041,15 @@ fn status_name_spans(
     }
 }
 
-/// Columns a session name must keep before the "23m ago" label is worth
+/// Columns a row's name must keep before the "23m ago" label is worth
 /// the space it costs. Below this the label drops and the name gets it all.
-const MIN_SESSION_NAME_W: usize = 8;
+const MIN_NAME_W: usize = 8;
 
-/// " 23m ago" for the sessions list, or empty for a session that has never
-/// run. Reads the raw status stamp rather than the sort key, so a session
-/// that has been working for an hour says "1h ago" — when you last spoke to
-/// it — instead of a permanent "just now".
+/// " 23m ago" for a list row, or empty for one that has never run. Reads
+/// the raw status stamp rather than the sort key, so a session that has
+/// been working for an hour says "1h ago" — when you last spoke to it —
+/// instead of a permanent "just now". Worktree and project rows pass the
+/// newest stamp under them and read the same way.
 fn ago_badge(status_changed_at: i64) -> String {
     if status_changed_at <= 0 {
         return String::new();
@@ -2052,6 +2057,16 @@ fn ago_badge(status_changed_at: i64) -> String {
     match crate::hosts::ago_label(crate::app::now_ms() - status_changed_at) {
         s if s.is_empty() => s,
         s => format!(" {s}"),
+    }
+}
+
+/// Fit an ago label into `free` columns beside a name: the label and the
+/// columns the name keeps. A narrow panel spends its columns on the name —
+/// the label drops out entirely rather than squeezing the title to nothing.
+fn fit_ago(ago: String, free: usize) -> (String, usize) {
+    match free.checked_sub(ago.chars().count()) {
+        Some(rest) if rest >= MIN_NAME_W => (ago, rest),
+        _ => (String::new(), free),
     }
 }
 
@@ -2089,7 +2104,7 @@ fn row_bar(selected: bool, focused: bool, th: Theme) -> Style {
 /// selection in the focused panel; every other row gets a plain 1-cell
 /// gutter so text stays aligned. Dim spans (idle dots, archived names)
 /// would sink into the selection fill, so they get lifted to muted there.
-fn render_row(
+pub(crate) fn render_row(
     f: &mut Frame,
     area: Rect,
     spans: Vec<Span>,
@@ -2529,12 +2544,13 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
 /// Per-row display data of the Projects panel, pre-collected to end the
 /// tree borrow: name, the folder name to show under it (Some only once the
-/// row has been renamed away from it), rollup, unwatched-finish count.
-type ProjectRowData = (String, Option<String>, Option<AgentStatus>, usize);
+/// row has been renamed away from it), rollup, unwatched-finish count,
+/// last-turn stamp.
+type ProjectRowData = (String, Option<String>, Option<AgentStatus>, usize, i64);
 
 /// The same for the Worktrees panel: branch, is-root, rollup,
-/// unwatched-finish count.
-type WorktreeRowData = (String, bool, Option<AgentStatus>, usize);
+/// unwatched-finish count, last-turn stamp.
+type WorktreeRowData = (String, bool, Option<AgentStatus>, usize, i64);
 
 /// Columns between the `WORKSPACES` label and the first tab.
 const TAB_GAP: u16 = 2;
@@ -2587,11 +2603,12 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                 p.folder_subtitle(),
                 app.project_rollup(&p.id),
                 app.project_unseen(&p.id),
+                app.project_recency(&p.id).stamped,
             )
         })
         .collect();
     let mut screen_row = 0usize;
-    for (row_idx, (text, folder, roll, unseen)) in rows.iter().enumerate() {
+    for (row_idx, (text, folder, roll, unseen, stamped)) in rows.iter().enumerate() {
         // A renamed row grows by the one line its folder name takes, so the
         // pads above and below stay a row each either way.
         let height = PROJECT_BTN_H + folder.is_some() as u16;
@@ -2601,14 +2618,22 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
         // Same badge as worktree rows: sessions that finished unwatched
         // anywhere under the project.
         let (badges, badge_len) = row_badges(*unseen, th);
+        // How long since anything under the project last did something,
+        // dim after the name. The column is sorted on this stamp, so the
+        // label is what makes the order legible.
+        let free = (inner.width as usize).saturating_sub(3 + badge_len);
+        let (ago, name_max) = fit_ago(ago_badge(*stamped), free);
         // Bold name: the top of the tree reads "biggest".
         let mut spans = vec![status_dot(*roll, *unseen > 0, th)];
         spans.extend(status_name_spans(
-            truncate(text, (inner.width as usize).saturating_sub(3 + badge_len)),
+            truncate(text, name_max),
             Style::default().add_modifier(Modifier::BOLD),
             sweep_ramp(*roll, th, app.animations),
             app.sweep_phase(),
         ));
+        if !ago.is_empty() {
+            spans.push(Span::styled(ago, Style::default().fg(th.dim)));
+        }
         for (text, style) in badges {
             spans.push(Span::styled(text, style));
         }
@@ -2690,6 +2715,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 w.is_main,
                 app.worktree_rollup(&w.id),
                 app.worktree_unseen(&w.id),
+                app.worktree_recency(&w.id).stamped,
             )
         })
         .collect();
@@ -2796,8 +2822,11 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
 
     // ---- draw ----
     // The main checkout renders as `branch ⌂ root` (dim badge — the branch
-    // is live, the badge marks root-ness).
+    // is live, the badge marks root-ness). When the ago label leaves no
+    // room for the word, the glyph alone still marks the row: at the
+    // default column width `main ⌂ 23m ago` is what fits.
     const ROOT_BADGE: &str = " ⌂ root";
+    const ROOT_GLYPH: &str = " ⌂";
     for (pos, (top, entry)) in layout.iter().enumerate() {
         let y = *top as isize - scroll;
         if y >= view_h as isize {
@@ -2811,24 +2840,36 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
             WorktreeEntry::Row(i) if *i < worktrees.len() => {
-                let (branch, is_main, roll, unseen) = &worktrees[*i];
+                let (branch, is_main, roll, unseen, stamped) = &worktrees[*i];
                 let (badges, badge_len) = row_badges(*unseen, th);
                 let ramp = sweep_ramp(*roll, th, app.animations);
                 // 3, not 2: the dot's two cells plus the pill marker
                 // `render_pill` prepends — bill them here or the trailing
                 // badge is what falls off the end of a twenty-cell column.
                 let free = (inner.width as usize).saturating_sub(3 + badge_len);
-                // The root badge then yields to a branch it would push into
-                // an ellipsis: in a narrow column `main 1 done` beats
+                // How long since a session in this checkout last did
+                // something — the stamp the group is sorted on, so the
+                // label is what makes the order legible. It yields to the
+                // branch name first (same rule as the session rows)...
+                let (ago, free) = fit_ago(ago_badge(*stamped), free);
+                // ...and the root badge then yields to a branch it would push
+                // into an ellipsis: in a narrow column `main 1 done` beats
                 // `ma… ⌂ root 1 done` — the ⌂ is the least load-bearing
-                // thing on the row, the branch is the row's identity.
-                let root = *is_main
-                    && branch.chars().count() <= free.saturating_sub(ROOT_BADGE.chars().count());
-                let max = if root {
-                    free - ROOT_BADGE.chars().count()
-                } else {
-                    free
+                // thing on the row, the branch is the row's identity. It
+                // shrinks to the bare glyph before it goes.
+                let fits = |badge: &str| {
+                    branch.chars().count() <= free.saturating_sub(badge.chars().count())
                 };
+                let root = if !*is_main {
+                    None
+                } else if fits(ROOT_BADGE) {
+                    Some(ROOT_BADGE)
+                } else if fits(ROOT_GLYPH) {
+                    Some(ROOT_GLYPH)
+                } else {
+                    None
+                };
+                let max = free - root.map_or(0, |r| r.chars().count());
                 let mut spans = vec![status_dot(*roll, *unseen > 0, th)];
                 spans.extend(status_name_spans(
                     truncate(branch, max),
@@ -2836,8 +2877,11 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     ramp,
                     app.sweep_phase(),
                 ));
-                if root {
-                    spans.push(Span::styled(ROOT_BADGE, Style::default().fg(th.dim)));
+                if let Some(root) = root {
+                    spans.push(Span::styled(root, Style::default().fg(th.dim)));
+                }
+                if !ago.is_empty() {
+                    spans.push(Span::styled(ago, Style::default().fg(th.dim)));
                 }
                 for (text, style) in badges {
                     spans.push(Span::styled(text, style));
@@ -3145,12 +3189,7 @@ fn draw_session_row(
             // 3 = the pill's selection marker plus the status dot, both of
             // which render ahead of the name.
             let free = (width.saturating_sub(3) as usize).saturating_sub(badge.chars().count());
-            // A narrow panel spends its columns on the name: the ago label
-            // drops out entirely rather than squeezing the title to nothing.
-            let (ago, name_max) = match free.checked_sub(ago.chars().count()) {
-                Some(rest) if rest >= MIN_SESSION_NAME_W => (ago, rest),
-                _ => (String::new(), free),
-            };
+            let (ago, name_max) = fit_ago(ago, free);
             // Archived rows stay quiet even if their last status was live.
             let ramp = if a.archived {
                 None
@@ -3690,6 +3729,16 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             },
             Style::default().fg(th.dim),
         )
+    } else if matches!(&app.overlay, Some(Overlay::AgentPresets(_))) {
+        Span::styled(
+            "↑/↓: select  Enter: launch with a task  a: new  e: edit  d: delete  Esc: close",
+            Style::default().fg(th.dim),
+        )
+    } else if matches!(&app.overlay, Some(Overlay::AgentPresetEditor(_))) {
+        Span::styled(
+            "Tab/↑↓: next field  ←/→: cycle  Shift+Enter/^J: newline  Enter: save  Esc: back to list",
+            Style::default().fg(th.dim),
+        )
     } else if matches!(&app.overlay, Some(Overlay::Menu(m)) if m.is_workspace_picker()) {
         Span::styled(
             "Enter: open  n: new  r: rename  d: delete  Esc: close",
@@ -3753,13 +3802,11 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::Help)
             ),
             Focus::Projects => format!(
-                "{}/{}: add  {}: rename  {}: remove  {}/{}: move  {}: search  {}: menu  {}: help",
+                "{}/{}: add  {}: rename  {}: remove  {}: search  {}: menu  {}: help",
                 k(Action::New),
                 k(Action::AddProject),
                 k(Action::Rename),
                 k(Action::Delete),
-                k(Action::MoveProjectDown),
-                k(Action::MoveProjectUp),
                 k(Action::Palette),
                 k(Action::ContextMenu),
                 k(Action::Help)
@@ -3808,9 +3855,10 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::Help)
             ),
             Focus::Sessions => format!(
-                "{}: focus  {}: agent  {}: terminal  {}: rename  {}: archive  {}: del  {}: menu  {}: help",
+                "{}: focus  {}: agent  {}: presets  {}: terminal  {}: rename  {}: archive  {}: del  {}: menu  {}: help",
                 k(Action::Activate),
                 k(Action::New),
+                k(Action::AgentPresets),
                 k(Action::NewTerminal),
                 k(Action::Rename),
                 k(Action::Archive),
@@ -4070,7 +4118,7 @@ fn fuzzy_highlight_spans(shown: &str, positions: &[usize], th: Theme) -> Vec<Spa
 /// always break; soft breaks prefer the last whitespace that fits. The
 /// returned row index is where the caret rendered, so the caller can keep
 /// that row inside its fixed-height viewport.
-fn multiline_input_lines(
+pub(crate) fn multiline_input_lines(
     input: &TextInput,
     width: usize,
     cursor: Color,
@@ -4168,7 +4216,12 @@ fn multiline_input_lines(
 ///
 /// `cursor` colors the caret block; pass `th.dim` to park it (the prompt
 /// does that while a listing row, not the text, holds Enter).
-fn input_spans(input: &TextInput, budget: usize, cursor: Color, th: Theme) -> Vec<Span<'static>> {
+pub(crate) fn input_spans(
+    input: &TextInput,
+    budget: usize,
+    cursor: Color,
+    th: Theme,
+) -> Vec<Span<'static>> {
     let chars: Vec<char> = input.chars().collect();
     let caret = input.cursor_chars();
     let budget = budget.max(1);
@@ -4230,7 +4283,7 @@ fn search_line(input: &TextInput, placeholder: &str, area: Rect, th: Theme) -> L
 }
 
 /// The i-th single-height row inside `inner`, or None when it overflows.
-fn row_rect(inner: Rect, i: usize) -> Option<Rect> {
+pub(crate) fn row_rect(inner: Rect, i: usize) -> Option<Rect> {
     rows_rect(inner, i, 1)
 }
 

@@ -32,6 +32,10 @@ three, every time, and read the screens.
 nebula replaces that with a tree and a color:
 
 - **Every project, worktree and agent in one list.** Up to four columns, `h`/`j`/`k`/`l` to move, `Enter` to drill in.
+- **Lists that order themselves.** Projects, worktrees and sessions all sit most-recent-first, with a dim
+  `23m ago` after the name saying why the row is where it is: a session is stamped when it last did
+  anything, a worktree carries the newest stamp of its sessions, a project the newest of its worktrees.
+  Pinned rows keep their own group on top. Nothing is dragged into place by hand.
 - **A dot per session that says what it's doing.** ● yellow is mid-turn, ● violet is done and waiting
   to be read, ● green is done and read, ● red wants you. Parents roll up their children, so a red dot
   on a collapsed project tells you exactly where to look without opening anything.
@@ -94,8 +98,9 @@ worktrees edit two directories and never collide. Or skip the column and just as
 "do this in a worktree" and it creates one through nebula and moves itself into it (see *How it works*).
 
 Under the checkouts, an `OPEN PRS` group lists every pull request still open on the repo — drafts
-included, badged as such — fetched with `gh` when you open the project and re-asked about once a minute
-(one `gh pr list` per project, so a repo with a hundred open PRs still costs one API call). That beat is
+included, badged as such — fetched with `gh` when you open the project, re-asked every 15 seconds, and
+again whenever the Worktrees or Sessions panel or the terminal window takes focus (one `gh pr list` per
+project, so a repo with a hundred open PRs still costs one API call). That beat is
 also how rows retire: merge or close a pull request and it stops coming back, so it leaves the list on
 its own, and the one under your cursor goes the moment GitHub says it's merged. Rest the cursor on one
 and the right-hand pane reads it to you — description, stats and the whole conversation — without
@@ -106,7 +111,8 @@ prompt that limits all work to that PR and includes its URL. The URL is kept wit
 reapplies the same scope. Only the row you actually stop on is fetched.
 
 **4. Start the agent.** With a worktree selected, press `n` in the Sessions column. A menu asks what to
-run — **Claude**, **Codex**, **Cursor**, or a plain **Terminal (shell)**. `→` on Claude or Codex drills
+run — **Claude**, **Codex**, or **Cursor** (a plain shell is `t`, see below); a CLI you never use can be
+switched off on the settings overlay's Agents tab and drops out of the menu entirely. `→` on Claude or Codex drills
 into model and reasoning-effort submenus; `Enter` anywhere takes your configured defaults. On the
 Claude row, `Tab` toggles Cloud mode: after the optional name, enter the task in the wrapped editor
 (`Shift+Enter` or `Ctrl+J` adds a line) and nebula launches `claude --cloud <task>`. On accounts without
@@ -126,6 +132,14 @@ refresh. To steer the cloud agent without a browser, pick **Send to cloud sessio
 editor — and nebula runs `claude -p <message> --cloud <id>` and pulls the transcript straight after. The
 reply shows up on a later refresh; the CLI never returns one. Otherwise, name the session or accept the
 default and nebula spawns the CLI in that worktree and drops you straight into it.
+
+If you keep starting the same kind of session with the same framing, save it as an **agent preset**:
+`e` in the Sessions column lists them, `a` opens a small form — name, harness, model, effort, and an
+optional prefix and postfix — and `e` / `d` edit or delete. `Enter` on a preset asks for the task in the
+same wrapped editor, then launches the CLI with `prefix + task + postfix` as its very first prompt, so
+the agent is already working when the pane opens. The row it creates is an ordinary session: it names
+itself on that first turn, resumes, and shows status like any other. Presets live in
+`agent_presets.json` beside `config.json`.
 
 **5. Leave — it keeps running.** `Ctrl+q` gets you out of the terminal and back to the panels. That's the
 key to remember: the agent doesn't care that you stopped watching. Press `q` to quit nebula entirely and
@@ -245,9 +259,13 @@ is currently unavailable; previously saved links remain visible so the change do
   the daemon and the TUI, so hand edits apply without a restart. `s` opens the settings overlay over the
   same file: color theme, animations, focused-panel tint, whether the Workspaces bar, PROJECTS PANEL,
   and WORKTREES PANEL are shown,
-  editor, default model and reasoning effort per agent CLI, the RECENT window, the idle timeout, and
-  whether new sessions stop to ask for a name. `R` inside the overlay puts every setting — hotkeys
-  included — back to its default, after a confirmation.
+  editor, which agent CLIs the new-session menu offers (at least one stays on) and their default model
+  and reasoning effort, the RECENT window, the idle timeout, the done sound (`done_sound`: a ding
+  when a turn finishes — a macOS system sound such as `Glass`, the default; `bell` for the terminal
+  bell, which Ghostty keeps silent unless its `bell-features` include `audio`; or `off`. Over
+  `nebula ssh` and off macOS it is always the bell), and whether new sessions stop to ask for a
+  name. `R` inside the overlay puts every setting — hotkeys included — back to its default, after a
+  confirmation.
 - **Every panel key is rebindable.** The overlay's Hotkeys tab lists every action and what it answers to,
   and writes overrides into the same file (`"keybindings": {"git_diff": "ctrl+g, g"}`); an empty value
   unbinds. Because nebula is always a guest inside Terminal.app / Ghostty / tmux, the tab says at bind
@@ -266,14 +284,13 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 
 | Context | Key | Action |
 |---|---|---|
-| Panels | `Tab`/`Shift+Tab`, `h/l` or `←/→`, `j/k` | move FOCUS / selection through visible panels; the walk stops at both ends (`Tab` at the TERMINAL PANE, `Shift+Tab` at the first visible panel) instead of cycling, and landing on a live pane takes its input; `h`/`l` stop one short of each end, and a double tap there (`l`,`l` at Sessions, `h`,`h` at the first visible panel) jumps the boundary |
+| Panels | `Tab`/`Shift+Tab`, `h/l` or `←/→`, `j/k` | move FOCUS / selection through visible panels; the walk stops at both ends (`Tab` at the TERMINAL PANE, `Shift+Tab` at the first visible panel) instead of cycling, and landing on a live pane takes its input; `h`/`l` stop one short of each end, and a double tap there (`l`,`l` at Sessions, `h`,`h` at the first visible panel) jumps the boundary; so do `k`,`k` on a panel's first row (up into the workspaces bar) and `j`,`j` in the bar (back down to the panel you came from) |
 | Panels | `Ctrl+→` | cross into the terminal pane *without* taking its input (`Tab`, or a double tap of `l`/`→` at Sessions, takes it) |
 | Panels | `Enter` | drill in; on a session: attach |
 | Any panel | `/` | fuzzy jump across every workspace, project, worktree and session — in *every* workspace, each row pathed `workspace/project/branch/session`, so typing another workspace's name jumps you into it (`Ctrl+n/p` move, `Ctrl+o` opens the hit, `Ctrl+f` just lands the selection on it) |
 | Projects | `n` / `d` | add project / remove from list |
 | Any panel | `o` | add ("open") a project — same prompt as `n`, from any focus |
 | Add project | type + `Tab`, `↓↑` / `→` / `←` | browse for the repo: type to filter (bash-style Tab completion), arrows pick a directory, `→` steps in, `←` steps up, `Enter` adds the highlighted (or typed) path; `●` marks git repos |
-| Projects | `Shift+J/K` | move project up / down the list (`Shift+↑/↓` too, but Terminal.app never sends those) |
 | Projects | `r` | rename the row — a label, not a move: the folder on disk keeps its name and hangs off a `└` under the new one. A terminal cell has one font size (Kitty's OSC 66 renders half-size text, but WezTerm and Ghostty don't implement it), so the hierarchy is weight, opacity and position instead: the name you chose is bold, the folder is the dimmest theme color plus the faint attribute. An empty name puts the row back on the folder's name |
 | Worktrees (checkout row) | `n` / `d` | new worktree / delete (typed confirm — deletes files) |
 | Worktrees (PROJECT OPEN PRS row) | `n`; `m` / right-click | new Claude SESSION scoped to that PR; the context menu also opens the PR or its diff |
@@ -283,6 +300,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | New session picker (Claude) | `Tab` | toggle Claude Cloud; Cloud adds a wrapped task prompt (`Shift+Enter` or `Ctrl+J` inserts a line) before launch |
 | Sessions (cloud row) | `m` | **Attach cloud session** re-pulls the transcript now; **Send to cloud session** queues a message on it |
 | Sessions | `r`, `a`, `u`, `d`, `A` | rename, archive, unarchive, delete, toggle archived |
+| Sessions | `e` | agent presets: saved launch definitions (harness, model, effort, optional prefix/postfix text). `Enter` asks for a task and starts the agent with prefix + task + postfix as its first prompt; `a` / `e` / `d` create, edit, delete |
 | Any panel | `Shift+D` | delete every row of the focused panel (confirm lists the casualties) |
 | Any panel | `g` | git diff for the selected worktree: filter, `↑↓` files, `Shift+↑↓`/`PgUp/PgDn`/`Ctrl+d/u` scroll, `Ctrl+r` marks a file reviewed ✓ |
 | Any panel | `Shift+G` | open the selected repo's page on its git host — the `origin` remote (`git@github.com:o/r.git`, `ssh://`, `https://`) turned into a browsable URL, credentials stripped |
@@ -298,7 +316,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Any panel | `Shift+H` | ssh hosts: every `nebula ssh` / `nebula tunnel` destination, newest first. `Enter`/click reconnects (quits this TUI and execs a fresh `nebula ssh` — local sessions keep running), `a` types a new `user@host [dir]`, `d` removes |
 | Any panel | `m` or right-click | context menu |
 | Any panel | `z` | full-screen terminal: collapse the sidebars and lock input into the attached session |
-| Any panel | `s` | settings overlay (theme, editor, agent defaults, timeouts) — its Hotkeys tab rebinds every key in this table; `R` inside it resets everything to the defaults (with a confirmation). A first open lands on the tab strip; reopening within a minute of closing lands back on the tab and row you left, and after that it opens fresh again |
+| Any panel | `s` | settings overlay (theme, editor, which agents to offer and their defaults, timeouts) — its Hotkeys tab rebinds every key in this table; `R` inside it resets everything to the defaults (with a confirmation). A first open lands on the tab strip; reopening within a minute of closing lands back on the tab and row you left, and after that it opens fresh again |
 | Any panel | `Shift+M` | memory usage: RAM per agent/terminal process tree, nebula itself, and the machine-wide share; `↑/↓` + `Enter` opens the selected session |
 | Any panel | `Shift+N` | replay the startup splash (any key returns) |
 | Any panel | `?` | help overlay |

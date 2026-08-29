@@ -416,15 +416,6 @@ impl Store {
         )?)
     }
 
-    /// Persist a project's list position (its sort order).
-    pub fn set_project_position(&self, p: &Project) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE projects SET sort_order = ?2 WHERE id = ?1",
-            params![p.id.as_str(), p.sort_order],
-        )?;
-        Ok(())
-    }
-
     pub fn rename_project(&self, id: &ProjectId, name: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE projects SET name = ?2 WHERE id = ?1",

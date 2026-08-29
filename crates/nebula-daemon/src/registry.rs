@@ -83,6 +83,8 @@ pub(crate) struct CreateAgentSpec {
     pub effort: Option<String>,
     pub auto_title: bool,
     pub cloud_prompt: Option<String>,
+    /// The CLI's positional first prompt (an AGENT PRESET launch). Request-only.
+    pub starting_prompt: Option<String>,
     pub pr_url: Option<String>,
 }
 
@@ -781,46 +783,6 @@ impl Daemon {
         Ok(())
     }
 
-    /// Move a project `delta` rows in the displayed list (clamped at the
-    /// edges). Sort orders are rewritten to the display index for every
-    /// project, which also normalizes legacy all-zero orders on first use.
-    pub fn move_project(self: &Arc<Self>, id: &ProjectId, delta: i64) -> Result<()> {
-        let (all_projects, _, _, _) = self.store.load_tree()?;
-        // Reorders happen within the project's workspace — the list clients
-        // actually see. Other workspaces' rows keep their sort orders; the
-        // rewrite below only renumbers this workspace's slice, which stays
-        // correctly interleaved because clients filter before ordering.
-        let workspace = all_projects
-            .iter()
-            .find(|p| &p.id == id)
-            .map(|p| p.workspace_id.clone());
-        let mut projects: Vec<Project> = all_projects
-            .into_iter()
-            .filter(|p| Some(&p.workspace_id) == workspace.as_ref())
-            .collect();
-        let Some(pos) = projects.iter().position(|p| &p.id == id) else {
-            bail!("project not found");
-        };
-        let target = (pos as i64 + delta).clamp(0, projects.len() as i64 - 1) as usize;
-        if target == pos {
-            return Ok(());
-        }
-        let moved = projects.remove(pos);
-        projects.insert(target, moved);
-        for (index, project) in projects.iter_mut().enumerate() {
-            let sort_order = index as i64;
-            if project.sort_order == sort_order {
-                continue;
-            }
-            project.sort_order = sort_order;
-            self.store.set_project_position(project)?;
-            self.broadcast(ServerEvent::EntityUpserted {
-                entity: Entity::Project(project.clone()),
-            });
-        }
-        Ok(())
-    }
-
     // ---- worktrees ----
 
     pub async fn create_worktree(
@@ -993,6 +955,7 @@ impl Daemon {
             effort,
             auto_title,
             cloud_prompt,
+            starting_prompt,
             pr_url,
         } = spec;
         let cloud_prompt = match cloud_prompt {
@@ -1003,6 +966,13 @@ impl Daemon {
                 let prompt = validate_cloud_text(&prompt, "task")?;
                 Some(prompt)
             }
+            None => None,
+        };
+        let starting_prompt = match starting_prompt {
+            Some(_) if cloud_prompt.is_some() => {
+                bail!("a starting prompt is not supported for Claude Cloud")
+            }
+            Some(prompt) => Some(validate_starting_prompt(&prompt)?),
             None => None,
         };
         let pr_url = match pr_url {
@@ -1021,8 +991,9 @@ impl Daemon {
             .context("worktree not found")?;
         // A warm session for this (worktree, kind) hands over its PTY and
         // its pre-generated id — the CLI booted while the user typed the
-        // name, so the create feels instant.
-        let adopted = (cloud_prompt.is_none() && pr_url.is_none())
+        // name, so the create feels instant. A starting prompt rides the
+        // CLI's argv, and a spare already booted bare cannot be handed one.
+        let adopted = (cloud_prompt.is_none() && pr_url.is_none() && starting_prompt.is_none())
             .then(|| self.take_prewarmed(&worktree_id, kind, model.as_deref(), effort.as_deref()))
             .flatten();
         // Only the cold path needs asking: an adopted warm session is proof
@@ -1068,7 +1039,7 @@ impl Daemon {
                 DEFAULT_COLS,
                 DEFAULT_ROWS,
                 cloud_prompt.as_deref().map(CloudLaunch::Create),
-                None,
+                starting_prompt.as_deref(),
             );
             self.rollback_agent_on_spawn_error(&agent.id, spawned)?;
         }
@@ -1533,15 +1504,14 @@ impl Daemon {
         tracing::info!(agent = %id, to = %target.branch, "relocating session into its worktree");
         self.kill_session(&sref);
         self.last_cwd.lock().unwrap().remove(id);
+        // Claude only: its `--resume <sid> "<prompt>"` is verified; whether
+        // `codex resume` / `cursor-agent --resume` take a trailing prompt is
+        // not, so their relocated sessions keep waiting for the user.
         let prompt = relocation_prompt(&target);
-        if let Err(e) = self.spawn_agent_session_with(
-            &agent,
-            &target,
-            DEFAULT_COLS,
-            DEFAULT_ROWS,
-            None,
-            Some(&prompt),
-        ) {
+        let prompt = (agent.kind == AgentKind::Claude).then_some(prompt.as_str());
+        if let Err(e) =
+            self.spawn_agent_session_with(&agent, &target, DEFAULT_COLS, DEFAULT_ROWS, None, prompt)
+        {
             tracing::warn!(agent = %id, error = %e, "respawn after worktree relocation failed");
         }
         self.try_broadcast_agent(id);
@@ -2367,7 +2337,8 @@ impl Daemon {
     /// The general spawn: `cloud` makes it a Claude Cloud launch (the
     /// initial dispatch, or a later attach/teleport of the session it
     /// created), `initial_prompt` a first turn the CLI submits on its own
-    /// (the relocation notice a `nebula worktree` respawn opens with). Both
+    /// (the relocation notice a `nebula worktree` respawn opens with, or the
+    /// prefix + task + postfix an AGENT PRESET launch composes). Both
     /// are intentionally transient: later restarts/resumes follow the
     /// persisted Agent fields — a Cloud row's `cloud_session_id` routes a
     /// restart back through `attach_cloud_agent`, everything else takes the
@@ -2689,8 +2660,9 @@ impl Daemon {
 /// Claude then gets nebula's worktree guidance appended to its system
 /// prompt, any persisted PR scope is composed into that same system-prompt
 /// argument, and an `initial_prompt` — the relocation notice a `nebula
-/// worktree` respawn opens with — goes last, as Claude's positional prompt
-/// (codex and cursor take none; their resumes wait for the user).
+/// worktree` respawn opens with, or the starting prompt an AGENT PRESET
+/// launch composes — goes last, as the CLI's trailing positional prompt
+/// (`claude [prompt]`, `codex [PROMPT]`, `cursor-agent [prompt...]`).
 ///
 /// The plain shape, as every restart/resume spawns it: no initial prompt,
 /// guidance on. Tests assert against this; the daemon calls the full form.
@@ -2823,10 +2795,39 @@ fn agent_spawn_command_with(
             if let Some(e) = effort {
                 args.extend(["-c".to_string(), format!("model_reasoning_effort={e}")]);
             }
+            // `codex [OPTIONS] [PROMPT]` — the trailing positional.
+            if let Some(p) = initial_prompt {
+                args.push(p.to_string());
+            }
         }
-        AgentKind::Cursor => {}
+        AgentKind::Cursor => {
+            // `cursor-agent [options] [prompt...]` — the trailing positional.
+            if let Some(p) = initial_prompt {
+                args.push(p.to_string());
+            }
+        }
     }
     (program, args, resumed)
+}
+
+/// Validate an AGENT PRESET's composed starting prompt before it becomes the
+/// CLI's positional argument. Same bounds as a cloud task — it crosses the
+/// same login-shell `-c` string and argv — with its own wording.
+fn validate_starting_prompt(raw: &str) -> Result<String> {
+    let text = raw.trim().to_string();
+    if text.is_empty() {
+        bail!("starting prompt is empty");
+    }
+    if text.contains('\0') {
+        bail!("starting prompt cannot contain NUL bytes");
+    }
+    if text.len() > MAX_CLOUD_PROMPT_BYTES {
+        bail!(
+            "starting prompt is too long (max {} KiB)",
+            MAX_CLOUD_PROMPT_BYTES / 1024
+        );
+    }
+    Ok(text)
 }
 
 /// How a Claude PTY enters the Cloud: dispatch a fresh task, attach live
@@ -3180,7 +3181,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_command_initial_prompt_is_claudes_positional_argument() {
+    fn spawn_command_initial_prompt_is_the_trailing_positional_argument() {
         // The relocation notice trails everything, guidance included.
         let (_, args, resumed) = agent_spawn_command_with(
             AgentKind::Claude,
@@ -3196,7 +3197,7 @@ mod tests {
         let mut expected = guided(&["--resume", "sid", "--model", "opus"]);
         expected.push("carry on".into());
         assert_eq!(args, expected);
-        // Codex and cursor take no such argument — their resumes stay plain.
+        // Codex and cursor take it as their trailing positional too.
         assert_eq!(
             agent_spawn_command_with(
                 AgentKind::Codex,
@@ -3209,12 +3210,12 @@ mod tests {
                 true
             )
             .1,
-            vec!["resume", "sid", "--yolo"]
+            vec!["resume", "sid", "--yolo", "carry on"]
         );
         assert_eq!(
             agent_spawn_command_with(
                 AgentKind::Cursor,
-                None,
+                Some("sid"),
                 None,
                 None,
                 None,
@@ -3223,7 +3224,60 @@ mod tests {
                 true
             )
             .1,
-            vec!["--force"]
+            vec!["--resume", "sid", "--force", "carry on"]
+        );
+        // A fresh spawn with a starting prompt (an AGENT PRESET launch):
+        // model, effort and system prompt all precede it.
+        let mut expected = guided(&["--model", "opus", "--effort", "high"]);
+        expected.push("fix auth".into());
+        assert_eq!(
+            agent_spawn_command_with(
+                AgentKind::Claude,
+                None,
+                Some("opus"),
+                Some("high"),
+                None,
+                Some("fix auth"),
+                None,
+                true
+            )
+            .1,
+            expected
+        );
+        assert_eq!(
+            agent_spawn_command_with(
+                AgentKind::Codex,
+                None,
+                Some("gpt-5.5"),
+                Some("high"),
+                None,
+                Some("fix auth"),
+                None,
+                true
+            )
+            .1,
+            vec![
+                "--yolo",
+                "--model",
+                "gpt-5.5",
+                "-c",
+                "model_reasoning_effort=high",
+                "fix auth"
+            ]
+        );
+        assert_eq!(
+            agent_spawn_command_with(
+                AgentKind::Cursor,
+                None,
+                None,
+                None,
+                None,
+                Some("fix auth"),
+                None,
+                true
+            )
+            .1,
+            vec!["--force", "fix auth"]
         );
         // An override is verbatim: no guidance, no prompt.
         assert_eq!(
@@ -3422,6 +3476,7 @@ mod tests {
                 effort: None,
                 auto_title: false,
                 cloud_prompt: Some(" \n ".into()),
+                starting_prompt: None,
                 pr_url: None,
             })
             .await
@@ -3437,6 +3492,7 @@ mod tests {
                 effort: None,
                 auto_title: false,
                 cloud_prompt: Some("fix\0auth".into()),
+                starting_prompt: None,
                 pr_url: None,
             })
             .await
@@ -3452,6 +3508,7 @@ mod tests {
                 effort: None,
                 auto_title: false,
                 cloud_prompt: Some("x".repeat(MAX_CLOUD_PROMPT_BYTES + 1)),
+                starting_prompt: None,
                 pr_url: None,
             })
             .await
@@ -3467,11 +3524,77 @@ mod tests {
                 effort: None,
                 auto_title: false,
                 cloud_prompt: Some("Fix auth".into()),
+                starting_prompt: None,
                 pr_url: None,
             })
             .await
             .unwrap_err();
         assert!(wrong_kind.to_string().contains("only supported for Claude"));
+    }
+
+    #[tokio::test]
+    async fn starting_prompt_is_validated_and_never_adopts_a_warm_cli() {
+        let daemon = test_daemon();
+        let spec = |kind: AgentKind, cloud: Option<&str>, starting: Option<&str>| CreateAgentSpec {
+            worktree: WorktreeId("unused".into()),
+            name: "preset".into(),
+            kind,
+            model: None,
+            effort: None,
+            auto_title: true,
+            cloud_prompt: cloud.map(String::from),
+            starting_prompt: starting.map(String::from),
+            pr_url: None,
+        };
+        // Validation runs before the worktree lookup, so an unknown
+        // worktree is fine here and every failure is the prompt's own.
+        for (kind, starting, needle) in [
+            (AgentKind::Claude, " \n ", "is empty"),
+            (AgentKind::Codex, "fix\0auth", "NUL"),
+            (
+                AgentKind::Cursor,
+                &*"x".repeat(MAX_CLOUD_PROMPT_BYTES + 1),
+                "too long",
+            ),
+        ] {
+            let err = daemon
+                .create_agent(spec(kind, None, Some(starting)))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(needle), "{kind:?}: {err}");
+        }
+        let with_cloud = daemon
+            .create_agent(spec(AgentKind::Claude, Some("Fix auth"), Some("Fix auth")))
+            .await
+            .unwrap_err();
+        assert!(with_cloud
+            .to_string()
+            .contains("not supported for Claude Cloud"));
+
+        // A starting prompt rides the CLI's argv, so a warm spare (booted
+        // bare) is never adopted: the pool entry survives the create.
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "w1", "/tmp", true);
+        let key = (WorktreeId("w1".into()), AgentKind::Claude);
+        daemon.prewarmed.lock().unwrap().insert(
+            key.clone(),
+            PrewarmEntry {
+                agent_id: AgentId("warm-1".into()),
+                spawned_at: Instant::now(),
+                model: None,
+                effort: None,
+                buffered_hooks: Vec::new(),
+            },
+        );
+        let mut preset = spec(AgentKind::Claude, None, Some("Fix auth"));
+        preset.worktree = WorktreeId("w1".into());
+        // Without a CLI on this box the cold path fails at the probe; the
+        // result is beside the point — adoption would have emptied the pool.
+        let _ = daemon.create_agent(preset).await;
+        assert!(
+            daemon.prewarmed.lock().unwrap().contains_key(&key),
+            "a starting-prompt create must not adopt the warm spare"
+        );
     }
 
     #[test]
@@ -3503,31 +3626,6 @@ mod tests {
                 })
                 .unwrap();
         }
-    }
-
-    /// Project names in display order.
-    fn names(daemon: &Daemon) -> Vec<String> {
-        let (projects, _, _, _) = daemon.store.load_tree().unwrap();
-        projects.into_iter().map(|p| p.name).collect()
-    }
-
-    #[test]
-    fn move_project_reorders_and_normalizes_sort_orders() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["a", "b", "c", "d"]);
-
-        daemon.move_project(&ProjectId("d".into()), -2).unwrap();
-        assert_eq!(names(&daemon), ["a", "d", "b", "c"]);
-        let (projects, _, _, _) = daemon.store.load_tree().unwrap();
-        assert_eq!(
-            projects.iter().map(|p| p.sort_order).collect::<Vec<_>>(),
-            [0, 1, 2, 3]
-        );
-
-        // Edge moves clamp to no-ops.
-        daemon.move_project(&ProjectId("a".into()), -1).unwrap();
-        daemon.move_project(&ProjectId("c".into()), 5).unwrap();
-        assert_eq!(names(&daemon), ["a", "d", "b", "c"]);
     }
 
     fn seed_worktree(daemon: &Daemon, project: &str, id: &str, path: &str, is_main: bool) {
@@ -3674,6 +3772,7 @@ mod tests {
             &a1,
             &HookEvent::PostToolUse {
                 tool_name: Some("Bash".into()),
+                subagent_id: None,
             },
         );
         assert!(
@@ -4449,38 +4548,6 @@ mod tests {
         );
         // An empty, closed workspace deletes cleanly.
         daemon.remove_workspace(&empty).unwrap();
-    }
-
-    /// Reorders only see the project's own workspace: a move never swaps
-    /// across workspaces, and other workspaces' sort orders stay untouched.
-    #[test]
-    fn move_project_is_scoped_to_the_workspace() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["a", "b"]); // default ws, sort 0 and 1
-        let EntityId::Workspace(other) = daemon.add_workspace("other").unwrap() else {
-            panic!("add returns the workspace id");
-        };
-        daemon
-            .store
-            .insert_project(&Project {
-                workspace_id: other.clone(),
-                id: ProjectId("x".into()),
-                name: "x".into(),
-                repo_path: "/tmp/x".into(),
-                sort_order: 1, // interleaves between a and b globally
-            })
-            .unwrap();
-
-        daemon.move_project(&ProjectId("a".into()), 1).unwrap();
-        let (projects, _, _, _) = daemon.store.load_tree().unwrap();
-        let default_order: Vec<&str> = projects
-            .iter()
-            .filter(|p| p.workspace_id.as_str() == "default")
-            .map(|p| p.name.as_str())
-            .collect();
-        assert_eq!(default_order, ["b", "a"], "a swapped with b, not x");
-        let x = projects.iter().find(|p| p.name == "x").unwrap();
-        assert_eq!(x.sort_order, 1, "other workspace untouched");
     }
 
     /// The status broadcast carries the flag it persisted: a live turn

@@ -353,6 +353,13 @@ pub enum PendingAction {
         reopen_picker: Option<usize>,
     },
     DeleteLink(LinkId),
+    /// `d` in the AGENT PRESETS list: drop the preset at `index` from the
+    /// store. Both answers reopen the list for `worktree`, so the modal the
+    /// confirm evicted comes back where the user left it.
+    DeleteAgentPreset {
+        index: usize,
+        worktree: WorktreeId,
+    },
     /// `R` in the settings overlay: rewrite config.json from the defaults
     /// (every setting and every hotkey), then reopen the overlay on them.
     ResetSettings,
@@ -404,6 +411,13 @@ pub enum PromptKind {
         name: String,
         model: Option<String>,
         effort: Option<String>,
+    },
+    /// The task for an AGENT PRESET launch: Enter composes
+    /// `prefix + task + postfix` into the CLI's starting prompt. Multi-row
+    /// like the cloud task — a framed request is rarely one line.
+    AgentPresetTask {
+        worktree: WorktreeId,
+        preset: crate::agent_presets::AgentPreset,
     },
     /// A message to queue on a row's Claude Cloud session
     /// (`claude -p <message> --cloud <id>`). Multi-row like the launch task:
@@ -478,12 +492,15 @@ impl PromptDialog {
         matches!(self.kind, PromptKind::AddProject)
     }
 
-    /// The Claude Cloud prompts — the launch task and a message to a live
-    /// session — are the ones with a multi-row editor.
+    /// The task prompts — the Claude Cloud launch task, a message to a live
+    /// cloud session, and an AGENT PRESET's task — are the ones with a
+    /// multi-row editor.
     pub fn is_multiline(&self) -> bool {
         matches!(
             self.kind,
-            PromptKind::ClaudeCloudTask { .. } | PromptKind::CloudMessage { .. }
+            PromptKind::ClaudeCloudTask { .. }
+                | PromptKind::CloudMessage { .. }
+                | PromptKind::AgentPresetTask { .. }
         )
     }
 
@@ -1358,6 +1375,10 @@ pub enum Overlay {
     Tree(crate::tree_browser::TreeBrowser),
     Metrics(MetricsView),
     Hosts(HostsView),
+    /// `e` in the SESSIONS PANEL: the AGENT PRESETS list.
+    AgentPresets(crate::preset_overlays::AgentPresetsView),
+    /// The PRESET EDITOR form behind the list's `a` / `e`.
+    AgentPresetEditor(crate::preset_overlays::AgentPresetEditor),
 }
 
 /// Rows optimistically removed for an in-flight DeleteWorktree, kept so an
@@ -1510,15 +1531,6 @@ impl SessionRow {
         matches!(self, SessionRow::Agent(a) if a.archived)
     }
 
-    /// Raw last-interaction stamp, or 0 for rows that carry no "23m ago"
-    /// label (terminals, links, sessions that have never run).
-    pub fn last_interaction_at(&self) -> i64 {
-        match self {
-            SessionRow::Agent(a) => a.status_changed_at,
-            SessionRow::Terminal(_) | SessionRow::Link(_) => 0,
-        }
-    }
-
     pub fn as_link(&self) -> Option<&LinkRow> {
         match self {
             SessionRow::Link(l) => Some(l),
@@ -1657,6 +1669,54 @@ pub fn last_interaction_ms(a: &Agent, now: i64) -> i64 {
 /// group in tree order.
 fn recency_key(a: &Agent, now: i64) -> std::cmp::Reverse<i64> {
     std::cmp::Reverse(last_interaction_ms(a, now))
+}
+
+/// The two stamps a worktree or project row derives from the sessions
+/// under it. `interacted` is the newest [`last_interaction_ms`] — the sort
+/// key, where a working session counts as now — and `stamped` the newest
+/// raw `status_changed_at`, which the row's "23m ago" label reads so a
+/// checkout with an hour-long turn in it says "1h ago" exactly like the
+/// session does. Both 0 when nothing under the row has ever run.
+///
+/// Archived sessions count: the stamp records when work last happened
+/// there, and archiving a row is housekeeping, not activity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Recency {
+    pub interacted: i64,
+    pub stamped: i64,
+}
+
+impl Recency {
+    fn of<'a>(agents: impl Iterator<Item = &'a Agent>, now: i64) -> Recency {
+        agents.fold(Recency::default(), |r, a| Recency {
+            interacted: r.interacted.max(last_interaction_ms(a, now)),
+            stamped: r.stamped.max(a.status_changed_at),
+        })
+    }
+}
+
+/// When a worktree last saw a turn: the newest stamp of any session in it.
+pub fn worktree_recency(tree: &Tree, worktree_id: &WorktreeId, now: i64) -> Recency {
+    Recency::of(
+        tree.agents.iter().filter(|a| &a.worktree_id == worktree_id),
+        now,
+    )
+}
+
+/// The same over every worktree of a project.
+pub fn project_recency(tree: &Tree, project_id: &ProjectId, now: i64) -> Recency {
+    let wt_ids: Vec<&WorktreeId> = tree
+        .worktrees
+        .iter()
+        .filter(|w| &w.project_id == project_id)
+        .map(|w| &w.id)
+        .collect();
+    Recency::of(
+        tree.agents
+            .iter()
+            .filter(|a| wt_ids.contains(&&a.worktree_id)),
+        now,
+    )
 }
 
 /// Priority-ordered aggregate: needs-feedback > running > finished > fresh.
@@ -1908,9 +1968,11 @@ pub struct PendingPrDetail {
 }
 
 /// How recently a project's open-PR list may have been fetched and still be
-/// refetched on arrival. Walking the project list must not turn into one
-/// API call per row visited.
-pub const OPEN_PRS_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+/// refetched on arrival — at a project, at a sidebar panel, or back at the
+/// terminal window. Walking the project list, or a flurry of focus events,
+/// must not turn into one API call per gesture; a few seconds is enough to
+/// coalesce those while still beating the steady beat by a wide margin.
+pub const OPEN_PRS_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct App {
     pub tree: Tree,
@@ -1953,11 +2015,16 @@ pub struct App {
     /// process with a fresh connection.
     pub pending_ssh: Option<crate::hosts::HostEntry>,
     pub flash: Option<String>,
-    /// The last `h`/`l` (or ←/→) that landed on the end of the panel row
-    /// and stayed put, with when it arrived: a second press of the same
-    /// action inside `DOUBLE_TAP` jumps the boundary the way ⇧Tab / Tab
-    /// would. Any other key in between clears it.
+    /// The last `h`/`l` (or ←/→) that landed on the end of the panel row,
+    /// or `k`/`j` (↑/↓) on a panel's first row / in the Workspaces bar, and
+    /// stayed put, with when it arrived: a second press of the same action
+    /// inside `DOUBLE_TAP` jumps the boundary the way ⇧Tab / Tab would.
+    /// Any other key in between clears it.
     pub edge_tap: Option<(crate::keymap::Action, std::time::Instant)>,
+    /// The panel focus came up from when it last stepped into the
+    /// Workspaces bar — by k,k, h,h, ⇧Tab or a click — so j,j in the bar
+    /// drops back onto it. Projects until the bar has been entered.
+    pub bar_return: Focus,
     pub overlay: Option<Overlay>,
     pub show_archived: bool,
     /// Sidebars collapsed (z) — terminal takes the full width.
@@ -2065,6 +2132,10 @@ pub struct App {
     /// when the copy has to be delegated to the attached terminal (see
     /// `copy_and_flash`). The main loop writes and clears it.
     pub pending_clipboard: Option<String>,
+    /// A turn reached FINISHED since the last frame: the main loop rings
+    /// the DONE SOUND (`Config::done_sound`) once and clears it — once per
+    /// frame however many rows finished together.
+    pub pending_ding: bool,
     /// Body rect (everything above the footer) from the last draw; bounds
     /// splitter drags.
     pub body_area: Rect,
@@ -2204,6 +2275,7 @@ impl App {
             pending_ssh: None,
             flash: None,
             edge_tap: None,
+            bar_return: Focus::Projects,
             overlay: None,
             show_archived: false,
             collapsed: false,
@@ -2239,6 +2311,7 @@ impl App {
             hover_splitter: None,
             pointer_shape: PointerShape::default(),
             pending_clipboard: None,
+            pending_ding: false,
             body_area: Rect::default(),
             hostname: nebula_core::host::hostname(),
             is_remote: nebula_core::host::is_remote_session(),
@@ -2461,14 +2534,28 @@ impl App {
     /// Projects panel rows in display order, each an index into the FULL
     /// `tree.projects` list. Scoped to the open workspace — other
     /// workspaces' projects get no row.
+    ///
+    /// Most recently interacted with first — the newest stamp under any of
+    /// the project's worktrees, so the project you just worked in heads the
+    /// column (mirrors the sessions list; there is no manual reorder). The
+    /// sort is stable, so never-run projects keep tree order at the bottom
+    /// instead of shuffling between frames.
     pub fn project_rows(&self) -> Vec<usize> {
-        self.tree
+        let now = now_ms();
+        let mut rows: Vec<usize> = self
+            .tree
             .projects
             .iter()
             .enumerate()
             .filter(|(_, p)| self.tree.in_active_workspace(p))
             .map(|(i, _)| i)
-            .collect()
+            .collect();
+        rows.sort_by_key(|i| {
+            std::cmp::Reverse(
+                project_recency(&self.tree, &self.tree.projects[*i].id, now).interacted,
+            )
+        });
+        rows
     }
 
     /// Index into `tree.projects` of the selected Projects-panel row.
@@ -2618,23 +2705,30 @@ impl App {
     }
 
     /// Worktrees of the selected project: pinned first, then the rest,
-    /// each group in tree order (mirrors the sessions list).
+    /// each group most recently interacted with first (mirrors the
+    /// sessions list). The stamp is the newest of the checkout's sessions,
+    /// so the root checkout moves like any other row; a stable sort keeps
+    /// never-run worktrees — the root among them, which the daemon lists
+    /// first — in tree order at the bottom of their group.
     pub fn visible_worktrees(&self) -> Vec<&Worktree> {
         let Some(project) = self.selected_project() else {
             return vec![];
         };
-        let mut rows: Vec<&Worktree> = self
-            .tree
-            .worktrees
-            .iter()
-            .filter(|w| w.project_id == project.id && w.pinned)
-            .collect();
-        rows.extend(
-            self.tree
+        let now = now_ms();
+        let collect = |pinned: bool| {
+            let mut group: Vec<&Worktree> = self
+                .tree
                 .worktrees
                 .iter()
-                .filter(|w| w.project_id == project.id && !w.pinned),
-        );
+                .filter(|w| w.project_id == project.id && w.pinned == pinned)
+                .collect();
+            group.sort_by_key(|w| {
+                std::cmp::Reverse(worktree_recency(&self.tree, &w.id, now).interacted)
+            });
+            group
+        };
+        let mut rows = collect(true);
+        rows.extend(collect(false));
         rows
     }
 
@@ -2877,6 +2971,15 @@ impl App {
 
     pub fn project_rollup(&self, project_id: &ProjectId) -> Option<AgentStatus> {
         project_rollup(&self.tree, project_id)
+    }
+
+    /// When the worktree last saw a turn — what its row sorts and labels on.
+    pub fn worktree_recency(&self, worktree_id: &WorktreeId) -> Recency {
+        worktree_recency(&self.tree, worktree_id, now_ms())
+    }
+
+    pub fn project_recency(&self, project_id: &ProjectId) -> Recency {
+        project_recency(&self.tree, project_id, now_ms())
     }
 
     pub fn workspace_rollup(&self, workspace_id: &WorkspaceId) -> Option<AgentStatus> {

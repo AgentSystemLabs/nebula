@@ -62,8 +62,6 @@ pub enum Action {
     // projects & worktrees
     AddProject,
     New,
-    MoveProjectDown,
-    MoveProjectUp,
     Pin,
     GitDiff,
     OpenRepo,
@@ -76,6 +74,8 @@ pub enum Action {
     ContextMenu,
     Delete,
     DeleteAll,
+    /// The AGENT PRESETS list: saved launch definitions for the SESSIONS PANEL.
+    AgentPresets,
     // files
     FindFile,
     Grep,
@@ -181,7 +181,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::MoveDown,
         id: "move_down",
         label: "Move down",
-        hint: "Move the selection down in the focused panel",
+        hint: "Move the selection down in the focused panel; in the workspaces bar a double tap drops back onto the panel you came up from",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["j", "down"],
@@ -190,7 +190,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::MoveUp,
         id: "move_up",
         label: "Move up",
-        hint: "Move the selection up in the focused panel",
+        hint: "Move the selection up in the focused panel, stopping at the first row; a double tap there jumps up into the workspaces bar, like ⇧Tab",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["k", "up"],
@@ -231,24 +231,6 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["n"],
-    },
-    ActionSpec {
-        action: Action::MoveProjectDown,
-        id: "move_project_down",
-        label: "Reorder project down",
-        hint: "Move the selected project down the list",
-        group: "PROJECTS & WORKTREES",
-        scope: Scope::Global,
-        defaults: &["shift+j", "shift+down"],
-    },
-    ActionSpec {
-        action: Action::MoveProjectUp,
-        id: "move_project_up",
-        label: "Reorder project up",
-        hint: "Move the selected project up the list",
-        group: "PROJECTS & WORKTREES",
-        scope: Scope::Global,
-        defaults: &["shift+k", "shift+up"],
     },
     ActionSpec {
         action: Action::Pin,
@@ -349,6 +331,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["shift+d"],
+    },
+    ActionSpec {
+        action: Action::AgentPresets,
+        id: "agent_presets",
+        label: "Agent presets",
+        hint: "Saved launch presets (CLI, model, effort, prefix/postfix); Enter asks for a task",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["e"],
     },
     // ---- FILES ----
     ActionSpec {

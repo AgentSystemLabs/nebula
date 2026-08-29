@@ -1,3 +1,4 @@
+pub mod agent_presets;
 pub mod app;
 pub mod branch_name;
 pub mod completion;
@@ -12,6 +13,7 @@ pub mod keymap;
 pub mod keys;
 pub mod links;
 pub mod pr_preview;
+pub mod preset_overlays;
 pub mod pull_request;
 pub mod raw_attach;
 pub mod remote;

@@ -292,9 +292,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     )
                     .await;
                 }
-                ClientRequest::MoveProject { req_id, id, delta } => {
-                    reply_done(&out_tx, req_id, daemon.move_project(&id, delta)).await;
-                }
                 ClientRequest::CreateWorktree {
                     req_id,
                     project,
@@ -334,8 +331,14 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     effort,
                     auto_title,
                     cloud_prompt,
+                    starting_prompt,
                 } => {
-                    let is_cloud = cloud_prompt.is_some();
+                    // Logged by mode only — never the task or prompt text.
+                    let launch_mode = match (&cloud_prompt, &starting_prompt) {
+                        (Some(_), _) => Some("cloud"),
+                        (None, Some(_)) => Some("preset"),
+                        (None, None) => None,
+                    };
                     let result = daemon
                         .create_agent(CreateAgentSpec {
                             worktree: worktree.clone(),
@@ -345,17 +348,18 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             effort,
                             auto_title,
                             cloud_prompt,
+                            starting_prompt,
                             pr_url: None,
                         })
                         .await;
-                    if is_cloud {
+                    if let Some(launch_mode) = launch_mode {
                         match &result {
                             Ok(nebula_core::EntityId::Agent(agent)) => tracing::info!(
                                 req_id,
                                 agent = %agent,
                                 kind = kind.as_str(),
                                 worktree = %worktree,
-                                launch_mode = "cloud",
+                                launch_mode,
                                 "agent session spawned"
                             ),
                             Err(error) => tracing::warn!(
@@ -363,7 +367,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                                 error = %error,
                                 kind = kind.as_str(),
                                 worktree = %worktree,
-                                launch_mode = "cloud",
+                                launch_mode,
                                 "agent session spawn failed"
                             ),
                             Ok(_) => unreachable!("CreateAgent returned a non-agent id"),
@@ -389,6 +393,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             effort,
                             auto_title,
                             cloud_prompt: None,
+                            starting_prompt: None,
                             pr_url: Some(pr_url.clone()),
                         })
                         .await;

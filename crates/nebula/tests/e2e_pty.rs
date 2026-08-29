@@ -361,6 +361,7 @@ async fn full_crud_attach_and_restart_persistence() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
@@ -718,6 +719,7 @@ async fn hook_post_from_agent_pty_drives_status() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
@@ -1040,6 +1042,7 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
@@ -1191,6 +1194,7 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
@@ -1362,6 +1366,7 @@ async fn codex_hooks_install_and_drive_status() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
@@ -1938,6 +1943,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
@@ -2060,6 +2066,7 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
@@ -2114,6 +2121,7 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
                 effort: None,
                 auto_title: false,
                 cloud_prompt: None,
+                starting_prompt: None,
             },
         )
         .await
@@ -2198,6 +2206,7 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
@@ -2267,6 +2276,7 @@ async fn create_agent_get_id(
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
@@ -2433,6 +2443,7 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
@@ -2493,6 +2504,7 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
@@ -2538,6 +2550,7 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
@@ -2651,6 +2664,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
@@ -2699,6 +2713,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
@@ -2942,6 +2957,7 @@ async fn auto_title_instruction_and_rename_flow() {
             effort: None,
             auto_title: true,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
@@ -3043,6 +3059,7 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
             effort: None,
             auto_title: false,
             cloud_prompt: None,
+            starting_prompt: None,
         },
     )
     .await
@@ -3599,6 +3616,7 @@ esac
             effort: None,
             auto_title: false,
             cloud_prompt: Some("Follow me".into()),
+            starting_prompt: None,
         },
     )
     .await
@@ -3749,6 +3767,7 @@ esac
             effort: None,
             auto_title: false,
             cloud_prompt: Some("Follow me".into()),
+            starting_prompt: None,
         },
     )
     .await
@@ -3873,6 +3892,7 @@ esac
             effort: None,
             auto_title: false,
             cloud_prompt: Some("Hello world".into()),
+            starting_prompt: None,
         },
     )
     .await

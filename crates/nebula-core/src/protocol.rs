@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 30;
+pub const PROTOCOL_VERSION: u32 = 32;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -103,12 +103,6 @@ pub enum ClientRequest {
         id: ProjectId,
         name: String,
     },
-    /// Move a project `delta` slots in the list (clamped at the edges).
-    MoveProject {
-        req_id: u64,
-        id: ProjectId,
-        delta: i64,
-    },
     CreateWorktree {
         req_id: u64,
         project: ProjectId,
@@ -143,6 +137,14 @@ pub enum ClientRequest {
         /// deliberately request-only: prompts are not persisted with Agent.
         #[serde(default)]
         cloud_prompt: Option<String>,
+        /// The first turn handed to the CLI as its positional prompt
+        /// (`claude "<text>"`, `codex "<text>"`, `cursor-agent "<text>"`) —
+        /// what an AGENT PRESET launch composes from its prefix, the task
+        /// and its postfix. Request-only like `cloud_prompt`: never
+        /// persisted, so a RESUME can never replay it. Skips PREWARM POOL
+        /// adoption, since a spare booted bare cannot be handed one.
+        #[serde(default)]
+        starting_prompt: Option<String>,
     },
     /// Create a local Claude AGENT from an OPEN PRS row. The PR URL is
     /// persisted as launch context so every cold spawn and RESUME rebuilds

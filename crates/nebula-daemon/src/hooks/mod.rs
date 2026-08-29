@@ -151,9 +151,11 @@ pub fn parse_event(hook_event: &str, payload: &HookPayload) -> Option<HookEvent>
         },
         "PreToolUse" => HookEvent::PreToolUse {
             tool_name: payload.tool_name.clone(),
+            subagent_id: payload.subagent_id(),
         },
         "PostToolUse" => HookEvent::PostToolUse {
             tool_name: payload.tool_name.clone(),
+            subagent_id: payload.subagent_id(),
         },
         "SubagentStart" => HookEvent::SubagentStart {
             subagent_id: payload.subagent_id(),
@@ -485,7 +487,8 @@ mod tests {
         assert_eq!(
             delivery.event,
             HookEvent::PostToolUse {
-                tool_name: Some("Bash".into())
+                tool_name: Some("Bash".into()),
+                subagent_id: None,
             }
         );
 
