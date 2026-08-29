@@ -51,6 +51,11 @@ Four `=` on each side of every header. Blank line under each header. No title ab
 sign-off below the technical section — an offer of follow-up work goes in the last line of the
 technical section if it goes anywhere, never under `ACTION REQUIRED`.
 
+**The short form, for a pure question that changed nothing** (an explanation, an assessment, "what does
+X do" — the prompts PROMPT DADDY skips): `YOU ASKED` quotes the prompt as typed, `OVERVIEW` carries the
+whole answer, and `TECHNICAL OVERVIEW` appears only when there are details beyond the answer worth a
+`file:line`. Two sections is a complete reply; do not pad a question into three.
+
 ### `==== YOU ASKED ====`
 
 One quoted prompt: **the refined prompt `prompt-daddy` logged**, verbatim, in double quotes — the text

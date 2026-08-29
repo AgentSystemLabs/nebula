@@ -40,7 +40,7 @@ cp <repo>/<file> "$W"/<file>
 
 For a file where your change is tangled with someone else's, extract only your hunks
 (`git diff -- <file> > all.patch`, keep your `@@` blocks, `git apply` them onto the pristine copy) and
-re-read the result. Read `.claude/MEMORY.md` for anything recorded about the subsystem you're releasing.
+re-read the result. Read the RELEASE SKILL group of `.claude/memory/gotchas.md` and grep `.claude/memory/entries` for the subsystem you're releasing.
 
 ## 2. Green gate — the tag must point at code that compiles
 

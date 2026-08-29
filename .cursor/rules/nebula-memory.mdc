@@ -3,14 +3,19 @@ description: Nebula shared work log — read before a task, append after
 alwaysApply: true
 ---
 
-This repo keeps a shared work log at `.claude/MEMORY.md`: one entry per task, recording what was asked,
-what was actually done, and the gotchas hit along the way.
+This repo keeps a shared MEMORY LOG in three layers: `.claude/MEMORY.md` is the index (one line per
+task — date, title, the TERMS and files it is about — newest first), `.claude/memory/gotchas.md` holds
+the standing gotchas (the traps that outlive their task, one line each, grouped by TERM), and
+`.claude/memory/entries/<date>-<slug>.md` hold each task's full Asked / Did / Gotchas.
 
-**Before starting a task**, read `.claude/MEMORY.md` and scan for entries related to what the user is
-asking — the same crate, subsystem, symptom, or tool. A recorded gotcha is a mine already stepped on; a
-recorded decision is settled unless the user reopens it. Entries describe what was true when written, so
-confirm any file or flag they name still exists before relying on it.
+**Before starting a task**, read `.claude/MEMORY.md` and `.claude/memory/gotchas.md` in full, then open
+the entry files whose index line names the TERMS, crate, symptom or file the user is asking about
+(`grep -ril '<symbol or TERM>' .claude/memory/entries` when the index is not enough). A recorded gotcha
+is a mine already stepped on; a recorded decision is settled unless the user reopens it. Entries
+describe what was true when written, so confirm any file or flag they name still exists before relying
+on it.
 
 **After finishing a task** that changed code or behavior, diagnosed a bug, or turned up something
-non-obvious, read `.claude/skills/nebula-memory/SKILL.md` and follow it to append an entry. Skip it for
-pure questions and trivial edits — the log is only useful if it stays free of restated diffs.
+non-obvious, read `.claude/skills/nebula-memory/SKILL.md` and follow it: one entry file, one index line,
+and any durable trap into the standing gotchas. Skip it for pure questions and trivial edits — the log
+is only useful if it stays free of restated diffs. Run `make memory-check` afterwards.

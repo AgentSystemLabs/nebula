@@ -4,7 +4,7 @@ description: "Before starting any new task, rewrite the user's prompt once into 
 user-invocable: true
 ---
 
-The user's prompt is the spec, and in this repo the spec is where turns get lost. `.claude/MEMORY.md`
+The user's prompt is the spec, and in this repo the spec is where turns get lost. The MEMORY LOG
 records it plainly: "done" took four turns because *"the first two readings were both wrong"*; the
 Shift+J/K move *"satisfied the literal words and not the request"*; a Ctrl+Shift+H/L tweak broke the
 walk the user liked because the prompt never said what to keep. Every one of those was a one-sentence
@@ -26,7 +26,8 @@ a question, not a guess.
 ## When to run it
 
 On every new prompt from the user — a feature, a bug report, a question, a refactor, a "debug this".
-Run it after reading `.claude/MEMORY.md` and `TERMS.md`, and before planning, grepping the code in
+Run it after reading `.claude/MEMORY.md` (the index), `.claude/memory/gotchas.md`, `TERMS.md` and
+whatever the RECALL HOOK injected under `[nebula recall]`, and before planning, grepping the code in
 earnest, or answering.
 
 Skip it, and just proceed, only when the prompt is:
@@ -37,6 +38,10 @@ Skip it, and just proceed, only when the prompt is:
   take the correction. If the correction is as ambiguous as the original, run it on the correction.
 - a slash-command, an explicit skill invocation, or a phrase that triggers one (`/release`,
   "commit push release", "remember this") — the skill is the refinement
+- a pure question that changes nothing — an explanation, an assessment, "what does X do", "is Y worth
+  it". Answer it directly, in TERMS, grounded by the RECALL HOOK's context; the rewrite only earns its
+  cost when work follows. A question that is a task in disguise ("why is X broken" that ends in a fix)
+  is a task: run it.
 - pure conversation with no task in it
 
 When there is no interactive user (a `-p` / headless run), still rewrite and still log — but skip the
@@ -57,13 +62,13 @@ eleven.
 | changes a behavior the user likes without saying what stays | add "keep ‹X› exactly as it is; only change ‹Y›" |
 | has a circular *when* ("auto focus when focused") | name the event, the result, and the boundary ("when Ctrl+Shift+L lands on the pane, focus it and stop the walk there") |
 | reports a bug with no evidence | restate what is known; ask for the exact on-screen text, the steps, where it *does* work, and the terminal, agent, and version when the diagnosis cannot start without them |
-| asks for a feature with no *why* | add "so that I can ‹…›" when the why is obvious from MEMORY.md or the feature; ask when the mechanism hinges on it (the unread counter went daemon-side for exactly this reason) |
+| asks for a feature with no *why* | add "so that I can ‹…›" when the why is obvious from the MEMORY LOG or the feature; ask when the mechanism hinges on it (the unread counter went daemon-side for exactly this reason) |
 | describes output with adjectives | give one literal example of the output (`'23m ago'`, `yellow-fox-jumps`, `nebula v0.13.0`) |
 | bundles asks that touch the same code path | split them, or order them ("first A, then B on top of A") |
 | is visual but has no screenshot or target | state the target ("flush with the tab", "10% opacity") or ask for the screenshot |
-| reverses a decision recorded in MEMORY.md | say so: "I know we removed ‹X› on ‹date›; bring it back because ‹Y›" |
+| reverses a decision recorded in the MEMORY LOG | say so: "I know we removed ‹X› on ‹date›; bring it back because ‹Y›" |
 | is silent on constraints the user usually cares about | name them: rate limits, no new deps, non-goals, which terminal, what must not get slower |
-| says "fix" when the user might want to understand first | keep the fix unless MEMORY.md shows they asked to understand first on this subsystem; then write it as "find out why and tell me before changing anything" |
+| says "fix" when the user might want to understand first | keep the fix unless the MEMORY LOG shows they asked to understand first on this subsystem; then write it as "find out why and tell me before changing anything" |
 
 ### 2. Ground it — briefly
 
@@ -72,7 +77,7 @@ word into the TERM, and the TERM's row names the file and symbol, so most ground
 grep. A noun with no TERM is worth noticing: the rewrite should name it in words the user can confirm,
 and `project-terms` will record it when the task ends.
 
-Then use the MEMORY.md entries you already read: a related gotcha, a recorded decision, the file where
+Then use the MEMORY LOG entries you already read and the ones the RECALL HOOK injected: a related gotcha, a recorded decision, the file where
 that subsystem lives. One quick `grep` to name the real symbol, panel, or idiom is fine if it makes the
 rewrite concrete ("the link row's unread-count idiom", `row_badges` in `ui.rs`). Do not investigate the
 bug or start the design — that is the task, and it has not been written yet.
@@ -82,7 +87,7 @@ bug or start the design — that is the task, and it has not been written yet.
 Draft the rewrite in your head. Then apply one test to every blank in it:
 
 > Is this a **who / what / when / where / why / how** that the implementation actually hinges on, and
-> that neither the prompt, nor MEMORY.md, nor `TERMS.md`, nor one grep can fill?
+> that neither the prompt, nor the MEMORY LOG, nor `TERMS.md`, nor one grep can fill?
 
 - **No** — every blank has a conventional default, a recorded decision, or an answer in the code. Do
   not ask. Fill it, and where you filled it with a judgment rather than a fact, write that judgment
@@ -154,7 +159,7 @@ Downstream, this logged text is what the other skills use:
 
 ## Worked examples
 
-**A prompt that has to ask.** Original (from MEMORY.md, 2026-08-27): *"can you make the status dot for
+**A prompt that has to ask.** Original (from the MEMORY LOG, 2026-08-27): *"can you make the status dot for
 done a different color than green so it's obvious something needs to be addressed"*
 
 "done" sits in the Alias index under both UNSEEN and FINISHED, and the two are different code paths
@@ -175,7 +180,7 @@ That is the sentence the user eventually typed by hand, three turns later.
 workspace, keep it short"*
 
 Every blank has a default: "top nav" is the WORKSPACES BAR by the Alias index, "the branch name" is the
-WORKTREE's branch, and "short" has a literal example in MEMORY.md's own tab-title convention. No
+WORKTREE's branch, and "short" has a literal example in the MEMORY LOG's own tab-title convention. No
 question. The logged prompt:
 
 > Refined prompt:

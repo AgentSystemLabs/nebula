@@ -8,7 +8,7 @@ Nebula keeps a shared, committed glossary at **`TERMS.md`** (repo root). Every a
 starting and speaks in its terms — see `CLAUDE.md`. Your job here is to keep it true after the task you
 just finished, so the next agent and the next teammate call things by the same name you did.
 
-`MEMORY.md` records *what happened*; `TERMS.md` records *what things are called*. Do not put a work log
+The MEMORY LOG records *what happened*; `TERMS.md` records *what things are called*. Do not put a work log
 in the glossary, and do not put definitions in the work log.
 
 ## Detect every session, promote only what recurred
@@ -106,7 +106,7 @@ Rules for a row:
   the other goes in *Also called*.
 - **Meaning is definitional, not historical.** "The daemon-owned flag that marks a finished turn nobody
   has looked at" — not "added on 2026-08-26 because the user asked for counters." History lives in
-  `MEMORY.md`; link to it by entry title if the why matters.
+  the MEMORY LOG; link to it by entry title if the why matters.
 - **Aliases are verbatim.** Quote the user's words exactly as typed, lower-case, in double quotes,
   comma-separated. An alias that is just the TERM in different casing is not worth a slot.
 - **Where it lives is greppable.** A path and symbol (`crates/nebula-tui/src/ui.rs::status_dot`), a
@@ -143,9 +143,10 @@ order a user meets them, not alphabetical), and add or update the row in the **A
 
 ## Size discipline
 
-`TERMS.md` is read at the start of every session alongside `MEMORY.md`, so it has to stay scannable.
+`TERMS.md` is read at the start of every session alongside `.claude/MEMORY.md` and
+`.claude/memory/gotchas.md`, so it has to stay scannable.
 Keep meanings to two sentences. When a section grows past what fits on one screen, tighten rows before
 adding more — merge a TERM that is only ever said together with another into that other's row. Retired
-TERMS get one line each; prune them when nothing in `MEMORY.md` mentions them any more. The Candidates
+TERMS get one line each; prune them when nothing under `.claude/memory/` mentions them any more (`grep -rl` it). The Candidates
 ledger should stay under about twenty rows: if it is longer, you are sighting helpers, not vocabulary —
 prune harder and ledger less.

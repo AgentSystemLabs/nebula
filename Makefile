@@ -48,7 +48,7 @@ DEV_ENV = NEBULA_RUNTIME_DIR=$(DEV_RUNTIME) NEBULA_DATA_DIR=$(DEV_DATA) \
 	$(if $(AGENT),NEBULA_AGENT_CMD=$(AGENT))
 
 .DEFAULT_GOAL := help
-.PHONY: help dev browser dev-prep dev-seed dev-reset dev-ls dev-stop build install kill cycle check fmt lint test ci clean
+.PHONY: help dev browser dev-prep dev-seed dev-reset dev-ls dev-stop build install kill cycle check fmt lint test memory-check ci clean
 
 help: ## Show this help
 	@grep -hE '^[a-z][a-z-]*:.*?## ' $(MAKEFILE_LIST) \
@@ -193,7 +193,11 @@ lint: ## Clippy over the workspace (STRICT=1 to fail on warnings)
 test: ## Full test suite (e2e_pty spawns real daemons — slow)
 	cargo test --workspace
 
-ci: ## The whole gate: fmt check, clippy, tests
+memory-check: ## The MEMORY LOG's always-loaded layer stays under its caps and its index matches its entries
+	python3 .claude/memory/check.py
+
+ci: ## The whole gate: memory-check, fmt check, clippy, tests
+	@$(MAKE) --no-print-directory memory-check
 	cargo fmt --all -- --check
 	@$(MAKE) --no-print-directory lint
 	@$(MAKE) --no-print-directory test
