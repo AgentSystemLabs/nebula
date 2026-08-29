@@ -576,6 +576,42 @@ fn tui_help_modal_grouped_keymap() {
     tui.wait_for_gone("NAVIGATE & SEARCH");
 }
 
+#[test]
+fn tui_hides_projects_and_worktrees_independently() {
+    let mut tui = TuiHarness::spawn();
+    let repo = tui.make_repo("roomy-proj");
+
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "roomy-proj");
+    tui.wait_for_text("PROJECTS");
+    tui.wait_for_text("WORKTREES");
+
+    tui.send(b"P");
+    tui.wait_for_gone("PROJECTS");
+    tui.wait_for_text("WORKTREES");
+    tui.wait_for_text(FOOTER_WORKTREES);
+
+    tui.send(b"B");
+    tui.wait_for_gone("WORKTREES");
+    tui.wait_for_text("SESSIONS");
+    tui.wait_for_text("⇧P: show projects");
+    tui.wait_for_text("⇧B: show worktrees");
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(tui.data_dir.join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(config["hide_projects"], true);
+    assert_eq!(config["hide_worktrees"], true);
+
+    tui.send(b"P");
+    tui.wait_for_text("PROJECTS");
+    tui.wait_for_gone("WORKTREES");
+    tui.wait_for_text("⇧B: show worktrees");
+
+    tui.send(b"B");
+    tui.wait_for_text("WORKTREES");
+    tui.wait_for_text(FOOTER_SESSIONS);
+}
+
 /// Renaming a project is a label change, and an empty name undoes it.
 /// Drives the real binary: the row picks up the new label with the folder
 /// name hanging off a `└` underneath, then clearing the field puts the row

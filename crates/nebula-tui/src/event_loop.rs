@@ -1351,8 +1351,8 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // and the preview under the Sessions cursor is already the session
         // they picked.
         Action::FocusNext => walk_focus_forward(app, out),
-        // ⇧Tab / ^⇧H walk back and stop dead at the first column — the
-        // Workspaces bar while it's shown, Projects when it's hidden.
+        // ⇧Tab / ^⇧H walk back and stop dead at the first visible stop —
+        // the Workspaces bar while shown, otherwise the first sidebar.
         // Neither wraps into the pane: ^⇧H is also the unlock hatch out of
         // a locked pane, so a wrap made the key cycle first column → pane
         // → Sessions → … → first column forever, with nothing to stop
@@ -1372,7 +1372,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // shown; hidden, there is nothing above to jump to), l,l at Sessions
         // crosses into the pane and takes its input.
         Action::FocusLeft => match app.focus {
-            Focus::Projects => {
+            focus if focus == app.first_sidebar_focus() => {
                 if app.show_workspaces && double_tapped(app, action, armed, &chord, "workspaces") {
                     walk_focus_back(app);
                 }
@@ -1399,7 +1399,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // Ctrl+→ still reaches the terminal pane (the counterpart of the
         // Ctrl+← escape hatch).
         Action::FocusTerminal => {
-            app.focus = next_focus(app.focus).unwrap_or(Focus::Terminal);
+            app.focus = app.next_visible_focus(app.focus);
         }
         Action::FocusRight => match app.focus {
             Focus::Sessions => {
@@ -1418,7 +1418,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             _ => walk_focus_forward(app, out),
         },
         // Show/hide the Workspaces bar. Hiding it moves a cursor parked
-        // there onto Projects — there'd be nothing on screen to drive.
+        // there onto the first visible sidebar.
         Action::ToggleWorkspaces => {
             set_show_workspaces(app, !app.show_workspaces);
             // The hotkey and the settings row edit the same value, so the
@@ -1426,6 +1426,14 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             let mut cfg = crate::config::Config::load();
             cfg.show_workspaces = app.show_workspaces;
             save_config(app, &cfg);
+        }
+        Action::ToggleProjects => {
+            set_hide_projects(app, !app.hide_projects);
+            save_panel_visibility(app);
+        }
+        Action::ToggleWorktrees => {
+            set_hide_worktrees(app, !app.hide_worktrees);
+            save_panel_visibility(app);
         }
         // Reordering only means anything in the projects panel; elsewhere
         // the shifted keys still move the selection, as they did before
@@ -1446,14 +1454,14 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         }
         // The Workspaces bar is a horizontal strip: ↓ steps out of it into
         // the panels below, ↑ has nowhere left to go. ←/→ walk the tabs.
-        Action::MoveDown if app.focus == Focus::Workspaces => app.focus = Focus::Projects,
+        Action::MoveDown if app.focus == Focus::Workspaces => app.focus = app.first_sidebar_focus(),
         Action::MoveUp if app.focus == Focus::Workspaces => {}
         Action::MoveDown => move_selection(app, 1, out),
         Action::MoveUp => move_selection(app, -1, out),
         Action::Activate => match app.focus {
             // The cursor already IS the open workspace; Enter steps into it.
-            Focus::Workspaces => app.focus = Focus::Projects,
-            Focus::Projects => app.focus = Focus::Worktrees,
+            Focus::Workspaces => app.focus = app.first_sidebar_focus(),
+            Focus::Projects => app.focus = app.next_visible_focus(Focus::Projects),
             // An open-PR row leads out of nebula, so Enter hands it to the
             // browser and stays put; a checkout hands focus one column right.
             Focus::Worktrees => match app.selected_worktree_pr().map(|pr| pr.url.clone()) {
@@ -3546,8 +3554,8 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
             app.overlay = Some(Overlay::Confirm(ConfirmDialog {
                 title: "Reset settings".into(),
                 message: "Every setting goes back to its default: theme, editor, agent \
-                          defaults,\ntimeouts, the Workspaces column, and all hotkey \
-                          bindings.\nYour config.json is rewritten — this can't be undone."
+                          defaults,\ntimeouts, panel visibility, and all hotkey \
+                          bindings.\nYour config.json is rewritten; this can't be undone."
                     .into(),
                 action: PendingAction::ResetSettings,
                 area: ratatui::layout::Rect::default(),
@@ -3727,6 +3735,8 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.animations = cfg.animations;
     app.focus_tint = cfg.focus_tint;
     set_show_workspaces(app, cfg.show_workspaces);
+    set_hide_projects(app, cfg.hide_projects);
+    set_hide_worktrees(app, cfg.hide_worktrees);
 }
 
 /// `R` in the settings overlay, confirmed: rewrite config.json from the
@@ -3780,12 +3790,35 @@ fn close_settings(app: &mut App) {
     app.note_settings_closed();
 }
 
-/// Show or hide the Workspaces bar, moving a cursor parked there onto
-/// Projects — there'd be nothing on screen to drive.
+/// Show or hide the Workspaces bar, moving a cursor parked there onto the
+/// first visible sidebar.
 fn set_show_workspaces(app: &mut App, shown: bool) {
     app.show_workspaces = shown;
     if !shown && app.focus == Focus::Workspaces {
-        app.focus = Focus::Projects;
+        app.focus = app.first_sidebar_focus();
+    }
+}
+
+fn set_hide_projects(app: &mut App, hidden: bool) {
+    app.hide_projects = hidden;
+    if hidden && app.focus == Focus::Projects {
+        app.focus = app.next_visible_focus(Focus::Projects);
+    }
+}
+
+fn set_hide_worktrees(app: &mut App, hidden: bool) {
+    app.hide_worktrees = hidden;
+    if hidden && app.focus == Focus::Worktrees {
+        app.focus = app.next_visible_focus(Focus::Worktrees);
+    }
+}
+
+fn save_panel_visibility(app: &mut App) {
+    let mut cfg = crate::config::Config::load();
+    cfg.hide_projects = app.hide_projects;
+    cfg.hide_worktrees = app.hide_worktrees;
+    if let Err(err) = cfg.save() {
+        app.flash = Some(format!("couldn't save settings: {err}"));
     }
 }
 
@@ -4483,8 +4516,8 @@ fn select_worktree_by_id(
 }
 
 /// Land on a project we just added, the way a `/` palette pick of it
-/// would: select its row, show its main checkout, and step into its
-/// Worktrees panel. False when its upsert hasn't arrived yet.
+/// would: select its row, show its main checkout, and step into the next
+/// visible child panel. False when its upsert hasn't arrived yet.
 fn select_created_project(
     app: &mut App,
     id: &nebula_core::ProjectId,
@@ -4494,7 +4527,7 @@ fn select_created_project(
         return false;
     }
     restore_context(app, out);
-    app.focus = Focus::Worktrees;
+    app.focus = app.next_visible_focus(Focus::Projects);
     true
 }
 
@@ -4549,8 +4582,7 @@ fn target_workspace(app: &App, target: &PaletteTarget) -> Option<WorkspaceId> {
 
 /// Land the panel selections on a `/` palette pick. A project or worktree
 /// pick moves the selection (restoring remembered child rows, like a manual
-/// switch), then hands focus one column right — a project pick lands in its
-/// Worktrees panel and a worktree pick in its Sessions panel, since picking
+/// switch), then hands focus to the next visible child panel, since picking
 /// either by name is a step towards one of its children, not an errand in
 /// the column it names. A session pick with `attach` opens
 /// it immediately, exactly like Enter on its row; without, it only lands
@@ -4607,7 +4639,7 @@ fn jump_to_target_inner(
             if changed {
                 restore_context(app, out);
             }
-            app.focus = Focus::Worktrees;
+            app.focus = app.next_visible_focus(Focus::Projects);
         }
         PaletteTarget::Worktree(id) => {
             if !switched && app.selected_worktree().is_some_and(|w| w.id == id) {
@@ -4880,18 +4912,6 @@ fn leave_terminal_lock(app: &mut App) {
     app.focus = Focus::Sessions;
 }
 
-/// The panel one step to the right in the focus walk, up to the Sessions
-/// column. None from Sessions (and the pane): what lies past the last
-/// column is each key's own decision.
-fn next_focus(focus: Focus) -> Option<Focus> {
-    match focus {
-        Focus::Workspaces => Some(Focus::Projects),
-        Focus::Projects => Some(Focus::Worktrees),
-        Focus::Worktrees => Some(Focus::Sessions),
-        Focus::Sessions | Focus::Terminal => None,
-    }
-}
-
 /// Cross into the terminal pane and take the input lock, so what the user
 /// types after the walk reaches the agent instead of the panels. An empty
 /// or dead pane is focused but never locked: there is nothing to type into,
@@ -4940,27 +4960,21 @@ fn double_tapped(
 /// user is going to type at the agent, and the preview under the Sessions
 /// cursor is already the session they picked.
 fn walk_focus_forward(app: &mut App, out: &mut Vec<ClientRequest>) {
-    match next_focus(app.focus) {
-        Some(next) => app.focus = next,
-        None => enter_terminal_pane(app, out),
+    match app.next_visible_focus(app.focus) {
+        Focus::Terminal => enter_terminal_pane(app, out),
+        next => app.focus = next,
     }
 }
 
 /// The backward panel walk — ⇧Tab / ^⇧H, and h/← (double-tapped at the
-/// end) — one column left, stopping dead at the first column: the Workspaces bar while it's shown,
-/// Projects when it's hidden. Never wraps into the pane: ^⇧H is also the
+/// end) — one visible column left, stopping at the Workspaces bar while it
+/// is shown, otherwise the first visible sidebar. Never wraps into the pane: ^⇧H is also the
 /// unlock hatch out of a locked pane, so a wrap made the key cycle first
 /// column → pane → Sessions → … forever, with nothing to stop against.
 /// Forward is the way into the pane, and Ctrl+→ crosses into it without
 /// taking the input lock.
 fn walk_focus_back(app: &mut App) {
-    app.focus = match app.focus {
-        Focus::Projects if app.show_workspaces => Focus::Workspaces,
-        Focus::Workspaces | Focus::Projects => app.focus,
-        Focus::Worktrees => Focus::Projects,
-        Focus::Sessions => Focus::Worktrees,
-        Focus::Terminal => Focus::Sessions,
-    };
+    app.focus = app.previous_visible_focus(app.focus);
 }
 
 /// Open a saved link in the browser, reporting either way — the browser
@@ -6074,7 +6088,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     if app.sel_project != i {
                         select_project_row(app, i, out);
                     }
-                    app.focus = Focus::Projects;
+                    app.focus = app.first_sidebar_focus();
                 }
                 Some(HitTarget::Worktree(i)) => {
                     if app.sel_worktree != i {
@@ -6555,13 +6569,11 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 (Some(PendingIntent::OpenCreatedWorkspace), Some(EntityId::Workspace(id))) => {
                     // A workspace created from the WORKSPACE SWITCHER or the
                     // WORKSPACES BAR: show it right away, with the cursor on
-                    // the PROJECTS PANEL. The new workspace is empty, so the
-                    // next thing to do is add its first PROJECT — and `n`
-                    // there does exactly that — rather than leave focus on
+                    // the first visible sidebar rather than leave focus on
                     // the bar (or wherever the switcher was opened from).
                     switch_workspace(app, id, out);
                     app.term_locked = false;
-                    app.focus = Focus::Projects;
+                    app.focus = app.first_sidebar_focus();
                 }
                 _ => {}
             }
@@ -11007,6 +11019,21 @@ diff --git a/src/b.rs b/src/b.rs
             assert_eq!(app.focus, Focus::Worktrees);
             assert_eq!(app.select_project_when_seen, None);
         }
+
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.hide_worktrees = true;
+        let mut out = Vec::new();
+        assert!(select_created_project(
+            &mut app,
+            &ProjectId("p1".into()),
+            &mut out
+        ));
+        assert_eq!(
+            app.focus,
+            Focus::Sessions,
+            "a hidden Worktrees panel is skipped after project creation"
+        );
     }
 
     #[test]
@@ -14321,7 +14348,7 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
-    fn palette_enter_on_project_lands_in_its_worktrees_panel() {
+    fn palette_enter_on_project_lands_in_the_next_visible_panel() {
         let mut app = App::new();
         seed_tree(&mut app);
         seed_second_project(&mut app);
@@ -14340,6 +14367,18 @@ diff --git a/src/b.rs b/src/b.rs
             Focus::Worktrees,
             "a project pick lands in its Worktrees panel, not the Projects column"
         );
+
+        app.hide_projects = true;
+        app.hide_worktrees = true;
+        app.focus = Focus::Sessions;
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        for c in "nebula".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.selected_project().unwrap().name, "nebula");
+        assert_eq!(app.focus, Focus::Sessions, "hidden panels stay hidden");
     }
 
     #[test]
@@ -17747,7 +17786,7 @@ diff --git a/src/b.rs b/src/b.rs
         use crate::app::{DEFAULT_PANEL_WIDTHS, WORKSPACES_BAR_H};
         let mut app = App::new();
         assert!(app.show_workspaces);
-        assert_eq!(app.splitter_indices(), 0..3);
+        assert_eq!(app.splitter_indices(), vec![0, 1, 2]);
         assert_eq!(app.workspaces_bar_h(), WORKSPACES_BAR_H);
         assert_eq!(app.splitter_x(0), 20);
         assert_eq!(app.splitter_x(2), 74);
@@ -17769,7 +17808,7 @@ diff --git a/src/b.rs b/src/b.rs
         // Hiding the bar changes nothing horizontal.
         app.show_workspaces = false;
         assert_eq!(app.workspaces_bar_h(), 0);
-        assert_eq!(app.splitter_indices(), 0..3);
+        assert_eq!(app.splitter_indices(), vec![0, 1, 2]);
         assert_eq!(app.splitter_x(0), 20);
     }
 
@@ -17980,6 +18019,158 @@ diff --git a/src/b.rs b/src/b.rs
             let text = buffer_text(&terminal);
             assert!(text.contains("Workspaces bar"), "{text}");
             assert!(text.contains("Appearance"), "{text}");
+        });
+    }
+
+    #[test]
+    fn shift_p_and_shift_b_hide_panels_independently_and_persist() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let mut out = Vec::new();
+
+            app.focus = Focus::Projects;
+            press(&mut app, KeyCode::Char('P'), KeyModifiers::SHIFT, &mut out);
+            assert!(app.hide_projects);
+            assert!(!app.hide_worktrees);
+            assert_eq!(app.focus, Focus::Worktrees);
+
+            press(&mut app, KeyCode::Char('B'), KeyModifiers::SHIFT, &mut out);
+            assert!(app.hide_projects);
+            assert!(app.hide_worktrees);
+            assert_eq!(app.focus, Focus::Sessions);
+            let saved = crate::config::Config::load();
+            assert!(saved.hide_projects);
+            assert!(saved.hide_worktrees);
+
+            let mut next = App::new();
+            apply_config(&mut next, &saved);
+            assert!(next.hide_projects);
+            assert!(next.hide_worktrees);
+            assert_eq!(next.focus, Focus::Sessions);
+
+            press(&mut app, KeyCode::Char('P'), KeyModifiers::SHIFT, &mut out);
+            assert!(!app.hide_projects);
+            assert!(app.hide_worktrees);
+            assert_eq!(app.focus, Focus::Sessions, "showing does not steal focus");
+            press(&mut app, KeyCode::Char('B'), KeyModifiers::SHIFT, &mut out);
+            assert!(!app.hide_projects);
+            assert!(!app.hide_worktrees);
+            assert_eq!(app.focus, Focus::Sessions, "showing does not steal focus");
+        });
+    }
+
+    #[test]
+    fn focus_walk_skips_hidden_panels() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        app.hide_projects = true;
+        app.hide_worktrees = true;
+        app.focus = Focus::Workspaces;
+
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.focus, Focus::Sessions);
+        press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
+        assert_eq!(app.focus, Focus::Workspaces);
+
+        app.show_workspaces = false;
+        app.focus = Focus::Sessions;
+        press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
+        assert_eq!(app.focus, Focus::Sessions, "no hidden stop to walk into");
+
+        app.hide_worktrees = false;
+        press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
+        assert_eq!(app.focus, Focus::Worktrees);
+        app.hide_projects = false;
+        press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
+        assert_eq!(app.focus, Focus::Projects);
+    }
+
+    #[test]
+    fn hidden_panels_give_their_width_to_the_terminal_and_restore() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_default_workspace(&mut app);
+        let widths = app.panel_widths;
+        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.term_area.x, widths.iter().sum::<u16>() + 1);
+        let all_text = buffer_text(&terminal);
+        assert!(all_text.contains("PROJECTS"), "{all_text}");
+        assert!(all_text.contains("WORKTREES"), "{all_text}");
+
+        app.focus = Focus::Projects;
+        set_hide_projects(&mut app, true);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let projects_hidden = buffer_text(&terminal);
+        assert!(!projects_hidden.contains("PROJECTS"), "{projects_hidden}");
+        assert!(projects_hidden.contains("WORKTREES"), "{projects_hidden}");
+        assert_eq!(app.term_area.x, widths[1] + widths[2] + 1);
+        assert_eq!(app.splitter_indices(), vec![1, 2]);
+        assert_eq!(app.focus, Focus::Worktrees);
+
+        set_hide_worktrees(&mut app, true);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let both_hidden = buffer_text(&terminal);
+        assert!(!both_hidden.contains("PROJECTS"), "{both_hidden}");
+        assert!(!both_hidden.contains("WORKTREES"), "{both_hidden}");
+        assert!(both_hidden.contains("SESSIONS"), "{both_hidden}");
+        assert!(both_hidden.contains("⇧P: show projects"), "{both_hidden}");
+        assert!(both_hidden.contains("⇧B: show worktrees"), "{both_hidden}");
+        assert_eq!(app.term_area.x, widths[2] + 1);
+        assert_eq!(app.splitter_indices(), vec![2]);
+        assert_eq!(app.panel_widths, widths, "hidden widths stay remembered");
+        assert_eq!(app.focus, Focus::Sessions);
+
+        set_hide_projects(&mut app, false);
+        set_hide_worktrees(&mut app, false);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let restored = buffer_text(&terminal);
+        assert!(restored.contains("PROJECTS"), "{restored}");
+        assert!(restored.contains("WORKTREES"), "{restored}");
+        assert_eq!(app.term_area.x, widths.iter().sum::<u16>() + 1);
+        assert_eq!(app.panel_widths, widths);
+        assert_eq!(app.focus, Focus::Sessions, "restoring does not steal focus");
+    }
+
+    #[test]
+    fn appearance_rows_toggle_project_and_worktree_panels_live() {
+        with_default_config(|| {
+            let mut app = App::new();
+            app.focus = Focus::Projects;
+            let (tab, projects_row) =
+                crate::config::locate(crate::config::SettingKind::HideProjects).unwrap();
+            let (_, worktrees_row) =
+                crate::config::locate(crate::config::SettingKind::HideWorktrees).unwrap();
+
+            apply_setting_at(&mut app, tab, projects_row, 0);
+            assert!(app.hide_projects);
+            assert_eq!(app.focus, Focus::Worktrees);
+            apply_setting_at(&mut app, tab, projects_row, 0);
+            assert!(!app.hide_projects);
+            assert_eq!(app.focus, Focus::Worktrees);
+
+            apply_setting_at(&mut app, tab, worktrees_row, 0);
+            assert!(app.hide_worktrees);
+            assert_eq!(app.focus, Focus::Sessions);
+            assert!(crate::config::Config::load().hide_worktrees);
+
+            press(
+                &mut app,
+                KeyCode::Char('s'),
+                KeyModifiers::NONE,
+                &mut Vec::new(),
+            );
+            for _ in 0..tab {
+                press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut Vec::new());
+            }
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("Projects panel"), "{text}");
+            assert!(text.contains("Worktrees panel"), "{text}");
+            assert!(text.contains("hidden"), "{text}");
         });
     }
 

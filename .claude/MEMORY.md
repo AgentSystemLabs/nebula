@@ -14,6 +14,34 @@ about what is worth recording.
 
 ## Entries
 
+### Independent PROJECTS PANEL And WORKTREES PANEL Visibility - 2026-08-28
+
+**Asked:** "Lets add a feature to allow us to toggle the PROJECTS column and also to toggle WORKTREES
+column separate. Having those toggles avaialble llow us to have more space, thats why we want it.
+
+grill me with docs" - then corrected: "I think instead of show_* in the configuration should be hide_*"
+
+**Did:** Added independent, global panel visibility to the TUI without a protocol, store, or UI STATE
+BLOB change. `crates/nebula-tui/src/config.rs::Config` now persists `hide_projects` and
+`hide_worktrees` (both default `false`) and exposes both on the SETTINGS OVERLAY's Appearance tab;
+`keymap.rs` adds `toggle_projects` on `Shift+P` and `toggle_worktrees` on `Shift+B`. Runtime layout in
+`app.rs::visible_panel_indices` and `ui.rs::draw` omits hidden panels, preserves their draggable widths,
+and gives the released width to the TERMINAL PANE. The PANEL WALK, ACTIVATE, new PROJECT selection,
+new WORKSPACE selection, and PALETTE project picks all skip hidden panels; hiding the focused panel
+moves FOCUS right, while restoring never steals it. The FOOTER leads with restore hints while a panel
+is hidden. README, CONFIG.JSON coverage, render tests, navigation tests, creation/PALETTE tests, and the
+real-PTY E2E TUI flow were updated. `cargo test --workspace`: 715 passed, 0 failed.
+
+**Gotchas:**
+- A restore hint appended to the normal FOOTER text is clipped at a 120-column PTY because the focus
+  hints and right-side metrics consume the row. Prepending `Shift+P: show projects` and
+  `Shift+B: show worktrees` keeps the recovery path visible.
+- `App::term_area` records the TERMINAL PANE's inner PTY rect after a one-cell left inset, so its `x` is
+  one cell past the outer layout boundary. Layout tests that measure released sidebar width must account
+  for that inset.
+- `cargo clippy --workspace --all-targets -- -D warnings` still stops on the pre-existing
+  `clippy::needless_return` at `event_loop.rs:5375` (`return copy_via("pbcopy", &[])`), outside this diff.
+
 ### Released v0.15.0 By Cherry-Picking Only The Post-v0.14.0 Delta Onto origin/main — 2026-08-28
 
 **Asked:** "pull latest from main, commit push and make another relase"
@@ -233,6 +261,25 @@ serde bools, layout/focus arithmetic, no new `ClientRequest`, no path or process
   covers all seven binaries plus doc-tests.
 - The dedup pass left clippy at zero warnings; the "pre-existing warnings" the PR description mentions are gone,
   so a warning after a merge with main is yours.
+
+**Follow-up (2026-08-28):** "fix the conflicts on the pr in a worktree and push" (a PR SESSION off the PROJECT
+OPEN PRS GROUP row; → refined: merge `origin/main` into `lnmunhoz:toggle-column` in a dedicated WORKTREE, keep
+the PR's behavior, fmt/clippy/test green, push to the fork). PR #20 had gone CONFLICTING again once v0.15.0
+and the PR SESSION work landed. This time the branch was checked out via nebula's own WORKTREE DIR rather
+than a scratch `git worktree add`: `git fetch origin pull/20/head:toggle-column` (local branch named after
+the fork's head ref) → `nebula worktree toggle-column` adopts the existing branch and relocates the session
+→ `git merge origin/main` → resolve → `cargo fmt` / `clippy -D warnings` / `test --workspace` (741 green)
+→ `git commit -F` → `git push git@github.com:lnmunhoz/nebula.git HEAD:toggle-column` (merge `7c46cb8`) →
+`MERGEABLE CLEAN` within 10 s. No worktree cleanup needed; it is a real WORKTREE row.
+- **Round two of a long-lived PR conflicts on the SELF-IMPROVING LOOP's files, not the code.** Every branch
+  prepends to `.claude/MEMORY.md` and edits `TERMS.md` rows, so `MEMORY.md` (keep both sides, PR entry
+  first), the `PROTOCOL VERSION` row (take main's number) and the three panel rows (merge column by
+  column: main's PROJECT OPEN PRS GROUP / WORKTREE OPEN PRS GROUP wording + the PR's `Config::hide_*`,
+  `Shift+P` / `Shift+B` cells) were the whole conflict; `app.rs`, `event_loop.rs`, `keymap.rs`, `ui.rs`
+  auto-merged clean.
+- `e2e_tui.rs` conflicted only because the PR's new `tui_hides_projects_and_worktrees_independently` sat
+  directly above the links test main deleted — the hunk carried the new test plus the dead test's doc
+  comment. Keep the test, drop the comment.
 
 ### The SESSIONS PANEL Shows OPEN PRS And Cannot Create LINKS — 2026-08-28
 

@@ -31,7 +31,7 @@ three, every time, and read the screens.
 
 nebula replaces that with a tree and a color:
 
-- **Every project, worktree and agent in one list.** Four columns, `h`/`j`/`k`/`l` to move, `Enter` to drill in.
+- **Every project, worktree and agent in one list.** Up to four columns, `h`/`j`/`k`/`l` to move, `Enter` to drill in.
 - **A dot per session that says what it's doing.** ● yellow is mid-turn, ● violet is done and waiting
   to be read, ● green is done and read, ● red wants you. Parents roll up their children, so a red dot
   on a collapsed project tells you exactly where to look without opening anything.
@@ -76,11 +76,15 @@ nebula add ~/code/my-app       # or, from inside the repo: nebula add .
 nebula
 ```
 
-Four columns, left to right: **Projects → Worktrees → Sessions → Terminal**. `Tab` / `Shift+Tab` (or
+Up to four columns, left to right: **Projects → Worktrees → Sessions → Terminal**. `Tab` / `Shift+Tab` (or
 `h` / `l`, or `←` / `→`) move focus between columns, `j` / `k` move the selection inside one, and `Enter`
-drills in. `Tab` stops at the terminal pane rather than wrapping back round to the first column, and `Shift+Tab`
-stops at the first column rather than wrapping into the pane — neither direction cycles. Landing on a
+drills in. `Tab` stops at the TERMINAL PANE rather than wrapping back round to the first visible panel,
+and `Shift+Tab` stops at the first visible panel rather than wrapping into the pane. Neither direction
+cycles. Landing on a
 live pane hands it the keyboard, so `Tab` all the way right and start typing at the agent.
+`Shift+P` shows or hides the PROJECTS PANEL and `Shift+B` does the same for the WORKTREES PANEL. Each
+toggle is independent, the TERMINAL PANE takes the released width, and showing a panel restores its
+remembered size without moving FOCUS.
 With no projects yet you get the splash instead — press `n` to add one without leaving the TUI.
 
 **3. Choose where the agent runs.** Select your project, then a worktree. Every project starts with one:
@@ -239,7 +243,8 @@ is currently unavailable; previously saved links remain visible so the change do
   revives on the next attach with its conversation resumed.
 - **Settings live in one JSON file** (`config.json`, beside the database), read fresh on each use by both
   the daemon and the TUI, so hand edits apply without a restart. `s` opens the settings overlay over the
-  same file: color theme, animations, focused-panel tint, whether the Workspaces bar is shown,
+  same file: color theme, animations, focused-panel tint, whether the Workspaces bar, PROJECTS PANEL,
+  and WORKTREES PANEL are shown,
   editor, default model and reasoning effort per agent CLI, the RECENT window, the idle timeout, and
   whether new sessions stop to ask for a name. `R` inside the overlay puts every setting — hotkeys
   included — back to its default, after a confirmation.
@@ -261,7 +266,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 
 | Context | Key | Action |
 |---|---|---|
-| Panels | `Tab`/`Shift+Tab`, `h/l` or `←/→`, `j/k` | move focus / selection — the walk stops at both ends (`Tab` at the terminal pane, `Shift+Tab` at the first column) instead of cycling, and landing on a live pane takes its input; `h`/`l` stop one short of each end, and a double tap there (`l`,`l` at Sessions, `h`,`h` at the first column) jumps the boundary |
+| Panels | `Tab`/`Shift+Tab`, `h/l` or `←/→`, `j/k` | move FOCUS / selection through visible panels; the walk stops at both ends (`Tab` at the TERMINAL PANE, `Shift+Tab` at the first visible panel) instead of cycling, and landing on a live pane takes its input; `h`/`l` stop one short of each end, and a double tap there (`l`,`l` at Sessions, `h`,`h` at the first visible panel) jumps the boundary |
 | Panels | `Ctrl+→` | cross into the terminal pane *without* taking its input (`Tab`, or a double tap of `l`/`→` at Sessions, takes it) |
 | Panels | `Enter` | drill in; on a session: attach |
 | Any panel | `/` | fuzzy jump across every workspace, project, worktree and session — in *every* workspace, each row pathed `workspace/project/branch/session`, so typing another workspace's name jumps you into it (`Ctrl+n/p` move, `Ctrl+o` opens the hit, `Ctrl+f` just lands the selection on it) |
@@ -284,10 +289,12 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Any panel | `f` / `F` / `b` | find file / find in files (`git grep`) / file tree browser, all scoped to the selected worktree — `Enter` opens the file in an editor modal (at the matched line, for `F`); in `f` and `b`, `Ctrl+y` copies the path |
 | Sessions | `Enter` on an OPEN PRS row | open it in the browser (a previously saved link can still be edited with `r` or deleted with `d`; the detected pull request cannot) |
 | Any panel | `t` | new shell terminal in the selected worktree's directory (Projects panel: the repo root) |
-| Any panel | `w` or click the `◇ workspace` nameplate bottom-left | workspace switcher: `Enter` opens, `n`/`r`/`d` create/rename/delete — a created workspace opens with focus on Projects; delete asks first, and deleting the open one lands on the tab to its right — from the last tab, the one to its left (the panels scope to the open workspace; `/` doesn't, and switches for you). Per window — switching here leaves your other nebula instances on the workspace you left them on |
+| Any panel | `w` or click the `◇ workspace` nameplate bottom-left | workspace switcher: `Enter` opens, `n`/`r`/`d` create/rename/delete; a created workspace opens with FOCUS on the first visible panel; delete asks first, and deleting the open one lands on the tab to its right, or the one to its left from the last tab (the panels scope to the open workspace; `/` doesn't, and switches for you). Per window, switching here leaves your other nebula instances on the workspace you left them on |
 | Any panel | `Shift+W` | show / hide the Workspaces bar across the top: `WORKSPACES` on the left, directly above `PROJECTS`, and one tab per workspace to its right with the rolled-up status of the agents under it (plus a count of the ones that finished unread), so a run in a workspace you don't have open still shows at the top level. The choice is remembered — it's the `Workspaces bar` setting, also in Settings → Appearance |
+| Any panel | `Shift+P` | show / hide the PROJECTS PANEL. The TERMINAL PANE takes the released width; showing the panel restores its remembered width without stealing FOCUS. Persisted as `hide_projects` in CONFIG.JSON and also available in Settings → Appearance |
+| Any panel | `Shift+B` | show / hide the WORKTREES PANEL independently from the PROJECTS PANEL. The TERMINAL PANE takes the released width; showing the panel restores its remembered width without stealing FOCUS. Persisted as `hide_worktrees` in CONFIG.JSON and also available in Settings → Appearance |
 | Any panel | `1`–`9` (or `⌘1`–`⌘9`) | open that numbered tab in the Workspaces bar without leaving the panel you're in. `⌘` is what the tabs advertise, but Terminal.app and most other emulators never encode it into pty bytes — the bare digit is the one that always arrives. Rebindable per slot in Settings → Hotkeys |
-| Workspaces | `←/→`, `↓`/`Enter`, `n`/`r`/`d`, `m` | the cursor is the open workspace, so `←/→` switches; `↓` or `Enter` steps down into Projects; create / rename / delete the open one (a created workspace opens with focus on Projects; delete asks first, refuses a non-empty workspace, and lands on the tab to the right — from the last tab, the one to its left); `m` or right-click lists the same verbs |
+| Workspaces | `←/→`, `↓`/`Enter`, `n`/`r`/`d`, `m` | the cursor is the open workspace, so `←/→` switches; `↓` or `Enter` steps down into the first visible panel; create / rename / delete the open one (a created workspace opens there too; delete asks first, refuses a non-empty workspace, and lands on the tab to the right, or the one to its left from the last tab); `m` or right-click lists the same verbs |
 | Any panel | `Shift+H` | ssh hosts: every `nebula ssh` / `nebula tunnel` destination, newest first. `Enter`/click reconnects (quits this TUI and execs a fresh `nebula ssh` — local sessions keep running), `a` types a new `user@host [dir]`, `d` removes |
 | Any panel | `m` or right-click | context menu |
 | Any panel | `z` | full-screen terminal: collapse the sidebars and lock input into the attached session |
@@ -305,7 +312,8 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 
 Mouse: left-click selects/attaches, right-click opens context menus, double-click in the terminal selects
 a word, `⌥`-click opens the URL or `file:line` under the cursor (browser / editor modal), and dragging a
-panel border resizes it. A click outside any modal (help, settings, a confirm, a prompt, the pickers)
+visible panel border resizes it. Hidden panels keep their last width for the next time they are shown.
+A click outside any modal (help, settings, a confirm, a prompt, the pickers)
 dismisses it, exactly as `Esc` would. Text selection: hold `Shift` while dragging (mouse capture bypass —
 same as tmux).
 
@@ -361,6 +369,9 @@ nebula upgrade            # install the latest release (--force on a dev build)
 
 Settings: `~/.local/share/nebula/config.json` (or the platform equivalent), beside the database —
 hand-editable, and what the `s` overlay writes.
+
+`hide_projects` and `hide_worktrees` default to `false`. Set either to `true` to start with that panel
+hidden; the SESSIONS PANEL always remains visible.
 
 Logs: `~/.local/state/nebula/daemon.log` and `tui.log` (`NEBULA_LOG=debug` for more). `NEBULA_EDITOR`
 overrides the configured editor. Overrides for tests/parallel instances: `NEBULA_RUNTIME_DIR`,

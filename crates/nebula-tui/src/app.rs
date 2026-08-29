@@ -26,7 +26,7 @@ pub fn now_ms() -> i64 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
-    /// The optional leftmost column (`Shift+W` shows/hides it). Its cursor
+    /// The optional top bar (`Shift+W` shows/hides it). Its cursor
     /// IS the open workspace — moving it switches, the way moving in the
     /// Projects column re-scopes the worktrees.
     Workspaces,
@@ -54,8 +54,9 @@ pub enum HitTarget {
     /// Panel background (registered after rows, so rows win).
     PanelBg(Focus),
     TerminalPane,
-    /// Draggable vertical boundary between panels, left to right:
-    /// 0 = projects|worktrees, 1 = worktrees|sessions, 2 = sessions|terminal.
+    /// Draggable right boundary of a visible sidebar panel. The index is
+    /// logical (0 Projects, 1 Worktrees, 2 Sessions), so hidden panels keep
+    /// their remembered widths without owning a boundary.
     Splitter(usize),
 }
 
@@ -1966,6 +1967,10 @@ pub struct App {
     /// setting, which both `Shift+W` and the Appearance tab write — this
     /// field is the live copy, the config file is where it persists.
     pub show_workspaces: bool,
+    /// Projects panel hidden; mirrors CONFIG.JSON's `hide_projects`.
+    pub hide_projects: bool,
+    /// Worktrees panel hidden; mirrors CONFIG.JSON's `hide_worktrees`.
+    pub hide_worktrees: bool,
     pub next_req_id: u64,
     pub pending: HashMap<u64, PendingIntent>,
     /// `nebula --workspace <name>`: the workspace this instance was asked
@@ -2203,6 +2208,8 @@ impl App {
             show_archived: false,
             collapsed: false,
             show_workspaces: true,
+            hide_projects: false,
+            hide_worktrees: false,
             next_req_id: 1,
             pending: HashMap::new(),
             startup_workspace: None,
@@ -2369,24 +2376,55 @@ impl App {
         }
     }
 
-    /// The splitters, left to right. The Workspaces bar runs across the top
-    /// now, so it owns no vertical boundary: all three are panel edges.
-    pub fn splitter_indices(&self) -> std::ops::Range<usize> {
-        0..3
+    /// Visible sidebar indices, left to right. Sessions is always present.
+    pub fn visible_panel_indices(&self) -> Vec<usize> {
+        (0..3).filter(|idx| self.panel_visible(*idx)).collect()
+    }
+
+    pub fn panel_visible(&self, idx: usize) -> bool {
+        match idx {
+            0 => !self.hide_projects,
+            1 => !self.hide_worktrees,
+            2 => true,
+            _ => false,
+        }
+    }
+
+    /// Every visible sidebar owns the draggable boundary on its right.
+    pub fn splitter_indices(&self) -> Vec<usize> {
+        self.visible_panel_indices()
     }
 
     /// Screen x of splitter `idx` — the column where the panel to its right
     /// starts, i.e. the right edge of panel `idx`.
     pub fn splitter_x(&self, idx: usize) -> u16 {
-        self.panel_widths[..=idx].iter().sum::<u16>()
+        self.visible_panel_indices()
+            .into_iter()
+            .filter(|visible| *visible <= idx)
+            .map(|visible| self.panel_widths[visible])
+            .sum()
     }
 
     /// Move splitter `idx` so its boundary lands at `boundary_x`, clamped so
     /// the panel keeps `MIN_PANEL_W` and the terminal pane keeps `MIN_TERM_W`.
     pub fn set_splitter(&mut self, idx: usize, boundary_x: i32, body_w: u16) {
         let want = boundary_x.max(0) as u16;
-        let left: u16 = self.panel_widths[..idx].iter().sum();
-        let fixed_right: u16 = self.panel_widths[idx + 1..].iter().sum();
+        if !self.panel_visible(idx) {
+            return;
+        }
+        let visible = self.visible_panel_indices();
+        let left: u16 = visible
+            .iter()
+            .copied()
+            .filter(|visible| *visible < idx)
+            .map(|visible| self.panel_widths[visible])
+            .sum();
+        let fixed_right: u16 = visible
+            .iter()
+            .copied()
+            .filter(|visible| *visible > idx)
+            .map(|visible| self.panel_widths[visible])
+            .sum();
         let max = body_w.saturating_sub(left + fixed_right + MIN_TERM_W);
         if max < MIN_PANEL_W {
             return; // terminal too small to honor the minimums
@@ -2400,13 +2438,13 @@ impl App {
     /// spans the full width above them, so it costs the panels nothing here.
     pub fn normalize_panel_widths(&mut self, body_w: u16) {
         let budget = body_w.saturating_sub(MIN_TERM_W);
-        for i in (0..3).rev() {
-            let others: u16 = self
-                .panel_widths
+        let visible = self.visible_panel_indices();
+        for i in visible.iter().rev().copied() {
+            let others: u16 = visible
                 .iter()
-                .enumerate()
-                .filter(|(j, _)| *j != i)
-                .map(|(_, w)| *w)
+                .copied()
+                .filter(|j| *j != i)
+                .map(|j| self.panel_widths[j])
                 .sum();
             let max = budget.saturating_sub(others);
             self.panel_widths[i] = self.panel_widths[i].clamp(MIN_PANEL_W, max.max(MIN_PANEL_W));
@@ -2858,15 +2896,71 @@ impl App {
         project_unseen(&self.tree, project_id)
     }
 
+    /// First visible sidebar under the Workspaces bar.
+    pub fn first_sidebar_focus(&self) -> Focus {
+        if !self.hide_projects {
+            Focus::Projects
+        } else if !self.hide_worktrees {
+            Focus::Worktrees
+        } else {
+            Focus::Sessions
+        }
+    }
+
+    pub fn focus_visible(&self, focus: Focus) -> bool {
+        match focus {
+            Focus::Workspaces => self.show_workspaces,
+            Focus::Projects => !self.hide_projects,
+            Focus::Worktrees => !self.hide_worktrees,
+            Focus::Sessions | Focus::Terminal => true,
+        }
+    }
+
+    fn focus_rank(focus: Focus) -> u8 {
+        match focus {
+            Focus::Workspaces => 0,
+            Focus::Projects => 1,
+            Focus::Worktrees => 2,
+            Focus::Sessions => 3,
+            Focus::Terminal => 4,
+        }
+    }
+
+    pub fn next_visible_focus(&self, focus: Focus) -> Focus {
+        let rank = Self::focus_rank(focus);
+        [
+            Focus::Workspaces,
+            Focus::Projects,
+            Focus::Worktrees,
+            Focus::Sessions,
+            Focus::Terminal,
+        ]
+        .into_iter()
+        .find(|candidate| Self::focus_rank(*candidate) > rank && self.focus_visible(*candidate))
+        .unwrap_or(focus)
+    }
+
+    pub fn previous_visible_focus(&self, focus: Focus) -> Focus {
+        let rank = Self::focus_rank(focus);
+        [
+            Focus::Terminal,
+            Focus::Sessions,
+            Focus::Worktrees,
+            Focus::Projects,
+            Focus::Workspaces,
+        ]
+        .into_iter()
+        .find(|candidate| Self::focus_rank(*candidate) < rank && self.focus_visible(*candidate))
+        .unwrap_or(focus)
+    }
+
     /// First stop in the Tab walk (and where a cross-workspace jump lands):
-    /// the Workspaces bar when it's shown, Projects otherwise. Note this is
-    /// no longer the *leftmost* focus — the bar spans the top, so h/l never
-    /// reach it; Tab, Shift+Tab and j/k do.
+    /// the Workspaces bar when shown, otherwise the first visible sidebar.
     pub fn first_focus(&self) -> Focus {
         if self.show_workspaces {
             Focus::Workspaces
         } else {
-            Focus::Projects
+            self.first_sidebar_focus()
         }
     }
 

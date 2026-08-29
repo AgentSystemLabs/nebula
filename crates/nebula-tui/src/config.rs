@@ -102,6 +102,8 @@ pub enum SettingKind {
     Animations,
     FocusTint,
     ShowWorkspaces,
+    HideProjects,
+    HideWorktrees,
     ClaudeModel,
     ClaudeEffort,
     CodexModel,
@@ -174,6 +176,16 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::ShowWorkspaces,
                 label: "Workspaces bar",
                 hint: "Show the Workspaces tab bar across the top (Shift+W toggles)",
+            },
+            SettingSpec {
+                kind: SettingKind::HideProjects,
+                label: "Projects panel",
+                hint: "Show or hide the Projects panel (Shift+P toggles)",
+            },
+            SettingSpec {
+                kind: SettingKind::HideWorktrees,
+                label: "Worktrees panel",
+                hint: "Show or hide the Worktrees panel (Shift+B toggles)",
             },
         ]),
     },
@@ -366,12 +378,19 @@ pub struct Config {
     /// Faint accent-tinted background fill on the focused panel. Off by
     /// default — it's a taste call, not everyone wants the extra color.
     pub focus_tint: bool,
-    /// Whether the Workspaces column is drawn at the left edge. This is
-    /// the column's only home: `Shift+W` writes it here as it toggles, so
-    /// a hidden column stays hidden across restarts — and a crash or a
+    /// Whether the Workspaces bar is drawn across the top. This is the
+    /// bar's only home: `Shift+W` writes it here as it toggles, so a hidden
+    /// bar stays hidden across restarts, and a crash or a
     /// closed browser tab can't lose the choice the way the daemon's
     /// save-on-quit UI blob would.
     pub show_workspaces: bool,
+    /// Hide the Projects panel and give its width to the terminal pane.
+    /// False by default so configs written before this key keep the current
+    /// three-panel layout.
+    pub hide_projects: bool,
+    /// Hide the Worktrees panel and give its width to the terminal pane.
+    /// Independent from `hide_projects`; Sessions always remains visible.
+    pub hide_worktrees: bool,
     /// Default model/effort for new Claude / Codex sessions. "default"
     /// means "don't pass the flag" (the CLI picks); any other value is
     /// passed through verbatim, so hand-edited configs can name models the
@@ -401,6 +420,8 @@ impl Default for Config {
             animations: true,
             focus_tint: false,
             show_workspaces: true,
+            hide_projects: false,
+            hide_worktrees: false,
             claude_model: DEFAULT_CHOICE.into(),
             claude_effort: DEFAULT_CHOICE.into(),
             codex_model: DEFAULT_CHOICE.into(),
@@ -498,6 +519,14 @@ impl Config {
             "show_workspaces".into(),
             serde_json::json!(self.show_workspaces),
         );
+        obj.insert(
+            "hide_projects".into(),
+            serde_json::json!(self.hide_projects),
+        );
+        obj.insert(
+            "hide_worktrees".into(),
+            serde_json::json!(self.hide_worktrees),
+        );
         obj.insert("claude_model".into(), serde_json::json!(self.claude_model));
         obj.insert(
             "claude_effort".into(),
@@ -576,6 +605,8 @@ impl Config {
             SettingKind::Animations => on_off(self.animations).into(),
             SettingKind::FocusTint => on_off(self.focus_tint).into(),
             SettingKind::ShowWorkspaces => on_off(self.show_workspaces).into(),
+            SettingKind::HideProjects => shown_hidden(self.hide_projects).into(),
+            SettingKind::HideWorktrees => shown_hidden(self.hide_worktrees).into(),
             SettingKind::ClaudeModel => self.claude_model.clone(),
             SettingKind::ClaudeEffort => self.claude_effort.clone(),
             SettingKind::CodexModel => self.codex_model.clone(),
@@ -623,6 +654,12 @@ impl Config {
             SettingKind::ShowWorkspaces => {
                 self.show_workspaces = !self.show_workspaces;
             }
+            SettingKind::HideProjects => {
+                self.hide_projects = !self.hide_projects;
+            }
+            SettingKind::HideWorktrees => {
+                self.hide_worktrees = !self.hide_worktrees;
+            }
             SettingKind::ClaudeModel => {
                 self.claude_model = cycle_choice(&self.claude_model, CLAUDE_MODELS, step).into();
             }
@@ -661,6 +698,14 @@ fn on_off(v: bool) -> &'static str {
         "on"
     } else {
         "off"
+    }
+}
+
+fn shown_hidden(hidden: bool) -> &'static str {
+    if hidden {
+        "hidden"
+    } else {
+        "shown"
     }
 }
 
@@ -947,6 +992,36 @@ mod tests {
         // A config predating the key leaves the column shown.
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(cfg.show_workspaces);
+    }
+
+    #[test]
+    fn project_and_worktree_panels_default_shown_toggle_and_persist() {
+        let mut cfg = Config::default();
+        assert!(!cfg.hide_projects);
+        assert!(!cfg.hide_worktrees);
+        assert_eq!(cfg.value_label(SettingKind::HideProjects), "shown");
+        assert_eq!(cfg.value_label(SettingKind::HideWorktrees), "shown");
+
+        let (projects_tab, projects_row) = locate(SettingKind::HideProjects).unwrap();
+        cfg.cycle(projects_tab, projects_row, 0);
+        let (worktrees_tab, worktrees_row) = locate(SettingKind::HideWorktrees).unwrap();
+        cfg.cycle(worktrees_tab, worktrees_row, 0);
+        assert!(cfg.hide_projects);
+        assert!(cfg.hide_worktrees);
+        assert_eq!(cfg.value_label(SettingKind::HideProjects), "hidden");
+        assert_eq!(cfg.value_label(SettingKind::HideWorktrees), "hidden");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let loaded = load_from(&path);
+        assert!(loaded.hide_projects);
+        assert!(loaded.hide_worktrees);
+
+        // A CONFIG.JSON predating these keys keeps both panels shown.
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.hide_projects);
+        assert!(!legacy.hide_worktrees);
     }
 
     #[test]
