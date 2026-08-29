@@ -14,3 +14,5 @@ all the other terminals open, including memory usage for individual and overall.
 **Gotchas:**
 - **Pinned sessions are never reaped**, and reaping is switchable off entirely. That constraint came from
   the user realizing mid-feature that agents may be running long jobs — treat it as load-bearing.
+  *(Superseded 2026-08-28: PIN was removed outright, and its reap exemption with it; the off switch is the
+  remaining protection — see `2026-08-28-pin-and-the-recent-group-are-gone-one-flat-list-in-recency`.)*

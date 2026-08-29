@@ -12,7 +12,7 @@ trigger* — between OVERVIEW and TECHNICAL OVERVIEW, present iff the user must 
 is complete (run a command, flip a setting, restart, decide, approve); numbered imperative steps, exact
 commands in code blocks; optional follow-up offers do not count.
 
-**Did:** New `.claude/skills/output-doctor/SKILL.md` (user-invocable): three fixed headers, four `=` each
+**Did:** (Later on 2026-08-28 the skill gained an always-present last section, `==== NEXT STEPS ====` — see `2026-08-28-the-release-skill-writes-benefit-grouped-release-notes-outp.md`.) New `.claude/skills/output-doctor/SKILL.md` (user-invocable): three fixed headers, four `=` each
 side, in order — `YOU ASKED` (the `prompt-daddy` pick verbatim, only the pick; the original/Other/as-typed
 prompt when there was none), `OVERVIEW` (plain sentences, no paths or symbols, TERMS in caps, the test
 gate and anything left out stated here), `TECHNICAL OVERVIEW` (bullets per overview item, `file:line`

@@ -140,23 +140,57 @@ otherwise cut the next patch version.
 ## 7. Replace the release notes
 
 The workflow publishes with `generate_release_notes: true`, which produces a bare commit list. That is
-not a changelog. Overwrite it:
+not a changelog. Overwrite it with RELEASE NOTES in the shape below — settled on 2026-08-28, when the
+user picked this merge out of five variations of the v0.16.0 notes:
 
-```bash
-gh release edit v0.3.0 --notes "$(cat <<'EOF'
-## What's new
+- **A one-line opener.** `**Nebula vX.Y.Z is out.**` then the release in half a sentence, naming the
+  headline items in the order the groups below use.
+- **Benefit groups, not "Features" / "Fixes".** `###` headers, one emoji each, named for what the user
+  gets. Reuse these when they fit and coin one when they do not: `🚀 Launch faster`,
+  `🔔 Know when it's done`, `🧭 Lists that look after themselves`, `🫥 Shape the screen`,
+  `🔌 Reach it from anywhere`. Two or three bullets per group; a group with one bullet merges into its
+  neighbour.
+- **Fixes file under the feature they belong to.** A fix is a bullet in the group whose promise it
+  keeps — "No more early green" sits beside the done sound under *Know when it's done* — with the
+  cause in one clause ("Claude Code 2.1 runs the Agent tool in the background, and its idle
+  notification was read as 'turn over'") and the new behaviour in the next.
+- **Tight bullets with a bold lead-in.** Each bullet opens with a bold two-to-five-word hook, then in
+  two or three sentences, written for someone who has not read the diff: the key or command, the
+  setting path in the `Settings › Sessions › done_sound` form, what happens, and where it lives
+  (`agent_presets.json` beside `config.json`). Keys and identifiers in backticks; the emoji stays on
+  the header, never on the bullet. Credit contributors inline: `Thanks @handle (#NN).`
+- **`### ⚠️ Heads up`** for what the user must do to upgrade — the PROTOCOL VERSION bump and
+  `nebula kill` — as one line. Omit the group when nothing needs them.
+- **The install line last**, in a fenced block.
 
-**Open the repo on its git host — `Shift+G`.** …one short paragraph per feature, written for someone
-who has not read the diff: what the key does, where it shows up, what it does when it can't.
+Every fact comes from the diff and the MEMORY LOG entries of the tasks being released; do not add a
+claim the code does not make. The v0.16.0 notes, condensed to two groups, as the template:
 
-## Fixes
+````bash
+gh release edit v0.16.0 --notes "$(cat <<'EOF'
+**Nebula v0.16.0 is out.** Presets, a done sound, self-sorting lists, hideable panels, and a fix for sessions that went green too soon.
 
-- …
+### 🚀 Launch faster
+- **Agent presets** (`e` in the Sessions column). Save a name, harness, model, effort, and optional prefix/postfix once; `a` adds, `e` / `d` edit or delete. `Enter` takes the task in the wrapped editor and launches the CLI with *prefix + task + postfix* as its first prompt, so the agent is already working when the pane opens. Stored in `agent_presets.json` beside `config.json`.
+- **Disable the CLIs you don't use.** Agents tab: `claude_enabled` / `codex_enabled` / `cursor_enabled` (at least one stays on). Disabled CLIs vanish from the new-session menu, PR launch and context menu.
 
-**Full install:** `curl -fsSL https://raw.githubusercontent.com/AgentSystemLabs/nebula/main/install.sh | sh`
+### 🔔 Know when it's done
+- **A done sound.** A ding when a turn finishes. Settings › Sessions › `done_sound`: a macOS system sound like Glass (default), `bell`, or `off`. Always the bell over `nebula ssh` and off macOS.
+- **No more early green.** Claude Code 2.1 runs the Agent tool in the background, and its idle notification was read as "turn over". Sessions now stay RUNNING while subagents are tracked, with a 30-minute quiet grace so a killed worker can't wedge the row.
+
+### ⚠️ Heads up
+Protocol version is now **32** — run `nebula kill` on an older daemon before the new TUI attaches.
+
+```
+curl -fsSL https://raw.githubusercontent.com/AgentSystemLabs/nebula/main/install.sh | sh
+```
 EOF
 )"
-```
+````
+
+Keep the `'EOF'` quoted so zsh does not command-substitute the backticks in the notes (the GUARD HOOK
+catches this only for `git commit -m`, not for `gh`), or write the notes to a file and pass
+`--notes-file` — the safer form when the notes run long.
 
 Writing to the API needs an account with write access to `AgentSystemLabs/nebula`. Check first:
 

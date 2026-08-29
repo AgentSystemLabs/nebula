@@ -1,19 +1,20 @@
 ---
 name: output-doctor
-description: "Shape every reply to the user into one fixed layout — ==== YOU ASKED ==== (the refined prompt prompt-daddy logged, verbatim), ==== OVERVIEW ==== (what happened, a few plain sentences), ==== ACTION REQUIRED ==== (present if and only if the user must do something before the work is complete: numbered steps, exact commands), ==== TECHNICAL OVERVIEW ==== (the details, kept short) — so a reply can be read top-down and stopped at any line. Use before writing the reply that answers or closes any request: features, bug fixes, questions, refactors, releases, recommendations. Also use when the user says \"output doctor\", \"format this\", \"use the output format\", or \"rewrite this in the format\"."
+description: "Shape every reply to the user into one fixed layout — ==== YOU ASKED ==== (the refined prompt prompt-daddy logged, verbatim), ==== OVERVIEW ==== (what happened, a few plain sentences), ==== ACTION REQUIRED ==== (present if and only if the user must do something before the work is complete: numbered steps, exact commands), ==== TECHNICAL OVERVIEW ==== (the details, kept short), ==== NEXT STEPS ==== (always present, always last: what is left for the user to do — commit, PR, a question, a command, a decision, or nothing) — so a reply can be read top-down and stopped at any line. Use before writing the reply that answers or closes any request: features, bug fixes, questions, refactors, releases, recommendations. Also use when the user says \"output doctor\", \"format this\", \"use the output format\", or \"rewrite this in the format\"."
 user-invocable: true
 ---
 
 The reply is the part of the task the user actually reads. Everything else — the grep, the build, the
 test run — is scaffolding they see a few lines of. A reply that opens with a file path, or with a
 paragraph that mixes the headline with the mechanism, makes the user do the sorting. This skill puts
-the sorting on you: what they asked, what happened, what they must do (only when they must), then
-how — in that order, under fixed headers, so they can stop reading the moment they have what they need.
+the sorting on you: what they asked, what happened, what they must do (only when they must), how, then
+what is left for them — in that order, under fixed headers, so they can stop reading the moment they
+have what they need.
 
 ## When to run it
 
 Right before you write the reply that answers or closes a request — after the work is done, after
-`nebula-memory` and `project-terms` have run (their one-line results fold into the last section). Every
+`nebula-memory` and `project-terms` have run (their one-line results fold into the technical section). Every
 kind of request: a feature, a bug fix, a question, a refactor, a release, a recommendation, a diagnosis
 that changed nothing.
 
@@ -29,9 +30,9 @@ When in doubt, use the format. A reply that is short is fine; a reply that is sh
 
 ## The format
 
-Three sections, these exact headers, this order, nothing before the first and nothing after the last —
-plus a fourth, `ACTION REQUIRED`, between `OVERVIEW` and `TECHNICAL OVERVIEW`, that is present **if and
-only if** the reply needs the user to do something:
+Four sections, these exact headers, this order, nothing before the first and nothing after the last —
+plus a fifth, `ACTION REQUIRED`, between `OVERVIEW` and `TECHNICAL OVERVIEW`, that is present **if and
+only if** the reply needs the user to do something. `NEXT STEPS` is always present and always last:
 
 ```
 ==== YOU ASKED ====
@@ -45,16 +46,22 @@ only if** the reply needs the user to do something:
 
 ==== TECHNICAL OVERVIEW ====
 <the details, simplified>
+
+==== NEXT STEPS ====
+<what is left for the user: commit, PR, a question, a command, a decision — or "Nothing — this is done.">
 ```
 
 Four `=` on each side of every header. Blank line under each header. No title above `YOU ASKED`, no
-sign-off below the technical section — an offer of follow-up work goes in the last line of the
-technical section if it goes anywhere, never under `ACTION REQUIRED`.
+sign-off below `NEXT STEPS` — it is the last section, and nothing follows it. An offer of follow-up
+work goes in the last line of the technical section if it goes anywhere, never under `ACTION REQUIRED`
+and never under `NEXT STEPS`.
 
 **The short form, for a pure question that changed nothing** (an explanation, an assessment, "what does
 X do" — the prompts PROMPT DADDY skips): `YOU ASKED` quotes the prompt as typed, `OVERVIEW` carries the
-whole answer, and `TECHNICAL OVERVIEW` appears only when there are details beyond the answer worth a
-`file:line`. Two sections is a complete reply; do not pad a question into three.
+whole answer, `TECHNICAL OVERVIEW` appears only when there are details beyond the answer worth a
+`file:line`, and `NEXT STEPS` is still present — usually the single line "Nothing — this is done.",
+unless the answer left the user a decision to make or a question to answer. Three sections is a
+complete reply; do not pad a question into four.
 
 ### `==== YOU ASKED ====`
 
@@ -82,7 +89,8 @@ line stretched to a short paragraph or a numbered list of at most five items. Ru
 - if nothing changed (a question, a diagnosis, a recommendation), open with that: "No code changed."
 
 A reader who stops after this section should know the outcome and *whether* anything still needs them;
-*what* they must do is the next section, which exists only when the answer is yes.
+*what* they must do before the work is complete is the next section, which exists only when the answer
+is yes, and what is left for them once it is complete is the last section, `NEXT STEPS`.
 
 ### `==== ACTION REQUIRED ====`
 
@@ -128,6 +136,38 @@ more, and a reply they have to scroll is a reply they skim. Rules:
 - the one-line results of `nebula-memory` and `project-terms` ("logged the entry", "aliased 'top nav' to
   WORKSPACES BAR, promoted nothing") close the section, and an offer of follow-up work is the last line
 
+### `==== NEXT STEPS ====`
+
+Always present, always last. `ACTION REQUIRED` is a gate — what the work cannot finish without; this is
+the hand-off — where the user stands now that the reply is done, and what, if anything, is theirs to do
+next. A reader who jumps to the bottom of the reply should find that here, and nothing else.
+
+Counts, and so is an item:
+
+- a git hand-off: "Good to commit — `git add -A && git commit`", "Ready for a PR from branch X",
+  "Nothing to commit"
+- a question the user still owes an answer to — restated, not pointed at
+- a command to run, in the `! <command>` form when its output should land in the session
+- a decision the user must make — the options in one line
+- a verification only they can do — a manual test in their terminal, a look at a screenshot, a review
+  before a merge
+- when there is genuinely nothing left, the single line "Nothing — this is done." — that line alone,
+  never an empty section and never a header without a body
+
+Does not count, and so is not an item:
+
+- an offer of optional follow-up work ("I can also…") — the last line of the technical section, as
+  today; never pad this section with offers
+- a step you could still take yourself — take it, then reply
+- a restatement of what changed, or a gotcha they only need to *know* — the overview and the technical
+  section already carry those
+
+Shape: a single line, or a numbered list of one to four items in the order to do them, in the user's
+terms — the TERMS from `TERMS.md`, not file paths. When `ACTION REQUIRED` is present, do not repeat its
+commands here: the first item points at it in one line ("Do the ACTION REQUIRED restart above, then …")
+and the rest is what comes after it. No prose above the list, no sign-off below it — this is the end of
+the reply.
+
 ## Worked example
 
 From the recommendation that produced this skill (2026-08-28), condensed:
@@ -159,6 +199,9 @@ Cutting all three removes roughly 3,500 lines, one external dependency, and need
 - *Dependents:* the multiline prompt editor has only cloud callers — keep or drop.
 
 **2. …**
+
+==== NEXT STEPS ====
+1. Decide which of the three to cut first; say the name and I'll start with it.
 ```
 
 The original reply had the same content in prose that opened with a heading and a rationale paragraph;
@@ -185,7 +228,12 @@ screen until it is restarted — and that restart is yours to run.
 
 ==== TECHNICAL OVERVIEW ====
 …
+
+==== NEXT STEPS ====
+1. Do the ACTION REQUIRED restart above.
+2. Good to commit once a Cursor session shows FINISHED in the SESSIONS PANEL.
 ````
 
 Had MAKE INSTALL been the only step left, the reply would have run it and carried no `ACTION REQUIRED`
-at all — the section is for what the user must do, not for what you could still do.
+at all — the section is for what the user must do, not for what you could still do — and `NEXT STEPS`
+would have opened with the commit hand-off instead of pointing at a restart.

@@ -137,15 +137,18 @@ after `nebula-memory` and `project-terms` have run, and before you write a word 
 Skill(skill: "output-doctor")
 ```
 
-It fixes the reply's shape to three sections in this order: `==== YOU ASKED ====` (the refined prompt
+It fixes the reply's shape to four sections in this order: `==== YOU ASKED ====` (the refined prompt
 `prompt-daddy` logged, verbatim — only the rewrite), `==== OVERVIEW ====` (what happened, in a few
-plain sentences a reader can stop after), and `==== TECHNICAL OVERVIEW ====` (the details, kept short
-enough that the user asks for more rather than skims) — plus `==== ACTION REQUIRED ====` between the
-overview and the technical section, present if and only if the user must do something before the work
-is complete (run a command, flip a setting, restart, decide, approve): numbered imperative steps with
-the exact command. Use it on every kind of reply — a feature, a bug fix, a question, a recommendation,
-a release. A pure question that changed nothing takes the short form: `YOU ASKED` (the prompt as typed)
-and `OVERVIEW` (the answer), with `TECHNICAL OVERVIEW` only when there are details beyond the answer.
+plain sentences a reader can stop after), `==== TECHNICAL OVERVIEW ====` (the details, kept short
+enough that the user asks for more rather than skims), and `==== NEXT STEPS ====`, always present and
+always last (what is left for the user: commit, PR, a question, a command, a decision, or nothing) —
+plus `==== ACTION REQUIRED ====` between the overview and the technical section, present if and only
+if the user must do something before the work is complete (run a command, flip a setting, restart,
+decide, approve): numbered imperative steps with the exact command. Use it on every kind of reply — a
+feature, a bug fix, a question, a recommendation, a release. A pure question that changed nothing takes
+the short form: `YOU ASKED` (the prompt as typed) and `OVERVIEW` (the answer), with `TECHNICAL
+OVERVIEW` only when there are details beyond the answer and `NEXT STEPS` still present — usually
+"Nothing — this is done.".
 The only text outside it is the one-line "about to" preamble, mid-task progress notes, and
 `AskUserQuestion` prompts; the skill lists those exceptions.
 
