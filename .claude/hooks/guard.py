@@ -28,8 +28,17 @@ CARGO_INSTALL_PATH = re.compile(r"\bcargo\s+install\b[^|;&\n]*--path\b")
 INSTALLED_BIN = r"(?:~|\$HOME|/Users/[\w.-]+)/\.cargo/bin/nebula(?=\s|$|['\"])"
 COPY_OVER_INSTALLED_BIN = re.compile(r"\b(?:cp|install)\b[^|;&\n]*" + INSTALLED_BIN)
 REDIRECT_OVER_INSTALLED_BIN = re.compile(r">\s*" + INSTALLED_BIN)
+# `for f in $(…)` — zsh does not word-split an unquoted expansion, so the loop runs once over one giant "filename".
+FOR_IN_COMMAND_SUBSTITUTION = re.compile(r"\bfor\s+\w+\s+in\s+\$\(")
 
 RULES = [
+    (
+        "for-in-unquoted-command-substitution",
+        lambda cmd: FOR_IN_COMMAND_SUBSTITUTION.search(cmd) is not None,
+        "Blocked: the harness shell is zsh, which does not word-split an unquoted `$(…)`, so `for f in $(git diff "
+        "--name-only)` runs once with every path glued into one filename and silently copies or checks nothing "
+        "(MEMORY gotcha 2026-08-26, re-hit 2026-08-28). Pipe instead: `… | while IFS= read -r f; do …; done`.",
+    ),
     (
         "backticks-in-commit-message",
         lambda cmd: COMMIT_MSG_WITH_BACKTICK.search(cmd) is not None,
