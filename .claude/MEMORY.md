@@ -17,6 +17,7 @@ Line shape: `- DATE · [Title](memory/entries/DATE-slug.md) · TERMS: A; B · fi
 
 ## Index
 
+- 2026-08-28 · [Released v0.16.0: A Single-Layer Diff 3-Way Applied Over PR #20's Merge](memory/entries/2026-08-28-released-v0-16-0-single-layer-diff-3-way-applied-over-pr-20.md) · TERMS: RELEASE SKILL; RELEASE WORKTREE; SHARED CHECKOUT; PANEL WALK; PROTOCOL VERSION; MEMORY LOG · files: focus_walk.rs; event_loop.rs; config.rs; MEMORY.md · gotchas: 7
 - 2026-08-28 · [Independent PROJECTS PANEL And WORKTREES PANEL Visibility](memory/entries/2026-08-28-independent-projects-panel-and-worktrees-panel-visibility.md) · TERMS: PROJECTS PANEL; WORKTREES PANEL; PANEL WALK; FOOTER; SETTINGS OVERLAY; SELF-IMPROVING LOOP · files: config.rs; keymap.rs; app.rs; ui.rs · gotchas: 3
 - 2026-08-28 · [The MEMORY LOG Split Into Index, Standing Gotchas And Entries](memory/entries/2026-08-28-the-memory-log-split-into-index-standing-gotchas-and-entries.md) · TERMS: MEMORY LOG; NEBULA-MEMORY SKILL; PROMPT DADDY; OUTPUT DOCTOR; PROJECT TERMS; MAKE CI · files: settings.json; recall.py; guard.py; check.py · gotchas: 6
 - 2026-08-28 · [AGENT PRESETS: `e` Lists Saved Launch Definitions And Starts A SESSION With Prefix + Task + Postfix](memory/entries/2026-08-28-agent-presets-launch-a-session-with-a-composed-first-prompt.md) · TERMS: AGENT; PROTOCOL VERSION; FOOTER; CLOUD TASK EDITOR; RELOCATION PROMPT; SESSIONS PANEL · files: registry.rs; agent_presets.rs; preset_overlays.rs; event_loop.rs · gotchas: 8
