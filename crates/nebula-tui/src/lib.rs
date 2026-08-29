@@ -69,6 +69,13 @@ pub fn run_worktree(name: String, base: Option<String>) -> Result<()> {
     runtime()?.block_on(ipc::enter_worktree_for_current_agent(&name, base))
 }
 
+/// `nebula spawn "<task>" [--kind <kind>]` — start a new agent session
+/// beside the current one (see `ipc::spawn_sibling_for_current_agent`).
+/// `kind` is the CLI's `--kind`, already parsed where the flag is.
+pub fn run_spawn(task: String, kind: Option<nebula_core::AgentKind>) -> Result<()> {
+    runtime()?.block_on(ipc::spawn_sibling_for_current_agent(&task, kind))
+}
+
 /// `nebula add <dir>` / bare `nebula <dir>` — register a directory as a
 /// project (see `ipc::add_project`).
 pub fn run_add_project(path: String) -> Result<()> {

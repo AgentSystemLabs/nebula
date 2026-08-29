@@ -322,15 +322,10 @@ async fn main_loop(
             next_draw = tokio::time::Instant::now() + FRAME_INTERVAL;
             sync_pty_size(&mut app, &mut out);
             sync_vim_size(&mut app);
-            // What the user sees selected, for RECENT-expiry re-anchoring.
-            app.drawn_session = app.selected_session_row().and_then(|r| r.sref());
         }
 
-        // Wake when the next RECENT session ages out so the list regroups
-        // (slack so the wakeup lands past the boundary).
-        let recent_expiry = app.next_recent_expiry();
-
         let focus_before = app.focus;
+        let preview_before = app.previewed_pr().map(|pr| pr.url);
         tokio::select! {
             // Pending redraw: wake at the frame boundary even if no new
             // events arrive.
@@ -380,24 +375,6 @@ async fn main_loop(
                     app.dirty = true;
                 }
                 next_ago_refresh = tokio::time::Instant::now() + AGO_REFRESH;
-            }
-            _ = tokio::time::sleep(recent_expiry.unwrap_or_default() + Duration::from_millis(250)),
-                if recent_expiry.is_some() =>
-            {
-                // Re-read the config so window edits apply without restart.
-                app.recent_window_ms = crate::config::Config::load().recent_window_ms();
-                // The expired session dropped down the list; keep the
-                // selection on whatever row the user had selected.
-                if let Some(keep) = app.drawn_session.clone() {
-                    if let Some(i) = app
-                        .visible_session_rows()
-                        .iter()
-                        .position(|r| r.sref().as_ref() == Some(&keep))
-                    {
-                        app.sel_session = i;
-                    }
-                }
-                app.dirty = true;
             }
             // The selection rested past the debounce: tell the daemon what
             // the pane has been showing since the cursor landed here.
@@ -507,6 +484,7 @@ async fn main_loop(
         while let Ok(ev) = vim_rx.try_recv() {
             handle_vim_event(&mut app, ev);
         }
+        note_preview_change(&mut app, preview_before);
 
         // Mouse handlers only record the pointer shape they want; emit the
         // OSC 22 request when it changes. Terminals without pointer-shape
@@ -794,20 +772,25 @@ fn drop_retired_pr(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
     app.dirty = true;
 }
 
-/// Arm (or disarm) the debounced fetch of the pull request under the
-/// Worktrees cursor. Called wherever that cursor moves. A PR already
-/// fetched, already in flight, or already known to be unanswerable arms
-/// nothing — the pane has something to show either way, and re-asking would
-/// spend an API call on a row the user is only passing through.
+/// Arm (or disarm) the debounced fetch of the pull request the pane is
+/// reading (`App::previewed_pr`) — the Worktrees cursor's open-PR row or the
+/// Sessions cursor's PR ROW. Called wherever the Worktrees cursor moves, and
+/// from `note_preview_change` whenever the previewed URL changes for any
+/// other reason. A PR already fetched, already in flight, or already known
+/// to be unanswerable arms nothing — the pane has something to show either
+/// way, and re-asking would spend an API call on a row the user is only
+/// passing through.
 fn schedule_pr_detail(app: &mut App) {
-    let pending = app.selected_worktree_pr().and_then(|pr| {
-        let url = pr.url.clone();
+    let pending = app.previewed_pr().and_then(|pr| {
+        let url = pr.url;
         if app.pr_detail.contains_key(&url)
             || app.pr_detail_inflight.contains(&url)
             || app.pr_detail_failed.contains(&url)
         {
             return None;
         }
+        // Either row lives in the selected project's repo; `gh pr view`
+        // resolves the number from any checkout of it.
         let dir = app.selected_project().map(|p| p.repo_path.clone())?;
         Some(crate::app::PendingPrDetail {
             url,
@@ -819,6 +802,19 @@ fn schedule_pr_detail(app: &mut App) {
     // something else now.
     app.pr_preview_scroll = 0;
     app.pending_pr_detail = pending.map(|p| (p, std::time::Instant::now() + PR_DETAIL_DEBOUNCE));
+}
+
+/// The one place "the pane is reading something else now" is noticed: the
+/// loop takes `previewed_pr()`'s URL before handling an event and hands it
+/// back here after. A different URL — the Sessions cursor stepped onto or
+/// off the PR ROW, focus left the Sessions panel for the pane, a refresh
+/// retired the row — re-arms the detail fetch and rewinds the scroll; the
+/// same URL leaves a reader exactly where they were. Keyed on URL, not the
+/// whole row, so a re-titled PR arriving on the GIT POLL is not a change.
+fn note_preview_change(app: &mut App, before: Option<String>) {
+    if app.previewed_pr().map(|pr| pr.url) != before {
+        schedule_pr_detail(app);
+    }
 }
 
 /// Fire the debounced fetch. Disarms first, so a `gh` that never answers
@@ -848,7 +844,7 @@ fn lookup_pr_detail(
 /// every file at once, which is why this view carries its diffs with it
 /// instead of shelling out per file the way the worktree view does.
 fn request_pr_diff(app: &mut App) {
-    let Some((number, title)) = app.selected_worktree_pr().map(|pr| (pr.number, pr.label())) else {
+    let Some((number, title)) = app.previewed_pr().map(|pr| (pr.number, pr.label)) else {
         return;
     };
     if app.pr_diff_inflight == Some(number) {
@@ -1366,8 +1362,9 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
 
     // Reading a pull request in the pane: the diff modal's scroll keys work
     // here too. Page/Home/End only — shift+↑/↓ already move a project, and
-    // ↑/↓ have to keep walking the PR list itself.
-    if app.selected_worktree_pr().is_some() && app.focus == Focus::Worktrees {
+    // ↑/↓ have to keep walking the PR list itself. From either list that
+    // can rest on one; a focused pane keeps its keys for the PTY.
+    if app.previewed_pr().is_some() && matches!(app.focus, Focus::Worktrees | Focus::Sessions) {
         let page = app.term_area.height.max(1);
         let max = app.pr_preview_max_scroll();
         let scrolled = match key.code {
@@ -1602,41 +1599,6 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 }
             }
         }
-        Action::Pin => match app.focus {
-            Focus::Sessions => {
-                if let Some(SessionRow::Terminal(_)) = app.selected_session_row() {
-                    app.flash = Some("terminals can't be pinned".into());
-                } else if let Some(SessionRow::Link(_)) = app.selected_session_row() {
-                    app.flash = Some("links can't be pinned".into());
-                } else if let Some(a) = app.selected_session() {
-                    if a.archived {
-                        app.flash = Some(AGENT_ARCHIVED.into());
-                    } else {
-                        // Keep the selection on this agent after it jumps
-                        // between the PINNED/UNPINNED groups.
-                        app.select_when_seen = Some(SessionRef::Agent(a.id.clone()));
-                        send(app, out, |req_id| ClientRequest::SetAgentPinned {
-                            req_id,
-                            id: a.id,
-                            pinned: !a.pinned,
-                        });
-                    }
-                }
-            }
-            Focus::Worktrees => {
-                // Selection follow across the regroup happens on the upsert
-                // (the handler re-finds the selected worktree by id).
-                if let Some(w) = app.selected_worktree() {
-                    let (id, pinned) = (w.id.clone(), !w.pinned);
-                    send(app, out, |req_id| ClientRequest::SetWorktreePinned {
-                        req_id,
-                        id,
-                        pinned,
-                    });
-                }
-            }
-            _ => {}
-        },
         Action::Unarchive => {
             if app.focus == Focus::Sessions {
                 if let Some(a) = app.selected_session() {
@@ -1679,9 +1641,10 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // lists the casualties).
         Action::DeleteAll => open_delete_all_confirm(app),
         Action::ContextMenu => open_context_menu_for_selection(app),
-        // On an open-PR row `g` reads that pull request's diff off GitHub
-        // instead of the checkout's — same modal, different source.
-        Action::GitDiff if app.selected_worktree_pr().is_some() => request_pr_diff(app),
+        // On an open-PR row (either list) `g` reads that pull request's
+        // diff off GitHub instead of the checkout's — same modal, different
+        // source.
+        Action::GitDiff if app.previewed_pr().is_some() => request_pr_diff(app),
         Action::GitDiff => open_diff_view(app),
         Action::OpenRepo => open_repo_in_browser(app),
         // AddProject adds a project from ANY panel — unlike New it never
@@ -2470,13 +2433,17 @@ fn open_delete_all_confirm(app: &mut App) {
     }
 }
 
-/// Row menu for a link: open it, and — unless it's the pull request nebula
-/// found in git — edit or delete it.
+/// Row menu for a link: open it, read its diff when it is a pull request,
+/// and — unless it's the pull request nebula found in git — edit or delete
+/// it.
 fn menu_items_for_link(row: &LinkRow) -> Vec<MenuItem> {
     let mut items = vec![MenuItem::new(
         "Open in browser",
         MenuAction::OpenLink(row.url().to_string()),
     )];
+    if row.pull_request().is_some() {
+        items.push(MenuItem::new("View diff", MenuAction::ViewPrDiff));
+    }
     if let Some(id) = row.id() {
         items.push(MenuItem::new("Edit URL", MenuAction::EditLink(id.clone())));
         items.push(MenuItem::destructive(
@@ -2500,10 +2467,6 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
                 MenuAction::Attach(SessionRef::Agent(a.id.clone())),
             ),
             MenuItem::new("Restart", MenuAction::RestartAgent(a.id.clone())),
-            MenuItem::new(
-                if a.pinned { "Unpin" } else { "Pin" },
-                MenuAction::SetAgentPinned(a.id.clone(), !a.pinned),
-            ),
             MenuItem::new("Rename", MenuAction::RenameAgent(a.id.clone())),
             MenuItem::new("Archive", MenuAction::ArchiveAgent(a.id.clone())),
             MenuItem::destructive("Delete", MenuAction::DeleteAgent(a.id.clone())),
@@ -3004,10 +2967,6 @@ fn open_context_menu_for_selection(app: &mut App) {
                 let mut items = vec![
                     MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
                     MenuItem::new("New terminal", MenuAction::NewTerminal(w.id.clone())),
-                    MenuItem::new(
-                        if w.pinned { "Unpin" } else { "Pin" },
-                        MenuAction::SetWorktreePinned(w.id.clone(), !w.pinned),
-                    ),
                 ];
                 if !w.is_main {
                     items.push(MenuItem::destructive(
@@ -3861,7 +3820,6 @@ fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i32) {
 /// the settings overlay so a new setting can't reach one and miss the
 /// other — the overlay is a live editor, not a restart-to-apply screen.
 fn apply_config(app: &mut App, cfg: &crate::config::Config) {
-    app.recent_window_ms = cfg.recent_window_ms();
     app.theme = cfg.theme();
     app.animations = cfg.animations;
     app.focus_tint = cfg.focus_tint;
@@ -4336,14 +4294,6 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 id,
             });
         }
-        MenuAction::SetAgentPinned(id, pinned) => {
-            app.select_when_seen = Some(SessionRef::Agent(id.clone()));
-            send(app, out, |req_id| ClientRequest::SetAgentPinned {
-                req_id,
-                id,
-                pinned,
-            });
-        }
         MenuAction::DeleteAgent(id) => {
             if let Some(a) = app.tree.agents.iter().find(|a| a.id == id).cloned() {
                 app.overlay = Some(Overlay::Confirm(confirm_delete_agent(&a.name, id)));
@@ -4446,13 +4396,6 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             {
                 delete_link(app, &row);
             }
-        }
-        MenuAction::SetWorktreePinned(id, pinned) => {
-            send(app, out, |req_id| ClientRequest::SetWorktreePinned {
-                req_id,
-                id,
-                pinned,
-            });
         }
         MenuAction::DeleteWorktree(id) => {
             if let Some(w) = app.tree.worktrees.iter().find(|w| w.id == id).cloned() {
@@ -6392,7 +6335,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     app.sessions_scroll.saturating_add(SESSIONS_WHEEL_STEP)
                 };
                 app.dirty = true;
-            } else if in_term && app.selected_worktree_pr().is_some() {
+            } else if in_term && app.previewed_pr().is_some() {
                 // The pane is showing a pull request, not a session: the
                 // wheel reads it rather than reaching the PTY underneath.
                 let max = app.pr_preview_max_scroll();
@@ -6655,9 +6598,9 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             changed_at,
             unseen,
         } => {
-            // A status flip can pull the agent into the RECENT group and
-            // reorder the sessions list — and, since worktrees and projects
-            // sort on their sessions' stamps, re-sort those columns too.
+            // A status flip reorders the sessions list — and, since
+            // worktrees and projects sort on their sessions' stamps,
+            // re-sorts those columns too.
             // Every cursor stays on the row it was on.
             let before = selection_snapshot(app);
             if let Some(a) = app.tree.agents.iter_mut().find(|a| a.id == agent) {
@@ -6745,8 +6688,8 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         ServerEvent::EntityUpserted { entity } => {
             let before = selection_snapshot(app);
             apply_upsert(app, entity);
-            // Cursors follow the row they were on across regroups (pin
-            // toggles, re-homes); a row that left its list (archived away,
+            // Cursors follow the row they were on across re-sorts and
+            // re-homes; a row that left its list (archived away,
             // moved elsewhere) hands the cursor — and the terminal pane —
             // to its neighbor.
             reconcile_selection(app, before, out);
@@ -7105,7 +7048,6 @@ mod tests {
                     status,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
@@ -7414,7 +7356,6 @@ mod tests {
                     path: "/tmp/demo".into(),
                     branch: "main".into(),
                     is_main: true,
-                    pinned: false,
                     sort_order: 0,
                 }),
             },
@@ -7429,7 +7370,6 @@ mod tests {
                     status: AgentStatus::Fresh,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
@@ -8934,6 +8874,155 @@ mod tests {
         assert!(text.contains("couldn't read this pull request"), "{text}");
     }
 
+    /// Seed the Sessions panel's PR ROW: the pull request `gh` found on the
+    /// seeded worktree's branch.
+    fn seed_branch_pr(app: &mut App, number: u64, title: &str) {
+        app.pull_requests.insert(
+            nebula_core::WorktreeId("w1".into()),
+            Some(crate::pull_request::PullRequest {
+                number,
+                url: format!("https://github.com/o/r/pull/{number}"),
+                title: title.into(),
+                state: "OPEN".into(),
+                is_draft: false,
+                activity: Vec::new(),
+            }),
+        );
+    }
+
+    fn sessions_pr_row(app: &App) -> usize {
+        app.visible_session_rows()
+            .iter()
+            .position(|r| r.as_link().is_some())
+            .expect("the PR ROW")
+    }
+
+    /// The Sessions panel's PR ROW reads in the pane the same way the
+    /// project-wide open-PR rows do — while that panel has focus. Stepping
+    /// into the pane brings the attached session back: unlike a Worktrees
+    /// PR row, there is still one underneath.
+    #[test]
+    fn the_sessions_panel_pr_row_reads_in_the_pane_too() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_branch_pr(&mut app, 7, "Attach links");
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        app.term = Some(AttachedTerm::new(a1, 40, 10));
+        app.focus = Focus::Sessions;
+        app.sel_session = sessions_pr_row(&app);
+        assert_eq!(app.previewed_pr().map(|pr| pr.number), Some(7));
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("PULL REQUEST"), "pane retitles:\n{text}");
+        assert!(text.contains("reading it…"), "loading state:\n{text}");
+        assert!(text.contains("PgUp/PgDn: scroll"), "footer:\n{text}");
+        assert!(app.term.is_some(), "the session stays attached underneath");
+
+        app.pr_detail.insert(
+            "https://github.com/o/r/pull/7".into(),
+            a_detail(7, "Pins a PR to the worktree.", vec![]),
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("#7 Attach links"), "{text}");
+        assert!(text.contains("Pins a PR to the worktree."), "{text}");
+
+        // Into the pane: the terminal has focus, so the terminal is what
+        // shows — what you type is what you see.
+        app.focus = Focus::Terminal;
+        assert!(app.previewed_pr().is_none());
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("TERMINAL · agent-1"), "{text}");
+        assert!(!text.contains("Pins a PR to the worktree."), "{text}");
+
+        // Back on a session row the pane is a terminal again.
+        app.focus = Focus::Sessions;
+        app.sel_session = 0;
+        assert!(app.previewed_pr().is_none());
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("TERMINAL · agent-1"));
+    }
+
+    /// The loop notices the pane reading something else by URL: landing on
+    /// the Sessions PR ROW arms one debounced fetch, a same-URL turn leaves
+    /// a reader's scroll alone, and leaving it (for the pane here) disarms.
+    #[test]
+    fn stepping_onto_the_sessions_pr_row_arms_the_detail_fetch() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_branch_pr(&mut app, 7, "Attach links");
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+
+        // Walk down from the agent row onto the PR ROW the way the loop
+        // does: the URL before each key, the check after it.
+        let target = sessions_pr_row(&app);
+        assert!(
+            app.pending_pr_detail.is_none(),
+            "a session row arms nothing"
+        );
+        while app.sel_session < target {
+            let before = app.previewed_pr().map(|pr| pr.url);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            note_preview_change(&mut app, before);
+        }
+        let (pending, _) = app.pending_pr_detail.clone().expect("armed on #7");
+        assert_eq!(pending.number, 7);
+        assert_eq!(pending.url, "https://github.com/o/r/pull/7");
+        assert_eq!(pending.dir, std::path::PathBuf::from("/tmp/demo"));
+        assert!(
+            app.pr_detail_delay()
+                .is_some_and(|d| d <= PR_DETAIL_DEBOUNCE),
+            "a delay, not an immediate fetch"
+        );
+
+        // A turn that changes nothing about the row keeps the reader's place.
+        app.pr_preview_scroll = 9;
+        let before = app.previewed_pr().map(|pr| pr.url);
+        note_preview_change(&mut app, before);
+        assert_eq!(app.pr_preview_scroll, 9);
+        assert!(app.pending_pr_detail.is_some(), "still armed");
+
+        // Focus into the pane: a terminal has nothing to fetch.
+        let before = app.previewed_pr().map(|pr| pr.url);
+        app.focus = Focus::Terminal;
+        note_preview_change(&mut app, before);
+        assert!(app.pending_pr_detail.is_none());
+        assert_eq!(app.pr_preview_scroll, 0);
+    }
+
+    /// `g` on the Sessions PR ROW asks GitHub for that pull request's diff
+    /// rather than opening the checkout's, and its row menu offers the same.
+    #[test]
+    fn g_on_the_sessions_pr_row_reads_its_diff() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_branch_pr(&mut app, 7, "Attach links");
+        app.focus = Focus::Sessions;
+        app.sel_session = sessions_pr_row(&app);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.pr_diff_tx = Some(tx);
+        app.pr_diff_inflight = Some(7);
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "not the worktree's diff modal");
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("still fetching the diff for #7…")
+        );
+
+        let items = menu_items_for_link(&app.selected_link().expect("the PR ROW"));
+        assert!(items.iter().any(|i| i.label == "View diff"), "{items:?}");
+        assert!(
+            !items.iter().any(|i| i.label == "Delete"),
+            "still not the user's row: {items:?}"
+        );
+    }
+
     /// PgDn/PgUp/Home/End page the preview, clamped to its real length —
     /// the pane writes the line count back on every draw.
     #[test]
@@ -9203,7 +9292,6 @@ diff --git a/src/b.rs b/src/b.rs
                     path: "/tmp/demo-w2".into(),
                     branch: "feature".into(),
                     is_main: false,
-                    pinned: false,
                     sort_order: 1,
                 }),
             },
@@ -9432,7 +9520,6 @@ diff --git a/src/b.rs b/src/b.rs
                     path: "/tmp/demo-w2".into(),
                     branch: "feature".into(),
                     is_main: false,
-                    pinned: false,
                     sort_order: 1,
                 }),
             },
@@ -9728,10 +9815,6 @@ diff --git a/src/b.rs b/src/b.rs
         assert!(text.contains("line2"), "second line rendered:\n{text}");
         assert!(text.contains("agent-1"), "session row rendered:\n{text}");
         assert!(
-            !text.contains("PINNED"),
-            "no group headers with nothing pinned:\n{text}"
-        );
-        assert!(
             !text.contains("TERMINALS"),
             "terminals section is gone:\n{text}"
         );
@@ -9756,7 +9839,6 @@ diff --git a/src/b.rs b/src/b.rs
                         status: AgentStatus::Fresh,
                         archived: false,
                         archived_at: 0,
-                        pinned: false,
                         unseen: false,
                         kind,
                         model: None,
@@ -9797,177 +9879,16 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(buffer[(badge_x, y)].fg, th.dim, "badge is dim");
     }
 
-    /// Pinning an agent splits the sessions panel into PINNED and UNPINNED
-    /// groups; pinned rows sort first.
+    /// Running / needs-feedback sessions head the list and hold their
+    /// place there however long they have been working — an old status
+    /// timestamp doesn't drop them below a fresher finish.
     #[test]
-    fn pinned_agents_render_in_their_own_group() {
-        use nebula_core::{Agent, AgentStatus, Entity};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(Agent {
-                    id: AgentId("a2".into()),
-                    worktree_id: WorktreeId("w1".into()),
-                    name: "agent-2".into(),
-                    status: AgentStatus::Fresh,
-                    archived: false,
-                    archived_at: 0,
-                    pinned: true,
-                    unseen: false,
-                    kind: nebula_core::AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    session_id: None,
-                    cloud_session_id: None,
-                    sort_order: 1,
-                    status_changed_at: 0,
-                    alive: true,
-                    cloud_mirroring: false,
-                }),
-            },
-        );
-
-        let rows = app.visible_sessions();
-        assert_eq!(rows[0].name, "agent-2", "pinned agent sorts first");
-        assert_eq!(app.session_group_counts(), (1, 0, 1, 0));
-
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(text.contains("PINNED"), "pinned header rendered:\n{text}");
-        assert!(
-            text.contains("UNPINNED"),
-            "unpinned header rendered:\n{text}"
-        );
-    }
-
-    /// `p` on a worktree row asks the daemon to pin it; the upsert splits
-    /// the worktrees panel into PINNED and UNPINNED groups with pinned rows
-    /// first, and the selection follows the row across the regroup.
-    #[test]
-    fn pinned_worktrees_render_in_their_own_group() {
-        use nebula_core::{Entity, Worktree, WorktreeId};
-        let mk_feat = |pinned: bool| ServerEvent::EntityUpserted {
-            entity: Entity::Worktree(Worktree {
-                id: WorktreeId("w2".into()),
-                project_id: nebula_core::ProjectId("p1".into()),
-                path: "/tmp/demo-worktrees/feat".into(),
-                branch: "feat".into(),
-                is_main: false,
-                pinned,
-                sort_order: 0,
-            }),
-        };
-        let mut app = App::new();
-        seed_tree(&mut app); // p1/w1(main) + agent-1
-        hse(&mut app, mk_feat(false));
-
-        app.focus = Focus::Worktrees;
-        app.sel_worktree = 1; // "feat"
-        let mut out = Vec::new();
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
-            &mut out,
-        );
-        assert!(
-            matches!(
-                out.last(),
-                Some(ClientRequest::SetWorktreePinned { id, pinned: true, .. })
-                    if id.as_str() == "w2"
-            ),
-            "p requests the pin: {out:?}"
-        );
-
-        hse(&mut app, mk_feat(true));
-        let rows = app.visible_worktrees();
-        assert_eq!(rows[0].branch, "feat", "pinned worktree sorts first");
-        assert_eq!(app.worktree_group_counts(), (1, 1));
-        assert_eq!(app.sel_worktree, 0, "selection follows the pinned row");
-        assert_eq!(app.focus, Focus::Worktrees, "focus stays on the panel");
-
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(text.contains("PINNED"), "pinned header rendered:\n{text}");
-        assert!(
-            text.contains("UNPINNED"),
-            "unpinned header rendered:\n{text}"
-        );
-    }
-
-    /// Agents whose status changed within the window sort into a RECENT
-    /// group: below PINNED (always), above the remaining unpinned rows.
-    /// Pinned agents stay in PINNED even with a fresh status change, and an
-    /// expired timestamp lands back in UNPINNED.
-    #[test]
-    fn recent_status_changes_group_below_pinned() {
+    fn working_sessions_head_the_list_regardless_of_age() {
         use nebula_core::{Agent, AgentStatus, Entity};
         let mut app = App::new();
         seed_tree(&mut app);
         let now = crate::app::now_ms();
-        let mk = |id: &str, pinned: bool, changed_at: i64, sort: i64| ServerEvent::EntityUpserted {
-            entity: Entity::Agent(Agent {
-                id: AgentId(id.into()),
-                worktree_id: WorktreeId("w1".into()),
-                name: id.into(),
-                status: AgentStatus::Finished,
-                archived: false,
-                archived_at: 0,
-                pinned,
-                unseen: false,
-                kind: nebula_core::AgentKind::Claude,
-                model: None,
-                effort: None,
-                session_id: None,
-                cloud_session_id: None,
-                sort_order: sort,
-                status_changed_at: changed_at,
-                alive: true,
-                cloud_mirroring: false,
-            }),
-        };
-        // Pinned with a fresh change: must stay in PINNED, not RECENT.
-        hse(&mut app, mk("pinned-fresh", true, now, 1));
-        // Unpinned, changed just now: RECENT.
-        hse(&mut app, mk("recent-1", false, now - 1_000, 2));
-        // Unpinned, changed outside the window: plain UNPINNED.
-        let stale = now - app.recent_window_ms - 60_000;
-        hse(&mut app, mk("stale-1", false, stale, 3));
-
-        let rows = app.visible_sessions();
-        let names: Vec<&str> = rows.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["pinned-fresh", "recent-1", "stale-1", "agent-1"],
-            "pinned, then recent, then the rest by last interaction              (stale-1 ran once; agent-1 never has)"
-        );
-        assert_eq!(app.session_group_counts(), (1, 1, 2, 0));
-        assert!(app.next_recent_expiry().is_some());
-
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(text.contains("PINNED"), "pinned header rendered:\n{text}");
-        assert!(text.contains("RECENT"), "recent header rendered:\n{text}");
-        assert!(
-            text.contains("UNPINNED"),
-            "unpinned header rendered:\n{text}"
-        );
-    }
-
-    /// Running / needs-feedback sessions head the RECENT group and hold
-    /// their place there however long they have been working — an old
-    /// status timestamp doesn't drop them back into UNPINNED.
-    #[test]
-    fn working_sessions_head_recent_regardless_of_age() {
-        use nebula_core::{Agent, AgentStatus, Entity};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        let now = crate::app::now_ms();
-        let stale = now - app.recent_window_ms - 60_000;
+        let stale = now - 2 * 3_600_000;
         let mk = |id: &str, status: AgentStatus, changed_at: i64, sort: i64| {
             ServerEvent::EntityUpserted {
                 entity: Entity::Agent(Agent {
@@ -9977,7 +9898,6 @@ diff --git a/src/b.rs b/src/b.rs
                     status,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
@@ -9991,12 +9911,12 @@ diff --git a/src/b.rs b/src/b.rs
                 }),
             }
         };
-        // Finished a moment ago: RECENT on the timestamp alone.
+        // Finished a moment ago: near the top on the timestamp alone.
         hse(
             &mut app,
             mk("just-finished", AgentStatus::Finished, now - 1_000, 1),
         );
-        // Working since before the window opened: still RECENT, and above it.
+        // Working for hours: still above it.
         hse(&mut app, mk("long-running", AgentStatus::Running, stale, 2));
         hse(
             &mut app,
@@ -10008,30 +9928,14 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(
             names,
             vec!["long-running", "long-blocked", "just-finished", "agent-1"],
-            "working sessions top RECENT, then the freshly-changed row, then the rest"
+            "working sessions on top, then the freshly-changed row, then the rest"
         );
-        assert_eq!(app.session_group_counts(), (0, 3, 1, 0));
-
-        // Only the finished row is on the expiry clock; the working ones
-        // would otherwise report a deadline already past and respin the
-        // event loop every 250ms.
-        let expiry = app
-            .next_recent_expiry()
-            .expect("the finished row still ages out");
-        assert!(
-            expiry > Duration::from_secs(60),
-            "expiry tracks the finished row, not the stale working ones: {expiry:?}"
-        );
-
-        // "off" still collapses the group, working sessions included.
-        app.recent_window_ms = 0;
-        assert_eq!(app.session_group_counts(), (0, 0, 4, 0));
-        assert!(app.next_recent_expiry().is_none());
+        assert_eq!(app.session_group_counts(), (4, 0));
     }
 
-    /// Every group is ordered by last interaction, newest first — the
-    /// session you just ran surfaces at the top of its group, and sessions
-    /// that have never run sink to the bottom in tree order.
+    /// The list is ordered by last interaction, newest first — the session
+    /// you just ran surfaces at the top, and sessions that have never run
+    /// sink to the bottom in tree order. No group headers split it.
     #[test]
     fn sessions_order_by_last_interaction() {
         use nebula_core::{Agent, AgentStatus, Entity};
@@ -10039,74 +9943,52 @@ diff --git a/src/b.rs b/src/b.rs
         seed_tree(&mut app); // agent-1: fresh, never run (stamp 0)
         let now = crate::app::now_ms();
         let mins = |n: i64| now - n * 60_000;
-        let mk = |id: &str, pinned: bool, status: AgentStatus, at: i64, sort: i64| {
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(Agent {
-                    id: AgentId(id.into()),
-                    worktree_id: WorktreeId("w1".into()),
-                    name: id.into(),
-                    status,
-                    archived: false,
-                    archived_at: 0,
-                    pinned,
-                    unseen: false,
-                    kind: nebula_core::AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    session_id: None,
-                    cloud_session_id: None,
-                    sort_order: sort,
-                    status_changed_at: at,
-                    alive: true,
-                    cloud_mirroring: false,
-                }),
-            }
+        let mk = |id: &str, status: AgentStatus, at: i64, sort: i64| ServerEvent::EntityUpserted {
+            entity: Entity::Agent(Agent {
+                id: AgentId(id.into()),
+                worktree_id: WorktreeId("w1".into()),
+                name: id.into(),
+                status,
+                archived: false,
+                archived_at: 0,
+                unseen: false,
+                kind: nebula_core::AgentKind::Claude,
+                model: None,
+                effort: None,
+                session_id: None,
+                cloud_session_id: None,
+                sort_order: sort,
+                status_changed_at: at,
+                alive: true,
+                cloud_mirroring: false,
+            }),
         };
-        // Two pinned rows, seeded in the *opposite* order to their stamps.
-        hse(
-            &mut app,
-            mk("pin-old", true, AgentStatus::Finished, mins(20), 1),
-        );
-        hse(
-            &mut app,
-            mk("pin-new", true, AgentStatus::Finished, mins(2), 2),
-        );
-        // RECENT: a long-running turn outranks a more recent finish, because
-        // a working session is interacting with you right now.
-        hse(
-            &mut app,
-            mk("working", false, AgentStatus::Running, mins(25), 3),
-        );
-        hse(
-            &mut app,
-            mk("done-1m", false, AgentStatus::Finished, mins(1), 4),
-        );
-        hse(
-            &mut app,
-            mk("done-10m", false, AgentStatus::Finished, mins(10), 5),
-        );
-        // Past the 30m window: plain unpinned, still newest-first, with the
-        // never-run agent-1 last.
-        hse(
-            &mut app,
-            mk("cold-2h", false, AgentStatus::Finished, mins(120), 6),
-        );
-        hse(
-            &mut app,
-            mk("cold-45m", false, AgentStatus::Finished, mins(45), 7),
-        );
+        // A long-running turn outranks a more recent finish, because a
+        // working session is interacting with you right now. Seeded out of
+        // stamp order on purpose.
+        hse(&mut app, mk("working", AgentStatus::Running, mins(25), 1));
+        hse(&mut app, mk("done-1m", AgentStatus::Finished, mins(1), 2));
+        hse(&mut app, mk("done-10m", AgentStatus::Finished, mins(10), 3));
+        hse(&mut app, mk("cold-2h", AgentStatus::Finished, mins(120), 4));
+        hse(&mut app, mk("cold-45m", AgentStatus::Finished, mins(45), 5));
 
         let rows = app.visible_sessions();
         let names: Vec<&str> = rows.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(
             names,
             vec![
-                "pin-new", "pin-old", // PINNED, newest first
-                "working", "done-1m", "done-10m", // RECENT, working on top
-                "cold-45m", "cold-2h", "agent-1", // the rest, never-run last
+                "working", "done-1m", "done-10m", // working on top, then newest first
+                "cold-45m", "cold-2h", "agent-1", // never-run last
             ],
         );
-        assert_eq!(app.session_group_counts(), (2, 3, 3, 0));
+        assert_eq!(app.session_group_counts(), (6, 0));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        for header in ["PINNED", "RECENT", "UNPINNED"] {
+            assert!(!text.contains(header), "no {header} header:\n{text}");
+        }
 
         // A status flip is an interaction: the coldest row jumps the queue.
         hse(
@@ -10123,12 +10005,10 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(
             names,
             vec![
-                "pin-new", "pin-old", //
                 "working", "cold-2h", "done-1m", "done-10m", //
                 "cold-45m", "agent-1",
             ],
-            "the cold row joined RECENT at the top, behind only the live turn \
-             it ties with"
+            "the cold row jumped to the top, behind only the live turn it ties with"
         );
     }
 
@@ -10150,7 +10030,6 @@ diff --git a/src/b.rs b/src/b.rs
                     status: AgentStatus::Finished,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
@@ -10168,11 +10047,12 @@ diff --git a/src/b.rs b/src/b.rs
         let row_with = |app: &mut App, needle: &str| -> String {
             let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
             terminal.draw(|f| ui::draw(f, app)).unwrap();
+            // From the name onward: the worktree row shares the screen
+            // line and carries its own "23m ago".
             buffer_text(&terminal)
                 .lines()
-                .find(|l| l.contains(needle))
+                .find_map(|l| l.find(needle).map(|i| l[i..].to_string()))
                 .unwrap_or_default()
-                .to_string()
         };
 
         let row = row_with(&mut app, "alpha");
@@ -10197,10 +10077,10 @@ diff --git a/src/b.rs b/src/b.rs
         assert!(!row.contains("ago"), "ago label yields to the name:\n{row}");
     }
 
-    /// A StatusChanged delta stamps the agent's timestamp, pulls it into
-    /// RECENT, and the selection follows the session it was on.
+    /// A StatusChanged delta stamps the agent's timestamp, pulls it to the
+    /// top, and the selection follows the session it was on.
     #[test]
-    fn status_change_regroups_and_selection_follows() {
+    fn status_change_resorts_and_selection_follows() {
         use nebula_core::{Agent, AgentStatus, Entity};
         let mut app = App::new();
         seed_tree(&mut app);
@@ -10214,7 +10094,6 @@ diff --git a/src/b.rs b/src/b.rs
                     status: AgentStatus::Fresh,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
@@ -10241,16 +10120,12 @@ diff --git a/src/b.rs b/src/b.rs
             },
         );
         let rows = app.visible_sessions();
-        assert_eq!(rows[0].name, "agent-2", "recent agent bubbled to the top");
-        assert_eq!(app.session_group_counts(), (0, 1, 1, 0));
+        assert_eq!(
+            rows[0].name, "agent-2",
+            "the stamped agent bubbled to the top"
+        );
+        assert_eq!(app.session_group_counts(), (2, 0));
         assert_eq!(app.sel_session, 0, "selection followed agent-2");
-
-        // recent_window "off" collapses the group back to a flat list —
-        // still ordered by last interaction, so agent-2 keeps the top.
-        app.recent_window_ms = 0;
-        assert_eq!(app.session_group_counts(), (0, 0, 2, 0));
-        assert_eq!(app.visible_sessions()[0].name, "agent-2");
-        assert!(app.next_recent_expiry().is_none());
     }
 
     /// Confirming a worktree delete drops the row (and its agents)
@@ -10271,7 +10146,6 @@ diff --git a/src/b.rs b/src/b.rs
                     path: "/tmp/demo-feature".into(),
                     branch: "feature".into(),
                     is_main: false,
-                    pinned: false,
                     sort_order: 0,
                 }),
             },
@@ -10286,7 +10160,6 @@ diff --git a/src/b.rs b/src/b.rs
                     status: AgentStatus::Fresh,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
@@ -11474,7 +11347,6 @@ diff --git a/src/b.rs b/src/b.rs
                     path: "/tmp/demo-worktrees/feat".into(),
                     branch: "feat".into(),
                     is_main: false,
-                    pinned: false,
                     sort_order: 1,
                 }),
             },
@@ -11580,7 +11452,6 @@ diff --git a/src/b.rs b/src/b.rs
                             path: "/tmp/herdr".into(),
                             branch: "main".into(),
                             is_main: true,
-                            pinned: false,
                             sort_order: 0,
                         }),
                     },
@@ -12083,7 +11954,6 @@ diff --git a/src/b.rs b/src/b.rs
                 status: AgentStatus::Fresh,
                 archived,
                 archived_at: 0,
-                pinned: false,
                 unseen: false,
                 kind: nebula_core::AgentKind::Claude,
                 model: None,
@@ -12170,7 +12040,6 @@ diff --git a/src/b.rs b/src/b.rs
             archived: true,
             unseen: false,
             archived_at,
-            pinned: false,
             kind: nebula_core::AgentKind::Claude,
             model: None,
             effort: None,
@@ -13079,7 +12948,6 @@ diff --git a/src/b.rs b/src/b.rs
                     path: "/tmp/demo-feat".into(),
                     branch: "feat".into(),
                     is_main: false,
-                    pinned: false,
                     sort_order: 0,
                 }),
             },
@@ -13092,7 +12960,6 @@ diff --git a/src/b.rs b/src/b.rs
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             kind: nebula_core::AgentKind::Claude,
             model: None,
@@ -13388,7 +13255,6 @@ diff --git a/src/b.rs b/src/b.rs
             },
             archived: false,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             kind: nebula_core::AgentKind::Claude,
             model: None,
@@ -13479,11 +13345,10 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(app.sel_project, 1, "still on \"two\"");
     }
 
-    /// Worktrees sort most-recently-interacted first inside each of the
-    /// PINNED / UNPINNED groups; the root checkout moves like any other
-    /// row, and the cursor follows.
+    /// Worktrees sort most-recently-interacted first; the root checkout
+    /// moves like any other row, and the cursor follows.
     #[test]
-    fn worktrees_sort_by_last_interaction_within_their_group() {
+    fn worktrees_sort_by_last_interaction() {
         use nebula_core::AgentStatus;
         let mut app = App::new();
         seed_tree(&mut app); // w1 "main" (root) / a1 never run
@@ -13495,11 +13360,12 @@ diff --git a/src/b.rs b/src/b.rs
                 entity: wt_entity("w2", "p1", "feat", false),
             },
         );
-        let mut pinned = wt_entity("w3", "p1", "pinned", false);
-        if let nebula_core::Entity::Worktree(w) = &mut pinned {
-            w.pinned = true;
-        }
-        hse(&mut app, ServerEvent::EntityUpserted { entity: pinned });
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: wt_entity("w3", "p1", "older", false),
+            },
+        );
         hse(
             &mut app,
             ServerEvent::EntityUpserted {
@@ -13520,12 +13386,11 @@ diff --git a/src/b.rs b/src/b.rs
         };
         assert_eq!(
             branches(&app),
-            ["pinned", "feat", "main"],
-            "pinned group first; the never-run root sinks below the active worktree"
+            ["feat", "older", "main"],
+            "newest first; the never-run root sinks below the active worktrees"
         );
 
-        // Rest on the root, then its session finishes: it overtakes `feat`
-        // — and only within UNPINNED, the pinned row stays on top.
+        // Rest on the root, then its session finishes: it overtakes both.
         app.focus = Focus::Worktrees;
         app.sel_worktree = 2;
         hse(
@@ -13537,8 +13402,8 @@ diff --git a/src/b.rs b/src/b.rs
                 unseen: false,
             },
         );
-        assert_eq!(branches(&app), ["pinned", "main", "feat"]);
-        assert_eq!(app.sel_worktree, 1, "selection follows the root row");
+        assert_eq!(branches(&app), ["main", "feat", "older"]);
+        assert_eq!(app.sel_worktree, 0, "selection follows the root row");
     }
 
     /// Project and worktree rows carry the same "23m ago" label the session
@@ -13663,7 +13528,6 @@ diff --git a/src/b.rs b/src/b.rs
             path: "/tmp/demo-worktrees/feat".into(),
             branch: "feat".into(),
             is_main: false,
-            pinned: false,
             sort_order: 0,
         };
         hse(
@@ -13817,7 +13681,6 @@ diff --git a/src/b.rs b/src/b.rs
                     path: "/tmp/demo-worktrees/other".into(),
                     branch: "other".into(),
                     is_main: false,
-                    pinned: false,
                     sort_order: 1,
                 }),
             },
@@ -13909,7 +13772,6 @@ diff --git a/src/b.rs b/src/b.rs
                     status: AgentStatus::Fresh,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
@@ -14114,7 +13976,6 @@ diff --git a/src/b.rs b/src/b.rs
                     path: path.to_path_buf(),
                     branch: "main".into(),
                     is_main: true,
-                    pinned: false,
                     sort_order: 0,
                 }),
             },
@@ -14852,7 +14713,6 @@ diff --git a/src/b.rs b/src/b.rs
                     path: "/tmp/nebula".into(),
                     branch: "feat-x".into(),
                     is_main: true,
-                    pinned: false,
                     sort_order: 0,
                 }),
             },
@@ -14867,7 +14727,6 @@ diff --git a/src/b.rs b/src/b.rs
                     status: AgentStatus::Fresh,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: nebula_core::AgentKind::Codex,
                     model: None,
@@ -14891,7 +14750,6 @@ diff --git a/src/b.rs b/src/b.rs
                     status: AgentStatus::Terminated,
                     archived: true,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
@@ -15262,7 +15120,6 @@ diff --git a/src/b.rs b/src/b.rs
                     status: AgentStatus::Running,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
@@ -15523,29 +15380,24 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
-    fn settings_hl_cycles_recent_window_and_applies() {
+    fn settings_hl_cycles_session_idle_timeout_and_persists() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         crate::config::with_config_path(path, || {
             let mut app = App::new();
             let mut out = Vec::new();
             let (tab, row) =
-                crate::config::locate(crate::config::SettingKind::RecentWindow).unwrap();
+                crate::config::locate(crate::config::SettingKind::SessionIdleTimeout).unwrap();
             open_settings_on(&mut app, tab, &mut out);
             for _ in 0..row {
                 press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
             }
             press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
             let cfg = crate::config::Config::load();
-            assert_eq!(cfg.recent_window, "1h");
-            assert_eq!(app.recent_window_ms, 3_600_000);
+            assert_eq!(cfg.session_idle_timeout, "15m");
             press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
             let cfg = crate::config::Config::load();
-            assert_eq!(cfg.recent_window, "30m");
-            assert_eq!(
-                app.recent_window_ms,
-                crate::config::DEFAULT_RECENT_WINDOW_MS
-            );
+            assert_eq!(cfg.session_idle_timeout, "5m");
         });
     }
 
@@ -15565,14 +15417,14 @@ diff --git a/src/b.rs b/src/b.rs
         // Settings live on their own tab now, so a row from another tab
         // is only on screen once you switch to it.
         assert!(
-            !text.contains("Recent window"),
+            !text.contains("Idle session timeout"),
             "another tab's rows stay off screen:\n{text}"
         );
         press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let sessions_text = buffer_text(&terminal);
         assert!(
-            sessions_text.contains("Recent window"),
+            sessions_text.contains("Idle session timeout"),
             "Tab reaches the Sessions tab:\n{sessions_text}"
         );
         for tab in crate::config::SETTINGS_TABS {
@@ -17046,7 +16898,6 @@ diff --git a/src/b.rs b/src/b.rs
                         path: format!("/tmp/demo-worktrees/{branch}").into(),
                         branch: branch.into(),
                         is_main: false,
-                        pinned: false,
                         sort_order: 0,
                     }),
                 },
@@ -17128,7 +16979,6 @@ diff --git a/src/b.rs b/src/b.rs
                         status: AgentStatus::Fresh,
                         archived,
                         archived_at: 0,
-                        pinned: false,
                         unseen: false,
                         kind: nebula_core::AgentKind::Claude,
                         model: None,
@@ -17187,7 +17037,6 @@ diff --git a/src/b.rs b/src/b.rs
             path: format!("/tmp/{branch}").into(),
             branch: branch.into(),
             is_main,
-            pinned: false,
             sort_order: 0,
         })
     }
@@ -17201,7 +17050,6 @@ diff --git a/src/b.rs b/src/b.rs
             status: AgentStatus::Fresh,
             archived,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             kind: nebula_core::AgentKind::Claude,
             model: None,
@@ -17535,7 +17383,6 @@ diff --git a/src/b.rs b/src/b.rs
                     path: "/tmp/secret".into(),
                     branch: "main".into(),
                     is_main: true,
-                    pinned: false,
                     sort_order: 0,
                 }),
             },
@@ -17632,7 +17479,6 @@ diff --git a/src/b.rs b/src/b.rs
                     status: nebula_core::AgentStatus::Fresh,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: AgentKind::Claude,
                     model: None,
@@ -17813,7 +17659,6 @@ diff --git a/src/b.rs b/src/b.rs
                         path: format!("/tmp/other-{id}").into(),
                         branch: branch.into(),
                         is_main,
-                        pinned: false,
                         sort_order,
                     }),
                 },
@@ -17829,7 +17674,6 @@ diff --git a/src/b.rs b/src/b.rs
                     status: AgentStatus::Fresh,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
@@ -17929,7 +17773,6 @@ diff --git a/src/b.rs b/src/b.rs
                     status: AgentStatus::Running,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
@@ -17960,7 +17803,6 @@ diff --git a/src/b.rs b/src/b.rs
                     status: AgentStatus::Finished,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: true,
                     kind: nebula_core::AgentKind::Claude,
                     model: None,
@@ -18022,7 +17864,6 @@ diff --git a/src/b.rs b/src/b.rs
                     path: "/tmp/third".into(),
                     branch: "main".into(),
                     is_main: true,
-                    pinned: false,
                     sort_order: 0,
                 }),
             },
@@ -18037,7 +17878,6 @@ diff --git a/src/b.rs b/src/b.rs
                     status: AgentStatus::Fresh,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: AgentKind::Claude,
                     model: None,

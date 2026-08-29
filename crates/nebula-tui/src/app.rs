@@ -143,7 +143,6 @@ pub enum MenuAction {
     RenameAgent(AgentId),
     ArchiveAgent(AgentId),
     UnarchiveAgent(AgentId),
-    SetAgentPinned(AgentId, bool),
     DeleteAgent(AgentId),
     NewAgent(WorktreeId),
     /// Picker result: create an agent of this kind (chains into the name
@@ -176,7 +175,6 @@ pub enum MenuAction {
     ViewPrDiff,
     EditLink(LinkId),
     DeleteLink(LinkId),
-    SetWorktreePinned(WorktreeId, bool),
     DeleteWorktree(WorktreeId),
     AddProject,
     RemoveProject(ProjectId),
@@ -1499,8 +1497,8 @@ pub fn pretty_url(url: &str) -> String {
     bare.strip_suffix('/').unwrap_or(bare).to_string()
 }
 
-/// One row in the Sessions panel: agents (pinned / recent / unpinned), then
-/// shell terminals, then the worktree's links, then archived agents.
+/// One row in the Sessions panel: agents, then shell terminals, then the
+/// worktree's links, then archived agents.
 #[derive(Debug, Clone)]
 pub enum SessionRow {
     Agent(Agent),
@@ -1645,9 +1643,9 @@ fn workspace_agents<'a>(
         .filter(move |a| !a.archived && wt_ids.contains(&a.worktree_id))
 }
 
-/// A session that is mid-turn or blocked on the user. These head the
-/// RECENT group and never age out of it — the whole point of the group is
-/// to keep what needs attention in view.
+/// A session that is mid-turn or blocked on the user. These count as
+/// interacting *now*, so they head the sessions list however long the turn
+/// has taken — the point is to keep what needs attention in view.
 pub fn is_active_status(s: AgentStatus) -> bool {
     matches!(s, AgentStatus::Running | AgentStatus::NeedsFeedback)
 }
@@ -1967,6 +1965,17 @@ pub struct PendingPrDetail {
     pub dir: PathBuf,
 }
 
+/// The pull request the TERMINAL PANE is reading instead of a session,
+/// wherever the cursor found it — a PROJECT OPEN PRS GROUP row or the
+/// SESSIONS PANEL's PR ROW. Just enough to fetch, title and scroll it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewedPr {
+    pub number: u64,
+    pub url: String,
+    /// Row text, `#42 title` — what the pane says while the body loads.
+    pub label: String,
+}
+
 /// How recently a project's open-PR list may have been fetched and still be
 /// refetched on arrival — at a project, at a sidebar panel, or back at the
 /// terminal window. Walking the project list, or a flurry of focus events,
@@ -2144,13 +2153,6 @@ pub struct App {
     /// Running inside an ssh session (SSH_CONNECTION/SSH_TTY) — the footer
     /// colors the hostname as a remote warning.
     pub is_remote: bool,
-    /// Unpinned sessions whose status changed within this window sort into
-    /// a RECENT group (below PINNED). 0 disables the group. From config
-    /// (`recent_window`); the event loop refreshes it.
-    pub recent_window_ms: i64,
-    /// Session under the cursor as of the last draw, so the RECENT-expiry
-    /// tick can re-anchor `sel_session` after rows regroup underneath it.
-    pub drawn_session: Option<SessionRef>,
     /// Active color theme. From config (`theme`); the event loop refreshes
     /// it when the setting changes.
     pub theme: crate::theme::Theme,
@@ -2315,8 +2317,6 @@ impl App {
             body_area: Rect::default(),
             hostname: nebula_core::host::hostname(),
             is_remote: nebula_core::host::is_remote_session(),
-            recent_window_ms: crate::config::DEFAULT_RECENT_WINDOW_MS,
-            drawn_session: None,
             theme: crate::theme::Theme::default(),
             vim: None,
             vim_tx: None,
@@ -2593,8 +2593,8 @@ impl App {
     /// The full row list the panel shows — `sel_session` indexes this.
     pub fn visible_session_rows(&self) -> Vec<SessionRow> {
         let agents = self.visible_sessions();
-        let (pinned, recent, unpinned, _) = self.session_group_counts();
-        let active = (pinned + recent + unpinned).min(agents.len());
+        let (active, _) = self.session_group_counts();
+        let active = active.min(agents.len());
         let mut rows: Vec<SessionRow> = agents[..active]
             .iter()
             .cloned()
@@ -2704,31 +2704,25 @@ impl App {
         }
     }
 
-    /// Worktrees of the selected project: pinned first, then the rest,
-    /// each group most recently interacted with first (mirrors the
-    /// sessions list). The stamp is the newest of the checkout's sessions,
-    /// so the root checkout moves like any other row; a stable sort keeps
-    /// never-run worktrees — the root among them, which the daemon lists
-    /// first — in tree order at the bottom of their group.
+    /// Worktrees of the selected project, most recently interacted with
+    /// first (mirrors the sessions list). The stamp is the newest of the
+    /// checkout's sessions, so the root checkout moves like any other row;
+    /// a stable sort keeps never-run worktrees — the root among them, which
+    /// the daemon lists first — in tree order at the bottom.
     pub fn visible_worktrees(&self) -> Vec<&Worktree> {
         let Some(project) = self.selected_project() else {
             return vec![];
         };
         let now = now_ms();
-        let collect = |pinned: bool| {
-            let mut group: Vec<&Worktree> = self
-                .tree
-                .worktrees
-                .iter()
-                .filter(|w| w.project_id == project.id && w.pinned == pinned)
-                .collect();
-            group.sort_by_key(|w| {
-                std::cmp::Reverse(worktree_recency(&self.tree, &w.id, now).interacted)
-            });
-            group
-        };
-        let mut rows = collect(true);
-        rows.extend(collect(false));
+        let mut rows: Vec<&Worktree> = self
+            .tree
+            .worktrees
+            .iter()
+            .filter(|w| w.project_id == project.id)
+            .collect();
+        rows.sort_by_key(|w| {
+            std::cmp::Reverse(worktree_recency(&self.tree, &w.id, now).interacted)
+        });
         rows
     }
 
@@ -2762,49 +2756,44 @@ impl App {
         self.visible_open_prs().get(i)
     }
 
-    /// (pinned, unpinned) worktree counts for the selected project.
-    pub fn worktree_group_counts(&self) -> (usize, usize) {
-        let Some(project) = self.selected_project() else {
-            return (0, 0);
-        };
-        let pinned = self
-            .tree
-            .worktrees
-            .iter()
-            .filter(|w| w.project_id == project.id && w.pinned)
-            .count();
-        let unpinned = self
-            .tree
-            .worktrees
-            .iter()
-            .filter(|w| w.project_id == project.id && !w.pinned)
-            .count();
-        (pinned, unpinned)
-    }
-
-    /// An unpinned, unarchived agent sorts into the RECENT group when it is
-    /// still working (running / needs-feedback, however long that has taken)
-    /// or when its status changed within the configured window. Pinned
-    /// agents never join it — PINNED always stays on top, and `off` still
-    /// collapses the group entirely.
-    pub fn is_recent(&self, a: &Agent) -> bool {
-        !a.pinned
-            && !a.archived
-            && self.recent_window_ms > 0
-            && (is_active_status(a.status)
-                || (a.status_changed_at > 0
-                    && now_ms().saturating_sub(a.status_changed_at) < self.recent_window_ms))
-    }
-
-    /// Session rows for the selected worktree: pinned agents, then RECENT
-    /// (whatever is working or changed status within the window), then the
-    /// remaining unpinned, then (when shown) archived agents.
+    /// The pull request the pane should be reading: the PROJECT OPEN PRS
+    /// GROUP row under the Worktrees cursor, or — while the SESSIONS PANEL
+    /// has focus — the PR ROW under its cursor (a saved LINK that *is* the
+    /// branch's pull request counts; a bare URL does not).
     ///
-    /// Every group is ordered by last interaction, newest first, so the
-    /// session you just ran surfaces at the top of its group and the list
-    /// reads as a history of what you have been doing. Working sessions
-    /// count as interacting now, which keeps them heading RECENT however
-    /// long the turn has taken.
+    /// The Sessions half is keyed on focus on purpose: a session is still
+    /// attached behind that pane, and stepping into it (`l`, a click) has
+    /// to bring the terminal back so what you type is what you see. The
+    /// Worktrees half never needs that — a PR row there has no checkout, so
+    /// there is nothing behind the pane to return to.
+    pub fn previewed_pr(&self) -> Option<PreviewedPr> {
+        if let Some(pr) = self.selected_worktree_pr() {
+            return Some(PreviewedPr {
+                number: pr.number,
+                url: pr.url.clone(),
+                label: pr.label(),
+            });
+        }
+        if self.focus != Focus::Sessions {
+            return None;
+        }
+        let row = self.selected_link()?;
+        let pr = row.pull_request()?;
+        Some(PreviewedPr {
+            number: pr.number,
+            url: pr.url.clone(),
+            label: row.label(),
+        })
+    }
+
+    /// Session rows for the selected worktree: the live agents, then (when
+    /// shown) the archived ones.
+    ///
+    /// The live rows are ordered by last interaction, newest first, so the
+    /// session you just ran surfaces at the top and the list reads as a
+    /// history of what you have been doing. Working sessions count as
+    /// interacting now, which keeps them on top however long the turn has
+    /// taken.
     pub fn visible_sessions(&self) -> Vec<Agent> {
         let worktrees = self.visible_worktrees();
         let Some(wt) = worktrees.get(self.sel_worktree) else {
@@ -2813,20 +2802,14 @@ impl App {
         let now = now_ms();
         // Stable throughout, so ties — never-run rows especially, which all
         // stamp 0 — keep tree order instead of shuffling between frames.
-        let collect = |keep: &dyn Fn(&Agent) -> bool| {
-            let mut group: Vec<Agent> = self
-                .tree
-                .agents
-                .iter()
-                .filter(|a| a.worktree_id == wt.id && keep(a))
-                .cloned()
-                .collect();
-            group.sort_by_key(|a| recency_key(a, now));
-            group
-        };
-        let mut rows = collect(&|a| !a.archived && a.pinned);
-        rows.extend(collect(&|a| self.is_recent(a)));
-        rows.extend(collect(&|a| !a.archived && !a.pinned && !self.is_recent(a)));
+        let mut rows: Vec<Agent> = self
+            .tree
+            .agents
+            .iter()
+            .filter(|a| a.worktree_id == wt.id && !a.archived)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|a| recency_key(a, now));
         if self.show_archived {
             let mut archived: Vec<Agent> = self
                 .tree
@@ -2843,29 +2826,17 @@ impl App {
         rows
     }
 
-    /// (pinned, recent, unpinned, archived-total) for the selected worktree.
-    pub fn session_group_counts(&self) -> (usize, usize, usize, usize) {
+    /// (live, archived) agent counts for the selected worktree.
+    pub fn session_group_counts(&self) -> (usize, usize) {
         let worktrees = self.visible_worktrees();
         let Some(wt) = worktrees.get(self.sel_worktree) else {
-            return (0, 0, 0, 0);
+            return (0, 0);
         };
-        let pinned = self
+        let live = self
             .tree
             .agents
             .iter()
-            .filter(|a| a.worktree_id == wt.id && !a.archived && a.pinned)
-            .count();
-        let recent = self
-            .tree
-            .agents
-            .iter()
-            .filter(|a| a.worktree_id == wt.id && self.is_recent(a))
-            .count();
-        let unpinned = self
-            .tree
-            .agents
-            .iter()
-            .filter(|a| a.worktree_id == wt.id && !a.archived && !a.pinned && !self.is_recent(a))
+            .filter(|a| a.worktree_id == wt.id && !a.archived)
             .count();
         let archived = self
             .tree
@@ -2873,25 +2844,7 @@ impl App {
             .iter()
             .filter(|a| a.worktree_id == wt.id && a.archived)
             .count();
-        (pinned, recent, unpinned, archived)
-    }
-
-    /// Delay until the next visible RECENT session ages out of the window,
-    /// so the event loop can wake up and regroup. None when nothing is
-    /// pending expiry. Working sessions are excluded — they hold their place
-    /// in RECENT past the window, so their deadline is already behind us and
-    /// would otherwise wake the loop on every pass.
-    pub fn next_recent_expiry(&self) -> Option<std::time::Duration> {
-        let worktrees = self.visible_worktrees();
-        let wt = worktrees.get(self.sel_worktree)?;
-        let now = now_ms();
-        self.tree
-            .agents
-            .iter()
-            .filter(|a| a.worktree_id == wt.id && self.is_recent(a) && !is_active_status(a.status))
-            .map(|a| (a.status_changed_at + self.recent_window_ms - now).max(0) as u64)
-            .min()
-            .map(std::time::Duration::from_millis)
+        (live, archived)
     }
 
     /// Delay until the pending worktree-sessions prewarm is due, so the
@@ -2949,11 +2902,11 @@ impl App {
         Some(at.saturating_duration_since(std::time::Instant::now()))
     }
 
-    /// The body and conversation behind the open-PR row under the cursor:
-    /// `Some(Some(_))` once fetched, `Some(None)` while it's still coming
-    /// (or came back empty), `None` when the cursor isn't on one at all.
+    /// The body and conversation behind the pull request the pane is
+    /// reading: `Some(Some(_))` once fetched, `Some(None)` while it's still
+    /// coming (or came back empty), `None` when the pane isn't reading one.
     pub fn selected_pr_detail(&self) -> Option<Option<&PrDetail>> {
-        let pr = self.selected_worktree_pr()?;
+        let pr = self.previewed_pr()?;
         Some(self.pr_detail.get(&pr.url))
     }
 
@@ -3148,7 +3101,6 @@ mod tests {
             path: "/tmp/demo".into(),
             branch: "main".into(),
             is_main: true,
-            pinned: false,
             sort_order: 0,
         });
         (app, worktree_id)
@@ -3240,7 +3192,6 @@ mod tests {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             status_changed_at: 0,
             kind: AgentKind::Claude,

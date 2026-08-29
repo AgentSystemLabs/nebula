@@ -141,7 +141,11 @@ fn hook_command(endpoint: &str, event: &str) -> String {
 /// permission prompt: the auto-title `nebula rename`, and the `nebula
 /// worktree` relocation its appended system prompt tells it to use
 /// (codex/cursor run with their skip-permissions flags).
-const CLAUDE_ALLOW_RULES: &[&str] = &["Bash(nebula rename:*)", "Bash(nebula worktree:*)"];
+const CLAUDE_ALLOW_RULES: &[&str] = &[
+    "Bash(nebula rename:*)",
+    "Bash(nebula worktree:*)",
+    "Bash(nebula spawn:*)",
+];
 
 /// Cursor variant: the payload arrives on stdin like Claude's, but cursor
 /// expects a JSON response on stdout — `{"continue": true}` keeps gating

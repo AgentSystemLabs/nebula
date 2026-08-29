@@ -62,7 +62,6 @@ pub enum Action {
     // projects & worktrees
     AddProject,
     New,
-    Pin,
     GitDiff,
     OpenRepo,
     // sessions
@@ -231,15 +230,6 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["n"],
-    },
-    ActionSpec {
-        action: Action::Pin,
-        id: "pin",
-        label: "Pin / unpin",
-        hint: "Pin the selected worktree or session to the top of its panel",
-        group: "PROJECTS & WORKTREES",
-        scope: Scope::Global,
-        defaults: &["p"],
     },
     ActionSpec {
         action: Action::GitDiff,

@@ -35,7 +35,7 @@ nebula replaces that with a tree and a color:
 - **Lists that order themselves.** Projects, worktrees and sessions all sit most-recent-first, with a dim
   `23m ago` after the name saying why the row is where it is: a session is stamped when it last did
   anything, a worktree carries the newest stamp of its sessions, a project the newest of its worktrees.
-  Pinned rows keep their own group on top. Nothing is dragged into place by hand.
+  Nothing is pinned or dragged into place by hand.
 - **A dot per session that says what it's doing.** ● yellow is mid-turn, ● violet is done and waiting
   to be read, ● green is done and read, ● red wants you. Parents roll up their children, so a red dot
   on a collapsed project tells you exactly where to look without opening anything.
@@ -195,11 +195,12 @@ The panels aren't the only view. With a worktree selected, from any panel:
 | **`f`** | **Find file.** Fuzzy finder over the worktree. `Enter` opens the file in an editor modal (vim by default; the `editor` setting or `NEBULA_EDITOR` picks another), `Ctrl+y` copies the path — ready to paste into an agent. |
 | **`F`** | **Find in files.** `git grep` into the same modal; `Enter` opens the hit at its line. |
 | **`b`** | **File tree browser.** Tree on the left, syntax-highlighted preview on the right, and an always-live filter that narrows the tree to matching files and the directories holding them. |
-| **`p`** | **Pin.** Pinned worktrees and agents sort to the top of their panel and are spared by the idle reaper. |
 
 nebula finds the pull request open on each branch with `gh` and shows it in the Sessions panel's
-OPEN PRS group, including a count of comments that landed while you were away. Manual link attachment
-is currently unavailable; previously saved links remain visible so the change does not discard data.
+OPEN PRS group, including a count of comments that landed while you were away. Rest on that row and the
+pane reads the pull request — description, stats, conversation — exactly as it does for the project-wide
+OPEN PRS rows under the worktrees; `g` shows its diff. Manual link attachment is currently unavailable;
+previously saved links remain visible so the change does not discard data.
 
 ## How it works
 
@@ -246,21 +247,28 @@ is currently unavailable; previously saved links remain visible so the change do
   spawn, plus a `Bash(nebula worktree:*)` permission so the command never prompts. Codex and Cursor
   sessions can run the same command; they resume silent and wait for your next prompt. The restart is
   the only way there: an agent CLI can't `cd` out of the directory it was started in.
+- **Ask the agent for another session and it starts one.** Tell a Claude session "start a new nebula
+  session that fixes the login redirect" and it runs `nebula spawn "<task>"`: the daemon starts a second
+  agent beside it — same worktree, same harness, model and effort unless `--kind claude|codex|cursor`
+  names another — opening on that task as its first prompt, so it is working before you look. The new
+  row appears in the sessions list on its own (default name, so it titles itself), and the session you
+  asked from is untouched: no restart, no focus change. Claude learns this from the same appended system
+  prompt as the worktree rule, plus a `Bash(nebula spawn:*)` permission.
 - **Everything persists in SQLite** (`~/.local/share/nebula/nebula.db` or the platform equivalent):
-  projects, worktrees, agents (with kind + CLI session ids), links, workspaces, pins, and your
+  projects, worktrees, agents (with kind + CLI session ids), links, workspaces, and your
   last selection.
 - **Sessions warm up, then get reaped.** The daemon can pre-spawn an agent CLI while you're still naming
   the session, and pre-boot a worktree's dead sessions while your selection rests on it, so attaching
   lands on a booted screen instead of a booting shell. To bound what that costs, idle PTYs in worktrees
-  no client is watching are killed after `session_idle_timeout` (5m by default) — pinned agents, working
-  agents, ones waiting on you, and terminals with a command running are all spared, and a reaped agent
+  no client is watching are killed after `session_idle_timeout` (5m by default) — working agents, ones
+  waiting on you, and terminals with a command running are all spared, and a reaped agent
   revives on the next attach with its conversation resumed.
 - **Settings live in one JSON file** (`config.json`, beside the database), read fresh on each use by both
   the daemon and the TUI, so hand edits apply without a restart. `s` opens the settings overlay over the
   same file: color theme, animations, focused-panel tint, whether the Workspaces bar, PROJECTS PANEL,
   and WORKTREES PANEL are shown,
   editor, which agent CLIs the new-session menu offers (at least one stays on) and their default model
-  and reasoning effort, the RECENT window, the idle timeout, the done sound (`done_sound`: a ding
+  and reasoning effort, the idle timeout, the done sound (`done_sound`: a ding
   when a turn finishes — a macOS system sound such as `Glass`, the default; `bell` for the terminal
   bell, which Ghostty keeps silent unless its `bell-features` include `audio`; or `off`. Over
   `nebula ssh` and off macOS it is always the bell), and whether new sessions stop to ask for a
@@ -295,7 +303,6 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Worktrees (checkout row) | `n` / `d` | new worktree / delete (typed confirm — deletes files) |
 | Worktrees (PROJECT OPEN PRS row) | `n`; `m` / right-click | new Claude SESSION scoped to that PR; the context menu also opens the PR or its diff |
 | New worktree | type a sentence, or `Enter` on the empty prompt | the branch name is slugified (`fix login redirect` → `fix-login-redirect`); empty takes a random `<adj>-<noun>-<verb>` |
-| Worktrees / Sessions | `p` | pin / unpin — pinned rows sort to the top and skip the idle reaper |
 | Sessions | `n` | new session (agent or shell terminal) |
 | New session picker (Claude) | `Tab` | toggle Claude Cloud; Cloud adds a wrapped task prompt (`Shift+Enter` or `Ctrl+J` inserts a line) before launch |
 | Sessions (cloud row) | `m` | **Attach cloud session** re-pulls the transcript now; **Send to cloud session** queues a message on it |
@@ -305,7 +312,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Any panel | `g` | git diff for the selected worktree: filter, `↑↓` files, `Shift+↑↓`/`PgUp/PgDn`/`Ctrl+d/u` scroll, `Ctrl+r` marks a file reviewed ✓ |
 | Any panel | `Shift+G` | open the selected repo's page on its git host — the `origin` remote (`git@github.com:o/r.git`, `ssh://`, `https://`) turned into a browsable URL, credentials stripped |
 | Any panel | `f` / `F` / `b` | find file / find in files (`git grep`) / file tree browser, all scoped to the selected worktree — `Enter` opens the file in an editor modal (at the matched line, for `F`); in `f` and `b`, `Ctrl+y` copies the path |
-| Sessions | `Enter` on an OPEN PRS row | open it in the browser (a previously saved link can still be edited with `r` or deleted with `d`; the detected pull request cannot) |
+| Sessions | `Enter` on an OPEN PRS row | open it in the browser (a previously saved link can still be edited with `r` or deleted with `d`; the detected pull request cannot). Resting on the pull request reads it in the pane; `g` shows its diff, `PgUp/PgDn` scroll |
 | Any panel | `t` | new shell terminal in the selected worktree's directory (Projects panel: the repo root) |
 | Any panel | `w` or click the `◇ workspace` nameplate bottom-left | workspace switcher: `Enter` opens, `n`/`r`/`d` create/rename/delete; a created workspace opens with FOCUS on the first visible panel; delete asks first, and deleting the open one lands on the tab to its right, or the one to its left from the last tab (the panels scope to the open workspace; `/` doesn't, and switches for you). Per window, switching here leaves your other nebula instances on the workspace you left them on |
 | Any panel | `Shift+W` | show / hide the Workspaces bar across the top: `WORKSPACES` on the left, directly above `PROJECTS`, and one tab per workspace to its right with the rolled-up status of the agents under it (plus a count of the ones that finished unread), so a run in a workspace you don't have open still shows at the top level. The choice is remembered — it's the `Workspaces bar` setting, also in Settings → Appearance |
@@ -350,6 +357,9 @@ nebula rename <title>     # title the current session (agents run this; --force 
 nebula worktree [name] [--base <ref>]  # move the current session into a worktree of its project,
                           # creating the branch if it's new (agents run this when you ask for a
                           # worktree; no name invents one; --base picks a new branch's start point)
+nebula spawn <task> [--kind <claude|codex|cursor>]  # start a new agent session beside the current
+                          # one, in the same worktree, opening on <task> (agents run this when you
+                          # ask for a new nebula session; --kind defaults to this session's harness)
 nebula workspace add <name>     # create a workspace (a named project group)
 nebula workspace open <name>    # open it in the next instance you launch
 nebula workspace list           # list workspaces; * marks the one new instances open into

@@ -349,7 +349,6 @@ mod tests {
                 path: "/tmp/p".into(),
                 branch: "main".into(),
                 is_main: true,
-                pinned: false,
                 sort_order: 0,
             })
             .unwrap();
@@ -360,7 +359,6 @@ mod tests {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             kind: AgentKind::Claude,
             model: None,

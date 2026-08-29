@@ -4,7 +4,7 @@
 use anyhow::{bail, Context, Result};
 use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{
-    env, paths, AgentId, ClientRequest, EnterOutcome, ServerEvent, PROTOCOL_VERSION,
+    env, paths, AgentId, AgentKind, ClientRequest, EnterOutcome, ServerEvent, PROTOCOL_VERSION,
 };
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -288,6 +288,46 @@ pub async fn rename_current_agent(title: &str, mode: RenameMode) -> Result<()> {
         Reply::Ack => println!("session renamed to \"{title}\""),
         Reply::Error(message) => println!("nebula: {message}"),
     }
+    Ok(())
+}
+
+/// CLI: `nebula spawn "<task>" [--kind <claude|codex|cursor>]` from inside
+/// an agent session — ask the daemon to start a new agent beside this one,
+/// in the same worktree, opening on `task` as its first prompt. The caller
+/// is untouched: no relocation, no turn-end wait. Never spawns a daemon: no
+/// daemon means no session to sit beside.
+///
+/// What this prints is read by the model that ran it, so it says what
+/// happened and that this session carries on. A daemon-side refusal (a
+/// blank task, a missing CLI) is a nonzero exit the model reports.
+pub async fn spawn_sibling_for_current_agent(task: &str, kind: Option<AgentKind>) -> Result<()> {
+    let agent_id = current_agent_id("spawn")?;
+    let task = task.trim();
+    if task.is_empty() {
+        bail!("the task is empty — `nebula spawn \"<task>\"` needs the work the new session starts on");
+    }
+    let sock = paths::socket_path();
+    let Ok(stream) = try_connect(&sock).await else {
+        bail!("no nebula daemon is running — no session started");
+    };
+    let mut conn = handshake(stream).await?;
+    let req_id = ONE_SHOT_REQ_ID;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::SpawnSiblingAgent {
+            req_id,
+            id: AgentId(agent_id),
+            kind,
+            starting_prompt: task.to_string(),
+        },
+    )
+    .await?;
+    await_ack(&mut conn, req_id).await?;
+    let harness = kind.map(|k| format!("{} ", k.as_str())).unwrap_or_default();
+    println!(
+        "started a new {harness}session in this worktree; it is working on that task now and \
+         shows in the sessions list. This session is unaffected — carry on."
+    );
     Ok(())
 }
 

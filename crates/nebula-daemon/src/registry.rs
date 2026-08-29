@@ -406,10 +406,8 @@ impl Daemon {
     /// walked-away-from sessions cost. "In view" = the worktree holding any
     /// attached session; in-view sessions get their stamps refreshed
     /// instead, so the full timeout starts only when the user leaves.
-    /// Spared regardless of age: pinned agents (the user's "never kill
-    /// this" mark — a running schedule or background job is invisible to
-    /// the status machine), agents that are running or waiting on feedback,
-    /// terminals with a command running, and prewarm-pool sessions
+    /// Spared regardless of age: agents that are running or waiting on
+    /// feedback, terminals with a command running, and prewarm-pool sessions
     /// (`reap_prewarmed` owns those). A reaped session revives on the next
     /// attach or prewarm; agents resume their conversation.
     pub fn reap_idle_sessions(self: &Arc<Self>) {
@@ -449,15 +447,10 @@ impl Daemon {
             }
             let spared = match &sref {
                 SessionRef::Agent(id) => match self.store.get_agent(id).ok().flatten() {
-                    // Pinned = the user marked it worth keeping (schedules,
-                    // loops, long jobs the status can't see) — never reap.
-                    Some(agent) => {
-                        agent.pinned
-                            || matches!(
-                                agent.status,
-                                AgentStatus::Running | AgentStatus::NeedsFeedback
-                            )
-                    }
+                    Some(agent) => matches!(
+                        agent.status,
+                        AgentStatus::Running | AgentStatus::NeedsFeedback
+                    ),
                     // Row vanished mid-sweep: its delete kills the PTY anyway.
                     None => true,
                 },
@@ -736,7 +729,6 @@ impl Daemon {
                 is_main: entry.path == repo_path,
                 path: entry.path.clone(),
                 branch: entry.branch,
-                pinned: false,
                 sort_order: 0,
             };
             self.store.insert_worktree(&worktree)?;
@@ -806,7 +798,6 @@ impl Daemon {
             path,
             branch: branch.to_string(),
             is_main: false,
-            pinned: false,
             sort_order: 0,
         };
         self.store.insert_worktree(&worktree)?;
@@ -835,15 +826,6 @@ impl Daemon {
         self.store.delete_worktree(id)?;
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Worktree(id.clone()),
-        });
-        Ok(())
-    }
-
-    pub fn set_worktree_pinned(self: &Arc<Self>, id: &WorktreeId, pinned: bool) -> Result<()> {
-        self.store.set_worktree_pinned(id, pinned)?;
-        let worktree = self.store.get_worktree(id)?.context("worktree not found")?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Worktree(worktree),
         });
         Ok(())
     }
@@ -914,7 +896,6 @@ impl Daemon {
                 is_main: is_root(&entry.path),
                 path: entry.path.clone(),
                 branch: entry.branch.clone(),
-                pinned: false,
                 sort_order: 0,
             };
             self.store.insert_worktree(&worktree)?;
@@ -1017,7 +998,6 @@ impl Daemon {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             kind,
             model,
@@ -1122,7 +1102,6 @@ impl Daemon {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             kind,
             model: model.clone(),
@@ -1676,12 +1655,6 @@ impl Daemon {
 
     pub fn unarchive_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
         self.store.set_agent_archived(id, false)?;
-        self.broadcast_agent(id)?;
-        Ok(())
-    }
-
-    pub fn set_agent_pinned(self: &Arc<Self>, id: &AgentId, pinned: bool) -> Result<()> {
-        self.store.set_agent_pinned(id, pinned)?;
         self.broadcast_agent(id)?;
         Ok(())
     }
@@ -2777,6 +2750,7 @@ fn agent_spawn_command_with(
             let mut system_prompt = Vec::new();
             if guidance {
                 system_prompt.push(CLAUDE_WORKTREE_GUIDANCE);
+                system_prompt.push(crate::sibling::CLAUDE_SPAWN_GUIDANCE);
             }
             if let Some(prompt) = additional_system_prompt {
                 system_prompt.push(prompt);
@@ -3053,13 +3027,18 @@ fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec
 mod tests {
     use super::*;
 
-    /// Claude argv: `args`, then nebula's appended worktree guidance.
+    /// Claude argv: `args`, then nebula's appended guidance (worktree and
+    /// spawn, one `--append-system-prompt`).
     fn guided(args: &[&str]) -> Vec<String> {
         args.iter()
             .map(|s| s.to_string())
             .chain([
                 "--append-system-prompt".to_string(),
-                CLAUDE_WORKTREE_GUIDANCE.to_string(),
+                [
+                    CLAUDE_WORKTREE_GUIDANCE,
+                    crate::sibling::CLAUDE_SPAWN_GUIDANCE,
+                ]
+                .join("\n\n"),
             ])
             .collect()
     }
@@ -3317,6 +3296,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(prompts.len(), 1, "Claude gets one composed system prompt");
         assert!(prompts[0].contains(CLAUDE_WORKTREE_GUIDANCE));
+        assert!(prompts[0].contains(crate::sibling::CLAUDE_SPAWN_GUIDANCE));
         assert!(prompts[0].contains("All work in this session must be scoped"));
         assert!(prompts[0].contains(pr_url));
     }
@@ -3637,7 +3617,6 @@ mod tests {
                 path: path.into(),
                 branch: id.into(),
                 is_main,
-                pinned: false,
                 sort_order: 0,
             })
             .unwrap();
@@ -3653,7 +3632,6 @@ mod tests {
                 status: AgentStatus::Running,
                 archived: false,
                 archived_at: 0,
-                pinned: false,
                 unseen: false,
                 kind: AgentKind::Claude,
                 model: None,
@@ -3838,7 +3816,6 @@ mod tests {
                     status: AgentStatus::Fresh,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: AgentKind::Claude,
                     model: None,

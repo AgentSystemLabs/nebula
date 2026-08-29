@@ -67,11 +67,12 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE agents ADD COLUMN kind TEXT NOT NULL DEFAULT 'claude';
     ",
-    // 5: pinned agents (their own group in the sessions list)
+    // 5: pinned agents — the PIN feature was removed on 2026-08-28; the
+    //    column stays (unread) rather than costing a table rebuild
     "
     ALTER TABLE agents ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
     ",
-    // 6: pinned worktrees (their own group in the worktrees list)
+    // 6: pinned worktrees (same story as 5)
     "
     ALTER TABLE worktrees ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
     ",
@@ -456,15 +457,14 @@ impl Store {
 
     pub fn insert_worktree(&self, w: &Worktree) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO worktrees (id, project_id, path, branch, is_main, pinned, sort_order, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO worktrees (id, project_id, path, branch, is_main, sort_order, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 w.id.as_str(),
                 w.project_id.as_str(),
                 w.path.to_string_lossy(),
                 w.branch,
                 w.is_main as i64,
-                w.pinned as i64,
                 w.sort_order,
                 now_ms()
             ],
@@ -494,14 +494,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_worktree_pinned(&self, id: &WorktreeId, pinned: bool) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE worktrees SET pinned = ?2 WHERE id = ?1",
-            params![id.as_str(), pinned as i64],
-        )?;
-        Ok(())
-    }
-
     // ---- agents ----
 
     pub fn insert_agent(&self, a: &Agent) -> Result<()> {
@@ -525,8 +517,8 @@ impl Store {
         pr_url: Option<&str>,
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id, pr_url)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id, pr_url)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 a.id.as_str(),
                 a.worktree_id.as_str(),
@@ -534,7 +526,6 @@ impl Store {
                 a.status.as_str(),
                 a.archived as i64,
                 a.archived_at,
-                a.pinned as i64,
                 a.kind.as_str(),
                 a.session_id,
                 a.sort_order,
@@ -624,14 +615,6 @@ impl Store {
                     unseen = CASE WHEN ?2 THEN 0 ELSE unseen END
              WHERE id = ?1",
             params![id.as_str(), archived as i64, archived_at],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_agent_pinned(&self, id: &AgentId, pinned: bool) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE agents SET pinned = ?2 WHERE id = ?1",
-            params![id.as_str(), pinned as i64],
         )?;
         Ok(())
     }
@@ -942,8 +925,8 @@ const WORKSPACE_COLUMNS: &str = "id, name";
 /// fills in the default rather than a `COALESCE(.., ?1)` in the column list,
 /// which would hide a positional bind every query had to remember.
 const PROJECT_COLUMNS: &str = "id, name, repo_path, sort_order, workspace_id";
-const WORKTREE_COLUMNS: &str = "id, project_id, path, branch, is_main, pinned, sort_order";
-const AGENT_COLUMNS: &str = "id, worktree_id, name, status, archived, pinned, kind, \
+const WORKTREE_COLUMNS: &str = "id, project_id, path, branch, is_main, sort_order";
+const AGENT_COLUMNS: &str = "id, worktree_id, name, status, archived, kind, \
                              claude_session_id, sort_order, status_changed_at, model, effort, \
                              archived_at, unseen, cloud_session_id";
 const TERMINAL_COLUMNS: &str = "id, worktree_id, name, sort_order";
@@ -976,8 +959,7 @@ fn row_to_worktree(r: &rusqlite::Row) -> rusqlite::Result<Worktree> {
         path: PathBuf::from(r.get::<_, String>(2)?),
         branch: r.get(3)?,
         is_main: r.get::<_, i64>(4)? != 0,
-        pinned: r.get::<_, i64>(5)? != 0,
-        sort_order: r.get(6)?,
+        sort_order: r.get(5)?,
     })
 }
 
@@ -990,16 +972,15 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<Agent> {
         name: r.get(2)?,
         status: AgentStatus::parse(&r.get::<_, String>(3)?).unwrap_or(AgentStatus::Fresh),
         archived: r.get::<_, i64>(4)? != 0,
-        pinned: r.get::<_, i64>(5)? != 0,
-        kind: AgentKind::parse(&r.get::<_, String>(6)?).unwrap_or_default(),
-        session_id: r.get(7)?,
-        sort_order: r.get(8)?,
-        status_changed_at: r.get(9)?,
-        model: r.get(10)?,
-        effort: r.get(11)?,
-        archived_at: r.get(12)?,
-        unseen: r.get::<_, i64>(13)? != 0,
-        cloud_session_id: r.get(14)?,
+        kind: AgentKind::parse(&r.get::<_, String>(5)?).unwrap_or_default(),
+        session_id: r.get(6)?,
+        sort_order: r.get(7)?,
+        status_changed_at: r.get(8)?,
+        model: r.get(9)?,
+        effort: r.get(10)?,
+        archived_at: r.get(11)?,
+        unseen: r.get::<_, i64>(12)? != 0,
+        cloud_session_id: r.get(13)?,
         alive: false,
         cloud_mirroring: false,
     })
@@ -1046,7 +1027,6 @@ mod tests {
             path: "/tmp/demo".into(),
             branch: "main".into(),
             is_main: true,
-            pinned: false,
             sort_order: 0,
         };
         store.insert_worktree(&worktree).unwrap();
@@ -1057,7 +1037,6 @@ mod tests {
             status: AgentStatus::Running,
             archived: false,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             kind: AgentKind::Claude,
             model: Some("opus".into()),
@@ -1080,7 +1059,6 @@ mod tests {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             kind: AgentKind::Codex,
             model: None,
@@ -1100,7 +1078,6 @@ mod tests {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             kind: AgentKind::Cursor,
             model: None,
@@ -1176,7 +1153,6 @@ mod tests {
             path: "/tmp/demo".into(),
             branch: "main".into(),
             is_main: true,
-            pinned: false,
             sort_order: 0,
         };
         store.insert_worktree(&worktree).unwrap();
@@ -1552,7 +1528,6 @@ mod tests {
             path: "/tmp/p".into(),
             branch: "main".into(),
             is_main: true,
-            pinned: false,
             sort_order: 0,
         };
         store.insert_worktree(&wt).unwrap();
@@ -1563,7 +1538,6 @@ mod tests {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
-            pinned: false,
             unseen: false,
             kind: AgentKind::Claude,
             model: None,
@@ -1634,7 +1608,6 @@ mod tests {
             path: "/tmp/demo".into(),
             branch: "main".into(),
             is_main: true,
-            pinned: false,
             sort_order: 0,
         };
         store.insert_worktree(&worktree).unwrap();
@@ -1672,7 +1645,6 @@ mod tests {
             path: "/tmp/p".into(),
             branch: "main".into(),
             is_main: true,
-            pinned: false,
             sort_order: 0,
         };
         store.insert_worktree(&wt).unwrap();
@@ -1689,7 +1661,6 @@ mod tests {
                     status,
                     archived: false,
                     archived_at: 0,
-                    pinned: false,
                     unseen: false,
                     kind: AgentKind::Claude,
                     model: None,
@@ -1744,7 +1715,6 @@ mod tests {
             path: "/tmp/demo".into(),
             branch: "main".into(),
             is_main: true,
-            pinned: false,
             sort_order: 0,
         };
         store.insert_worktree(&worktree).unwrap();
@@ -1756,7 +1726,6 @@ mod tests {
                 status,
                 archived: false,
                 archived_at: 0,
-                pinned: false,
                 unseen: false,
                 kind: AgentKind::Claude,
                 model: None,

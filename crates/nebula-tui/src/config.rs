@@ -12,12 +12,6 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Fallback for `recent_window` when the value is missing or malformed.
-pub const DEFAULT_RECENT_WINDOW_MS: i64 = 30 * 60 * 1000;
-
-/// Values the settings overlay cycles through for `recent_window`.
-pub const RECENT_WINDOWS: &[&str] = &["off", "5m", "10m", "30m", "1h", "24h"];
-
 /// Values the settings overlay cycles through for `session_idle_timeout`
 /// (daemon-owned: how long unwatched idle sessions live before their PTY
 /// is reaped).
@@ -125,7 +119,6 @@ pub enum SettingKind {
     GitInitOnCreate,
     Editor,
     SkipSessionNaming,
-    RecentWindow,
     SessionIdleTimeout,
     DoneSound,
     Theme,
@@ -176,14 +169,9 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 hint: "New agents skip the name prompt and take the auto-title the agent sets",
             },
             SettingSpec {
-                kind: SettingKind::RecentWindow,
-                label: "Recent window",
-                hint: "How long unpinned sessions stay in the RECENT group",
-            },
-            SettingSpec {
                 kind: SettingKind::SessionIdleTimeout,
                 label: "Idle session timeout",
-                hint: "Kill idle sessions in unviewed worktrees (pinned/busy spared; off disables)",
+                hint: "Kill idle sessions in unviewed worktrees (busy ones spared; off disables)",
             },
             SettingSpec {
                 kind: SettingKind::DoneSound,
@@ -412,10 +400,6 @@ pub struct Config {
     /// prompt does. Off by default — naming a session is the deliberate
     /// choice, and skipping it is opting out of that.
     pub skip_session_naming: bool,
-    /// How long a session stays in the RECENT group after its status last
-    /// changed: "5m", "10m", "30m", "1h", "24h" (any `<n>m`/`<n>h` works).
-    /// "off" disables the group. Malformed values fall back to 30m.
-    pub recent_window: String,
     /// How long an idle session in an unviewed worktree lives before the
     /// daemon reaps its PTY: "1m", "5m", "15m", "30m", "1h"; "off"
     /// disables. Owned by the daemon (which does the parsing and reaping);
@@ -481,7 +465,6 @@ impl Default for Config {
             git_init_on_create: true,
             editor: "vim".into(),
             skip_session_naming: false,
-            recent_window: "30m".into(),
             session_idle_timeout: "5m".into(),
             done_sound: "Glass".into(),
             theme: "default".into(),
@@ -576,10 +559,6 @@ impl Config {
             serde_json::json!(self.skip_session_naming),
         );
         obj.insert(
-            "recent_window".into(),
-            serde_json::json!(self.recent_window),
-        );
-        obj.insert(
             "session_idle_timeout".into(),
             serde_json::json!(self.session_idle_timeout),
         );
@@ -628,11 +607,6 @@ impl Config {
         std::fs::write(&tmp, &bytes)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
-    }
-
-    /// `recent_window` parsed to ms; 0 disables the RECENT group.
-    pub fn recent_window_ms(&self) -> i64 {
-        parse_window_ms(&self.recent_window).unwrap_or(DEFAULT_RECENT_WINDOW_MS)
     }
 
     /// `theme` resolved to the palette the UI draws with.
@@ -702,7 +676,6 @@ impl Config {
             SettingKind::GitInitOnCreate => on_off(self.git_init_on_create).into(),
             SettingKind::Editor => self.editor.clone(),
             SettingKind::SkipSessionNaming => on_off(self.skip_session_naming).into(),
-            SettingKind::RecentWindow => self.recent_window.clone(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
             SettingKind::DoneSound => self.done_sound.clone(),
             SettingKind::Theme => self.theme.clone(),
@@ -741,9 +714,6 @@ impl Config {
             }
             SettingKind::SkipSessionNaming => {
                 self.skip_session_naming = !self.skip_session_naming;
-            }
-            SettingKind::RecentWindow => {
-                self.recent_window = cycle_choice(&self.recent_window, RECENT_WINDOWS, step).into();
             }
             SettingKind::SessionIdleTimeout => {
                 self.session_idle_timeout =
@@ -904,19 +874,6 @@ fn settings_path() -> PathBuf {
     nebula_core::paths::config_path()
 }
 
-fn parse_window_ms(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if s.eq_ignore_ascii_case("off") || s == "0" {
-        return Some(0);
-    }
-    let (digits, unit_ms) = match s.strip_suffix(['m', 'M']) {
-        Some(d) => (d, 60_000),
-        None => (s.strip_suffix(['h', 'H'])?, 3_600_000),
-    };
-    let n: i64 = digits.trim().parse().ok()?;
-    (n >= 0).then(|| n.saturating_mul(unit_ms))
-}
-
 #[cfg(test)]
 thread_local! {
     static CONFIG_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
@@ -1017,29 +974,6 @@ mod tests {
     }
 
     #[test]
-    fn recent_window_parses_minutes_hours_and_off() {
-        let ms = |v: &str| {
-            let cfg: Config =
-                serde_json::from_str(&format!(r#"{{"recent_window": "{v}"}}"#)).unwrap();
-            cfg.recent_window_ms()
-        };
-        assert_eq!(ms("5m"), 5 * 60_000);
-        assert_eq!(ms("10m"), 10 * 60_000);
-        assert_eq!(ms("30m"), 30 * 60_000);
-        assert_eq!(ms("1h"), 3_600_000);
-        assert_eq!(ms("24h"), 24 * 3_600_000);
-        assert_eq!(ms("off"), 0);
-        assert_eq!(ms("0"), 0);
-        // Malformed values fall back to the default.
-        assert_eq!(ms("soon"), DEFAULT_RECENT_WINDOW_MS);
-        assert_eq!(ms("-5m"), DEFAULT_RECENT_WINDOW_MS);
-        assert_eq!(
-            Config::default().recent_window_ms(),
-            DEFAULT_RECENT_WINDOW_MS
-        );
-    }
-
-    #[test]
     fn done_sound_defaults_to_bell_cycles_persists_and_resolves() {
         let mut cfg = Config::default();
         assert_eq!(cfg.done_sound, "Glass");
@@ -1102,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn cycle_toggles_bools_and_walks_recent_window() {
+    fn cycle_toggles_bools_and_walks_session_idle_timeout() {
         let mut cfg = Config::default();
         let (t, r) = locate(SettingKind::PaletteEnterAttaches).unwrap();
         assert!(cfg.palette_enter_attaches);
@@ -1111,14 +1045,14 @@ mod tests {
         cfg.cycle(t, r, 1);
         assert!(cfg.palette_enter_attaches);
 
-        assert_eq!(cfg.recent_window, "30m");
-        let (t, r) = locate(SettingKind::RecentWindow).unwrap();
+        assert_eq!(cfg.session_idle_timeout, "5m");
+        let (t, r) = locate(SettingKind::SessionIdleTimeout).unwrap();
         cfg.cycle(t, r, 0);
-        assert_eq!(cfg.recent_window, "1h");
+        assert_eq!(cfg.session_idle_timeout, "15m");
         cfg.cycle(t, r, -1);
-        assert_eq!(cfg.recent_window, "30m");
+        assert_eq!(cfg.session_idle_timeout, "5m");
         cfg.cycle(t, r, -1);
-        assert_eq!(cfg.recent_window, "10m");
+        assert_eq!(cfg.session_idle_timeout, "1m");
     }
 
     #[test]
@@ -1375,7 +1309,7 @@ mod tests {
             r#"{
   "git_init_on_create": false,
   "future_daemon_flag": true,
-  "recent_window": "5m"
+  "session_idle_timeout": "15m"
 }
 "#,
         )
@@ -1383,17 +1317,17 @@ mod tests {
 
         let mut cfg = load_from(&path);
         assert!(!cfg.git_init_on_create);
-        assert_eq!(cfg.recent_window, "5m");
+        assert_eq!(cfg.session_idle_timeout, "15m");
         cfg.palette_enter_attaches = false;
         cfg.git_init_on_create = true;
-        cfg.recent_window = "1h".into();
+        cfg.session_idle_timeout = "1h".into();
         cfg.save_to(&path).unwrap();
 
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["palette_enter_attaches"], false);
         assert_eq!(saved["git_init_on_create"], true);
-        assert_eq!(saved["recent_window"], "1h");
+        assert_eq!(saved["session_idle_timeout"], "1h");
         assert_eq!(saved["future_daemon_flag"], true);
     }
 
@@ -1484,6 +1418,6 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["palette_enter_attaches"], true);
         assert_eq!(saved["git_init_on_create"], true);
-        assert_eq!(saved["recent_window"], "30m");
+        assert_eq!(saved["session_idle_timeout"], "5m");
     }
 }

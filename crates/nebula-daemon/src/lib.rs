@@ -6,6 +6,7 @@ pub mod metrics;
 pub mod pty;
 pub mod registry;
 pub mod server;
+pub mod sibling;
 pub mod status;
 pub mod store;
 

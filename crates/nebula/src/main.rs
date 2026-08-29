@@ -27,6 +27,20 @@ struct Cli {
     workspace: Option<String>,
 }
 
+/// `--kind` for `nebula spawn`: one of the agent CLIs nebula runs.
+fn parse_agent_kind(s: &str) -> Result<nebula_core::AgentKind, String> {
+    nebula_core::AgentKind::parse(s).ok_or_else(|| {
+        format!(
+            "unknown harness `{s}` — expected one of {}",
+            nebula_core::AgentKind::ALL
+                .iter()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Add a directory as a project, named after the repo's root directory
@@ -66,6 +80,20 @@ enum Command {
         /// Start point for a new branch (default: the checkout's HEAD).
         #[arg(long, value_name = "REF")]
         base: Option<String>,
+    },
+    /// Start a new agent session beside this one — same worktree, same
+    /// harness unless --kind names another — opening on the given task as
+    /// its first prompt (run from inside a nebula agent session; agents run
+    /// it when you ask for a new nebula session). The new row shows up in
+    /// the sessions list on its own; this session carries on untouched.
+    Spawn {
+        /// The task the new session starts on; multiple words need no quotes.
+        #[arg(required = true, num_args = 1..)]
+        task: Vec<String>,
+        /// Harness for the new session: claude, codex or cursor (default:
+        /// the same as this session's).
+        #[arg(long, value_name = "KIND", value_parser = parse_agent_kind)]
+        kind: Option<nebula_core::AgentKind>,
     },
     /// Manage workspaces — named project groups. Each nebula instance has
     /// one open and scopes its project list (and `/` search) to it.
@@ -194,6 +222,7 @@ fn main() -> Result<()> {
             nebula_tui::run_rename(title.join(" "), mode)
         }
         Some(Command::Worktree { name, base }) => nebula_tui::run_worktree(name.join(" "), base),
+        Some(Command::Spawn { task, kind }) => nebula_tui::run_spawn(task.join(" "), kind),
         Some(Command::Browser {
             port,
             bind,

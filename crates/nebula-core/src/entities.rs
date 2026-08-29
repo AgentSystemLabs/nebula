@@ -135,9 +135,6 @@ pub struct Worktree {
     pub path: PathBuf,
     pub branch: String,
     pub is_main: bool,
-    /// Pinned worktrees sort into their own PINNED group in the worktrees list.
-    #[serde(default)]
-    pub pinned: bool,
     pub sort_order: i64,
 }
 
@@ -152,9 +149,6 @@ pub struct Agent {
     /// this field existed). Orders the ARCHIVED group newest-first.
     #[serde(default)]
     pub archived_at: i64,
-    /// Pinned agents sort into their own PINNED group in the sessions list.
-    #[serde(default)]
-    pub pinned: bool,
     /// Finished a turn (running or needs-feedback → finished) that no client
     /// has looked at since. The Projects and Worktrees rows count these so
     /// the user knows how many terminals to go read; the pane landing on

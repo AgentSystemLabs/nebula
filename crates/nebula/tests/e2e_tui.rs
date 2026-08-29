@@ -308,13 +308,26 @@ fn row_is_selected(screen: &vt100::Screen, needle: &str) -> bool {
                 line.push_str(contents);
             }
         }
-        if line.contains(needle) {
+        if let Some(at) = line.find(needle) {
             // Selection paints the row with the raised fill: indexed 237 in
             // the focused panel, 235 in unfocused ones (theme sel_bg /
-            // sel_bg_dim).
-            let filled = (0..cols).any(|col| {
+            // sel_bg_dim). Only the needle's own panel band counts — the
+            // panels share screen lines, and a selected pill in the next
+            // column over used to pass this check for a row it had nothing
+            // to do with.
+            let at = line[..at].chars().count();
+            let chars: Vec<char> = line.chars().collect();
+            let band_start = chars[..at]
+                .iter()
+                .rposition(|&c| c == '│')
+                .map_or(0, |i| i + 1);
+            let band_end = chars[at..]
+                .iter()
+                .position(|&c| c == '│')
+                .map_or(chars.len(), |i| at + i);
+            let filled = (band_start..band_end).any(|col| {
                 matches!(
-                    screen.cell(row, col).map(|c| c.bgcolor()),
+                    screen.cell(row, col as u16).map(|c| c.bgcolor()),
                     Some(vt100::Color::Idx(237)) | Some(vt100::Color::Idx(235))
                 )
             });
@@ -508,11 +521,13 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(CTRL_Q); // back to panels
     tui.wait_for_text(FOOTER_SESSIONS);
 
-    // ---- sessions are per-worktree: feat-b has no agent-1 ----
+    // ---- sessions are per-worktree: main has no agent-1 ----
+    // feat-a is the only stamped worktree now, so RECENCY ORDER has it on
+    // top: [feat-a, main, feat-b]. j from it lands on the root checkout.
     tui.send(LEFT); // back to Worktrees (feat-a still selected)
     tui.wait_for_text(FOOTER_WORKTREES);
-    tui.send(b"j"); // feat-b
-    tui.wait_for_selected("feat-b");
+    tui.send(b"j"); // main
+    tui.wait_for_selected("main ⌂ root");
     tui.wait_for_sessions_row_gone("agent-1");
     tui.send(b"k"); // back to feat-a
     tui.wait_for_selected("feat-a");

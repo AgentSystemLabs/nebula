@@ -576,7 +576,6 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[New]), "new worktree (PR row: Claude)"),
                         (Act(&[GitDiff]), "git diff (^r: mark reviewed ✓)"),
                         (Act(&[OpenRepo]), "open the repo on GitHub"),
-                        (Act(&[Pin]), "pin / unpin"),
                         (Act(&[Delete, DeleteAll]), "delete one / delete all"),
                     ],
                 ),
@@ -599,7 +598,6 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[NewTerminal]), "new shell terminal"),
                         (Act(&[Activate]), "attach session / open link"),
                         (Act(&[Rename]), "rename agent / edit link URL"),
-                        (Act(&[Pin]), "pin / unpin"),
                         (
                             Act(&[Archive, Unarchive, ToggleArchived]),
                             "archive / unarchive / show",
@@ -2731,10 +2729,6 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // Group headers only appear once something is pinned; otherwise the
-    // list stays flat (same idiom as the sessions panel).
-    let (pinned_count, _) = app.worktree_group_counts();
-    let grouped = pinned_count > 0;
     let dim = Style::default().fg(th.dim);
 
     // ---- lay the column out in virtual rows ----
@@ -2751,19 +2745,12 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         layout.push((*vrow, e));
         *vrow += h;
     };
-    if grouped {
-        header(&mut layout, &mut vrow, "PINNED".into());
-    }
     for i in 0..worktrees.len() {
-        if grouped && i == pinned_count {
-            header(&mut layout, &mut vrow, "UNPINNED".into());
-        }
         layout.push((vrow, WorktreeEntry::Row(i)));
         vrow += PILL_H as usize;
         // An extra quiet row separates the main checkout from the true
-        // worktrees below; group headers take over once something is
-        // pinned.
-        if !grouped && worktrees[i].1 && worktrees.len() > 1 {
+        // worktrees below.
+        if worktrees[i].1 && worktrees.len() > 1 {
             vrow += 1;
         }
     }
@@ -2966,8 +2953,7 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
             inner,
         );
     }
-    let (pinned_count, recent_count, unpinned_count, archived_count) = app.session_group_counts();
-    let active_count = pinned_count + recent_count + unpinned_count;
+    let (active_count, archived_count) = app.session_group_counts();
     let terminal_count = rows
         .iter()
         .filter(|r| matches!(r, SessionRow::Terminal(_)))
@@ -2996,38 +2982,9 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
             }
         };
 
-    // Group headers only appear once something is pinned or recent;
-    // otherwise the list stays flat with no group header.
-    let grouped = pinned_count > 0 || recent_count > 0;
-    if pinned_count > 0 {
-        header(
-            &mut layout,
-            &mut vrow,
-            SessionEntry::Header("PINNED".into()),
-        );
-        push_rows(&mut layout, &mut vrow, 0, pinned_count);
-    }
-    if recent_count > 0 {
-        header(
-            &mut layout,
-            &mut vrow,
-            SessionEntry::Header("RECENT".into()),
-        );
-        push_rows(&mut layout, &mut vrow, pinned_count, recent_count);
-    }
-    if grouped && unpinned_count > 0 {
-        header(
-            &mut layout,
-            &mut vrow,
-            SessionEntry::Header("UNPINNED".into()),
-        );
-    }
-    push_rows(
-        &mut layout,
-        &mut vrow,
-        pinned_count + recent_count,
-        unpinned_count,
-    );
+    // The live agents are one flat list with no header of its own — the
+    // headers below name what *isn't* an agent.
+    push_rows(&mut layout, &mut vrow, 0, active_count);
     if terminal_count > 0 {
         header(
             &mut layout,
@@ -3265,15 +3222,16 @@ fn draw_session_row(
 }
 
 /// The pull-request reading pane. Replaces the session view while the
-/// Worktrees cursor rests on an open-PR row: headline, description, then
-/// the conversation, scrolled by `pr_preview_scroll`.
+/// Worktrees cursor rests on an open-PR row, or the focused Sessions cursor
+/// on the PR ROW (`App::previewed_pr`): headline, description, then the
+/// conversation, scrolled by `pr_preview_scroll`.
 ///
 /// The line count is written back to `app.pr_preview_lines` so the scroll
 /// handlers know how far down they may go — the pane is the only thing that
 /// knows how wide the prose wrapped.
 fn draw_pr_preview(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     let th = app.theme;
-    let Some(pr) = app.selected_worktree_pr().cloned() else {
+    let Some(pr) = app.previewed_pr() else {
         return;
     };
     let detail = app.pr_detail.get(&pr.url).cloned();
@@ -3318,7 +3276,7 @@ fn draw_pr_preview(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         let row = |text: &str, style: Style| Line::from(Span::styled(format!(" {text}"), style));
         let mut lines = vec![Line::from("")];
         lines.extend(
-            crate::pr_preview::wrap(&pr.label(), w)
+            crate::pr_preview::wrap(&pr.label, w)
                 .iter()
                 .map(|t| row(t, Style::default().fg(th.muted))),
         );
@@ -3415,10 +3373,12 @@ fn titled_frame(
 fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Terminal;
-    // The Worktrees cursor is resting on an open pull request: the pane
-    // reads it. The attachment underneath stays live — walking down into
-    // the OPEN PRS group and back must not churn detach/attach.
-    if app.selected_worktree_pr().is_some() {
+    // A cursor is resting on an open pull request — the Worktrees cursor
+    // on a PROJECT OPEN PRS GROUP row, or the focused Sessions cursor on
+    // the PR ROW: the pane reads it. The attachment underneath stays live —
+    // walking down into either OPEN PRS group and back must not churn
+    // detach/attach.
+    if app.previewed_pr().is_some() {
         draw_pr_preview(f, app, area, focused);
         return;
     }
@@ -3823,25 +3783,26 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::Help)
             ),
             Focus::Worktrees => format!(
-                "{}: new worktree  {}: terminal  {}: pin  {}: delete  {}: search  {}: menu  {}: help",
+                "{}: new worktree  {}: terminal  {}: delete  {}: search  {}: menu  {}: help",
                 k(Action::New),
                 k(Action::NewTerminal),
-                k(Action::Pin),
                 k(Action::Delete),
                 k(Action::Palette),
                 k(Action::ContextMenu),
                 k(Action::Help)
             ),
-            // A discovered pull request only opens; it has no stored row to
-            // edit or delete. Previously saved rows retain those two verbs.
+            // A discovered pull request opens, reads in the pane and shows
+            // its diff; it has no stored row to edit or delete. Previously
+            // saved rows retain those two verbs.
             Focus::Sessions
                 if app
                     .selected_link()
                     .is_some_and(|row| row.id().is_none()) =>
             {
                 format!(
-                    "{}: open in browser  {}: menu  {}: help",
+                    "{}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: menu  {}: help",
                     k(Action::Activate),
+                    k(Action::GitDiff),
                     k(Action::ContextMenu),
                     k(Action::Help)
                 )
@@ -4640,9 +4601,8 @@ mod tests {
     }
 
     /// A test tree: one project, `branches` as its worktrees (the first is
-    /// the root checkout), `agents` under the first worktree — pinned ones
-    /// as `(name, true)`.
-    fn hit_test_app(branches: &[&str], agents: &[(&str, bool)]) -> App {
+    /// the root checkout), `agents` and `terminals` under the first worktree.
+    fn hit_test_app(branches: &[&str], agents: &[&str], terminals: &[&str]) -> App {
         use nebula_core::{Agent, AgentId, AgentStatus, Project, ProjectId, Worktree, WorktreeId};
         let mut app = App::new();
         let project_id = ProjectId("p1".into());
@@ -4660,11 +4620,10 @@ mod tests {
                 path: format!("/tmp/{branch}").into(),
                 branch: (*branch).into(),
                 is_main: i == 0,
-                pinned: false,
                 sort_order: i as i64,
             });
         }
-        for (i, (name, pinned)) in agents.iter().enumerate() {
+        for (i, name) in agents.iter().enumerate() {
             app.tree.agents.push(Agent {
                 id: AgentId(format!("a{i}")),
                 worktree_id: WorktreeId("w0".into()),
@@ -4672,7 +4631,6 @@ mod tests {
                 status: AgentStatus::Fresh,
                 archived: false,
                 archived_at: 0,
-                pinned: *pinned,
                 unseen: false,
                 status_changed_at: 0,
                 kind: nebula_core::AgentKind::Claude,
@@ -4685,6 +4643,15 @@ mod tests {
                 cloud_mirroring: false,
             });
         }
+        for (i, name) in terminals.iter().enumerate() {
+            app.tree.terminals.push(nebula_core::TerminalTab {
+                id: nebula_core::TerminalId(format!("t{i}")),
+                worktree_id: WorktreeId("w0".into()),
+                name: (*name).into(),
+                sort_order: i as i64,
+                alive: false,
+            });
+        }
         app
     }
 
@@ -4695,7 +4662,7 @@ mod tests {
     /// drawn — must still hit the pill, not the panel background.
     #[test]
     fn worktree_pills_are_clickable_over_their_whole_height() {
-        let mut app = hit_test_app(&["main", "feature", "other"], &[]);
+        let mut app = hit_test_app(&["main", "feature", "other"], &[], &[]);
         let area = Rect::new(0, 0, 30, 20);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 20)).unwrap();
@@ -4730,24 +4697,23 @@ mod tests {
     /// a header under it instead of another pill, and keeps its bottom pad.
     #[test]
     fn session_pills_are_clickable_over_their_whole_height() {
-        let mut app = hit_test_app(&["main"], &[("pinned-one", true), ("plain", false)]);
+        let mut app = hit_test_app(&["main"], &["agent"], &["shell"]);
         let area = Rect::new(0, 0, 30, 20);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 20)).unwrap();
         terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
 
-        // PINNED header at 3, its pill at 4..=6 (the "blank" row above
-        // the next header is that pill's bottom pad), UNPINNED header at
-        // 7, its pill at 8..=10.
+        // The agent has no header: its pill at 3..=5 (the "blank" row above
+        // the next header is that pill's bottom pad), TERMINALS header at
+        // 6, the terminal's pill at 7..=9.
         let at = |y: u16| app.hit_at(1, y);
-        assert_eq!(at(3), Some(HitTarget::PanelBg(Focus::Sessions)), "header");
-        for y in 4..=6 {
-            assert_eq!(at(y), Some(HitTarget::Session(0)), "pinned row y={y}");
+        for y in 3..=5 {
+            assert_eq!(at(y), Some(HitTarget::Session(0)), "agent row y={y}");
         }
-        assert_eq!(at(7), Some(HitTarget::PanelBg(Focus::Sessions)), "header");
-        for y in 8..=10 {
-            assert_eq!(at(y), Some(HitTarget::Session(1)), "unpinned row y={y}");
+        assert_eq!(at(6), Some(HitTarget::PanelBg(Focus::Sessions)), "header");
+        for y in 7..=9 {
+            assert_eq!(at(y), Some(HitTarget::Session(1)), "terminal row y={y}");
         }
-        assert_eq!(at(11), Some(HitTarget::PanelBg(Focus::Sessions)));
+        assert_eq!(at(10), Some(HitTarget::PanelBg(Focus::Sessions)));
     }
 }

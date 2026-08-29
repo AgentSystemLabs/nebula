@@ -2699,46 +2699,6 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     };
     let term_id = term_id.clone();
 
-    // A pinned agent: idle and unwatched like the idler, but marked "never
-    // kill" (schedules and background jobs are invisible to the status
-    // machine, so pinning is the user's protection).
-    write_frame(
-        &mut c,
-        &ClientRequest::CreateAgent {
-            req_id: 4,
-            worktree: worktree.id.clone(),
-            name: "keeper".into(),
-            kind: AgentKind::Claude,
-            model: None,
-            effort: None,
-            auto_title: false,
-            cloud_prompt: None,
-            starting_prompt: None,
-        },
-    )
-    .await
-    .unwrap();
-    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 4).is_some()).await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Agent(pinned_id)),
-        ..
-    } = find_ack(&events, 4).unwrap()
-    else {
-        panic!("CreateAgent failed: {events:#?}");
-    };
-    let pinned_id = pinned_id.clone();
-    write_frame(
-        &mut c,
-        &ClientRequest::SetAgentPinned {
-            req_id: 5,
-            id: pinned_id.clone(),
-            pinned: true,
-        },
-    )
-    .await
-    .unwrap();
-    read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 5).is_some()).await;
-
     // Give the terminal a running command, then stop looking at anything.
     let term_sref = SessionRef::Terminal(term_id.clone());
     write_frame(
@@ -2778,21 +2738,14 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
         })
     })
     .await;
-    // …while the terminal's sleep and the keeper's pin keep them alive.
+    // …while the terminal's sleep keeps it alive.
     let term_reaped = |evs: &[ServerEvent]| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Terminal(t) }
                 if t.id == term_id && !t.alive)
         })
     };
-    let pinned_reaped = |evs: &[ServerEvent]| {
-        evs.iter().any(|e| {
-            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
-                if a.id == pinned_id && !a.alive)
-        })
-    };
     assert!(!term_reaped(&events), "busy terminal spared: {events:#?}");
-    assert!(!pinned_reaped(&events), "pinned agent spared: {events:#?}");
 
     // Attaching revives the agent; an attached session then idles forever.
     let agent_sref = SessionRef::Agent(agent_id.clone());
@@ -2837,10 +2790,6 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     assert!(
         !term_reaped(&events),
         "in-view terminal spared: {events:#?}"
-    );
-    assert!(
-        !pinned_reaped(&events),
-        "pinned agent still spared: {events:#?}"
     );
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
@@ -3400,6 +3349,139 @@ async fn subscribe(c: &mut UnixStream) -> Vec<ServerEvent> {
             .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
     .await
+}
+
+/// `nebula spawn "<task>"` from inside a session, end to end over real
+/// processes: the CLI (what the model runs) makes the daemon start a second
+/// agent in the caller's worktree — booted at once, on the default name so
+/// AUTO-TITLE applies, matching the caller's harness unless `--kind` names
+/// another — while the caller's own process is left alone. The task itself
+/// reaches argv only outside `NEBULA_AGENT_CMD`, so it is covered by the
+/// registry's argv unit tests, not here.
+#[tokio::test]
+async fn nebula_spawn_cli_starts_a_sibling_session_in_the_same_worktree() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let env_dir = env.tmp.path().join("agent-env");
+    std::fs::create_dir_all(&env_dir).unwrap();
+    // Stand-in CLI: record every boot by agent id, then park.
+    let script = env.tmp.path().join("agent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nenv | grep '^NEBULA_' > '{d}'/$NEBULA_AGENT_ID.env\nexec sleep 600\n",
+            d = env_dir.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&script);
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    subscribe(&mut c).await;
+    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: main_worktree.id.clone(),
+            name: "agent-1".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(caller)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let caller = caller.clone();
+    read_env_file(&env_dir.join(format!("{}.env", caller.0))).await;
+
+    // The model obeys the guidance — `nebula spawn fix the login redirect`
+    // (the words join) with the session's env.
+    let out = agent_cli(&env, &caller, &["spawn", "fix", "the", "login", "redirect"]);
+    assert!(out.status.success(), "nebula spawn failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("started a new session") && stdout.contains("carry on"),
+        "stdout: {stdout}"
+    );
+
+    // A second row, in the caller's worktree, on the default name, live.
+    let sibling_of = |evs: &[ServerEvent], kind: AgentKind| {
+        evs.iter().find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            } if a.id != caller
+                && a.worktree_id == main_worktree.id
+                && a.kind == kind
+                && a.alive =>
+            {
+                Some(a.clone())
+            }
+            _ => None,
+        })
+    };
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        sibling_of(evs, AgentKind::Claude).is_some()
+    })
+    .await;
+    let sibling = sibling_of(&events, AgentKind::Claude).unwrap();
+    assert_eq!(sibling.name, "agent-2", "the first free default name");
+    // …and its CLI really booted (the stub logged its own env).
+    let sibling_env = read_env_file(&env_dir.join(format!("{}.env", sibling.id.0))).await;
+    assert_eq!(sibling_env[env::AGENT_ID], sibling.id.0);
+    // The caller was never respawned: still its one boot.
+    assert_eq!(
+        std::fs::read_dir(&env_dir).unwrap().count(),
+        2,
+        "exactly two boots: the caller's and the sibling's"
+    );
+
+    // `--kind` picks another harness (the stub stands in for every CLI).
+    let out = agent_cli(
+        &env,
+        &caller,
+        &["spawn", "--kind", "codex", "run the tests"],
+    );
+    assert!(out.status.success(), "nebula spawn --kind failed: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("new codex session"),
+        "stdout names the harness"
+    );
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        sibling_of(evs, AgentKind::Codex).is_some()
+    })
+    .await;
+    assert_eq!(
+        sibling_of(&events, AgentKind::Codex).unwrap().name,
+        "agent-3"
+    );
+
+    // A bad harness name and a blank task are the CLI's own refusals.
+    let out = agent_cli(&env, &caller, &["spawn", "--kind", "gemini", "x"]);
+    assert!(!out.status.success(), "unknown harness must fail: {out:?}");
+    let out = agent_cli(&env, &caller, &["spawn", "   "]);
+    assert!(!out.status.success(), "blank task must fail: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("task is empty"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = daemon.kill();
 }
 
 /// Run the `nebula` CLI the way a hook would inside an agent session: the

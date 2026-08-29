@@ -319,9 +319,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         reply_done(&out_tx, req_id, daemon.delete_worktree(&id, force).await).await;
                     });
                 }
-                ClientRequest::SetWorktreePinned { req_id, id, pinned } => {
-                    reply_done(&out_tx, req_id, daemon.set_worktree_pinned(&id, pinned)).await;
-                }
                 ClientRequest::CreateAgent {
                     req_id,
                     worktree,
@@ -459,6 +456,35 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 } => {
                     reply_done(&out_tx, req_id, daemon.move_agent(&id, &worktree)).await;
                 }
+                ClientRequest::SpawnSiblingAgent {
+                    req_id,
+                    id,
+                    kind,
+                    starting_prompt,
+                } => {
+                    // Logged by mode only — never the prompt text.
+                    let result = daemon
+                        .spawn_sibling_agent(&id, kind, &starting_prompt)
+                        .await;
+                    match &result {
+                        Ok(nebula_core::EntityId::Agent(agent)) => tracing::info!(
+                            req_id,
+                            agent = %agent,
+                            spawned_by = %id,
+                            launch_mode = "sibling",
+                            "agent session spawned"
+                        ),
+                        Err(error) => tracing::warn!(
+                            req_id,
+                            error = %error,
+                            spawned_by = %id,
+                            launch_mode = "sibling",
+                            "agent session spawn failed"
+                        ),
+                        Ok(_) => unreachable!("SpawnSiblingAgent returned a non-agent id"),
+                    }
+                    reply(&out_tx, req_id, result.map(Some)).await;
+                }
                 ClientRequest::EnterWorktree {
                     req_id,
                     id,
@@ -483,9 +509,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientRequest::UnarchiveAgent { req_id, id } => {
                     reply_done(&out_tx, req_id, daemon.unarchive_agent(&id)).await;
-                }
-                ClientRequest::SetAgentPinned { req_id, id, pinned } => {
-                    reply_done(&out_tx, req_id, daemon.set_agent_pinned(&id, pinned)).await;
                 }
                 ClientRequest::DeleteAgent { req_id, id } => {
                     reply_done(&out_tx, req_id, daemon.delete_agent(&id)).await;
