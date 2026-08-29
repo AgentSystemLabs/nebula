@@ -143,6 +143,16 @@ Refined prompt:
 > <the rewrite, verbatim>
 ```
 
+Then run the RECALL HOOK on it — the hook already ran on the *raw* prompt, before the aliases became
+TERMS, so the refined prompt can reach entries the raw one could not:
+
+```
+python3 .claude/hooks/recall.py --diff "<the user's original prompt>" "<the rewrite>"
+```
+
+It prints only the `[nebula recall]` entries and STANDING GOTCHAS the rewrite adds (nothing when there
+are none); read them as you would the injection under `[nebula recall]`.
+
 That is the only output before the work starts. **Do not ask whether it is right.** Do not offer to
 change it, do not list what you assumed separately (the assumptions are in the prompt, in parentheses),
 and do not wait. The rewrite is now the user's prompt: work from it exactly as if it had been the first

@@ -52,7 +52,7 @@ DEV_ENV = NEBULA_RUNTIME_DIR=$(DEV_RUNTIME) NEBULA_DATA_DIR=$(DEV_DATA) \
 	$(if $(AGENT),NEBULA_AGENT_CMD=$(AGENT))
 
 .DEFAULT_GOAL := help
-.PHONY: help dev browser dev-prep dev-seed dev-reset dev-ls dev-stop build install kill prune cycle check fmt lint test memory-check ci clean
+.PHONY: help dev browser dev-prep dev-seed dev-reset dev-ls dev-stop build install kill prune cycle check fmt lint test memory-check recall-eval terms-check ci clean
 
 help: ## Show this help
 	@grep -hE '^[a-z][a-z-]*:.*?## ' $(MAKEFILE_LIST) \
@@ -217,8 +217,16 @@ test: ## Full test suite (e2e_pty spawns real daemons — slow)
 memory-check: ## The MEMORY LOG's always-loaded layer stays under its caps and its index matches its entries
 	python3 .claude/memory/check.py
 
-ci: ## The whole gate: memory-check, fmt check, clippy, tests
+recall-eval: ## The RECALL HOOK still finds each entry from its own prompt and the curated pairs (no regression vs recall_baseline.json)
+	python3 .claude/memory/recall_eval.py
+
+terms-check: ## TERMS.md has no stale Where pointers or dangling aliases; reports dead TERMS, merge pairs and overdue candidates
+	python3 .claude/memory/terms_check.py
+
+ci: ## The whole gate: memory-check, recall-eval, terms-check, fmt check, clippy, tests
 	@$(MAKE) --no-print-directory memory-check
+	@$(MAKE) --no-print-directory recall-eval
+	@$(MAKE) --no-print-directory terms-check
 	cargo fmt --all -- --check
 	@$(MAKE) --no-print-directory lint
 	@$(MAKE) --no-print-directory test

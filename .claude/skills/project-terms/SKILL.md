@@ -1,6 +1,6 @@
 ---
 name: project-terms
-description: "Keep TERMS.md — nebula's shared glossary of ALL-CAPS canonical names for its features, panels, keys, CLI commands, hook routes, daemon mechanisms, statuses and dev workflows — true after a task. Use at the end of every task, right after nebula-memory. Every run detects the vocabulary the task surfaced; only a concept that has recurred across separate tasks is promoted to a TERM, the rest wait in the Candidates ledger. Aliases the user typed for an existing TERM, renames, and retirements land immediately. Also use when the user says \"add this to terms\", \"what do we call this\", \"name this\", \"promote this\", or \"update the glossary\"."
+description: "Keep TERMS.md — nebula's shared glossary of ALL-CAPS canonical names for its features, panels, keys, CLI commands, hook routes, daemon mechanisms, statuses and dev workflows — true after a task. Use at the end of every task, right after nebula-memory. Every run detects the vocabulary the task surfaced and runs terms_check.py to prune: only a concept that has recurred across separate tasks is promoted to a TERM, the rest wait in the Candidates ledger; dead TERMS, merge pairs, stale pointers and overdue candidates are merged, retired or pruned with --merge / --retire / --prune. Aliases the user typed for an existing TERM, renames, and retirements land immediately. Also use when the user says \"add this to terms\", \"what do we call this\", \"name this\", \"promote this\", or \"update the glossary\"."
 user-invocable: true
 ---
 
@@ -48,8 +48,9 @@ These are not gated, because they are not guesses:
 - **A TERM changed its name or meaning.** A status was renamed, a badge's wording changed, a key moved,
   a mechanism was superseded. Edit the existing row in place — never leave the old definition standing
   next to the new one.
-- **A TERM's thing was removed.** Move its row to **Retired** with the date and what replaced it, so old
-  prompts and old MEMORY LOG entries stay readable.
+- **A TERM's thing was removed.** `terms_check.py --retire A [--into B]` moves its row to **Retired**
+  with the date and what replaced it (and repoints every reference), so old prompts and old MEMORY LOG
+  entries stay readable.
 - **A *Where* cell went stale.** The symbol moved or was renamed; fix the pointer.
 
 ## What waits: new TERMS
@@ -82,12 +83,40 @@ Every run, walk the ledger once:
 2. **Promote** any candidate whose *Seen* now holds sightings from two or more separate tasks. Write the
    full row in the section it belongs to (format below), carry the candidate's aliases into *Also
    called* and the **Alias index**, and delete the ledger row.
-3. **Prune** any candidate whose only sighting is older than 30 days — `date +%F` for today, compare
-   against the row — or whose thing has been removed. Delete the row; do not retire it (it was never a
-   TERM).
+3. **Prune** any candidate whose only sighting is older than 30 days, or whose thing has been removed —
+   `terms_check.py --prune` does the first (it knows today's date); delete the second by hand. Do not
+   retire a candidate; it was never a TERM.
 
 If a candidate's thing was already removed before it ever recurred, that is the system working: a name
 that never got a second use was not vocabulary.
+
+## Prune and merge with `terms_check.py`
+
+`python3 .claude/memory/terms_check.py` (`make terms-check`, part of `make ci`) reads the glossary
+against everything that speaks it — the MEMORY LOG, `CLAUDE.md`, README, the skills, code comments —
+and reports what to act on. Run it every time this skill runs, after the sightings, and **act on the
+report yourself; do not just relay it.** Each line has a rule:
+
+| Report line | Rule | Do |
+|---|---|---|
+| `stale` — a `Where` pointer no longer greps | fix now, always | grep the symbol's new home and edit the cell |
+| `dangling` — an Alias-index target names no row | fix now, always | point it at the row it means, or delete the alias row |
+| `overdue` — a candidate past 30 days · `unmentioned` — a Retired row nothing in `.claude/memory/` says | delete, always | `terms_check.py --prune` |
+| `dead` — never written in caps outside `TERMS.md` | retire if its thing is gone or its `Where` is stale; merge if another row already says what it says; **otherwise leave it** — a live feature nobody has discussed yet is not noise | `--retire A` · `--merge A --into B` |
+| `once` | same rule as `dead`, weaker evidence — act only when the merge target is obvious | `--merge A --into B` |
+| `merge?` — A is only ever said on lines that also say B | merge when B's row already covers A's meaning, or A is B's internal state / data (PENDING ACTION → CONFIRM DIALOG, METRICS SNAPSHOT → MEMORY MODAL); keep two rows when the user could mean one without the other (CHORD vs KEYMAP, HANDSHAKE vs VERSION SKEW) | `--merge A --into B` |
+| `collide` — an alias shared by 3+ TERMS | keep only a deliberate ambiguity ("done", the status colors); otherwise leave the alias on the one TERM the user meant and remove it from the others | edit the rows and the Alias index |
+
+`--merge A --into B` and `--retire A [--into B]` move A's row to Retired, make A's name and aliases
+aliases of B, and rewrite every reference — the Alias index, other rows' cross-references, the MEMORY
+LOG index cells, the `**A**` keys in `gotchas.md` — then run RECALL EVAL and refuse the change if
+retrieval dropped. A merge prints A's meaning: fold it into B's row by hand if B does not already say
+it, and keep B to two sentences. `--dry-run` shows the plan first; `git checkout TERMS.md
+.claude/MEMORY.md .claude/memory/gotchas.md` undoes a write. Entry files are never rewritten — a
+Retired row is what keeps the old name readable in them.
+
+Merges and retirements are glossary edits like any other: name them in the one-line confirmation
+(step 6), and note why in the MEMORY LOG entry when the reason was a judgment call.
 
 ## The format of a TERM
 
@@ -133,11 +162,15 @@ order a user meets them, not alphabetical), and add or update the row in the **A
    - the task renamed, removed, or moved it → edit the row, retire it, or fix *Where* (immediate).
 3. **Walk the ledger** — sightings, promotions, pruning — per the section above. Get today's date with
    `date +%F`; do not guess it.
-4. **Update the Alias index** for every alias you added or promoted.
-5. **Reread the rows you touched** once, as the next agent would: can they tell what it is, what the
+4. **Run `python3 .claude/memory/terms_check.py`** and act on every line per "Prune and merge with
+   `terms_check.py`": `--prune` what is overdue or unmentioned, fix what is stale or dangling, and
+   `--merge` / `--retire` what the rules say — leave the rest.
+5. **Update the Alias index** for every alias you added or promoted.
+6. **Reread the rows you touched** once, as the next agent would: can they tell what it is, what the
    user calls it, and where to grep, from that row alone?
-6. **Confirm to the user in one line**, in the TERMS themselves: TERMS promoted / changed / retired (by
-   name), candidates added (by name), aliases recorded — or "no glossary changes" when nothing moved.
+7. **Confirm to the user in one line**, in the TERMS themselves: TERMS promoted / changed / retired /
+   merged (by name), candidates added or pruned (by name), aliases recorded — or "no glossary changes"
+   when nothing moved.
    Most runs record a sighting or an alias and promote nothing; that is the expected outcome, not a
    failure to find something.
 
@@ -146,7 +179,7 @@ order a user meets them, not alphabetical), and add or update the row in the **A
 `TERMS.md` is read at the start of every session alongside `.claude/MEMORY.md` and
 `.claude/memory/gotchas.md`, so it has to stay scannable.
 Keep meanings to two sentences. When a section grows past what fits on one screen, tighten rows before
-adding more — merge a TERM that is only ever said together with another into that other's row. Retired
-TERMS get one line each; prune them when nothing under `.claude/memory/` mentions them any more (`grep -rl` it). The Candidates
-ledger should stay under about twenty rows: if it is longer, you are sighting helpers, not vocabulary —
-prune harder and ledger less.
+adding more — `terms_check.py` names the merge pairs (`merge?`) and the TERMS nobody says (`dead`,
+`once`); `--merge` folds one into the other. Retired TERMS get one line each and `--prune` drops them
+once nothing under `.claude/memory/` mentions them. The Candidates ledger should stay under about twenty
+rows: if it is longer, you are sighting helpers, not vocabulary — prune harder and ledger less.

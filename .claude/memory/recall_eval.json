@@ -1,0 +1,97 @@
+[
+  {
+    "prompt": "did the auto name break?",
+    "expect": "*version-skew*",
+    "why": "measured miss on 2026-08-28: got PR ROW entries instead of the skew entry"
+  },
+  {
+    "prompt": "sessions are still just named agent-1 agent-2 after I prompt them",
+    "expect": "*version-skew*",
+    "why": "the user's words for VERSION SKEW"
+  },
+  {
+    "prompt": "commit push release",
+    "expect": "*release*",
+    "why": "measured miss on 2026-08-28: 0 entries for the RELEASE SKILL trigger"
+  },
+  {
+    "prompt": "the stop gate turns green while subagents run",
+    "expect": "*background-subagents*",
+    "why": "recall.py's own docstring example"
+  },
+  {
+    "prompt": "do this in a worktree",
+    "expect": "*do-this-in-a-worktree*",
+    "why": "must reach the nebula worktree entry, not EnterWorktree"
+  },
+  {
+    "prompt": "spin up another session to fix the tests",
+    "expect": "*nebula-spawn*",
+    "why": "NEBULA SPAWN in the user's words"
+  },
+  {
+    "prompt": "the selected pill has black corners",
+    "expect": "*black-notches*",
+    "why": "issue #6 in different words"
+  },
+  {
+    "prompt": "new sessions don't pick up my zshrc",
+    "expect": "*login-shell*",
+    "why": "paraphrase of the login-shell entry"
+  },
+  {
+    "prompt": "the settings modal forgot which setting I was on",
+    "expect": "*settings-position-memory*",
+    "why": "paraphrase"
+  },
+  {
+    "prompt": "control shift l should stop at the claude pane and lock it",
+    "expect": "*panel-walk-stops*",
+    "why": "PANEL WALK edge in the user's words"
+  },
+  {
+    "prompt": "cmd+p in claude just pastes a pi character",
+    "expect": "*cmd-p-never-reaches*",
+    "why": "paraphrase"
+  },
+  {
+    "prompt": "two nebula instances switch workspaces together",
+    "expect": "*workspaces-are-per-instance*",
+    "why": "paraphrase"
+  },
+  {
+    "prompt": "when I cancel claude the status stays yellow",
+    "expect": "*cancelling-claude*",
+    "why": "paraphrase"
+  },
+  {
+    "prompt": "the palette should show the sessions that need me first",
+    "expect": "*palette-sorts-by-attention*",
+    "why": "paraphrase"
+  },
+  {
+    "prompt": "yes do it thanks, looks good to me",
+    "expect": null,
+    "why": "chatter must inject nothing"
+  },
+  {
+    "prompt": "ok now make it faster and cleaner",
+    "expect": null,
+    "why": "chatter must inject nothing"
+  },
+  {
+    "prompt": "I think that's everything, nice work",
+    "expect": null,
+    "why": "chatter must inject nothing"
+  },
+  {
+    "prompt": "sounds good, go ahead with the second option",
+    "expect": null,
+    "why": "a reply to a question must inject nothing"
+  },
+  {
+    "prompt": "can you explain what you just changed and why?",
+    "expect": null,
+    "why": "a question about the turn must inject nothing"
+  }
+]

@@ -12,25 +12,26 @@ import os
 import re
 import sys
 
+sys.dont_write_bytecode = True
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-TERM_ROW = re.compile(r"^\| \*\*([A-Z0-9][A-Z0-9 ./+'-]*?)\*\* \|")
+TERM_ROW = re.compile(r"^\| \*\*([A-Z0-9][^|*]*?)\*\* \|")
 ALIAS_ROW = re.compile(r'^\| ("[^|]*") \| ([A-Z0-9][^|]*?) \|\s*$')
 FILEISH = re.compile(r"\b[\w-]+\.(?:rs|toml|sh|py|json|mdc)\b")
 HEAD = re.compile(r"^# (.+?) — (\d{4}-\d{2}-\d{2})((?: → \d{2}-\d{2})?)\s*$", re.M)
 
 
 def load_terms():
-    names, aliases, alias_index = [], {}, False
+    sys.path.insert(0, os.path.join(ROOT, ".claude/hooks"))
+    from recall import resolve_targets
+    names, aliases, alias_rows, alias_index = [], {}, [], False
     for line in open(os.path.join(ROOT, "TERMS.md"), encoding="utf-8"):
         if line.startswith("## Alias index"):
             alias_index = True
         if alias_index:
             m = ALIAS_ROW.match(line)
             if m:
-                for t in re.split(r"\s*/\s*", m.group(2).strip()):
-                    for a in re.findall(r'"([^"]+)"', m.group(1)):
-                        if len(a) >= 4:
-                            aliases.setdefault(t.strip(), set()).add(a.lower())
+                alias_rows.append(([a.lower() for a in re.findall(r'"([^"]+)"', m.group(1)) if len(a) >= 4], m.group(2)))
             continue
         m = TERM_ROW.match(line)
         if m:
@@ -40,6 +41,9 @@ def load_terms():
                 for a in re.findall(r'"([^"]+)"', cells[2]):
                     if len(a) >= 4:
                         aliases.setdefault(names[-1], set()).add(a.lower())
+    for als, cell in alias_rows:
+        for t in resolve_targets(cell, names):
+            aliases.setdefault(t, set()).update(als)
     return sorted(set(names), key=len, reverse=True), aliases
 
 

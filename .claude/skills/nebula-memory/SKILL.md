@@ -82,6 +82,11 @@ Prepend one line directly under `## Index` in `.claude/MEMORY.md` (newest first)
   names a file finds the entry too.
 - **gotchas:** the bullet count in the entry.
 
+Then `python3 .claude/memory/recall_eval.py --entry <the entry file>`: it runs the RECALL HOOK on the
+entry's own **Asked** prompt and prints the rank the entry gets. `> 5` means a future prompt in those
+words will not be shown it — add the alias-reachable TERMS to the cell (or the user's word to
+`TERMS.md`) until it ranks. `make recall-eval` (part of `make ci`) gates the whole log the same way.
+
 If the index is at its cap, move the oldest lines (from the bottom) to `.claude/memory/archive.md` — same
 line shape, under its `## Archived index` header — until it fits. Do not delete index lines; the archive
 is still searched.

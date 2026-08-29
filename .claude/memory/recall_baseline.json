@@ -1,0 +1,7 @@
+{
+  "self_prompts": 104,
+  "self_top1": 70,
+  "self_top5": 92,
+  "curated": 19,
+  "curated_top5": 19
+}

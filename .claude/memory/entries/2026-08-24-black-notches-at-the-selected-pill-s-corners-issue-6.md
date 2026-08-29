@@ -17,7 +17,8 @@ glyph assertions in `event_loop.rs::pill_rail_spans_pads_and_sessions_match_work
   cleverer glyph. Options are: rail takes the full cell (chosen), or the fill takes it and the rail stops
   at the text row.
 - **The setting in the issue is the FOCUS TINT (`focus_tint`, "Focused panel tint"), not anything called "focus
-  terminal".** The notch has always been there — without the tint it's the terminal's own background
+  terminal".** (Since 2026-08-29 the tint is always on and the SETTING is gone — see
+  [The FOCUS TINT Is Always On And Its SETTING Is Gone].) The notch has always been there — without the tint it's the terminal's own background
   (`#282c34` on this user's Terminal.app) against `sel_bg` `#3a3a3a` and nearly invisible. `draw_focus_tint`
   only repaints cells whose `bg == Color::Reset`, so it turns exactly that stranded quarter near-black.
 - **Do not evaluate a TUI style change by reading code.** Mocking the four candidate geometries as PNGs
