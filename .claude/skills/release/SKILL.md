@@ -56,7 +56,10 @@ guess until a green run proves it.
 
 **When a test fails, prove whose fault it is before you decide.** Check out `origin/main` in the same
 worktree and run that same test: if it fails there too, it is pre-existing and not a release blocker —
-say so in your report rather than silently ignoring it. Two known-environmental patterns in this repo:
+say so in your report rather than silently ignoring it. Run that check in the *same* worktree (or in a
+SCRATCH WORKTREE with its **own** `CARGO_TARGET_DIR`): two worktrees built into one target dir share the
+`nebula` bin's unit hash, the base build overwrites `debug/nebula`, and every E2E run after it in the
+release worktree exercises `origin/main`'s binary until you `cargo clean -p` the workspace crates (v0.18.0). Two known-environmental patterns in this repo:
 
 - *Every* `e2e_tui`/`e2e_pty` test failing with "daemon did not come up … daemon.log: No such file or
   directory" is orphan-daemon starvation. Dozens of stale `target/debug/nebula daemon --foreground`

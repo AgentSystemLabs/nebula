@@ -271,7 +271,7 @@ previously saved links remain visible so the change does not discard data.
   revives on the next attach with its conversation resumed.
 - **Settings live in one JSON file** (`config.json`, beside the database), read fresh on each use by both
   the daemon and the TUI, so hand edits apply without a restart. `s` opens the settings overlay over the
-  same file: color theme, animations, focused-panel tint, whether the Workspaces bar, PROJECTS PANEL,
+  same file: color theme, animations, whether the Workspaces bar, PROJECTS PANEL,
   and WORKTREES PANEL are shown,
   editor, which agent CLIs the new-session menu offers (at least one stays on) and their default model
   and reasoning effort, the idle timeout, the done sound (`done_sound`: a ding
