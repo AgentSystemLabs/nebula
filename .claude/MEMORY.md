@@ -16,6 +16,7 @@ Line shape: `- DATE · [Title](memory/entries/DATE-slug.md) · TERMS: A; B · fi
 > `.claude/MEMORY.md` was split into this index plus per-entry files on 2026-08-28.
 
 ## Index
+- 2026-08-29 · [Released v0.21.0 — `cp` What Is Strictly Ahead, Merge What Moved Both Ways](memory/entries/2026-08-29-released-v0-21-0-cp-what-is-ahead-merge-what-moved-both-ways.md) · TERMS: RELEASE SKILL; CARRY SET; RELEASE WORKTREE; SHARED CHECKOUT; QUICK PROMPT FOCUS; MEMORY CHECK · files: gotchas.md; MEMORY.md; TERMS.md; config.rs · gotchas: 6
 - 2026-08-29 · [A QUICK PROMPT Launch No Longer Steals The TERMINAL PANE](memory/entries/2026-08-29-a-quick-prompt-launch-no-longer-steals-the-terminal-pane.md) · TERMS: QUICK PROMPT; FOCUS; TERMINAL PANE; LOCKED PANE; SETTING; AGENTS TAB · files: event_loop.rs; app.rs; config.rs · gotchas: 5
 - 2026-08-29 · [Released v0.20.0 — The CARRY SET Is What Differs From `origin/main`, Not What `git status` Lists](memory/entries/2026-08-29-released-v0-20-0-the-carry-set-is-what-differs-from-origin.md) · TERMS: RELEASE SKILL; CARRY SET; RELEASE WORKTREE; SHARED CHECKOUT; GUARD HOOK; RELEASE NOTES · files: guard.py; gotchas.md; Cargo.toml · gotchas: 4
 - 2026-08-29 · [`Tab` And `⇧Tab` Retarget One QUICK PROMPT Launch — Harness Or AGENT PRESET](memory/entries/2026-08-29-tab-and-shift-tab-retarget-one-quick-prompt-launch.md) · TERMS: QUICK PROMPT; AGENT PRESET; MODEL / EFFORT; CONTEXT MENU; PROMPT DIALOG; OVERLAY · files: quick_prompt.rs; preset_overlays.rs; event_loop.rs; ui.rs · gotchas: 5
