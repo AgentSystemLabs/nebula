@@ -16,6 +16,8 @@ Line shape: `- DATE · [Title](memory/entries/DATE-slug.md) · TERMS: A; B · fi
 > `.claude/MEMORY.md` was split into this index plus per-entry files on 2026-08-28.
 
 ## Index
+- 2026-08-29 · [`Tab` And `⇧Tab` Retarget One QUICK PROMPT Launch — Harness Or AGENT PRESET](memory/entries/2026-08-29-tab-and-shift-tab-retarget-one-quick-prompt-launch.md) · TERMS: QUICK PROMPT; AGENT PRESET; MODEL / EFFORT; CONTEXT MENU; PROMPT DIALOG; OVERLAY · files: quick_prompt.rs; preset_overlays.rs; event_loop.rs; ui.rs · gotchas: 5
+- 2026-08-29 · [`p` Opens A QUICK PROMPT That Launches An AGENT On What You Typed](memory/entries/2026-08-29-p-opens-a-quick-prompt-that-launches-an-agent-on-it.md) · TERMS: QUICK PROMPT; PROMPT DIALOG; OVERLAY; SETTINGS OVERLAY; KEYMAP; STARTING PROMPT · files: quick_prompt.rs; event_loop.rs; config.rs; keymap.rs · gotchas: 6
 - 2026-08-29 · [Released v0.19.0 — The RELEASE NOTES Span Pushed Commits, Not Just The Dirty Tree](memory/entries/2026-08-29-released-v0-19-0-notes-span-pushed-commits-too.md) · TERMS: RELEASE SKILL; RELEASE NOTES; RELEASE WORKTREE; SHARED CHECKOUT; GUARD HOOK; PROTOCOL VERSION · files: Cargo.toml; event_loop.rs; config.rs; e2e_tui.rs · gotchas: 4
 - 2026-08-29 · [`q` Asks Before It Quits The TUI](memory/entries/2026-08-29-q-asks-before-it-quits-the-tui.md) · TERMS: CONFIRM DIALOG; KEYMAP; TUI; LOCKED PANE; HOSTS HANDOFF; ESCAPE HATCH · files: event_loop.rs; app.rs; e2e_tui.rs · gotchas: 4
 - 2026-08-29 · [The FILE FINDER Closes Behind The EDITOR It Opens](memory/entries/2026-08-29-the-file-finder-closes-behind-the-editor-it-opens.md) · TERMS: FILE FINDER; SETTING; EDITOR; TREE BROWSER; CONFIG.JSON · files: config.rs; event_loop.rs · gotchas: 4
