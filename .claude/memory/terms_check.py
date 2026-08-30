@@ -3,7 +3,7 @@
 
 Report (default): what in `TERMS.md` is dead weight or broken —
   dead        TERMS never written in caps anywhere outside TERMS.md (entries, gotchas, index, CLAUDE.md,
-              README, skills, `//` comments), and TERMS said exactly once
+              README, docs/, skills, `//` comments), and TERMS said exactly once
   merge?      TERMS only ever said on a line that also says another TERM (the skill's merge rule)
   collide     aliases shared by 3+ TERMS (they carry no signal for the RECALL HOOK)
   stale       `Where` cells whose file or symbol no longer greps            [CI fails]
@@ -120,6 +120,9 @@ def corpus_lines():
              os.path.join(ROOT, "AGENTS.md")]
     if os.path.isdir(ENTRIES):
         files += [os.path.join(ENTRIES, n) for n in sorted(os.listdir(ENTRIES)) if n.endswith(".md")]
+    docs = os.path.join(ROOT, "docs")          # the README's reference pages: keys, commands, sessions, …
+    if os.path.isdir(docs):
+        files += [os.path.join(docs, n) for n in sorted(os.listdir(docs)) if n.endswith(".md")]
     skills = os.path.join(ROOT, ".claude/skills")
     if os.path.isdir(skills):
         for d in sorted(os.listdir(skills)):
