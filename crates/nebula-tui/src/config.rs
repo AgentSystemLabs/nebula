@@ -176,6 +176,7 @@ pub enum SettingKind {
     HideProjects,
     HideWorktrees,
     QuickPromptKind,
+    QuickPromptFocus,
     ClaudeEnabled,
     ClaudeModel,
     ClaudeEffort,
@@ -273,6 +274,11 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::QuickPromptKind,
                 label: "Quick prompt agent",
                 hint: "Harness the quick prompt hotkey launches, with that kind's model/effort",
+            },
+            SettingSpec {
+                kind: SettingKind::QuickPromptFocus,
+                label: "Quick prompt focus",
+                hint: "Enter the new session's terminal on launch (off = just select its row)",
             },
             SettingSpec {
                 kind: SettingKind::ClaudeEnabled,
@@ -530,6 +536,14 @@ pub struct Config {
     /// [`Config::quick_prompt_kind`], which steps around a harness that has
     /// since been switched off.
     pub quick_prompt_kind: String,
+    /// Whether a QUICK PROMPT launch takes FOCUS into the TERMINAL PANE and
+    /// locks it. Off by default: the new SESSION's row is selected (so the
+    /// pane previews it and it is marked seen) but FOCUS stays on the panel
+    /// the prompt was fired from, so firing one off does not interrupt what
+    /// you were doing. Only the QUICK PROMPT reads this — every other launch
+    /// (the NEW SESSION PICKER, an AGENT PRESET, a PR SESSION, a Cloud task)
+    /// still enters the pane.
+    pub quick_prompt_focus: bool,
     /// Hotkey overrides, keyed by `keymap::ActionSpec::id`; the value is a
     /// comma-separated chord list (`"j, down"`), and an empty string means
     /// deliberately unbound. Only rows that differ from the defaults are
@@ -563,6 +577,7 @@ impl Default for Config {
             codex_enabled: true,
             cursor_enabled: true,
             quick_prompt_kind: AgentKind::Claude.as_str().into(),
+            quick_prompt_focus: false,
             keybindings: BTreeMap::new(),
         }
     }
@@ -692,6 +707,10 @@ impl Config {
             "quick_prompt_kind".into(),
             serde_json::json!(self.quick_prompt_kind),
         );
+        obj.insert(
+            "quick_prompt_focus".into(),
+            serde_json::json!(self.quick_prompt_focus),
+        );
         obj.insert("keybindings".into(), serde_json::json!(self.keybindings));
         let mut bytes = serde_json::to_vec_pretty(&root)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
@@ -809,6 +828,7 @@ impl Config {
             SettingKind::CodexEnabled => on_off(self.codex_enabled).into(),
             SettingKind::CursorEnabled => on_off(self.cursor_enabled).into(),
             SettingKind::QuickPromptKind => self.quick_prompt_kind.clone(),
+            SettingKind::QuickPromptFocus => on_off(self.quick_prompt_focus).into(),
         }
     }
 
@@ -896,6 +916,9 @@ impl Config {
             SettingKind::QuickPromptKind => {
                 self.quick_prompt_kind =
                     cycle_choice(&self.quick_prompt_kind, AGENT_KIND_NAMES, step).into();
+            }
+            SettingKind::QuickPromptFocus => {
+                self.quick_prompt_focus = !self.quick_prompt_focus;
             }
             SettingKind::CursorEffort => {
                 let choices = effort_choices(AgentKind::Cursor, Some(&self.cursor_model));
@@ -1357,6 +1380,33 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(raw.get("focus_tint").is_none());
+    }
+
+    /// The QUICK PROMPT's focus toggle: off unless the user turns it on,
+    /// and persisted under its own key (a missed `obj.insert` would let the
+    /// row toggle on screen and read back off on the next launch).
+    #[test]
+    fn quick_prompt_focus_toggles_off_by_default_and_persists() {
+        let mut cfg = Config::default();
+        assert!(
+            !cfg.quick_prompt_focus,
+            "a quick prompt stays out of the way"
+        );
+        assert_eq!(cfg.value_label(SettingKind::QuickPromptFocus), "off");
+
+        let (tab, row) = locate(SettingKind::QuickPromptFocus).unwrap();
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.quick_prompt_focus);
+        assert_eq!(cfg.value_label(SettingKind::QuickPromptFocus), "on");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).quick_prompt_focus);
+
+        // A config predating the key reads as off.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.quick_prompt_focus);
     }
 
     /// The QUICK PROMPT's harness: one name, cycled over every AGENT KIND,

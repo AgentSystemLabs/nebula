@@ -1210,13 +1210,19 @@ pub struct WorktreeRollback {
 /// What to do when an Ack (or Error) for this req_id arrives.
 #[derive(Debug, Clone)]
 pub enum PendingIntent {
-    /// Attach the created session and focus the terminal.
-    AttachCreated,
+    /// Attach the created session; `focus` also enters and locks the
+    /// terminal pane. Off (the QUICK PROMPT's default) stops at selecting
+    /// the row, so the pane previews the new session without taking the
+    /// cursor off whatever panel the create was fired from.
+    AttachCreated {
+        focus: bool,
+    },
     /// Attach on success; on failure, reopen the exact Cloud task so a
     /// transient daemon/CLI error never makes the user retype it.
     AttachCreatedWithCloudRetry {
         kind: PromptKind,
         task: String,
+        focus: bool,
     },
     /// Flash `note` on success; on failure, reopen this prompt with `text`
     /// restored. Same bargain as the Cloud task: a message worth typing into

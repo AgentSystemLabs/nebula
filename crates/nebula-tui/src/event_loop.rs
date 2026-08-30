@@ -2232,13 +2232,16 @@ fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
 
 /// Ask the daemon for a shell terminal in `worktree`; the Ack attaches it.
 fn create_terminal(app: &mut App, worktree: WorktreeId, out: &mut Vec<ClientRequest>) {
-    send_with(app, out, PendingIntent::AttachCreated, |req_id| {
-        ClientRequest::CreateTerminal {
+    send_with(
+        app,
+        out,
+        PendingIntent::AttachCreated { focus: true },
+        |req_id| ClientRequest::CreateTerminal {
             req_id,
             worktree,
             name: None,
-        }
-    });
+        },
+    );
 }
 
 /// The worktree the selection stands for: the selected one, or the selected
@@ -4186,6 +4189,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                         starting_prompt: None,
                         reopen_on_error: None,
                         pr_url,
+                        focus_pane: true,
                     },
                     out,
                 );
@@ -4208,6 +4212,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 starting_prompt: None,
                 reopen_on_error: None,
                 pr_url: None,
+                focus_pane: true,
             },
             out,
         ),
@@ -4239,6 +4244,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                         value,
                     )),
                     pr_url: None,
+                    focus_pane: true,
                 },
                 out,
             );
@@ -4260,6 +4266,9 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                     starting_prompt: Some(starting_prompt),
                     reopen_on_error: Some((PromptKind::QuickPrompt(launch), value)),
                     pr_url: None,
+                    // The QUICK PROMPT is the one launch that stays out of
+                    // the way by default: `p`, type, Enter, keep working.
+                    focus_pane: crate::config::Config::load().quick_prompt_focus,
                 },
                 out,
             );
@@ -4546,6 +4555,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                             starting_prompt: None,
                             reopen_on_error: None,
                             pr_url,
+                            focus_pane: true,
                         },
                         out,
                     );
@@ -5423,6 +5433,10 @@ struct AgentLaunchDraft {
     /// refuse the create — so a rejected preset task is not lost.
     reopen_on_error: Option<(PromptKind, String)>,
     pr_url: Option<String>,
+    /// Enter and lock the TERMINAL PANE once the create is acked. True for
+    /// every launch the user walked a picker to reach; the QUICK PROMPT
+    /// passes the `quick_prompt_focus` SETTING, which is off by default.
+    focus_pane: bool,
 }
 
 fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequest>) {
@@ -5436,9 +5450,14 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
         starting_prompt,
         reopen_on_error,
         pr_url,
+        focus_pane,
     } = draft;
     let intent = match (reopen_on_error, &cloud_prompt) {
-        (Some((kind, task)), _) => PendingIntent::AttachCreatedWithCloudRetry { kind, task },
+        (Some((kind, task)), _) => PendingIntent::AttachCreatedWithCloudRetry {
+            kind,
+            task,
+            focus: focus_pane,
+        },
         (None, Some(task)) => PendingIntent::AttachCreatedWithCloudRetry {
             kind: PromptKind::ClaudeCloudTask {
                 worktree: worktree.clone(),
@@ -5447,8 +5466,9 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
                 effort: effort.clone(),
             },
             task: task.clone(),
+            focus: focus_pane,
         },
-        (None, None) => PendingIntent::AttachCreated,
+        (None, None) => PendingIntent::AttachCreated { focus: focus_pane },
     };
     let auto_title = name.is_empty();
     let name = if auto_title {
@@ -6831,8 +6851,8 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             match (app.pending.remove(&req_id), created) {
                 (
                     Some(
-                        PendingIntent::AttachCreated
-                        | PendingIntent::AttachCreatedWithCloudRetry { .. },
+                        PendingIntent::AttachCreated { focus }
+                        | PendingIntent::AttachCreatedWithCloudRetry { focus, .. },
                     ),
                     Some(id),
                 ) => {
@@ -6847,8 +6867,13 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         // the selection now, or on the upsert otherwise.
                         land_pending_selection(app, out);
                         attach_now(app, sref, out);
-                        app.focus = Focus::Terminal;
-                        app.term_locked = true;
+                        // Without `focus` the row is selected and the pane
+                        // shows it, but the cursor stays where the create
+                        // was fired from — see `quick_prompt_focus`.
+                        if focus {
+                            app.focus = Focus::Terminal;
+                            app.term_locked = true;
+                        }
                     }
                 }
                 (Some(PendingIntent::ReopenPromptOnError { note, .. }), _) => {
@@ -6947,7 +6972,9 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     restore_worktree_rows(app, rollback)
                 }
                 Some(
-                    PendingIntent::AttachCreatedWithCloudRetry { kind, task: text }
+                    PendingIntent::AttachCreatedWithCloudRetry {
+                        kind, task: text, ..
+                    }
                     | PendingIntent::ReopenPromptOnError { kind, text, .. },
                 ) => {
                     open_prompt(app, kind);
@@ -20120,6 +20147,90 @@ diff --git a/src/b.rs b/src/b.rs
                         if matches!(prompt.kind, PromptKind::QuickPrompt { .. })
                             && prompt.input.as_str() == "Fix auth\nthen ship it"
                 ));
+            },
+        );
+    }
+
+    /// A QUICK PROMPT is fire-and-forget: its Ack selects the new SESSION's
+    /// row (so the pane previews it and it is marked seen) but leaves FOCUS
+    /// on the panel the prompt was fired from. `quick_prompt_focus` puts the
+    /// old behaviour — enter the pane and lock it — back.
+    #[test]
+    fn a_quick_prompt_lands_the_row_without_taking_the_pane() {
+        use nebula_core::{Agent, AgentStatus, Entity, WorktreeId};
+
+        fn launch(app: &mut App) {
+            let mut out = Vec::new();
+            seed_tree(app);
+            app.focus = Focus::Projects;
+            press(app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(paste_into_overlay(app, "Fix auth"));
+            press(app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(ClientRequest::CreateAgent { req_id, .. }) = out.last() else {
+                panic!("expected CreateAgent, got {:?}", out.last());
+            };
+            let req_id = *req_id;
+            // The daemon broadcasts the new row before it acks the create.
+            hse(
+                app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(Agent {
+                        id: AgentId("a2".into()),
+                        worktree_id: WorktreeId("w1".into()),
+                        name: "agent-2".into(),
+                        status: AgentStatus::Fresh,
+                        archived: false,
+                        archived_at: 0,
+                        unseen: false,
+                        kind: nebula_core::AgentKind::Codex,
+                        model: None,
+                        effort: None,
+                        session_id: None,
+                        cloud_session_id: None,
+                        sort_order: 1,
+                        status_changed_at: 0,
+                        alive: true,
+                        cloud_mirroring: false,
+                    }),
+                },
+            );
+            hse(
+                app,
+                ServerEvent::Ack {
+                    req_id,
+                    created: Some(EntityId::Agent(AgentId("a2".into()))),
+                },
+            );
+        }
+
+        with_config_json(r#"{"quick_prompt_kind": "codex"}"#, || {
+            let mut app = App::new();
+            launch(&mut app);
+            assert_eq!(
+                app.term.as_ref().map(|t| t.sref.clone()),
+                Some(SessionRef::Agent(AgentId("a2".into()))),
+                "the pane still previews what was just launched"
+            );
+            assert_eq!(
+                app.selected_session().map(|a| a.id),
+                Some(AgentId("a2".into())),
+                "and the cursor lands on its row"
+            );
+            assert_eq!(app.focus, Focus::Projects, "but focus stays put");
+            assert!(!app.term_locked, "and the pane is not locked");
+        });
+
+        with_config_json(
+            r#"{"quick_prompt_kind": "codex", "quick_prompt_focus": true}"#,
+            || {
+                let mut app = App::new();
+                launch(&mut app);
+                assert_eq!(
+                    app.focus,
+                    Focus::Terminal,
+                    "opted in: straight into the pane"
+                );
+                assert!(app.term_locked, "typing goes to the new agent");
             },
         );
     }
