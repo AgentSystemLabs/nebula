@@ -46,7 +46,7 @@ const MODAL_WHEEL_LINES: i32 = 3;
 /// Wheel step over the terminal pane, in lines: how far the scrollback
 /// offset moves, and how many arrow keys an alt-screen app that ignores
 /// the mouse is sent per notch.
-const TERM_WHEEL_LINES: usize = 3;
+const TERM_WHEEL_LINES: usize = 1;
 
 /// Ceiling on a panel or file-list width read back from the persisted UI
 /// state — a coarse sanity clamp; the draw re-fits it to the real screen.
@@ -5170,6 +5170,7 @@ fn select_worktree_row(app: &mut App, i: usize, out: &mut Vec<ClientRequest>) {
 /// the input lock — walking the list with ↑/↓ (or single-clicking a row)
 /// previews each session so it can be read; Enter (or a double-click) is
 /// what commits: focus + lock. Archived rows don't preview.
+/// Debounced only for a session the daemon has reaped — see `preview_inner`.
 fn preview_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
     preview_inner(app, ATTACH_DEBOUNCE, out);
 }
@@ -5192,7 +5193,28 @@ fn preview_inner(app: &mut App, delay: Duration, out: &mut Vec<ClientRequest>) {
     let Some(sref) = row.sref() else {
         return;
     };
+    // Walking onto a session the daemon still holds is as immediate as
+    // clicking it: there is no CLI to fork, so there is nothing to wait to
+    // see whether the user meant it, and the pane never flashes the
+    // `starting session…` notice on the way past. Only a reaped session —
+    // the one case the debounce exists for — keeps the wait.
+    let delay = if session_has_live_pty(app, &sref) {
+        Duration::ZERO
+    } else {
+        delay
+    };
     attach_inner(app, sref, delay, out);
+}
+
+/// Whether the daemon currently holds a live PTY for `sref`. Attaching to
+/// one only replays its ring; attaching to a session the IDLE REAPER took
+/// cold-spawns an agent CLI, which is the only thing [`ATTACH_DEBOUNCE`]
+/// exists to keep a cursor merely passing through a row from doing.
+fn session_has_live_pty(app: &App, sref: &SessionRef) -> bool {
+    match sref {
+        SessionRef::Agent(id) => app.tree.agents.iter().any(|a| &a.id == id && a.alive),
+        SessionRef::Terminal(id) => app.tree.terminals.iter().any(|t| &t.id == id && t.alive),
+    }
 }
 
 /// Enter on the Sessions panel: attach the session under the cursor, or —
@@ -12244,22 +12266,15 @@ diff --git a/src/b.rs b/src/b.rs
             Some(a2.clone()),
             "the walked-to session shows in the pane"
         );
-        // The pane swaps at once, but the Attach waits for the cursor to
-        // settle — walking a list must not boot a CLI per row passed.
+        // a2 is alive, so the walk attaches at once — the same instant
+        // scrollback a click gets, with no `starting session…` flash.
         assert!(
-            !out.iter()
-                .any(|r| matches!(r, ClientRequest::Attach { .. })),
-            "the walk itself attaches nothing: {out:?}"
+            app.pending_attach.is_none(),
+            "a live session needs no debounce: {out:?}"
         );
-        assert_eq!(
-            app.pending_attach.as_ref().map(|(s, _)| s.clone()),
-            Some(a2.clone()),
-            "the attach is armed for the walked-to session"
-        );
-        fire_pending_attach(&mut app, &mut out);
         assert!(
             matches!(out.last(), Some(ClientRequest::Attach { session, .. }) if *session == a2),
-            "settling attaches so scrollback streams in: {out:?}"
+            "walking onto a live session attaches immediately: {out:?}"
         );
 
         // Walking onto an archived row keeps the previous preview.
@@ -12279,6 +12294,64 @@ diff --git a/src/b.rs b/src/b.rs
             !out.iter()
                 .any(|r| matches!(r, ClientRequest::Attach { .. })),
             "already-previewed session isn't re-attached"
+        );
+    }
+
+    /// The other half of the rule above: a session the daemon has reaped
+    /// still waits out ATTACH_DEBOUNCE, because attaching one cold-spawns
+    /// an agent CLI and a cursor passing through has not asked for that.
+    #[test]
+    fn walking_onto_a_reaped_session_still_waits_out_the_debounce() {
+        use nebula_core::{Agent, AgentStatus, Entity, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a2".into()),
+                    worktree_id: WorktreeId("w1".into()),
+                    name: "agent-2".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    archived_at: 0,
+                    unseen: false,
+                    kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    cloud_session_id: None,
+                    sort_order: 1,
+                    status_changed_at: 0,
+                    alive: false,
+                    cloud_mirroring: false,
+                }),
+            },
+        );
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        let a2 = SessionRef::Agent(AgentId("a2".into()));
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(a2.clone()),
+            "the pane still swaps at once"
+        );
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { .. })),
+            "but a dead session isn't booted by a passing cursor: {out:?}"
+        );
+        assert_eq!(
+            app.pending_attach.as_ref().map(|(s, _)| s.clone()),
+            Some(a2.clone()),
+            "the attach is armed for the walked-to session"
+        );
+        fire_pending_attach(&mut app, &mut out);
+        assert!(
+            matches!(out.last(), Some(ClientRequest::Attach { session, .. }) if *session == a2),
+            "settling attaches so the CLI boots: {out:?}"
         );
     }
 
@@ -12949,7 +13022,7 @@ diff --git a/src/b.rs b/src/b.rs
 
         handle_mouse(&mut app, mev(MouseEventKind::ScrollUp, 10, 5), &mut out);
         match out.as_slice() {
-            [ClientRequest::Input { data, .. }] => assert_eq!(data, b"\x1b[A\x1b[A\x1b[A"),
+            [ClientRequest::Input { data, .. }] => assert_eq!(data, b"\x1b[A"),
             other => panic!("expected one Input request, got {other:?}"),
         }
     }
