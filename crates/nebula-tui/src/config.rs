@@ -160,6 +160,7 @@ pub enum SettingKind {
     PaletteEnterAttaches,
     GitInitOnCreate,
     Editor,
+    CloseFinderOnOpen,
     SkipSessionNaming,
     SessionIdleTimeout,
     DoneSound,
@@ -200,6 +201,11 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::Editor,
                 label: "File editor",
                 hint: "Editor f/b/F and ⌥click launch (NEBULA_EDITOR overrides)",
+            },
+            SettingSpec {
+                kind: SettingKind::CloseFinderOnOpen,
+                label: "Finder closes on open",
+                hint: "Opening a file closes f/F, so quitting the editor is one Esc",
             },
         ]),
     },
@@ -442,6 +448,14 @@ pub struct Config {
     /// `NEBULA_EDITOR` env var overrides it for the process; see
     /// [`Config::editor_command`].
     pub editor: String,
+    /// Opening a file from the file finder (`f`) or find-in-files (`F`)
+    /// closes that overlay as the editor modal opens, so quitting the
+    /// editor lands back on the panels instead of on the finder the user
+    /// then has to Esc a second time. When false the finder stays open
+    /// underneath and quitting the editor returns to the results. Does not
+    /// touch the tree browser (`b`), whose editor is embedded in its own
+    /// preview pane, or ⌥click, which has no overlay to close.
+    pub close_finder_on_open: bool,
     /// Create new agent sessions straight from the kind picker, with no
     /// name prompt: the session takes the generated default name and is
     /// opted into agent-driven auto-titling, exactly as accepting an empty
@@ -512,6 +526,7 @@ impl Default for Config {
             palette_enter_attaches: true,
             git_init_on_create: true,
             editor: "vim".into(),
+            close_finder_on_open: true,
             skip_session_naming: false,
             session_idle_timeout: "5m".into(),
             done_sound: "Glass".into(),
@@ -603,6 +618,10 @@ impl Config {
             serde_json::json!(self.git_init_on_create),
         );
         obj.insert("editor".into(), serde_json::json!(self.editor));
+        obj.insert(
+            "close_finder_on_open".into(),
+            serde_json::json!(self.close_finder_on_open),
+        );
         obj.insert(
             "skip_session_naming".into(),
             serde_json::json!(self.skip_session_naming),
@@ -729,6 +748,7 @@ impl Config {
             SettingKind::PaletteEnterAttaches => on_off(self.palette_enter_attaches).into(),
             SettingKind::GitInitOnCreate => on_off(self.git_init_on_create).into(),
             SettingKind::Editor => self.editor.clone(),
+            SettingKind::CloseFinderOnOpen => on_off(self.close_finder_on_open).into(),
             SettingKind::SkipSessionNaming => on_off(self.skip_session_naming).into(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
             SettingKind::DoneSound => self.done_sound.clone(),
@@ -772,6 +792,9 @@ impl Config {
             }
             SettingKind::Editor => {
                 self.editor = cycle_choice(&self.editor, EDITORS, step).into();
+            }
+            SettingKind::CloseFinderOnOpen => {
+                self.close_finder_on_open = !self.close_finder_on_open;
             }
             SettingKind::SkipSessionNaming => {
                 self.skip_session_naming = !self.skip_session_naming;
@@ -972,6 +995,23 @@ pub fn with_config_path<T>(path: PathBuf, f: impl FnOnce() -> T) -> T {
 mod tests {
     use super::*;
     use crate::keymap::Keymap;
+
+    #[test]
+    fn defaults_close_the_finder_on_open() {
+        assert!(Config::default().close_finder_on_open);
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.close_finder_on_open);
+        let cfg: Config = serde_json::from_str(r#"{"close_finder_on_open": false}"#).unwrap();
+        assert!(!cfg.close_finder_on_open);
+        // The overlay toggle round-trips through the saved file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut cfg = Config::default();
+        let (t, r) = locate(SettingKind::CloseFinderOnOpen).unwrap();
+        cfg.cycle(t, r, 1);
+        cfg.save_to(&path).unwrap();
+        assert!(!load_from(&path).close_finder_on_open);
+    }
 
     #[test]
     fn defaults_enter_attaches() {

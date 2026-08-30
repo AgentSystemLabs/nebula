@@ -560,6 +560,8 @@ fn tui_projects_worktrees_agents_navigation() {
 
     // ---- clean quit ----
     tui.send(b"q");
+    tui.wait_for_text("Quit nebula");
+    tui.send(b"y");
     let deadline = Instant::now() + CLI_TIMEOUT;
     loop {
         match tui.child.try_wait() {

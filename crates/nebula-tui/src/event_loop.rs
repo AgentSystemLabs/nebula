@@ -1357,7 +1357,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     }
 
     // Splash preview up: the next key just dismisses it, back to the
-    // panels — even q, which quits on the press after.
+    // panels — even q, which asks to quit on the press after.
     if app.splash_preview {
         app.splash_preview = false;
         return;
@@ -1397,7 +1397,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     };
     use crate::keymap::Action;
     match action {
-        Action::Quit => app.should_quit = true,
+        Action::Quit => app.overlay = Some(Overlay::Confirm(confirm_quit())),
         Action::Help => app.overlay = Some(Overlay::Help(HelpView::default())),
         Action::Settings => open_settings(app),
         // Request a reading right away — the main loop's poll may be up to
@@ -1980,8 +1980,9 @@ fn open_grep_view(app: &mut App) {
 }
 
 /// Enter on a grep hit: spawn the editor at `path:line` inside the modal
-/// terminal. The grep overlay stays open underneath, so quitting the editor
-/// lands back on the results.
+/// terminal. With `close_finder_on_open` the grep overlay closes as the
+/// editor opens, so quitting the editor is a single Esc; with it off the
+/// overlay stays open underneath and quitting lands back on the results.
 fn open_selected_hit_in_editor(app: &mut App) {
     let Some(Overlay::Grep(view)) = &app.overlay else {
         return;
@@ -1993,7 +1994,19 @@ fn open_selected_hit_in_editor(app: &mut App) {
     let (path, line) = (hit.path.clone(), hit.line);
     // Size guess from the last-drawn body; the post-draw sync corrects it.
     let size = vim_size_guess(app);
-    spawn_editor_modal(app, &editor, &root, &path, line, size);
+    if spawn_editor_modal(app, &editor, &root, &path, line, size) {
+        close_finder_behind_editor(app);
+    }
+}
+
+/// Drop the finder overlay the editor was just launched from, when the
+/// setting asks for it. Only called after a spawn actually succeeded — a
+/// failed spawn (or a unit test with no reader channel) must leave the
+/// results on screen rather than dismiss them for nothing.
+fn close_finder_behind_editor(app: &mut App) {
+    if crate::config::Config::load().close_finder_on_open {
+        app.overlay = None;
+    }
 }
 
 /// Boot `editor` on `file` at `line` (cwd `root`) into the editor modal at
@@ -2026,8 +2039,9 @@ fn spawn_editor_modal(
 }
 
 /// Enter on a file-finder row: spawn the editor at the file's first line
-/// inside the modal terminal. The finder stays open underneath, so quitting
-/// the editor lands back on the results.
+/// inside the modal terminal. With `close_finder_on_open` the finder closes
+/// as the editor opens, so quitting the editor is a single Esc; with it off
+/// the finder stays open underneath and quitting lands back on the results.
 fn open_selected_file_in_editor(app: &mut App) {
     let Some(Overlay::Files(finder)) = &app.overlay else {
         return;
@@ -2038,7 +2052,9 @@ fn open_selected_file_in_editor(app: &mut App) {
     let (root, editor) = (finder.root.clone(), finder.editor.clone());
     // Size guess from the last-drawn body; the post-draw sync corrects it.
     let size = vim_size_guess(app);
-    spawn_editor_modal(app, &editor, &root, &path, 1, size);
+    if spawn_editor_modal(app, &editor, &root, &path, 1, size) {
+        close_finder_behind_editor(app);
+    }
 }
 
 /// Enter on a tree-browser file row: spawn the editor embedded in the
@@ -2292,6 +2308,20 @@ fn confirm_close_terminal(name: &str, id: TerminalId) -> ConfirmDialog {
         title: "Close terminal".into(),
         message: format!("Close terminal '{name}'? Its shell is killed."),
         action: PendingAction::CloseTerminal(id),
+        area: ratatui::layout::Rect::default(),
+    }
+}
+
+/// The confirm before the TUI closes. `q` sits one finger away from every
+/// other panel hotkey, so a stray letter aimed at an agent used to end the
+/// client outright; the gate costs one keystroke and the message says why
+/// it is cheap — the daemon keeps every session running.
+fn confirm_quit() -> ConfirmDialog {
+    ConfirmDialog {
+        title: "Quit nebula".into(),
+        // Sized to the longest line, never wrapped: keep both under 52.
+        message: "Leave the TUI?\nSessions keep running in the daemon.".into(),
+        action: PendingAction::Quit,
         area: ratatui::layout::Rect::default(),
     }
 }
@@ -3286,6 +3316,17 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 app.overlay = None;
                 run_pending_action(app, action, out);
             }
+            // Ctrl+C twice always gets out. The gate exists to catch a
+            // letter aimed at an agent, not to argue with someone who
+            // pressed the terminal's own quit chord on purpose — and in
+            // raw mode this dialog is the only thing standing in the way.
+            KeyCode::Char('c')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && confirm.action == PendingAction::Quit =>
+            {
+                app.overlay = None;
+                app.should_quit = true;
+            }
             _ => {}
         },
         Overlay::Diff(view) => {
@@ -3406,9 +3447,8 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 KeyCode::Up => finder.select(finder.selected as i64 - 1),
                 KeyCode::Char('n') if ctrl => finder.select(finder.selected as i64 + 1),
                 KeyCode::Char('p') if ctrl => finder.select(finder.selected as i64 - 1),
-                // Enter opens the selected file in the editor modal; the
-                // finder stays open underneath so quitting the editor
-                // returns here.
+                // Enter opens the selected file in the editor modal, which
+                // closes the finder unless `close_finder_on_open` is off.
                 KeyCode::Enter => open_selected_file_in_editor(app),
                 // Ctrl+y copies the selected path (relative to the worktree
                 // root) to the clipboard — ready to paste into an agent.
@@ -3443,8 +3483,8 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 KeyCode::Up => view.select(view.selected as i64 - 1),
                 KeyCode::Char('n') if ctrl => view.select(view.selected as i64 + 1),
                 KeyCode::Char('p') if ctrl => view.select(view.selected as i64 - 1),
-                // Enter opens the hit in the editor modal; the overlay stays
-                // open underneath so quitting the editor returns here.
+                // Enter opens the hit in the editor modal, which closes this
+                // overlay unless `close_finder_on_open` is off.
                 KeyCode::Enter => open_selected_hit_in_editor(app),
                 // Everything else edits the query like a terminal line
                 // (see text_input).
@@ -5880,8 +5920,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         return;
     }
     // File finder: the wheel moves the selection, a click on a result row
-    // opens it in the editor, a click outside the modal closes; everything
-    // else is swallowed.
+    // opens it in the editor (closing the finder unless
+    // `close_finder_on_open` is off), a click outside the modal closes;
+    // everything else is swallowed.
     if let Some(Overlay::Files(finder)) = &mut app.overlay {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -5913,8 +5954,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         return;
     }
     // Find-in-files: the wheel moves the selection, a click on a result row
-    // opens it in the editor, a click outside the modal closes; everything
-    // else is swallowed.
+    // opens it in the editor (closing this overlay unless
+    // `close_finder_on_open` is off), a click outside the modal closes;
+    // everything else is swallowed.
     if let Some(Overlay::Grep(view)) = &mut app.overlay {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -10449,10 +10491,20 @@ diff --git a/src/b.rs b/src/b.rs
         seed_tree(&mut app);
         let mut out = Vec::new();
 
-        // Panel focus: 'q' quits.
+        // Panel focus: 'q' asks first, then quits on `y`.
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut out,
+        );
+        assert!(!app.should_quit, "q asks before it quits");
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Confirm(c)) if c.action == PendingAction::Quit),
+            "q opens the quit confirm"
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
             &mut out,
         );
         assert!(app.should_quit);
@@ -10477,6 +10529,62 @@ diff --git a/src/b.rs b/src/b.rs
         );
         assert_eq!(app.focus, Focus::Sessions, "Ctrl+q escapes to panels");
         assert!(!app.term_locked, "Ctrl+q clears the input lock");
+    }
+
+    /// `q` sits among the panel hotkeys, so a letter meant for an agent used
+    /// to end the client outright. Both quit chords ask first, and backing
+    /// out leaves the app exactly where it was.
+    #[test]
+    fn quit_asks_before_it_closes_the_tui() {
+        for chord in [
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let mut out = Vec::new();
+
+            handle_key(&mut app, chord, &mut out);
+            let Some(Overlay::Confirm(c)) = &app.overlay else {
+                panic!("{chord:?} opens the quit confirm, got {:?}", app.overlay)
+            };
+            assert_eq!(c.action, PendingAction::Quit);
+            // The dialog is sized to its longest line and never wraps.
+            assert!(
+                c.message.lines().all(|l| l.chars().count() < 52),
+                "quit message must fit the dialog: {:?}",
+                c.message
+            );
+            assert!(!app.should_quit);
+
+            // Esc backs out to the panels, still running.
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &mut out,
+            );
+            assert!(app.overlay.is_none(), "Esc closes the confirm");
+            assert!(!app.should_quit, "Esc keeps the TUI up");
+
+            // Asked again, `y` goes through.
+            handle_key(&mut app, chord, &mut out);
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                &mut out,
+            );
+            assert!(app.should_quit, "y quits");
+        }
+
+        // Ctrl+C twice is never a trap: the second press goes through.
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        handle_key(&mut app, ctrl_c, &mut out);
+        handle_key(&mut app, ctrl_c, &mut out);
+        assert!(app.should_quit, "a second Ctrl+C quits");
+        assert!(app.overlay.is_none());
     }
 
     /// Picker/submenu tests resolve model/effort through `Config::load`, so
@@ -16323,61 +16431,128 @@ diff --git a/src/b.rs b/src/b.rs
 
     #[test]
     fn f_opens_file_finder_listing_tracked_and_untracked() {
+        // Pinned to the legacy behavior: with `close_finder_on_open`
+        // (the default) the finder would be gone under the editor, and
+        // the Ctrl+y at the end would have nothing to copy from.
+        with_config_json(r#"{"close_finder_on_open": false}"#, || {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = test_repo(&dir);
+            std::fs::write(repo.join("fresh.txt"), "hello\n").unwrap();
+            let mut app = App::new();
+            seed_repo_tree(&mut app, &repo);
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            app.vim_tx = Some(tx);
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE, &mut out);
+            let files = &finder(&app).files;
+            assert!(files.contains(&"a.txt".to_string()), "{files:?}");
+            assert!(files.contains(&"fresh.txt".to_string()), "{files:?}");
+            // The empty query shows everything.
+            assert_eq!(finder(&app).matches.len(), files.len());
+            assert!(out.is_empty(), "opening the finder sends nothing");
+
+            // Typing narrows to the fuzzy matches.
+            for c in ['f', 'r'] {
+                press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+            }
+            assert_eq!(finder(&app).matches.len(), 1, "fr matches only fresh.txt");
+            assert_eq!(finder(&app).selected_path(), Some("fresh.txt"));
+
+            // Enter opens the selection in the editor modal; the finder stays
+            // open underneath. A shell stands in for vim (`sh +1 fresh.txt`
+            // still spawns fine).
+            if let Some(Overlay::Files(f)) = &mut app.overlay {
+                f.editor = "/bin/sh".into();
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let vim = app.vim.as_ref().expect("enter spawns the editor modal");
+            assert_eq!(vim.title, "fresh.txt:1");
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Files(_))),
+                "the finder stays open under the editor"
+            );
+
+            // Ctrl+Q closes the editor, landing back on the finder; Ctrl+y
+            // copies the selected path and closes.
+            press(
+                &mut app,
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert!(app.vim.is_none(), "Ctrl+Q force-closes the editor");
+            press(
+                &mut app,
+                KeyCode::Char('y'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert!(app.overlay.is_none(), "ctrl+y closes the finder");
+            assert_eq!(app.flash.as_deref(), Some("copied fresh.txt"));
+        });
+    }
+
+    #[test]
+    fn close_finder_on_open_leaves_only_the_editor_modal() {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo(&dir);
-        std::fs::write(repo.join("fresh.txt"), "hello\n").unwrap();
-        let mut app = App::new();
-        seed_repo_tree(&mut app, &repo);
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        app.vim_tx = Some(tx);
-        let mut out = Vec::new();
+        // Default-on: the finder is gone by the time the editor is up, so
+        // quitting the editor lands on the panels with nothing left to Esc.
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_repo_tree(&mut app, &repo);
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            app.vim_tx = Some(tx);
+            let mut out = Vec::new();
 
-        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE, &mut out);
-        let files = &finder(&app).files;
-        assert!(files.contains(&"a.txt".to_string()), "{files:?}");
-        assert!(files.contains(&"fresh.txt".to_string()), "{files:?}");
-        // The empty query shows everything.
-        assert_eq!(finder(&app).matches.len(), files.len());
-        assert!(out.is_empty(), "opening the finder sends nothing");
+            press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE, &mut out);
+            // A shell stands in for vim (`sh +1 a.txt` still spawns fine).
+            if let Some(Overlay::Files(f)) = &mut app.overlay {
+                f.editor = "/bin/sh".into();
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.vim.is_some(), "enter spawns the editor modal");
+            assert!(
+                app.overlay.is_none(),
+                "the finder closes as the editor opens"
+            );
 
-        // Typing narrows to the fuzzy matches.
-        for c in ['f', 'r'] {
-            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
-        }
-        assert_eq!(finder(&app).matches.len(), 1, "fr matches only fresh.txt");
-        assert_eq!(finder(&app).selected_path(), Some("fresh.txt"));
+            press(
+                &mut app,
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert!(app.vim.is_none(), "Ctrl+Q force-closes the editor");
+            assert!(app.overlay.is_none(), "no finder left to dismiss");
+        });
+    }
 
-        // Enter opens the selection in the editor modal; the finder stays
-        // open underneath. A shell stands in for vim (`sh +1 fresh.txt`
-        // still spawns fine).
-        if let Some(Overlay::Files(f)) = &mut app.overlay {
-            f.editor = "/bin/sh".into();
-        }
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        let vim = app.vim.as_ref().expect("enter spawns the editor modal");
-        assert_eq!(vim.title, "fresh.txt:1");
-        assert!(
-            matches!(&app.overlay, Some(Overlay::Files(_))),
-            "the finder stays open under the editor"
-        );
+    #[test]
+    fn a_failed_editor_spawn_keeps_the_finder_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_repo_tree(&mut app, &repo);
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            app.vim_tx = Some(tx);
+            let mut out = Vec::new();
 
-        // Ctrl+Q closes the editor, landing back on the finder; Ctrl+y
-        // copies the selected path and closes.
-        press(
-            &mut app,
-            KeyCode::Char('q'),
-            KeyModifiers::CONTROL,
-            &mut out,
-        );
-        assert!(app.vim.is_none(), "Ctrl+Q force-closes the editor");
-        press(
-            &mut app,
-            KeyCode::Char('y'),
-            KeyModifiers::CONTROL,
-            &mut out,
-        );
-        assert!(app.overlay.is_none(), "ctrl+y closes the finder");
-        assert_eq!(app.flash.as_deref(), Some("copied fresh.txt"));
+            press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE, &mut out);
+            if let Some(Overlay::Files(f)) = &mut app.overlay {
+                f.editor = "/nonexistent/nebula-not-an-editor".into();
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.vim.is_none(), "the spawn failed");
+            assert!(app.flash.is_some(), "the failure flashes");
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Files(_))),
+                "a finder dismissed for an editor that never opened would \
+                 leave the user staring at the panels"
+            );
+        });
     }
 
     #[test]
@@ -16770,50 +16945,83 @@ diff --git a/src/b.rs b/src/b.rs
 
     #[test]
     fn grep_enter_spawns_editor_and_ctrl_q_closes_it() {
+        // Pinned to the legacy behavior — the "lands back on the
+        // results" half of this test is what `close_finder_on_open`
+        // off buys you.
+        with_config_json(r#"{"close_finder_on_open": false}"#, || {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = test_repo(&dir);
+            let mut app = App::new();
+            seed_repo_tree(&mut app, &repo);
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            app.vim_tx = Some(tx);
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('F'), KeyModifiers::SHIFT, &mut out);
+            for c in "orig".chars() {
+                press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+            }
+            assert_eq!(grep_view(&app).selected_hit().unwrap().path, "a.txt");
+            // A shell stands in for vim (`sh +1 a.txt` still spawns fine).
+            if let Some(Overlay::Grep(v)) = &mut app.overlay {
+                v.editor = "/bin/sh".into();
+            }
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let vim = app.vim.as_ref().expect("enter spawns the editor modal");
+            assert_eq!(vim.title, "a.txt:1");
+            assert_eq!(vim.generation, 1);
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Grep(_))),
+                "the grep overlay stays open under the editor"
+            );
+
+            // With the modal open, keys forward to the editor — q must not quit.
+            press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE, &mut out);
+            assert!(!app.should_quit, "q goes to the editor, not the app");
+            assert!(app.vim.is_some());
+
+            // Ctrl+Q is the hatch.
+            press(
+                &mut app,
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert!(app.vim.is_none(), "Ctrl+Q force-closes the editor");
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Grep(_))),
+                "closing the editor lands back on the results"
+            );
+        });
+    }
+
+    #[test]
+    fn close_finder_on_open_also_closes_the_grep_overlay() {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo(&dir);
-        let mut app = App::new();
-        seed_repo_tree(&mut app, &repo);
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        app.vim_tx = Some(tx);
-        let mut out = Vec::new();
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_repo_tree(&mut app, &repo);
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            app.vim_tx = Some(tx);
+            let mut out = Vec::new();
 
-        press(&mut app, KeyCode::Char('F'), KeyModifiers::SHIFT, &mut out);
-        for c in "orig".chars() {
-            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
-        }
-        assert_eq!(grep_view(&app).selected_hit().unwrap().path, "a.txt");
-        // A shell stands in for vim (`sh +1 a.txt` still spawns fine).
-        if let Some(Overlay::Grep(v)) = &mut app.overlay {
-            v.editor = "/bin/sh".into();
-        }
-
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        let vim = app.vim.as_ref().expect("enter spawns the editor modal");
-        assert_eq!(vim.title, "a.txt:1");
-        assert_eq!(vim.generation, 1);
-        assert!(
-            matches!(&app.overlay, Some(Overlay::Grep(_))),
-            "the grep overlay stays open under the editor"
-        );
-
-        // With the modal open, keys forward to the editor — q must not quit.
-        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE, &mut out);
-        assert!(!app.should_quit, "q goes to the editor, not the app");
-        assert!(app.vim.is_some());
-
-        // Ctrl+Q is the hatch.
-        press(
-            &mut app,
-            KeyCode::Char('q'),
-            KeyModifiers::CONTROL,
-            &mut out,
-        );
-        assert!(app.vim.is_none(), "Ctrl+Q force-closes the editor");
-        assert!(
-            matches!(&app.overlay, Some(Overlay::Grep(_))),
-            "closing the editor lands back on the results"
-        );
+            press(&mut app, KeyCode::Char('F'), KeyModifiers::SHIFT, &mut out);
+            for c in "orig".chars() {
+                press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+            }
+            // A shell stands in for vim (`sh +1 a.txt` still spawns fine).
+            if let Some(Overlay::Grep(v)) = &mut app.overlay {
+                v.editor = "/bin/sh".into();
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.vim.is_some(), "enter spawns the editor modal");
+            assert!(
+                app.overlay.is_none(),
+                "find-in-files closes as the editor opens"
+            );
+        });
     }
 
     #[test]
