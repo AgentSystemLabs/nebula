@@ -5,7 +5,7 @@ user-invocable: true
 ---
 
 Nebula keeps a shared, committed glossary at **`TERMS.md`** (repo root). Every agent reads it before
-starting and speaks in its terms — see `CLAUDE.md`. Your job here is to keep it true after the task you
+starting and speaks in its terms — see `AGENTS.md`. Your job here is to keep it true after the task you
 just finished, so the next agent and the next teammate call things by the same name you did.
 
 The MEMORY LOG records *what happened*; `TERMS.md` records *what things are called*. Do not put a work log

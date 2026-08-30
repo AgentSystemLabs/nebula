@@ -1,77 +1,72 @@
 # Nebula
 
-## Project memory
+## The shared memory and vocabulary
 
-This repo keeps a shared, committed MEMORY LOG in three layers: **`.claude/MEMORY.md`** is the index —
-one line per task (date, title, the TERMS and files it is about), newest first, capped at 200 lines;
-**`.claude/memory/gotchas.md`** holds the standing gotchas — the traps that outlive their task, one line
-each, grouped by TERM, capped at 300 lines; **`.claude/memory/entries/<date>-<slug>.md`** hold the full
-Asked / Did / Gotchas of each task and are opened by index line or grep, never read wholesale. Claude
-Code sessions also get the matching entries injected per prompt by `.claude/hooks/recall.py`
-(`[nebula recall] …`); other harnesses grep `.claude/memory/entries` for the TERMS and files the prompt
-names. `make memory-check` enforces the caps.
+This repo runs a SELF-IMPROVING LOOP: every task starts from what past tasks recorded and ends by
+recording its own. Four committed files carry it. Read the index, the standing gotchas and the
+glossary before you start; the entries are fetched by index line or grep, never read wholesale.
 
-It also keeps a shared glossary at **`TERMS.md`** (repo root): one ALL-CAPS canonical name per feature,
-panel, key, CLI command, hook route, daemon mechanism, status and dev workflow, with the words the user
-has used for it and where it lives in the code. Read it with the memory log, map the user's words onto
-its **Alias index**, and use the TERMS — in caps, as spelled there — in all the output you produce
-about this project: replies, summaries, plans, commit messages, PR descriptions, memory entries, and
-code comments. Text written in the TERMS is much easier for the team to read than a fresh paraphrase of
-the same thing each time, so prefer a TERM over a synonym even when the synonym reads more naturally.
-Code identifiers are not renamed to match it; the glossary points at them.
+| File | What it is | Cap |
+|---|---|---|
+| `.claude/MEMORY.md` | the **index** of the MEMORY LOG — one line per task: date, title, the TERMS and files it is about, its gotcha count, newest first | 200 lines |
+| `.claude/memory/gotchas.md` | the **standing gotchas** — traps that outlive their task, one line each, grouped by TERM | 300 lines |
+| `.claude/memory/entries/<date>-<slug>.md` | the **entries** — the full Asked / Did / Gotchas of each task | none |
+| `TERMS.md` | the **glossary** — one ALL-CAPS name per feature, panel, key, command, hook route, daemon mechanism, status and workflow, with the user's words for it and where it lives | — |
 
-**Before you start a task, read `.claude/MEMORY.md`, `.claude/memory/gotchas.md` and `TERMS.md`.** Scan
-the index for entries related to what the user is asking — the same TERMS, the same crate, the same
-symptom, the same file — open those entry files, and match on the user's vocabulary as well as your own. A recorded gotcha is a mine already stepped on. A recorded decision
-("we're not doing X because Y") is settled unless the user reopens it. A recorded fix tells you where the
-code that matters actually lives. Entries describe what was true when written: if one names a file or
-flag, confirm it still exists before relying on it.
+`make ci` enforces this: `make memory-check` (caps, index ↔ entries), `make recall-eval` (the
+entries are still findable from their own prompts), `make terms-check` (no stale `Where` pointers or
+dangling aliases).
 
-**After you finish a task, record it** by reading `.claude/skills/nebula-memory/SKILL.md` and following
-it — an entry file, an index line, and any durable trap into the standing gotchas. Do this whenever the task changed code or behavior, diagnosed a bug, or turned up something
-non-obvious about this repo, the daemon, the TUI, the vendored vt100, or the agent hook dialects. Skip it
-for pure questions and for trivial edits that held no surprise — the log is only useful if it stays free
-of restated diffs.
+## Before you start a task
 
-**Then keep the glossary true** by reading `.claude/skills/project-terms/SKILL.md` and following it — on
-every task, even one that recorded no memory entry: record any word the user used for an existing TERM
-that its row did not list, rename or retire a TERM the task changed, and put any *new* name in the
-**Candidates** ledger at the bottom of `TERMS.md` — it is promoted to a TERM only once a later, separate
-task uses it again.
+1. **Read `.claude/MEMORY.md`, `.claude/memory/gotchas.md` and `TERMS.md`.**
+2. **Open the entries that match what the user is asking** — same TERMS, crate, symptom or file;
+   grep when the index line is not enough (`grep -ril '<symbol or TERM>' .claude/memory/entries`).
+   Match on the user's vocabulary as well as your own: entries quote the original request verbatim.
+   - a recorded gotcha is a mine already stepped on — do not step on it again
+   - a recorded decision ("we're not doing X because Y") is settled unless the user reopens it
+   - a recorded fix tells you where the code that matters actually lives
+   - all of it describes what was true when written: confirm a named file, function or flag still
+     exists before relying on it, and correct it if it has gone stale
+3. **Map every noun in the prompt onto `TERMS.md`** through its **Alias index** ("top nav" →
+   WORKSPACES BAR). A word that maps to two TERMS is an ambiguity to settle before working, not to
+   guess.
+4. **Rewrite the prompt** — PROMPT DADDY: read `.claude/skills/prompt-daddy/SKILL.md` and follow it.
+   Do this on every prompt that is a task, before planning or grepping in earnest. The refined
+   prompt is the request you work from. The skill lists what it skips (a reply to your own question,
+   a bare confirmation, a specific mid-task correction, a skill trigger, and a pure question that
+   changes nothing).
 
-**Then shape the reply** by reading `.claude/skills/output-doctor/SKILL.md` and following it, before
-you write the reply that answers or closes the request: four fixed sections — `==== YOU ASKED ====`
-(the prompt you worked from, verbatim), `==== OVERVIEW ====` (what happened, in plain sentences),
-`==== TECHNICAL OVERVIEW ====` (the details, kept short), and `==== NEXT STEPS ====`, always present
-and always last (what is left for the user: commit, PR, a question, a command, a decision, or
-"Nothing — this is done.") — with `==== ACTION REQUIRED ====` between the overview and the technical
-section if and only if the user must do something before the work is complete (run a command, flip a
-setting, restart, decide, approve), as numbered steps with the exact command. Every reply, every kind
-of task; only the one-line preamble and mid-task progress notes sit outside it.
+## Speak in the TERMS
 
-(Claude Code sessions get this same protocol from `CLAUDE.md`, and can invoke the skills directly as
-`Skill(skill: "nebula-memory")`, `Skill(skill: "project-terms")` and `Skill(skill: "output-doctor")`.)
+Use the TERMS, in ALL CAPS, exactly as `TERMS.md` spells them, in **everything** you write about
+this project: replies, plans, `AskUserQuestion` options, commit messages, PR descriptions, release
+notes, MEMORY LOG entries, and code comments. Prefer a TERM over a synonym even when the synonym
+reads more naturally — a stiffer sentence the whole team parses instantly beats a smoother one only
+you understand. When the user says an alias, answer in the TERM with their word beside it the first
+time ("the WORKSPACES BAR (your 'top nav')"), the TERM alone after that. When they name something
+with no TERM, say so and propose one. Code identifiers are never renamed to match the glossary; it
+points at them.
 
-## Keep modules small
+## After you finish a task
 
-A file, type or function that has grown long is a refactoring smell, not a fact of life. This repo has
-20k-line `event_loop.rs` and 4k-line `ui.rs` / `registry.rs` files precisely because every task added a
-little more to the file it found; do not keep adding to the pile.
+1. **Record it** — the NEBULA-MEMORY SKILL: read `.claude/skills/nebula-memory/SKILL.md` and follow
+   it: an entry file, an index line, any durable trap into the standing gotchas. Whenever the task
+   changed code or behavior, diagnosed a bug, or turned up something non-obvious about this repo,
+   the DAEMON, the TUI, the VENDORED VT100 or the agent hook dialects. Skip it for pure questions
+   and for trivial edits that held no surprise — the log is only useful if it stays free of restated
+   diffs.
+2. **Keep the glossary true** — PROJECT TERMS: read `.claude/skills/project-terms/SKILL.md` and
+   follow it, on **every** task, including one that recorded no entry.
+3. **Shape the reply** — OUTPUT DOCTOR: read `.claude/skills/output-doctor/SKILL.md` and follow it,
+   before you write a word of the reply that answers or closes the request. Every kind of reply,
+   including a question you answered without changing anything.
 
-- **Split what you touch.** When the file, `impl` block, struct, enum or function you are editing is
-  long — many screens, several unrelated concerns, a `match` with dozens of arms, a function that needs
-  section comments to be read — extract the part you are working on (or the coherent piece next to it)
-  into its own module, type or function with a name that says what it does. A `mod foo;` in a new file
-  beside the old one is cheap; the next agent's grep finds `foo.rs` instead of a 20k-line haystack.
-- **Split when it makes sense, not by ruler.** There is no line limit. A long table or a long, flat
-  test module is fine; a function that does three things, or a file whose name no longer describes its
-  contents, is not. Prefer one module per concern (a panel, an overlay, a hook dialect, a
-  subcommand) over one module per crate.
-- **Behavior-preserving, tested first.** An extraction is a refactor: confirm a test covers the code
-  (write one if not), run it green against the old shape, then move the code and run it again. Do not
-  change behavior and layout in the same commit, and keep the public names callers use unless the task
-  is to rename them.
-- **Stay in your lane.** Extract from the file the task already has you in; do not launch drive-by
-  refactors of files the task does not touch — the SHARED CHECKOUT has other sessions mid-edit, and a
-  wholesale move of a file they are in is a merge conflict for everyone. A file that deserves a split
-  but is out of scope is worth one line in the reply, not a change.
+## Writing code here
+
+- **Keep modules small** — `.claude/rules/rust-modules.md`. Read it before editing a long file under
+  `crates/`.
+- **The SHARED CHECKOUT is edited by several sessions at once.** Red tests, compile errors and dirty
+  files are routinely someone else's; `git status` and `git diff origin/main` before blaming your
+  change, and never `git add`, `git stash pop` or `git checkout` the shared tree on your own
+  judgment.
