@@ -30,6 +30,9 @@ COPY_OVER_INSTALLED_BIN = re.compile(r"\b(?:cp|install)\b[^|;&\n]*" + INSTALLED_
 REDIRECT_OVER_INSTALLED_BIN = re.compile(r">\s*" + INSTALLED_BIN)
 # `for f in $(…)` — zsh does not word-split an unquoted expansion, so the loop runs once over one giant "filename".
 FOR_IN_COMMAND_SUBSTITUTION = re.compile(r"\bfor\s+\w+\s+in\s+\$\(")
+# `cargo test … | tail` — a pipeline's `$?` is the *last* stage's, so a red suite reports success.
+# A single `&` is allowed through so `2>&1` does not end the scan; `&&` still ends the command.
+CARGO_PIPED = re.compile(r"\bcargo\s+(?:test|check|build|clippy)\b(?:[^|;&\n]|&(?!&))*\|")
 
 RULES = [
     (
@@ -38,6 +41,14 @@ RULES = [
         "Blocked: the harness shell is zsh, which does not word-split an unquoted `$(…)`, so `for f in $(git diff "
         "--name-only)` runs once with every path glued into one filename and silently copies or checks nothing "
         "(MEMORY gotcha 2026-08-26, re-hit 2026-08-28). Pipe instead: `… | while IFS= read -r f; do …; done`.",
+    ),
+    (
+        "piped-cargo-hides-its-exit-code",
+        lambda cmd: CARGO_PIPED.search(cmd) is not None and "pipefail" not in cmd,
+        "Blocked: a pipeline reports the *last* stage's exit code, so `cargo test … | tail` returns tail's 0 "
+        "even when the suite failed, and the pipe truncates away which crates actually ran (MEMORY gotcha "
+        "2026-08-26, re-hit 2026-08-29). Redirect instead: `cargo test --workspace > gate.log 2>&1; echo $?` "
+        "and read the `test result:` lines — or prefix the command with `set -o pipefail;`.",
     ),
     (
         "backticks-in-commit-message",
