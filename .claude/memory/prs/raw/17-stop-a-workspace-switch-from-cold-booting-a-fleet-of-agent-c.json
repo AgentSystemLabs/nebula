@@ -1,0 +1,234 @@
+{
+  "pr": {
+    "additions": 774,
+    "assignees": [],
+    "author": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "baseRefName": "main",
+    "body": "## Summary\n\nSwitching workspaces could leave the terminal pane blank for 5\u201310s. Three compounding causes, all confirmed against the live dev daemon log and DB:\n\n1. **Every switch attached a dead session.** `session_idle_timeout` (5m) reaps everything in a workspace nobody is looking at, so switching back always landed on a reaped session and the daemon cold-spawned `zsh -l -i -c 'exec claude --resume \u2026'` \u2014 with an empty replay, so the pane showed nothing. One fresh `claude` under a login shell measures 0.67s to first byte, 1.47s to a painted screen.\n2. **250ms later the prewarm booted every other dead session in the worktree, inline** on the connection's request loop. Five agents \u2192 five concurrent CLI boots contending with the one the user was waiting on, and that client's `Input` frames stalled for the whole burst.\n3. **`attach` had no debounce.** In the Workspaces column every cursor step is a full `switch_workspace`, so walking past four workspaces cold-booted four CLIs and abandoned three.\n\n### Fixes\n\n- **Daemon:** `ensure_session` holds a `spawn_gate` across its check-and-install, so an Attach and the prewarm sweep racing the same dead session fork one CLI, not two. That lets the sweep leave the request loop: `run_worktree_prewarm` runs on its own task, boots one session per `PREWARM_STAGGER` (1.5s), skips ones already alive, and is aborted by a newer sweep.\n- **TUI:** selection-driven attaches wait out `ATTACH_DEBOUNCE` (180ms). The pane swaps immediately; only the `Attach` waits. Explicit picks \u2014 Enter, click, menu, palette, a freshly created session, the post-delete reconcile, and the boot snapshot \u2014 go through `attach_now` and don't wait. `attached_sref` tracks what the daemon actually holds while `term.sref` runs ahead.\n- **UI:** the pane says `starting\u2026` instead of rendering a blank grid, so a boot no longer reads as a hang.\n\n### Also in this PR\n\n**Keep a worktree row on its branch while a rebase is paused** (`95c0a18`). Found while rebasing this branch: a rebase parks HEAD on the commits it replays, so `git worktree list --porcelain` prints `detached` for as long as it sits on a conflict. The worktree sync renamed the row to `detached @ <sha>` and back \u2014 and since `nebula worktree <name>` finds rows by branch string, it would have tried to create a *second* checkout for the branch in the meantime. `list_worktrees` now reads `<git-dir>/rebase-merge/head-name` (the same file `git status` uses to say \"rebasing branch X\") before falling back to the detached label.\n\n**Wait for the upsert in `workspace_scope_is_per_connection`.** The e2e test read events until the `AddProject` Ack and expected the project upsert among them, but the daemon writes the Ack from the request loop and the upsert from the broadcast forwarder and promises no order (the TUI handles either). The memory log had this test losing that race twice under load; a timing shift from the `git.rs` change made it lose ~60% of idle runs even though the new code path never executes in that test. It now waits for both, as `cli_add_project` already did \u2014 10/10 after, 4/11 before.\n\n### Rebase notes\n\nThe branch was cut at v0.9.0 and rebased onto v0.13.0, then again onto `8f56ca6`. Two semantic conflicts, both resolved the same way \u2014 main factored a path into a helper, and the branch's hook moved into the helper so it covers every caller:\n\n- `main` added `mark_agent_seen` at the top of `attach()`; after the debounce split that funnel is `attach_inner`, so the call moved there \u2014 keyed to the pane swap, not the Attach, since the user is reading the screen during the debounce.\n- `main` extracted the input-lock into `enter_terminal_pane`, shared by Enter and the new Tab/^\u21e7L panel walk. `fire_pending_attach` now lives inside it, so landing on the pane by either route settles a debounced attach before the first keystroke.\n\n## Test plan\n\n- [x] `cargo test --workspace --no-fail-fast` \u2014 693 passed, 0 failed, exit 0 on the rebase onto `8f56ca6` (all binaries incl. e2e_pty 25 / e2e_tui 5)\n- [x] New: `walking_the_workspaces_column_attaches_only_where_it_stops`, `a_paused_rebase_keeps_the_worktree_on_its_branch`\n- [x] `workspace_scope_is_per_connection` 10/10 idle runs\n- [x] `cargo fmt --check` clean; clippy shows only the 7 warnings already on `main` (verified the warned lines are untouched by this diff)\n- [ ] Manual: switch between workspaces in the live TUI \u2014 expect `starting\u2026` instead of a blank pane, and one CLI boot per stop rather than per row passed\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changedFiles": 8,
+    "closedAt": "2026-08-28T02:23:51Z",
+    "closingIssuesReferences": [],
+    "comments": [],
+    "commits": [
+      {
+        "authoredDate": "2026-08-26T04:45:36Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Opus 5"
+          }
+        ],
+        "committedDate": "2026-08-28T02:21:46Z",
+        "messageBody": "Switching workspaces could leave the terminal pane blank for 5-10s. Three\ncauses, all compounding:\n\n- The idle reaper kills sessions in a workspace nobody is looking at after\n  5m, so switching back always attached a dead session and the daemon\n  cold-spawned `zsh -l -i -c 'exec claude --resume'` inline. Measured floor\n  for one fresh claude on a quiet machine: 0.67s to first byte, 1.47s to a\n  painted screen \u2014 and the attach replay is empty, so the pane showed\n  nothing at all meanwhile.\n\n- 250ms later the debounced prewarm fired PrewarmWorktreeSessions, which\n  booted *every* dead session under the worktree, synchronously on the\n  connection's request loop. A worktree with five agents forked five CLIs\n  at once, all contending with the one the user was waiting on, and stalled\n  that client's Input frames for the duration.\n\n- attach() had no debounce, unlike prewarm. In the Workspaces column every\n  cursor step is a full switch_workspace, so walking past four workspaces\n  cold-spawned four agents and abandoned three, each living 5m more.\n\nFixes:\n\n- ensure_session holds a spawn gate across its check-and-install, so an\n  Attach and the prewarm sweep racing the same dead session produce one CLI\n  instead of two. That makes it safe for the sweep to leave the request\n  loop: it now runs on its own task, boots sessions one at a time 1.5s\n  apart, skips ones already alive, and is superseded when a newer sweep\n  arrives.\n\n- Selection-driven attaches wait out ATTACH_DEBOUNCE (180ms). The pane\n  swaps immediately; only the Attach waits. Explicit picks \u2014 Enter, a\n  click, the menu, the palette, a freshly created session, and the\n  post-delete/archive reconcile \u2014 go through attach_now and don't wait.\n  attached_sref tracks what the daemon holds while term.sref runs ahead.\n\n- The pane says \"starting\u2026\" instead of rendering a blank grid, so a boot\n  no longer reads as a hang.\n\n631 tests green, fmt clean, no new clippy warnings.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+        "messageHeadline": "Stop a workspace switch from cold-booting a fleet of agent CLIs",
+        "oid": "5950a15e004342b2c21424106dd5dbf9f5c6177f"
+      },
+      {
+        "authoredDate": "2026-08-26T04:46:26Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Opus 5"
+          }
+        ],
+        "committedDate": "2026-08-28T02:21:46Z",
+        "messageBody": "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+        "messageHeadline": "Log the workspace-switch cold-boot investigation",
+        "oid": "9111cd4f20c6f2e8c8565d9e25ceaacb83f7467b"
+      },
+      {
+        "authoredDate": "2026-08-28T02:06:25Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Opus 5"
+          }
+        ],
+        "committedDate": "2026-08-28T02:21:46Z",
+        "messageBody": "The branch sat unmerged for 20 commits. Resolved against main's newer work:\n\n- registry.rs: both sides only added fields (pending_moves / cloud_* vs.\n  spawn_gate / prewarm_sweep), so both survive.\n\n- attach(): main added mark_agent_seen at its top, reasoning that every path\n  landing the pane on a session goes through attach. After the debounce split\n  that funnel is attach_inner, so the call moves there \u2014 keyed to the pane\n  swap, not the Attach, since the user is reading the screen during the\n  debounce just the same.\n\n- The boot snapshot now attaches through preview_selected_now. It restores one\n  remembered session once, with no cursor sweep to wait out, so the debounce\n  bought nothing there and only delayed the screen the user is waiting for.\n  The workspace-switch path keeps the debounce \u2014 that is what the fix is for \u2014\n  and its test moved to the new contract instead.\n\n- Test-only struct drift: Project lost its divider_* fields and Agent gained\n  unseen / cloud_session_id / cloud_mirroring.\n\n657 tests green (exit 0, --no-fail-fast, all 7 binaries). fmt and clippy are\ndirty on origin/main already; nothing new from this diff.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+        "messageHeadline": "Rebase the workspace-switch fix onto v0.13.0",
+        "oid": "3662c30d0715cd8eb1581df98dd0765e45962c62"
+      },
+      {
+        "authoredDate": "2026-08-28T02:11:48Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Opus 5"
+          }
+        ],
+        "committedDate": "2026-08-28T02:21:46Z",
+        "messageBody": "A rebase parks HEAD on the commits it replays, so for as long as it sits on\na conflict `git worktree list --porcelain` prints `detached` for the\ncheckout. The worktree sync took that at face value and renamed the row to\n`detached @ <sha>`, then renamed it back when the rebase finished \u2014 a\nworktree that looked like it had lost its identity for a few minutes, and\none that `nebula worktree <name>` (which finds rows by branch) could not\nsee at all in the meantime.\n\ngit itself knows better: `git status` says \"rebasing branch X\" from\n`<git-dir>/rebase-merge/head-name`. list_worktrees now reads the same file\n(and the `rebase-apply` one) for any entry without a branch line, and only\nfalls back to the detached label when there is no rebase in progress or the\nrebase started from a detached HEAD.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+        "messageHeadline": "Keep a worktree row on its branch while a rebase is paused",
+        "oid": "d49e0ad8943155b08c822c08fd6b15a1fc338a12"
+      },
+      {
+        "authoredDate": "2026-08-28T02:12:16Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Opus 5"
+          }
+        ],
+        "committedDate": "2026-08-28T02:22:08Z",
+        "messageBody": "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+        "messageHeadline": "Log the paused-rebase worktree relabel",
+        "oid": "7bbb65f5e15f337776233a2e8cdae58938a61eb6"
+      },
+      {
+        "authoredDate": "2026-08-28T02:19:53Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Opus 5"
+          }
+        ],
+        "committedDate": "2026-08-28T02:22:08Z",
+        "messageBody": "The test read events until the AddProject Ack and then expected the\nproject upsert to be among them. The daemon promises no such order: the\nAck is written from the request loop and the upsert from the broadcast\nforwarder task, and the TUI already handles either arriving first. The\nmemory log records this test losing that race twice under load. A\ntiming shift from the git.rs change made it lose ~60% of idle runs.\n\nWait for both, the way cli_add_project already waits on the upsert.\n10/10 idle runs after; 4/11 before.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+        "messageHeadline": "Wait for the upsert in workspace_scope_is_per_connection",
+        "oid": "1d1386d55311b6bb8c2aff3ea7b29db5c8942c41"
+      },
+      {
+        "authoredDate": "2026-08-28T02:19:54Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Opus 5"
+          }
+        ],
+        "committedDate": "2026-08-28T02:22:21Z",
+        "messageBody": "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+        "messageHeadline": "Log the Ack race that the git.rs change surfaced",
+        "oid": "18555ed8ae1d88442ebefe929c3ccc921712100d"
+      }
+    ],
+    "createdAt": "2026-08-28T02:13:09Z",
+    "deletions": 61,
+    "files": [
+      {
+        "additions": 133,
+        "deletions": 2,
+        "path": ".claude/MEMORY.md"
+      },
+      {
+        "additions": 107,
+        "deletions": 12,
+        "path": "crates/nebula-daemon/src/git.rs"
+      },
+      {
+        "additions": 68,
+        "deletions": 4,
+        "path": "crates/nebula-daemon/src/registry.rs"
+      },
+      {
+        "additions": 5,
+        "deletions": 5,
+        "path": "crates/nebula-daemon/src/server.rs"
+      },
+      {
+        "additions": 26,
+        "deletions": 0,
+        "path": "crates/nebula-tui/src/app.rs"
+      },
+      {
+        "additions": 385,
+        "deletions": 37,
+        "path": "crates/nebula-tui/src/event_loop.rs"
+      },
+      {
+        "additions": 27,
+        "deletions": 0,
+        "path": "crates/nebula-tui/src/ui.rs"
+      },
+      {
+        "additions": 23,
+        "deletions": 1,
+        "path": "crates/nebula/tests/e2e_pty.rs"
+      }
+    ],
+    "headRefName": "worktree-workspace-switch-lag",
+    "headRefOid": "18555ed8ae1d88442ebefe929c3ccc921712100d",
+    "isDraft": false,
+    "labels": [],
+    "mergeCommit": {
+      "oid": "5b662984ada89f07859a9a7c9ae3be23a69dfeaf"
+    },
+    "mergedAt": "2026-08-28T02:23:51Z",
+    "mergedBy": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "milestone": null,
+    "number": 17,
+    "reviewRequests": [],
+    "reviews": [],
+    "state": "MERGED",
+    "title": "Stop a workspace switch from cold-booting a fleet of agent CLIs",
+    "updatedAt": "2026-08-28T02:23:51Z",
+    "url": "https://github.com/AgentSystemLabs/nebula/pull/17"
+  },
+  "review_comments": []
+}

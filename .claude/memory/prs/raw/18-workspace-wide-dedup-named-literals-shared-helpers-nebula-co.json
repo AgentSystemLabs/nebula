@@ -1,0 +1,436 @@
+{
+  "pr": {
+    "additions": 3169,
+    "assignees": [],
+    "author": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "baseRefName": "main",
+    "body": "## Summary\n\nA behavior-preserving cleanup pass over all four crates: magic numbers named, copy-pasted blocks folded into helpers, and a handful of idiom fixes (`&String`/`&Option<String>` params, `bool` args \u2192 enums, `match`-on-`Option` \u2192 `map_or`, `.unwrap()` in row mappers \u2192 `?`). Every refactor was gated on a test: where one already covered the code it was named and run first; where none did, a pinning test was written against the *old* code and run green before the change. Net: **+20 tests** (710 across the workspace), **0 clippy warnings** workspace-wide (was 7), `cargo fmt --check` clean.\n\nOne commit per area so each is reviewable on its own:\n\n| Commit | What |\n|---|---|\n| `nebula-core` | New `nebula_core::env`: every `NEBULA_*` variable name as a const, plus `non_empty()` and `home_dir()`, used by the daemon, TUI, CLI, hook installer and the e2e tests instead of string literals (a typo now fails to build instead of silently falling back to a default). `paths.rs` uses it and one `project_dirs()`. `codec.rs` has one `check_len()`/`invalid_data()` instead of two frame-too-large blocks. `crashlog.rs` gets `SECS_PER_*` and a testable `format_timestamp`. |\n| `nebula` CLI | `KILL_HINT` shared by `upgrade.rs` and `main.rs` (the two copies had drifted: \"all\" vs \"ALL\"); one `init_file_logging()` for daemon and TUI; `log_fatal(&Path)`, `spawn_ttyd(&OsStr)`. |\n| e2e tests | `make_executable()` replaces 12 chmod blocks, `subscribe()` 8 subscribe-and-wait blocks, `agent_cli()` 4 CLI spawns, `make_repo` delegates to `make_repo_at`; 120 bare `Duration` literals and the escape-byte sends become named consts. |\n| `nebula-tui` (non-event-loop) | `modal_block`/`render_modal_frame` (6 byte-identical sites), `empty_list_row`, `below_first_row`, `visible_positions`, `hint_line`; popup sizes named. `window_start`/`clamp_selection`/`max_scroll`/`clamp_files_width` shared by 6/5/2/2 impls. One `truncate` (was also `grep_search::clip`), one `cap_lines`. `ipc.rs`: `await_ack`, `current_agent_id`, `RenameMode`. `pull_request.rs`: one `gh()` wrapper and `str_at`/`arr_at`/`web_url` extractors; `STATE_OPEN`. `keymap.rs`: one `KEY_NAMES` table backs `parse_key_name`/`key_name`/`key_display` (pinned first by a test asserting every current spelling and glyph); `CTRL_COLLISIONS`; `UNBOUND`. `config.rs`: `DEFAULT_CHOICE`. |\n| `nebula-daemon` | `DEFAULT_COLS/ROWS` (9 \u00d7 `80, 24`), `broadcast_agent`/`try_broadcast_agent` (15 sites), `kill_sessions_in`, `LOGIN_SHELL_ARGS`, `CLI_PROBE_TIMEOUT`; `AGENT_SESSION_VARS` replaces the per-spawn `scrubbed_env_names()` allocation. `store.rs`: one `*_COLUMNS` const + `row_to_*` mapper per entity shared by point lookups and `load_tree` (the point lookups' ~41 `.unwrap()`s now propagate via `?`), `delete_by_id`, `DEFAULT_WORKSPACE_ID` bound instead of an inlined `'default'`. `status.rs`: `end_turn` shared by `Stop` and `Progress{busy:false}`. `hooks/installer.rs`: `install_claude_hooks` reuses `install_managed_hooks`, `root_object_mut`/`object_mut`/`array_mut` replace 9 bail blocks (messages verbatim), `purge_nebula_groups`, `HOOKS_FILE`/dir consts, shared curl prelude (pinned verbatim by a new test). `hooks/mod.rs`: `HookDialect` enum for the `bool`, `HOOK_OK`/`HOOK_NOT_OK`, handlers moved above the test module. `lib.rs`: `env_period_ms` (tested) + `env_interval`. `server.rs`: `reply_done` for 21 arms. `pty`: `pty_size`, `ESC`/`BEL`. `git.rs`: `parse_worktree_list` is a pure, tested function. |\n| `event_loop.rs` | `contains()` for 10 open-coded rect tests; `selected_checkout` + `load_worktree_files` (4 modal preambles); `spawn_editor_modal` (4); `settings`/`settings_mut` (17); `send`/`send_with` (~24 `alloc_req_id` + push pairs); `upsert_by`; `worktree_in_context`; `select_project_row`/`select_worktree_row` shared by key and mouse; `is_double_click`; `leave_terminal_lock`; `bracketed()` + `PASTE_START/END`; `edit_keymap`; `confirm_delete_agent`/`confirm_close_terminal`/`confirm_remove_project` shared by key and menu (pinned by a new test); `MenuItem::new`/`destructive` for 46 literals; `Landing` enum for `jump_to_target`'s `bool`; `next_focus` behind the three focus-walk tables; `home_dir`; `step_selection`; `clamp_index`; wheel-step, restore-clamp, anchor and fallback-pane consts. |\n\n### Deliberately not done (medium risk, untested draw paths)\n- Folding the six list-modal mouse arms / four overlay key handlers in `event_loop.rs` into one \u2014 arm order is load-bearing for Tree.\n- `jump_to_target` vs `open_session` (~45 near-identical lines) \u2014 the non-attach path has extra `preview_selected` bookkeeping.\n- The two-pane modal scaffold in `ui.rs` (Diff vs Tree, ~120 lines) \u2014 no test covers the Tree arm.\n- A `str_enum!` macro for `AgentStatus`/`AgentKind` \u2014 a typo there is a silent persistence break.\n- `Config::write_into`/`value_label`/`cycle` table-driving \u2014 serde field-name drift hazard.\n\nA `/code-review` pass over the branch (no high-severity findings) fed a final commit: the agents' overlapping helpers were reconciled (`step_selection`/`clamp_index` \u2192 `app::clamp_selection`, `home_dir` \u2192 `nebula_core::env::home_dir`, `pr_preview::fit` \u2192 `truncate`, `grep_search` \u2192 `git_diff::run_git`, hit-testing \u2192 ratatui's `Rect::contains`), `PROJECT_COLUMNS` no longer hides a positional `?1` bind (the default workspace is applied in `row_to_project`), `remove_project` loads the tree once again, `RenameMode` is built where `--force` is parsed, and the `paths.rs` env test restores its vars on drop.\n\n### Small semantic deltas worth knowing\n- `store.rs` point lookups return `Err` on a corrupt row instead of panicking the daemon thread.\n- `nebula stale-daemon-note` now prints \"(stops all sessions)\" like the two `upgrade` sites did, not \"ALL\" \u2014 the three copies had drifted and `KILL_HINT` picked the majority.\n- The metrics modal's `k`/wheel-up now clamps to the last row (it was an unclamped `saturating_sub`); identical while the cursor is in range.\n- `~/` expansion everywhere goes through `home_dir()` (`var_os`), so a non-UTF-8 `$HOME` now expands where `ipc::add_project` used to fall through.\n\n## Test plan\n- [x] `cargo fmt --all --check`\n- [x] `cargo clippy --workspace --all-targets` \u2014 0 warnings\n- [x] `cargo test --workspace --no-fail-fast` \u2014 709 passed, 0 failed (incl. `e2e_pty` 25/25, `e2e_tui` 5/5)\n- [x] Every new helper's pinning test was run green against the pre-refactor code first\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changedFiles": 37,
+    "closedAt": "2026-08-28T14:02:04Z",
+    "closingIssuesReferences": [],
+    "comments": [],
+    "commits": [
+      {
+        "authoredDate": "2026-08-28T02:23:41Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5"
+          }
+        ],
+        "committedDate": "2026-08-28T02:42:03Z",
+        "messageBody": "- New nebula_core::env with the NEBULA_* variable names and a non_empty()\n  reader, so the daemon/TUI/CLI stop spelling them as literals\n- paths.rs uses it, shares one project_dirs(), and builds the /tmp\n  fallback with Path::join; gains a test for the override semantics\n- codec.rs: one check_len()/invalid_data() pair instead of two copies of\n  the frame-too-large block; gains round-trip and oversize tests\n- crashlog.rs: SECS_PER_* consts, timestamp formatting split out and tested\n- host.rs: hostname() no longer allocates a throwaway \"unknown\"\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+        "messageHeadline": "nebula-core: name env vars, dedupe codec and path helpers",
+        "oid": "1ed166b524121d93c81c992519a89578428949ad"
+      },
+      {
+        "authoredDate": "2026-08-28T02:30:03Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5"
+          }
+        ],
+        "committedDate": "2026-08-28T02:45:57Z",
+        "messageBody": "- upgrade.rs: KILL_HINT const shared with main.rs (which had drifted to\n  \"ALL\"), install_url via nebula_core::env::non_empty, dev_build drops a\n  clone\n- main.rs: one init_file_logging() for the daemon and TUI, log_fatal takes\n  &Path, NEBULA_LOG named once\n- browser.rs: spawn_ttyd takes &OsStr\n- e2e_pty.rs: make_repo delegates to make_repo_at, make_executable()\n  replaces 12 chmod blocks, subscribe() replaces 8 subscribe-and-wait\n  blocks, agent_cli() replaces 4 CLI invocations; clippy len_zero\n- e2e_tui.rs: make_repo uses the existing repo_git helper; needless borrows\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+        "messageHeadline": "nebula CLI: share the kill hint and logging init, dedupe e2e helpers",
+        "oid": "515e994599d3530c2c6ad268a75c74cc1dbb1b5e"
+      },
+      {
+        "authoredDate": "2026-08-28T02:31:39Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5"
+          }
+        ],
+        "committedDate": "2026-08-28T02:45:57Z",
+        "messageBody": "- e2e_pty.rs: EVENT_TIMEOUT / SLOW_TIMEOUT / SPAWN_CHAIN_TIMEOUT / POLL_STEP\n  replace 120 bare Duration literals\n- e2e_tui.rs: ENTER / TAB / ESC / LEFT / DOWN / CTRL_Q / CTRL_R /\n  CTRL_RBRACKET replace escape-byte literals whose meaning lived in a\n  trailing comment\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+        "messageHeadline": "e2e tests: name the event timeouts and raw key bytes",
+        "oid": "78b97582fe94d54cfe4c23ab629dac75012a928c"
+      },
+      {
+        "authoredDate": "2026-08-28T02:41:03Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5"
+          }
+        ],
+        "committedDate": "2026-08-28T02:45:57Z",
+        "messageBody": "Pure refactor, no behavior change (467 tests, was 458; e2e_tui 5/5; clippy\nclean outside event_loop.rs). What was folded together:\n\nui.rs\n- modal_block / render_modal_frame for the six accent+BOLD modal frames\n  (Settings, Memory, Palette, Files, Grep, Hosts)\n- below_first_row, empty_list_row + NO_MATCHES across the five filtered lists\n- visible_positions for the ellipsis-aware fuzzy highlight clip (x3)\n- hint_line for the three empty-panel nudges\n- named popup sizes beside VIM_MODAL_PCT; SPLIT_PANE_LAYOUT_MIN documents\n  why the Min(20) sits below MIN_DIFF_PANE_W\n- truncate is pub; grep_search::clip removed in its favor\n\napp.rs / tree_browser.rs / git_diff.rs\n- free window_start, clamp_selection, max_scroll, scrolled_by,\n  clamp_files_width shared by DiffView, Palette, FileFinder, GrepView,\n  HostsView and TreeBrowser\n- cap_lines + TRUNCATED_MARK shared by the diff pane and the tree preview\n\nipc.rs / lib.rs\n- agent_id_from / current_agent_id for the NEBULA_AGENT_ID guard\n- await_reply / await_ack for the three Ack-or-Error loops\n- RenameMode { Auto, Force } replaces the bool (lib.rs converts at the CLI\n  boundary); rename/add_project take &str\n- ONE_SHOT_REQ_ID, CLOSED_BEFORE_REPLY, POLL_STEP\n\npull_request.rs / pr_preview.rs\n- one gh(dir, args, timeout) wrapper for the five process spawns\n- str_at / u64_at / bool_at / arr_at / state_at / web_url replace the\n  per-parser closures; STATE_OPEN + state_is_open; unseen uses map_or\n- MIN_BODY_W names the bare .max(20)\n\nconfig.rs\n- DEFAULT_CHOICE sentinel; struct-update syntax in the save test (clippy)\n\nkeymap.rs\n- KEY_NAMES table behind parse_key_name / key_name / key_display, pinned\n  first by named_keys_keep_their_spellings_and_glyphs\n- CTRL_COLLISIONS table in host_warning; UNBOUND; map_or in chords/label\n\nSkipped: bind(.., add: bool) -> enum, since event_loop.rs calls it.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+        "messageHeadline": "Dedup nebula-tui: modal frames, list math, gh wrapper, key-name table",
+        "oid": "f14724127b32224d8e33ee0aa3d696caab56e2d1"
+      },
+      {
+        "authoredDate": "2026-08-28T02:42:52Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5"
+          }
+        ],
+        "committedDate": "2026-08-28T02:45:57Z",
+        "messageBody": "\u2026n defaults\n\nZero-behavior-change cleanup of crates/nebula-daemon, one item per hunk:\n\nregistry.rs\n- pty::DEFAULT_COLS/DEFAULT_ROWS replace the nine literal `80, 24` headless spawns\n- broadcast_agent / try_broadcast_agent replace 15 copies of\n  `agent_entity(id)? + broadcast(EntityUpserted)` (5 of them if-let-Ok variants)\n- kill_sessions_in shares the kill-agents-and-terminals-then-kill_prewarmed_in\n  sequence between remove_project and delete_worktree\n- take_prewarmed takes Option<&str> for model/effort\n- the spawn-args builder pushes the shared `--model` flag once (argv byte-identical)\n- nebula_core::env consts for the agent PTY env vec, and AGENT_SESSION_VARS\n  replaces the per-spawn scrubbed_env_names() allocation\n- LOGIN_SHELL_ARGS shared by the CLI probe and login_shell_wrap; CLI_PROBE_TIMEOUT,\n  AGENT_CMD and CLOUD_MIRROR_SECS name the remaining env/timeout literals\n\nstore.rs\n- one *_COLUMNS const and row_to_* mapper per entity (workspace, project, worktree,\n  agent, terminal, link), shared by the point lookups and load_tree; the ~40\n  `.unwrap()`s in the point lookups now propagate with `?`\n- delete_by_id behind the six `DELETE FROM <table> WHERE id = ?1` bodies\n- the default workspace id is bound from DEFAULT_WORKSPACE_ID instead of an\n  inlined 'default' literal in two SELECTs\n\nstatus.rs\n- end_turn shares the end-of-turn bookkeeping between Stop and Progress{busy:false}\n\nhooks/installer.rs\n- install_claude_hooks reuses install_managed_hooks (new allow_rules param)\n- root_object_mut / object_mut / array_mut replace nine let-else bail blocks,\n  messages kept verbatim\n- purge_nebula_groups shared by the codex prune and the cursor install\n- HOOKS_FILE, CLAUDE_SETTINGS_FILE, CLAUDE_DIR/CURSOR_DIR/CODEX_DIR,\n  HOOK_CURL_TIMEOUT_SECS; env_guard + hook_curl share the curl prelude between\n  the claude/codex and cursor command builders (pinned verbatim by a new test)\n\nhooks/mod.rs\n- HookDialect { Injectable, Plain } replaces the inject_capable bool\n- HOOK_OK / HOOK_NOT_OK consts\n- handlers moved above the test module (clears clippy items_after_test_module)\n\nlib.rs\n- env_period_ms + env_interval share the env-tunable interval loop (unit-tested),\n  MIN_TICK_MS, IDLE_REAP_MS / WORKTREE_SYNC_MS consts\n\nserver.rs\n- reply_done for the 21 `reply(.., x.map(|_| None))` arms\n\npty/mod.rs, pty/progress.rs, pty/kitty.rs\n- pty_size for the four PtySize literals; SpawnSpec::scrub_env is now a\n  &'static [&'static str]; ESC / BEL name the scanner bytes\n\ngit.rs\n- parse_worktree_list is a pure function (unit-tested against porcelain output)\n  with one shared stanza close instead of two push sites\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+        "messageHeadline": "nebula-daemon: dedupe row mappers, broadcasts, hook helpers, and spaw\u2026",
+        "oid": "a473f4f2d09762345fbf29a95c1bb6c101dd89b4"
+      },
+      {
+        "authoredDate": "2026-08-28T02:44:35Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5"
+          }
+        ],
+        "committedDate": "2026-08-28T02:45:57Z",
+        "messageBody": "No behavior change; every fold is pinned by the existing unit tests plus\ntwo written first for the unpinned spots (menu-path confirm copy, and the\nbracketed paste sent to a locked pane).\n\nDuplicate blocks folded:\n- rect hit-testing in handle_mouse            -> contains()\n- selected-worktree preamble in the 4 file modals -> selected_checkout(),\n  plus load_worktree_files() for the finder/tree pair\n- the 4 editor-spawn blocks                   -> spawn_editor_modal()\n- `Overlay::Settings(view)` unwraps           -> settings()/settings_mut()\n- alloc_req_id + push                         -> send()/send_with()\n- apply_upsert find-or-push                   -> upsert_by()\n- worktree-or-root-checkout rule              -> worktree_in_context()\n- click-to-select vs move_selection arms      -> select_project_row()/\n                                                 select_worktree_row()\n- double-click detection x3                   -> is_double_click()\n- escape-hatch unlock x2                      -> leave_terminal_lock()\n- bracketed paste x2                          -> bracketed() + PASTE_*\n- clone/mutate/save_keymap x3                 -> edit_keymap(), save_config()\n- key-vs-menu confirm dialogs                 -> confirm_delete_agent(),\n                                                 confirm_close_terminal(),\n                                                 confirm_remove_project()\n- detach + delete/close request pairs         -> delete_agent(),\n                                                 close_terminal(),\n                                                 delete_worktree(),\n                                                 create_terminal()\n\nLiterals named: MODAL_WHEEL_LINES, TERM_WHEEL_LINES (arrow burst now built\nby repetition), MAX_RESTORED_WIDTH, MIN_PANE_DIM (+ pane_usable()),\nFALLBACK_PANE, KEYBOARD_MENU_ANCHOR, SELECT_CONTEXT_FIRST, SESSION_GONE,\nAGENT_ARCHIVED; the four HOME reads go through home_dir(); MenuItem\nliterals use the new MenuItem::new / MenuItem::destructive (app.rs).\n\nIdioms: jump_to_target takes `Landing::{Attach, FocusOnly}` instead of a\nbool; open_menu_at removed; move_selection matches focus once;\nnext_focus() backs FocusNext/FocusTerminal/FocusRight; unwrap_or_else /\nif-let in note_open_prs_answer and select_link_by_id; resolve_file_link\nborrows its candidates; open_prompt uses Cow locals; clamp_index() and\nstep_selection() replace the hand-rolled clamps; the pbcopy\nneedless_return is gone.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+        "messageHeadline": "Dedupe event_loop.rs: shared helpers, named consts, idiom cleanups",
+        "oid": "e80f4de00a42bb15effbc313672f35449ab0e50a"
+      },
+      {
+        "authoredDate": "2026-08-28T02:47:49Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5"
+          }
+        ],
+        "committedDate": "2026-08-28T02:47:49Z",
+        "messageBody": "Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+        "messageHeadline": "Log the workspace-wide dedup pass",
+        "oid": "5ff1721da9f58031f6a0348cf82c41ab46d4c583"
+      },
+      {
+        "authoredDate": "2026-08-28T03:15:55Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5"
+          }
+        ],
+        "committedDate": "2026-08-28T03:15:55Z",
+        "messageBody": "\u2026 env consts\n\n- nebula_core::env now carries every NEBULA_* name (AGENT_CMD, IDLE_REAP_MS,\n  WORKTREE_SYNC_MS, CLOUD_MIRROR_SECS, LOG, INSTALL_URL, EDITOR) plus\n  home_dir(); the per-crate private consts and the e2e tests' string\n  literals use it\n- store.rs: PROJECT_COLUMNS selects bare workspace_id and row_to_project\n  applies DEFAULT_WORKSPACE_ID, instead of a COALESCE(.., ?1) that made\n  every query bind a hidden first parameter\n- registry.rs: kill_sessions_in takes the rows remove_project already\n  loaded, so it no longer reads the tree twice\n- event_loop.rs: step_selection/clamp_index replaced by app::clamp_selection,\n  hit-testing by ratatui's Rect::contains (with the dead width > 0 guards\n  dropped), the local home_dir by nebula_core::env::home_dir; the\n  misplaced doc comment is back on enter_terminal_pane\n- pr_preview::fit uses ui::truncate; grep_search uses git_diff::run_git\n- RenameMode is built in main.rs where --force is parsed and re-exported\n  from nebula_tui\n- paths.rs env test restores NEBULA_RUNTIME_DIR/DATA_DIR on drop, so a\n  failed assertion can't leak the override into a later test\n- e2e_pty.rs: TestEnv::cli() base builder behind the daemon spawns,\n  run_cli, run_upgrade and agent_cli; spawn_daemon_with_shell shares\n  spawn_daemon_in; e2e_tui.rs names its 5s/50ms\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+        "messageHeadline": "Address review: reconcile the agents' overlapping helpers, finish the\u2026",
+        "oid": "48529389249890ac995f8bdb2f2e0006edf3f624"
+      },
+      {
+        "authoredDate": "2026-08-28T03:16:16Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5"
+          }
+        ],
+        "committedDate": "2026-08-28T03:16:16Z",
+        "messageBody": "Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+        "messageHeadline": "Log the review-pass lessons from the dedup PR",
+        "oid": "828def4a8c54354a4f27bd7bf251b9cd604b3325"
+      },
+      {
+        "authoredDate": "2026-08-28T13:44:15Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          }
+        ],
+        "committedDate": "2026-08-28T13:44:15Z",
+        "messageBody": "# Conflicts:\n#\t.claude/MEMORY.md\n#\tcrates/nebula-daemon/src/git.rs\n#\tcrates/nebula-tui/src/event_loop.rs\n#\tcrates/nebula/tests/e2e_pty.rs",
+        "messageHeadline": "Merge remote-tracking branch 'origin/main' into clean-up",
+        "oid": "098d34ad665156b5c02f13d656cafd0b3558e1a7"
+      }
+    ],
+    "createdAt": "2026-08-28T03:15:59Z",
+    "deletions": 2809,
+    "files": [
+      {
+        "additions": 73,
+        "deletions": 0,
+        "path": ".claude/MEMORY.md"
+      },
+      {
+        "additions": 3,
+        "deletions": 0,
+        "path": "crates/nebula-core/Cargo.toml"
+      },
+      {
+        "additions": 57,
+        "deletions": 15,
+        "path": "crates/nebula-core/src/codec.rs"
+      },
+      {
+        "additions": 27,
+        "deletions": 5,
+        "path": "crates/nebula-core/src/crashlog.rs"
+      },
+      {
+        "additions": 65,
+        "deletions": 0,
+        "path": "crates/nebula-core/src/env.rs"
+      },
+      {
+        "additions": 6,
+        "deletions": 4,
+        "path": "crates/nebula-core/src/host.rs"
+      },
+      {
+        "additions": 1,
+        "deletions": 0,
+        "path": "crates/nebula-core/src/lib.rs"
+      },
+      {
+        "additions": 84,
+        "deletions": 21,
+        "path": "crates/nebula-core/src/paths.rs"
+      },
+      {
+        "additions": 76,
+        "deletions": 27,
+        "path": "crates/nebula-daemon/src/git.rs"
+      },
+      {
+        "additions": 169,
+        "deletions": 102,
+        "path": "crates/nebula-daemon/src/hooks/installer.rs"
+      },
+      {
+        "additions": 111,
+        "deletions": 94,
+        "path": "crates/nebula-daemon/src/hooks/mod.rs"
+      },
+      {
+        "additions": 51,
+        "deletions": 13,
+        "path": "crates/nebula-daemon/src/lib.rs"
+      },
+      {
+        "additions": 4,
+        "deletions": 2,
+        "path": "crates/nebula-daemon/src/pty/kitty.rs"
+      },
+      {
+        "additions": 31,
+        "deletions": 30,
+        "path": "crates/nebula-daemon/src/pty/mod.rs"
+      },
+      {
+        "additions": 7,
+        "deletions": 5,
+        "path": "crates/nebula-daemon/src/pty/progress.rs"
+      },
+      {
+        "additions": 123,
+        "deletions": 127,
+        "path": "crates/nebula-daemon/src/registry.rs"
+      },
+      {
+        "additions": 27,
+        "deletions": 77,
+        "path": "crates/nebula-daemon/src/server.rs"
+      },
+      {
+        "additions": 20,
+        "deletions": 23,
+        "path": "crates/nebula-daemon/src/status.rs"
+      },
+      {
+        "additions": 164,
+        "deletions": 167,
+        "path": "crates/nebula-daemon/src/store.rs"
+      },
+      {
+        "additions": 124,
+        "deletions": 21,
+        "path": "crates/nebula-tui/src/app.rs"
+      },
+      {
+        "additions": 25,
+        "deletions": 16,
+        "path": "crates/nebula-tui/src/config.rs"
+      },
+      {
+        "additions": 892,
+        "deletions": 931,
+        "path": "crates/nebula-tui/src/event_loop.rs"
+      },
+      {
+        "additions": 36,
+        "deletions": 8,
+        "path": "crates/nebula-tui/src/git_diff.rs"
+      },
+      {
+        "additions": 4,
+        "deletions": 18,
+        "path": "crates/nebula-tui/src/grep_search.rs"
+      },
+      {
+        "additions": 114,
+        "deletions": 83,
+        "path": "crates/nebula-tui/src/ipc.rs"
+      },
+      {
+        "additions": 146,
+        "deletions": 96,
+        "path": "crates/nebula-tui/src/keymap.rs"
+      },
+      {
+        "additions": 5,
+        "deletions": 4,
+        "path": "crates/nebula-tui/src/lib.rs"
+      },
+      {
+        "additions": 11,
+        "deletions": 11,
+        "path": "crates/nebula-tui/src/pr_preview.rs"
+      },
+      {
+        "additions": 139,
+        "deletions": 145,
+        "path": "crates/nebula-tui/src/pull_request.rs"
+      },
+      {
+        "additions": 11,
+        "deletions": 20,
+        "path": "crates/nebula-tui/src/tree_browser.rs"
+      },
+      {
+        "additions": 191,
+        "deletions": 194,
+        "path": "crates/nebula-tui/src/ui.rs"
+      },
+      {
+        "additions": 2,
+        "deletions": 2,
+        "path": "crates/nebula/src/browser.rs"
+      },
+      {
+        "additions": 44,
+        "deletions": 36,
+        "path": "crates/nebula/src/main.rs"
+      },
+      {
+        "additions": 10,
+        "deletions": 10,
+        "path": "crates/nebula/src/upgrade.rs"
+      },
+      {
+        "additions": 238,
+        "deletions": 430,
+        "path": "crates/nebula/tests/e2e_pty.rs"
+      },
+      {
+        "additions": 77,
+        "deletions": 71,
+        "path": "crates/nebula/tests/e2e_tui.rs"
+      },
+      {
+        "additions": 1,
+        "deletions": 1,
+        "path": "crates/nebula/tests/tunnel_cli.rs"
+      }
+    ],
+    "headRefName": "clean-up",
+    "headRefOid": "098d34ad665156b5c02f13d656cafd0b3558e1a7",
+    "isDraft": false,
+    "labels": [],
+    "mergeCommit": {
+      "oid": "32b0f515b9d14e38a9c48673f14fade4a74a067c"
+    },
+    "mergedAt": "2026-08-28T14:02:04Z",
+    "mergedBy": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "milestone": null,
+    "number": 18,
+    "reviewRequests": [],
+    "reviews": [],
+    "state": "MERGED",
+    "title": "Workspace-wide dedup: named literals, shared helpers, nebula_core::env",
+    "updatedAt": "2026-08-28T14:02:04Z",
+    "url": "https://github.com/AgentSystemLabs/nebula/pull/18"
+  },
+  "review_comments": []
+}

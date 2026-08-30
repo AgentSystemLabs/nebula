@@ -1,0 +1,128 @@
+{
+  "pr": {
+    "additions": 91,
+    "assignees": [],
+    "author": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "baseRefName": "main",
+    "body": "Closes #8.\n\n`h` / `l` now move focus between the four panels \u2014 the horizontal twins of the `j` / `k` already bound to selection. The arrow keys keep working exactly as before; `h` and `l` are **added** to `focus_left` / `focus_right`, nothing was taken away.\n\nThe two actions that were sitting on those letters move onto the shifted keys:\n\n| Action | Was | Now |\n|---|---|---|\n| Focus left / right | `\u2190` `\u2192` | `h` `\u2190` / `l` `\u2192` |\n| SSH hosts | `h` | `\u21e7H` |\n| Attach a link | `l` | `\u21e7L` |\n\nBoth `\u21e7H` and `\u21e7L` were free.\n\n### Notes\n\n- The letter leads each default list, so the footer hints and the Help overlay \u2014 which are spelled from the live keymap \u2014 now show `h` / `l` for the focus walk, and `\u21e7H` / `\u21e7L` for hosts and links, with no extra edits.\n- Only *defaults* changed. The config persists overrides rather than the whole table (`Keymap::overrides`), so anyone who had already rebound `hosts` or `new_link` keeps their binding, and everyone else picks these up on upgrade. Every key here is still rebindable in Settings \u2192 Hotkeys.\n- `h` / `l` inside overlays (settings tabs, the diff viewer, the tree browser) are overlay-local grammar and are untouched.\n\n### Verification\n\n- New unit test `h_and_l_walk_panel_focus_like_the_arrows` covers the full walk in both directions plus the stops at Projects and Sessions, and asserts neither key opens an overlay any more.\n- The existing hosts-picker and link tests now drive `\u21e7H` / `\u21e7L`, including the three `e2e_tui` PTY tests.\n- `defaults_do_not_collide_within_a_scope` still passes, so the new defaults are conflict-free.\n- `cargo test --workspace`, `cargo fmt --check` and `cargo clippy --workspace --all-targets` are clean (clippy warnings present are pre-existing on `main`).\n- README keymap table and the two prose mentions updated.\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)",
+    "changedFiles": 5,
+    "closedAt": "2026-08-25T02:36:01Z",
+    "closingIssuesReferences": [
+      {
+        "id": "I_kwDOTu3A5c8AAAABOER0Vw",
+        "number": 8,
+        "repository": {
+          "id": "R_kgDOTu3A5Q",
+          "name": "nebula",
+          "owner": {
+            "id": "O_kgDOEKJkvQ",
+            "login": "AgentSystemLabs"
+          }
+        },
+        "url": "https://github.com/AgentSystemLabs/nebula/issues/8"
+      }
+    ],
+    "comments": [],
+    "commits": [
+      {
+        "authoredDate": "2026-08-25T02:31:07Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Opus 5"
+          }
+        ],
+        "committedDate": "2026-08-25T02:31:07Z",
+        "messageBody": "`h` and `l` now walk focus between the four panels, the twins of `j`/`k`\ninside one \u2014 the pairing everyone's fingers already expect, and the first\nthing a vim user reaches for. The arrows still do exactly what they did;\nthese are added chords on `focus_left` / `focus_right`, not a swap. Like\n`j`/`k`, the letter leads the default list, so the footer and the help\noverlay now spell the walk as `h`/`l`.\n\nThe two actions that held those letters move up onto the shifted keys:\n`\u21e7H` opens the ssh host picker, `\u21e7L` attaches a link. Both are things\nyou do once in a while; moving between panels is something you do every\nfew seconds, and it had the worse key.\n\nOnly defaults changed. Anyone who already rebound `hosts` or `new_link`\nkeeps their binding \u2014 the config stores overrides, not the whole table \u2014\nand every one of these is still rebindable in Settings \u2192 Hotkeys.\n\nCloses #8\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+        "messageHeadline": "Give panel focus the vim keys, and move ssh hosts and links to shift",
+        "oid": "a4f6853b7c8352370a106aea73b3fa65a199f2ac"
+      },
+      {
+        "authoredDate": "2026-08-25T02:31:57Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Opus 5"
+          }
+        ],
+        "committedDate": "2026-08-25T02:31:57Z",
+        "messageBody": "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+        "messageHeadline": "Log the h/l panel-navigation remap in the shared memory",
+        "oid": "ac32c46a35caab3c4fd85e66e05dac6f4f0bbaaa"
+      }
+    ],
+    "createdAt": "2026-08-25T02:31:27Z",
+    "deletions": 27,
+    "files": [
+      {
+        "additions": 25,
+        "deletions": 0,
+        "path": ".claude/MEMORY.md"
+      },
+      {
+        "additions": 7,
+        "deletions": 6,
+        "path": "README.md"
+      },
+      {
+        "additions": 51,
+        "deletions": 13,
+        "path": "crates/nebula-tui/src/event_loop.rs"
+      },
+      {
+        "additions": 4,
+        "deletions": 4,
+        "path": "crates/nebula-tui/src/keymap.rs"
+      },
+      {
+        "additions": 4,
+        "deletions": 4,
+        "path": "crates/nebula/tests/e2e_tui.rs"
+      }
+    ],
+    "headRefName": "worktree-hl-panel-nav",
+    "headRefOid": "ac32c46a35caab3c4fd85e66e05dac6f4f0bbaaa",
+    "isDraft": false,
+    "labels": [],
+    "mergeCommit": {
+      "oid": "6a0effaae35c730908fa77156565a1d773a76458"
+    },
+    "mergedAt": "2026-08-25T02:36:01Z",
+    "mergedBy": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "milestone": null,
+    "number": 12,
+    "reviewRequests": [],
+    "reviews": [],
+    "state": "MERGED",
+    "title": "Give panel focus the vim keys (h/l), move ssh hosts and links to Shift",
+    "updatedAt": "2026-08-25T02:36:02Z",
+    "url": "https://github.com/AgentSystemLabs/nebula/pull/12"
+  },
+  "review_comments": []
+}

@@ -1,0 +1,73 @@
+{
+  "pr": {
+    "additions": 221,
+    "assignees": [],
+    "author": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "baseRefName": "main",
+    "body": "## The bug\n\nStart a session in the main checkout, ask it to create a worktree and work there \u2014 the session's row stays under the main checkout instead of moving into the new worktree.\n\n## Cause\n\n`reparent_agent_by_cwd` re-homes an agent row when a hook payload reports a cwd inside a different worktree of the same project. But it only matches against worktree rows already in the store, and a checkout the agent created itself isn't adopted until the background sync's next tick (up to 2s away).\n\nThe agent reports its new cwd on the very next hook event \u2014 usually the `Stop` that ends the same turn \u2014 which beats the sync. The reparent found nothing to match, silently no-opped, and nothing re-ran it once the row appeared, so the row sat under the old checkout until the user's next prompt. Whether it worked at all came down to which of the two landed first, which matches the daemon log: three successful re-homes over two days, with many more attempts.\n\n## Fix\n\nRemember each agent's last hook-reported cwd, and replay it from `sync_project_worktrees` whenever that sync adopts a checkout. The row then follows the session as soon as the worktree it moved into is known.\n\nTwo guards keep the remembered cwd from doing damage:\n\n- It's only recorded after the existing foreign-session gate, so a nested CLI in the agent's PTY can't seed it.\n- A deliberate `move_agent` drops it. That call kills and respawns the PTY in the target so the process and the row agree; without dropping the cwd, the next adoption anywhere in the project would replay the stale value straight back over the user's choice.\n\n## Tests\n\nTwo new tests in `crates/nebula-daemon/src/registry.rs`, both verified to fail without the corresponding half of the fix:\n\n- `worktree_sync_replays_a_cwd_reported_before_adoption` \u2014 real git repo, real `git worktree add`; covers the hook-lands-first race and the stale-cwd-after-`move_agent` hazard.\n- `cwd_replay_skips_other_projects_and_archived_agents` \u2014 the replay stays scoped to the synced project and leaves archived rows alone.\n\nFull workspace suite green (396 tests).\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)",
+    "changedFiles": 1,
+    "closedAt": "2026-08-22T17:30:27Z",
+    "closingIssuesReferences": [],
+    "comments": [],
+    "commits": [
+      {
+        "authoredDate": "2026-08-22T17:02:41Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Opus 5"
+          }
+        ],
+        "committedDate": "2026-08-22T17:02:41Z",
+        "messageBody": "An agent working in the main checkout that runs `git worktree add` and\nsteps into the result reports its new cwd on the very next hook event \u2014\ntypically the `Stop` that ends the same turn. The worktree sync only\nadopts a row for that checkout on its next tick (up to 2s later), so\n`reparent_agent_by_cwd` ran against a store that had no row to match:\nthe re-home silently no-opped and the session sat under the old checkout\nuntil the user's next prompt. Whether it worked at all came down to\nwhich of the two landed first.\n\nRemember each agent's last hook-reported cwd and replay it from the\nworktree sync whenever that sync adopts a checkout, so the row follows\nthe session as soon as the worktree it moved into is known. The cwd is\nonly recorded after the foreign-session gate, and a deliberate\n`move_agent` drops it \u2014 otherwise a later adoption would replay a stale\ncwd back over the user's own choice.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+        "messageHeadline": "Re-home a session into the worktree it just created",
+        "oid": "7570387938cd9ed8adc9319fe93e63c3468fb7a2"
+      }
+    ],
+    "createdAt": "2026-08-22T17:03:00Z",
+    "deletions": 8,
+    "files": [
+      {
+        "additions": 221,
+        "deletions": 8,
+        "path": "crates/nebula-daemon/src/registry.rs"
+      }
+    ],
+    "headRefName": "move-worktrees-after-create",
+    "headRefOid": "7570387938cd9ed8adc9319fe93e63c3468fb7a2",
+    "isDraft": false,
+    "labels": [],
+    "mergeCommit": {
+      "oid": "869acb0336838241816fcbecbb3cc72b77391ba2"
+    },
+    "mergedAt": "2026-08-22T17:30:27Z",
+    "mergedBy": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "milestone": null,
+    "number": 2,
+    "reviewRequests": [],
+    "reviews": [],
+    "state": "MERGED",
+    "title": "Re-home a session into the worktree it just created",
+    "updatedAt": "2026-08-22T17:30:27Z",
+    "url": "https://github.com/AgentSystemLabs/nebula/pull/2"
+  },
+  "review_comments": []
+}

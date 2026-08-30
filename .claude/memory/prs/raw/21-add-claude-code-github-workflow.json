@@ -1,0 +1,87 @@
+{
+  "pr": {
+    "additions": 95,
+    "assignees": [],
+    "author": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "baseRefName": "main",
+    "body": "## \ud83e\udd16 Installing Claude Code GitHub App\r\n\r\nThis PR adds a GitHub Actions workflow that enables Claude Code integration in our repository.\r\n\r\n### What is Claude Code?\r\n\r\n[Claude Code](https://claude.com/claude-code) is an AI coding agent that can help with:\r\n- Bug fixes and improvements  \r\n- Documentation updates\r\n- Implementing new features\r\n- Code reviews and suggestions\r\n- Writing tests\r\n- And more!\r\n\r\n### How it works\r\n\r\nOnce this PR is merged, we'll be able to interact with Claude by mentioning @claude in a pull request or issue comment.\r\nOnce the workflow is triggered, Claude will analyze the comment and surrounding context, and execute on the request in a GitHub action.\r\n\r\n### Important Notes\r\n\r\n- **This workflow won't take effect until this PR is merged**\r\n- **@claude mentions won't work until after the merge is complete**\r\n- The workflow runs automatically whenever Claude is mentioned in PR or issue comments\r\n- Claude gets access to the entire PR or issue context including files, diffs, and previous comments\r\n\r\n### Security\r\n\r\n- Our Anthropic API key is securely stored as a GitHub Actions secret\r\n- Only users with write access to the repository can trigger the workflow\r\n- All Claude runs are stored in the GitHub Actions run history\r\n- Claude's default tools are limited to reading/writing files and interacting with our repo by creating comments, branches, and commits.\r\n- We can add more allowed tools by adding them to the workflow file like:\r\n\r\n```\r\nallowed_tools: Bash(npm install),Bash(npm run build),Bash(npm run lint),Bash(npm run test)\r\n```\r\n\r\nThere's more information in the [Claude Code action repo](https://github.com/anthropics/claude-code-action).\r\n\r\nAfter merging this PR, let's try mentioning @claude in a comment on any PR to get started!",
+    "changedFiles": 2,
+    "closedAt": "2026-08-29T01:20:15Z",
+    "closingIssuesReferences": [],
+    "comments": [],
+    "commits": [
+      {
+        "authoredDate": "2026-08-29T01:20:00Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "Web Dev Cody"
+          }
+        ],
+        "committedDate": "2026-08-29T01:20:00Z",
+        "messageBody": "",
+        "messageHeadline": "\"Claude PR Assistant workflow\"",
+        "oid": "3d37e3a08e83092c945a9e62f1fc9ea338f5e70d"
+      },
+      {
+        "authoredDate": "2026-08-29T01:20:01Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "Web Dev Cody"
+          }
+        ],
+        "committedDate": "2026-08-29T01:20:01Z",
+        "messageBody": "",
+        "messageHeadline": "\"Claude Code Review workflow\"",
+        "oid": "c8cfba84e95001fd0a005d9210949052c703ab4d"
+      }
+    ],
+    "createdAt": "2026-08-29T01:20:08Z",
+    "deletions": 0,
+    "files": [
+      {
+        "additions": 45,
+        "deletions": 0,
+        "path": ".github/workflows/claude-code-review.yml"
+      },
+      {
+        "additions": 50,
+        "deletions": 0,
+        "path": ".github/workflows/claude.yml"
+      }
+    ],
+    "headRefName": "add-claude-github-actions-1787966398621",
+    "headRefOid": "c8cfba84e95001fd0a005d9210949052c703ab4d",
+    "isDraft": false,
+    "labels": [],
+    "mergeCommit": {
+      "oid": "8de245bc675d28dec6d719ab3a968a387e17be3d"
+    },
+    "mergedAt": "2026-08-29T01:20:15Z",
+    "mergedBy": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "milestone": null,
+    "number": 21,
+    "reviewRequests": [],
+    "reviews": [],
+    "state": "MERGED",
+    "title": "Add Claude Code GitHub Workflow",
+    "updatedAt": "2026-08-29T01:20:15Z",
+    "url": "https://github.com/AgentSystemLabs/nebula/pull/21"
+  },
+  "review_comments": []
+}

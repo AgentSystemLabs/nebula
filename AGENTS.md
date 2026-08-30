@@ -12,6 +12,7 @@ glossary before you start; the entries are fetched by index line or grep, never 
 | `.claude/memory/gotchas.md` | the **standing gotchas** — traps that outlive their task, one line each, grouped by TERM | 300 lines |
 | `.claude/memory/entries/<date>-<slug>.md` | the **entries** — the full Asked / Did / Gotchas of each task | none |
 | `TERMS.md` | the **glossary** — one ALL-CAPS name per feature, panel, key, command, hook route, daemon mechanism, status and workflow, with the user's words for it and where it lives | — |
+| `.claude/memory/prs/` | the **PR ARCHIVE** — every merged pull request rendered to Markdown (description, comments, reviews, inline comments) by a GitHub Action; not injected, reached by grep | — |
 
 `make ci` enforces this: `make memory-check` (caps, index ↔ entries), `make recall-eval` (the
 entries are still findable from their own prompts), `make terms-check` (no stale `Where` pointers or

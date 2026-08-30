@@ -1,0 +1,201 @@
+{
+  "pr": {
+    "additions": 639,
+    "assignees": [],
+    "author": {
+      "id": "MDQ6VXNlcjQzNzY4MzU=",
+      "is_bot": false,
+      "login": "lnmunhoz",
+      "name": "Lucas N. Munhoz"
+    },
+    "baseRefName": "main",
+    "body": "## Why\r\nThe user might not always want to see the PROJECTS panel when the work is focused on a particular project. I added the possibility to hide/show the PROJECTS and also WORKTREES tab to allow more visible workspace for the TERMINAL.\r\n\r\n## Summary\r\n\r\n- add independent `Shift+P` and `Shift+B` toggles for the PROJECTS PANEL and WORKTREES PANEL\r\n- persist visibility through `hide_projects` and `hide_worktrees` in CONFIG.JSON and Settings > Appearance\r\n- give hidden panel width to the TERMINAL PANE while preserving draggable widths\r\n- skip hidden panels in FOCUS, PANEL WALK, creation, and PALETTE flows\r\n- show FOOTER restore hints whenever a panel is hidden\r\n\r\n## Validation\r\n\r\n- `cargo test --workspace` (715 passed)\r\n- `cargo clippy --workspace --all-targets` (passes with pre-existing warnings)\r\n- real PTY E2E coverage for independent toggling and CONFIG.JSON persistence\r\n\r\n## Notes\r\n\r\n- Both panels default to shown.\r\n- The SESSIONS PANEL always remains visible.\r\n- No protocol, store, or UI STATE BLOB migration is required.\r\n\r\n## Screenshots\r\n\r\nPressed Shift + P, and 'PROJECTS' panel is hidden\r\n<img width=\"1476\" height=\"869\" alt=\"image\" src=\"https://github.com/user-attachments/assets/35a5a283-0c08-442d-9f0e-a0abcf8eace7\" />\r\n\r\nPressed Shift + B, and 'WORKTREES' panel is hidden\r\n<img width=\"1466\" height=\"875\" alt=\"image\" src=\"https://github.com/user-attachments/assets/48f40003-feb9-4b68-98d4-3a92167aef44\" />\r\n\r\nAdded shortcuts to Help panel:\r\n<img width=\"779\" height=\"511\" alt=\"image\" src=\"https://github.com/user-attachments/assets/1175fccd-a9bc-447f-8dc8-89c4efea4ad7\" />\r\n\r\n\r\n\r\n",
+    "changedFiles": 9,
+    "closedAt": "2026-08-29T00:07:03Z",
+    "closingIssuesReferences": [],
+    "comments": [
+      {
+        "author": {
+          "login": "webdevcody"
+        },
+        "authorAssociation": "MEMBER",
+        "body": "curious about your background theme, is that custom in your fork?",
+        "createdAt": "2026-08-28T14:03:14Z",
+        "id": "IC_kwDOTu3A5c8AAAABRQ1NVw",
+        "includesCreatedEdit": false,
+        "isMinimized": false,
+        "minimizedReason": "",
+        "reactionGroups": [],
+        "url": "https://github.com/AgentSystemLabs/nebula/pull/20#issuecomment-5453466967",
+        "viewerDidAuthor": true
+      },
+      {
+        "author": {
+          "login": "lnmunhoz"
+        },
+        "authorAssociation": "CONTRIBUTOR",
+        "body": "@webdevcody That's just my wallpaper. The terminal looks like this because it has a window background opacity and background blur settings.\r\n\r\nOn WezTerm, you can use this config:\r\n\r\n```\r\nconfig.window_background_opacity = 0.85\r\nconfig.macos_window_background_blur = 50\r\n```",
+        "createdAt": "2026-08-28T16:10:27Z",
+        "id": "IC_kwDOTu3A5c8AAAABRSKH9A",
+        "includesCreatedEdit": false,
+        "isMinimized": false,
+        "minimizedReason": "",
+        "reactionGroups": [],
+        "url": "https://github.com/AgentSystemLabs/nebula/pull/20#issuecomment-5454858228",
+        "viewerDidAuthor": false
+      }
+    ],
+    "commits": [
+      {
+        "authoredDate": "2026-08-28T08:57:52Z",
+        "authors": [
+          {
+            "email": "ln.munhoz@gmail.com",
+            "id": "MDQ6VXNlcjQzNzY4MzU=",
+            "login": "lnmunhoz",
+            "name": "Lucas N. Munhoz"
+          }
+        ],
+        "committedDate": "2026-08-28T08:57:52Z",
+        "messageBody": "",
+        "messageHeadline": "Add independent panel visibility toggles",
+        "oid": "6c0feccb6731232a8f66d08c63e64d686525290d"
+      },
+      {
+        "authoredDate": "2026-08-28T14:07:30Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5"
+          }
+        ],
+        "committedDate": "2026-08-28T14:07:30Z",
+        "messageBody": "Resolves the conflicts against the dedup pass (PR #18):\n\n- config.rs: keep the PR's hide_projects / hide_worktrees defaults and take\n  main's DEFAULT_CHOICE for the model and effort fields.\n- event_loop.rs: the PR's App::next_visible_focus supersedes main's\n  next_focus extraction in Action::FocusTerminal and the PANEL WALK\n  (walk_focus_forward) \u2014 same semantics, but it skips hidden panels \u2014 so the\n  now-unused next_focus helper is removed.\n\ncargo fmt / clippy clean, 734 tests green.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>",
+        "messageHeadline": "Merge origin/main into toggle-column",
+        "oid": "9c3a4dfc92e69f67f81fe89029a4153fc78139ae"
+      },
+      {
+        "authoredDate": "2026-08-28T18:09:55Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5"
+          }
+        ],
+        "committedDate": "2026-08-28T18:09:55Z",
+        "messageBody": "Resolves the second round of conflicts on PR #20 after v0.15.0 and the\nPR SESSION work landed on main:\n\n- TERMS.md: PROTOCOL VERSION row from main (30); PROJECTS PANEL /\n  WORKTREES PANEL / SESSIONS PANEL rows merged so they carry main's\n  PROJECT OPEN PRS GROUP / WORKTREE OPEN PRS GROUP wording plus this\n  branch's Config::hide_* and Shift+P / Shift+B toggles; both sides'\n  Candidates kept.\n- .claude/MEMORY.md: both sides' entries kept.\n- crates/nebula/tests/e2e_tui.rs: keep\n  tui_hides_projects_and_worktrees_independently; drop the LINKS test\n  doc comment main removed with the links test.\n\ncargo fmt / clippy -D warnings clean; cargo test --workspace: 741 passed.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_013vQG7EP7FjVS8q7bj7Ge92",
+        "messageHeadline": "Merge origin/main into toggle-column",
+        "oid": "7c46cb872893da1c1c27bc0c26941b3f9bca5585"
+      },
+      {
+        "authoredDate": "2026-08-28T18:13:40Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5"
+          }
+        ],
+        "committedDate": "2026-08-28T18:13:40Z",
+        "messageBody": "MEMORY LOG: follow-up on \"Fixing A Fork PR's Conflicts From The Shared\nTree\" with the nebula-worktree recipe (fetch pull/N/head:<head ref>,\nnebula worktree <head ref>) and why round two conflicts on MEMORY.md /\nTERMS.md rather than code. TERMS: SELF-IMPROVING LOOP promoted from\nthe Candidates ledger on its second sighting.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_013vQG7EP7FjVS8q7bj7Ge92",
+        "messageHeadline": "Log the second PR #20 conflict round, promote SELF-IMPROVING LOOP",
+        "oid": "08761c8b2bec083d3f60667c4a7ff78c0a276cad"
+      }
+    ],
+    "createdAt": "2026-08-28T08:58:16Z",
+    "deletions": 123,
+    "files": [
+      {
+        "additions": 47,
+        "deletions": 0,
+        "path": ".claude/MEMORY.md"
+      },
+      {
+        "additions": 20,
+        "deletions": 9,
+        "path": "README.md"
+      },
+      {
+        "additions": 21,
+        "deletions": 16,
+        "path": "TERMS.md"
+      },
+      {
+        "additions": 114,
+        "deletions": 20,
+        "path": "crates/nebula-tui/src/app.rs"
+      },
+      {
+        "additions": 78,
+        "deletions": 3,
+        "path": "crates/nebula-tui/src/config.rs"
+      },
+      {
+        "additions": 242,
+        "deletions": 51,
+        "path": "crates/nebula-tui/src/event_loop.rs"
+      },
+      {
+        "additions": 23,
+        "deletions": 3,
+        "path": "crates/nebula-tui/src/keymap.rs"
+      },
+      {
+        "additions": 58,
+        "deletions": 21,
+        "path": "crates/nebula-tui/src/ui.rs"
+      },
+      {
+        "additions": 36,
+        "deletions": 0,
+        "path": "crates/nebula/tests/e2e_tui.rs"
+      }
+    ],
+    "headRefName": "toggle-column",
+    "headRefOid": "08761c8b2bec083d3f60667c4a7ff78c0a276cad",
+    "isDraft": false,
+    "labels": [],
+    "mergeCommit": {
+      "oid": "d9b97c02a46a95dba799591fe4dd7262fcb899e3"
+    },
+    "mergedAt": "2026-08-29T00:07:03Z",
+    "mergedBy": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "milestone": null,
+    "number": 20,
+    "reviewRequests": [],
+    "reviews": [],
+    "state": "MERGED",
+    "title": "Add independent PROJECTS and WORKTREES panel toggles",
+    "updatedAt": "2026-08-29T00:07:03Z",
+    "url": "https://github.com/AgentSystemLabs/nebula/pull/20"
+  },
+  "review_comments": []
+}

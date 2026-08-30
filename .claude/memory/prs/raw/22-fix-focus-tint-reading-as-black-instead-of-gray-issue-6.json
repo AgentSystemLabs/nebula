@@ -1,0 +1,87 @@
+{
+  "pr": {
+    "additions": 30,
+    "assignees": [],
+    "author": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "baseRefName": "main",
+    "body": "Fixes #6.\r\n\r\nEvery theme preset's `focus_tint` color was an almost-pure-black truecolor RGB, so `draw_focus_tint` painted untouched cells \u2014 including the rounded pad-row corners of a selected pill row \u2014 as flat black instead of a visible gray tint. Lifted every preset's `focus_tint` to a real gray floor and added a regression test.\r\n\r\n\u26a0\ufe0f `cargo test` could not be run in this headless session (approval-gated) \u2014 please run the test suite before merging.\r\n\r\nGenerated with [Claude Code](https://claude.ai/code)",
+    "changedFiles": 1,
+    "closedAt": "2026-08-29T01:30:20Z",
+    "closingIssuesReferences": [
+      {
+        "id": "I_kwDOTu3A5c8AAAABN5HzTw",
+        "number": 6,
+        "repository": {
+          "id": "R_kgDOTu3A5Q",
+          "name": "nebula",
+          "owner": {
+            "id": "O_kgDOEKJkvQ",
+            "login": "AgentSystemLabs"
+          }
+        },
+        "url": "https://github.com/AgentSystemLabs/nebula/issues/6"
+      }
+    ],
+    "comments": [],
+    "commits": [
+      {
+        "authoredDate": "2026-08-29T01:25:45Z",
+        "authors": [
+          {
+            "email": "41898282+claude[bot]@users.noreply.github.com",
+            "id": "MDM6Qm90NDE4OTgyODI=",
+            "login": "github-actions[bot]",
+            "name": "claude[bot]"
+          },
+          {
+            "email": "123222405+webdevcody@users.noreply.github.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "Web Dev Cody"
+          }
+        ],
+        "committedDate": "2026-08-29T01:25:45Z",
+        "messageBody": "Every preset's focus_tint was an almost-pure-black truecolor RGB (e.g.\ndefault Rgb(4, 15, 16)), so draw_focus_tint painted untouched cells \u2014\nincluding the rounded pad-row corners of a selected PILL ROW \u2014 as flat\nblack instead of a visible gray tint. Lifted each preset's focus_tint\nto a real gray floor.\n\nFixes #6\n\nCo-authored-by: Web Dev Cody <123222405+webdevcody@users.noreply.github.com>",
+        "messageHeadline": "Fix FOCUS TINT reading as black instead of gray (issue #6)",
+        "oid": "f2966e1b37b10bf6da6cf3489793425a17ea73f9"
+      }
+    ],
+    "createdAt": "2026-08-29T01:30:12Z",
+    "deletions": 8,
+    "files": [
+      {
+        "additions": 30,
+        "deletions": 8,
+        "path": "crates/nebula-tui/src/theme.rs"
+      }
+    ],
+    "headRefName": "claude/issue-6-20260829-0120",
+    "headRefOid": "f2966e1b37b10bf6da6cf3489793425a17ea73f9",
+    "isDraft": false,
+    "labels": [],
+    "mergeCommit": {
+      "oid": "d5a152c618639379a8f315c7ee492b47b600663d"
+    },
+    "mergedAt": "2026-08-29T01:30:20Z",
+    "mergedBy": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "milestone": null,
+    "number": 22,
+    "reviewRequests": [],
+    "reviews": [],
+    "state": "MERGED",
+    "title": "Fix FOCUS TINT reading as black instead of gray (issue #6)",
+    "updatedAt": "2026-08-29T01:30:21Z",
+    "url": "https://github.com/AgentSystemLabs/nebula/pull/22"
+  },
+  "review_comments": []
+}

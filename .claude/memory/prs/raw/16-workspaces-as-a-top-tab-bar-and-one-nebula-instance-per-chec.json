@@ -1,0 +1,191 @@
+{
+  "pr": {
+    "additions": 846,
+    "assignees": [],
+    "author": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "baseRefName": "main",
+    "body": "Two independent things landed on this branch: the Workspaces column became a top tab bar, and running a\nnebula checkout per worktree stopped colliding with itself.\n\n## The Workspaces column becomes a top tab bar\n\n`WORKSPACES` now sits across the top of the body on the same `x=3` / row-1 grid as the panel headers, so\nit reads as the tier directly above `PROJECTS`, with one tab per workspace to its right. The rule closing\nthe bar off breaks under the open tab, joining it to the panels below.\n\n- Tabs answer to `\u23181`\u2013`\u23189` and to the bare digits `1`\u2013`9`. `\u2318` is what the tabs advertise, but Terminal.app\n  (and most other emulators) never encode it into pty bytes, so the bare digit is the binding that\n  actually fires. Both are rebindable per slot in Settings \u2192 Hotkeys.\n- `\u2190/\u2192` switch once the bar has focus; `\u2193` or `Enter` steps down into Projects; a click works too.\n- Splitters reindex to `0..2` \u2014 a full-width bar owns no vertical boundary, so the column's\n  drag-to-resize and its persisted width are gone.\n\n## One checkout per worktree, without the collisions\n\nRunning a checkout per worktree meant three collisions, only one of them a port:\n\n- **`nebula browser` hard-failed on a busy 7681.** It now prefers 7681, falls back to a free port and says\n  which, and takes `--port 0` as \"any free one\" instead of refusing it. An explicitly named `--port N` is\n  still that port or an error \u2014 silently moving would break an ssh tunnel pointed at the number.\n- **`make dev` and `make browser` shared one runtime dir across every checkout**, so the second TUI attached\n  to the first's daemon and drove the other checkout's binary \u2014 and `dev-prep` SIGTERMed whichever daemon\n  got there first. Runtime and data dirs are now keyed to a hash of the checkout path.\n- **`make browser` pinned `PORT=7681`.** It now passes no `--port` at all unless you set one.\n\nAdds `make dev-ls` to see every checkout's instance, since slots outlive the worktrees that made them.\n\n## Notes\n\n- `origin/main` (v0.10.0) is merged in. Two trivial conflicts, both resolved by keeping both sides; one\n  semantic break the merge couldn't see \u2014 main removed the project divider fields, so the\n  `seed_many_workspaces` test helper no longer sets them.\n- `make ci` is green: fmt, clippy, and 631 tests across the workspace.\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "changedFiles": 12,
+    "closedAt": "2026-08-27T01:05:17Z",
+    "closingIssuesReferences": [],
+    "comments": [],
+    "commits": [
+      {
+        "authoredDate": "2026-08-26T05:09:21Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Opus 5"
+          }
+        ],
+        "committedDate": "2026-08-26T05:09:21Z",
+        "messageBody": "WORKSPACES now sits across the top of the body on the same x=3 / row-1\ngrid as the panel headers, so it reads as the tier directly above\nPROJECTS, with one tab per workspace to its right. The rule closing the\nbar off breaks under the open tab, joining it to the panels below.\n\nTabs answer to cmd+1..9 and to the bare digits 1..9 (cmd never reaches a\nTUI in Terminal.app, so the digits are what actually fire), to left/right\nonce the bar has focus, and to a click. down or Enter steps out into\nProjects.\n\nSplitters reindex to 0..2 \u2014 a full-width bar owns no vertical boundary,\nso the column's drag-to-resize and its persisted width are gone.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+        "messageHeadline": "Prototype: the Workspaces column becomes a top tab bar",
+        "oid": "30042e9c6ea0391d5dd05d747028021fd33f6cb4"
+      },
+      {
+        "authoredDate": "2026-08-26T05:12:28Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Opus 5"
+          }
+        ],
+        "committedDate": "2026-08-26T05:12:28Z",
+        "messageBody": "Two conflicts, both trivial: main added reset_settings/reopen_settings\ndirectly above set_show_workspaces, and both sides prepended a memory\nentry. Kept both sides in each.\n\nOne semantic break the merge could not see: main removed the project\ndivider fields, so the seed_many_workspaces test helper no longer sets\nthem.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+        "messageHeadline": "Merge origin/main (v0.10.0) into the workspace-tabs prototype",
+        "oid": "eb91435d338028359ee5002a39704a5737a08f54"
+      },
+      {
+        "authoredDate": "2026-08-26T05:18:57Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Opus 5"
+          }
+        ],
+        "committedDate": "2026-08-26T05:18:57Z",
+        "messageBody": "\u2026ckout\n\nRunning a checkout per worktree meant three collisions, only one of them\na port:\n\n- `nebula browser` hard-failed on a busy 7681. It now prefers 7681, falls\n  back to a free port and says which, and takes `--port 0` as \"any free\n  one\" instead of refusing it. An explicitly named `--port N` is still\n  that port or an error \u2014 silently moving would break an ssh tunnel\n  pointed at the number.\n\n- `make dev` and `make browser` shared one runtime dir across every\n  checkout, so the second TUI attached to the first's daemon and drove\n  the other checkout's binary \u2014 and `dev-prep` SIGTERMed whichever\n  daemon got there first. Runtime and data dirs are now keyed to a hash\n  of the checkout path.\n\n- `make browser` pinned PORT=7681. It now passes no --port at all unless\n  you set one.\n\nAdds `make dev-ls` to see every checkout's instance, since slots outlive\nthe worktrees that made them.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+        "messageHeadline": "Let nebula browser pick its port, and key the dev instance to the che\u2026",
+        "oid": "6f30a5536c0d6e1e3dbad77f57e2809508ee6fde"
+      },
+      {
+        "authoredDate": "2026-08-26T05:20:18Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Opus 5"
+          }
+        ],
+        "committedDate": "2026-08-26T05:20:18Z",
+        "messageBody": "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+        "messageHeadline": "Log the v0.10.0 merge and the per-checkout port/dev-slot work",
+        "oid": "c94e6dee90744252565628d0b68f6ac2ad88a984"
+      }
+    ],
+    "createdAt": "2026-08-27T00:55:58Z",
+    "deletions": 346,
+    "files": [
+      {
+        "additions": 119,
+        "deletions": 0,
+        "path": ".claude/MEMORY.md"
+      },
+      {
+        "additions": 42,
+        "deletions": 13,
+        "path": "Makefile"
+      },
+      {
+        "additions": 11,
+        "deletions": 7,
+        "path": "README.md"
+      },
+      {
+        "additions": 29,
+        "deletions": 64,
+        "path": "crates/nebula-tui/src/app.rs"
+      },
+      {
+        "additions": 2,
+        "deletions": 2,
+        "path": "crates/nebula-tui/src/config.rs"
+      },
+      {
+        "additions": 261,
+        "deletions": 163,
+        "path": "crates/nebula-tui/src/event_loop.rs"
+      },
+      {
+        "additions": 32,
+        "deletions": 2,
+        "path": "crates/nebula-tui/src/keymap.rs"
+      },
+      {
+        "additions": 231,
+        "deletions": 72,
+        "path": "crates/nebula-tui/src/ui.rs"
+      },
+      {
+        "additions": 97,
+        "deletions": 14,
+        "path": "crates/nebula/src/browser.rs"
+      },
+      {
+        "additions": 6,
+        "deletions": 3,
+        "path": "crates/nebula/src/main.rs"
+      },
+      {
+        "additions": 13,
+        "deletions": 3,
+        "path": "crates/nebula/tests/browser_cli.rs"
+      },
+      {
+        "additions": 3,
+        "deletions": 3,
+        "path": "crates/nebula/tests/e2e_tui.rs"
+      }
+    ],
+    "headRefName": "worktree-workspace-tabs",
+    "headRefOid": "c94e6dee90744252565628d0b68f6ac2ad88a984",
+    "isDraft": false,
+    "labels": [],
+    "mergeCommit": {
+      "oid": "0361f0a3495fb2f3d802fc1dc9fad0da8fc67b2f"
+    },
+    "mergedAt": "2026-08-27T01:05:17Z",
+    "mergedBy": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "milestone": null,
+    "number": 16,
+    "reviewRequests": [],
+    "reviews": [],
+    "state": "MERGED",
+    "title": "Workspaces as a top tab bar, and one nebula instance per checkout",
+    "updatedAt": "2026-08-27T01:05:18Z",
+    "url": "https://github.com/AgentSystemLabs/nebula/pull/16"
+  },
+  "review_comments": []
+}

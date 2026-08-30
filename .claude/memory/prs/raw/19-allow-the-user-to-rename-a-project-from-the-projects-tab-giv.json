@@ -1,0 +1,170 @@
+{
+  "pr": {
+    "additions": 533,
+    "assignees": [],
+    "author": {
+      "id": "MDQ6VXNlcjQzNzY4MzU=",
+      "is_bot": false,
+      "login": "lnmunhoz",
+      "name": "Lucas N. Munhoz"
+    },
+    "baseRefName": "main",
+    "body": "Renames a project's row in the Projects panel with `r`, without touching anything on disk.\r\n\r\n## What\r\n\r\nA project row has always been named after its folder. `r` on a selected project now retitles that row, and only that row: `repo_path` is untouched, so the checkout, its worktrees, and everything keyed on the path carry on unchanged.\r\n\r\n```\r\n\u258c\u25cf Acme API\r\n\u258c  \u2514 acme-repo\r\n```\r\n\r\nA renamed row keeps its folder visible underneath. An unrenamed row shows nothing extra \u2014 the \"has it been renamed?\" test is derived, not stored (`Project::folder_subtitle` returns the folder name only while it differs from `name`).\r\n\r\n**Undo:** submitting an empty name puts the row back on the folder's name. That is the only way back from a rename, and the prompt says so on its label.\r\n\r\nAlso on the context menu (`m` / right-click) as **Rename**, plus footer hint, help overlay and README rows.\r\n\r\n## Why no migration\r\n\r\n`projects.name` was already a plain display column and `repo_path` already carried the folder, so a rename is one `UPDATE`. No schema change, no new field, no flag.\r\n\r\n## On the folder line's styling\r\n\r\nA terminal cell has exactly one font size, so \"smaller text\" is not renderable. The subordination is spelled with the three signals that do work in every terminal and font:\r\n\r\n- **weight** \u2014 the chosen label is bold at full strength\r\n- **opacity** \u2014 the folder line is the dimmest theme color *plus* `DIM` (SGR 2, faint)\r\n- **position** \u2014 a `\u2514` hangs it off the label, the same tree glyph the metrics modal uses\r\n\r\nKitty's text sizing protocol (OSC 66) can render genuinely half-size text inside the same cells, but only Kitty and Foot implement it. WezTerm does not; Ghostty parses OSC 66 and renders nothing ([\"not implemented in the GUI yet\"](https://ghostty.org/docs/install/release-notes/1-3-0), tracking issue ghostty-org/ghostty#10333). On a terminal that ignores OSC 66 the whole run *including the text* is eaten as an OSC string, so emitting it unprobed would make the folder name vanish. The Unicode fallbacks are font-dead too: small caps are missing 25/26 glyphs in Hack Nerd Font Mono and SF Mono, superscripts 26/26 and 24/26.\r\n\r\n## Protocol\r\n\r\n**28 \u2192 29** for `ClientRequest::RenameProject`. A daemon from before this change refuses the new client until it restarts, which the client already handles with its kill-and-restart offer.\r\n\r\n## Notable fix along the way\r\n\r\n`submit_prompt` cancels empty input for every `PromptKind` not on an explicit allowlist \u2014 it flashes `cancelled: empty input` and returns *before* building the request. That left the daemon's reset-to-folder-name branch unreachable from the UI while its daemon-side test passed. `RenameProject` now joins `NewAgent` and `NewWorktree` on that allowlist.\r\n\r\n## Tests\r\n\r\n| Test | Covers |\r\n|---|---|\r\n| `rename_project_relabels_the_row_and_leaves_the_folder_alone` | daemon: trims, resets on empty, folder untouched and still on disk |\r\n| `r_renames_the_selected_project_row` | `r` opens the prompt prefilled, submit sends `RenameProject` |\r\n| `renaming_a_project_to_nothing_undoes_the_rename` | the empty value reaches the daemon instead of being cancelled |\r\n| `a_renamed_project_shows_its_folder_name_underneath` | layout **and** style: bold label, faint folder, `\u2514` flush with the label, faint surviving the selection lift |\r\n| `tui_project_rename_shows_the_folder_and_empty_undoes_it` | real PTY, real binary: rename \u2192 assert both lines \u2192 clear \u2192 assert the row is the folder name again |\r\n\r\nThe e2e test was A/B'd against the unfixed code: without the allowlist change it fails with `cancelled: empty input` on screen and the row still renamed.\r\n\r\n**698 tests pass.** `cargo fmt` clean, no new clippy warnings.\r\n\r\n## Screenshots\r\n\r\nPress \"R\" in a project to rename it:\r\n<img width=\"2034\" height=\"1754\" alt=\"CleanShot 2026-08-28 at 11 53 36@2x\" src=\"https://github.com/user-attachments/assets/1d44013a-3eac-4da2-8fb2-28632bc3a7e5\" />\r\n\r\nAfter renaming it:\r\n<img width=\"1074\" height=\"1730\" alt=\"CleanShot 2026-08-28 at 11 54 03@2x\" src=\"https://github.com/user-attachments/assets/cc618c53-3733-425c-80d5-ee56b0fe17e6\" />\r\n\r\nIn search is also displayed:\r\n<img width=\"2066\" height=\"1728\" alt=\"CleanShot 2026-08-28 at 11 55 48@2x\" src=\"https://github.com/user-attachments/assets/a39b452c-dd19-4c14-ae3d-89ee91bcab53\" />\r\n\r\n",
+    "changedFiles": 11,
+    "closedAt": "2026-08-28T05:23:56Z",
+    "closingIssuesReferences": [],
+    "comments": [
+      {
+        "author": {
+          "login": "webdevcody"
+        },
+        "authorAssociation": "MEMBER",
+        "body": "## PR Security Audit \u2014 #19 Allow the user to rename a project from the projects tab (giving it a alias)\n\n**Risk: 1/5 \u2014 Minimal**\n\n**Verdict:** No security blockers\n\n**Confidence:** High\n\n### Findings\n\n**No material security findings.**\n\n### Sensitive paths reviewed\n\n- **IPC trust boundary:** `ClientRequest::RenameProject` is protocol-gated and frame-bounded (`crates/nebula-core/src/protocol.rs:101`, `crates/nebula-core/src/codec.rs:40`). The Unix socket lives under the daemon's existing `0700` runtime directory, so this remains a same-OS-user control plane (`crates/nebula-daemon/src/lifecycle.rs:114`).\n- **Authorization/ownership:** the request identifies a project by opaque `ProjectId` and checks that it exists before mutation (`crates/nebula-daemon/src/registry.rs:723`). Workspaces are UI groupings, not tenant/security boundaries; the new handler matches the existing project CRUD trust model.\n- **Injection:** the SQLite update uses bound parameters, so the name cannot alter the query (`crates/nebula-daemon/src/store.rs:414`). The name is not used in filesystem paths, Git commands, shell arguments, subprocess environment, URLs, or HTTP requests.\n- **Terminal safety:** pasted text can contain control characters, but Ratatui filters control characters and zero-width graphemes before cells reach the Crossterm backend. Project names are otherwise truncated at their display sites (`crates/nebula-tui/src/ui.rs:2602`, `crates/nebula-tui/src/ui.rs:3562`).\n- **Persistence/data flow:** rename changes only `projects.name`; `repo_path`, worktree paths, and path-keyed reconciliation remain unchanged (`crates/nebula-daemon/src/registry.rs:726`).\n\n### Residual risk / questions\n\n- There is no small semantic length limit or explicit control-character rejection for project names; the IPC frame limit is the effective upper bound. A smaller shared label validator would be reasonable defense in depth, but this is not scored as a vulnerability: the endpoint is same-user-only, stored SQL is parameterized, rendering drops terminal controls, and the value never reaches an execution sink.\n- This was a static review plus targeted local testing, not hostile runtime fuzzing of the MessagePack socket.\n\n### Checks performed\n\n- Exact submitted range reviewed: `5b662984ada89f07859a9a7c9ae3be23a69dfeaf...eeaa35c3982e3a7243819ce1468412fdc500337f`.\n- `cargo test -p nebula-daemon rename_project_relabels_the_row_and_leaves_the_folder_alone` \u2014 **passed** (1/1).\n- The three focused `nebula-tui` project-rename unit tests \u2014 **passed** (3/3).\n- `cargo test -p nebula --test e2e_tui tui_project_rename_shows_the_folder_and_empty_undoes_it` \u2014 **passed** (1/1 real PTY test).\n- `cargo fmt --all -- --check` and `git diff --check <base>...<head>` \u2014 **passed**.\n- Added-line credential/dangerous-primitive scan \u2014 **no credential material found**; no dependency, lockfile, migration, install-script, or workflow changes to audit.\n\n### Rating rationale\n\nThis PR adds a local metadata mutation with no new remote exposure or privileged execution path. The request is bounded and same-user, the database write is parameterized, the renamed value is display-only, terminal controls are filtered by the rendering layer, and the exact feature tests pass. The absence of a tighter display-label validator is a low-value hardening opportunity rather than a reachable security issue, so the PR rates **1/5 \u2014 Minimal**.\n\n<!-- pr-security-audit -->\n",
+        "createdAt": "2026-08-28T05:12:03Z",
+        "id": "IC_kwDOTu3A5c8AAAABRMTAKg",
+        "includesCreatedEdit": false,
+        "isMinimized": false,
+        "minimizedReason": "",
+        "reactionGroups": [
+          {
+            "content": "HEART",
+            "users": {
+              "totalCount": 1
+            }
+          }
+        ],
+        "url": "https://github.com/AgentSystemLabs/nebula/pull/19#issuecomment-5448712234",
+        "viewerDidAuthor": true
+      }
+    ],
+    "commits": [
+      {
+        "authoredDate": "2026-08-28T04:47:23Z",
+        "authors": [
+          {
+            "email": "ln.munhoz@gmail.com",
+            "id": "MDQ6VXNlcjQzNzY4MzU=",
+            "login": "lnmunhoz",
+            "name": "Lucas N. Munhoz"
+          }
+        ],
+        "committedDate": "2026-08-28T04:47:23Z",
+        "messageBody": "A project row has always been named after its folder. `r` in the Projects\npanel now retitles that row, and only that row: `repo_path` is untouched,\nso the checkout on disk, its worktrees and everything keyed on the path\ncarry on unchanged. `projects.name` was already a plain display column, so\nthis needs no migration; the \"has it been renamed?\" test is derived rather\nthan stored (`Project::folder_subtitle` returns the folder name only while\nit differs from `name`).\n\nA renamed row keeps its folder visible on the line below, hanging off a\n`\u2514`. A terminal cell has exactly one font size, so the subordination is\nspelled with the three signals that do work everywhere: the chosen label is\nbold at full strength, the folder line is the dimmest theme color plus DIM\n(SGR 2, faint), and the glyph plus indent make it read as a child. Kitty's\nOSC 66 can render genuinely half-size text, but WezTerm does not implement\nit and Ghostty only parses it (ghostty-org/ghostty#10333), so emitting it\nwould buy nothing and would eat the text on any terminal that ignores it.\n\nAn empty name undoes the rename and puts the row back on the folder's name,\nwhich is the only way back. That needed `RenameProject` on the allowlist in\n`submit_prompt` that `NewAgent` and `NewWorktree` already sit on: everything\nelse treats an empty field as a cancel and returns before building a\nrequest, which left the daemon's reset branch unreachable from the UI.\n\nProtocol 28 -> 29 for the new `ClientRequest::RenameProject`, so a daemon\nfrom before this change refuses the new client until it restarts.",
+        "messageHeadline": "Rename a project's row with r, keeping the folder name under it",
+        "oid": "7b4201b482a7ab19d4730d69145c7168fba9f846"
+      },
+      {
+        "authoredDate": "2026-08-28T04:47:29Z",
+        "authors": [
+          {
+            "email": "ln.munhoz@gmail.com",
+            "id": "MDQ6VXNlcjQzNzY4MzU=",
+            "login": "lnmunhoz",
+            "name": "Lucas N. Munhoz"
+          }
+        ],
+        "committedDate": "2026-08-28T04:47:29Z",
+        "messageBody": "Records the settled answer to \"render this text smaller in a terminal\", so\nthe next session does not re-derive it: OSC 66 does it but only Kitty and\nFoot implement it, and the Unicode small-caps and superscript fallbacks are\nmissing 24-26 of 26 glyphs in the fonts actually installed here.\n\nAlso the trap this feature fell into: submit_prompt cancels empty input for\nevery PromptKind not on an explicit allowlist, so a daemon-side branch for\nthe empty case can pass its own test while being unreachable from the UI.\n\nCorrects a stale note claiming the terminal in use is Ghostty.",
+        "messageHeadline": "Log the project rename and the OSC 66 dead end",
+        "oid": "eeaa35c3982e3a7243819ce1468412fdc500337f"
+      },
+      {
+        "authoredDate": "2026-08-28T05:23:32Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          }
+        ],
+        "committedDate": "2026-08-28T05:23:32Z",
+        "messageBody": "",
+        "messageHeadline": "Merge main into feat/rename-project",
+        "oid": "c570e8b577cc4320df17559cfafc127569326938"
+      }
+    ],
+    "createdAt": "2026-08-28T04:49:54Z",
+    "deletions": 36,
+    "files": [
+      {
+        "additions": 95,
+        "deletions": 3,
+        "path": ".claude/MEMORY.md"
+      },
+      {
+        "additions": 1,
+        "deletions": 0,
+        "path": "README.md"
+      },
+      {
+        "additions": 20,
+        "deletions": 1,
+        "path": "crates/nebula-core/src/entities.rs"
+      },
+      {
+        "additions": 9,
+        "deletions": 1,
+        "path": "crates/nebula-core/src/protocol.rs"
+      },
+      {
+        "additions": 58,
+        "deletions": 6,
+        "path": "crates/nebula-daemon/src/registry.rs"
+      },
+      {
+        "additions": 8,
+        "deletions": 0,
+        "path": "crates/nebula-daemon/src/server.rs"
+      },
+      {
+        "additions": 8,
+        "deletions": 0,
+        "path": "crates/nebula-daemon/src/store.rs"
+      },
+      {
+        "additions": 8,
+        "deletions": 0,
+        "path": "crates/nebula-tui/src/app.rs"
+      },
+      {
+        "additions": 236,
+        "deletions": 3,
+        "path": "crates/nebula-tui/src/event_loop.rs"
+      },
+      {
+        "additions": 54,
+        "deletions": 22,
+        "path": "crates/nebula-tui/src/ui.rs"
+      },
+      {
+        "additions": 36,
+        "deletions": 0,
+        "path": "crates/nebula/tests/e2e_tui.rs"
+      }
+    ],
+    "headRefName": "feat/rename-project",
+    "headRefOid": "c570e8b577cc4320df17559cfafc127569326938",
+    "isDraft": false,
+    "labels": [],
+    "mergeCommit": {
+      "oid": "f29288ebe330f492753762d25e2d926e371c6892"
+    },
+    "mergedAt": "2026-08-28T05:23:56Z",
+    "mergedBy": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "milestone": null,
+    "number": 19,
+    "reviewRequests": [],
+    "reviews": [],
+    "state": "MERGED",
+    "title": "Allow the user to rename a project from the projects tab (giving it a alias)",
+    "updatedAt": "2026-08-28T05:23:56Z",
+    "url": "https://github.com/AgentSystemLabs/nebula/pull/19"
+  },
+  "review_comments": []
+}

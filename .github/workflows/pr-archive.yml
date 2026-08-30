@@ -1,0 +1,72 @@
+name: Archive Merged PR
+
+# Every PR that lands on main is rendered into `.claude/memory/prs/` so later agents can read the
+# discussion that produced a change, not just its diff. See `.claude/memory/prs/README.md`.
+on:
+  # pull_request_target, not pull_request: a `pull_request` run for a PR from a **fork** gets a
+  # read-only GITHUB_TOKEN and no secrets, so the push below would 403 on exactly the contributor
+  # PRs this exists to archive. pull_request_target runs in the base repo's context with a write
+  # token, and reads its own definition from main. It is only dangerous when it checks out and runs
+  # the PR's code — this one checks out `main` and runs main's script, never the PR branch.
+  pull_request_target:
+    types: [closed]
+    branches: [main]
+  # Backfill or re-render by hand: run this workflow with a space-separated list of PR numbers.
+  workflow_dispatch:
+    inputs:
+      numbers:
+        description: "PR numbers to archive (space-separated)"
+        required: true
+
+# Serialised: every run commits to main, so two at once would race on the push.
+concurrency:
+  group: pr-archive
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Archive the PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          NUMBERS: ${{ github.event_name == 'workflow_dispatch' && inputs.numbers || github.event.pull_request.number }}
+        run: python3 .github/scripts/pr_archive.py "$NUMBERS"
+
+      - name: Commit and push
+        env:
+          NUMBERS: ${{ github.event_name == 'workflow_dispatch' && inputs.numbers || github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .claude/memory/prs
+          if git diff --cached --quiet; then
+            echo "pr-archive: nothing changed"
+            exit 0
+          fi
+          git commit -m "Archive merged PR(s) $NUMBERS for agent context" -m "Written by .github/workflows/pr-archive.yml. [skip ci]"
+          # main moves on its own (other merges, the Claude workflows), so rebase and retry.
+          for attempt in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              echo "pr-archive: pushed on attempt $attempt"
+              exit 0
+            fi
+            echo "pr-archive: push rejected, rebasing (attempt $attempt)"
+            git fetch origin main
+            git rebase origin/main
+            sleep $((attempt * 5))
+          done
+          echo "pr-archive: could not push after 5 attempts" >&2
+          exit 1

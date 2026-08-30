@@ -1,0 +1,81 @@
+{
+  "pr": {
+    "additions": 27,
+    "assignees": [],
+    "author": {
+      "id": "MDQ6VXNlcjMwMzc4NTAx",
+      "is_bot": false,
+      "login": "rchdlps",
+      "name": "Richard Lopes"
+    },
+    "baseRefName": "main",
+    "body": "`copy_to_clipboard` only supports macOS (`pbcopy`); on every other OS it returns `false` unconditionally, so drag-select copy, select+copy mode, and `Ctrl+y` path copy all flash `copy failed (clipboard unavailable)` on Linux.\n\nThis PR shells out to the platform clipboard utility instead:\n\n- `wl-copy` when `WAYLAND_DISPLAY` is set (Wayland)\n- `xclip -selection clipboard` (X11, most common)\n- `xsel --clipboard --input` (X11 fallback)\n\nSame spawn/pipe pattern as the existing `pbcopy` path.\n\n**Verified** on Linux X11 (Ubuntu 24.04, patched v0.3.0 build): drag-selected text lands in the system clipboard; readback via `xclip -o` matches. The standalone spawn/pipe logic was also verified in isolation.\n\nFixes #9\n\nNote: terminals like Tabby do not handle OSC 52, so shelling out to a clipboard utility is the only mechanism that works everywhere.\n",
+    "changedFiles": 1,
+    "closedAt": "2026-08-25T02:23:07Z",
+    "closingIssuesReferences": [
+      {
+        "id": "I_kwDOTu3A5c8AAAABOEYiDg",
+        "number": 9,
+        "repository": {
+          "id": "R_kgDOTu3A5Q",
+          "name": "nebula",
+          "owner": {
+            "id": "O_kgDOEKJkvQ",
+            "login": "AgentSystemLabs"
+          }
+        },
+        "url": "https://github.com/AgentSystemLabs/nebula/issues/9"
+      }
+    ],
+    "comments": [],
+    "commits": [
+      {
+        "authoredDate": "2026-08-24T23:40:33Z",
+        "authors": [
+          {
+            "email": "rchdlps@gmail.com",
+            "id": "MDQ6VXNlcjMwMzc4NTAx",
+            "login": "rchdlps",
+            "name": "Richard"
+          }
+        ],
+        "committedDate": "2026-08-24T23:40:55Z",
+        "messageBody": "copy_to_clipboard only supports macOS (pbcopy); on every other OS it\nreturns false unconditionally, so drag-select copy, select+copy mode,\nand Ctrl+y path copy all flash \"copy failed (clipboard unavailable)\"\non Linux.\n\nShell out to the platform clipboard utility instead: wl-copy when\nWAYLAND_DISPLAY is set, then xclip -selection clipboard, then\nxsel --clipboard --input as a fallback. Same spawn/pipe pattern as the\nexisting pbcopy path.\n\nFixes #9",
+        "messageHeadline": "Add Linux clipboard support to copy_to_clipboard",
+        "oid": "ca23930075d886de9fa09c7dfae40c5d53c2847c"
+      }
+    ],
+    "createdAt": "2026-08-24T23:41:11Z",
+    "deletions": 8,
+    "files": [
+      {
+        "additions": 27,
+        "deletions": 8,
+        "path": "crates/nebula-tui/src/event_loop.rs"
+      }
+    ],
+    "headRefName": "linux-clipboard-support",
+    "headRefOid": "ca23930075d886de9fa09c7dfae40c5d53c2847c",
+    "isDraft": false,
+    "labels": [],
+    "mergeCommit": {
+      "oid": "88a52bb8759bbbc34993b90547e404d5ae72b5fa"
+    },
+    "mergedAt": "2026-08-25T02:23:07Z",
+    "mergedBy": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "milestone": null,
+    "number": 11,
+    "reviewRequests": [],
+    "reviews": [],
+    "state": "MERGED",
+    "title": "Add Linux clipboard support to copy_to_clipboard",
+    "updatedAt": "2026-08-25T02:23:07Z",
+    "url": "https://github.com/AgentSystemLabs/nebula/pull/11"
+  },
+  "review_comments": []
+}

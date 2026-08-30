@@ -1,0 +1,98 @@
+{
+  "pr": {
+    "additions": 897,
+    "assignees": [],
+    "author": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "baseRefName": "main",
+    "body": "## What\n\nEvery typed field in the TUI \u2014 note names, the prompt dialog, the fuzzy filters (diff, tree, palette, file finder), the grep query, the ssh destination \u2014 tracked a bare `String` and was append-only. There was no caret, `\u2190`/`\u2192` did nothing, and **\u2325\u2190 typed a literal `b` into the field** instead of stepping back a word (macOS terminals send \u2325\u2190/\u2325\u2192 as `ESC b` / `ESC f` \u2014 Terminal.app's bundled `keyMappings.plist` maps `~F702`/`~F703` to exactly that, and iTerm2 does the same).\n\nAll eight fields now share one `TextInput` (text + caret) in the new `crates/nebula-tui/src/text_input.rs`.\n\n## Keys\n\n| | |\n|---|---|\n| `\u2190\u2192` / `\u2325\u2190\u2192` / `^b` `^f` | char and word motion |\n| `Home`/`End` / `^a` `^e` | line start / end |\n| `\u232b` / `\u2326` | delete around the caret |\n| `\u2325\u232b` `^w` / `\u2325\u2326` `\u2325d` | delete a word either side |\n| `^u` / `^k` | kill to line start / end |\n\nWord motion splits on punctuation, so `\u2325\u2190` in a path walks it a segment at a time.\n\n## No bindings were stolen\n\n`handle_key` returns `Edit::Ignored` for anything it doesn't own, and each overlay runs it **last**, after its own arms. So:\n\n- the tree browser's `\u2190`/`\u2192` still fold/unfold\n- the add-project prompt's `\u2190`/`\u2192` still ascend/dive the directory listing (the one place they were already spoken for \u2014 caret motion there is `\u2325\u2190\u2192`, `^b`/`^f`, `Home`/`End`)\n- `^d`/`^u` still half-page the diff and tree views **when nothing is typed**; with a live filter `^u` is the line editor's kill-to-start (identical to the old \"clear\" when the caret is at the end, which it usually is)\n- `^n`/`^p`/`^o`/`^f`/`^y` in the palette, finder and tree are untouched\n\nBracketed paste now lands in the focused field instead of falling through to the terminal pane.\n\n## Rendering\n\nThe block cursor draws **in place** rather than always at the tail, and a value longer than its field scrolls under it with a `\u2026` on whichever end is clipped (previously long values just showed their tail). One `input_spans` helper replaced eight copies of the old `text + \"\u2588\"` snippet.\n\nHelp gained a `TYPING IN A FIELD` section; the note and non-path prompt hints mention `\u2325\u2190\u2192`.\n\n## Testing\n\n- 14 unit tests on `TextInput` (motion, deletes, multibyte, \"\u2325\u2190 arrives as Alt+b\", unknown keys pass through)\n- 4 render tests on caret placement and scroll-window ellipsis\n- 3 event-loop tests driving the real overlays: editing a note with `\u2325\u2190` + insert-at-caret, `\u232b` in a note edit not leaking to the list's delete-note binding, and `\u2325\u2190`/`^w` in the palette query re-running the filter\n- `cargo test --workspace` green (e2e included); `cargo fmt` / `clippy` clean on touched files\n- Verified live in tmux: after two `\u2325\u2190` the caret block sits on the `l` of \"login\" (`fg 0 / bg 6`) and typing inserts there\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)",
+    "changedFiles": 6,
+    "closedAt": "2026-08-22T17:02:21Z",
+    "closingIssuesReferences": [],
+    "comments": [],
+    "commits": [
+      {
+        "authoredDate": "2026-08-22T16:59:07Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Opus 5 (1M context)"
+          }
+        ],
+        "committedDate": "2026-08-22T16:59:07Z",
+        "messageBody": "Every input in the TUI \u2014 note names, the prompt dialog, the fuzzy\nfilters, the grep query, the ssh destination \u2014 was append-only: it\ntracked a bare String, so there was no caret, \u2190/\u2192 did nothing, and\n\u2325\u2190 (which macOS terminals send as ESC b) typed a literal \"b\" into the\nfield instead of stepping back a word.\n\nReplace all eight of them with one `TextInput` (text + caret) that\nhandles the keys a terminal user already knows:\n\n  \u2190\u2192 / \u2325\u2190\u2192 / ^b ^f    char and word motion (\u2325\u2190\u2192 arrive as \u2325b/\u2325f on\n                      both Terminal.app and iTerm2)\n  Home/End / ^a ^e    line ends\n  \u232b / \u2326               delete around the caret\n  \u2325\u232b ^w / \u2325\u2326 \u2325d       delete a word either side\n  ^u / ^k             kill to line start / end\n\n`handle_key` returns Ignored for anything it doesn't own, and each\noverlay runs it last, so existing bindings keep first refusal: the\ntree's \u2190/\u2192 still fold, the add-project prompt's \u2190/\u2192 still browse\ndirectories, ^d/^u still page the diff and tree when nothing is typed.\nBracketed paste now lands in the focused field too.\n\nRendering follows the caret: the block cursor draws in place rather\nthan always at the tail, and a value longer than its field scrolls\nunder it with a \u2026 on whichever end is clipped.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+        "messageHeadline": "Give every typed field real terminal line-editing",
+        "oid": "cd07baa20947a44db7d0914b7ac549d0155c1a27"
+      }
+    ],
+    "createdAt": "2026-08-22T17:00:14Z",
+    "deletions": 240,
+    "files": [
+      {
+        "additions": 18,
+        "deletions": 16,
+        "path": "crates/nebula-tui/src/app.rs"
+      },
+      {
+        "additions": 230,
+        "deletions": 104,
+        "path": "crates/nebula-tui/src/event_loop.rs"
+      },
+      {
+        "additions": 1,
+        "deletions": 0,
+        "path": "crates/nebula-tui/src/lib.rs"
+      },
+      {
+        "additions": 476,
+        "deletions": 0,
+        "path": "crates/nebula-tui/src/text_input.rs"
+      },
+      {
+        "additions": 3,
+        "deletions": 2,
+        "path": "crates/nebula-tui/src/tree_browser.rs"
+      },
+      {
+        "additions": 169,
+        "deletions": 118,
+        "path": "crates/nebula-tui/src/ui.rs"
+      }
+    ],
+    "headRefName": "fixing-input-ux",
+    "headRefOid": "cd07baa20947a44db7d0914b7ac549d0155c1a27",
+    "isDraft": false,
+    "labels": [],
+    "mergeCommit": {
+      "oid": "15aeae7af44619e9f3ea66f504aa13d47372d0df"
+    },
+    "mergedAt": "2026-08-22T17:02:21Z",
+    "mergedBy": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "milestone": null,
+    "number": 1,
+    "reviewRequests": [],
+    "reviews": [],
+    "state": "MERGED",
+    "title": "Give every typed field real terminal line-editing",
+    "updatedAt": "2026-08-22T17:02:21Z",
+    "url": "https://github.com/AgentSystemLabs/nebula/pull/1"
+  },
+  "review_comments": []
+}
