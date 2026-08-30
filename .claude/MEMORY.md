@@ -16,6 +16,7 @@ Line shape: `- DATE · [Title](memory/entries/DATE-slug.md) · TERMS: A; B · fi
 > `.claude/MEMORY.md` was split into this index plus per-entry files on 2026-08-28.
 
 ## Index
+- 2026-08-29 · [Proving A SHARED CHECKOUT Reset Loses Nothing Before Running It](memory/entries/2026-08-29-proving-a-shared-checkout-reset-loses-nothing.md) · TERMS: SHARED CHECKOUT; RELEASE SKILL; MEMORY CHECK; STANDING GOTCHAS · files: gotchas.md; MEMORY.md; TERMS.md · gotchas: 3
 - 2026-08-29 · [Released v0.21.0 — `cp` What Is Strictly Ahead, Merge What Moved Both Ways](memory/entries/2026-08-29-released-v0-21-0-cp-what-is-ahead-merge-what-moved-both-ways.md) · TERMS: RELEASE SKILL; CARRY SET; RELEASE WORKTREE; SHARED CHECKOUT; QUICK PROMPT FOCUS; MEMORY CHECK · files: gotchas.md; MEMORY.md; TERMS.md; config.rs · gotchas: 6
 - 2026-08-29 · [A QUICK PROMPT Launch No Longer Steals The TERMINAL PANE](memory/entries/2026-08-29-a-quick-prompt-launch-no-longer-steals-the-terminal-pane.md) · TERMS: QUICK PROMPT; FOCUS; TERMINAL PANE; LOCKED PANE; SETTING; AGENTS TAB · files: event_loop.rs; app.rs; config.rs · gotchas: 5
 - 2026-08-29 · [Released v0.20.0 — The CARRY SET Is What Differs From `origin/main`, Not What `git status` Lists](memory/entries/2026-08-29-released-v0-20-0-the-carry-set-is-what-differs-from-origin.md) · TERMS: RELEASE SKILL; CARRY SET; RELEASE WORKTREE; SHARED CHECKOUT; GUARD HOOK; RELEASE NOTES · files: guard.py; gotchas.md; Cargo.toml · gotchas: 4
