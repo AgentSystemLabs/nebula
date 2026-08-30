@@ -16,6 +16,7 @@ Line shape: `- DATE · [Title](memory/entries/DATE-slug.md) · TERMS: A; B · fi
 > `.claude/MEMORY.md` was split into this index plus per-entry files on 2026-08-28.
 
 ## Index
+- 2026-08-30 · [Every NEBULA Command Gets Its Own Wrapped `--help` Page](memory/entries/2026-08-30-every-nebula-command-gets-its-own-wrapped-help-page.md) · TERMS: NEBULA; NEBULA BROWSER; NEBULA WORKSPACE; NEBULA TUNNEL; MAKE CI · files: cli.rs; help_cli.rs; main.rs; commands.md · gotchas: 7
 - 2026-08-30 · [Five Topical Commits Out Of One Dirty SHARED CHECKOUT](memory/entries/2026-08-30-five-topical-commits-out-of-one-dirty-shared-checkout.md) · TERMS: SHARED CHECKOUT; MAKE CI; MEMORY LOG; OVERLAY; ATTACH; WHEEL SCROLL · files: event_loop.rs; gotchas.md; MEMORY.md · gotchas: 3
 - 2026-08-30 · [README Cut To A Landing Page, Reference Moved Verbatim Into `docs/`](memory/entries/2026-08-30-readme-cut-to-a-landing-page-with-reference-moved-to-docs.md) · TERMS: TUI; STATUS DOT; KEYMAP; CONFIG.JSON; AGENT PRESET; CLOUD MIRROR · files: README.md; docs/keys.md; docs/sessions.md; docs/how-it-works.md · gotchas: 5
 - 2026-08-30 · [Every Modal Closes On Ctrl+Q, A CLICK OUTSIDE Or One Esc](memory/entries/2026-08-30-every-modal-closes-on-ctrl-q-a-click-outside-or-one-esc.md) · TERMS: OVERLAY; CLICK OUTSIDE; HARDWIRED UNLOCK; CONFIRM DIALOG; SETTINGS OVERLAY; VIM MODAL · files: overlay_close.rs; event_loop.rs; preset_overlays.rs; ui.rs · gotchas: 7
