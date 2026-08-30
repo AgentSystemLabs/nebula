@@ -170,8 +170,9 @@ const FOOTER_METRICS_POLL: Duration = Duration::from_secs(5);
 
 /// The one hotkey that isn't only a hotkey. Whatever the user binds to
 /// [`crate::keymap::Action::UnlockTerminal`], Ctrl+q also unlocks a locked
-/// pane — the alternative is a config that silently traps you inside a
-/// session with the keyboard going to the child process.
+/// pane, force-closes the VIM MODAL and closes any OVERLAY outright — the
+/// alternative is a config, a nested modal or a half-typed field that
+/// silently traps you with no way back to the panels.
 const HARDWIRED_UNLOCK: crate::keymap::KeyChord = crate::keymap::KeyChord {
     code: KeyCode::Char('q'),
     mods: KeyModifiers::CONTROL,
@@ -1293,8 +1294,17 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         return;
     }
 
-    // Modal overlays swallow all keys.
+    // Modal overlays swallow all keys — except the HARDWIRED UNLOCK, which
+    // closes whatever is open outright, from any state and any nesting
+    // depth. Esc is the ordinary way out and several overlays stage it (a
+    // typed filter or an open submenu peels first), and a click outside
+    // needs a mouse; Ctrl+Q is the one press that always lands back on the
+    // panels, the same promise it makes inside a LOCKED PANE.
     if app.overlay.is_some() {
+        if crate::keymap::KeyChord::from_event(&key) == HARDWIRED_UNLOCK {
+            crate::overlay_close::force_close(app, out);
+            return;
+        }
         handle_overlay_key(app, key, out);
         return;
     }
@@ -2775,7 +2785,7 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
 
 /// The QUICK PROMPT box a picker menu owes back, read off any of its rows
 /// (every row of a quick picker carries the same one).
-fn menu_quick_return(menu: &ContextMenu) -> Option<crate::quick_prompt::QuickReturn> {
+pub(crate) fn menu_quick_return(menu: &ContextMenu) -> Option<crate::quick_prompt::QuickReturn> {
     menu.items.iter().find_map(|item| match &item.action {
         MenuAction::NewAgentOfKind { quick, .. } => quick.as_deref().cloned(),
         _ => None,
@@ -3073,7 +3083,7 @@ fn open_context_menu_for_selection(app: &mut App) {
     }
 }
 
-fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
+pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     if matches!(&app.overlay, Some(Overlay::Settings(_))) {
         handle_settings_key(app, key);
         return;
@@ -3245,19 +3255,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
         },
         Overlay::Prompt(prompt) => match key.code {
             KeyCode::Esc => {
-                // Abandoning a Claude name prompt can leave the warm slot
-                // holding the submenu's off-default spec (its prewarm fired
-                // on kind-pick); put the standing default spec back. Same
-                // spec = daemon-side no-op.
-                let restore = match &prompt.kind {
-                    PromptKind::NewAgent {
-                        worktree,
-                        kind: AgentKind::Claude,
-                        cloud: false,
-                        ..
-                    } => Some(worktree.clone()),
-                    _ => None,
-                };
+                let restore = abandoned_prompt_prewarm(&prompt.kind);
                 // Abandoning a preset's task goes back to the list it came
                 // from, on the same row, rather than to the panels.
                 let back_to_presets = match &prompt.kind {
@@ -3267,9 +3265,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                     _ => None,
                 };
                 app.overlay = None;
-                if let Some(worktree) = restore {
-                    out.extend(default_claude_prewarm(worktree));
-                }
+                out.extend(restore);
                 if let Some((worktree, name)) = back_to_presets {
                     let index = crate::agent_presets::load()
                         .iter()
@@ -4009,7 +4005,7 @@ fn reopen_settings(app: &mut App) {
 /// Take the settings overlay down and start the clock on its remembered
 /// position (see `open_settings`). Both ways out — Esc/`q`/`s` and a click
 /// outside the modal — go through here.
-fn close_settings(app: &mut App) {
+pub(crate) fn close_settings(app: &mut App) {
     app.overlay = None;
     app.note_settings_closed();
 }
@@ -5513,6 +5509,23 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
     }
 }
 
+/// The prewarm to re-issue when a PROMPT DIALOG is abandoned, whichever exit
+/// abandoned it. A Claude name prompt can leave the warm slot holding the
+/// submenu's off-default spec — its prewarm fired the moment the kind was
+/// picked — so the standing default spec goes back; the same spec is a
+/// daemon-side no-op.
+pub(crate) fn abandoned_prompt_prewarm(kind: &PromptKind) -> Option<ClientRequest> {
+    match kind {
+        PromptKind::NewAgent {
+            worktree,
+            kind: AgentKind::Claude,
+            cloud: false,
+            ..
+        } => default_claude_prewarm(worktree.clone()),
+        _ => None,
+    }
+}
+
 /// The one spec kept permanently warm: a Claude CLI at the configured
 /// default model/effort. Creates matching it adopt the warm session
 /// instantly; any other spec launches cold on purpose — off-default CLIs
@@ -5877,8 +5890,23 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     if app.vim.is_some() {
         return;
     }
-    // An open context menu owns the mouse: click inside activates, outside
-    // closes (and swallows the click).
+    // A left-click outside any modal dismisses it, exactly as Esc would, and
+    // is swallowed rather than landing on the panel underneath. One
+    // hit-test covers all fourteen variants; what each has to unwind on the
+    // way out lives in `overlay_close`.
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+        if let Some(overlay) = &app.overlay {
+            if crate::overlay_close::click_is_outside(overlay, mouse_pos) {
+                crate::overlay_close::click_outside(app, out);
+                app.dirty = true;
+                return;
+            }
+        }
+    }
+    // An open context menu owns the rest of the mouse: a click on a row
+    // activates it, a right- or middle-click off the rows closes (the left
+    // button never gets here — the pre-check above took it), and everything
+    // is swallowed either way.
     if let Some(Overlay::Menu(menu)) = &app.overlay {
         if let MouseEventKind::Down(_) = mouse.kind {
             let area = menu.area;
@@ -5886,55 +5914,22 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 && mouse.column < area.x + area.width
                 && mouse.row > area.y
                 && mouse.row < area.y + area.height.saturating_sub(1);
-            if inside {
-                let index = (mouse.row - area.y - 1) as usize;
-                if let Some(item) = menu.items.get(index) {
-                    let action = item.action.clone();
+            let hit = inside
+                .then(|| (mouse.row - area.y - 1) as usize)
+                .and_then(|index| menu.items.get(index))
+                .map(|item| item.action.clone());
+            match hit {
+                Some(action) => {
                     app.overlay = None;
                     run_menu_action(app, action, out);
                 }
-            } else {
-                app.overlay = None;
+                // A click on the menu's own border or a blank row is inert.
+                None if inside => {}
+                None => crate::overlay_close::click_outside(app, out),
             }
             app.dirty = true;
         }
         return;
-    }
-    // Help, confirm, prompt, diff: a left-click outside the modal's box
-    // dismisses it the way Esc does — a confirm cancels (and lands back in
-    // the settings overlay / workspace switcher it came from), a prompt is
-    // abandoned (restoring the warm slot's spec), help and the diff viewer
-    // just close — and the click is swallowed rather than landing on the
-    // panel underneath. The other modals hit-test the same way in their own
-    // arms below. An undrawn box (zero width) can't be clicked outside of.
-    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-        let boxed = match &app.overlay {
-            Some(Overlay::Help(v)) => Some(v.area),
-            Some(Overlay::Confirm(c)) => Some(c.area),
-            Some(Overlay::Prompt(p)) => Some(p.area),
-            Some(Overlay::Diff(v)) => Some(v.area),
-            // The preset editor backs out to its list, as its Esc does.
-            Some(Overlay::AgentPresetEditor(e)) => Some(e.area),
-            _ => None,
-        };
-        if let Some(area) = boxed {
-            let inside = mouse.column >= area.x
-                && mouse.column < area.x + area.width
-                && mouse.row >= area.y
-                && mouse.row < area.y + area.height;
-            if area.width > 0 && !inside {
-                match &app.overlay {
-                    Some(Overlay::Help(_)) | Some(Overlay::Diff(_)) => app.overlay = None,
-                    _ => handle_overlay_key(
-                        app,
-                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                        out,
-                    ),
-                }
-                app.dirty = true;
-                return;
-            }
-        }
     }
     // A prompt dialog is modal too: the wheel and clicks drive the
     // Add-project directory listing (click highlights, a second click on
@@ -6016,7 +6011,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         return;
     }
     // Palette: the wheel moves the selection, a click on a result row jumps
-    // there, a click outside the modal closes; everything else is swallowed.
+    // there; everything else inside the box is swallowed.
     if let Some(Overlay::Palette(palette)) = &mut app.overlay {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -6029,9 +6024,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = palette.list_area;
-                let inside_list = list.contains(mouse_pos);
-                let inside_modal = palette.area.contains(mouse_pos);
-                if inside_list {
+                if list.contains(mouse_pos) {
                     let start = palette.window_start(list.height as usize);
                     let index = start + (mouse.row - list.y) as usize;
                     if index < palette.matches.len() {
@@ -6042,8 +6035,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                             jump_to_target(app, target, landing, out);
                         }
                     }
-                } else if !inside_modal {
-                    app.overlay = None;
                 }
                 app.dirty = true;
             }
@@ -6053,8 +6044,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     }
     // File finder: the wheel moves the selection, a click on a result row
     // opens it in the editor (closing the finder unless
-    // `close_finder_on_open` is off), a click outside the modal closes;
-    // everything else is swallowed.
+    // `close_finder_on_open` is off); everything else inside the box is
+    // swallowed.
     if let Some(Overlay::Files(finder)) = &mut app.overlay {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -6067,17 +6058,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = finder.list_area;
-                let inside_list = list.contains(mouse_pos);
-                let inside_modal = finder.area.contains(mouse_pos);
-                if inside_list {
+                if list.contains(mouse_pos) {
                     let start = finder.window_start(list.height as usize);
                     let index = start + (mouse.row - list.y) as usize;
                     if index < finder.matches.len() {
                         finder.select(index as i64);
                         open_selected_file_in_editor(app);
                     }
-                } else if !inside_modal {
-                    app.overlay = None;
                 }
                 app.dirty = true;
             }
@@ -6087,8 +6074,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     }
     // Find-in-files: the wheel moves the selection, a click on a result row
     // opens it in the editor (closing this overlay unless
-    // `close_finder_on_open` is off), a click outside the modal closes;
-    // everything else is swallowed.
+    // `close_finder_on_open` is off); everything else inside the box is
+    // swallowed.
     if let Some(Overlay::Grep(view)) = &mut app.overlay {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -6101,17 +6088,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = view.list_area;
-                let inside_list = list.contains(mouse_pos);
-                let inside_modal = view.area.contains(mouse_pos);
-                if inside_list {
+                if list.contains(mouse_pos) {
                     let start = view.window_start(list.height as usize);
                     let index = start + (mouse.row - list.y) as usize;
                     if index < view.hits.len() {
                         view.select(index as i64);
                         open_selected_hit_in_editor(app);
                     }
-                } else if !inside_modal {
-                    app.overlay = None;
                 }
                 app.dirty = true;
             }
@@ -6121,8 +6104,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     }
     // Tree browser: the wheel scrolls the preview, a click selects a row
     // (folding/unfolding directories), a drag on the tree/preview border
-    // resizes the tree panel, a click outside the modal closes; everything
-    // else is swallowed.
+    // resizes the tree panel; everything else inside the box is swallowed.
     if let Some(Overlay::Tree(view)) = &mut app.overlay {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -6142,17 +6124,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     return;
                 }
                 let list = view.list_area;
-                let inside_list = list.contains(mouse_pos);
-                let inside_modal = view.area.contains(mouse_pos);
-                if inside_list {
+                if list.contains(mouse_pos) {
                     let start = view.window_start(list.height as usize);
                     let index = start + (mouse.row - list.y) as usize;
                     if index < view.rows.len() {
                         view.select(index as i64);
                         view.toggle_row(index); // no-op on files / under a filter
                     }
-                } else if !inside_modal {
-                    app.overlay = None;
                 }
                 app.dirty = true;
             }
@@ -6176,8 +6154,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         return;
     }
     // Hosts picker: the wheel moves the selection, a click on a row connects
-    // (the context-menu convention — rows are actions, not editable items),
-    // a click outside the modal closes; everything else is swallowed.
+    // (the context-menu convention — rows are actions, not editable items);
+    // everything else inside the box is swallowed.
     if let Some(Overlay::Hosts(view)) = &mut app.overlay {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -6190,9 +6168,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = view.list_area;
-                let inside_list = list.contains(mouse_pos);
-                let inside_modal = view.area.contains(mouse_pos);
-                if inside_list {
+                if list.contains(mouse_pos) {
                     let start = view.window_start(list.height as usize);
                     let index = start + (mouse.row - list.y) as usize;
                     if let Some(entry) = view.hosts.get(index).cloned() {
@@ -6201,8 +6177,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         app.pending_ssh = Some(entry);
                         app.should_quit = true;
                     }
-                } else if !inside_modal {
-                    app.overlay = None;
                 }
                 app.dirty = true;
             }
@@ -6211,9 +6185,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         return;
     }
     // Settings: click a tab to switch, a row to select (or activate it if
-    // it was already selected), outside to close; everything else is
-    // swallowed. While a hotkey capture is live the mouse is inert — the
-    // overlay is waiting for a key, and a stray click shouldn't answer it.
+    // it was already selected); everything else inside the box is swallowed.
+    // While a hotkey capture is live the mouse is inert — the overlay is
+    // waiting for a key, and a stray click shouldn't answer it.
     if matches!(&app.overlay, Some(Overlay::Settings(_))) {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let Some(view) = settings(app) else {
@@ -6230,12 +6204,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 view.first_row,
             );
             let tab_hits = view.tab_hits.clone();
-            let inside = area.contains(mouse_pos);
-            if !inside {
-                close_settings(app);
-                app.dirty = true;
-                return;
-            }
             // The strip first: its labels are recorded during draw.
             if let Some(next) = tab_hits
                 .iter()
@@ -6292,8 +6260,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         return;
     }
     // Metrics: the wheel moves the selection, a click on a row selects it
-    // (a click on the selected row opens it), a click outside closes;
-    // everything else is swallowed.
+    // (a click on the selected row opens it); everything else inside the box
+    // is swallowed.
     if let Some(Overlay::Metrics(view)) = &mut app.overlay {
         let mut open: Option<SessionRef> = None;
         match mouse.kind {
@@ -6307,9 +6275,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = view.list_area;
-                let inside_list = list.contains(mouse_pos);
-                let inside_modal = view.area.contains(mouse_pos);
-                if inside_list {
+                if list.contains(mouse_pos) {
                     let index = view.scroll + (mouse.row - list.y) as usize;
                     if index < view.rows.len() {
                         if view.selected == index {
@@ -6317,8 +6283,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         }
                         view.selected = index;
                     }
-                } else if !inside_modal {
-                    app.overlay = None;
                 }
                 app.dirty = true;
             }
@@ -21038,16 +21002,12 @@ diff --git a/src/b.rs b/src/b.rs
     // ---- a click outside any modal dismisses it ----
 
     /// Draw once so the modal writes back its hit-test rect, and return it.
+    /// Every variant is inset from the frame, so (0, 0) is always outside.
     fn drawn_modal_area(app: &mut App) -> ratatui::layout::Rect {
         let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
         terminal.draw(|f| ui::draw(f, app)).unwrap();
-        let area = match &app.overlay {
-            Some(Overlay::Help(v)) => v.area,
-            Some(Overlay::Confirm(c)) => c.area,
-            Some(Overlay::Prompt(p)) => p.area,
-            Some(Overlay::Diff(v)) => v.area,
-            other => panic!("no boxed modal open: {other:?}"),
-        };
+        let overlay = app.overlay.as_ref().expect("no modal open");
+        let area = crate::overlay_close::overlay_area(overlay);
         assert!(area.width > 0 && area.x > 0 && area.y > 0, "{area:?}");
         area
     }
@@ -21164,6 +21124,422 @@ diff --git a/src/b.rs b/src/b.rs
         );
         click(&mut app, 0, 0, &mut out);
         assert!(app.overlay.is_none(), "outside click closes");
+    }
+
+    // ---- every modal has all three exits ----
+
+    /// Every `Overlay` variant, the opener that puts it on screen, and where
+    /// its two staged exits land: `None` for the panels, `Some(label)` for
+    /// the modal it backs out to. The HARDWIRED UNLOCK always lands on the
+    /// panels, so it needs no column.
+    ///
+    /// `overlay_label` below is an exhaustive match, so a new variant cannot
+    /// be added without landing in this table — which is what keeps the
+    /// three-exits contract from drifting as overlays come and go.
+    #[allow(clippy::type_complexity)]
+    fn every_overlay() -> Vec<(&'static str, fn(&mut App), Option<&'static str>)> {
+        vec![
+            (
+                "Menu",
+                |app| {
+                    seed_tree(app);
+                    app.focus = Focus::Sessions;
+                    press(app, KeyCode::Char('m'), KeyModifiers::NONE, &mut Vec::new());
+                },
+                None,
+            ),
+            (
+                "Confirm",
+                |app| {
+                    seed_tree(app);
+                    seed_link(app, "https://example.dev/spec");
+                    press(app, KeyCode::Char('D'), KeyModifiers::NONE, &mut Vec::new());
+                },
+                None,
+            ),
+            (
+                "Prompt",
+                |app| press(app, KeyCode::Char('n'), KeyModifiers::NONE, &mut Vec::new()),
+                None,
+            ),
+            (
+                "Help",
+                |app| press(app, KeyCode::Char('?'), KeyModifiers::NONE, &mut Vec::new()),
+                None,
+            ),
+            (
+                "Settings",
+                |app| press(app, KeyCode::Char('s'), KeyModifiers::NONE, &mut Vec::new()),
+                None,
+            ),
+            (
+                "Diff",
+                |app| {
+                    seed_tree(app);
+                    app.overlay = Some(Overlay::Diff(fake_diff_view(10)));
+                },
+                None,
+            ),
+            (
+                "Palette",
+                |app| {
+                    seed_tree(app);
+                    press(app, KeyCode::Char('/'), KeyModifiers::NONE, &mut Vec::new());
+                },
+                None,
+            ),
+            (
+                "Files",
+                |app| {
+                    app.overlay = Some(Overlay::Files(FileFinder::new(
+                        "/tmp/demo".into(),
+                        "main".into(),
+                        "vi".into(),
+                        vec!["src/main.rs".into(), "README.md".into()],
+                    )));
+                },
+                None,
+            ),
+            (
+                "Grep",
+                |app| {
+                    app.overlay = Some(Overlay::Grep(GrepView::new(
+                        "/tmp/demo".into(),
+                        "main".into(),
+                        "vi".into(),
+                    )));
+                },
+                None,
+            ),
+            (
+                "Tree",
+                |app| {
+                    app.overlay = Some(Overlay::Tree(TreeBrowser::new(
+                        "/tmp/demo".into(),
+                        "main".into(),
+                        "vi".into(),
+                        vec!["src/main.rs".into(), "README.md".into()],
+                    )));
+                },
+                None,
+            ),
+            (
+                "Metrics",
+                |app| app.overlay = Some(Overlay::Metrics(MetricsView::new())),
+                None,
+            ),
+            (
+                "Hosts",
+                |app| {
+                    app.overlay = Some(Overlay::Hosts(crate::app::HostsView::new(vec![
+                        crate::hosts::HostEntry {
+                            host: "old@one".into(),
+                            path: None,
+                            last_used_ms: 1,
+                        },
+                    ])));
+                },
+                None,
+            ),
+            (
+                "AgentPresets",
+                |app| {
+                    crate::preset_overlays::reopen_agent_presets(
+                        app,
+                        nebula_core::WorktreeId("w1".into()),
+                        0,
+                    );
+                },
+                None,
+            ),
+            (
+                // The only staged landing: the editor backs out to the list
+                // it was opened from, unsaved, exactly as its own Esc does.
+                "AgentPresetEditor",
+                |app| {
+                    crate::preset_overlays::open_agent_preset_editor(
+                        app,
+                        nebula_core::WorktreeId("w1".into()),
+                        None,
+                    );
+                },
+                Some("AgentPresets"),
+            ),
+        ]
+    }
+
+    /// The variant's name. Exhaustive on purpose — see `every_overlay`.
+    fn overlay_label(overlay: &Overlay) -> &'static str {
+        match overlay {
+            Overlay::Menu(_) => "Menu",
+            Overlay::Confirm(_) => "Confirm",
+            Overlay::Prompt(_) => "Prompt",
+            Overlay::Help(_) => "Help",
+            Overlay::Settings(_) => "Settings",
+            Overlay::Diff(_) => "Diff",
+            Overlay::Palette(_) => "Palette",
+            Overlay::Files(_) => "Files",
+            Overlay::Grep(_) => "Grep",
+            Overlay::Tree(_) => "Tree",
+            Overlay::Metrics(_) => "Metrics",
+            Overlay::Hosts(_) => "Hosts",
+            Overlay::AgentPresets(_) => "AgentPresets",
+            Overlay::AgentPresetEditor(_) => "AgentPresetEditor",
+        }
+    }
+
+    /// What the three exit tests below stand on: every row's opener really
+    /// does put its own variant on screen, and the table has a row per
+    /// variant. Bump the count when an overlay is added or retired.
+    #[test]
+    fn the_overlay_table_covers_every_variant_exactly_once() {
+        with_seeded_presets(|| {
+            let mut seen: Vec<&'static str> = Vec::new();
+            for (label, open, _) in every_overlay() {
+                let mut app = App::new();
+                open(&mut app);
+                let overlay = app
+                    .overlay
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{label}: the opener left no overlay open"));
+                assert_eq!(
+                    overlay_label(overlay),
+                    label,
+                    "{label}: the opener produced another variant"
+                );
+                seen.push(label);
+            }
+            seen.sort_unstable();
+            let mut unique = seen.clone();
+            unique.dedup();
+            assert_eq!(unique, seen, "two rows for the same variant");
+            assert_eq!(seen.len(), 14, "a variant came or went: {seen:?}");
+        });
+    }
+
+    /// One Esc from a modal's base state — nothing typed, no submenu open —
+    /// is enough to leave it.
+    #[test]
+    fn one_esc_closes_every_overlay() {
+        with_seeded_presets(|| {
+            for (label, open, lands) in every_overlay() {
+                let mut app = App::new();
+                let mut out = Vec::new();
+                open(&mut app);
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+                assert_eq!(
+                    app.overlay.as_ref().map(overlay_label),
+                    lands,
+                    "{label}: one Esc landed somewhere else"
+                );
+            }
+        });
+    }
+
+    /// A left-click off the modal's box is the mouse's way out of all of
+    /// them, and it lands exactly where Esc would. What a click *inside* the
+    /// box does is each modal's own business — a row is an action in the
+    /// CONTEXT MENU, the HOSTS PICKER and the AGENT PRESETS list, inert in
+    /// the rest — so the per-modal tests above own that half.
+    #[test]
+    fn a_click_outside_closes_every_overlay() {
+        with_seeded_presets(|| {
+            for (label, open, lands) in every_overlay() {
+                let mut app = App::new();
+                let mut out = Vec::new();
+                open(&mut app);
+                drawn_modal_area(&mut app);
+                click(&mut app, 0, 0, &mut out);
+                assert_eq!(
+                    app.overlay.as_ref().map(overlay_label),
+                    lands,
+                    "{label}: a click outside landed somewhere else"
+                );
+            }
+        });
+    }
+
+    /// The HARDWIRED UNLOCK reaches every modal, and unlike Esc it always
+    /// lands on the panels — a modal opened from a modal included.
+    #[test]
+    fn ctrl_q_closes_every_overlay() {
+        with_seeded_presets(|| {
+            for (label, open, _) in every_overlay() {
+                let mut app = App::new();
+                let mut out = Vec::new();
+                open(&mut app);
+                press(
+                    &mut app,
+                    KeyCode::Char('q'),
+                    KeyModifiers::CONTROL,
+                    &mut out,
+                );
+                assert!(
+                    app.overlay.is_none(),
+                    "{label}: Ctrl+Q left {:?} on screen",
+                    app.overlay.as_ref().map(overlay_label)
+                );
+            }
+        });
+    }
+
+    /// Where the two exits part company: Esc peels a typed filter, an open
+    /// submenu and a nested form one layer at a time — deliberately. Ctrl+Q
+    /// takes the lot in one press, which is what makes it the exit that can
+    /// never leave the user stuck.
+    #[test]
+    fn ctrl_q_takes_the_layers_esc_would_peel() {
+        with_seeded_presets(|| {
+            // A typed diff filter: Esc clears it and keeps the viewer.
+            let staged_diff = |app: &mut App| {
+                seed_tree(app);
+                app.overlay = Some(Overlay::Diff(fake_diff_view(10)));
+                assert!(paste_into_overlay(app, "alpha"));
+            };
+            assert!(
+                matches!(peel_with(staged_diff, KeyCode::Esc), Some(Overlay::Diff(_))),
+                "Esc should clear the filter first"
+            );
+            assert!(peel_with(staged_diff, KeyCode::Char('q')).is_none());
+
+            // An open MODEL submenu: Esc backs out one level.
+            let submenu = |app: &mut App| {
+                let mut out = Vec::new();
+                seed_tree(app);
+                app.focus = Focus::Sessions;
+                press(app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+                press(app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+                assert!(
+                    matches!(&app.overlay, Some(Overlay::Menu(m)) if m.parent.is_some()),
+                    "→ should open a submenu, got {:?}",
+                    app.overlay
+                );
+            };
+            assert!(
+                matches!(peel_with(submenu, KeyCode::Esc), Some(Overlay::Menu(m)) if m.parent.is_none()),
+                "Esc should pop to the root menu"
+            );
+            assert!(peel_with(submenu, KeyCode::Char('q')).is_none());
+
+            // The PRESET EDITOR over its list: Esc goes back to the list.
+            let editor = |app: &mut App| {
+                let mut out = Vec::new();
+                seed_tree(app);
+                app.focus = Focus::Sessions;
+                press(app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+                press(app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+                assert!(
+                    matches!(app.overlay, Some(Overlay::AgentPresetEditor(_))),
+                    "{:?}",
+                    app.overlay
+                );
+            };
+            assert!(
+                matches!(
+                    peel_with(editor, KeyCode::Esc),
+                    Some(Overlay::AgentPresets(_))
+                ),
+                "Esc should back out to the list"
+            );
+            assert!(peel_with(editor, KeyCode::Char('q')).is_none());
+        });
+    }
+
+    /// Build a staged modal from scratch, press one exit key on it, and hand
+    /// back whatever is left on screen. `App` is not `Clone`, so comparing
+    /// two exits on the same state means opening it twice.
+    fn peel_with(open: impl Fn(&mut App), code: KeyCode) -> Option<Overlay> {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        open(&mut app);
+        let mods = match code {
+            KeyCode::Esc => KeyModifiers::NONE,
+            _ => KeyModifiers::CONTROL,
+        };
+        press(&mut app, code, mods, &mut out);
+        app.overlay
+    }
+
+    /// Backing out of a QUICK PROMPT picker with the mouse is the same
+    /// return trip Esc makes: the box comes back with its text. The
+    /// HARDWIRED UNLOCK is the one exit that doesn't — it owes the panels,
+    /// not the box.
+    #[test]
+    fn clicking_outside_a_quick_prompt_picker_restores_the_box() {
+        with_seeded_presets(|| {
+            for opener in [KeyCode::Tab, KeyCode::BackTab] {
+                let picker = |app: &mut App| {
+                    let mut out = Vec::new();
+                    seed_tree(app);
+                    app.focus = Focus::Sessions;
+                    press(app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+                    assert!(paste_into_overlay(app, "Fix auth"));
+                    press(app, opener, KeyModifiers::NONE, &mut out);
+                };
+
+                let mut app = App::new();
+                let mut out = Vec::new();
+                picker(&mut app);
+                drawn_modal_area(&mut app);
+                click(&mut app, 0, 0, &mut out);
+                let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                    panic!(
+                        "{opener:?}: the click should hand the box back, got {:?}",
+                        app.overlay
+                    );
+                };
+                assert_eq!(prompt.input.as_str(), "Fix auth");
+
+                assert!(
+                    peel_with(picker, KeyCode::Char('q')).is_none(),
+                    "{opener:?}: Ctrl+Q owes the panels"
+                );
+            }
+        });
+    }
+
+    /// A live HOTKEY CAPTURE swallows the overlay's own keys so nearly the
+    /// whole keyboard stays bindable — but not this one. Ctrl+Q closes the
+    /// SETTINGS OVERLAY out from under the capture, which is the price of it
+    /// meaning the same thing everywhere; the chord is the HARDWIRED UNLOCK
+    /// on top of whatever is bound anyway, so capturing it bound nothing.
+    #[test]
+    fn ctrl_q_closes_settings_out_from_under_a_hotkey_capture() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            open_settings_on(&mut app, crate::config::hotkeys_tab(), &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(settings_view(&app).capturing(), "a capture is live");
+            press(
+                &mut app,
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+        });
+    }
+
+    /// A submenu clicked away from closes outright rather than popping one
+    /// level — but it still owes the QUICK PROMPT its box.
+    #[test]
+    fn clicking_outside_a_submenu_closes_the_whole_menu() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            drawn_modal_area(&mut app);
+            click(&mut app, 0, 0, &mut out);
+            assert!(
+                app.overlay.is_none(),
+                "outside click closes the whole menu, not one level: {:?}",
+                app.overlay
+            );
+        });
     }
 
     #[test]

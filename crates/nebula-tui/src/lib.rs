@@ -13,6 +13,7 @@ pub mod ipc;
 pub mod keymap;
 pub mod keys;
 pub mod links;
+pub mod overlay_close;
 pub mod palette;
 pub mod pr_preview;
 pub mod preset_overlays;

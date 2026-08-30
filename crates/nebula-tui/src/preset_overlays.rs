@@ -659,9 +659,7 @@ pub(crate) fn handle_list_mouse(app: &mut App, mouse: MouseEvent, mouse_pos: Pos
         }
         MouseEventKind::Down(MouseButton::Left) => {
             let list = view.list_area;
-            let inside_list = list.contains(mouse_pos);
-            let inside_modal = view.area.contains(mouse_pos);
-            if inside_list {
+            if list.contains(mouse_pos) {
                 let start = view.window_start(list.height as usize);
                 let index = start + (mouse.row - list.y) as usize;
                 if index < view.presets.len() {
@@ -669,8 +667,6 @@ pub(crate) fn handle_list_mouse(app: &mut App, mouse: MouseEvent, mouse_pos: Pos
                     let view = view.clone();
                     open_agent_preset_task(app, &view);
                 }
-            } else if !inside_modal {
-                app.overlay = None;
             }
             app.dirty = true;
         }
