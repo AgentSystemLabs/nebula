@@ -17,6 +17,7 @@ pub mod palette;
 pub mod pr_preview;
 pub mod preset_overlays;
 pub mod pull_request;
+pub mod quick_prompt;
 pub mod raw_attach;
 pub mod remote;
 pub mod review;

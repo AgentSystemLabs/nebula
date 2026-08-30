@@ -48,6 +48,11 @@ pub struct AgentPresetsView {
     /// Screen rect of the preset rows, written back during draw so clicks
     /// can hit-test rows.
     pub list_area: Rect,
+    /// Set when the list was opened from the QUICK PROMPT's `Shift+Tab`:
+    /// the box to put back, with the text typed so far. In that mode the
+    /// list is a picker — Enter applies the row to that launch and Esc
+    /// returns unchanged, while `a` / `e` / `d` stay in the SESSIONS PANEL.
+    pub quick: Option<crate::quick_prompt::QuickReturn>,
 }
 
 impl AgentPresetsView {
@@ -58,7 +63,13 @@ impl AgentPresetsView {
             worktree,
             area: Rect::default(),
             list_area: Rect::default(),
+            quick: None,
         }
+    }
+
+    /// Is this list a QUICK PROMPT picker rather than the manager?
+    pub fn is_picker(&self) -> bool {
+        self.quick.is_some()
     }
 
     /// First visible row of the list's stateless follow-window for a list of
@@ -499,18 +510,56 @@ pub(crate) fn open_agent_preset_task(app: &mut App, view: &AgentPresetsView) {
     );
 }
 
+/// The picker's Enter: adopt the hovered AGENT PRESET — its harness,
+/// MODEL / EFFORT and prefix/postfix — for the QUICK PROMPT that opened
+/// the list, and hand the box back with its text. A harness switched off
+/// in Settings → Agents is refused here, where the row is, rather than by
+/// a failed spawn later.
+fn apply_preset_to_quick_prompt(
+    app: &mut App,
+    presets: &[AgentPreset],
+    selected: usize,
+    back: crate::quick_prompt::QuickReturn,
+) {
+    let Some(preset) = presets.get(selected).cloned() else {
+        app.flash = Some("no preset selected".into());
+        return;
+    };
+    let cfg = crate::config::Config::load();
+    if !cfg.kind_enabled(preset.kind) {
+        app.flash = Some(format!(
+            "{} is turned off in Settings → Agents",
+            preset.kind.as_str()
+        ));
+        return;
+    }
+    let launch = crate::quick_prompt::QuickLaunch::of_preset(back.launch.worktree, preset, &cfg);
+    crate::quick_prompt::reopen(app, launch, &back.text);
+}
+
 /// Keys in the AGENT PRESETS list.
 pub(crate) fn handle_list_key(app: &mut App, key: KeyEvent) {
     let Some(Overlay::AgentPresets(view)) = &mut app.overlay else {
         return;
     };
     match key.code {
+        // Backing out of the picker is a return trip, not a close: the box
+        // comes back exactly as it left, text and all.
+        KeyCode::Esc | KeyCode::Char('q') if view.is_picker() => {
+            let back = view.quick.clone().expect("is_picker");
+            crate::quick_prompt::reopen(app, back.launch, &back.text);
+        }
         KeyCode::Esc | KeyCode::Char('q') => app.overlay = None,
         KeyCode::Char('j') | KeyCode::Down => {
             view.selected = clamp_selection(view.selected as i64 + 1, view.presets.len());
         }
         KeyCode::Char('k') | KeyCode::Up => {
             view.selected = clamp_selection(view.selected as i64 - 1, view.presets.len());
+        }
+        KeyCode::Char('a') | KeyCode::Char('n') | KeyCode::Char('e') | KeyCode::Char('d')
+            if view.is_picker() =>
+        {
+            app.flash = Some("presets are added and edited with e in the Sessions panel".into());
         }
         KeyCode::Char('a') | KeyCode::Char('n') => {
             let worktree = view.worktree.clone();
@@ -530,7 +579,10 @@ pub(crate) fn handle_list_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             let view = view.clone();
-            open_agent_preset_task(app, &view);
+            match view.quick {
+                Some(back) => apply_preset_to_quick_prompt(app, &view.presets, view.selected, back),
+                None => open_agent_preset_task(app, &view),
+            }
         }
         _ => {}
     }
@@ -635,8 +687,20 @@ pub(crate) fn draw_list(f: &mut Frame, app: &mut App, view: &AgentPresetsView, t
         .clamp(5, f.area().height.max(5));
     let area = centered_rect(f.area(), AGENT_PRESETS_W, height);
     f.render_widget(Clear, area);
-    let hint = " Enter: launch  a: new  e: edit  d: delete  Esc: close ";
-    let block = modal_block(" Agent presets ", th)
+    // In QUICK PROMPT picker mode the list only picks: Enter applies the
+    // row to the box waiting behind it, Esc gives the box back.
+    let (title, hint) = if view.is_picker() {
+        (
+            " Use preset ",
+            " Enter: use for this prompt  Esc: back to the prompt ",
+        )
+    } else {
+        (
+            " Agent presets ",
+            " Enter: launch  a: new  e: edit  d: delete  Esc: close ",
+        )
+    };
+    let block = modal_block(title, th)
         .title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
     let inner = block.inner(area);
     f.render_widget(block, area);

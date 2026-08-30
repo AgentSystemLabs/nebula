@@ -69,6 +69,12 @@ pub const CODEX_MODELS: &[&str] = &[
 ];
 pub const CODEX_EFFORTS: &[&str] = &[DEFAULT_CHOICE, "minimal", "low", "medium", "high", "xhigh"];
 
+/// The `quick_prompt_kind` choices — every AGENT KIND, by the name the
+/// config file stores. Spelled out rather than derived because
+/// [`cycle_choice`] works over `&'static [&'static str]`;
+/// `quick_prompt_kinds_are_every_agent_kind` keeps it honest.
+pub const AGENT_KIND_NAMES: &[&str] = &["claude", "codex", "cursor"];
+
 /// Model choices for a session kind. Cursor's come from the CURSOR
 /// CATALOGUE (`cursor_catalogue.rs`): a seed plus a cached
 /// `cursor-agent --list-models`.
@@ -169,6 +175,7 @@ pub enum SettingKind {
     ShowWorkspaces,
     HideProjects,
     HideWorktrees,
+    QuickPromptKind,
     ClaudeEnabled,
     ClaudeModel,
     ClaudeEffort,
@@ -262,6 +269,11 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
     SettingsTab {
         title: "Agents",
         body: TabBody::Values(&[
+            SettingSpec {
+                kind: SettingKind::QuickPromptKind,
+                label: "Quick prompt agent",
+                hint: "Harness the quick prompt hotkey launches, with that kind's model/effort",
+            },
             SettingSpec {
                 kind: SettingKind::ClaudeEnabled,
                 label: "Claude enabled",
@@ -512,6 +524,12 @@ pub struct Config {
     pub claude_enabled: bool,
     pub codex_enabled: bool,
     pub cursor_enabled: bool,
+    /// Which AGENT KIND the QUICK PROMPT hotkey launches. Its model and
+    /// effort come from that kind's own defaults above, so the setting is
+    /// one name, not a third model/effort pair. Read through
+    /// [`Config::quick_prompt_kind`], which steps around a harness that has
+    /// since been switched off.
+    pub quick_prompt_kind: String,
     /// Hotkey overrides, keyed by `keymap::ActionSpec::id`; the value is a
     /// comma-separated chord list (`"j, down"`), and an empty string means
     /// deliberately unbound. Only rows that differ from the defaults are
@@ -544,6 +562,7 @@ impl Default for Config {
             claude_enabled: true,
             codex_enabled: true,
             cursor_enabled: true,
+            quick_prompt_kind: AgentKind::Claude.as_str().into(),
             keybindings: BTreeMap::new(),
         }
     }
@@ -669,6 +688,10 @@ impl Config {
             "cursor_enabled".into(),
             serde_json::json!(self.cursor_enabled),
         );
+        obj.insert(
+            "quick_prompt_kind".into(),
+            serde_json::json!(self.quick_prompt_kind),
+        );
         obj.insert("keybindings".into(), serde_json::json!(self.keybindings));
         let mut bytes = serde_json::to_vec_pretty(&root)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
@@ -737,6 +760,19 @@ impl Config {
             .collect()
     }
 
+    /// The AGENT KIND the QUICK PROMPT launches: the `quick_prompt_kind`
+    /// setting, stepped on to the first enabled kind when that harness has
+    /// been switched off on the AGENTS TAB since it was chosen (an
+    /// unreadable name, or a hand-edited config with every harness off,
+    /// reads as Claude — the same default the picker starts from).
+    pub fn quick_prompt_kind(&self) -> AgentKind {
+        let configured = AgentKind::parse(&self.quick_prompt_kind).unwrap_or_default();
+        if self.kind_enabled(configured) {
+            return configured;
+        }
+        self.enabled_kinds().first().copied().unwrap_or(configured)
+    }
+
     /// Hotkeys as the event loop dispatches them: defaults with this
     /// config's overrides applied.
     pub fn keymap(&self) -> crate::keymap::Keymap {
@@ -772,6 +808,7 @@ impl Config {
             SettingKind::ClaudeEnabled => on_off(self.claude_enabled).into(),
             SettingKind::CodexEnabled => on_off(self.codex_enabled).into(),
             SettingKind::CursorEnabled => on_off(self.cursor_enabled).into(),
+            SettingKind::QuickPromptKind => self.quick_prompt_kind.clone(),
         }
     }
 
@@ -855,6 +892,10 @@ impl Config {
                         fit_effort(AgentKind::Cursor, Some(&self.cursor_model), None)
                             .unwrap_or_else(|| DEFAULT_CHOICE.into());
                 }
+            }
+            SettingKind::QuickPromptKind => {
+                self.quick_prompt_kind =
+                    cycle_choice(&self.quick_prompt_kind, AGENT_KIND_NAMES, step).into();
             }
             SettingKind::CursorEffort => {
                 let choices = effort_choices(AgentKind::Cursor, Some(&self.cursor_model));
@@ -1316,6 +1357,45 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(raw.get("focus_tint").is_none());
+    }
+
+    /// The QUICK PROMPT's harness: one name, cycled over every AGENT KIND,
+    /// read back through the fallback that steps around a harness switched
+    /// off since it was chosen.
+    #[test]
+    fn quick_prompt_kind_cycles_every_harness_and_persists() {
+        let names: Vec<&str> = AgentKind::ALL.iter().map(|k| k.as_str()).collect();
+        assert_eq!(AGENT_KIND_NAMES, names.as_slice(), "one choice per kind");
+
+        let mut cfg = Config::default();
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Claude);
+        let (tab, row) = locate(SettingKind::QuickPromptKind).unwrap();
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.value_label(SettingKind::QuickPromptKind), "codex");
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Codex);
+        cfg.cycle(tab, row, -1);
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Claude);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.cycle(tab, row, 2);
+        cfg.save_to(&path).unwrap();
+        assert_eq!(load_from(&path).quick_prompt_kind(), AgentKind::Cursor);
+
+        // A config predating the key, and a name nothing parses, both read
+        // as Claude rather than refusing to launch.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Claude);
+        let cfg: Config = serde_json::from_str(r#"{"quick_prompt_kind":"gemini"}"#).unwrap();
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Claude);
+
+        // The chosen harness switched off on the AGENTS TAB steps on to the
+        // first one still enabled.
+        let cfg: Config = serde_json::from_str(
+            r#"{"quick_prompt_kind":"codex","codex_enabled":false,"claude_enabled":false}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Cursor);
     }
 
     #[test]

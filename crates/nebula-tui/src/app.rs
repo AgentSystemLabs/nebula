@@ -160,6 +160,11 @@ pub enum MenuAction {
         /// OPEN PRS launch context. Some is valid only for local Claude and
         /// is preserved through model/effort submenus and the name prompt.
         pr_url: Option<String>,
+        /// Set when the picker was opened from the QUICK PROMPT's `Tab`:
+        /// the box to put back (with its typed text) instead of creating a
+        /// session. Rides through the MODEL / EFFORT submenus like
+        /// `pr_url`, and is what an abandoned picker restores.
+        quick: Option<Box<crate::quick_prompt::QuickReturn>>,
     },
     /// Shell terminal in the worktree's directory; created immediately with
     /// a default name (no prompt), renameable later.
@@ -485,6 +490,13 @@ pub enum PromptKind {
         worktree: WorktreeId,
         preset: crate::agent_presets::AgentPreset,
     },
+    /// The QUICK PROMPT's task: one multi-row box, opened by its hotkey
+    /// from anywhere, that launches an AGENT in the selected WORKTREE with
+    /// the typed text as its STARTING PROMPT. It carries the whole launch
+    /// spec, resolved when the dialog opens (as [`PromptKind::NewAgent`]'s
+    /// options are) so the title can show what Enter is about to start —
+    /// and rewritten in place by the box's `Tab` / `Shift+Tab` pickers.
+    QuickPrompt(crate::quick_prompt::QuickLaunch),
     /// A message to queue on a row's Claude Cloud session
     /// (`claude -p <message> --cloud <id>`). Multi-row like the launch task:
     /// steering a cloud agent is rarely one line.
@@ -559,14 +571,15 @@ impl PromptDialog {
     }
 
     /// The task prompts — the Claude Cloud launch task, a message to a live
-    /// cloud session, and an AGENT PRESET's task — are the ones with a
-    /// multi-row editor.
+    /// cloud session, an AGENT PRESET's task and the QUICK PROMPT — are the
+    /// ones with a multi-row editor.
     pub fn is_multiline(&self) -> bool {
         matches!(
             self.kind,
             PromptKind::ClaudeCloudTask { .. }
                 | PromptKind::CloudMessage { .. }
                 | PromptKind::AgentPresetTask { .. }
+                | PromptKind::QuickPrompt { .. }
         )
     }
 

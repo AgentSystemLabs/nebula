@@ -1465,6 +1465,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         }
         Action::Hosts => open_hosts_picker(app),
         Action::AgentPresets => crate::preset_overlays::open_agent_presets(app),
+        Action::QuickPrompt => crate::quick_prompt::open_quick_prompt(app),
         // Ctrl+→ still reaches the terminal pane (the counterpart of the
         // Ctrl+← escape hatch).
         Action::FocusTerminal => {
@@ -1697,6 +1698,18 @@ fn open_new_worktree_prompt(app: &mut App, project: nebula_core::ProjectId) {
     );
 }
 
+/// The round trip a QUICK PROMPT's picker carries: the launch as it stands
+/// and the text typed so far.
+fn quick_return_of(prompt: &PromptDialog) -> Option<crate::quick_prompt::QuickReturn> {
+    let PromptKind::QuickPrompt(launch) = &prompt.kind else {
+        return None;
+    };
+    Some(crate::quick_prompt::QuickReturn {
+        launch: launch.clone(),
+        text: prompt.input.as_str().to_string(),
+    })
+}
+
 pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
     use std::borrow::Cow;
     let (title, label, input): (Cow<'static, str>, Cow<'static, str>, String) = match &kind {
@@ -1750,6 +1763,9 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
             },
             String::new(),
         ),
+        PromptKind::QuickPrompt(launch) => {
+            (launch.title().into(), launch.label().into(), String::new())
+        }
         PromptKind::CloudMessage { .. } => (
             "Send to cloud session".into(),
             "message for the cloud agent".into(),
@@ -2587,6 +2603,7 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
                     effort: None,
                     cloud: false,
                     pr_url: None,
+                    quick: None,
                 },
             )
         })
@@ -2636,6 +2653,7 @@ fn pr_agent_menu_item(
             effort: None,
             cloud: false,
             pr_url: Some(pr.url.clone()),
+            quick: None,
         },
     )
 }
@@ -2677,22 +2695,34 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
         model,
         cloud,
         pr_url,
+        quick,
         ..
     } = &item.action
     else {
         return None;
     };
     let cfg = crate::config::Config::load();
+    // The ✓ marks what Enter would take: the AGENTS TAB default, or — in a
+    // QUICK PROMPT picker still on the box's own harness — what that box is
+    // already set to launch with.
+    let from_box = quick
+        .as_ref()
+        .filter(|q| q.launch.kind == *kind)
+        .map(|q| &q.launch);
     let (title, choices, configured) = match sub {
         SubmenuKind::Models => (
             format!("{} model", kind_label(*kind)),
             crate::config::model_choices(*kind),
-            cfg.default_model(*kind),
+            from_box
+                .and_then(|l| l.model.clone())
+                .or_else(|| cfg.default_model(*kind)),
         ),
         SubmenuKind::Efforts => (
             format!("{} effort", kind_label(*kind)),
             crate::config::effort_choices(*kind, model.as_deref()),
-            cfg.default_effort(*kind),
+            from_box
+                .and_then(|l| l.effort.clone())
+                .or_else(|| cfg.default_effort(*kind)),
         ),
     };
     let configured = configured.unwrap_or_else(|| "default".into());
@@ -2718,6 +2748,7 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
                     },
                     cloud: *cloud,
                     pr_url: pr_url.clone(),
+                    quick: quick.clone(),
                 },
             )
         })
@@ -2739,7 +2770,16 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
     })
 }
 
-fn kind_label(kind: AgentKind) -> &'static str {
+/// The QUICK PROMPT box a picker menu owes back, read off any of its rows
+/// (every row of a quick picker carries the same one).
+fn menu_quick_return(menu: &ContextMenu) -> Option<crate::quick_prompt::QuickReturn> {
+    menu.items.iter().find_map(|item| match &item.action {
+        MenuAction::NewAgentOfKind { quick, .. } => quick.as_deref().cloned(),
+        _ => None,
+    })
+}
+
+pub(crate) fn kind_label(kind: AgentKind) -> &'static str {
     match kind {
         AgentKind::Claude => "Claude",
         AgentKind::Codex => "Codex",
@@ -3143,10 +3183,18 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
             KeyCode::Esc if menu.has_filter_text() => {
                 menu.set_filter("");
             }
-            // Esc in a submenu backs out one level; at the top it closes.
+            // Esc in a submenu backs out one level; at the top it closes —
+            // unless the picker was opened from the QUICK PROMPT, which is
+            // owed its box back with the text still in it.
             KeyCode::Esc => match menu.parent.take() {
                 Some(parent) => *menu = *parent,
-                None => app.overlay = None,
+                None => match menu_quick_return(menu) {
+                    Some(back) => {
+                        app.overlay = None;
+                        crate::quick_prompt::reopen(app, back.launch, &back.text);
+                    }
+                    None => app.overlay = None,
+                },
             },
             KeyCode::Char('j') | KeyCode::Down => {
                 menu.hover = (menu.hover + 1).min(menu.items.len() - 1)
@@ -3246,6 +3294,20 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 }
                 app.overlay = None;
                 submit_prompt(app, prompt, out);
+            }
+            // Tab / Shift+Tab retarget this one launch: the harness (and
+            // its MODEL / EFFORT submenus) or a saved AGENT PRESET. Both
+            // are free here — `TextInput` ignores them — and both come back
+            // with the text. Only the QUICK PROMPT has anything to retarget.
+            KeyCode::Tab if matches!(prompt.kind, PromptKind::QuickPrompt(_)) => {
+                if let Some(back) = quick_return_of(prompt) {
+                    crate::quick_prompt::open_launch_picker(app, back);
+                }
+            }
+            KeyCode::BackTab if matches!(prompt.kind, PromptKind::QuickPrompt(_)) => {
+                if let Some(back) = quick_return_of(prompt) {
+                    crate::quick_prompt::open_preset_picker(app, back);
+                }
             }
             KeyCode::Tab if prompt.completes_paths() => {
                 let home = nebula_core::env::home_dir();
@@ -3984,16 +4046,21 @@ fn save_panel_visibility(app: &mut App) {
 fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientRequest>) {
     let value = prompt.input.trim().to_string();
     // A cloud session cannot start without its task. Keep the multiline
-    // dialog open on validation so the user can correct it in place.
+    // dialog open on validation so the user can correct it in place (the
+    // QUICK PROMPT opts out of the empty half of that — see below).
     if prompt.is_multiline() {
         // The cloud prompts and a preset's task share the bounds (the text
         // crosses the same argv), not the wording.
         let (needs, what) = match &prompt.kind {
-            PromptKind::AgentPresetTask { .. } => ("the preset needs a task", "task"),
-            _ => ("Claude Cloud needs a task", "Claude Cloud task"),
+            PromptKind::AgentPresetTask { .. } => (Some("the preset needs a task"), "task"),
+            // Nothing typed into a quick prompt is a change of mind, not
+            // a half-finished launch: it falls through to the generic
+            // empty-input cancel below instead of holding the box open.
+            PromptKind::QuickPrompt(_) => (None, "prompt"),
+            _ => (Some("Claude Cloud needs a task"), "Claude Cloud task"),
         };
         let error = if value.is_empty() {
-            Some(needs.to_string())
+            needs.map(str::to_string)
         } else if value.contains('\0') {
             Some(format!("{what} cannot contain NUL bytes"))
         } else if value.len() > MAX_CLOUD_PROMPT_BYTES {
@@ -4001,11 +4068,17 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 "{what} is too long (max {} KiB)",
                 MAX_CLOUD_PROMPT_BYTES / 1024
             ))
-        } else if let PromptKind::AgentPresetTask { preset, .. } = &prompt.kind {
+        } else if let Some(composed) = match &prompt.kind {
             // The wrapped text crosses the same argv as the task alone, so
             // it gets the same ceiling — a long prefix can push a valid
             // task over it.
-            (preset.compose(&value).len() > MAX_CLOUD_PROMPT_BYTES).then(|| {
+            PromptKind::AgentPresetTask { preset, .. } => Some(preset.compose(&value)),
+            PromptKind::QuickPrompt(launch) if launch.preset.is_some() => {
+                Some(launch.compose(&value))
+            }
+            _ => None,
+        } {
+            (composed.len() > MAX_CLOUD_PROMPT_BYTES).then(|| {
                 format!(
                     "prefix + task + postfix is too long (max {} KiB)",
                     MAX_CLOUD_PROMPT_BYTES / 1024
@@ -4165,6 +4238,27 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                         PromptKind::AgentPresetTask { worktree, preset },
                         value,
                     )),
+                    pr_url: None,
+                },
+                out,
+            );
+        }
+        PromptKind::QuickPrompt(launch) => {
+            // Sized above, with the task — composing cannot fail here.
+            let starting_prompt = launch.compose(&value);
+            // An empty name opts the row into AUTO-TITLE, so the session
+            // names itself from the very prompt that started it.
+            create_agent(
+                app,
+                AgentLaunchDraft {
+                    worktree: launch.worktree.clone(),
+                    kind: launch.kind,
+                    model: launch.model.clone(),
+                    effort: launch.effort.clone(),
+                    name: String::new(),
+                    cloud_prompt: None,
+                    starting_prompt: Some(starting_prompt),
+                    reopen_on_error: Some((PromptKind::QuickPrompt(launch), value)),
                     pr_url: None,
                 },
                 out,
@@ -4388,7 +4482,24 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             effort,
             cloud,
             pr_url,
+            quick,
         } => {
+            // Opened from the QUICK PROMPT: the pick rewrites that box's
+            // launch and hands it straight back — no session is created
+            // here, nothing is warmed (a STARTING PROMPT launch can never
+            // adopt a WARM SPARE), and the SETTING is untouched. The
+            // resolve/fit below is `QuickLaunch::of_kind`'s job instead.
+            if let Some(back) = quick {
+                let launch = crate::quick_prompt::QuickLaunch::of_kind(
+                    worktree,
+                    kind,
+                    model.filter(|m| m != "default"),
+                    effort.filter(|e| e != "default"),
+                    &crate::config::Config::load(),
+                );
+                crate::quick_prompt::reopen(app, launch, &back.text);
+                return;
+            }
             // Resolve the picker's choice against the configured defaults:
             // an unexpanded submenu (None) and the explicit "default" row
             // both take the setting; the setting's own "default" means
@@ -5346,7 +5457,7 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
         name
     };
     let cloud = cloud_prompt.is_some();
-    let preset = starting_prompt.is_some();
+    let with_first_prompt = starting_prompt.is_some();
     send_with(app, out, intent, |req_id| match pr_url {
         Some(pr_url) => {
             debug_assert_eq!(kind, AgentKind::Claude);
@@ -5374,9 +5485,10 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
         },
     });
     // The create consumes (or, off-spec, discards) the worktree's warm
-    // Claude slot; refill it so the next create is instant too. A cloud or
-    // preset launch never touches the slot, so there is nothing to refill.
-    if kind == AgentKind::Claude && !cloud && !preset {
+    // Claude slot; refill it so the next create is instant too. A cloud
+    // launch, and any launch carrying a STARTING PROMPT (a preset, the
+    // QUICK PROMPT), never touches the slot, so there is nothing to refill.
+    if kind == AgentKind::Claude && !cloud && !with_first_prompt {
         out.extend(default_claude_prewarm(worktree));
     }
 }
@@ -19930,6 +20042,351 @@ diff --git a/src/b.rs b/src/b.rs
                 Some(Overlay::AgentPresets(view)) => assert_eq!(view.selected, 1, "same row"),
                 other => panic!("Esc goes back to the list, got {other:?}"),
             }
+        });
+    }
+
+    /// The QUICK PROMPT: `p` anywhere in the panels, a multi-row box, and
+    /// Enter starts an agent of the configured harness on what was typed —
+    /// no picker and no name prompt on the way.
+    #[test]
+    fn p_opens_the_quick_prompt_and_launches_on_what_was_typed() {
+        with_config_json(
+            r#"{"quick_prompt_kind": "codex", "codex_model": "gpt-5.5", "codex_effort": "high"}"#,
+            || {
+                let mut app = App::new();
+                let mut out = Vec::new();
+                seed_tree(&mut app);
+                // Deliberately not the Sessions panel: unlike the presets
+                // list, the quick prompt answers from wherever you are.
+                app.focus = Focus::Projects;
+                let worktree = app.selected_worktree().unwrap().id.clone();
+
+                press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+                let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                    panic!("p should open the quick prompt, got {:?}", app.overlay);
+                };
+                assert_eq!(prompt.title, "Quick prompt (codex · gpt-5.5 · high)");
+                assert!(prompt.is_multiline(), "a task box, not a one-line name");
+                assert!(out.is_empty(), "opening it sends nothing: {out:?}");
+
+                // Shift+Enter keeps typing; only a bare Enter launches.
+                assert!(paste_into_overlay(&mut app, "Fix auth"));
+                press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
+                assert!(paste_into_overlay(&mut app, "then ship it"));
+                assert!(
+                    matches!(&app.overlay, Some(Overlay::Prompt(_))),
+                    "Shift+Enter stays in the box"
+                );
+
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+                assert!(app.overlay.is_none(), "launching closes the box");
+                assert!(
+                    matches!(
+                        out.as_slice(),
+                        [ClientRequest::CreateAgent {
+                            worktree: w,
+                            kind: AgentKind::Codex,
+                            model: Some(model),
+                            effort: Some(effort),
+                            auto_title: true,
+                            cloud_prompt: None,
+                            starting_prompt: Some(text),
+                            ..
+                        }] if *w == worktree
+                            && model == "gpt-5.5"
+                            && effort == "high"
+                            && text == "Fix auth\nthen ship it"
+                    ),
+                    "one create carrying the typed prompt: {out:?}"
+                );
+
+                // A refused create brings the text back rather than losing it.
+                let req_id = match &out[0] {
+                    ClientRequest::CreateAgent { req_id, .. } => *req_id,
+                    other => panic!("expected create request, got {other:?}"),
+                };
+                handle_server_event(
+                    &mut app,
+                    ServerEvent::Error {
+                        req_id: Some(req_id),
+                        message: "codex is not installed".into(),
+                    },
+                    &mut out,
+                );
+                assert_eq!(app.flash.as_deref(), Some("codex is not installed"));
+                assert!(matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(prompt))
+                        if matches!(prompt.kind, PromptKind::QuickPrompt { .. })
+                            && prompt.input.as_str() == "Fix auth\nthen ship it"
+                ));
+            },
+        );
+    }
+
+    /// `Tab` in the box retargets this one launch: the same harness rows
+    /// the NEW SESSION PICKER offers, with the MODEL / EFFORT submenus
+    /// behind them — and the typed text survives the trip.
+    #[test]
+    fn tab_in_the_quick_prompt_picks_the_harness_and_keeps_the_text() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let worktree = app.selected_worktree().unwrap().id.clone();
+
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(paste_into_overlay(&mut app, "Fix auth"));
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("Tab should open the harness picker, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("Quick prompt agent"));
+            assert_eq!(menu.hover, 0, "starts on the harness the box has");
+            assert!(out.is_empty(), "no session, no prewarm yet: {out:?}");
+
+            // Down to Codex, → into its model list, and take a model.
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("→ should open the model submenu, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("Codex model"));
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            let model = match &app.overlay {
+                Some(Overlay::Menu(menu)) => menu.items[menu.hover].label.clone(),
+                other => panic!("{other:?}"),
+            };
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("the pick should hand the box back, got {:?}", app.overlay);
+            };
+            assert_eq!(prompt.input.as_str(), "Fix auth", "the text came back");
+            assert_eq!(prompt.title, format!("Quick prompt (codex · {model})"));
+            assert!(out.is_empty(), "still nothing sent: {out:?}");
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [ClientRequest::CreateAgent {
+                        worktree: w,
+                        kind: AgentKind::Codex,
+                        model: Some(m),
+                        starting_prompt: Some(text),
+                        ..
+                    }] if *w == worktree && *m == model && text == "Fix auth"
+                ),
+                "the picked harness launches: {out:?}"
+            );
+        });
+    }
+
+    /// Backing out of either picker is a return trip: the box comes back
+    /// exactly as it left.
+    #[test]
+    fn esc_out_of_a_quick_prompt_picker_restores_the_box() {
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(paste_into_overlay(&mut app, "Fix auth"));
+
+            for open in [KeyCode::Tab, KeyCode::BackTab] {
+                press(&mut app, open, KeyModifiers::NONE, &mut out);
+                assert!(
+                    !matches!(&app.overlay, Some(Overlay::Prompt(_))),
+                    "{open:?} should open a picker"
+                );
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+                let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                    panic!("Esc should hand the box back, got {:?}", app.overlay);
+                };
+                assert_eq!(prompt.input.as_str(), "Fix auth");
+                assert_eq!(prompt.title, "Quick prompt (claude)", "spec unchanged");
+            }
+            assert!(out.is_empty(), "{out:?}");
+        });
+    }
+
+    /// `Shift+Tab` picks a saved AGENT PRESET for this launch: its harness,
+    /// its MODEL / EFFORT, and its prefix/postfix around what was typed.
+    #[test]
+    fn shift_tab_applies_a_preset_and_wraps_the_task() {
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(paste_into_overlay(&mut app, "Fix auth"));
+
+            press(&mut app, KeyCode::BackTab, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresets(view)) = &app.overlay else {
+                panic!("⇧Tab should open the presets, got {:?}", app.overlay);
+            };
+            assert!(view.is_picker(), "opened to pick, not to manage");
+            assert_eq!(view.presets[0].name, "reviewer");
+
+            // The management verbs belong to the Sessions panel's list.
+            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(&app.overlay, Some(Overlay::AgentPresets(_))),
+                "a stays put in picker mode: {:?}",
+                app.overlay
+            );
+            assert_eq!(
+                app.flash.as_deref(),
+                Some("presets are added and edited with e in the Sessions panel")
+            );
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("the pick should hand the box back, got {:?}", app.overlay);
+            };
+            assert_eq!(prompt.input.as_str(), "Fix auth");
+            assert_eq!(
+                prompt.title,
+                "Quick prompt · reviewer (claude · opus · high)"
+            );
+            assert!(
+                prompt.label.contains("prefix + your task + postfix"),
+                "{}",
+                prompt.label
+            );
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [ClientRequest::CreateAgent {
+                        kind: AgentKind::Claude,
+                        model: Some(model),
+                        effort: Some(effort),
+                        starting_prompt: Some(text),
+                        ..
+                    }] if model == "opus"
+                        && effort == "high"
+                        && text == "Be strict.\n\nFix auth\n\nRun the tests."
+                ),
+                "the preset wraps the typed task: {out:?}"
+            );
+        });
+    }
+
+    /// With no presets saved there is nothing to pick — say so and leave
+    /// the box up rather than opening an empty list.
+    #[test]
+    fn shift_tab_without_presets_leaves_the_box_alone() {
+        with_default_config(|| {
+            let dir = tempfile::tempdir().unwrap();
+            crate::agent_presets::with_presets_path(dir.path().join("agent_presets.json"), || {
+                let mut app = App::new();
+                let mut out = Vec::new();
+                seed_tree(&mut app);
+                app.focus = Focus::Sessions;
+                press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+                assert!(paste_into_overlay(&mut app, "Fix auth"));
+                press(&mut app, KeyCode::BackTab, KeyModifiers::NONE, &mut out);
+                let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                    panic!("the box should stay up, got {:?}", app.overlay);
+                };
+                assert_eq!(prompt.input.as_str(), "Fix auth");
+                assert_eq!(
+                    app.flash.as_deref(),
+                    Some("no agent presets yet — press e in the Sessions panel to add one")
+                );
+            });
+        });
+    }
+
+    /// The box on screen: wrapped over several rows, and once the text
+    /// outruns them it follows the caret instead of hiding the end.
+    #[test]
+    fn the_quick_prompt_box_wraps_and_scrolls_to_the_caret() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+
+            // Twelve rows of text in a box that shows far fewer.
+            for i in 0..12 {
+                assert!(paste_into_overlay(&mut app, &format!("line {i}")));
+                press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
+            }
+            assert!(paste_into_overlay(&mut app, "the last word"));
+
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("Quick prompt (claude)"),
+                "the box is titled with what it will launch: {text}"
+            );
+            assert!(
+                text.contains("what should the agent do?"),
+                "and labelled: {text}"
+            );
+            assert!(
+                text.contains("the last word"),
+                "the caret's line is on screen: {text}"
+            );
+            assert!(
+                !text.contains("line 0"),
+                "the head scrolled off rather than the tail: {text}"
+            );
+            assert!(
+                text.contains("⇧Enter/^J: newline") && text.contains("Esc"),
+                "the newline and cancel keys are on the border: {text}"
+            );
+            assert!(
+                text.contains("Tab: agent") && text.contains("⇧Tab: preset"),
+                "and so are the two pickers: {text}"
+            );
+        });
+    }
+
+    /// Nothing typed is a change of mind, not an error: the box closes and
+    /// nothing is created (the preset and cloud task boxes hold open on
+    /// empty because their launch is already half-specified; this one is
+    /// one keystroke away from being reopened).
+    #[test]
+    fn an_empty_quick_prompt_cancels_without_creating() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "empty Enter closes it");
+            assert_eq!(app.flash.as_deref(), Some("cancelled: empty input"));
+            assert!(out.is_empty(), "{out:?}");
+        });
+    }
+
+    /// The agent has to run somewhere: with no checkout under the cursor
+    /// (an empty tree, or a cursor parked on an OPEN PRS row) `p` says so
+    /// instead of opening a box that cannot launch.
+    #[test]
+    fn the_quick_prompt_needs_a_worktree() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert_eq!(
+                app.flash.as_deref(),
+                Some("quick prompt: select a worktree first")
+            );
+            assert!(out.is_empty(), "{out:?}");
         });
     }
 

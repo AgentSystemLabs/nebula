@@ -26,6 +26,37 @@ const PALETTE_SIZE: (u16, u16) = (64, 18);
 const FILES_SIZE: (u16, u16) = (72, 20);
 /// Fixed (width, height) of the multi-line task prompt.
 const TASK_PROMPT_SIZE: (u16, u16) = (76, 14);
+
+/// The key hints on a task box's bottom border, widest that fits inside
+/// `width` (the block's, so two columns go to its edges). The QUICK PROMPT
+/// has two more keys to advertise than the cloud and preset boxes — `Tab`
+/// retargets the harness, `⇧Tab` picks an AGENT PRESET — and a hint wider
+/// than the border is silently chopped, hence the tiers and the test that
+/// measures them.
+fn task_prompt_hint(kind: &crate::app::PromptKind, width: u16) -> &'static str {
+    if matches!(kind, crate::app::PromptKind::QuickPrompt(_)) {
+        return if width >= 72 {
+            " Enter: launch · ⇧Enter/^J: newline · Tab: agent · ⇧Tab: preset · Esc "
+        } else if width >= 61 {
+            " Enter launch · ^J newline · Tab agent · ⇧Tab preset · Esc "
+        } else if width >= 44 {
+            " ↵ launch · Tab agent · ⇧Tab preset · Esc "
+        } else if width >= 22 {
+            " Esc · ^J · Tab · ↵ "
+        } else {
+            " Esc · ^J · ↵ "
+        };
+    }
+    if width >= 57 {
+        " Enter: launch · Shift+Enter/^J: newline · Esc: cancel "
+    } else if width >= 42 {
+        // Not 36: at 36–41 columns this line was two characters wider than
+        // the border and lost its tail.
+        " Enter launch · ^J newline · Esc cancel "
+    } else {
+        " Esc · ^J · Enter "
+    }
+}
 /// Width of a one-line prompt, and of the wider one carrying a directory
 /// listing under its input.
 const PROMPT_W: u16 = 56;
@@ -354,13 +385,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
         Overlay::Prompt(prompt) if prompt.is_multiline() => {
             let area = centered_rect(f.area(), TASK_PROMPT_SIZE.0, TASK_PROMPT_SIZE.1);
             f.render_widget(Clear, area);
-            let hint = if area.width >= 64 {
-                " Enter: launch · Shift+Enter/^J: newline · Esc: cancel "
-            } else if area.width >= 36 {
-                " Enter launch · ^J newline · Esc cancel "
-            } else {
-                " Esc · ^J · Enter "
-            };
+            let hint = task_prompt_hint(&prompt.kind, area.width);
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -4490,6 +4515,40 @@ mod tests {
         input.handle_key(&KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         // Caret at the start: the head is shown, the tail elided.
         assert_eq!(rendered(&input, 8), "[a]bcdefg…");
+    }
+
+    /// Every tier of a task box's hint has to fit between the borders it
+    /// is drawn on, or ratatui clips the end silently — the SETTINGS
+    /// OVERLAY has been bitten by exactly that.
+    #[test]
+    fn task_prompt_hints_fit_the_border_they_sit_on() {
+        use crate::app::PromptKind;
+        let quick = PromptKind::QuickPrompt(crate::quick_prompt::QuickLaunch {
+            worktree: nebula_core::WorktreeId::from("wt".to_string()),
+            kind: nebula_core::AgentKind::Claude,
+            model: None,
+            effort: None,
+            preset: None,
+        });
+        let cloud = PromptKind::CloudMessage {
+            id: nebula_core::AgentId::from("a".to_string()),
+        };
+        for width in 20..=TASK_PROMPT_SIZE.0 {
+            for kind in [&quick, &cloud] {
+                let hint = task_prompt_hint(kind, width);
+                assert!(
+                    hint.chars().count() <= width.saturating_sub(2) as usize,
+                    "{width}: {hint:?}"
+                );
+            }
+        }
+        // The full-width box advertises the two pickers.
+        let full = task_prompt_hint(&quick, TASK_PROMPT_SIZE.0);
+        assert!(
+            full.contains("Tab: agent") && full.contains("⇧Tab: preset"),
+            "{full}"
+        );
+        assert!(!task_prompt_hint(&cloud, TASK_PROMPT_SIZE.0).contains("Tab"));
     }
 
     #[test]

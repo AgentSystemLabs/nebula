@@ -75,6 +75,8 @@ pub enum Action {
     DeleteAll,
     /// The AGENT PRESETS list: saved launch definitions for the SESSIONS PANEL.
     AgentPresets,
+    /// The QUICK PROMPT: type a task, launch an agent on it.
+    QuickPrompt,
     // files
     FindFile,
     Grep,
@@ -330,6 +332,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["e"],
+    },
+    ActionSpec {
+        action: Action::QuickPrompt,
+        id: "quick_prompt",
+        label: "Quick prompt",
+        hint: "Type a prompt; Enter starts an agent on it (Settings > Agents picks which)",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["p"],
     },
     // ---- FILES ----
     ActionSpec {
