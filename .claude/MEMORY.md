@@ -16,6 +16,8 @@ Line shape: `- DATE · [Title](memory/entries/DATE-slug.md) · TERMS: A; B · fi
 > `.claude/MEMORY.md` was split into this index plus per-entry files on 2026-08-28.
 
 ## Index
+- 2026-08-30 · [Top Three Security Concerns And The Attack Surface Walkthrough](memory/entries/2026-08-30-top-three-security-concerns-and-the-attack-surface-diagram.md) · TERMS: DAEMON SOCKET; HOOK RECEIVER; BEARER TOKEN; AGENT ENV; INSTALL.SH; NEBULA TUNNEL · files: server.rs; hooks/mod.rs; lifecycle.rs; upgrade.rs; ssh.rs · gotchas: 12
+- 2026-08-30 · [A Ten-Agent Docs Audit Found Eight False Claims In README And `docs/`](memory/entries/2026-08-30-a-ten-agent-docs-audit-against-the-code.md) · TERMS: DOCS PAGES; CONFIG.JSON; KEYMAP; HOSTS PICKER; PREWARM POOL; PROTOCOL VERSION · files: keys.md; configuration.md; commands.md; cli.rs · gotchas: 5
 - 2026-08-30 · [Every NEBULA Command Gets Its Own Wrapped `--help` Page](memory/entries/2026-08-30-every-nebula-command-gets-its-own-wrapped-help-page.md) · TERMS: NEBULA; NEBULA BROWSER; NEBULA WORKSPACE; NEBULA TUNNEL; MAKE CI · files: cli.rs; help_cli.rs; main.rs; commands.md · gotchas: 7
 - 2026-08-30 · [Five Topical Commits Out Of One Dirty SHARED CHECKOUT](memory/entries/2026-08-30-five-topical-commits-out-of-one-dirty-shared-checkout.md) · TERMS: SHARED CHECKOUT; MAKE CI; MEMORY LOG; OVERLAY; ATTACH; WHEEL SCROLL · files: event_loop.rs; gotchas.md; MEMORY.md · gotchas: 3
 - 2026-08-30 · [README Cut To A Landing Page, Reference Moved Verbatim Into `docs/`](memory/entries/2026-08-30-readme-cut-to-a-landing-page-with-reference-moved-to-docs.md) · TERMS: TUI; STATUS DOT; KEYMAP; CONFIG.JSON; AGENT PRESET; CLOUD MIRROR · files: README.md; docs/keys.md; docs/sessions.md; docs/how-it-works.md · gotchas: 5
