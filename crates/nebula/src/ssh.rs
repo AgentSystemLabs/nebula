@@ -47,7 +47,7 @@ const REMOTE_SCRIPT: &str = concat!(
 );
 
 pub fn run_ssh(host: &str, path: Option<&str>) -> Result<()> {
-    // Remember the destination for the TUI's `h` picker. Before the exec on
+    // Remember the destination for the TUI's `Shift+H` picker. Before the exec on
     // purpose (there is no after); a host that fails to connect still lists,
     // and `d` can drop it.
     nebula_tui::hosts::record(host, path);

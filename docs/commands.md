@@ -3,9 +3,11 @@
 <sub>[← README](../README.md) · [Keys](keys.md) · [Commands](commands.md) · [Sessions](sessions.md) · [Configuration](configuration.md) · [How it works](how-it-works.md)</sub>
 
 The `nebula` CLI. Every command carries its own help — `nebula <command> --help` is the full page,
-flags and examples included, and `-h` is the one-screen reminder. This page is the same surface in
-one place. Commands marked *(agents run this)* are the ones a coding agent invokes on your behalf —
-see [How it works](how-it-works.md).
+flags and examples included, and `-h` is the one-screen reminder. `nebula --version` (short `-V`)
+prints the version of the binary you're running (`nebula 0.21.0`) — the same version the TUI's
+FOOTER carries at its left edge, and what to check after `nebula upgrade`. This page is the same
+surface in one place. Commands marked *(agents run this)* are the ones a coding agent invokes on
+your behalf — see [How it works](how-it-works.md).
 
 ```
 nebula                      open the TUI (auto-starts the daemon)
@@ -27,7 +29,10 @@ nebula upgrade              install the latest published nebula
 ```sh
 nebula                    # launch the TUI (auto-starts the daemon)
 nebula --workspace <name> # launch it on a named workspace; each instance keeps its own, so
-                          # two windows can sit on two workspaces at once
+                          # two windows can sit on two workspaces at once. Only this bare TUI
+                          # launch reads the flag — `nebula --workspace foo add ~/repo` parses
+                          # fine, but the flag is ignored there and the repo lands in the
+                          # daemon's current default workspace instead
 ```
 
 ## Projects and the daemon
@@ -35,8 +40,11 @@ nebula --workspace <name> # launch it on a named workspace; each instance keeps 
 ```sh
 nebula add <dir>          # add a repo as a project, named after its root directory
 nebula add .              # same, for the repo you're in (bare `nebula <dir>` / `nebula .` also work)
+                          # — but a directory whose name collides with a subcommand needs the long
+                          # form (`nebula add browser`) or a `./` prefix, or bare `nebula browser`
+                          # serves the TUI over ttyd instead of adding the directory
 nebula daemon             # run the daemon (normally auto-spawned)
-nebula daemon --foreground  # daemon with logs to stderr, for debugging
+nebula daemon --foreground  # daemon with logs to stdout, for debugging
 nebula kill               # stop the daemon and all sessions cleanly
 ```
 
@@ -66,7 +74,8 @@ nebula workspace delete <name>  # delete an empty workspace
 
 ```sh
 nebula ssh <host> [dir]   # open nebula on a remote machine over ssh (installs it there if
-                          # missing); destinations are remembered for the TUI's `h` picker
+                          # missing); destinations are remembered for the TUI's HOSTS PICKER
+                          # (`Shift+H`). Needs the OpenSSH client (`ssh`) on PATH here
 nebula tunnel <host> [dir] [--port N] [--remote-port N]
                           # that host's nebula in a browser tab here, over one ssh tunnel: installs
                           # nebula there if missing, runs `nebula browser` on its loopback, forwards
@@ -75,9 +84,10 @@ nebula tunnel <host> [dir] [--port N] [--remote-port N]
                           # If that host already has a `nebula browser` on the port, the tunnel
                           # reuses it instead of failing on the clash (a --credential one will ask
                           # for it in the tab).
-                          # Needs ttyd on the remote; Ctrl+C takes both ends down. --port is the
-                          # local end (same rules as `nebula browser`), --remote-port the far end
-                          # when something there already holds that number
+                          # Needs the OpenSSH client (`ssh`) on PATH here and ttyd on the remote;
+                          # Ctrl+C takes both ends down. --port is the local end (same rules as
+                          # `nebula browser`), --remote-port the far end when something there
+                          # already holds that number
 nebula browser [--port N] [--bind ADDR | --public] [--credential USER:PASSWORD] [--no-open]
                           # serve this TUI in a browser tab via ttyd and open it; needs ttyd on
                           # PATH. With no --port it takes 7681 when that's free and a free port
@@ -90,5 +100,9 @@ nebula browser [--port N] [--bind ADDR | --public] [--credential USER:PASSWORD] 
                           # live, writable terminal, so put something in front of it and use
                           # --credential to add ttyd's HTTP basic auth on top. --no-open serves
                           # without launching a desktop browser, for a box that has none
-nebula upgrade            # install the latest release (--force on a dev build)
+nebula upgrade            # install the latest release (--force on a dev build). Swapping the
+                          # binary doesn't touch a running daemon, so afterwards it shuts an idle
+                          # one (no live sessions) down for you and the next launch starts on the
+                          # new binary. With sessions live it leaves the daemon up — they'd die
+                          # with it — and says to run `nebula kill` when you're ready to restart
 ```

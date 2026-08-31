@@ -64,11 +64,17 @@ curl -fsSL https://raw.githubusercontent.com/AgentSystemLabs/nebula/main/install
 It downloads the prebuilt binary for your platform from the latest GitHub release into `~/.local/bin`
 (override with `NEBULA_INSTALL_DIR`), falling back to `cargo install --git` when no release matches.
 Afterwards, `nebula upgrade` runs that same script for you; it refuses to clobber a local `cargo build`
-(pass `--force` if you mean it). Upgrading with a DAEMON running is safe:
-SESSIONS keep running on the old binary until you `nebula kill` and relaunch.
+(pass `--force` if you mean it). Upgrading with a DAEMON running is safe: an idle one — nothing live in
+it — is shut down for you, so the next launch comes up on the new binary. A DAEMON with live SESSIONS is
+left alone and they keep running the old binary until you `nebula kill` and relaunch. `nebula --version`
+(`-V`) says which binary you are on.
 
 > **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, or `cursor-agent`.
 > nebula spawns them; it doesn't ship them.
+>
+> Three commands each want one more binary, and only those commands: `nebula ssh` and `nebula tunnel`
+> exit if there is no OpenSSH client (`ssh`), and `nebula browser` needs `ttyd` on your `PATH` — for
+> `nebula tunnel` it is the *remote* host that needs it. The TUI itself needs neither.
 
 ## Quickstart
 
@@ -96,9 +102,10 @@ two agents in two WORKTREES edit two directories and never collide.
 PANEL opens the QUICK PROMPT, you type the task, and an agent starts working on it in the selected
 WORKTREE. Save a framing you keep retyping as an AGENT PRESET (`e`) and it becomes one keystroke.
 
-**5. Walk away.** `Ctrl+q` leaves the TERMINAL PANE for the panels; `q` quits nebula entirely. The DAEMON
-still owns every PTY — come back with `nebula` an hour later and each SESSION is exactly where you left
-it, scrollback replayed.
+**5. Walk away.** `Ctrl+q` leaves the TERMINAL PANE for the panels; `q` asks first — a CONFIRM DIALOG
+reading *Leave the TUI? Sessions keep running in the daemon.* that `Enter` accepts and a second `Ctrl+C`
+walks straight through. The DAEMON still owns every PTY — come back with `nebula` an hour later and each
+SESSION is exactly where you left it, scrollback replayed.
 
 Leave a new SESSION on its default name and AUTO-TITLE renames it from your first prompt — `Fix Login
 Redirect`, not `agent-3`. Type a name yourself and nebula never touches it.
@@ -114,6 +121,9 @@ Redirect`, not `agent-3`. Type a name yourself and nebula never touches it.
 | ● red | NEEDS FEEDBACK — permission prompt or question waiting on you |
 | ● magenta | terminated — process died mid-run |
 | ○ | disconnected — the DAEMON restarted while the agent was live |
+
+A Cursor SESSION never goes red: nebula runs `cursor-agent --force` and Cursor reports no permission
+event, so waiting-on-you is not detectable there.
 
 WORKTREE and PROJECT rows ROLL UP their children: red beats yellow beats done, and a parent's dot is
 violet whenever anything UNSEEN finished under it — so the violet walks up the tree and turns green as
@@ -141,7 +151,7 @@ is open.
 | | |
 |---|---|
 | [**Keys**](docs/keys.md) | Every default binding, the WORKTREE views (`g` `f` `F` `b`), and the mouse. All of it rebindable. |
-| [**Commands**](docs/commands.md) | The `nebula` CLI: `add`, `worktree`, `spawn`, `workspace`, `ssh`, `tunnel`, `browser`, `upgrade`. |
+| [**Commands**](docs/commands.md) | The `nebula` CLI: `add`, `rename`, `worktree`, `spawn`, `workspace`, `ssh`, `tunnel`, `browser`, `daemon`, `kill`, `upgrade`. |
 | [**Sessions**](docs/sessions.md) | The NEW SESSION PICKER, MODEL / EFFORT, Claude Cloud and the CLOUD MIRROR, AGENT PRESETS, the PROJECT OPEN PRS group. |
 | [**Configuration**](docs/configuration.md) | `config.json`, the SETTINGS OVERLAY, the HOTKEYS TAB, logs and environment overrides. |
 | [**How it works**](docs/how-it-works.md) | The DAEMON, the hook dialects, AUTO-TITLE, WORKTREE RELOCATION, prewarm and reaping, persistence. |

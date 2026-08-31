@@ -6,6 +6,16 @@
   when the TUI closes. The TUI is a client that attaches over a unix socket (`$XDG_RUNTIME_DIR/nebula/`
   or `/tmp/nebula-<uid>/`, mode 0700). Quit the TUI, relaunch later, and your sessions are still alive
   with scrollback replayed.
+- **Client and DAEMON must agree on the PROTOCOL VERSION.** IPC frames are positional msgpack, so any
+  change to the shared types bumps `PROTOCOL_VERSION` (`crates/nebula-core/src/protocol.rs`) and the
+  handshake refuses a mismatched pair — the DAEMON answers `Incompatible`, the TUI bails, and the
+  VERSION SKEW message names both binaries. Which side is stale decides the fix, and getting it
+  backwards costs an afternoon: when the DAEMON is the *older* build, `nebula kill` and relaunch is the
+  whole remedy (it stops every live session on the way). When the DAEMON is *ahead* of the `nebula` you
+  just ran, `nebula kill` does nothing for you — a live instance respawns its DAEMON from its own
+  binary, so the skew survives every restart, and the fix is to install the DAEMON's build over yours
+  (`make install` from that checkout) instead. The usual shape in a checkout is a `make dev` DAEMON out
+  of `target/debug` while your PATH still finds an older `nebula` from the last `make install`.
 - **RECENCY ORDER stamps every row.** A session is stamped when it last did anything, a worktree carries
   the newest stamp of its sessions, and a project the newest of its worktrees — which is why the lists
   sort themselves most-recent-first. The one fixed seat is the ROOT WORKTREE, always the first worktree
@@ -13,6 +23,15 @@
 - **Projects → worktrees → sessions.** All work happens in the main checkout or a git worktree.
   Worktrees are real (`git worktree add/remove`), created under
   `<repo>/../<repo-name>-worktrees/<branch>`.
+- **Worktrees made outside nebula show up anyway — WORKTREE SYNC.** Every 2 s the DAEMON mtime-probes
+  the git files a worktree operation touches — the repo's shared `.git/HEAD`, the `.git/worktrees`
+  directory, and each linked checkout's own `HEAD` — and only when the newest of those stamps has moved
+  does it spend a `git worktree list` and reconcile the rows. So an agent that runs `git worktree add`
+  itself, a `git checkout` you did in another terminal, or a worktree someone removed lands in the
+  panel within a couple of seconds without a restart, while an idle repo costs nothing but a few
+  `stat` calls (`NEBULA_WORKTREE_SYNC_MS` overrides the 2 s beat; the e2e tests turn it down to
+  100 ms). This structural sync is the *only* git polling the DAEMON does — the pull request lookups
+  further down are the TUI's own.
 - **Agents boot `claude`, `codex`, or `cursor-agent`.** Creating an agent (`n`) first asks which CLI to
   run, then spawns it in the worktree. Claude's picker can also dispatch a one-shot Cloud task as
   `claude --cloud <task>`; because Claude accepts that description as a process argument, don't put
@@ -31,6 +50,34 @@
   suppresses the idle notification that normally un-sticks one, so nebula also reads the CLI's terminal
   progress-bar escapes (OSC 9;4) straight off the PTY. That signal survives a cancel, and it stays busy
   while a permission prompt is open — so it can't mark an agent done while it is actually waiting on you.
+- **…and the IDLE PROMPT, which is a hold rather than a finish.** Claude posts a
+  `Notification{idle_prompt}` after roughly 60 s parked at the input box with nobody touching the
+  keyboard, and that is the notification which un-sticks a turn that ended without a `Stop` — a
+  rejected prompt, an escape mid-turn. Since Claude Code 2.1 the Agent tool runs subagents in the
+  *background*, so it also fires while workers are still going: the foreground turn ended and the input
+  box came back, but the session is anything but done. So nebula treats an IDLE PROMPT as a hold —
+  exactly the hold a gated `Stop` gets — whenever any subagent is still tracked, and only a set that
+  has gone quiet is ever presumed orphaned and finished on the strength of it.
+- **The STOP GATE's four graces, on a 30 s tick.** A `Stop` (or an IDLE PROMPT) is held while
+  `SubagentStart`s outnumber `SubagentStop`s, and a recheck every 30 s — fixed in the DAEMON, with no
+  knob to turn it down — decides what becomes of the hold. Once the set drains and stays empty for
+  180 s the session is finished; a `SubagentStart` that lands within 30 s of a finish instead heals it
+  back to running, on the reading that the `Stop` raced that subagent's own POST. When the set never
+  drains, a subagent that has shown no sign of life for 30 min — no `SubagentStart`/`SubagentStop`, no
+  subagent tool traffic — is presumed killed and the turn finishes anyway. That last grace is why a
+  session whose worker died can sit yellow far longer than you expect, and it is generous on purpose:
+  one silent `cargo test` can run for many minutes, and a wrong green is the bug it exists to prevent.
+  An individually tracked subagent older than 2 h is dropped from the set outright.
+- **Which of those signals you get depends on the harness.** Claude is installed with all ten hook
+  groups — `UserPromptSubmit`, `Stop`, `SessionStart`, `PermissionRequest`, `Notification`, a
+  `PreToolUse` and a `PostToolUse` on `AskUserQuestion`, and a `PostToolUse` on
+  `Bash|EnterWorktree|ExitWorktree` so a session that moves re-homes its row seconds later instead of
+  at the turn's `Stop`, plus `SubagentStart` and `SubagentStop`. Codex gets six of them: no
+  `Notification` and neither `*ToolUse` group, because it has no `AskUserQuestion` tool and its native
+  `PermissionRequest` already covers waiting on you. Cursor gets five camelCase events —
+  `sessionStart`, `beforeSubmitPrompt`, `stop`, `subagentStart`, `subagentStop` — and no permission
+  event at all; nebula runs `cursor-agent --force`, so waiting-on-you is simply not detectable there
+  and a Cursor session never reaches NEEDS FEEDBACK, only busy or idle.
 - **Sessions title themselves.** Create a session with the default name and the agent renames it after
   your first prompt — a 3-4 word title describing the ask (e.g. `Fix Login Redirect`), via a
   `nebula rename <title>` command the CLI runs in its own turn (no extra API calls, no MCP server).
@@ -64,7 +111,13 @@
   lands on a booted screen instead of a booting shell. To bound what that costs, idle PTYs in worktrees
   no client is watching are killed after `session_idle_timeout` (5m by default) — working agents, ones
   waiting on you, and terminals with a command running are all spared, and a reaped agent
-  revives on the next attach with its conversation resumed.
+  revives on the next attach with its conversation resumed. Both halves of the PREWARM POOL are
+  switchable — `prewarm_agents` and `prewarm_sessions` in CONFIG.JSON, `true` by default and
+  hand-edit-only, since neither has a SETTINGS OVERLAY row (see [Configuration](configuration.md)) —
+  and a warm spare nobody claims inside 15 min is reaped on its own, because it holds real memory and
+  its context goes stale. The IDLE REAPER's check is a 15 s sweep (`NEBULA_IDLE_REAP_MS`), so the real
+  latency is the timeout plus up to 15 s more; `session_idle_timeout` also takes `"off"`, which
+  switches reaping off entirely.
 
 ## Pull requests
 
@@ -73,6 +126,16 @@ OPEN PRS group, including a count of comments that landed while you were away. R
 pane reads the pull request — description, stats, conversation — exactly as it does for the project-wide
 OPEN PRS rows under the worktrees; `g` shows its diff. Manual link attachment is currently unavailable;
 previously saved links remain visible so the change does not discard data.
+
+This is the one part of nebula the TUI asks for itself rather than the DAEMON: every `gh pr view`,
+`gh pr list` and `gh pr diff` is spawned by the client, which is why the lookups stop the moment you
+quit, and why a machine with no `gh` — or one that is unauthenticated, or pointed at a checkout with no
+remote — just shows no rows instead of an error. Only what you are looking at is ever asked about: the
+selected worktree's PR ROW and the selected project's PROJECT OPEN PRS GROUP, one process each, never
+stacked while one is in flight, each abandoned after 20 s. A repo that answers settles onto a steady
+15 s beat; an empty answer backs off by doubling — out to 3 min for a branch that never grows a PR,
+10 min for a project with none open — so a workspace of thirty repos does not cost thirty API calls a
+beat.
 
 Settings and hotkeys live in [Configuration](configuration.md). The process model, the IPC CODEC and
 the crate layout are covered in more depth in [ARCHITECTURE.md](../ARCHITECTURE.md).

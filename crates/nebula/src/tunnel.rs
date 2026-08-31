@@ -112,7 +112,7 @@ pub struct TunnelOpts {
 pub fn run_tunnel(opts: TunnelOpts) -> Result<()> {
     let local = resolve_local_port(opts.port)?;
     let remote = opts.remote_port.unwrap_or(local);
-    // The same list `nebula ssh` writes and the TUI's `h` picker reads — a
+    // The same list `nebula ssh` writes and the TUI's `Shift+H` picker reads — a
     // host worth tunnelling into is a host worth reconnecting to. Recorded
     // before the connection, as there, so a failed attempt still lists.
     nebula_tui::hosts::record(&opts.host, opts.path.as_deref());

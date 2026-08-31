@@ -1,4 +1,4 @@
-//! Recently-used `nebula ssh` destinations, backing the TUI's `h` picker.
+//! Recently-used `nebula ssh` destinations, backing the TUI's `Shift+H` picker.
 //!
 //! A plain JSON list in the data dir, most-recent first. `nebula ssh`
 //! records every launch (typed invocations and picker handoffs both run

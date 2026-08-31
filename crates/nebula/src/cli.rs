@@ -159,8 +159,9 @@ pub(crate) enum Command {
     ///
     /// Each nebula instance has exactly one workspace open and scopes its
     /// project list — and the `/` search — to it, so two windows can sit on
-    /// two workspaces at once. Every install starts with one named `default`,
-    /// which cannot be deleted.
+    /// two workspaces at once. Every install starts with one named `default`;
+    /// it is an ordinary workspace with no special protection — only the last
+    /// workspace left standing cannot be deleted.
     #[command(after_help = WORKSPACE_EXAMPLES)]
     Workspace {
         #[command(subcommand)]
@@ -279,7 +280,7 @@ Examples:
 
 const DAEMON_EXAMPLES: &str = "\
 Examples:
-  nebula daemon --foreground       run it attached, logs on stderr
+  nebula daemon --foreground       run it attached, logs on stdout
   NEBULA_LOG=debug nebula daemon --foreground
                                    the same, at debug level";
 
@@ -362,8 +363,9 @@ pub(crate) enum WorkspaceCommand {
     List,
     /// Delete an empty workspace.
     ///
-    /// A workspace that still holds projects is refused, and the `default`
-    /// workspace can never be deleted.
+    /// A workspace that still holds projects is refused, and so is the last
+    /// one left — no name is protected, `default` included. Deleting the one
+    /// new instances open into moves that mark to a surviving workspace.
     #[command(after_help = "Example:\n  nebula workspace delete client-work")]
     Delete {
         /// Workspace to delete; it must hold no projects.
