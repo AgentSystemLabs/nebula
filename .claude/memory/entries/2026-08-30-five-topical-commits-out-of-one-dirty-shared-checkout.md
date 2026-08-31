@@ -30,5 +30,9 @@ ARCHIVE.
 - `.claude/memory/gotchas.md` was already at exactly its 300-line cap, so adding this task's line
   meant folding two existing SHARED CHECKOUT lines (the `git diff <commit>` and `git stash create`
   untracked-file traps, which say the same thing) into one first.
+- A finished task's own MEMORY LOG entry is the checksum for its split: the DOCS AUDIT entry
+  recorded "309 insertions / 56 deletions across 10 files", and `git diff --cached --stat` after
+  staging its paths read exactly `10 files changed, 309 insertions(+), 56 deletions(-)` — proof no
+  other session's hunks rode along in a shared file, before committing rather than after.
 - The GUARD HOOK blocks `cargo check … | tail`; redirect to a log and `echo $?` instead. Already a
   rule, so nothing to re-log.
