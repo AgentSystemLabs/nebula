@@ -6,6 +6,7 @@ pub mod metrics;
 pub mod pty;
 pub mod registry;
 pub mod server;
+pub mod session_title;
 pub mod sibling;
 pub mod status;
 pub mod store;
@@ -88,10 +89,18 @@ async fn serve() -> Result<()> {
                 event,
                 session_id,
                 cwd,
+                transcript,
             }) = hook_rx.recv().await
             {
                 let captures_session = event.captures_session();
                 daemon.apply_hook_event(&agent_id, event.clone(), session_id.clone());
+                // Claude's own session name (`/rename`) rides no hook, but
+                // every payload says where it is persisted: remember that
+                // for the window-title path and read it now.
+                if let Some(transcript) = transcript {
+                    daemon.note_transcript(&agent_id, transcript);
+                    daemon.sync_claude_title(&agent_id);
+                }
                 if let Some(cwd) = &cwd {
                     daemon.reparent_agent_by_cwd(
                         &agent_id,

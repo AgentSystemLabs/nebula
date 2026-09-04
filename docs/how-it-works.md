@@ -86,6 +86,16 @@
   session is untitled); Cursor gets a managed `.cursor/rules/nebula-title.mdc` project rule instead,
   since its hooks can't inject context. Titling is one-shot and never clobbers a name you typed or set
   with `r` — a late agent attempt is politely declined. `nebula rename --force` overrides.
+- **A Claude session's own name and its row stay tied.** `/rename <name>` inside Claude Code retitles
+  the row within a moment — the same name then shows in the SESSIONS PANEL, Claude's prompt box, its
+  `/resume` picker and `/rc` list, and survives a restart. Claude fires no hook for `/rename`; it
+  rewrites the window title (`✳ <name>`) and writes `custom-title.json` beside the transcript, so the
+  DAEMON reads that file when the PTY's title changes (and on every hook), and adopts a title Claude
+  did not hold before as if you had pressed `r`. The other way round, a name set in nebula — typed at
+  creation, set with `r`, or chosen by AUTO-TITLE — reaches Claude on your next prompt through the
+  same `UserPromptSubmit` hook reply, as `hookSpecificOutput.sessionTitle`. Whichever side changed
+  last wins; a name you set in nebula is never undone by re-reading Claude's older one. Claude only —
+  Codex and Cursor have no session name of their own.
 - **Ask the agent for a worktree and it moves there.** Tell a Claude session "do this in a worktree" and
   it runs `nebula worktree <name>` instead of its own `EnterWorktree` tool (whose checkouts land under
   `<repo>/.claude/worktrees/` on a `worktree-*` branch). nebula creates the checkout in its usual

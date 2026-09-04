@@ -2,6 +2,7 @@
 //! changes), so a mutex-guarded connection is sufficient — no ORM, no
 //! connection pool.
 
+use crate::session_title::TitleState;
 use anyhow::{Context, Result};
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, PrSeen, Project, ProjectId, TerminalId,
@@ -230,6 +231,15 @@ const MIGRATIONS: &[&str] = &[
     // system prompt after a daemon restart or RESUME.
     "
     ALTER TABLE agents ADD COLUMN pr_url TEXT;
+    ",
+    // 23: the title Claude Code itself holds for the row's session — what
+    // `/rename` set inside the CLI, or what nebula last pushed into it
+    // through the UserPromptSubmit hook reply (CLAUDE TITLE SYNC, see
+    // `session_title.rs`). Compared with `name` to keep the two tied
+    // without either side undoing the other's newer choice; NULL until
+    // the first sync, so every existing row simply starts unsynced.
+    "
+    ALTER TABLE agents ADD COLUMN claude_title TEXT;
     ",
 ];
 
@@ -594,6 +604,52 @@ impl Store {
                 e => Err(e),
             })?;
         Ok(pending == Some(1))
+    }
+
+    /// The title last seen from (or pushed into) Claude for this session;
+    /// `None` until the CLAUDE TITLE SYNC has run once.
+    pub fn agent_claude_title(&self, id: &AgentId) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT claude_title FROM agents WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id.as_str()])?;
+        match rows.next()? {
+            Some(row) => Ok(row.get(0)?),
+            None => Ok(None),
+        }
+    }
+
+    /// Claude's own title for the session, as just read from disk: when it
+    /// is not the one last seen from Claude, the row takes it as a user
+    /// rename (retiring any pending auto-title) and remembers it. The
+    /// comparison is deliberately against `claude_title`, not `name`, so a
+    /// name the user set in nebula since is never undone by re-reading
+    /// Claude's older title. Returns whether anything changed.
+    pub fn adopt_claude_title(&self, id: &AgentId, title: &str) -> Result<bool> {
+        let changed = self.conn.lock().unwrap().execute(
+            "UPDATE agents SET name = ?2, claude_title = ?2, auto_title_pending = 0 \
+             WHERE id = ?1 AND (claude_title IS NULL OR claude_title != ?2)",
+            params![id.as_str(), title],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Everything the hook reply needs to decide whether to push the row's
+    /// name into Claude (`TitleState::to_push`); `None` for an unknown id.
+    pub fn agent_title_state(&self, id: &AgentId) -> Result<Option<TitleState>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT name, claude_title, auto_title_pending, kind FROM agents WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id.as_str()])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(TitleState {
+                name: row.get(0)?,
+                claude_title: row.get(1)?,
+                auto_title_pending: row.get::<_, i64>(2)? != 0,
+                kind: AgentKind::parse(&row.get::<_, String>(3)?).unwrap_or_default(),
+            })),
+            None => Ok(None),
+        }
     }
 
     pub fn set_agent_worktree(&self, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
@@ -1261,13 +1317,18 @@ mod tests {
 
         let store = Store::open(&path).unwrap();
         assert_eq!(store.agent_pr_url(&AgentId("a1".into())).unwrap(), None);
+        // …and the later columns arrive NULL too (23: claude_title).
+        assert_eq!(
+            store.agent_claude_title(&AgentId("a1".into())).unwrap(),
+            None
+        );
         let version: i64 = store
             .conn
             .lock()
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 22);
+        assert_eq!(version, MIGRATIONS.len() as i64);
         drop(store);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
@@ -1588,6 +1649,98 @@ mod tests {
             .unwrap());
         assert!(!store
             .agent_auto_title_pending(&AgentId("ghost".into()))
+            .unwrap());
+    }
+
+    /// CLAUDE TITLE SYNC bookkeeping: Claude's title is adopted only when
+    /// it changed on Claude's side, a nebula rename made since survives a
+    /// re-read of Claude's older title, and the reply pushes the row's
+    /// name only until Claude holds it.
+    #[test]
+    fn claude_title_follows_claude_without_undoing_a_nebula_rename() {
+        let store = Store::open_in_memory().unwrap();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId::generate(),
+            name: "p".into(),
+            repo_path: "/tmp/p".into(),
+            sort_order: 0,
+        };
+        store.insert_project(&project).unwrap();
+        let wt = Worktree {
+            id: WorktreeId::generate(),
+            project_id: project.id.clone(),
+            path: "/tmp/p".into(),
+            branch: "main".into(),
+            is_main: true,
+            sort_order: 0,
+        };
+        store.insert_worktree(&wt).unwrap();
+        let id = AgentId("a1".into());
+        store
+            .insert_agent_with_auto_title(
+                &Agent {
+                    id: id.clone(),
+                    worktree_id: wt.id.clone(),
+                    name: "agent-1".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    archived_at: 0,
+                    unseen: false,
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    cloud_session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    alive: false,
+                    cloud_mirroring: false,
+                },
+                true,
+            )
+            .unwrap();
+        let state = |store: &Store| store.agent_title_state(&id).unwrap().unwrap();
+
+        // Fresh: nothing seen from Claude, nothing to push while pending.
+        assert_eq!(store.agent_claude_title(&id).unwrap(), None);
+        assert!(state(&store).auto_title_pending);
+        assert_eq!(state(&store).to_push(), None);
+
+        // `/rename` in Claude: adopted as a user rename, once.
+        assert!(store.adopt_claude_title(&id, "From Claude").unwrap());
+        assert!(!store.adopt_claude_title(&id, "From Claude").unwrap());
+        let agent = store.get_agent(&id).unwrap().unwrap();
+        assert_eq!(agent.name, "From Claude");
+        assert!(!store.agent_auto_title_pending(&id).unwrap());
+        assert_eq!(
+            store.agent_claude_title(&id).unwrap().as_deref(),
+            Some("From Claude")
+        );
+        assert_eq!(state(&store).to_push(), None, "the two agree");
+
+        // `r` in nebula: the row changes, Claude's title is unchanged, so
+        // re-reading it must not revert the row — and the name is due a push.
+        store.rename_agent(&id, "From Nebula").unwrap();
+        assert!(!store.adopt_claude_title(&id, "From Claude").unwrap());
+        assert_eq!(store.get_agent(&id).unwrap().unwrap().name, "From Nebula");
+        assert_eq!(state(&store).to_push(), Some("From Nebula"));
+
+        // Claude took the push (or the user typed the same name there).
+        assert!(store.adopt_claude_title(&id, "From Nebula").unwrap());
+        assert_eq!(state(&store).to_push(), None);
+
+        // Unknown ids read as nothing rather than erroring.
+        assert_eq!(
+            store.agent_claude_title(&AgentId("ghost".into())).unwrap(),
+            None
+        );
+        assert!(store
+            .agent_title_state(&AgentId("ghost".into()))
+            .unwrap()
+            .is_none());
+        assert!(!store
+            .adopt_claude_title(&AgentId("ghost".into()), "x")
             .unwrap());
     }
 

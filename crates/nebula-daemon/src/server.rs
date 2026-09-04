@@ -643,9 +643,11 @@ async fn forward_pty(
             }
             // Daemon-side only: the progress edge drives the status machine
             // and reaches clients as a StatusChanged, not as session output;
-            // the cloud sightings reach them as the row's own upsert.
+            // the cloud sightings and a title change reach them as the
+            // row's own upsert (the title bytes themselves are in Output).
             Ok(
                 PtyEvent::Progress { .. }
+                | PtyEvent::Title { .. }
                 | PtyEvent::CloudSession { .. }
                 | PtyEvent::CloudAttachRejected,
             ) => {}
