@@ -14,7 +14,9 @@ when none can be made), at least one mermaid diagram of the change, easy-to-scan
 technical overview section (a PR-body section, not the OUTPUT DOCTOR's DETAILS). The skill ends by
 writing the body to a file for `gh pr create --body-file` and keeps the Claude Code footer. (no questions asked)
 
-**Did:** New skill `.claude/skills/pr-description/SKILL.md` (208 lines): six mandatory parts of every PR
+**Did:** *Superseded in part on 2026-09-04:* the TOC anchor rule below targeted GitHub's file-view slugs,
+which a PR body never gets; the templates and the skill's *GitHub anchors* section now use explicit `<a id>`
+anchors — see `2026-09-04-pr-body-headings-get-no-github-anchors-toc-links-a-id`. New skill `.claude/skills/pr-description/SKILL.md` (208 lines): six mandatory parts of every PR
 body (TOC, screenshots, mermaid, scannable categories, technical overview, harness footer), the house
 style lifted from PR ARCHIVE #16 (opener, benefit groups, `## Notes` gate line), seven steps — gather
 facts from `git log origin/main..HEAD` + the task's MEMORY LOG entry, pick a template, capture with the
@@ -32,10 +34,11 @@ reviewed by eye, not rendered — no `mmdc` here and headless Chrome is SIGKILLe
 **Live run (PR #27):** In the NEBULA WORKTREE `pr-description-skill` the skill was followed end to end: the branch pushed, the gate output rendered to PNG with Pillow + Menlo (no TUI screen changed, so no SCREENSHOT HARNESS capture), the orphan `pr-assets` branch created and pushed from a scratchpad worktree, the body written from `templates/01-benefit-groups.md` to `<scratchpad>/pr-body.md`, the anchor checker run (0 dead), `gh pr create --body-file` → https://github.com/AgentSystemLabs/nebula/pull/27, opened with `open -a "Google Chrome"`. The REST render (`Accept: application/vnd.github.html+json`) confirmed one `<pre lang="mermaid">` block and the `<img>` pointing at the raw `pr-assets` URL, which served 200 on the first request.
 
 **Gotchas:**
-- **GitHub's heading anchor keeps the space after a stripped emoji**, so `## 📸 Screenshots` is
+- **GitHub's *file-view* heading anchor keeps the space after a stripped emoji**, so `## 📸 Screenshots` is
   `#-screenshots` (leading hyphen), `## Before / After` is `#before--after` (the slash leaves two
-  spaces), `## 1. What changed` is `#1-what-changed`. A TOC written by hand against `#screenshots` is
-  dead. The skill carries the rule, a table, and a 10-line Python checker to run on the body file.
+  spaces), `## 1. What changed` is `#1-what-changed` — in a README or blob. A PR body gets no heading
+  anchors at all (corrected 2026-09-04), so the skill now links to explicit `<a id>`s and its checker
+  matches links against those.
 - **A `<placeholder>` sanitiser eats mermaid's `<-->` arrow**: `re.sub(r'<([^<>\n]+)>', r'\1')` turned
   `E <-->|"…"| S` into `E --|"…"| S`. Angle-bracket placeholders inside mermaid fences also risk being
   read as HTML in labels — the templates keep placeholders out of the fences entirely.
@@ -47,9 +50,10 @@ reviewed by eye, not rendered — no `mmdc` here and headless Chrome is SIGKILLe
   first use, from a scratchpad worktree, never from the SHARED CHECKOUT's index.
 - The Skill tool's listing picked the new skill up the moment `SKILL.md` existed (already recorded for
   OUTPUT DOCTOR and PROMPT DADDY): the `pr-description` row appeared in the next tool result.
-- **GitHub adds heading anchors in the browser.** Neither the REST `body_html` nor a logged-out `curl` of the PR
-  page carries an `id="user-content-…"` or `class="anchor"`; the slug port in the skill is the only pre-flight, and
-  the click in a browser is the only proof.
+- **Corrected 2026-09-04: GitHub does *not* add heading anchors in the browser for a PR body.** The REST
+  `body_html` and a logged-out `curl` of the PR page showing no `id="user-content-…"` was the truth, not a
+  pre-render gap — the comment pipeline never emits them; the slug port was checking against the file
+  pipeline. See `2026-09-04-pr-body-headings-get-no-github-anchors-toc-links-a-id`.
 - **Menlo has no emoji glyphs**: a `📸` in text rendered with Pillow + `Menlo.ttc` comes out as a tofu box. Keep
   emoji out of terminal text bound for a PNG, or paste Apple Color Emoji per the SCREENSHOT HARNESS recipe.
 - **Replace a hosted PNG by renaming, not overwriting.** `raw.githubusercontent.com` served the new branch's file

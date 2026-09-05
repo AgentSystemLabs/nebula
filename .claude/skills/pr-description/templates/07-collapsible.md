@@ -3,15 +3,15 @@
 
 <Two sentences: what this PR is, and the one number that says how big (files, tests, a version).>
 
-**Contents:** [🎯 Summary](#-summary) · [✨ Changes](#-changes) · [📸 Screenshots](#-screenshots) · [🧩 Architecture](#-architecture) · [🔧 Technical overview](#-technical-overview) · [📝 Notes](#-notes)
+**Contents:** [🎯 Summary](#summary) · [✨ Changes](#changes) · [📸 Screenshots](#screenshots) · [🧩 Architecture](#architecture) · [⚠️ Risk](#risk) · [🔧 Technical overview](#technical-overview) · [📝 Notes](#notes)
 
-## 🎯 Summary
+## 🎯 Summary <a id="summary"></a>
 
 - **<Hook one>.** <One sentence.>
 - **<Hook two>.** <One sentence.>
 - **<Hook three>.** <One sentence.>
 
-## ✨ Changes
+## ✨ Changes <a id="changes"></a>
 
 <details>
 <summary>🚀 <b>&lt;Change one&gt;</b> — &lt;one clause&gt;</summary>
@@ -36,13 +36,13 @@
 
 <!-- A blank line after <summary> and before </details> is what makes GitHub render the markdown inside. -->
 
-## 📸 Screenshots
+## 📸 Screenshots <a id="screenshots"></a>
 
 | <Change one> | <Change two> |
 |---|---|
 | ![<alt>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/<one>.png) | ![<alt>](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch>/<two>.png) |
 
-## 🧩 Architecture
+## 🧩 Architecture <a id="architecture"></a>
 
 ```mermaid
 flowchart TB
@@ -62,7 +62,19 @@ flowchart TB
   class R,UI changed
 ```
 
-## 🔧 Technical overview
+## ⚠️ Risk <a id="risk"></a>
+
+**Verdict:** <🟢 Low risk · 🟡 Merge with care · 🔴 Do not merge as-is — pick one, then one clause saying why. The author's own read; the PR REVIEWER SKILL checks it against the diff.>
+
+| | Level | Why |
+|---|---|---|
+| 🔒 **Security & production** | <Low / Medium / High> | <who can reach the new code and what it reaches — a new `ClientRequest`, a hook route, a shell call, a token, a file the DAEMON writes — or "no new surface: <why>"> |
+| ⚡ **Performance** | <Low / Medium / High> | <the hot path touched — the TUI draw, the event-loop drain, the PTY byte path, the WORKTREE SYNC tick — or "off every hot path: <why>"> |
+| 🧩 **Fit with the codebase** | <Low / Medium / High> | <the existing pattern it follows, or the departure and why> |
+
+**Rollback:** <one line — `git revert <merge>`, plus what the revert does not undo: a PROTOCOL VERSION bump, a migrated store, a pushed branch.>
+
+## 🔧 Technical overview <a id="technical-overview"></a>
 
 <details>
 <summary>Mechanism, files, rejected approaches, gate</summary>
@@ -74,7 +86,7 @@ flowchart TB
 
 </details>
 
-## 📝 Notes
+## 📝 Notes <a id="notes"></a>
 
 - <Merge state, conflicts, upgrade note.>
 
