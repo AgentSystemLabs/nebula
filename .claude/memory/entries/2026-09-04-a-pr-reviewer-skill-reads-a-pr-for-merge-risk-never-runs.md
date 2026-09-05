@@ -36,6 +36,17 @@ description); step 1's fetch block dry-run read-only against PR #26 (15 files, +
 command exit 0, nothing posted. No crate touched. PROJECT TERMS: SECURITY REVIEW promoted (second sighting: this
 entry), PR REVIEWER SKILL ledgered, MAKE CI row brought up to the Makefile; `terms-check`'s
 `merge? SECURITY REVIEW → SCRATCH WORKTREE` declined — the user can mean the skill without the worktree.
+Follow-up, same session — asked "create a pr for me as an example from a work tree then open browser"
+→ refined: Put this session's PR REVIEWER SKILL work on a branch in a nebula WORKTREE (`nebula worktree
+pr-reviewer-skill --base origin/main`, so the SHARED CHECKOUT stays untouched), commit it, push, and open a pull
+request with a house-style description; then open the PR's URL in my default browser with `open` (assuming
+"open browser" means the PR page, not NEBULA BROWSER). Did: NEBULA WORKTREE relocated the session (WORKTREE
+RELOCATION worked live — see Gotchas); in the worktree, copied the two new files from the SHARED CHECKOUT by
+absolute path, re-applied the three shared-file edits by content anchor, gates green, commit `35c1ac7`
+(`git commit -F`, backticks in the message), `git push -u`, body written to the scratchpad in the pr-description
+house style by hand (TOC with GitHub anchors — checker reported none dead — benefit sections, a fenced dry-run
+in place of a screenshot, a mermaid flowchart, technical overview, Notes, footer), `gh pr create --body-file` →
+https://github.com/AgentSystemLabs/nebula/pull/28, `open <url>`.
 
 **Gotchas:**
 - **Nothing on GitHub builds or tests a PR in this repo.** `gh pr checks` lists `claude-review` alone:
@@ -53,3 +64,17 @@ entry), PR REVIEWER SKILL ledgered, MAKE CI row brought up to the Makefile; `ter
 - A new `.claude/skills/<name>/SKILL.md` is registered in the running session as soon as the file
   exists — the harness listed `pr-reviewer` as invocable on the very next turn, no restart; the same
   liveness the GUARD HOOK's `settings.json` rule and a rewritten SKILL.md already showed.
+- **WORKTREE RELOCATION works live.** `nebula worktree pr-reviewer-skill --base origin/main` from the SHARED
+  CHECKOUT ended the turn, and the session came back inside `nebula-worktrees/pr-reviewer-skill` with a
+  `[nebula] This session now runs inside the worktree …` continuation prompt and carried straight on — the
+  "never exercised" caveat from 2026-08-26 is retired. What changes under you: `CLAUDE.md`/`AGENTS.md` are
+  re-read from the worktree, the scratchpad path moves (its slug is the cwd), MCP servers reconnect.
+- **Uncommitted work does not follow the session.** The worktree is a clean checkout of `--base`; copy new
+  files from the old checkout by absolute path (no `cd` there) and re-apply shared-file edits by *content*
+  anchor, never by line number or adjacency — a merge that asserted two MAKE INSTALL lines adjacent (true in the
+  SHARED CHECKOUT, where an uncommitted reorder had moved a `zsh: killed` line between them) failed on
+  `origin/main`.
+- `set -e` at the top of a Bash tool call did not stop the chain after a python heredoc exited non-zero — the
+  gates ran over a half-applied edit; check each step's exit or chain with `&&`.
+- A skill that exists only as an untracked file in the SHARED CHECKOUT (pr-description on 2026-09-04) is not in a
+  worktree off `origin/main`, so the relocated session cannot invoke it — its house style was applied by hand.
