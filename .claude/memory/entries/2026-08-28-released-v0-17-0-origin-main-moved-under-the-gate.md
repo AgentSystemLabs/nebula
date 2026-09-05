@@ -35,8 +35,10 @@ blocks the `for` form, passes `| while IFS= read -r f`); its gotchas line retire
   nothing; grep the per-binary `test result:` lines (`awk` them into passed / failed totals).
 - `echo =====` under zsh fails with `==== not found`: a bare word beginning with `=` is zsh's `=cmd`
   expansion. Quote separators (`echo '-----'`).
-- Re-hit: `for f in $(git diff --name-only …); do cmp -s …` printed nothing and "checked" 37 files —
-  the glued path made every `cmp` fail silently. Now enforced by the GUARD HOOK.
+- ~~Re-hit: `for f in $(git diff --name-only …); do cmp -s …` printed nothing and "checked" 37 files~~ —
+  **corrected 2026-09-05**: that `cmp -s … || echo "DIFFERS: $f"` loop printing nothing means all 37
+  files matched (a glued path would have printed DIFFERS); zsh splits `$(…)`. The GUARD HOOK rule this
+  spawned rests on the misreading (2026-09-05-for-in-guard-block-was-right-its-zsh-premise-is-false).
 - Picking the tag's run without a blind sleep: `until` loop on `gh run list --workflow=release.yml
   --json databaseId,headBranch -q '.[] | select(.headBranch=="vX.Y.Z") | .databaseId'`, then
   `gh run watch --exit-status`.

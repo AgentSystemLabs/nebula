@@ -12,10 +12,10 @@ restore, NOTES removal, the VERSION SKEW message. Followed the RELEASE SKILL: pr
 scratch, "nothing here is load-bearing") deliberately left out.
 
 **Gotchas:**
-- **`for f in $(git diff --name-only)` silently copies nothing in zsh.** Unquoted expansions are not
-  word-split, so the loop ran once with all 19 paths as a single filename and `cp` failed with one
-  `No such file or directory`. The tell was `git status` in the new worktree showing only the untracked
-  file. Use `... | while IFS= read -r f`.
+- ~~`for f in $(git diff --name-only)` silently copies nothing in zsh~~ — **corrected 2026-09-05**: this
+  session's own transcript shows that exact loop printing `IDENTICAL diff stat` with all 19 files copied;
+  zsh splits an unquoted `$(…)`, only `$VAR` stays one word
+  (2026-09-05-for-in-guard-block-was-right-its-zsh-premise-is-false).
 - **`cargo test … | tail -60` reports `tail`'s exit code, not cargo's.** The first run "passed" with exit 0
   while the tail showed no e2e results at all. Redirect to a file and check `$?` directly, or set
   `pipefail` — never trust a piped cargo exit status for a green gate.

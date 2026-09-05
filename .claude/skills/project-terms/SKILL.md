@@ -91,7 +91,9 @@ Every run, walk the ledger once:
    sessions.
 2. **Promote** any candidate whose *Seen* now holds sightings from two or more separate tasks. Write the
    full row in the section it belongs to (format below), carry the candidate's aliases into *Also
-   called* and the **Alias index**, and delete the ledger row.
+   called* and the **Alias index**, and delete the ledger row. A TERM promoted this task is `dead` to
+   `terms_check.py` until something outside `TERMS.md` says it in caps: write it into this task's MEMORY
+   LOG entry and gotcha lines before step 4.
 3. **Prune** any candidate whose only sighting is older than 30 days, or whose thing has been removed —
    `terms_check.py --prune` does the first (it knows today's date); delete the second by hand. Do not
    retire a candidate; it was never a TERM.

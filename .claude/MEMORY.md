@@ -16,6 +16,7 @@ Line shape: `- DATE · [Title](memory/entries/DATE-slug.md) · TERMS: A; B · fi
 > `.claude/MEMORY.md` was split into this index plus per-entry files on 2026-08-28.
 
 ## Index
+- 2026-09-05 · [The `for … in $(…)` GUARD HOOK Block Was Right, But Its zsh Premise Is False](memory/entries/2026-09-05-for-in-guard-block-was-right-its-zsh-premise-is-false.md) · TERMS: GUARD HOOK; SESSION; RELEASE SKILL; RELEASE WORKTREE; WORKTREE · files: guard.py; gotchas.md · gotchas: 4
 - 2026-09-05 · [A SKILL AUDIT HOOK On Stop, Housekeeping Skips For PROMPT DADDY And NEBULA-MEMORY, A Quote-Aware GUARD HOOK](memory/entries/2026-09-05-skill-audit-hook-housekeeping-skips-quote-aware-guard.md) · TERMS: SELF-IMPROVING LOOP; GUARD HOOK; PROMPT DADDY; OUTPUT DOCTOR; NEBULA-MEMORY SKILL; SCREENSHOT HARNESS · files: skill_audit.py; guard.py; shot.sh; SKILL.md · gotchas: 7
 - 2026-09-04 · ["Commit Push And Merge" From A Clean SHARED CHECKOUT: Branch, PR #29, Merge Commit, Fast-Forward Back](memory/entries/2026-09-04-commit-push-and-merge-from-a-clean-shared-checkout-pr-29.md) · TERMS: SHARED CHECKOUT; CLAUDE REVIEW; PR ARCHIVE; MAKE CI; VERSION SKEW; AUTO-TITLE · files: Makefile · gotchas: 3
 - 2026-09-04 · [A Merged Or Closed PR ROW Goes; Drafts Sink Dimmed To The Bottom Of The PROJECT OPEN PRS GROUP](memory/entries/2026-09-04-merged-pr-rows-go-drafts-sink-dimmed-to-the-bottom.md) · TERMS: PR ROW; PROJECT OPEN PRS GROUP; DRAFT BADGE; WORKTREE OPEN PRS GROUP; GIT POLL; PR PREVIEW · files: pull_request.rs; pr_row.rs; ui.rs; event_loop.rs · gotchas: 4

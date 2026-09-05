@@ -44,6 +44,9 @@ slug the title in lower-kebab-case, at most ~60 characters. Never overwrite anot
 **Asked:** The user's original prompt, quoted verbatim — the words they actually typed, not your
 restatement of it. Trim a long prompt with an ellipsis rather than paraphrasing it. A future agent
 matches against the *request*, so the user's own vocabulary is the part that has to survive.
+The line opens with the quote — `**Asked:** "…"` is the only shape `recall_eval.py` parses, and a
+parenthesis before it leaves the entry unranked. Text the user pasted with the prompt (an error, a
+tool call) stays inside the quote, trimmed with ellipses: a future paste of that text is what matches.
 → refined: the REFINED PROMPT that PROMPT DADDY logged, verbatim, with each question it asked and the
 answer in a following parenthesis ("(asked: which 'done' → UNSEEN)"). Omit the line if it skipped.
 
