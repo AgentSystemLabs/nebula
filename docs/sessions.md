@@ -76,7 +76,8 @@ itself on that first turn, resumes, and shows status like any other. Presets liv
 ## The PROJECT OPEN PRS group
 
 Under the checkouts, an `OPEN PRS` group lists every pull request still open on the repo — drafts
-included, badged as such — fetched with `gh` when you open the project, re-asked every 15 seconds once
+included, sunk to the bottom of the group, dimmed and badged `draft` so they are told apart from the
+ones asking for a reviewer — fetched with `gh` when you open the project, re-asked every 15 seconds once
 that PROJECT has answered with at least one open pull request, and again whenever the Worktrees or
 Sessions panel or the terminal window takes focus (one `gh pr list` per project, so a repo with a
 hundred open PRs still costs one API call). A PROJECT that answers empty — or one where `gh` is

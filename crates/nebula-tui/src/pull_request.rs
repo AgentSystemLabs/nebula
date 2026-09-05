@@ -22,7 +22,8 @@ use std::path::Path;
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// `gh`'s state string for a pull request that still accepts work — the
-/// one state both PR shapes and the preview key their badges on.
+/// one state a branch's PR ROW is kept for, and the one the preview and the
+/// detail-driven retirement key on.
 pub const STATE_OPEN: &str = "OPEN";
 
 /// Whether a `gh` state string is [`STATE_OPEN`]; drafts are open too, so
@@ -93,14 +94,18 @@ fn web_url(v: &serde_json::Value) -> Option<String> {
     (url.starts_with("https://") || url.starts_with("http://")).then_some(url)
 }
 
-/// The pull request `gh` reports for a checkout's branch.
+/// The pull request still open on a checkout's branch.
+///
+/// Always open: `gh pr view` on a branch answers with that branch's most
+/// recent pull request whatever its state — a merged one keeps coming back
+/// for as long as the branch exists — and this row lives under an OPEN PRS
+/// header, so [`parse`] turns a MERGED or CLOSED answer into "no PR" and the
+/// row simply goes. A draft is open, just not finished, and stays.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequest {
     pub number: u64,
     pub url: String,
     pub title: String,
-    /// `gh`'s state string: OPEN, MERGED or CLOSED.
-    pub state: String,
     pub is_draft: bool,
     /// When somebody *other than you* commented or submitted a review, as
     /// GitHub's RFC 3339 stamps, oldest first. Those sort lexicographically,
@@ -110,22 +115,15 @@ pub struct PullRequest {
 }
 
 impl PullRequest {
-    /// Short state word for the row's trailing badge — the same slot the
-    /// agent rows use for their CLI kind.
+    /// Short word for the row's trailing badge — the same slot the agent
+    /// rows use for their CLI kind. Every row here is open by construction,
+    /// so the only thing left to say is whether it's still a draft.
     pub fn badge(&self) -> &'static str {
-        match self.state.as_str() {
-            STATE_OPEN if self.is_draft => "draft",
-            STATE_OPEN => "pr",
-            "MERGED" => "merged",
-            "CLOSED" => "closed",
-            _ => "pr",
+        if self.is_draft {
+            "draft"
+        } else {
+            "pr"
         }
-    }
-
-    /// Whether the PR is still open (draft included) — the badge is quiet
-    /// for these and loud for the ones that no longer accept work.
-    pub fn is_open(&self) -> bool {
-        state_is_open(&self.state)
     }
 
     /// The mark to store when the user opens this PR: everything nebula
@@ -186,14 +184,20 @@ async fn viewer_login() -> Option<&'static str> {
 /// so the shape it expects is testable without a GitHub account. `viewer`
 /// is your login when it's known; without it your own reviews count as
 /// activity, which is a wrong badge rather than a broken one.
+///
+/// A pull request that is no longer open parses to `None`. `gh` prefers an
+/// open PR when the branch has several, so this only bites once nothing on
+/// the branch accepts work any more — exactly when the row should be gone.
 fn parse(json: &str, viewer: Option<&str>) -> Option<PullRequest> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let url = web_url(&v)?;
+    if !state_is_open(&state_at(&v)) {
+        return None;
+    }
     Some(PullRequest {
         number: v.get("number")?.as_u64()?,
         url,
         title: str_at(&v, "title"),
-        state: state_at(&v),
         is_draft: bool_at(&v, "isDraft"),
         activity: activity(&v, viewer),
     })
@@ -312,7 +316,9 @@ impl PrLaunch {
 ///   one most likely to have a nebula worktree still attached to it — the
 ///   list would be worth least if it hid exactly the work in progress. They
 ///   arrive with `isDraft` set and wear a `draft` badge; nothing here or
-///   downstream filters them out.
+///   downstream filters them out. Where they land does change: the group
+///   sinks them below every finished pull request ([`drafts_last`]), so
+///   the rows asking for a reviewer come first.
 /// * **Closed ones fall out of it.** This is the whole mechanism for
 ///   pruning: a pull request that was merged or closed since the last call
 ///   simply stops coming back, so re-asking on a beat *is* the periodic
@@ -359,6 +365,16 @@ fn parse_list(json: &str) -> Option<Vec<OpenPr>> {
             })
             .collect(),
     )
+}
+
+/// Sink the drafts below everything else, keeping `gh`'s newest-first
+/// order within each half. A draft is open, but it is not asking anyone for
+/// anything yet; the rows that want a reviewer come first, and a draft is
+/// told apart by where it sits as much as by its badge. Stable, so the
+/// cursor's PR — followed by URL across every refresh — never swaps places
+/// with a neighbour it did not change relative to.
+pub fn drafts_last(list: &mut [OpenPr]) {
+    list.sort_by_key(|pr| pr.is_draft);
 }
 
 /// How long a `gh pr diff` may run. Diffs are bigger than metadata and
@@ -589,7 +605,6 @@ mod tests {
             number: 1,
             url: "https://github.com/o/r/pull/1".into(),
             title: "t".into(),
-            state: "OPEN".into(),
             is_draft: false,
             activity: stamps.iter().map(|s| s.to_string()).collect(),
         }
@@ -606,33 +621,45 @@ mod tests {
         assert_eq!(pr.url, "https://github.com/o/r/pull/42");
         assert_eq!(pr.title, "Attach links to worktrees");
         assert_eq!(pr.badge(), "pr");
-        assert!(pr.is_open());
     }
 
+    /// `gh pr view` keeps answering with a branch's pull request after it
+    /// is merged or closed. The row it feeds sits under an OPEN PRS header,
+    /// so those answers are "no PR"; a draft is open and stays, badged.
     #[test]
-    fn badges_name_the_state() {
-        let base = PullRequest {
-            number: 1,
-            url: "https://x.dev/pull/1".into(),
-            title: "t".into(),
-            state: "OPEN".into(),
-            is_draft: true,
-            activity: vec![],
+    fn a_merged_or_closed_branch_pull_request_is_no_row() {
+        let payload = |state: &str, draft: bool| {
+            format!(
+                r#"{{"number":1,"url":"https://x.dev/pull/1","title":"t","state":"{state}","isDraft":{draft}}}"#
+            )
         };
-        assert_eq!(base.badge(), "draft");
-        assert!(base.is_open(), "a draft is still open");
-        let merged = PullRequest {
-            state: "MERGED".into(),
-            is_draft: false,
-            ..base.clone()
+        assert!(parse(&payload("MERGED", false), None).is_none());
+        assert!(parse(&payload("CLOSED", false), None).is_none());
+        let draft = parse(&payload("OPEN", true), None).expect("a draft is still open");
+        assert_eq!(draft.badge(), "draft");
+        let open = parse(&payload("OPEN", false), None).expect("open");
+        assert_eq!(open.badge(), "pr");
+        // An older `gh` that leaves `state` out is trusted to have listed
+        // something open.
+        let bare = parse(r#"{"number":1,"url":"https://x.dev/pull/1"}"#, None);
+        assert!(bare.is_some(), "no state field means open");
+    }
+
+    /// Drafts sink below the finished pull requests and keep `gh`'s
+    /// newest-first order on both sides of that line.
+    #[test]
+    fn drafts_sink_below_the_open_rows_in_their_own_order() {
+        let row = |number: u64, is_draft: bool| OpenPr {
+            number,
+            title: String::new(),
+            url: format!("https://github.com/o/r/pull/{number}"),
+            is_draft,
+            head: String::new(),
         };
-        assert_eq!(merged.badge(), "merged");
-        assert!(!merged.is_open());
-        let closed = PullRequest {
-            state: "CLOSED".into(),
-            ..merged
-        };
-        assert_eq!(closed.badge(), "closed");
+        let mut list = vec![row(42, true), row(40, false), row(31, true), row(30, false)];
+        drafts_last(&mut list);
+        let numbers: Vec<u64> = list.iter().map(|p| p.number).collect();
+        assert_eq!(numbers, [40, 30, 42, 31]);
     }
 
     #[test]

@@ -16,6 +16,7 @@ Line shape: `- DATE · [Title](memory/entries/DATE-slug.md) · TERMS: A; B · fi
 > `.claude/MEMORY.md` was split into this index plus per-entry files on 2026-08-28.
 
 ## Index
+- 2026-09-04 · [A Merged Or Closed PR ROW Goes; Drafts Sink Dimmed To The Bottom Of The PROJECT OPEN PRS GROUP](memory/entries/2026-09-04-merged-pr-rows-go-drafts-sink-dimmed-to-the-bottom.md) · TERMS: PR ROW; PROJECT OPEN PRS GROUP; DRAFT BADGE; WORKTREE OPEN PRS GROUP; GIT POLL; PR PREVIEW · files: pull_request.rs; pr_row.rs; ui.rs; event_loop.rs · gotchas: 4
 - 2026-09-04 · [The TUI Catches Up To `CreatePrAgent`'s `project` + `head`](memory/entries/2026-09-04-the-tui-catches-up-to-createpragent-project-plus-head.md) · TERMS: PR SESSION; PROTOCOL VERSION; SHARED CHECKOUT; WORKTREE; MAKE DEV; PROJECT OPEN PRS GROUP · files: event_loop.rs; pull_request.rs; agent_picker.rs; protocol.rs · gotchas: 3
 - 2026-09-04 · [Merging PR #28 After The SHARED CHECKOUT Squash Had Already Landed Its Skill](memory/entries/2026-09-04-merging-pr-28-after-the-shared-tree-squash-pre-landed-it.md) · TERMS: SHARED CHECKOUT; PR REVIEWER SKILL; CLAUDE REVIEW; PR DESCRIPTION SKILL; PR ROW; MAKE CI · files: pr-reviewer/SKILL.md; gotchas.md; TERMS.md · gotchas: 9
 - 2026-09-04 · [Claude's `/rename` And The SESSION Row Name Are Tied (Issue #25)](memory/entries/2026-09-04-claude-s-rename-and-the-session-row-name-are-tied-issue-25.md) · TERMS: AUTO-TITLE; NEBULA RENAME; RENAME; HOOK RECEIVER; HOOK EVENT; SESSION · files: session_title.rs; title.rs; hooks/mod.rs; store.rs · gotchas: 8

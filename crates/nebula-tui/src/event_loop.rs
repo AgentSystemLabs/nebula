@@ -660,7 +660,11 @@ fn note_open_prs_answer(
         }
     };
     let now = std::time::Instant::now();
-    let list = list.unwrap_or_else(|| previous.map(|o| o.list.clone()).unwrap_or_default());
+    let mut list = list.unwrap_or_else(|| previous.map(|o| o.list.clone()).unwrap_or_default());
+    // Drafts sink to the bottom of the group here, on the one path every
+    // answer lands through; the cursor reconcile below follows its PR by
+    // URL, so the reorder never moves the selection off it.
+    crate::pull_request::drafts_last(&mut list);
     app.dirty |= previous.map(|o| &o.list) != Some(&list);
     app.open_prs.insert(
         project,
@@ -8680,9 +8684,10 @@ mod tests {
 
     /// Drafts belong in the group. A draft is an open pull request — often
     /// the one a nebula worktree is still attached to — so it renders
-    /// alongside the rest, told apart by a badge rather than left out.
+    /// alongside the rest, told apart by a badge and by where it sits: below
+    /// every finished pull request, however new it is, rather than left out.
     #[test]
-    fn draft_pull_requests_render_in_the_group() {
+    fn draft_pull_requests_render_at_the_bottom_of_the_group() {
         let mut app = App::new();
         seed_tree(&mut app);
         let pid = app.selected_project().expect("a project").id.clone();
@@ -8712,11 +8717,12 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("OPEN PRS · 2"), "both are counted:\n{text}");
-        let row = |needle: &str| {
+        let row_at = |needle: &str| {
             text.lines()
-                .find(|l| l.contains(needle))
+                .position(|l| l.contains(needle))
                 .unwrap_or_else(|| panic!("no {needle} row:\n{text}"))
         };
+        let row = |needle: &str| text.lines().nth(row_at(needle)).unwrap();
         assert!(
             row("#9").contains("draft"),
             "the draft is in the list, badged:\n{text}"
@@ -8724,6 +8730,15 @@ mod tests {
         assert!(
             !row("#7").contains("draft"),
             "and the finished one is not:\n{text}"
+        );
+        assert!(
+            row_at("#7") < row_at("#9"),
+            "the newer draft still sits below the finished one:\n{text}"
+        );
+        assert_eq!(
+            open_pr_numbers(&app),
+            vec![7, 9],
+            "the stored list is what the panel shows"
         );
     }
 
@@ -8843,7 +8858,8 @@ mod tests {
     /// A refresh that merely reorders the list keeps the cursor on the pull
     /// request it was reading, not on whatever now holds that index — `gh`
     /// sorts newest first, so anyone opening a PR reshuffles everything
-    /// below it.
+    /// below it. (A finished one: a new *draft* would sink below the cursor
+    /// instead and reshuffle nothing.)
     #[test]
     fn the_cursor_follows_its_pull_request_across_a_reorder() {
         let mut app = App::new();
@@ -8858,7 +8874,7 @@ mod tests {
                 number: 11,
                 title: "Brand new".into(),
                 url: pr_url(11),
-                is_draft: true,
+                is_draft: false,
                 head: "brand-new".into(),
             },
             crate::pull_request::OpenPr {
@@ -9083,7 +9099,6 @@ mod tests {
                 number,
                 url: format!("https://github.com/o/r/pull/{number}"),
                 title: title.into(),
-                state: "OPEN".into(),
                 is_draft: false,
                 activity: Vec::new(),
             }),
@@ -9373,7 +9388,6 @@ diff --git a/src/b.rs b/src/b.rs
                 number: 7,
                 url: "https://github.com/o/r/pull/7".into(),
                 title: "Attach links".into(),
-                state: "OPEN".into(),
                 is_draft: false,
                 activity: Vec::new(),
             }),
@@ -9584,7 +9598,6 @@ diff --git a/src/b.rs b/src/b.rs
                 number: 7,
                 url: "https://github.com/o/r/pull/7".into(),
                 title: "done".into(),
-                state: "OPEN".into(),
                 is_draft: false,
                 activity: Vec::new(),
             }),
@@ -9613,7 +9626,6 @@ diff --git a/src/b.rs b/src/b.rs
                 number: 7,
                 url: url.into(),
                 title: "done".into(),
-                state: "OPEN".into(),
                 is_draft: false,
                 activity: vec!["2024-04-25T19:55:42Z".into()],
             }),
@@ -9655,7 +9667,6 @@ diff --git a/src/b.rs b/src/b.rs
             number: 7,
             url: url.into(),
             title: "Attach links".into(),
-            state: "OPEN".into(),
             is_draft: false,
             activity,
         };
@@ -11897,7 +11908,6 @@ diff --git a/src/b.rs b/src/b.rs
                 number: 7,
                 url: "https://github.com/o/r/pull/7".into(),
                 title: "Attach links".into(),
-                state: "OPEN".into(),
                 is_draft: false,
                 activity: Vec::new(),
             }),

@@ -153,7 +153,8 @@
 ## Pull requests
 
 nebula finds the pull request open on each branch with `gh` and shows it in the Sessions panel's
-OPEN PRS group, including a count of comments that landed while you were away. Rest on that row and the
+OPEN PRS group, including a count of comments that landed while you were away; once that pull request
+is merged or closed the row goes (a draft stays, dimmed and badged `draft`). Rest on that row and the
 pane reads the pull request — description, stats, conversation — exactly as it does for the project-wide
 OPEN PRS rows under the worktrees; `g` shows its diff. Manual link attachment is currently unavailable;
 previously saved links remain visible so the change does not discard data.
