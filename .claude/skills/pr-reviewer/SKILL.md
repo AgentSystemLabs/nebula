@@ -35,8 +35,9 @@ gh pr diff <n>                                   # the unified diff
 gh pr checks <n>                                 # CI state as GitHub reports it (exit 8 = pending)
 gh api repos/<owner>/<repo>/pulls/<n>/comments   # inline review comments — not a --json field
 git fetch origin && git fetch origin pull/<n>/head   # refresh origin/<base>; the PR head lands in FETCH_HEAD, no ref, no checkout
+git merge-base origin/<base> <headRefOid>        # the commit the PR branched from — origin/<base> has moved on since, and is not the base
 git show <headRefOid>:<path>                     # the PR's whole file (the SHA is stable; FETCH_HEAD is not, other sessions fetch too)
-git show origin/<base>:<path>                    # the same file before the PR
+git show <mergeBase>:<path>                      # the same file as the PR saw it — what `gh pr diff` is relative to
 git log · git grep · grep · cat · sed -n · wc · diff   # over files, never through them
 ```
 
@@ -48,7 +49,10 @@ Forbidden, whatever the PR is — when a review seems to need one of these, it n
   on any file the PR adds or changes — reading a script means `cat`, not `sh -n`.
 - `gh pr checkout`, `git checkout`, `git switch`, `git merge`, `git rebase`, `git apply`,
   `git cherry-pick`, `git stash`, `git worktree add`, `git reset` — nothing that moves the SHARED
-  CHECKOUT or creates a tree; editing or creating any file inside the repo.
+  CHECKOUT or creates a tree; editing or creating any file inside the repo, with one carve-out: the
+  SELF-IMPROVING LOOP's own files — `.claude/MEMORY.md`, `.claude/memory/`, `TERMS.md` — which
+  NEBULA-MEMORY and PROJECT TERMS write *after* the review is posted, as on every other task. Nothing
+  from the PR ever lands on disk; the review itself is written to the scratchpad, outside the repo.
 - `gh pr review --approve`, `gh pr review --request-changes`, `gh pr merge`, `gh pr edit`,
   `gh pr close`, `gh pr comment` — the skill posts exactly one `--comment` review and changes nothing
   else about the PR. Approval is a human's signature.
@@ -70,6 +74,7 @@ gh pr diff $N --repo $R > $S/pr.diff
 gh pr checks $N --repo $R > $S/pr.checks 2>&1 || true      # exit 8 = pending; the output is still the answer
 gh api repos/$R/pulls/$N/comments --paginate --jq '.[] | "\(.path):\(.line // .original_line) \(.user.login): \(.body)"' > $S/pr.inline
 git fetch -q origin && git fetch -q origin pull/$N/head
+git merge-base origin/<baseRefName> <headRefOid> > $S/pr.base   # both from pr.json; the commit pr.diff is relative to
 ```
 
 Read `pr.json` first. `isCrossRepository` — a fork raises the bar on everything under `.github/`,
@@ -77,13 +82,16 @@ Read `pr.json` first. `isCrossRepository` — a fork raises the bar on everythin
 opening the diff. `additions` / `deletions` / `changedFiles` — the only counts the review may quote.
 `statusCheckRollup` and `pr.checks` — on this repo that is `claude-review` alone; say so. `reviews`,
 `comments` and `pr.inline` — what the automated Claude Code Review workflow and any human already
-said; reference it, do not repeat it. Then read the description against the diff: a body that claims a
-focus-tint fix while the diff touches INSTALL.SH is the review's first finding.
+said; reference it, do not repeat it. `pr.base` — the merge base, the only "before" this review reads:
+`origin/<base>` is whatever `main` is now, and on a day with several merges a file there already
+carries other PRs' changes, so comparing against it pins their hunks on this PR or hides a regression.
+Then read the description against the diff: a body that claims a focus-tint fix while the diff touches
+INSTALL.SH is the review's first finding.
 
 ### 2. Read what the repo already knows about this area
 
 ```bash
-grep -ril '<each touched file basename> \| <each TERM the PR touches>' .claude/memory/entries .claude/memory/prs | head
+grep -rilE '<each touched file basename>|<each TERM the PR touches>' .claude/memory/entries .claude/memory/prs | head   # one -E pattern: BRE `\|` is GNU-only, and a branch padded with spaces never matches a backticked name
 grep -n '<TERM>' .claude/memory/gotchas.md
 ```
 
@@ -99,8 +107,9 @@ Read `pr.diff` hunk by hunk in risk order: `.github/`, INSTALL.SH, `Cargo.toml` 
 `store.rs` (`MIGRATIONS`), `nebula-core/src/protocol.rs` (PROTOCOL VERSION), `sibling.rs`, `ssh.rs`,
 `tunnel.rs`, `upgrade.rs`, `browser.rs`, `paths.rs`, `lifecycle.rs`; then the TUI; then docs and the
 MEMORY LOG files. A hunk is not a unit of meaning: for every function the diff touches, `git show
-<headRefOid>:<path>` the whole function and `git show origin/<base>:<path>` its previous shape, and
-`git grep` the callers of anything whose signature or contract moved.
+<headRefOid>:<path>` the whole function and `git show $(cat $S/pr.base):<path>` its previous shape —
+the merge base, never `origin/<base>` — and `git grep` the callers of anything whose signature or
+contract moved.
 
 ### 4. Security and production-merge risk — first and heaviest
 
@@ -186,9 +195,9 @@ weighting:
 ## Merge-risk review — read, not run
 
 **Verdict:** 🔴 Do not merge as-is · 🟡 Merge with care · 🟢 Low risk — one clause saying why.
-**Basis:** the diff (+N / −M over K files), the surrounding code at `<base>` and `<headRefOid[:7]>`,
-the description, CI (`claude-review` only — nothing on GitHub builds or tests a PR here) and the prior
-reviews. Nothing was built, run or checked out for this review.
+**Basis:** the diff (+N / −M over K files), the surrounding code at the merge base `<mergeBase[:7]>`
+and the head `<headRefOid[:7]>`, the description, CI (`claude-review` only — nothing on GitHub builds
+or tests a PR here) and the prior reviews. Nothing was built, run or checked out for this review.
 
 ### 🔒 Security & production risk
 - **Blocker — <what>.** `path:line` — who triggers it, what it reaches, the blast radius. *Confirmed
