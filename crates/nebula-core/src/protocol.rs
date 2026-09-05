@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 37;
+pub const PROTOCOL_VERSION: u32 = 38;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -140,15 +140,21 @@ pub enum ClientRequest {
         #[serde(default)]
         starting_prompt: Option<String>,
     },
-    /// Create a local AGENT of any kind from an OPEN PRS row. The PR URL is
-    /// persisted as launch context so every cold spawn and RESUME rebuilds
-    /// the same PR-scoped rule — Claude's appended system prompt, or the
-    /// first prompt a Codex / Cursor cold spawn opens with. Separate from
-    /// CreateAgent so ordinary callers cannot accidentally opt into a
-    /// partial PR launch.
+    /// Create a local AGENT of any kind from an OPEN PRS row — a PR
+    /// SESSION. It never runs in the ROOT WORKTREE: the daemon finds the
+    /// PROJECT's worktree checked out on the PR's head branch, or creates
+    /// one (fetching the branch from `origin`, or the PR ref for a fork),
+    /// and every PR SESSION for that PR shares it. The PR URL is persisted
+    /// as launch context so every cold spawn and RESUME rebuilds the same
+    /// PR-scoped rule — naming that worktree — as Claude's appended system
+    /// prompt, or the first prompt a Codex / Cursor cold spawn opens with.
+    /// Separate from CreateAgent so ordinary callers cannot accidentally
+    /// opt into a partial PR launch. The reply's `created` is the AGENT;
+    /// a created worktree arrives as its own `EntityUpserted` first.
     CreatePrAgent {
         req_id: u64,
-        worktree: WorktreeId,
+        /// The PROJECT whose repo the pull request is open on.
+        project: ProjectId,
         name: String,
         kind: AgentKind,
         /// Model the CLI launches with; None = the CLI's own default.
@@ -157,6 +163,9 @@ pub enum ClientRequest {
         effort: Option<String>,
         auto_title: bool,
         pr_url: String,
+        /// The pull request's head branch (`gh`'s `headRefName`): the
+        /// branch the PR SESSION's worktree is checked out on.
+        head: String,
     },
     /// Fire-and-forget: pre-spawn an agent CLI for this (worktree, kind) so
     /// the next CreateAgent adopts an already-booted session. Sent the

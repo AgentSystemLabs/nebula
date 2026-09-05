@@ -157,14 +157,15 @@ pub enum MenuAction {
         /// One-shot launch modifier for Claude. The task itself is collected
         /// after the optional name prompt and crosses IPC only on create.
         cloud: bool,
-        /// OPEN PRS launch context (a PR SESSION). Valid for every local
-        /// kind, never with `cloud`, and preserved through model/effort
-        /// submenus and the name prompt.
-        pr_url: Option<String>,
+        /// OPEN PRS launch context (a PR SESSION): the pull request and
+        /// the head branch its worktree is checked out on. Valid for every
+        /// local kind, never with `cloud`, and preserved through
+        /// model/effort submenus and the name prompt.
+        pr: Option<crate::pull_request::PrLaunch>,
         /// Set when the picker was opened from the QUICK PROMPT's `Tab`:
         /// the box to put back (with its typed text) instead of creating a
         /// session. Rides through the MODEL / EFFORT submenus like
-        /// `pr_url`, and is what an abandoned picker restores.
+        /// `pr`, and is what an abandoned picker restores.
         quick: Option<Box<crate::quick_prompt::QuickReturn>>,
     },
     /// Shell terminal in the worktree's directory; created immediately with
@@ -476,7 +477,9 @@ pub enum PromptKind {
         model: Option<String>,
         effort: Option<String>,
         cloud: bool,
-        pr_url: Option<String>,
+        /// OPEN PRS launch context (a PR SESSION), carried through the name
+        /// prompt so Enter can send `CreatePrAgent`.
+        pr: Option<crate::pull_request::PrLaunch>,
     },
     /// Final task input for a one-shot `claude --cloud <task>` launch. Kept
     /// separate from the name prompt so Enter still submits names normally,

@@ -2639,7 +2639,7 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
         kind,
         model,
         cloud,
-        pr_url,
+        pr,
         quick,
         ..
     } = &item.action
@@ -2692,7 +2692,7 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
                         SubmenuKind::Efforts => Some((*choice).to_string()),
                     },
                     cloud: *cloud,
-                    pr_url: pr_url.clone(),
+                    pr: pr.clone(),
                     quick: quick.clone(),
                 },
             )
@@ -4077,7 +4077,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             model,
             effort,
             cloud,
-            pr_url,
+            pr,
         } => {
             if cloud {
                 open_prompt(
@@ -4101,7 +4101,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                         cloud_prompt: None,
                         starting_prompt: None,
                         reopen_on_error: None,
-                        pr_url,
+                        pr,
                         focus_pane: true,
                     },
                     out,
@@ -4124,7 +4124,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 cloud_prompt: Some(value),
                 starting_prompt: None,
                 reopen_on_error: None,
-                pr_url: None,
+                pr: None,
                 focus_pane: true,
             },
             out,
@@ -4156,7 +4156,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                         PromptKind::AgentPresetTask { worktree, preset },
                         value,
                     )),
-                    pr_url: None,
+                    pr: None,
                     focus_pane: true,
                 },
                 out,
@@ -4178,7 +4178,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                     cloud_prompt: None,
                     starting_prompt: Some(starting_prompt),
                     reopen_on_error: Some((PromptKind::QuickPrompt(launch), value)),
-                    pr_url: None,
+                    pr: None,
                     // The QUICK PROMPT is the one launch that stays out of
                     // the way by default: `p`, type, Enter, keep working.
                     focus_pane: crate::config::Config::load().quick_prompt_focus,
@@ -4403,7 +4403,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             model,
             effort,
             cloud,
-            pr_url,
+            pr,
             quick,
         } => {
             // Opened from the QUICK PROMPT: the pick rewrites that box's
@@ -4467,7 +4467,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                             cloud_prompt: None,
                             starting_prompt: None,
                             reopen_on_error: None,
-                            pr_url,
+                            pr,
                             focus_pane: true,
                         },
                         out,
@@ -4478,7 +4478,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             // Warm the CLI while the user types the name: the daemon
             // pre-spawns the session so CreateAgent adopts an already-booted
             // PTY. Fail-soft — a missing CLI just means a cold spawn later.
-            if !cloud && pr_url.is_none() {
+            if !cloud && pr.is_none() {
                 out.push(ClientRequest::PrewarmAgent {
                     worktree: worktree.clone(),
                     kind,
@@ -4494,7 +4494,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     model,
                     effort,
                     cloud,
-                    pr_url,
+                    pr,
                 },
             )
         }
@@ -5367,11 +5367,23 @@ struct AgentLaunchDraft {
     /// The prompt (and its typed text) to bring back should the daemon
     /// refuse the create — so a rejected preset task is not lost.
     reopen_on_error: Option<(PromptKind, String)>,
-    pr_url: Option<String>,
+    /// OPEN PRS launch context: this launch is a PR SESSION, scoped to that
+    /// pull request and run in a checkout of its head branch.
+    pr: Option<crate::pull_request::PrLaunch>,
     /// Enter and lock the TERMINAL PANE once the create is acked. True for
     /// every launch the user walked a picker to reach; the QUICK PROMPT
     /// passes the `quick_prompt_focus` SETTING, which is off by default.
     focus_pane: bool,
+}
+
+/// The PROJECT a checkout belongs to — what `CreatePrAgent` is addressed
+/// to. None only if the row went away between the picker and Enter.
+fn project_of_worktree(app: &App, worktree: &WorktreeId) -> Option<ProjectId> {
+    app.tree
+        .worktrees
+        .iter()
+        .find(|w| &w.id == worktree)
+        .map(|w| w.project_id.clone())
 }
 
 fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequest>) {
@@ -5384,7 +5396,7 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
         cloud_prompt,
         starting_prompt,
         reopen_on_error,
-        pr_url,
+        pr,
         focus_pane,
     } = draft;
     let intent = match (reopen_on_error, &cloud_prompt) {
@@ -5413,18 +5425,32 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
     };
     let cloud = cloud_prompt.is_some();
     let with_first_prompt = starting_prompt.is_some();
-    send_with(app, out, intent, |req_id| match pr_url {
-        Some(pr_url) => {
+    // A PR SESSION is addressed to the PROJECT, not to a checkout: the
+    // DAEMON runs it in the PR head branch's own worktree, creating that
+    // checkout the first time. `worktree` here only names which project.
+    let pr = match pr {
+        Some(pr) => {
+            let Some(project) = project_of_worktree(app, &worktree) else {
+                app.flash = Some("worktree no longer exists".into());
+                return;
+            };
+            Some((project, pr))
+        }
+        None => None,
+    };
+    send_with(app, out, intent, |req_id| match pr {
+        Some((project, pr)) => {
             debug_assert!(!cloud);
             ClientRequest::CreatePrAgent {
                 req_id,
-                worktree: worktree.clone(),
+                project,
                 name,
                 kind,
                 model,
                 effort,
                 auto_title,
-                pr_url,
+                pr_url: pr.url,
+                head: pr.head,
             }
         }
         None => ClientRequest::CreateAgent {
@@ -8208,6 +8234,7 @@ mod tests {
                         title: (*title).into(),
                         url: format!("https://github.com/o/r/pull/{number}"),
                         is_draft: false,
+                        head: format!("pr-{number}-head"),
                     })
                     .collect(),
                 at: now,
@@ -8356,11 +8383,14 @@ mod tests {
                     MenuAction::NewAgentOfKind {
                         worktree,
                         kind,
-                        pr_url: Some(url),
+                        pr: Some(pr),
                         cloud: false,
                         quick: None,
                         ..
-                    } if worktree.as_str() == "w1" && url == "https://github.com/o/r/pull/7" => {
+                    } if worktree.as_str() == "w1"
+                        && pr.url == "https://github.com/o/r/pull/7"
+                        && pr.head == "pr-7-head" =>
+                    {
                         (item.label.as_str(), *kind)
                     }
                     other => panic!("a PR row without the PR context: {other:?}"),
@@ -8387,10 +8417,10 @@ mod tests {
                         &p.kind,
                         PromptKind::NewAgent {
                             kind: AgentKind::Codex,
-                            pr_url: Some(url),
+                            pr: Some(pr),
                             cloud: false,
                             ..
-                        } if url == "https://github.com/o/r/pull/7"
+                        } if pr.url == "https://github.com/o/r/pull/7"
                     )
                 ),
                 "{:?}",
@@ -8410,14 +8440,16 @@ mod tests {
                 matches!(
                     out.first(),
                     Some(ClientRequest::CreatePrAgent {
-                        worktree,
+                        project,
                         name,
                         kind: AgentKind::Codex,
                         pr_url,
+                        head,
                         ..
-                    }) if worktree.as_str() == "w1"
+                    }) if project.as_str() == "p1"
                         && name == "pr-7"
                         && pr_url == "https://github.com/o/r/pull/7"
+                        && head == "pr-7-head"
                 ),
                 "{out:?}"
             );
@@ -8452,9 +8484,9 @@ mod tests {
             assert!(menu.items[..sessions].iter().all(|item| matches!(
                 &item.action,
                 MenuAction::NewAgentOfKind {
-                    pr_url: Some(url),
+                    pr: Some(pr),
                     ..
-                } if url == "https://github.com/o/r/pull/7"
+                } if pr.url == "https://github.com/o/r/pull/7"
             )));
 
             app.overlay = None;
@@ -8502,6 +8534,7 @@ mod tests {
             title: "Attach links".into(),
             url: "https://github.com/o/r/pull/7".into(),
             is_draft: false,
+            head: "attach-links".into(),
         }];
         note_open_prs_answer(&mut app, pid.clone(), Some(found.clone()), &mut Vec::new());
         assert_eq!(
@@ -8662,12 +8695,14 @@ mod tests {
                     title: "Still cooking".into(),
                     url: pr_url(9),
                     is_draft: true,
+                    head: "still-cooking".into(),
                 },
                 crate::pull_request::OpenPr {
                     number: 7,
                     title: "Attach links".into(),
                     url: pr_url(7),
                     is_draft: false,
+                    head: "attach-links".into(),
                 },
             ]),
             &mut Vec::new(),
@@ -8766,6 +8801,7 @@ mod tests {
                     title: format!("pull {number}"),
                     url: format!("https://github.com/o/r/pull/{number}"),
                     is_draft,
+                    head: format!("pr-{number}-head"),
                 })
                 .collect();
             note_open_prs_answer(app, pid.clone(), Some(list), &mut Vec::new());
@@ -8823,18 +8859,21 @@ mod tests {
                 title: "Brand new".into(),
                 url: pr_url(11),
                 is_draft: true,
+                head: "brand-new".into(),
             },
             crate::pull_request::OpenPr {
                 number: 9,
                 title: "Number lines".into(),
                 url: pr_url(9),
                 is_draft: false,
+                head: "number-lines".into(),
             },
             crate::pull_request::OpenPr {
                 number: 7,
                 title: "Attach links".into(),
                 url: pr_url(7),
                 is_draft: false,
+                head: "attach-links".into(),
             },
         ];
         // Halfway down #7's conversation when the refresh lands.
@@ -9752,7 +9791,7 @@ diff --git a/src/b.rs b/src/b.rs
                     model: Some("opus".into()),
                     effort: Some("high".into()),
                     cloud: false,
-                    pr_url: None,
+                    pr: None,
                 },
             )));
             let mut out = Vec::new();
