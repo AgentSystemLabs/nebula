@@ -29,6 +29,8 @@ link in all ten (0 dead); every ALL-CAPS phrase in the skill and templates is a 
 STUB AGENTS → STUB AGENT, DOCS PAGE → DOCS PAGES); `terms_check.py` still `ok`. Mermaid blocks were
 reviewed by eye, not rendered — no `mmdc` here and headless Chrome is SIGKILLed on this Mac.
 
+**Live run (PR #27):** In the NEBULA WORKTREE `pr-description-skill` the skill was followed end to end: the branch pushed, the gate output rendered to PNG with Pillow + Menlo (no TUI screen changed, so no SCREENSHOT HARNESS capture), the orphan `pr-assets` branch created and pushed from a scratchpad worktree, the body written from `templates/01-benefit-groups.md` to `<scratchpad>/pr-body.md`, the anchor checker run (0 dead), `gh pr create --body-file` → https://github.com/AgentSystemLabs/nebula/pull/27, opened with `open -a "Google Chrome"`. The REST render (`Accept: application/vnd.github.html+json`) confirmed one `<pre lang="mermaid">` block and the `<img>` pointing at the raw `pr-assets` URL, which served 200 on the first request.
+
 **Gotchas:**
 - **GitHub's heading anchor keeps the space after a stripped emoji**, so `## 📸 Screenshots` is
   `#-screenshots` (leading hyphen), `## Before / After` is `#before--after` (the slash leaves two
@@ -45,3 +47,15 @@ reviewed by eye, not rendered — no `mmdc` here and headless Chrome is SIGKILLe
   first use, from a scratchpad worktree, never from the SHARED CHECKOUT's index.
 - The Skill tool's listing picked the new skill up the moment `SKILL.md` existed (already recorded for
   OUTPUT DOCTOR and PROMPT DADDY): the `pr-description` row appeared in the next tool result.
+- **GitHub adds heading anchors in the browser.** Neither the REST `body_html` nor a logged-out `curl` of the PR
+  page carries an `id="user-content-…"` or `class="anchor"`; the slug port in the skill is the only pre-flight, and
+  the click in a browser is the only proof.
+- **Menlo has no emoji glyphs**: a `📸` in text rendered with Pillow + `Menlo.ttc` comes out as a tofu box. Keep
+  emoji out of terminal text bound for a PNG, or paste Apple Color Emoji per the SCREENSHOT HARNESS recipe.
+- **Replace a hosted PNG by renaming, not overwriting.** `raw.githubusercontent.com` served the new branch's file
+  on the first request; the corrected image went in as `gate.png` with the old name deleted, so no CDN cache was
+  ever asked to refresh. Overwriting in place is untested and may serve the stale bytes for minutes.
+- **A NEBULA WORKTREE carries only committed skills.** Branched off `origin/main`, the worktree loaded the
+  pre-2026-09-04 OUTPUT DOCTOR (ACTION REQUIRED / TECHNICAL OVERVIEW) because the rewrite was still
+  uncommitted in the SHARED CHECKOUT; the new `pr-description` skill had to be `cp`'d across the same way.
+  Uncommitted skill edits do not follow a session into its worktree.
