@@ -5,8 +5,8 @@
 The `nebula` CLI. Every command carries its own help — `nebula <command> --help` is the full page,
 flags and examples included, and `-h` is the one-screen reminder. `nebula --version` (short `-V`)
 prints the version of the binary you're running (`nebula 0.21.0`) — the same version the TUI's
-FOOTER carries at its left edge, and what to check after `nebula upgrade`. This page is the same
-surface in one place. Commands marked *(agents run this)* are the ones a coding agent invokes on
+FOOTER carries at its left edge (with `⇡ vX.Y.Z` beside it once a newer release is published), and
+what to check after `nebula upgrade`. This page is the same surface in one place. Commands marked *(agents run this)* are the ones a coding agent invokes on
 your behalf — see [How it works](how-it-works.md).
 
 ```
@@ -17,6 +17,7 @@ nebula kill                 shut the running daemon down (stops all sessions)
 nebula rename <title>       title the session this runs inside          (agents run this)
 nebula worktree [name]      move this session into a worktree           (agents run this)
 nebula spawn <task>         start another agent session beside it       (agents run this)
+nebula open <file>…         show files in this nebula's file tabs       (agents run this)
 nebula workspace <cmd>      manage workspaces — named groups of projects
 nebula browser              serve this TUI in a web browser via ttyd
 nebula ssh <host>           open nebula on a remote host over ssh
@@ -55,9 +56,12 @@ nebula rename <title>     # title the current session (agents run this; --force 
 nebula worktree [name] [--base <ref>]  # move the current session into a worktree of its project,
                           # creating the branch if it's new (agents run this when you ask for a
                           # worktree; no name invents one; --base picks a new branch's start point)
-nebula spawn <task> [--kind <claude|codex|cursor>]  # start a new agent session beside the current
+nebula spawn <task> [--kind <claude|codex|cursor|pi>]  # start a new agent session beside the current
                           # one, in the same worktree, opening on <task> (agents run this when you
                           # ask for a new nebula session; --kind defaults to this session's harness)
+nebula open <file>…       # show the files in this nebula's FILE TABS — a modal with one tab per
+                          # file, the focused one previewed, Enter editing it (agents run this when
+                          # you ask to see a file, or to put their own work in front of you)
 ```
 
 ## Workspaces

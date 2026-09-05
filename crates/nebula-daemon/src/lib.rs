@@ -1,8 +1,11 @@
+pub mod attach;
 pub mod config;
 pub mod git;
 pub mod hooks;
 pub mod lifecycle;
 pub mod metrics;
+pub mod open_files;
+pub mod pr_scope;
 pub mod pty;
 pub mod registry;
 pub mod server;

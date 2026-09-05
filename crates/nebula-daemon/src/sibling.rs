@@ -13,14 +13,15 @@ use crate::registry::{CreateAgentSpec, Daemon};
 
 /// What nebula appends to Claude's system prompt so "start a new nebula
 /// session that …" becomes one `nebula spawn` call instead of the model
-/// trying to launch an agent process itself. Claude only, like the worktree
-/// guidance: codex and cursor have no system-prompt flag.
+/// trying to launch an agent process itself. Claude and pi, like the
+/// worktree guidance (both take `--append-system-prompt`): codex and cursor
+/// have no system-prompt flag.
 pub const CLAUDE_SPAWN_GUIDANCE: &str = "[nebula] When the user asks you to start a new nebula \
 session (\"start a new nebula session that …\", \"spin up another session to …\", \"open a new \
 session for …\"), do not launch an agent process yourself. Run this shell command instead, exactly \
 once:\n\n  nebula spawn \"<task>\"\n\nwhere <task> is the work the user wants that session to do, \
 in their own words — the new session opens on it as its first prompt, so make it self-contained. \
-Add `--kind claude|codex|cursor` only when the user names the harness; otherwise the new session \
+Add `--kind claude|codex|cursor|pi` only when the user names the harness; otherwise the new session \
 matches this one. nebula starts it beside this session, in the same worktree, and it shows up in \
 the sessions list on its own. This session is unaffected: carry on with whatever else the user \
 asked, and if starting the session was the whole request, tell the user in one line that it is \

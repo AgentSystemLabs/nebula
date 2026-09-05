@@ -1477,6 +1477,109 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
     wait_for_exit(&mut daemon);
 }
 
+/// A kill-and-respawn behind an attached client — Restart here, and the
+/// same path a `nebula worktree` relocation or a cloud re-entry takes —
+/// rebinds that client to the new PTY: a fresh Scrollback and the new
+/// process's output arrive on the attachment it already holds, with no
+/// second Attach. Before this the forward task died with the old PTY and
+/// the TUI's pane sat frozen until the user clicked away and back.
+#[tokio::test]
+async fn restart_rebinds_an_attached_client_to_the_new_pty() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    // Stand-in CLI: announce which boot this is, then park.
+    let counter = env.tmp.path().join("boots");
+    let script = env.tmp.path().join("agent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nn=$(( $(cat '{c}' 2>/dev/null || echo 0) + 1 ))\necho $n > '{c}'\n\
+             echo \"booted $n\"\nexec sleep 600\n",
+            c = counter.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&script);
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: main_worktree.id.clone(),
+            name: "agent-1".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+    let sref = SessionRef::Agent(agent_id.clone());
+
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 120,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        String::from_utf8_lossy(&collected_output(evs)).contains("booted 1")
+    })
+    .await;
+
+    // The daemon kills the PTY and spawns another under the same ref; the
+    // attachment above is all this client ever sends.
+    write_frame(
+        &mut c,
+        &ClientRequest::RestartAgent {
+            req_id: 3,
+            id: agent_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        find_ack(evs, 3).is_some()
+            && String::from_utf8_lossy(&collected_output(evs)).contains("booted 2")
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&events, 3), Some(ServerEvent::Ack { .. })),
+        "restart failed: {events:#?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ServerEvent::Scrollback { session, .. } if session == &sref)),
+        "the rebind replays the new PTY's ring: {events:#?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// Codex mirror of the claude hook test: a codex-kind agent gets its hooks
 /// installed into codex's home (not the worktree — one trust approval has
 /// to cover every worktree), and posts to `/api/hooks/codex` drive the same
@@ -2291,6 +2394,7 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
         // Cursor's binary is `cursor-agent`; the message must name that, not
         // the kind, or the user goes looking for the wrong thing to install.
         (12, AgentKind::Cursor, "cursor-agent"),
+        (13, AgentKind::Pi, "pi"),
     ] {
         write_frame(
             &mut c,
@@ -3143,13 +3247,95 @@ async fn auto_title_instruction_and_rename_flow() {
         body,
         nebula_daemon::hooks::user_prompt_reply(false, Some("Fix Login Redirect"))
     );
-    assert!(!body.contains("additionalContext"), "no instruction: {body}");
+    assert!(
+        !body.contains("additionalContext"),
+        "no instruction: {body}"
+    );
 
     // A repeat attempt is declined as a settled answer (exit 0), not a fault.
     let out = agent_cli(&env, &agent_id, &["rename", "Another", "Title"]);
     assert!(out.status.success(), "declined rename must exit 0: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("already has a title"), "stdout: {stdout}");
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// `nebula open <file>…` from inside a session, end to end over real
+/// processes: the CLI (what the model runs) resolves the paths against its
+/// own cwd, the daemon checks the caller and fans the files out to every
+/// subscriber as one `FilesOpened` carrying the agent's checkout — and a
+/// path that does not exist fails in the CLI before anything is sent.
+#[tokio::test]
+async fn nebula_open_cli_hands_the_files_to_every_subscriber() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let script = env.tmp.path().join("agent.sh");
+    std::fs::write(&script, "#!/bin/sh\nexec sleep 600\n").unwrap();
+    make_executable(&script);
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let agent_id = create_agent_get_id(&mut c, &worktree.id, "agent-1", 2).await;
+
+    let notes = repo.join("docs").join("notes.md");
+    std::fs::create_dir_all(notes.parent().unwrap()).unwrap();
+    std::fs::write(&notes, "# notes\n").unwrap();
+    let main_rs = repo.join("main.rs");
+    std::fs::write(&main_rs, "fn main() {}\n").unwrap();
+
+    // Relative paths resolve against the CLI's cwd — the agent's.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(["open", "docs/notes.md", "main.rs"])
+        .current_dir(&repo)
+        .env(env::RUNTIME_DIR, &env.runtime_dir)
+        .env(env::AGENT_ID, &agent_id.0)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "open failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("opened 2 files"), "stdout: {stdout}");
+
+    let want: Vec<PathBuf> = [&notes, &main_rs]
+        .iter()
+        .map(|p| std::fs::canonicalize(p).unwrap())
+        .collect();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::FilesOpened { .. }))
+    })
+    .await;
+    let opened = events
+        .iter()
+        .find(|e| matches!(e, ServerEvent::FilesOpened { .. }))
+        .unwrap();
+    let ServerEvent::FilesOpened { agent, root, paths } = opened else {
+        unreachable!()
+    };
+    assert_eq!(agent, &agent_id);
+    assert_eq!(root, &worktree.path, "the agent's checkout rides along");
+    assert_eq!(paths, &want, "absolute, in the order given");
+
+    // A missing file is the CLI's error, before the daemon hears anything.
+    let out = agent_cli(&env, &agent_id, &["open", "/nowhere/at/all.md"]);
+    assert!(!out.status.success(), "a missing file must fail: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no such file"), "stderr: {stderr}");
+
+    // Outside a session there is no row to open for.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(["open", main_rs.to_str().unwrap()])
+        .env(env::RUNTIME_DIR, &env.runtime_dir)
+        .env_remove(env::AGENT_ID)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "outside a session must fail: {out:?}"
+    );
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
@@ -3168,13 +3354,13 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
     let env_dir = env.tmp.path().join("agent-env");
     std::fs::create_dir_all(&env_dir).unwrap();
     // Stand-in CLI: dump the NEBULA_* env its hooks would use, log where
-    // each boot runs, then park.
+    // each boot runs (to a file, and to its own screen), then park.
     let script = env.tmp.path().join("agent.sh");
     std::fs::write(
         &script,
         format!(
             "#!/bin/sh\nenv | grep '^NEBULA_' > '{d}'/$NEBULA_AGENT_ID.env\n\
-             pwd >> '{d}'/$NEBULA_AGENT_ID.pwd\nexec sleep 600\n",
+             pwd >> '{d}'/$NEBULA_AGENT_ID.pwd\necho \"booted in $(pwd)\"\nexec sleep 600\n",
             d = env_dir.display()
         ),
     )
@@ -3236,6 +3422,25 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
         tokio::time::sleep(POLL_STEP).await;
     }
 
+    // A client sits on the pane throughout — the TUI, showing the session
+    // that is about to run `nebula worktree`.
+    let sref = SessionRef::Agent(agent_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 120,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        String::from_utf8_lossy(&collected_output(evs)).contains("booted in")
+    })
+    .await;
+
     // The model obeys the guidance — `nebula worktree feat x` (the space
     // slugifies) with the session's env.
     let out = agent_cli(&env, &agent_id, &["worktree", "feat", "x"]);
@@ -3285,14 +3490,24 @@ async fn nebula_worktree_cli_relocates_the_session_when_the_turn_ends() {
         assert_eq!(status, 200, "{event}");
     }
 
-    // The respawn: alive again under feat-x, and booted inside it.
-    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
-        evs.iter().any(|e| {
+    // The respawn: alive again under feat-x, booted inside it — and the
+    // attached client follows it there with no second Attach: the daemon
+    // rebinds the pane to the new PTY (a fresh Scrollback, then its output),
+    // so the TUI never sits frozen on the old process's last frame.
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        let alive = evs.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
                 if a.id == agent_id && a.worktree_id == feat.id && a.alive)
-        })
+        });
+        alive && String::from_utf8_lossy(&collected_output(evs)).contains("repo-worktrees/feat-x")
     })
     .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ServerEvent::Scrollback { session, .. } if session == &sref)),
+        "the rebind replays the new PTY's ring: {events:#?}"
+    );
     let deadline = tokio::time::Instant::now() + SLOW_TIMEOUT;
     loop {
         let b = boots(&pwd_log);

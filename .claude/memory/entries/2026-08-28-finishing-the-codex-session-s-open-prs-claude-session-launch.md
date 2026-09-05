@@ -6,7 +6,7 @@ skipped). The codex session's own prompt: "add the ability for a user to create 
 rows, so they can create claude sessions which would already have a system prompt defining all work must be
 done on that PR already injected and include pr url".
 
-**Did:** The transcript is `~/.codex/sessions/<Y>/<M>/<D>/rollout-<stamp>-<session id>.jsonl` (JSONL;
+**Did:** *(Superseded 2026-09-04: the PR SESSION picker offers every AGENT KIND, `CreatePrAgent` carries a `kind`, and `claude_pr_system_prompt` is `pr_scope::rule` — see that entry.)* The transcript is `~/.codex/sessions/<Y>/<M>/<D>/rollout-<stamp>-<session id>.jsonl` (JSONL;
 `payload.type` is `message` / `function_call` / `custom_tool_call_output` / `agent_message`; the final
 `task_complete` line carried `usage_limit_exceeded`). The feature was already built and green in the SHARED
 CHECKOUT when it died: `ClientRequest::CreatePrAgent` (`protocol.rs`, PROTOCOL VERSION 28 → 29), MIGRATION 22

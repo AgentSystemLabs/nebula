@@ -331,6 +331,50 @@ pub async fn spawn_sibling_for_current_agent(task: &str, kind: Option<AgentKind>
     Ok(())
 }
 
+/// CLI: `nebula open <file>…` from inside an agent session — resolve the
+/// paths here, where the cwd is the agent's, and hand them to the daemon,
+/// which raises every attached TUI's FILE TABS on them. Never spawns a
+/// daemon: no daemon means nobody is looking. What this prints is read by
+/// the model that ran it.
+pub async fn open_files_for_current_agent(files: &[String]) -> Result<()> {
+    let agent_id = current_agent_id("open")?;
+    if files.is_empty() {
+        bail!("nothing to open — `nebula open <file>…` needs at least one file");
+    }
+    let mut resolved = Vec::with_capacity(files.len());
+    for file in files {
+        let path = std::fs::canonicalize(file)
+            .with_context(|| format!("can't open {file}: no such file"))?;
+        if !path.is_file() {
+            bail!("can't open {file}: not a file");
+        }
+        resolved.push(path);
+    }
+    let sock = paths::socket_path();
+    let Ok(stream) = try_connect(&sock).await else {
+        bail!("no nebula daemon is running — nothing opened");
+    };
+    let mut conn = handshake(stream).await?;
+    let req_id = ONE_SHOT_REQ_ID;
+    let count = resolved.len();
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::OpenFiles {
+            req_id,
+            id: AgentId(agent_id),
+            paths: resolved,
+        },
+    )
+    .await?;
+    await_ack(&mut conn, req_id).await?;
+    let noun = if count == 1 { "file" } else { "files" };
+    println!(
+        "opened {count} {noun} in nebula's file tabs — the user is looking at them now, one tab \
+         each, with a preview and an editor. Don't paste their contents into your reply; carry on."
+    );
+    Ok(())
+}
+
 /// CLI: `nebula worktree [name] [--base <ref>]` from inside an agent
 /// session — take (or create) the named worktree of this session's project
 /// and have the daemon move the session into it. A blank name is invented

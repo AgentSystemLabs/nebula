@@ -1,10 +1,13 @@
+pub mod agent_picker;
 pub mod agent_presets;
 pub mod app;
 pub mod branch_name;
+pub mod claude_catalogue;
 pub mod completion;
 pub mod config;
 pub mod cursor_catalogue;
 pub mod event_loop;
+pub mod file_tabs;
 pub mod fuzzy;
 pub mod git_diff;
 pub mod grep_search;
@@ -28,6 +31,7 @@ pub mod text_input;
 pub mod theme;
 pub mod tree_browser;
 pub mod ui;
+pub mod update_check;
 pub mod vim_term;
 
 use anyhow::Result;
@@ -71,6 +75,12 @@ pub fn run_rename(title: String, mode: RenameMode) -> Result<()> {
 /// into a worktree of its project (see `ipc::enter_worktree_for_current_agent`).
 pub fn run_worktree(name: String, base: Option<String>) -> Result<()> {
     runtime()?.block_on(ipc::enter_worktree_for_current_agent(&name, base))
+}
+
+/// `nebula open <file>…` — show files in every attached TUI's FILE TABS
+/// (see `ipc::open_files_for_current_agent`).
+pub fn run_open(files: Vec<String>) -> Result<()> {
+    runtime()?.block_on(ipc::open_files_for_current_agent(&files))
 }
 
 /// `nebula spawn "<task>" [--kind <kind>]` — start a new agent session

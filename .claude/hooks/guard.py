@@ -33,6 +33,13 @@ FOR_IN_COMMAND_SUBSTITUTION = re.compile(r"\bfor\s+\w+\s+in\s+\$\(")
 # `cargo test … | tail` — a pipeline's `$?` is the *last* stage's, so a red suite reports success.
 # A single `&` is allowed through so `2>&1` does not end the scan; `&&` still ends the command.
 CARGO_PIPED = re.compile(r"\bcargo\s+(?:test|check|build|clippy)\b(?:[^|;&\n]|&(?!&))*\|")
+# `git stash` (push/pop/apply/drop/…) at a command position; `list`, `show`, `create` and `store` leave the tree alone.
+GIT_STASH_MUTATES = re.compile(r"(?:^|[;&|(]\s*)git\s+stash\b(?!\s+(?:list|show|create|store)\b)", re.M)
+# A bare word beginning with `=` — `echo ======`, `[ a == b ]` — is zsh's `=cmd` expansion: no such command,
+# so the line dies with `== not found` before anything runs. Quoted strings, `[[ … ]]` and `(( … ))` are
+# skipped first (there `==` is fine); `a=b`, `--flag=val`, a lone `=` and `=(…)` process substitution never match.
+QUOTED_OR_CONDITION = re.compile(r"'[^']*'|\"[^\"]*\"|\[\[.*?\]\]|\(\(.*?\)\)", re.S)
+BARE_EQUALS_WORD = re.compile(r"(?:^|[\s;&|(])=[=\w]\S*")
 
 RULES = [
     (
@@ -49,6 +56,22 @@ RULES = [
         "even when the suite failed, and the pipe truncates away which crates actually ran (MEMORY gotcha "
         "2026-08-26, re-hit 2026-08-29). Redirect instead: `cargo test --workspace > gate.log 2>&1; echo $?` "
         "and read the `test result:` lines — or prefix the command with `set -o pipefail;`.",
+    ),
+    (
+        "git-stash-on-the-shared-checkout",
+        lambda cmd: GIT_STASH_MUTATES.search(cmd) is not None,
+        "Blocked: `git stash` on the SHARED CHECKOUT sweeps every other session's uncommitted hunks up with yours, "
+        "and `pop` races their edits back over the tree (AGENTS.md rule; MEMORY gotcha 2026-08-24, re-hit "
+        "2026-09-04). For a baseline build, `git archive HEAD | tar -x -C <scratchpad>/head` and build there; to "
+        "snapshot without touching the tree, `git stash create` + `git update-ref`.",
+    ),
+    (
+        "bare-equals-word-in-zsh",
+        lambda cmd: BARE_EQUALS_WORD.search(QUOTED_OR_CONDITION.sub(" ", cmd)) is not None,
+        "Blocked: the harness shell is zsh, where a bare word beginning with `=` is `=cmd` expansion — `echo ======` "
+        "and `[ a == b ]` die with `== not found` before anything runs, and the failure sinks the whole `&&`/`;` "
+        "line (MEMORY gotcha 2026-08-28, re-hit ×3 2026-09-04). Quote the separator (`echo '======'`) or test "
+        "with `[[ a == b ]]`.",
     ),
     (
         "backticks-in-commit-message",

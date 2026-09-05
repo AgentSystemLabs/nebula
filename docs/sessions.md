@@ -7,12 +7,14 @@ Everything that can start an AGENT, and what each launch path does differently.
 ## The NEW SESSION PICKER
 
 With a WORKTREE selected, press `n` in the SESSIONS PANEL. A menu asks what to
-run — **Claude**, **Codex**, or **Cursor** (a plain shell is `t` — see [Keys](keys.md)); a CLI you never use can be
+run — **Claude**, **Codex**, **Cursor**, or **Pi** (a plain shell is `t` — see [Keys](keys.md)); a CLI you never use can be
 switched off on the settings overlay's Agents tab and drops out of the menu entirely. `→` on any row drills
 into model and reasoning-effort submenus (Cursor's model is a family such as `claude-opus-5-thinking`, and
 its effort list follows the family, `-fast` variants included — `cursor-agent --list-models` bakes both
 into the id, so nebula launches `--model claude-opus-5-thinking-high-fast`; the list is a built-in seed
-merged with `--list-models`, cached in `cursor_models.json` beside `config.json` and refreshed daily);
+merged with `--list-models`, cached in `cursor_models.json` beside `config.json` and refreshed daily;
+Pi's model is a fuzzy `--model` pattern — `opus`, `sonnet`, or a `provider/id` you set in `config.json` —
+and its effort is the `--thinking` level, `off` through `max`).
 In those submenus you type to filter — `opus` narrows the rows to the Opus families, `↑`/`↓` move, `Backspace` widens, `Esc` clears — and the preset editor's Harness / Model / Effort rows take the same type-ahead.
 `Enter` anywhere takes your configured defaults. On the
 Claude row, `Tab` toggles Cloud mode: after the optional name, enter the task in the wrapped editor
@@ -37,11 +39,12 @@ editor — and nebula runs `claude -p <message> --cloud=<id>` and pulls the tran
 reply shows up on a later refresh; the CLI never returns one. Otherwise, name the session or accept the
 default and nebula spawns the CLI in that worktree and drops you straight into it.
 
-The three rows do not run under the same permissions, and the picker is where you decide that. Claude
+The rows do not run under the same permissions, and the picker is where you decide that. Claude
 is spawned with no permission flag at all and keeps its normal prompts — it stops and asks before the
 things it is configured to ask about. Codex is spawned with `--yolo` and Cursor with `--force`, so
 **neither of those two ever stops to ask**: they edit files and run commands on their own judgment for
-the life of the SESSION, and nothing in the picker or the settings overlay softens that. Pick the
+the life of the SESSION, and nothing in the picker or the settings overlay softens that. Pi has no
+permission gate to begin with — nebula passes no flag, and it runs its tools as it sees fit. Pick the
 harness with that in mind, especially in the ROOT WORKTREE.
 
 The same choice reaches the STATUS DOT, because an AGENT can only report what its hook set can see.
@@ -53,7 +56,12 @@ installed, so the red state stays reachable there. Cursor has no `PermissionRequ
 and since nebula runs it with `--force` there is nothing left to wait on anyway: its hooks are
 `sessionStart`, `beforeSubmitPrompt`, `stop`, `subagentStart` and `subagentStop`, which is busy versus
 idle and nothing else. **A Cursor SESSION can never show the red NEEDS FEEDBACK dot** — if you are
-watching one and waiting for it to ask you something, it is not going to.
+watching one and waiting for it to ask you something, it is not going to. Pi has no shell hooks at all:
+nebula installs one managed extension (`~/.pi/agent/extensions/nebula.ts`, inert outside nebula) that
+posts pi's `session_start`, `before_agent_start`, `agent_end` and `ask_question` tool events as
+`SessionStart`, `UserPromptSubmit`, `Stop` and `PreToolUse` / `PostToolUse`, and any blocking prompt an
+extension raises mid-run as `PermissionRequest` — so a Pi row goes yellow, red while its `ask_question`
+tool waits on you, and green when the run ends, a cancelled run included.
 
 ## AGENT PRESETS
 
@@ -80,7 +88,9 @@ beat is also how rows retire: merge or close a pull request and it stops coming 
 list on its own, and the one under your cursor goes the moment GitHub says it's merged. Rest the cursor
 on one and the right-hand pane reads it to you — description, stats and the whole conversation — without
 leaving nebula; `g` opens its diff in the same viewer your worktree diffs use, `Enter` or a double-click
-opens it in the browser, and `/` finds it by title. Press `n` — or choose **New Claude session** from
-`m` / right-click — to start a Claude SESSION in the PROJECT's ROOT WORKTREE with an injected system
-prompt that limits all work to that PR and includes its URL. The URL is kept with the AGENT, so RESUME
+opens it in the browser, and `/` finds it by title. Press `n` — or choose **New Claude session**, **New
+Codex session** or **New Cursor session** from `m` / right-click — to start a SESSION on any enabled
+harness in the PROJECT's ROOT WORKTREE, through the same MODEL / EFFORT submenus as the NEW SESSION
+PICKER, with a rule that limits all work to that PR and includes its URL: Claude gets it as an appended
+system prompt, Codex and Cursor as their first prompt. The URL is kept with the AGENT, so RESUME
 reapplies the same scope. Only the row you actually stop on is fetched.

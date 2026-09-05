@@ -1,11 +1,14 @@
 //! Agent-CLI hook receiver: a loopback-only HTTP endpoint the shell hook
-//! one-liners POST to (`/api/hooks/claude`, `/api/hooks/codex`, and
-//! `/api/hooks/cursor`). Codex mirrors Claude's hook events and payload
-//! shape; cursor speaks its own dialect, but its installer translates event
-//! names into the `hookEvent` query param and the payload fields are aliased
-//! here (`conversation_id`, `subagent_id`, `workspace_roots`), so one
-//! handler serves all three. Fail-soft on both sides — a malformed payload
-//! still gets a 200 so a broken hook never faults the user's agent turn.
+//! one-liners POST to (`/api/hooks/claude`, `/api/hooks/codex`,
+//! `/api/hooks/cursor`, and `/api/hooks/pi`). Codex mirrors Claude's hook
+//! events and payload shape; cursor speaks its own dialect, but its
+//! installer translates event names into the `hookEvent` query param and
+//! the payload fields are aliased here (`conversation_id`, `subagent_id`,
+//! `workspace_roots`); pi has no shell hooks at all — its managed extension
+//! (`pi_extension.rs`) maps pi's events onto the same names and POSTs
+//! Claude-shaped payloads — so one handler serves all four. Fail-soft on
+//! both sides — a malformed payload still gets a 200 so a broken hook never
+//! faults the user's agent turn.
 //!
 //! The Claude `UserPromptSubmit` reply is also the one channel back into
 //! the CLI: its `hookSpecificOutput` carries the AUTO-TITLE instruction
@@ -13,6 +16,7 @@
 //! name is not the one Claude holds (CLAUDE TITLE SYNC, `session_title.rs`).
 
 pub mod installer;
+pub mod pi_extension;
 
 use crate::session_title::TranscriptRef;
 use crate::status::HookEvent;
@@ -77,6 +81,8 @@ enum HookDialect {
     /// Claude and Codex: the UserPromptSubmit hook pipes the body to the
     /// CLI's stdout, where it lands in the model's context — so on that
     /// event the body must be empty or the instruction, never diagnostics.
+    /// Pi's extension reads the same body out of the envelope and appends
+    /// it to the run's system prompt.
     Injectable,
     /// Cursor: every hook answers with its own gating JSON and drops the
     /// body, so the `{"ok": …}` diagnostics can stay.
@@ -90,12 +96,13 @@ enum HookCli {
     Claude,
     Codex,
     Cursor,
+    Pi,
 }
 
 impl HookCli {
     fn dialect(self) -> HookDialect {
         match self {
-            HookCli::Claude | HookCli::Codex => HookDialect::Injectable,
+            HookCli::Claude | HookCli::Codex | HookCli::Pi => HookDialect::Injectable,
             HookCli::Cursor => HookDialect::Plain,
         }
     }
@@ -228,13 +235,15 @@ pub async fn start_hook_server(
     });
     // Claude and Codex UserPromptSubmit hooks pipe this server's response
     // body to the CLI's stdout, where it lands in the model's context —
-    // that's the auto-title instruction channel. Cursor's dialect has no
+    // that's the auto-title instruction channel; pi's extension carries
+    // the same body into its run's system prompt. Cursor's dialect has no
     // such channel (its hooks answer with their own gating JSON), so it
     // takes the plain route.
     let app = Router::new()
         .route("/api/hooks/claude", post(receive_claude_hook))
         .route("/api/hooks/codex", post(receive_codex_hook))
         .route("/api/hooks/cursor", post(receive_cursor_hook))
+        .route("/api/hooks/pi", post(receive_pi_hook))
         .with_state(state);
 
     tokio::spawn(async move {
@@ -287,6 +296,17 @@ async fn receive_cursor_hook(
     receive_hook(HookCli::Cursor, state, query, headers, body).await
 }
 
+/// `/api/hooks/pi`: pi's managed extension POSTs Claude-shaped payloads
+/// and unwraps the injectable reply body into the run's system prompt.
+async fn receive_pi_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(HookCli::Pi, state, query, headers, body).await
+}
+
 async fn receive_hook(
     cli: HookCli,
     state: Arc<HookServerState>,
@@ -335,7 +355,7 @@ async fn receive_hook(
             payload.transcript_path.as_deref(),
             payload.session_id.as_deref(),
         ),
-        HookCli::Codex | HookCli::Cursor => None,
+        HookCli::Codex | HookCli::Cursor | HookCli::Pi => None,
     };
     let _ = state
         .tx
@@ -367,7 +387,7 @@ async fn receive_hook(
                 .ok()
                 .flatten()
                 .and_then(|s| s.to_push().map(str::to_string)),
-            HookCli::Codex | HookCli::Cursor => None,
+            HookCli::Codex | HookCli::Cursor | HookCli::Pi => None,
         };
         return (
             StatusCode::OK,
@@ -572,15 +592,18 @@ mod tests {
         assert_eq!(delivery.agent_id.as_str(), "pending");
         assert_eq!(delivery.event, HookEvent::UserPromptSubmit);
 
-        // Codex shares the injectable dialect.
-        let (_, body) = http_post(
-            env.port,
-            "/api/hooks/codex?agentId=pending&hookEvent=UserPromptSubmit",
-            &env.token,
-            payload,
-        )
-        .await;
-        assert_eq!(body, auto_title_injection());
+        // Codex shares the injectable dialect, and so does pi's extension,
+        // which unwraps the same envelope.
+        for route in ["codex", "pi"] {
+            let (_, body) = http_post(
+                env.port,
+                &format!("/api/hooks/{route}?agentId=pending&hookEvent=UserPromptSubmit"),
+                &env.token,
+                payload,
+            )
+            .await;
+            assert_eq!(body, auto_title_injection(), "{route}");
+        }
 
         // Titled session: strictly empty — anything else would leak into
         // the model's context.

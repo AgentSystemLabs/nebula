@@ -4,7 +4,7 @@
 
 **Mission control for your coding agents.**
 
-Run **Claude Code**, **Codex** and **Cursor** across every project and git WORKTREE you own — from one
+Run **Claude Code**, **Codex**, **Cursor** and **Pi** across every project and git WORKTREE you own — from one
 terminal, one keyboard, one tree. They keep working when you close it.
 
 [![Release](https://img.shields.io/github/v/release/AgentSystemLabs/nebula?style=flat-square&color=e8c547&label=release)](https://github.com/AgentSystemLabs/nebula/releases)
@@ -47,8 +47,8 @@ dot on a collapsed PROJECT tells you exactly where to look without opening anyth
 | **STATUS DOTS you read instead of screens** | ● yellow mid-turn, ● violet finished and UNSEEN, ● green finished and read, ● red waiting on you — plus a violet `n done` DONE BADGE counting the terminals you still owe a look. |
 | **Lists that order themselves** | PROJECTS, WORKTREES and SESSIONS all sit most-recent-first in RECENCY ORDER, with a dim `23m ago` after the name saying why the row is where it is. The one fixed seat is the ROOT WORKTREE, always the first WORKTREES PANEL row; nothing else is pinned or dragged into place by hand. |
 | **Real git WORKTREES, one keystroke** | `n` in the WORKTREES PANEL branches off into an actual `git worktree`. Two agents in two directories never collide. |
-| **Agents that drive nebula back** | Tell a Claude SESSION *"do this in a worktree"* and it runs `nebula worktree`, then restarts itself resumed inside the new checkout. Say *"start a new nebula session that…"* and `nebula spawn` has a second agent working beside it before you look. |
-| **Every open pull request, in place** | nebula asks `gh` what's still open on the repo. Rest on a PR ROW and the PR PREVIEW reads it to you — description, stats, the whole conversation. `g` for its diff, `Enter` for the browser, `n` for a Claude SESSION scoped to that PR. |
+| **Agents that drive nebula back** | Tell a Claude SESSION *"do this in a worktree"* and it runs `nebula worktree`, then restarts itself resumed inside the new checkout. Say *"show me the file"* and `nebula open` puts it in front of you in a tabbed modal. Say *"start a new nebula session that…"* and `nebula spawn` has a second agent working beside it before you look. |
+| **Every open pull request, in place** | nebula asks `gh` what's still open on the repo. Rest on a PR ROW and the PR PREVIEW reads it to you — description, stats, the whole conversation. `g` for its diff, `Enter` for the browser, `n` for a SESSION on any harness, scoped to that PR. |
 | **Diff, find, grep, browse** | `g` opens the DIFF VIEWER with REVIEWED MARKS, `f` the FILE FINDER, `F` a `git grep`, `b` the TREE BROWSER — all scoped to the selected WORKTREE, all one key from anywhere. |
 | **`/` finds anything, anywhere** | The PALETTE spans every WORKSPACE, not just the open one. Before you type it sorts by attention: NEEDS FEEDBACK first, then RUNNING, then UNSEEN — so `/` `Enter` is the fastest way back to whatever needs you. |
 | **It follows you to other machines** | `nebula ssh <host>` opens nebula there, installing it if missing. `nebula tunnel <host>` puts that machine's TUI in a browser tab over a single ssh tunnel. |
@@ -69,7 +69,7 @@ it — is shut down for you, so the next launch comes up on the new binary. A DA
 left alone and they keep running the old binary until you `nebula kill` and relaunch. `nebula --version`
 (`-V`) says which binary you are on.
 
-> **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, or `cursor-agent`.
+> **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, or `pi`.
 > nebula spawns them; it doesn't ship them.
 >
 > Three commands each want one more binary, and only those commands: `nebula ssh` and `nebula tunnel`
@@ -97,8 +97,8 @@ nebula
 in the WORKTREES PANEL to branch off into a real `git worktree`. That's the whole point of the column —
 two agents in two WORKTREES edit two directories and never collide.
 
-**4. Start the agent.** `n` in the SESSIONS PANEL opens the NEW SESSION PICKER — **Claude**, **Codex** or
-**Cursor**, `→` for MODEL and EFFORT, `Enter` for your defaults. Or skip the picker entirely: `p` from any
+**4. Start the agent.** `n` in the SESSIONS PANEL opens the NEW SESSION PICKER — **Claude**, **Codex**,
+**Cursor** or **Pi**, `→` for MODEL and EFFORT, `Enter` for your defaults. Or skip the picker entirely: `p` from any
 PANEL opens the QUICK PROMPT, you type the task, and an agent starts working on it in the selected
 WORKTREE. Save a framing you keep retyping as an AGENT PRESET (`e`) and it becomes one keystroke.
 
@@ -143,7 +143,8 @@ and is shared by every client; a turn that finishes in the pane you're already l
 nebula doesn't poll the agents and it doesn't guess from the screen. At spawn it merges MANAGED HOOKS
 into the WORKTREE's `.claude/settings.local.json`, `.cursor/hooks.json` or `~/.codex/hooks.json` — tagged
 `_nebulaManaged`, your own hooks preserved, rebuilt every spawn — and each one is a fail-soft `curl` to
-the DAEMON's loopback HOOK RECEIVER, authenticated with a per-boot BEARER TOKEN. For the one event no CLI
+the DAEMON's loopback HOOK RECEIVER, authenticated with a per-boot BEARER TOKEN. Pi has no shell hooks,
+so it gets one managed extension at `~/.pi/agent/extensions/nebula.ts` that posts the same events. For the one event no CLI
 reports — a turn you cancelled with `Esc` — the PROGRESS SCANNER reads the CLI's own OSC 9;4 progress
 escapes straight off the PTY, a signal that survives the cancel and stays busy while a permission prompt
 is open.

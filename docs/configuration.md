@@ -25,7 +25,9 @@ convenience stores: missing or malformed reads as empty.
 ## Every setting
 
 Twenty-six keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
-exists only in the file, so it is hand-edit-only.
+exists only in the file, so it is hand-edit-only. The Agents tab groups its rows under **Quick prompt**,
+**Claude**, **Codex** and **Cursor** headers, so a harness's rows read `Enabled` / `Model` / `Effort`
+under its name rather than repeating it.
 
 | Key | Type | Default | Overlay | What it does |
 |---|---|---|---|---|
@@ -41,17 +43,21 @@ exists only in the file, so it is hand-edit-only.
 | `show_workspaces` | bool | `true` | Appearance | Whether the WORKSPACES BAR is drawn across the top. `Shift+W` writes the key as it toggles, so a hidden bar stays hidden across restarts. |
 | `hide_projects` | bool | `false` | Appearance | Hide the PROJECTS PANEL and give its width to the TERMINAL PANE (`Shift+P`). |
 | `hide_worktrees` | bool | `false` | Appearance | Hide the WORKTREES PANEL (`Shift+B`), independently of `hide_projects`. |
-| `quick_prompt_kind` | string | `"claude"` | Agents | Which AGENT KIND the QUICK PROMPT (`p`) launches: `claude`, `codex` or `cursor`. Its model and effort come from that kind's own defaults below, so this is one name, not a third pair. A kind switched off here is stepped around. |
+| `quick_prompt_kind` | string | `"claude"` | Agents | Which AGENT KIND the QUICK PROMPT (`p`) launches: `claude`, `codex`, `cursor` or `pi`. Its model and effort come from that kind's own defaults below, so this is one name, not a third pair. A kind switched off here is stepped around. |
 | `quick_prompt_focus` | bool | `false` | Agents | QUICK PROMPT FOCUS: whether a QUICK PROMPT launch enters and locks the new session's TERMINAL PANE. Off, its row is selected and previewed but FOCUS stays on the panel you fired from. Only the QUICK PROMPT reads it — every other launch takes the pane. |
-| `claude_enabled` | bool | `true` | Agents | HARNESS TOGGLE. Off leaves Claude out of the NEW SESSION PICKER, the PR SESSION launch and the standing PREWARM POOL slot; existing sessions keep attaching and resuming. The last kind left on cannot be switched off. |
+| `claude_enabled` | bool | `true` | Agents | HARNESS TOGGLE. Off leaves Claude out of the NEW SESSION PICKER and the PR SESSION picker, and skips the standing PREWARM POOL slot; existing sessions keep attaching and resuming. The last kind left on cannot be switched off. |
 | `codex_enabled` | bool | `true` | Agents | HARNESS TOGGLE for Codex, same rules. |
 | `cursor_enabled` | bool | `true` | Agents | HARNESS TOGGLE for Cursor, same rules. |
-| `claude_model` | string | `"default"` | Agents | Default `--model` for new Claude sessions. The literal `"default"` is the sentinel meaning *don't pass the flag, let the CLI pick* — it is what you see in a fresh file, not a missing value. Overlay list: `fable`, `opus`, `sonnet`, `haiku`; any other string is passed through verbatim. |
+| `pi_enabled` | bool | `true` | Agents | HARNESS TOGGLE for Pi, same rules. |
+| `claude_model` | string | `"default"` | Agents | Default `--model` for new Claude sessions. The literal `"default"` is the sentinel meaning *don't pass the flag, let the CLI pick* — it is what you see in a fresh file, not a missing value. Overlay list: `fable`, `opus`, `sonnet`, `haiku` — unless `claude_models` below or Claude Code's own `availableModels` allowlist replaces it; any other string is passed through verbatim. |
+| `claude_models` | array of strings | `[]` | — (hand-edited) | The Claude model rows every picker offers (the NEW SESSION PICKER and QUICK PROMPT submenus, the AGENTS TAB, the PRESET EDITOR) in place of the built-in aliases, verbatim, `"default"` always first: `["claude-sonnet-5", "us.anthropic.claude-opus-5-v1:0"]`. For an organization that restricts models (Claude Code refuses `--model sonnet` with *Model "sonnet" is restricted by your organization's settings. Using claude-sonnet-5 instead.*) or a provider whose ids the aliases don't reach (Bedrock, Vertex, a gateway; on Bedrock `sonnet` even means Sonnet 4.5). Empty, the list follows Claude Code's `availableModels` when one is on disk — `~/.claude/remote-settings.json` (server-managed cache), the macOS MDM profile, `managed-settings.json` and `managed-settings.d/` in the system directory, then `~/.claude/settings.json`, read once at TUI start — else the aliases. A hand edit here applies without a restart. |
 | `claude_effort` | string | `"default"` | Agents | Default reasoning effort (`--effort`) for new Claude sessions: `low`, `medium`, `high`, `xhigh`, `max`, or the `"default"` sentinel. |
 | `codex_model` | string | `"default"` | Agents | Default `--model` for new Codex sessions (Codex spells the flag the same way Claude does): `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, or the `"default"` sentinel. |
 | `codex_effort` | string | `"default"` | Agents | Default `-c model_reasoning_effort=` for new Codex sessions: `minimal`, `low`, `medium`, `high`, `xhigh`, or the `"default"` sentinel. |
 | `cursor_model` | string | `"default"` | Agents | Default model *family* for new Cursor sessions, from the cached catalogue (`cursor_models.json`), or the `"default"` sentinel. |
 | `cursor_effort` | string | `"default"` | Agents | The effort suffix the DAEMON joins onto `cursor_model` into one flat `--model <family>-<effort>` id. The choices follow the family, so the overlay row reads `n/a` while the model is unset or has no effort variants. |
+| `pi_model` | string | `"default"` | Agents | Default `--model` for new Pi sessions. Pi takes a fuzzy pattern across every provider it has credentials for, so the overlay lists families (`opus`, `sonnet`, `haiku`, `gpt-5.5`); a hand-edited `provider/id` such as `anthropic/claude-sonnet-5` passes through verbatim. |
+| `pi_effort` | string | `"default"` | Agents | Default `--thinking` level for new Pi sessions: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or the `"default"` sentinel. |
 | `keybindings` | object | `{}` | Hotkeys | KEYMAP overrides, keyed by action id, valued with a comma-separated chord list: `{"git_diff": "ctrl+g, g"}`. An empty string deliberately unbinds; unknown ids are ignored. Only rows that differ from the defaults are written. |
 | `prewarm_agents` | bool | `true` | — | PREWARM POOL: pre-spawn an agent CLI while you are still naming the session, so creation feels instant. **Costs one idle CLI process per warm slot** (150–300 MB each, up to 15 minutes). `false` opts out. |
 | `prewarm_sessions` | bool | `true` | — | SESSION PREWARM: pre-spawn a WORKTREE's dead sessions when your selection rests on it, so attaching shows an already-booted screen instead of a booting shell. **Costs idle shell/CLI processes for sessions you may never open.** `false` opts out. |
@@ -132,6 +138,7 @@ Overrides for tests and parallel instances — real, but not things a normal ins
 | `NEBULA_DATA_DIR` | the platform app-support dir | The DATA DIR holding the database, config and logs. |
 | `NEBULA_AGENT_CMD` | — | Replaces every agent CLI with one command line, taken verbatim (tests stand in `/bin/sh` or a stub script). |
 | `NEBULA_INSTALL_URL` | the published install script | The URL `nebula upgrade` / `nebula ssh` fetch. |
+| `NEBULA_UPDATE_CHECK_SECS` | `3600` | How often the TUI asks GitHub whether a newer release is published, for the FOOTER's `⇡ vX.Y.Z` indicator (one `curl` to the release page's redirect, no `gh` token); `0` turns it off. See [Keys](keys.md#chips-and-readouts). |
 | `NEBULA_IDLE_REAP_MS` | `15000` | IDLE REAPER sweep period in ms. This is how often it looks, not how long a session may idle — that is `session_idle_timeout`. |
 | `NEBULA_WORKTREE_SYNC_MS` | `2000` | WORKTREE SYNC probe period in ms: how often the DAEMON reconciles `git worktree list` so worktrees made outside nebula appear. |
 
