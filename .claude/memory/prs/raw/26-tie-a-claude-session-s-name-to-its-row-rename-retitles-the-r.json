@@ -1,0 +1,250 @@
+{
+  "pr": {
+    "additions": 1435,
+    "assignees": [],
+    "author": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "baseRefName": "main",
+    "body": "Closes #25.\n\n## What\n\nA Claude SESSION's own name and its row in the SESSIONS PANEL are now tied, both ways (CLAUDE TITLE SYNC; Claude only \u2014 Codex and Cursor have no session name of their own):\n\n- **`/rename <name>` inside Claude retitles the row** within a few seconds, as if you had pressed `r` \u2014 so AUTO-TITLE never overrides it.\n- **A name set in nebula reaches Claude on your next prompt** \u2014 typed at creation, set with `r`, or chosen by AUTO-TITLE \u2014 so `/resume`, `/rc` and Claude's prompt box show what the row shows, and a restart (`--resume`) keeps it.\n\nWhichever side changed last wins; a name set in nebula is never undone by re-reading Claude's older one.\n\n## How\n\nClaude Code fires **no hook** for `/rename`. It rewrites the PTY window title (`\u2733 <name>`) and writes `custom-title.json` beside the transcript (`{\"type\":\"custom-title\"}` lines in the transcript too).\n\n- **Claude \u2192 nebula** \u2014 `crates/nebula-daemon/src/session_title.rs`. A new OSC 0/2 `TitleScanner` (`pty/title.rs`) emits `PtyEvent::Title`; the DAEMON then reads `<transcript dir>/<session id>/custom-title.json` (path from every hook payload's `transcript_path`), retrying at 0/300 ms/1 s/3 s since the file can land after the bytes, and also on every hook. `Store::adopt_claude_title` is one conditional UPDATE against a new `claude_title` column (migration 23): the title is adopted only when it differs from the one **last seen from Claude**, not from the row's name \u2014 that is what keeps an `r` rename from being reverted. The title text itself is never used as the name: Claude's AI summaries and the permission-prompt glyph flip ride the same OSC.\n- **nebula \u2192 Claude** \u2014 `hooks/mod.rs::user_prompt_reply`. The `UserPromptSubmit` reply gains `hookSpecificOutput.sessionTitle` (undocumented, in the CLI's schema; verified on 2.1.261 to rename and persist like `/rename`). Sent only on the Claude route, only for a settled non-`agent-N` name Claude does not hold yet, never while the AUTO-TITLE instruction is pending. A `SessionStart` push was rejected: it changes the display only.\n\nRejected: reading the name off the window title; `claude --name` at spawn (older CLIs would refuse the flag, an ignored reply field costs nothing); typing `/rename` into the PTY.\n\n## Verification\n\n- Live in a DEV INSTANCE with Claude Code 2.1.261: AUTO-TITLE's `Say Pong Reply` appeared in Claude's prompt box on the next prompt; `/rename Live Sync Check` retitled the row in ~4 s.\n- Tests: `pty/title.rs` scanner (6), `session_title.rs` (7, one against a real `Daemon`), store, receiver, PTY, and E2E PTY `claude_session_title_and_row_name_stay_tied`. `auto_title_instruction_and_rename_flow` now expects the push on the post-title prompt; `migration_22_adds_pr_context_without_backfill` asserts `MIGRATIONS.len()`.\n- `cargo test --workspace --no-fail-fast` green (851 tests, nine binaries), clippy and fmt clean, `make memory-check recall-eval terms-check` ok.\n\n## Behavior you will notice\n\nEvery titled Claude row names its Claude session on the next prompt, so `/resume` lists start showing nebula titles. Existing rows start unsynced and pick this up on their next prompt. Needs the DAEMON restarted on the new build.\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_011Z4TLnGLTY5muye9PcAKsT\n",
+    "changedFiles": 15,
+    "closedAt": "2026-09-05T03:30:01Z",
+    "closingIssuesReferences": [
+      {
+        "id": "I_kwDOTu3A5c8AAAABPR3rPw",
+        "number": 25,
+        "repository": {
+          "id": "R_kgDOTu3A5Q",
+          "name": "nebula",
+          "owner": {
+            "id": "O_kgDOEKJkvQ",
+            "login": "AgentSystemLabs"
+          }
+        },
+        "url": "https://github.com/AgentSystemLabs/nebula/issues/25"
+      }
+    ],
+    "comments": [],
+    "commits": [
+      {
+        "authoredDate": "2026-09-04T23:01:19Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5.1"
+          }
+        ],
+        "committedDate": "2026-09-04T23:01:19Z",
+        "messageBody": "\u2026 the row's name reaches Claude\n\nCLAUDE TITLE SYNC (issue #25), Claude only. Claude Code fires no hook for\n/rename; it rewrites the PTY window title and writes custom-title.json beside\nthe transcript. A new OSC 0/2 TitleScanner (pty/title.rs) cues the DAEMON to\nread that file (session_title.rs), which adopts a title Claude did not hold\nbefore as a user RENAME. The comparison is against the title last seen from\nClaude (new claude_title column, migration 23), never the row's name, so an\n`r` rename made since survives re-reads. The other way, the HOOK RECEIVER's\nUserPromptSubmit reply carries a settled row name back to Claude as\nhookSpecificOutput.sessionTitle, which Claude persists exactly like /rename,\nso /resume and /rc show what the SESSIONS PANEL shows.\n\nVerified live on Claude Code 2.1.261 in a DEV INSTANCE. Unit tests for the\nscanner, the reader, the store and the receiver, a daemon-level sync test and\nan E2E PTY test; the auto-title e2e now expects the push on the post-title\nprompt, and the migration test asserts MIGRATIONS.len(). Docs updated.\n\nCloses #25\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_011Z4TLnGLTY5muye9PcAKsT",
+        "messageHeadline": "Tie a Claude SESSION's own name to its row: /rename retitles the row,\u2026",
+        "oid": "c1caad84f3480e4e4649bbecd20e32386a76de55"
+      },
+      {
+        "authoredDate": "2026-09-04T23:01:19Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5.1"
+          }
+        ],
+        "committedDate": "2026-09-04T23:01:19Z",
+        "messageBody": "MEMORY LOG entry for issue #25 (8 gotchas): /rename fires no hook, the\nundocumented sessionTitle hook-reply field, the window title as cue not\nsource, the E2E PTY echoed-marker trap, and a headless DEV INSTANCE recipe.\nFour standing gotchas added under HOOK EVENT, HOOK RECEIVER, E2E PTY and DEV\nINSTANCE; one line the GUARD HOOK now enforces retired, one change-specific\nline demoted, two STUB AGENT lines merged, a stray blank removed. TERMS:\nCLAUDE TITLE SYNC ledgered, \"session name\" aliased to RENAME, the RENAME,\nAUTO-TITLE and HOOK RECEIVER rows updated, HOOK ROUTE repointed at\nreceive_claude_hook.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_011Z4TLnGLTY5muye9PcAKsT",
+        "messageHeadline": "Log the CLAUDE TITLE SYNC task and ledger the candidate",
+        "oid": "69f60d58b5507be3272bfabe094113ad06c044d0"
+      },
+      {
+        "authoredDate": "2026-09-05T02:47:58Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5.1"
+          }
+        ],
+        "committedDate": "2026-09-05T02:47:58Z",
+        "messageBody": "\u2026LI handlers\n\nmain renamed nothing the PR relied on but added a fourth HOOK ROUTE\n(`/api/hooks/pi`) on the old `receive_injectable_hook`, while the PR had\nreplaced that pair with one handler per CLI (`HookCli`). The merge keeps\nthe PR's shape and gives pi its own `HookCli::Pi` (injectable, no session\ntitle of its own) and `receive_pi_hook`.\n\nmain also moved `forward_pty` out of `server.rs` into `attach.rs`, so the\nPR's `PtyEvent::Title` arm is re-applied in `attach::step`.\n\nMEMORY LOG index, STANDING GOTCHAS (back at the 300-line cap by folding\ntwo E2E PTY lines and two DEV INSTANCE lines; the zsh `=word` line takes\nmain's shorter form now that a GUARD HOOK rule enforces it) and TERMS.md\n(main's NEW and HOOK ROUTE rows, the PR's RENAME row and CLAUDE TITLE\nSYNC candidate; the HOOK ROUTE `Where` now points at `receive_hook` /\n`HookCli::dialect`) keep both sides.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_013a1eVvd6pFfbCGG25fvi4M",
+        "messageHeadline": "Merge main into session-title-sync: the Pi HOOK ROUTE meets the per-C\u2026",
+        "oid": "e17340b22b6ac9db5be96b7d0becd8fa8fb93670"
+      },
+      {
+        "authoredDate": "2026-09-05T02:48:48Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5.1"
+          }
+        ],
+        "committedDate": "2026-09-05T02:48:48Z",
+        "messageBody": "Only the TERMS.md Alias index collided: the PR's \"session name\" alias for RENAME sits above main's extended WORKTREE RELOCATION / NEBULA WORKTREE line.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_013a1eVvd6pFfbCGG25fvi4M",
+        "messageHeadline": "Merge origin/main (PRs #27 and #28) into session-title-sync",
+        "oid": "2b74ebbb5054d5d0268bdc081f85ea9a2ff44ba3"
+      },
+      {
+        "authoredDate": "2026-09-05T03:26:53Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          }
+        ],
+        "committedDate": "2026-09-05T03:26:53Z",
+        "messageBody": "\u2026ange\n\nmain now addresses CreatePrAgent to the PROJECT plus the PR's head branch\n(PROTOCOL VERSION 38) and gives a PR SESSION its own WORKTREE. That lands\nin registry.rs beside the CLAUDE TITLE SYNC hooks with no overlap; the one\nconflict was the MEMORY LOG index, resolved as all three entry lines.",
+        "messageHeadline": "Merge origin/main into session-title-sync: the PR SESSION WORKTREE ch\u2026",
+        "oid": "515c101d30fb28f15a613bc9f56ba4cc2c54d343"
+      }
+    ],
+    "createdAt": "2026-09-04T23:01:22Z",
+    "deletions": 43,
+    "files": [
+      {
+        "additions": 1,
+        "changeType": "MODIFIED",
+        "deletions": 0,
+        "path": ".claude/MEMORY.md"
+      },
+      {
+        "additions": 66,
+        "changeType": "ADDED",
+        "deletions": 0,
+        "path": ".claude/memory/entries/2026-09-04-claude-s-rename-and-the-session-row-name-are-tied-issue-25.md"
+      },
+      {
+        "additions": 7,
+        "changeType": "MODIFIED",
+        "deletions": 7,
+        "path": ".claude/memory/gotchas.md"
+      },
+      {
+        "additions": 3,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": "README.md"
+      },
+      {
+        "additions": 6,
+        "changeType": "MODIFIED",
+        "deletions": 4,
+        "path": "TERMS.md"
+      },
+      {
+        "additions": 3,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": "crates/nebula-daemon/src/attach.rs"
+      },
+      {
+        "additions": 207,
+        "changeType": "MODIFIED",
+        "deletions": 25,
+        "path": "crates/nebula-daemon/src/hooks/mod.rs"
+      },
+      {
+        "additions": 9,
+        "changeType": "MODIFIED",
+        "deletions": 0,
+        "path": "crates/nebula-daemon/src/lib.rs"
+      },
+      {
+        "additions": 58,
+        "changeType": "MODIFIED",
+        "deletions": 0,
+        "path": "crates/nebula-daemon/src/pty/mod.rs"
+      },
+      {
+        "additions": 225,
+        "changeType": "ADDED",
+        "deletions": 0,
+        "path": "crates/nebula-daemon/src/pty/title.rs"
+      },
+      {
+        "additions": 16,
+        "changeType": "MODIFIED",
+        "deletions": 2,
+        "path": "crates/nebula-daemon/src/registry.rs"
+      },
+      {
+        "additions": 476,
+        "changeType": "ADDED",
+        "deletions": 0,
+        "path": "crates/nebula-daemon/src/session_title.rs"
+      },
+      {
+        "additions": 154,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": "crates/nebula-daemon/src/store.rs"
+      },
+      {
+        "additions": 194,
+        "changeType": "MODIFIED",
+        "deletions": 2,
+        "path": "crates/nebula/tests/e2e_pty.rs"
+      },
+      {
+        "additions": 10,
+        "changeType": "MODIFIED",
+        "deletions": 0,
+        "path": "docs/how-it-works.md"
+      }
+    ],
+    "headRefName": "session-title-sync",
+    "headRefOid": "515c101d30fb28f15a613bc9f56ba4cc2c54d343",
+    "isDraft": false,
+    "labels": [],
+    "mergeCommit": {
+      "oid": "08f71602a8a84bb6a358d3c285c94334c4d3bd1f"
+    },
+    "mergedAt": "2026-09-05T03:30:01Z",
+    "mergedBy": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "milestone": null,
+    "number": 26,
+    "reviewRequests": [],
+    "reviews": [],
+    "state": "MERGED",
+    "title": "Tie a Claude session's name to its row: /rename retitles the row, the row's name reaches Claude",
+    "updatedAt": "2026-09-05T03:30:01Z",
+    "url": "https://github.com/AgentSystemLabs/nebula/pull/26"
+  },
+  "review_comments": []
+}
