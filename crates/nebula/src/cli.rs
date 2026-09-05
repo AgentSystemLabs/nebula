@@ -31,8 +31,8 @@ use clap::{Parser, Subcommand};
         Agents keep running after the TUI quits, and their scrollback is replayed \
         when you come back.\n\n\
         A bare `nebula` opens the TUI. The commands below drive the same tree from \
-        a shell; `rename`, `worktree` and `spawn` are the ones an agent runs on \
-        your behalf from inside a session.",
+        a shell; `rename`, `worktree`, `spawn` and `open` are the ones an agent \
+        runs on your behalf from inside a session.",
     after_help = ROOT_EXAMPLES
 )]
 pub(crate) struct Cli {
@@ -154,6 +154,19 @@ pub(crate) enum Command {
         /// Defaults to the harness this session is running.
         #[arg(long, value_name = "KIND", value_parser = parse_agent_kind)]
         kind: Option<nebula_core::AgentKind>,
+    },
+    /// Show files to the user inside this nebula.
+    ///
+    /// Run from inside a nebula agent session; agents run it when you ask to
+    /// see a file, or to put their own work in front of you. The files open
+    /// in nebula's file tabs — a modal with one tab per file, the focused one
+    /// previewed, Enter editing it — in every nebula attached to this
+    /// daemon, and this session carries on untouched.
+    #[command(after_help = OPEN_EXAMPLES)]
+    Open {
+        /// The files to show, relative to the current directory or absolute.
+        #[arg(required = true, num_args = 1.., value_name = "FILE")]
+        files: Vec<String>,
     },
     /// Manage workspaces — named groups of projects.
     ///
@@ -305,6 +318,11 @@ const SPAWN_EXAMPLES: &str = "\
 Examples:
   nebula spawn \"port the tests to the new fixture\"
   nebula spawn --kind codex \"review the diff on this branch\"";
+
+const OPEN_EXAMPLES: &str = "\
+Examples:
+  nebula open README.md                one tab
+  nebula open src/main.rs docs/keys.md a tab each, in this order";
 
 const WORKSPACE_EXAMPLES: &str = "\
 Examples:

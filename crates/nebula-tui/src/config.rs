@@ -57,7 +57,10 @@ pub const DEFAULT_CHOICE: &str = "default";
 
 /// Model/effort choices for the new-session submenus and the settings
 /// overlay. [`DEFAULT_CHOICE`] everywhere means "don't pass the flag — let
-/// the CLI pick" and is what the daemon sees as None.
+/// the CLI pick" and is what the daemon sees as None. `CLAUDE_MODELS` is
+/// the built-in alias list; what the pickers show is
+/// `claude_catalogue::models()`, which swaps it for `claude_models` in
+/// CONFIG.JSON or Claude Code's own `availableModels` allowlist.
 pub const CLAUDE_MODELS: &[&str] = &[DEFAULT_CHOICE, "fable", "opus", "sonnet", "haiku"];
 pub const CLAUDE_EFFORTS: &[&str] = &[DEFAULT_CHOICE, "low", "medium", "high", "xhigh", "max"];
 pub const CODEX_MODELS: &[&str] = &[
@@ -68,21 +71,39 @@ pub const CODEX_MODELS: &[&str] = &[
     "gpt-5.5",
 ];
 pub const CODEX_EFFORTS: &[&str] = &[DEFAULT_CHOICE, "minimal", "low", "medium", "high", "xhigh"];
+/// Pi's `--model` takes a fuzzy pattern across every provider it has
+/// credentials for (`opus` finds `anthropic/claude-opus-…`), so the list is
+/// families, not ids; a hand-edited `provider/id` passes through verbatim.
+pub const PI_MODELS: &[&str] = &[DEFAULT_CHOICE, "opus", "sonnet", "haiku", "gpt-5.5"];
+/// Pi's `--thinking` levels, in the CLI's own order.
+pub const PI_EFFORTS: &[&str] = &[
+    DEFAULT_CHOICE,
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+];
 
 /// The `quick_prompt_kind` choices — every AGENT KIND, by the name the
 /// config file stores. Spelled out rather than derived because
 /// [`cycle_choice`] works over `&'static [&'static str]`;
 /// `quick_prompt_kinds_are_every_agent_kind` keeps it honest.
-pub const AGENT_KIND_NAMES: &[&str] = &["claude", "codex", "cursor"];
+pub const AGENT_KIND_NAMES: &[&str] = &["claude", "codex", "cursor", "pi"];
 
-/// Model choices for a session kind. Cursor's come from the CURSOR
+/// Model choices for a session kind. Claude's come from
+/// `claude_catalogue.rs`: CONFIG.JSON's `claude_models`, else Claude Code's
+/// `availableModels`, else [`CLAUDE_MODELS`]. Cursor's come from the CURSOR
 /// CATALOGUE (`cursor_catalogue.rs`): a seed plus a cached
 /// `cursor-agent --list-models`.
 pub fn model_choices(kind: AgentKind) -> &'static [&'static str] {
     match kind {
-        AgentKind::Claude => CLAUDE_MODELS,
+        AgentKind::Claude => crate::claude_catalogue::models(),
         AgentKind::Codex => CODEX_MODELS,
         AgentKind::Cursor => crate::cursor_catalogue::models(),
+        AgentKind::Pi => PI_MODELS,
     }
 }
 
@@ -97,6 +118,7 @@ pub fn effort_choices(kind: AgentKind, model: Option<&str>) -> &'static [&'stati
         AgentKind::Claude => CLAUDE_EFFORTS,
         AgentKind::Codex => CODEX_EFFORTS,
         AgentKind::Cursor => crate::cursor_catalogue::efforts(model),
+        AgentKind::Pi => PI_EFFORTS,
     }
 }
 
@@ -107,14 +129,14 @@ pub(crate) fn fits(value: &str, choices: &[&str]) -> bool {
 }
 
 /// The effort to launch `kind` with, given its model and the picked effort.
-/// Claude and Codex pass through. For Cursor: no family → None; an effort
+/// Claude, Codex and Pi pass through. For Cursor: no family → None; an effort
 /// the family ships → itself; anything else ("default", unset, a suffix the
 /// family lacks) → None when the bare family id exists, otherwise the
 /// family's fallback (`high` > `medium` > first) — most families have no
 /// bare id, and `--model claude-fable-5` alone is refused at spawn.
 pub fn fit_effort(kind: AgentKind, model: Option<&str>, effort: Option<String>) -> Option<String> {
     match kind {
-        AgentKind::Claude | AgentKind::Codex => effort,
+        AgentKind::Claude | AgentKind::Codex | AgentKind::Pi => effort,
         AgentKind::Cursor => {
             let family = model
                 .map(str::trim)
@@ -141,6 +163,10 @@ pub struct SettingSpec {
     pub kind: SettingKind,
     pub label: &'static str,
     pub hint: &'static str,
+    /// Section header the row sits under, as `keymap::ActionSpec::group`
+    /// is for the Hotkeys tab. Empty means the tab lists the row bare;
+    /// a tab whose rows all say so stays a flat list.
+    pub group: &'static str,
 }
 
 /// What a tab shows. Ordinary tabs are a list of value settings; the
@@ -186,6 +212,9 @@ pub enum SettingKind {
     CursorEnabled,
     CursorModel,
     CursorEffort,
+    PiEnabled,
+    PiModel,
+    PiEffort,
 }
 
 /// The tab strip, left to right. Ordered by how often a setting gets
@@ -199,21 +228,25 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::PaletteEnterAttaches,
                 label: "Search Enter attaches",
                 hint: "Enter in / search opens the session in the terminal",
+                group: "",
             },
             SettingSpec {
                 kind: SettingKind::GitInitOnCreate,
                 label: "git init new projects",
                 hint: "When adding a missing directory, run git init in it",
+                group: "",
             },
             SettingSpec {
                 kind: SettingKind::Editor,
                 label: "File editor",
                 hint: "Editor f/b/F and ⌥click launch (NEBULA_EDITOR overrides)",
+                group: "",
             },
             SettingSpec {
                 kind: SettingKind::CloseFinderOnOpen,
                 label: "Finder closes on open",
                 hint: "Opening a file closes f/F, so quitting the editor is one Esc",
+                group: "",
             },
         ]),
     },
@@ -224,16 +257,19 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::SkipSessionNaming,
                 label: "Skip session naming",
                 hint: "New agents skip the name prompt and take the auto-title the agent sets",
+                group: "",
             },
             SettingSpec {
                 kind: SettingKind::SessionIdleTimeout,
                 label: "Idle session timeout",
                 hint: "Kill idle sessions in unviewed worktrees (busy ones spared; off disables)",
+                group: "",
             },
             SettingSpec {
                 kind: SettingKind::DoneSound,
                 label: "Done sound",
                 hint: "Ding when a turn finishes: off, the terminal bell, or a macOS system sound",
+                group: "",
             },
         ]),
     },
@@ -244,86 +280,123 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::Theme,
                 label: "Color theme",
                 hint: "Accent colors used across the panels and overlays",
+                group: "",
             },
             SettingSpec {
                 kind: SettingKind::Animations,
                 label: "Animations",
                 hint: "Status text sweep and splash motion (off = fewer repaints)",
+                group: "",
             },
             SettingSpec {
                 kind: SettingKind::ShowWorkspaces,
                 label: "Workspaces bar",
                 hint: "Show the Workspaces tab bar across the top (Shift+W toggles)",
+                group: "",
             },
             SettingSpec {
                 kind: SettingKind::HideProjects,
                 label: "Projects panel",
                 hint: "Show or hide the Projects panel (Shift+P toggles)",
+                group: "",
             },
             SettingSpec {
                 kind: SettingKind::HideWorktrees,
                 label: "Worktrees panel",
                 hint: "Show or hide the Worktrees panel (Shift+B toggles)",
+                group: "",
             },
         ]),
     },
+    // Grouped per harness: the two cross-kind quick prompt rows first,
+    // then one section per agent kind holding its enabled toggle and
+    // its model / effort defaults, in that order.
     SettingsTab {
         title: "Agents",
         body: TabBody::Values(&[
             SettingSpec {
                 kind: SettingKind::QuickPromptKind,
-                label: "Quick prompt agent",
+                label: "Agent",
                 hint: "Harness the quick prompt hotkey launches, with that kind's model/effort",
+                group: "Quick prompt",
             },
             SettingSpec {
                 kind: SettingKind::QuickPromptFocus,
-                label: "Quick prompt focus",
+                label: "Focus",
                 hint: "Enter the new session's terminal on launch (off = just select its row)",
+                group: "Quick prompt",
             },
             SettingSpec {
                 kind: SettingKind::ClaudeEnabled,
-                label: "Claude enabled",
+                label: "Enabled",
                 hint: "Offer Claude in the New session picker (off hides it; existing sessions keep running)",
+                group: "Claude",
             },
             SettingSpec {
                 kind: SettingKind::ClaudeModel,
-                label: "Claude model",
-                hint: "Default model for new Claude sessions (default = CLI's pick)",
+                label: "Model",
+                hint: "Default model; rows follow Claude's availableModels or config.json claude_models",
+                group: "Claude",
             },
             SettingSpec {
                 kind: SettingKind::ClaudeEffort,
-                label: "Claude effort",
+                label: "Effort",
                 hint: "Default reasoning effort for new Claude sessions",
+                group: "Claude",
             },
             SettingSpec {
                 kind: SettingKind::CodexEnabled,
-                label: "Codex enabled",
+                label: "Enabled",
                 hint: "Offer Codex in the New session picker (off hides it; existing sessions keep running)",
+                group: "Codex",
             },
             SettingSpec {
                 kind: SettingKind::CodexModel,
-                label: "Codex model",
+                label: "Model",
                 hint: "Default model for new Codex sessions (default = CLI's pick)",
+                group: "Codex",
             },
             SettingSpec {
                 kind: SettingKind::CodexEffort,
-                label: "Codex effort",
+                label: "Effort",
                 hint: "Default reasoning effort for new Codex sessions",
+                group: "Codex",
             },
             SettingSpec {
                 kind: SettingKind::CursorEnabled,
-                label: "Cursor enabled",
+                label: "Enabled",
                 hint: "Offer Cursor in the New session picker (off hides it; existing sessions keep running)",
+                group: "Cursor",
             },
             SettingSpec {
                 kind: SettingKind::CursorModel,
-                label: "Cursor model",
+                label: "Model",
                 hint: "Default model family for new Cursor sessions (default = CLI's pick)",
+                group: "Cursor",
             },
             SettingSpec {
                 kind: SettingKind::CursorEffort,
-                label: "Cursor effort",
+                label: "Effort",
                 hint: "Effort (and -fast) variant of the chosen Cursor model; n/a while it is default or auto",
+                group: "Cursor",
+            },
+            SettingSpec {
+                kind: SettingKind::PiEnabled,
+                label: "Enabled",
+                hint: "Offer Pi in the New session picker (off hides it; existing sessions keep running)",
+                group: "Pi",
+            },
+            SettingSpec {
+                kind: SettingKind::PiModel,
+                label: "Model",
+                hint: "Default --model pattern for new Pi sessions (default = CLI's pick)",
+                group: "Pi",
+            },
+            SettingSpec {
+                kind: SettingKind::PiEffort,
+                label: "Effort",
+                hint: "Default --thinking level for new Pi sessions",
+                group: "Pi",
             },
         ]),
     },
@@ -425,26 +498,39 @@ impl SettingsRow {
 
 pub fn settings_rows(tab: usize) -> Vec<SettingsRow> {
     match SETTINGS_TABS.get(tab).map(|t| t.body) {
-        Some(TabBody::Values(settings)) => (0..settings.len()).map(SettingsRow::Setting).collect(),
-        Some(TabBody::Hotkeys) => {
-            // The action table is already grouped; emit a header whenever
-            // the group name changes.
-            let mut rows = Vec::new();
-            let mut group: Option<&'static str> = None;
-            for (i, spec) in crate::keymap::ACTIONS.iter().enumerate() {
-                if group != Some(spec.group) {
-                    if group.is_some() {
-                        rows.push(SettingsRow::Blank);
-                    }
-                    rows.push(SettingsRow::Header(spec.group));
-                    group = Some(spec.group);
-                }
-                rows.push(SettingsRow::Hotkey(i));
-            }
-            rows
+        Some(TabBody::Values(settings)) => {
+            grouped(settings.iter().map(|s| s.group), SettingsRow::Setting)
         }
+        Some(TabBody::Hotkeys) => grouped(
+            crate::keymap::ACTIONS.iter().map(|s| s.group),
+            SettingsRow::Hotkey,
+        ),
         None => Vec::new(),
     }
+}
+
+/// Lays a table that is already in group order out under its section
+/// headers: a header whenever the group name changes, a blank line
+/// before every header but the first, and no header at all for a row
+/// whose group is empty — so a tab with no groups is the bare list it
+/// always was.
+fn grouped(
+    groups: impl Iterator<Item = &'static str>,
+    row: fn(usize) -> SettingsRow,
+) -> Vec<SettingsRow> {
+    let mut rows = Vec::new();
+    let mut current: Option<&'static str> = None;
+    for (i, group) in groups.enumerate() {
+        if !group.is_empty() && current != Some(group) {
+            if !rows.is_empty() {
+                rows.push(SettingsRow::Blank);
+            }
+            rows.push(SettingsRow::Header(group));
+            current = Some(group);
+        }
+        rows.push(row(i));
+    }
+    rows
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -517,19 +603,31 @@ pub struct Config {
     /// models the pickers don't list. Cursor's pair is a family plus the
     /// effort suffix the daemon joins onto it (see `cursor_catalogue.rs`).
     pub claude_model: String,
+    /// The Claude model rows the pickers, the AGENTS TAB and the PRESET
+    /// EDITOR offer, verbatim, in place of the built-in aliases — for an
+    /// organization allowlist or a provider (Bedrock, Vertex, a gateway)
+    /// whose ids the aliases don't reach: `["claude-sonnet-5",
+    /// "us.anthropic.claude-opus-5-v1:0"]`. Empty (the default) means the
+    /// list follows Claude Code's own `availableModels` when one is on
+    /// disk, else the aliases; see `claude_catalogue.rs`. Hand-edited only.
+    pub claude_models: Vec<String>,
     pub claude_effort: String,
     pub codex_model: String,
     pub codex_effort: String,
     pub cursor_model: String,
     pub cursor_effort: String,
+    /// Pi's pair: a `--model` pattern and a `--thinking` level.
+    pub pi_model: String,
+    pub pi_effort: String,
     /// Which AGENT KINDS the NEW SESSION PICKER offers. Off leaves that
-    /// harness out of the picker (and, for Claude, out of the PR SESSION
-    /// launch and the standing PREWARM POOL slot); sessions that already
+    /// harness out of the picker and the PR SESSION picker (and, for
+    /// Claude, out of the standing PREWARM POOL slot); sessions that already
     /// exist keep attaching, resuming and restarting as before. All on by
     /// default, so a config predating the keys hides nothing.
     pub claude_enabled: bool,
     pub codex_enabled: bool,
     pub cursor_enabled: bool,
+    pub pi_enabled: bool,
     /// Which AGENT KIND the QUICK PROMPT hotkey launches. Its model and
     /// effort come from that kind's own defaults above, so the setting is
     /// one name, not a third model/effort pair. Read through
@@ -568,14 +666,18 @@ impl Default for Config {
             hide_projects: false,
             hide_worktrees: false,
             claude_model: DEFAULT_CHOICE.into(),
+            claude_models: Vec::new(),
             claude_effort: DEFAULT_CHOICE.into(),
             codex_model: DEFAULT_CHOICE.into(),
             codex_effort: DEFAULT_CHOICE.into(),
             cursor_model: DEFAULT_CHOICE.into(),
             cursor_effort: DEFAULT_CHOICE.into(),
+            pi_model: DEFAULT_CHOICE.into(),
+            pi_effort: DEFAULT_CHOICE.into(),
             claude_enabled: true,
             codex_enabled: true,
             cursor_enabled: true,
+            pi_enabled: true,
             quick_prompt_kind: AgentKind::Claude.as_str().into(),
             quick_prompt_focus: false,
             keybindings: BTreeMap::new(),
@@ -585,7 +687,13 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> Self {
-        load_from(&settings_path())
+        let cfg = load_from(&settings_path());
+        // The Claude model rows follow `claude_models` live, as every
+        // other hand edit does. Not under test: the list is process-global
+        // and a test that never pinned the path would install the dev's.
+        #[cfg(not(test))]
+        crate::claude_catalogue::sync_config(&cfg.claude_models);
+        cfg
     }
 
     /// Patch this config's known keys into the JSON file, preserving any
@@ -681,6 +789,10 @@ impl Config {
         );
         obj.insert("claude_model".into(), serde_json::json!(self.claude_model));
         obj.insert(
+            "claude_models".into(),
+            serde_json::json!(self.claude_models),
+        );
+        obj.insert(
             "claude_effort".into(),
             serde_json::json!(self.claude_effort),
         );
@@ -691,6 +803,8 @@ impl Config {
             "cursor_effort".into(),
             serde_json::json!(self.cursor_effort),
         );
+        obj.insert("pi_model".into(), serde_json::json!(self.pi_model));
+        obj.insert("pi_effort".into(), serde_json::json!(self.pi_effort));
         obj.insert(
             "claude_enabled".into(),
             serde_json::json!(self.claude_enabled),
@@ -703,6 +817,7 @@ impl Config {
             "cursor_enabled".into(),
             serde_json::json!(self.cursor_enabled),
         );
+        obj.insert("pi_enabled".into(), serde_json::json!(self.pi_enabled));
         obj.insert(
             "quick_prompt_kind".into(),
             serde_json::json!(self.quick_prompt_kind),
@@ -744,6 +859,7 @@ impl Config {
             AgentKind::Claude => &self.claude_model,
             AgentKind::Codex => &self.codex_model,
             AgentKind::Cursor => &self.cursor_model,
+            AgentKind::Pi => &self.pi_model,
         };
         non_default(value)
     }
@@ -756,6 +872,7 @@ impl Config {
             AgentKind::Claude => &self.claude_effort,
             AgentKind::Codex => &self.codex_effort,
             AgentKind::Cursor => &self.cursor_effort,
+            AgentKind::Pi => &self.pi_effort,
         };
         fit_effort(kind, Some(&self.cursor_model), non_default(value))
     }
@@ -766,6 +883,7 @@ impl Config {
             AgentKind::Claude => self.claude_enabled,
             AgentKind::Codex => self.codex_enabled,
             AgentKind::Cursor => self.cursor_enabled,
+            AgentKind::Pi => self.pi_enabled,
         }
     }
 
@@ -824,9 +942,12 @@ impl Config {
                     self.cursor_effort.clone()
                 }
             }
+            SettingKind::PiModel => self.pi_model.clone(),
+            SettingKind::PiEffort => self.pi_effort.clone(),
             SettingKind::ClaudeEnabled => on_off(self.claude_enabled).into(),
             SettingKind::CodexEnabled => on_off(self.codex_enabled).into(),
             SettingKind::CursorEnabled => on_off(self.cursor_enabled).into(),
+            SettingKind::PiEnabled => on_off(self.pi_enabled).into(),
             SettingKind::QuickPromptKind => self.quick_prompt_kind.clone(),
             SettingKind::QuickPromptFocus => on_off(self.quick_prompt_focus).into(),
         }
@@ -879,7 +1000,8 @@ impl Config {
                 self.hide_worktrees = !self.hide_worktrees;
             }
             SettingKind::ClaudeModel => {
-                self.claude_model = cycle_choice(&self.claude_model, CLAUDE_MODELS, step).into();
+                self.claude_model =
+                    cycle_choice(&self.claude_model, model_choices(AgentKind::Claude), step).into();
             }
             SettingKind::ClaudeEffort => {
                 self.claude_effort = cycle_choice(&self.claude_effort, CLAUDE_EFFORTS, step).into();
@@ -898,6 +1020,15 @@ impl Config {
             }
             SettingKind::CursorEnabled => {
                 self.cursor_enabled = !self.cursor_enabled;
+            }
+            SettingKind::PiEnabled => {
+                self.pi_enabled = !self.pi_enabled;
+            }
+            SettingKind::PiModel => {
+                self.pi_model = cycle_choice(&self.pi_model, PI_MODELS, step).into();
+            }
+            SettingKind::PiEffort => {
+                self.pi_effort = cycle_choice(&self.pi_effort, PI_EFFORTS, step).into();
             }
             SettingKind::CursorModel => {
                 self.cursor_model =
@@ -1460,7 +1591,7 @@ mod tests {
         assert!(!cfg.kind_enabled(AgentKind::Codex));
         assert_eq!(
             cfg.enabled_kinds(),
-            vec![AgentKind::Claude, AgentKind::Cursor],
+            vec![AgentKind::Claude, AgentKind::Cursor, AgentKind::Pi],
             "the disabled kind drops out, order kept"
         );
         // ←/→ toggle a bool just like Enter does.
@@ -1478,11 +1609,11 @@ mod tests {
         assert!(loaded.cursor_enabled);
         // A config predating the keys offers every harness.
         let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(cfg.enabled_kinds().len(), 3);
+        assert_eq!(cfg.enabled_kinds().len(), AgentKind::ALL.len());
 
         // Every kind off is representable (a hand edit), and reads as empty.
         let cfg: Config = serde_json::from_str(
-            r#"{"claude_enabled":false,"codex_enabled":false,"cursor_enabled":false}"#,
+            r#"{"claude_enabled":false,"codex_enabled":false,"cursor_enabled":false,"pi_enabled":false}"#,
         )
         .unwrap();
         assert!(cfg.enabled_kinds().is_empty());
@@ -1508,6 +1639,22 @@ mod tests {
         assert_eq!(
             cfg.default_effort(AgentKind::Codex).as_deref(),
             Some("high")
+        );
+        // Pi passes both through like Claude: a pattern and a thinking level.
+        assert_eq!(cfg.default_model(AgentKind::Pi), None);
+        assert_eq!(cfg.default_effort(AgentKind::Pi), None);
+        cfg.pi_model = "sonnet".into();
+        cfg.pi_effort = "xhigh".into();
+        assert_eq!(cfg.default_model(AgentKind::Pi).as_deref(), Some("sonnet"));
+        assert_eq!(cfg.default_effort(AgentKind::Pi).as_deref(), Some("xhigh"));
+        let (tab, row) = locate(SettingKind::PiEffort).unwrap();
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.value_label(SettingKind::PiEffort), "max");
+        cfg.cycle(tab, row, 1);
+        assert_eq!(
+            cfg.value_label(SettingKind::PiEffort),
+            DEFAULT_CHOICE,
+            "wraps"
         );
         // Cursor: the family is the model; the effort only counts when
         // that family ships it.
@@ -1643,6 +1790,36 @@ mod tests {
         );
     }
 
+    /// `claude_models` is hand-edited only: empty by default, written back
+    /// as `[]` so the key is discoverable, and read back verbatim — a
+    /// Bedrock id or an org's full model name survives the round trip.
+    #[test]
+    fn claude_models_key_round_trips_and_defaults_empty() {
+        assert!(Config::default().claude_models.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        Config::default().save_to(&path).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["claude_models"], serde_json::json!([]));
+
+        std::fs::write(
+            &path,
+            r#"{"claude_models": ["claude-sonnet-5", "us.anthropic.claude-opus-5-v1:0"]}"#,
+        )
+        .unwrap();
+        let cfg = load_from(&path);
+        assert_eq!(
+            cfg.claude_models,
+            vec![
+                "claude-sonnet-5".to_string(),
+                "us.anthropic.claude-opus-5-v1:0".to_string()
+            ]
+        );
+        cfg.save_to(&path).unwrap();
+        assert_eq!(load_from(&path).claude_models, cfg.claude_models);
+    }
+
     #[test]
     fn save_persists_model_effort_keys() {
         let dir = tempfile::tempdir().unwrap();
@@ -1718,17 +1895,75 @@ mod tests {
             );
         }
 
-        // Value tabs are a bare list; only Hotkeys carries headers.
+        // A value tab carries headers exactly when its rows name groups;
+        // Hotkeys always does.
         for (t, tab) in SETTINGS_TABS.iter().enumerate() {
             let headers = settings_rows(t)
                 .into_iter()
                 .filter(|row| matches!(row, SettingsRow::Header(_)))
                 .count();
             match tab.body {
-                TabBody::Values(_) => assert_eq!(headers, 0, "{}", tab.title),
+                TabBody::Values(settings) => {
+                    let grouped = settings.iter().any(|s| !s.group.is_empty());
+                    assert_eq!(headers > 0, grouped, "{}", tab.title);
+                }
                 TabBody::Hotkeys => assert!(headers > 0, "hotkeys tab groups its rows"),
             }
         }
+    }
+
+    #[test]
+    fn agents_tab_groups_its_rows_per_harness() {
+        let (tab, _) = locate(SettingKind::ClaudeEnabled).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Agents");
+
+        // Read the rows back the way the screen shows them: a header,
+        // then the labels under it, with a blank between sections.
+        let mut sections: Vec<(&str, Vec<&str>)> = Vec::new();
+        for row in settings_rows(tab) {
+            match row {
+                SettingsRow::Header(title) => sections.push((title, Vec::new())),
+                SettingsRow::Setting(i) => sections
+                    .last_mut()
+                    .expect("every Agents row sits under a header")
+                    .1
+                    .push(setting_at(tab, i).unwrap().label),
+                SettingsRow::Blank => assert!(!sections.is_empty(), "no leading blank"),
+                SettingsRow::Hotkey(_) => unreachable!(),
+            }
+        }
+        assert_eq!(
+            sections,
+            vec![
+                ("Quick prompt", vec!["Agent", "Focus"]),
+                ("Claude", vec!["Enabled", "Model", "Effort"]),
+                ("Codex", vec!["Enabled", "Model", "Effort"]),
+                ("Cursor", vec!["Enabled", "Model", "Effort"]),
+                ("Pi", vec!["Enabled", "Model", "Effort"]),
+            ]
+        );
+
+        // The header a row sits under names the kind whose setting it is,
+        // so the shortened labels can never drift onto the wrong harness.
+        for (_, _, spec) in all_settings().filter(|(t, _, _)| *t == tab) {
+            let kind = format!("{:?}", spec.kind);
+            let harness = match spec.group {
+                "Quick prompt" => "QuickPrompt",
+                other => other,
+            };
+            assert!(
+                kind.starts_with(harness),
+                "{kind} sits under {}",
+                spec.group
+            );
+        }
+
+        // One blank line separates the sections and nothing else does.
+        let blanks = settings_rows(tab)
+            .into_iter()
+            .filter(|row| *row == SettingsRow::Blank)
+            .count();
+        assert_eq!(blanks, sections.len() - 1);
     }
 
     #[test]

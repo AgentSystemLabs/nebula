@@ -37,7 +37,7 @@ Verified each claim against the cited lines. Verified the page renders by headle
   Do not "fix" this by hardening the comparison.
 - **`validate_pr_url` (`registry.rs:2868`) accepts any host** — it checks http(s), no whitespace,
   <4 KiB and the substring `/pull/`, nothing else. That string is persisted and re-composed into
-  `--append-system-prompt` on every spawn and RESUME (`claude_pr_system_prompt`,
+  `--append-system-prompt` on every spawn and RESUME (`claude_pr_system_prompt`, since 2026-09-04 `pr_scope::rule`,
   `registry.rs:2699`), so it is a restart-surviving prompt-injection channel (whitespace-free only).
 - **`reparent_agent_to_cwd` (`registry.rs:1577`) is bounded to worktrees of the same project**, so
   forged-`cwd` hooks are a UI-integrity problem, not a path escape. Say so rather than overstating it.

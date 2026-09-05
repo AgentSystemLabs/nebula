@@ -52,18 +52,28 @@ pub enum AgentKind {
     Claude,
     Codex,
     Cursor,
+    /// pi.dev's coding agent: the `pi` CLI (npm
+    /// `@earendil-works/pi-coding-agent`). Status comes from a managed
+    /// TypeScript extension rather than shell hooks.
+    Pi,
 }
 
 impl AgentKind {
     /// Every kind, for callers that must cover all of them (menus, the
     /// boot-time CLI probe warm) and should fail to compile if one is added.
-    pub const ALL: [AgentKind; 3] = [AgentKind::Claude, AgentKind::Codex, AgentKind::Cursor];
+    pub const ALL: [AgentKind; 4] = [
+        AgentKind::Claude,
+        AgentKind::Codex,
+        AgentKind::Cursor,
+        AgentKind::Pi,
+    ];
 
     pub fn as_str(&self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::Cursor => "cursor",
+            AgentKind::Pi => "pi",
         }
     }
 
@@ -72,6 +82,7 @@ impl AgentKind {
             "claude" => AgentKind::Claude,
             "codex" => AgentKind::Codex,
             "cursor" => AgentKind::Cursor,
+            "pi" => AgentKind::Pi,
             _ => return None,
         })
     }
@@ -83,6 +94,7 @@ impl AgentKind {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::Cursor => "cursor-agent",
+            AgentKind::Pi => "pi",
         }
     }
 }

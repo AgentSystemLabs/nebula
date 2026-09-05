@@ -5,7 +5,9 @@
 - **Detached daemon (tmux-style).** A background `nebula` daemon owns every PTY, so agents keep running
   when the TUI closes. The TUI is a client that attaches over a unix socket (`$XDG_RUNTIME_DIR/nebula/`
   or `/tmp/nebula-<uid>/`, mode 0700). Quit the TUI, relaunch later, and your sessions are still alive
-  with scrollback replayed.
+  with scrollback replayed. When the daemon swaps the process under a session you are looking at — a
+  restart, or the `nebula worktree` relocation at the end of a turn — the pane is rebound to the new
+  one on its own.
 - **Client and DAEMON must agree on the PROTOCOL VERSION.** IPC frames are positional msgpack, so any
   change to the shared types bumps `PROTOCOL_VERSION` (`crates/nebula-core/src/protocol.rs`) and the
   handshake refuses a mismatched pair — the DAEMON answers `Incompatible`, the TUI bails, and the
@@ -32,13 +34,15 @@
   `stat` calls (`NEBULA_WORKTREE_SYNC_MS` overrides the 2 s beat; the e2e tests turn it down to
   100 ms). This structural sync is the *only* git polling the DAEMON does — the pull request lookups
   further down are the TUI's own.
-- **Agents boot `claude`, `codex`, or `cursor-agent`.** Creating an agent (`n`) first asks which CLI to
+- **Agents boot `claude`, `codex`, `cursor-agent`, or `pi`.** Creating an agent (`n`) first asks which CLI to
   run, then spawns it in the worktree. Claude's picker can also dispatch a one-shot Cloud task as
   `claude --cloud <task>`; because Claude accepts that description as a process argument, don't put
   secrets in the Cloud task. Restored agents resume with `claude --resume <session-id>` /
   `codex resume <session-id>` / `cursor-agent --resume <session-id>` (falling back to a fresh session
-  when the old one is gone). A Claude AGENT created from a PROJECT OPEN PRS row also receives the PR URL
-  through `--append-system-prompt`; nebula persists that URL and reapplies the constraint on every spawn.
+  when the old one is gone) / `pi --session-id <session-id>` (which creates a missing id instead of
+  dying). An AGENT created from a PROJECT OPEN PRS row also receives the PR URL and a PR-only
+  work rule — Claude and Pi through `--append-system-prompt` on every spawn, Codex and Cursor as the first prompt of
+  their cold spawn (their transcripts carry it through a resume); nebula persists that URL.
 - **Status via agent-CLI hooks, not MCP.** At agent spawn, nebula merges managed hooks into the
   worktree's `.claude/settings.local.json` (Claude Code) or `.cursor/hooks.json` (Cursor CLI), and into
   `~/.codex/hooks.json` (Codex — codex records hook approvals against the hook file's path, so a
@@ -77,13 +81,22 @@
   `PermissionRequest` already covers waiting on you. Cursor gets five camelCase events —
   `sessionStart`, `beforeSubmitPrompt`, `stop`, `subagentStart`, `subagentStop` — and no permission
   event at all; nebula runs `cursor-agent --force`, so waiting-on-you is simply not detectable there
-  and a Cursor session never reaches NEEDS FEEDBACK, only busy or idle.
+  and a Cursor session never reaches NEEDS FEEDBACK, only busy or idle. Pi runs TypeScript extensions
+  instead of shell hooks, so nebula writes one managed extension into its global agent dir
+  (`~/.pi/agent/extensions/nebula.ts`, or `$PI_CODING_AGENT_DIR/extensions/` — global because pi loads
+  those without the trust prompt a per-project `.pi/extensions/` raises) that maps pi's events onto the
+  same names: `session_start` → `SessionStart`, `before_agent_start` → `UserPromptSubmit`,
+  `agent_end` → `Stop` (it fires on an abort too, so a cancelled pi turn goes green on its own), the
+  `ask_question` tool's start and end → `PreToolUse` / `PostToolUse`, and a blocking extension prompt
+  mid-run → `PermissionRequest`. The file is env-guarded, so a `pi` you run outside nebula loads it and
+  does nothing.
 - **Sessions title themselves.** Create a session with the default name and the agent renames it after
   your first prompt — a 3-4 word title describing the ask (e.g. `Fix Login Redirect`), via a
   `nebula rename <title>` command the CLI runs in its own turn (no extra API calls, no MCP server).
   Claude Code and Codex get the instruction injected through the `UserPromptSubmit` hook response — as
   `hookSpecificOutput.additionalContext`, the one envelope both read (the daemon sends it only while the
-  session is untitled); Cursor gets a managed `.cursor/rules/nebula-title.mdc` project rule instead,
+  session is untitled) — Pi's extension reads the same envelope and appends it to that run's system
+  prompt; Cursor gets a managed `.cursor/rules/nebula-title.mdc` project rule instead,
   since its hooks can't inject context. Titling is one-shot and never clobbers a name you typed or set
   with `r` — a late agent attempt is politely declined. `nebula rename --force` overrides.
 - **Ask the agent for a worktree and it moves there.** Tell a Claude session "do this in a worktree" and
@@ -93,16 +106,24 @@
   session's row under it at once, and the moment that turn ends restarts the CLI resumed inside the
   worktree, opening with a note saying where it now runs, so the conversation carries on there without
   you typing anything. Claude learns the rule from a short `--append-system-prompt` nebula passes at
-  spawn, plus a `Bash(nebula worktree:*)` permission so the command never prompts. Codex and Cursor
+  spawn, plus a `Bash(nebula worktree:*)` permission so the command never prompts; Pi gets the same
+  appended prompt and reopens on the same note. Codex and Cursor
   sessions can run the same command; they resume silent and wait for your next prompt. The restart is
   the only way there: an agent CLI can't `cd` out of the directory it was started in.
 - **Ask the agent for another session and it starts one.** Tell a Claude session "start a new nebula
   session that fixes the login redirect" and it runs `nebula spawn "<task>"`: the daemon starts a second
-  agent beside it — same worktree, same harness, model and effort unless `--kind claude|codex|cursor`
+  agent beside it — same worktree, same harness, model and effort unless `--kind claude|codex|cursor|pi`
   names another — opening on that task as its first prompt, so it is working before you look. The new
   row appears in the sessions list on its own (default name, so it titles itself), and the session you
   asked from is untouched: no restart, no focus change. Claude learns this from the same appended system
   prompt as the worktree rule, plus a `Bash(nebula spawn:*)` permission.
+- **Ask the agent to show you a file and it opens in nebula.** Say "open it" or "show me the examples"
+  and the session runs `nebula open <file>…`; every TUI attached to the daemon raises its file tabs on
+  them — a modal with one tab per file, the focused one previewed with syntax highlighting, `Enter`
+  editing it in place — so the agent puts the file in front of you instead of pasting it into the
+  reply. The CLI resolves the paths against the session's own directory and refuses a path that isn't
+  there; the daemon only checks the caller is a known session and passes the agent's checkout along as
+  the editor's working directory. Same appended prompt, plus a `Bash(nebula open:*)` permission.
 - **Everything persists in SQLite** (`~/.local/share/nebula/nebula.db` or the platform equivalent):
   projects, worktrees, agents (with kind + CLI session ids), links, workspaces, and your
   last selection.

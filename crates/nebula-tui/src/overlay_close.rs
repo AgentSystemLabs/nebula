@@ -4,7 +4,7 @@
 //! UNLOCK. The Esc arms stay beside the rest of each overlay's keys, because
 //! several of them are deliberately two-stage — the first press peels a
 //! typed filter or an open submenu and only the second closes. The other two
-//! exits live here: both need the same two facts about all fourteen
+//! exits live here: both need the same two facts about all fifteen
 //! variants, the box the overlay was last drawn in and what has to be put
 //! back when it goes, and spelling either of those out per variant is how
 //! the list drifts.
@@ -33,6 +33,7 @@ pub(crate) fn overlay_area(overlay: &Overlay) -> Rect {
         Overlay::Files(v) => v.area,
         Overlay::Grep(v) => v.area,
         Overlay::Tree(v) => v.area,
+        Overlay::FileTabs(v) => v.area,
         Overlay::Metrics(v) => v.area,
         Overlay::Hosts(v) => v.area,
         Overlay::AgentPresets(v) => v.area,
@@ -74,6 +75,7 @@ pub(crate) fn click_outside(app: &mut App, out: &mut Vec<ClientRequest>) {
             | Overlay::Files(_)
             | Overlay::Grep(_)
             | Overlay::Tree(_)
+            | Overlay::FileTabs(_)
             | Overlay::Metrics(_)
             | Overlay::Hosts(_),
         ) => app.overlay = None,
@@ -89,12 +91,25 @@ pub(crate) fn click_outside(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// live HOTKEY CAPTURE, the PRESET EDITOR nested over its list. Returns
 /// false when there was no overlay to close.
 ///
-/// This is the one exit that never stages and never hands anything back: its
+/// This is the exit that never stages and never hands anything back: its
 /// whole contract is that a rebind, a nested modal or a half-typed field can
 /// never trap the user, so it lands on the panels every time. Only the
 /// cleanup that would otherwise leave the daemon or the config wrong still
 /// runs.
+///
+/// The one exception is the FILE TABS: from their preview (and, one level
+/// up, from the editor over them — `handle_vim_key` gets that press first)
+/// Ctrl+Q steps back to the tab strip, and closes only from there — the set
+/// of files an agent put in front of the user is not lost to the press
+/// that leaves one of them. Nothing can trap the user in it: the strip's
+/// Ctrl+Q is unconditional.
 pub(crate) fn force_close(app: &mut App, out: &mut Vec<ClientRequest>) -> bool {
+    if let Some(Overlay::FileTabs(view)) = &mut app.overlay {
+        if !view.on_tabs {
+            view.on_tabs = true;
+            return true;
+        }
+    }
     let Some(overlay) = &app.overlay else {
         return false;
     };

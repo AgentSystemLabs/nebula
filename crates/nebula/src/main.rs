@@ -44,6 +44,7 @@ fn main() -> Result<()> {
         }
         Some(Command::Worktree { name, base }) => nebula_tui::run_worktree(name.join(" "), base),
         Some(Command::Spawn { task, kind }) => nebula_tui::run_spawn(task.join(" "), kind),
+        Some(Command::Open { files }) => nebula_tui::run_open(files),
         Some(Command::Browser {
             port,
             bind,

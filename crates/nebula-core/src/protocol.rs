@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 34;
+pub const PROTOCOL_VERSION: u32 = 37;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -140,17 +140,20 @@ pub enum ClientRequest {
         #[serde(default)]
         starting_prompt: Option<String>,
     },
-    /// Create a local Claude AGENT from an OPEN PRS row. The PR URL is
+    /// Create a local AGENT of any kind from an OPEN PRS row. The PR URL is
     /// persisted as launch context so every cold spawn and RESUME rebuilds
-    /// the same PR-scoped appended system prompt. Separate from CreateAgent
-    /// so ordinary callers cannot accidentally opt into a partial PR launch.
+    /// the same PR-scoped rule — Claude's appended system prompt, or the
+    /// first prompt a Codex / Cursor cold spawn opens with. Separate from
+    /// CreateAgent so ordinary callers cannot accidentally opt into a
+    /// partial PR launch.
     CreatePrAgent {
         req_id: u64,
         worktree: WorktreeId,
         name: String,
-        /// Model the Claude CLI launches with; None = Claude's own default.
+        kind: AgentKind,
+        /// Model the CLI launches with; None = the CLI's own default.
         model: Option<String>,
-        /// Reasoning effort the Claude CLI launches with; None = default.
+        /// Reasoning effort the CLI launches with; None = default.
         effort: Option<String>,
         auto_title: bool,
         pr_url: String,
@@ -230,6 +233,17 @@ pub enum ClientRequest {
         id: AgentId,
         kind: Option<AgentKind>,
         starting_prompt: String,
+    },
+    /// `nebula open <file>…`, run by the agent from inside its own session:
+    /// show these files to the user in every attached TUI's FILE TABS —
+    /// one tab per file, the focused one previewed, Enter editing it.
+    /// Paths are absolute (the CLI resolves them against its own cwd, which
+    /// is the agent's). Answered with `Ack`; the files reach every
+    /// subscriber as `FilesOpened`.
+    OpenFiles {
+        req_id: u64,
+        id: AgentId,
+        paths: Vec<PathBuf>,
     },
     /// Kills the PTY, sets archived=1.
     ArchiveAgent {
@@ -454,6 +468,16 @@ pub enum ServerEvent {
         /// turn just finished, cleared when it left `finished`.
         #[serde(default)]
         unseen: bool,
+    },
+
+    /// `nebula open` from an agent session: the files the user asked to
+    /// see, for every subscriber to raise its FILE TABS on. `root` is the
+    /// agent's worktree checkout — the editor's cwd, and what the tab
+    /// labels are relative to.
+    FilesOpened {
+        agent: AgentId,
+        root: PathBuf,
+        paths: Vec<PathBuf>,
     },
 
     // -- PTY plane (only to clients attached to that session) --

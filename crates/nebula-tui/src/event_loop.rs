@@ -1,5 +1,6 @@
 //! The main TUI loop: terminal setup/teardown, message routing, update logic.
 
+use crate::agent_picker::{self, kind_label, KindPicker};
 use crate::app::{
     clamp_selection, App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView,
     FileFinder, Focus, GrepView, HelpView, HitTarget, LinkRow, MenuAction, MenuFilter, MenuItem,
@@ -27,9 +28,14 @@ use std::io::{BufWriter, Stdout};
 use std::time::Duration;
 
 mod focus_walk;
+mod host_terminal;
 use focus_walk::{
     at_top_row, bar_return_target, double_tapped, enter_terminal_pane, enter_workspaces_bar,
     leave_workspaces_bar, panel_name, walk_focus_back, walk_focus_forward,
+};
+pub use host_terminal::restore_terminal;
+use host_terminal::{
+    on_host_resize, reassert_modes, repaint, setup_terminal, take_worker_panic, MODE_REASSERT,
 };
 
 /// Rows the Sessions column scrolls per wheel notch — one pill's stride,
@@ -203,70 +209,6 @@ pub async fn run_app(workspace: Option<String>) -> Result<Option<crate::hosts::H
     result
 }
 
-/// Whether we pushed kitty keyboard flags on the outer terminal (so restore —
-/// including the panic hook — knows to pop them).
-static KITTY_PUSHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<BufWriter<Stdout>>>> {
-    use crossterm::{execute, terminal::*};
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture,
-        crossterm::event::EnableBracketedPaste,
-        // Focus reports (mode 1004): coming back from the browser is the
-        // moment a pull request was most likely just closed there.
-        crossterm::event::EnableFocusChange,
-    )?;
-    // Kitty keyboard protocol on the outer terminal: without it, Cmd-combos
-    // never reach us and Option/Esc combos arrive ambiguous. Probe first —
-    // Terminal.app and friends don't speak it (must happen before the
-    // EventStream exists; the probe reads stdin).
-    if matches!(supports_keyboard_enhancement(), Ok(true)) {
-        use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
-        execute!(
-            stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )?;
-        KITTY_PUSHED.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    // Panic hook: restore the user's terminal before the panic message prints.
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
-        default_hook(info);
-    }));
-    // Buffered so a full-frame redraw reaches the terminal in a few large
-    // writes instead of one syscall per line (Stdout is line-buffered).
-    let writer = BufWriter::with_capacity(64 * 1024, std::io::stdout());
-    Ok(Terminal::new(CrosstermBackend::new(writer))?)
-}
-
-pub fn restore_terminal() {
-    use crossterm::{execute, terminal::*};
-    // Pop while still on the alternate screen — kitty keeps a keyboard-flag
-    // stack per screen, so the pop must land on the screen that pushed.
-    if KITTY_PUSHED.swap(false, std::sync::atomic::Ordering::Relaxed) {
-        let _ = execute!(
-            std::io::stdout(),
-            crossterm::event::PopKeyboardEnhancementFlags
-        );
-    }
-    let _ = execute!(
-        std::io::stdout(),
-        // Hand back the default pointer in case we left it col-resize
-        // (OSC 22; terminals without pointer-shape support drop it).
-        crossterm::style::Print("\x1b]22;default\x1b\\"),
-        crossterm::event::DisableFocusChange,
-        crossterm::event::DisableBracketedPaste,
-        crossterm::event::DisableMouseCapture,
-        LeaveAlternateScreen,
-    );
-    let _ = disable_raw_mode();
-}
-
 async fn main_loop(
     terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
     channels: &mut ipc::IpcChannels,
@@ -281,6 +223,10 @@ async fn main_loop(
     // The Cursor MODEL / EFFORT lists: cached `cursor-agent --list-models`
     // now, a background refresh when the cache is a day old.
     crate::cursor_catalogue::bootstrap(cfg.cursor_enabled);
+    // The Claude MODEL list: Claude Code's own `availableModels` allowlist
+    // when its settings carry one, so an org-restricted machine offers the
+    // ids the CLI will accept instead of aliases it refuses.
+    crate::claude_catalogue::bootstrap(cfg.claude_enabled);
     let mut input = crossterm::event::EventStream::new();
     let mut out: Vec<ClientRequest> = Vec::new();
     // Pointer shape last sent to the terminal (OSC 22), so hover over a
@@ -305,10 +251,19 @@ async fn main_loop(
     let (prdiff_tx, mut prdiff_rx) =
         tokio::sync::mpsc::unbounded_channel::<(u64, String, Option<String>)>();
     app.pr_diff_tx = Some(prdiff_tx);
+    // A newer nebula published on GitHub, probed off the loop at start and
+    // then on a slow beat (`update_check::interval`; the e2e tests turn it
+    // off). Only a newer version ever arrives, so the footer's indicator,
+    // once lit, survives a check that later can't ask.
+    let (update_tx, mut update_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let update_interval = crate::update_check::interval();
+    let mut next_update_check = tokio::time::Instant::now();
     let mut next_metrics_poll = tokio::time::Instant::now();
     let mut next_splash_frame = tokio::time::Instant::now();
     let mut next_sweep_frame = tokio::time::Instant::now();
     let mut next_ago_refresh = tokio::time::Instant::now() + AGO_REFRESH;
+    // The host's runtime modes, re-asked on a slow beat (see host_terminal).
+    let mut next_mode_reassert = tokio::time::Instant::now() + MODE_REASSERT;
     // Editor-modal PTY output; the channel outlives individual editor
     // spawns (VimEvent generations keep them apart).
     let (vim_tx, mut vim_rx) = tokio::sync::mpsc::unbounded_channel::<VimEvent>();
@@ -380,6 +335,13 @@ async fn main_loop(
                 }
                 next_ago_refresh = tokio::time::Instant::now() + AGO_REFRESH;
             }
+            // A host that reset itself (iTerm2's ⌘R) drops mouse reporting
+            // without a word, and a dead mouse can't report that it is
+            // dead — so re-ask on a beat rather than on a signal.
+            _ = tokio::time::sleep_until(next_mode_reassert) => {
+                let _ = reassert_modes(terminal.backend_mut());
+                next_mode_reassert = tokio::time::Instant::now() + MODE_REASSERT;
+            }
             // The selection rested past the debounce: tell the daemon what
             // the pane has been showing since the cursor landed here.
             _ = tokio::time::sleep(app.attach_delay().unwrap_or_default()),
@@ -406,6 +368,9 @@ async fn main_loop(
             ev = input.next() => match ev {
                 Some(Ok(event)) => {
                     tracing::debug!(?event, "terminal event");
+                    if matches!(event, Event::Resize(..)) {
+                        on_host_resize(terminal)?;
+                    }
                     handle_terminal_event(&mut app, event, &mut out);
                 }
                 Some(Err(_)) | None => app.should_quit = true,
@@ -440,6 +405,18 @@ async fn main_loop(
                 if let Some((project, list)) = answer {
                     note_open_prs_answer(&mut app, project, list, &mut out);
                     refresh_palette(&mut app);
+                }
+            }
+            _ = tokio::time::sleep_until(next_update_check), if update_interval.is_some() => {
+                crate::update_check::spawn(update_tx.clone());
+                next_update_check = tokio::time::Instant::now()
+                    + update_interval.unwrap_or(crate::update_check::DEFAULT_INTERVAL);
+            }
+            answer = update_rx.recv() => {
+                // Never None: `update_tx` lives as long as the loop.
+                if let Some(version) = answer {
+                    app.dirty |= app.update_available.as_deref() != Some(version.as_str());
+                    app.update_available = Some(version);
                 }
             }
             // The hover debounce: the cursor has rested on a pull request
@@ -489,6 +466,15 @@ async fn main_loop(
             handle_vim_event(&mut app, ev);
         }
         note_preview_change(&mut app, preview_before);
+
+        // A worker thread panicked: the loop is fine, the default hook's
+        // message is smeared over the alternate screen, and the crash log
+        // has the backtrace.
+        if take_worker_panic() {
+            repaint(terminal)?;
+            app.flash = Some("a background task crashed — logged to tui.log".into());
+            app.dirty = true;
+        }
 
         // Mouse handlers only record the pointer shape they want; emit the
         // OSC 22 request when it changes. Terminals without pointer-shape
@@ -1137,7 +1123,7 @@ fn sync_vim_size(app: &mut App) {
 }
 
 /// Whether a rect has been drawn large enough to size a grid to.
-fn pane_usable(area: ratatui::layout::Rect) -> bool {
+pub(crate) fn pane_usable(area: ratatui::layout::Rect) -> bool {
     area.width >= MIN_PANE_DIM && area.height >= MIN_PANE_DIM
 }
 
@@ -1163,14 +1149,16 @@ fn handle_vim_event(app: &mut App, ev: VimEvent) {
 }
 
 /// Drop the editor; an embedded one hands its preview pane back to the tree
-/// browser with the (possibly just-edited) file reloaded.
+/// browser with the (possibly just-edited) file reloaded. The FILE TABS
+/// re-read the file whether the editor was theirs or floating over them,
+/// and land the cursor on the strip — the level Ctrl+Q steps back to.
 fn close_vim(app: &mut App) {
     let embedded = app.vim.as_ref().is_some_and(|v| v.embedded);
     app.vim = None;
-    if embedded {
-        if let Some(Overlay::Tree(view)) = &mut app.overlay {
-            view.load_preview();
-        }
+    match &mut app.overlay {
+        Some(Overlay::Tree(view)) if embedded => view.load_preview(),
+        Some(Overlay::FileTabs(view)) => view.editor_closed(),
+        _ => {}
     }
 }
 
@@ -2039,7 +2027,7 @@ fn close_finder_behind_editor(app: &mut App) {
 /// grid `size`, replacing whatever it held; a spawn failure flashes. False
 /// when nothing was spawned — the main loop isn't running (unit tests
 /// without a channel) or the spawn failed.
-fn spawn_editor_modal(
+pub(crate) fn spawn_editor_modal(
     app: &mut App,
     editor: &str,
     root: &std::path::Path,
@@ -2115,7 +2103,7 @@ fn open_selected_tree_file_in_editor(app: &mut App) {
 /// Expected inner size of the editor modal before its first draw, derived
 /// from the last-drawn body rect (`VIM_MODAL_PCT` of the frame, minus the
 /// border). `sync_vim_size` trues it up after the real draw.
-fn vim_size_guess(app: &App) -> (u16, u16) {
+pub(crate) fn vim_size_guess(app: &App) -> (u16, u16) {
     let frame_w = app.body_area.width;
     let frame_h = app.body_area.height + 2; // + footer row and its padding
     let cols = (frame_w * ui::VIM_MODAL_PCT.0 / 100)
@@ -2596,49 +2584,8 @@ fn open_menu(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
 fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
     // Only the AGENT KINDS still enabled in the SETTINGS OVERLAY's Agents
     // tab are offered; a disabled harness is absent, not greyed.
-    let kinds = crate::config::Config::load().enabled_kinds();
-    if kinds.is_empty() {
-        // Only a hand-edited config gets here (the overlay refuses to turn
-        // off the last harness). An empty ContextMenu would index past its
-        // rows on Enter and `j`, so flash instead of opening one.
-        app.flash = Some("every harness is disabled — enable one in Settings › Agents".into());
-        return;
-    }
-    let items = kinds
-        .into_iter()
-        .map(|kind| {
-            MenuItem::new(
-                kind_label(kind),
-                MenuAction::NewAgentOfKind {
-                    worktree: worktree.clone(),
-                    kind,
-                    model: None,
-                    effort: None,
-                    cloud: false,
-                    pr_url: None,
-                    quick: None,
-                },
-            )
-        })
-        .collect();
-    app.overlay = Some(Overlay::Menu(ContextMenu {
-        title: Some("New session".into()),
-        items,
-        at: None,
-        hover: 0,
-        area: ratatui::layout::Rect::default(),
-        parent: None,
-        filter: None,
-    }));
+    agent_picker::open_kind_picker(app, KindPicker::new_session(worktree));
 }
-
-/// Whether Claude is still offered — the PR SESSION launch and the standing
-/// PREWARM POOL slot are Claude-only, so both follow this toggle.
-fn claude_enabled() -> bool {
-    crate::config::Config::load().kind_enabled(AgentKind::Claude)
-}
-
-const CLAUDE_DISABLED_FLASH: &str = "Claude is disabled in Settings › Agents — PR sessions need it";
 
 /// ROOT WORKTREE used by PROJECT-scoped actions. An OPEN PRS row has no
 /// checkout of its own, so PR-created AGENTS follow the same established
@@ -2652,48 +2599,33 @@ fn selected_project_main_worktree(app: &App) -> Option<WorktreeId> {
         .map(|worktree| worktree.id.clone())
 }
 
-fn pr_agent_menu_item(
-    worktree: WorktreeId,
-    pr: &crate::pull_request::OpenPr,
-    label: &str,
-) -> MenuItem {
-    MenuItem::new(
-        label,
-        MenuAction::NewAgentOfKind {
-            worktree,
-            kind: AgentKind::Claude,
-            model: None,
-            effort: None,
-            cloud: false,
-            pr_url: Some(pr.url.clone()),
-            quick: None,
-        },
-    )
-}
-
-/// An OPEN PRS row creates only a local Claude AGENT, while still reusing
-/// the MODEL/EFFORT and optional naming steps of the NEW SESSION PICKER.
+/// `n` on a PROJECT OPEN PRS GROUP row: the NEW SESSION PICKER's harness
+/// rows, every one carrying the PR's URL and launching a local AGENT in
+/// the ROOT WORKTREE through the same MODEL / EFFORT and naming steps.
 fn open_pr_agent_picker(app: &mut App) {
     let Some(pr) = app.selected_worktree_pr().cloned() else {
         return;
     };
-    if !claude_enabled() {
-        app.flash = Some(CLAUDE_DISABLED_FLASH.into());
-        return;
-    }
     let Some(worktree) = selected_project_main_worktree(app) else {
         app.flash = Some("the project has no ROOT WORKTREE for this PR session".into());
         return;
     };
-    app.overlay = Some(Overlay::Menu(ContextMenu {
-        title: Some(format!("New PR session · #{}", pr.number)),
-        items: vec![pr_agent_menu_item(worktree, &pr, "Claude")],
-        at: None,
-        hover: 0,
-        area: ratatui::layout::Rect::default(),
-        parent: None,
-        filter: None,
-    }));
+    agent_picker::open_kind_picker(app, KindPicker::pr_session(worktree, &pr));
+}
+
+/// The CONTEXT MENU for a PROJECT OPEN PRS GROUP row: a PR SESSION row per
+/// enabled harness (none when the PROJECT has no ROOT WORKTREE to launch
+/// in), then the row's browser and diff verbs.
+fn pr_row_menu_items(app: &App, pr: &crate::pull_request::OpenPr) -> Vec<MenuItem> {
+    let mut items = match selected_project_main_worktree(app) {
+        Some(worktree) => agent_picker::pr_session_menu_rows(worktree, pr),
+        None => Vec::new(),
+    };
+    items.extend([
+        MenuItem::new("Open in browser", MenuAction::OpenLink(pr.url.clone())),
+        MenuItem::new("View diff", MenuAction::ViewPrDiff),
+    ]);
+    items
 }
 
 /// Build the submenu a menu row expands into: the model list for a
@@ -2790,14 +2722,6 @@ pub(crate) fn menu_quick_return(menu: &ContextMenu) -> Option<crate::quick_promp
         MenuAction::NewAgentOfKind { quick, .. } => quick.as_deref().cloned(),
         _ => None,
     })
-}
-
-pub(crate) fn kind_label(kind: AgentKind) -> &'static str {
-    match kind {
-        AgentKind::Claude => "Claude",
-        AgentKind::Codex => "Codex",
-        AgentKind::Cursor => "Cursor",
-    }
 }
 
 /// Workspace switcher (`w`): pick which workspace this instance shows. The
@@ -3046,18 +2970,7 @@ fn open_context_menu_for_selection(app: &mut App) {
         }
         Focus::Worktrees => {
             if let Some(pr) = app.selected_worktree_pr().cloned() {
-                let Some(worktree) = selected_project_main_worktree(app) else {
-                    app.flash = Some("the project has no ROOT WORKTREE for this PR session".into());
-                    return;
-                };
-                let mut items = Vec::new();
-                if claude_enabled() {
-                    items.push(pr_agent_menu_item(worktree, &pr, "New Claude session"));
-                }
-                items.extend([
-                    MenuItem::new("Open in browser", MenuAction::OpenLink(pr.url)),
-                    MenuItem::new("View diff", MenuAction::ViewPrDiff),
-                ]);
+                let items = pr_row_menu_items(app, &pr);
                 open_menu(app, items, at);
             } else if let Some(w) = app.selected_worktree() {
                 let mut items = vec![
@@ -3088,11 +3001,15 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
         handle_settings_key(app, key);
         return;
     }
+    if matches!(&app.overlay, Some(Overlay::FileTabs(_))) {
+        crate::file_tabs::handle_key(app, key);
+        return;
+    }
     let Some(overlay) = &mut app.overlay else {
         return;
     };
     match overlay {
-        Overlay::Settings(_) => {}
+        Overlay::Settings(_) | Overlay::FileTabs(_) => {}
         Overlay::Help(_) => {
             if matches!(
                 key.code,
@@ -5498,12 +5415,12 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
     let with_first_prompt = starting_prompt.is_some();
     send_with(app, out, intent, |req_id| match pr_url {
         Some(pr_url) => {
-            debug_assert_eq!(kind, AgentKind::Claude);
             debug_assert!(!cloud);
             ClientRequest::CreatePrAgent {
                 req_id,
                 worktree: worktree.clone(),
                 name,
+                kind,
                 model,
                 effort,
                 auto_title,
@@ -5914,7 +5831,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     }
     // A left-click outside any modal dismisses it, exactly as Esc would, and
     // is swallowed rather than landing on the panel underneath. One
-    // hit-test covers all fourteen variants; what each has to unwind on the
+    // hit-test covers all fifteen variants; what each has to unwind on the
     // way out lives in `overlay_close`.
     if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
         if let Some(overlay) = &app.overlay {
@@ -6204,6 +6121,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             _ => {}
         }
+        return;
+    }
+    // FILE TABS: a tab label switches, the body takes the preview cursor,
+    // the wheel scrolls it; everything else inside the box is swallowed.
+    if matches!(&app.overlay, Some(Overlay::FileTabs(_))) {
+        crate::file_tabs::handle_mouse(app, mouse, mouse_pos);
         return;
     }
     // Settings: click a tab to switch, a row to select (or activate it if
@@ -6635,16 +6558,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     app.sel_session = 0;
                     app.focus = Focus::Worktrees;
                     if let Some(pr) = app.selected_worktree_pr().cloned() {
-                        let mut items = Vec::new();
-                        if let Some(worktree) =
-                            selected_project_main_worktree(app).filter(|_| claude_enabled())
-                        {
-                            items.push(pr_agent_menu_item(worktree, &pr, "New Claude session"));
-                        }
-                        items.extend([
-                            MenuItem::new("Open in browser", MenuAction::OpenLink(pr.url)),
-                            MenuItem::new("View diff", MenuAction::ViewPrDiff),
-                        ]);
+                        let items = pr_row_menu_items(app, &pr);
                         open_menu(app, items, at);
                     } else if let Some(w) = app.selected_worktree() {
                         let mut items = vec![
@@ -6938,6 +6852,10 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             refresh_palette(app);
             refresh_workspace_picker(app);
             app.dirty = true;
+        }
+        // `nebula open` in a session: the user asked to see these files.
+        ServerEvent::FilesOpened { root, paths, .. } => {
+            crate::file_tabs::open(app, root, paths);
         }
         ServerEvent::Metrics { req_id, snapshot } => {
             // Answered with Metrics, not Ack — clear the pending slot by hand.
@@ -8411,12 +8329,13 @@ mod tests {
         assert!(app.flash.is_none(), "got {:?}", app.flash);
     }
 
-    /// `n` on an OPEN PRS row creates a Claude-only SESSION draft against
-    /// the PROJECT's ROOT WORKTREE. The PR URL survives the normal naming
-    /// flow and crosses IPC on the dedicated create request; no unscoped
-    /// PREWARM POOL process can be adopted for it.
+    /// `n` on an OPEN PRS row offers the same harness rows as the NEW
+    /// SESSION PICKER, every one a SESSION draft against the PROJECT's ROOT
+    /// WORKTREE carrying the PR URL. The URL survives the normal naming flow
+    /// and crosses IPC on the dedicated create request with the picked
+    /// kind; no unscoped PREWARM POOL process can be adopted for it.
     #[test]
-    fn new_on_an_open_pr_row_carries_its_url_into_a_claude_session() {
+    fn new_on_an_open_pr_row_offers_every_harness_and_carries_its_url() {
         with_default_config(|| {
             let mut app = App::new();
             seed_tree(&mut app);
@@ -8430,35 +8349,57 @@ mod tests {
                 panic!("expected the PR SESSION picker, got {:?}", app.overlay);
             };
             assert_eq!(menu.title.as_deref(), Some("New PR session · #7"));
-            assert_eq!(menu.items.len(), 1, "PR rows create Claude AGENTS only");
-            assert!(matches!(
-                &menu.items[0].action,
-                MenuAction::NewAgentOfKind {
-                    worktree,
-                    kind: AgentKind::Claude,
-                    pr_url: Some(url),
-                    cloud: false,
-                    ..
-                } if worktree.as_str() == "w1" && url == "https://github.com/o/r/pull/7"
-            ));
-
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(matches!(
-                &app.overlay,
-                Some(Overlay::Prompt(p)) if matches!(
-                    &p.kind,
-                    PromptKind::NewAgent {
-                        kind: AgentKind::Claude,
+            let rows: Vec<(&str, AgentKind)> = menu
+                .items
+                .iter()
+                .map(|item| match &item.action {
+                    MenuAction::NewAgentOfKind {
+                        worktree,
+                        kind,
                         pr_url: Some(url),
                         cloud: false,
+                        quick: None,
                         ..
-                    } if url == "https://github.com/o/r/pull/7"
-                )
-            ));
+                    } if worktree.as_str() == "w1" && url == "https://github.com/o/r/pull/7" => {
+                        (item.label.as_str(), *kind)
+                    }
+                    other => panic!("a PR row without the PR context: {other:?}"),
+                })
+                .collect();
+            let expected: Vec<(&str, AgentKind)> = crate::config::Config::load()
+                .enabled_kinds()
+                .into_iter()
+                .map(|kind| (kind_label(kind), kind))
+                .collect();
+            assert_eq!(
+                rows, expected,
+                "the PR picker lists every harness the NEW SESSION PICKER does"
+            );
+            assert_eq!(rows[1].1, AgentKind::Codex);
+
+            // The second row: a Codex PR SESSION.
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(p)) if matches!(
+                        &p.kind,
+                        PromptKind::NewAgent {
+                            kind: AgentKind::Codex,
+                            pr_url: Some(url),
+                            cloud: false,
+                            ..
+                        } if url == "https://github.com/o/r/pull/7"
+                    )
+                ),
+                "{:?}",
+                app.overlay
+            );
             assert!(
                 out.iter()
                     .all(|request| !matches!(request, ClientRequest::PrewarmAgent { .. })),
-                "an unscoped warm Claude must not start before a PR SESSION: {out:?}"
+                "an unscoped warm CLI must not start before a PR SESSION: {out:?}"
             );
 
             for c in "pr-7".chars() {
@@ -8471,6 +8412,7 @@ mod tests {
                     Some(ClientRequest::CreatePrAgent {
                         worktree,
                         name,
+                        kind: AgentKind::Codex,
                         pr_url,
                         ..
                     }) if worktree.as_str() == "w1"
@@ -8482,51 +8424,63 @@ mod tests {
         });
     }
 
+    /// `m` / right-click on an OPEN PRS row: one PR SESSION row per enabled
+    /// harness, each carrying the URL, ahead of the browser and diff verbs.
     #[test]
-    fn context_menu_on_an_open_pr_row_offers_a_claude_session() {
-        let mut app = App::new();
-        seed_tree(&mut app);
-        seed_open_prs(&mut app, &[(7, "Attach links")]);
-        app.focus = Focus::Worktrees;
-        app.sel_worktree = 1;
+    fn context_menu_on_an_open_pr_row_offers_a_pr_session_per_harness() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            seed_open_prs(&mut app, &[(7, "Attach links")]);
+            app.focus = Focus::Worktrees;
+            app.sel_worktree = 1;
 
-        open_context_menu_for_selection(&mut app);
-        let Some(Overlay::Menu(menu)) = &app.overlay else {
-            panic!("expected the OPEN PRS context menu, got {:?}", app.overlay);
-        };
-        assert!(menu.items.iter().any(|item| {
-            item.label == "New Claude session"
-                && matches!(
-                    &item.action,
-                    MenuAction::NewAgentOfKind {
-                        pr_url: Some(url),
-                        ..
-                    } if url == "https://github.com/o/r/pull/7"
-                )
-        }));
+            let mut expected: Vec<String> = crate::config::Config::load()
+                .enabled_kinds()
+                .into_iter()
+                .map(|kind| format!("New {} session", kind_label(kind)))
+                .collect();
+            let sessions = expected.len();
+            assert!(expected.contains(&"New Codex session".to_string()));
+            expected.extend(["Open in browser".to_string(), "View diff".to_string()]);
+            open_context_menu_for_selection(&mut app);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the OPEN PRS context menu, got {:?}", app.overlay);
+            };
+            let labels: Vec<&str> = menu.items.iter().map(|item| item.label.as_str()).collect();
+            assert_eq!(labels, expected);
+            assert!(menu.items[..sessions].iter().all(|item| matches!(
+                &item.action,
+                MenuAction::NewAgentOfKind {
+                    pr_url: Some(url),
+                    ..
+                } if url == "https://github.com/o/r/pull/7"
+            )));
 
-        app.overlay = None;
-        app.hits.push((
-            ratatui::layout::Rect::new(0, 0, 20, 2),
-            HitTarget::Worktree(1),
-        ));
-        handle_mouse(
-            &mut app,
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Right),
-                column: 1,
-                row: 0,
-                modifiers: KeyModifiers::NONE,
-            },
-            &mut Vec::new(),
-        );
-        let Some(Overlay::Menu(menu)) = &app.overlay else {
-            panic!(
-                "expected the right-click OPEN PRS menu, got {:?}",
-                app.overlay
+            app.overlay = None;
+            app.hits.push((
+                ratatui::layout::Rect::new(0, 0, 20, 2),
+                HitTarget::Worktree(1),
+            ));
+            handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Right),
+                    column: 1,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &mut Vec::new(),
             );
-        };
-        assert_eq!(menu.items[0].label, "New Claude session");
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!(
+                    "expected the right-click OPEN PRS menu, got {:?}",
+                    app.overlay
+                );
+            };
+            let labels: Vec<&str> = menu.items.iter().map(|item| item.label.as_str()).collect();
+            assert_eq!(labels, expected);
+        });
     }
 
     /// A repo with nothing open backs off instead of asking every beat, and
@@ -9941,6 +9895,46 @@ diff --git a/src/b.rs b/src/b.rs
         );
     }
 
+    /// A newer published release rides the nameplate as `⇡ vX.Y.Z` and
+    /// yields with it — the flash rule is the nameplate's, not a second
+    /// one — and the workspace chip's click target moves over with it.
+    #[test]
+    fn footer_flags_a_newer_release_beside_the_nameplate() {
+        let stamp = concat!("nebula v", env!("CARGO_PKG_VERSION"));
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(!buffer_text(&terminal).contains('⇡'), "nothing to flag yet");
+
+        app.update_available = Some("9.9.9".into());
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let flagged = format!("{stamp} ⇡ v9.9.9");
+        assert!(text.contains(&flagged), "{flagged} missing from:\n{text}");
+        assert!(text.contains(&format!("{flagged}  ·  ◇ ")), "{text}");
+        let (rect, _) = app
+            .hits
+            .iter()
+            .find(|(_, t)| matches!(t, crate::app::HitTarget::FooterWorkspace))
+            .expect("the workspace nameplate is still a click target");
+        assert_eq!(
+            rect.x as usize,
+            1 + flagged.chars().count() + "  ·  ".chars().count(),
+            "the click target follows the wider plate"
+        );
+
+        // A flash that would be clipped drops the whole plate, indicator too.
+        let long = "the pull request link can't be deleted from here, close it on github";
+        app.flash = Some(long.into());
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            !text.contains(stamp) && !text.contains("⇡ v9.9.9"),
+            "plate and indicator should have yielded:\n{text}"
+        );
+    }
+
     /// The footer's right edge shows live session counts and nebula's
     /// total memory once a metrics reading arrives.
     #[test]
@@ -10035,7 +10029,11 @@ diff --git a/src/b.rs b/src/b.rs
         use nebula_core::{Agent, AgentKind, AgentStatus, Entity};
         let mut app = App::new();
         seed_tree(&mut app); // agent-1, claude
-        for (i, kind) in [(2, AgentKind::Codex), (3, AgentKind::Cursor)] {
+        for (i, kind) in [
+            (2, AgentKind::Codex),
+            (3, AgentKind::Cursor),
+            (4, AgentKind::Pi),
+        ] {
             hse(
                 &mut app,
                 ServerEvent::EntityUpserted {
@@ -10068,6 +10066,7 @@ diff --git a/src/b.rs b/src/b.rs
             ("agent-1", "claude"),
             ("agent-2", "codex"),
             ("agent-3", "cursor"),
+            ("agent-4", "pi"),
         ] {
             assert!(
                 text.contains(&format!("{name} {kind}")),
@@ -10742,8 +10741,8 @@ diff --git a/src/b.rs b/src/b.rs
             assert_eq!(menu.title.as_deref(), Some("New session"));
             assert_eq!(
                 menu.items.len(),
-                3,
-                "no Terminal row: NEW TERMINAL (`t`) already covers it"
+                AgentKind::ALL.len(),
+                "one row per harness, no Terminal row: NEW TERMINAL (`t`) already covers it"
             );
             assert_eq!(menu.items[0].label, "Claude");
             assert_eq!(menu.items[1].label, "Codex");
@@ -11360,7 +11359,11 @@ diff --git a/src/b.rs b/src/b.rs
                 panic!("expected the NEW SESSION PICKER, got {:?}", app.overlay);
             };
             let labels: Vec<&str> = menu.items.iter().map(|item| item.label.as_str()).collect();
-            assert_eq!(labels, ["Claude", "Cursor"], "Codex is absent, not greyed");
+            assert_eq!(
+                labels,
+                ["Claude", "Cursor", "Pi"],
+                "Codex is absent, not greyed"
+            );
 
             // The second row is now Cursor: the rows shift, nothing is dead.
             press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
@@ -11375,7 +11378,7 @@ diff --git a/src/b.rs b/src/b.rs
     #[test]
     fn picker_with_every_harness_disabled_flashes_instead_of_opening() {
         with_config_json(
-            r#"{"claude_enabled": false, "codex_enabled": false, "cursor_enabled": false}"#,
+            r#"{"claude_enabled": false, "codex_enabled": false, "cursor_enabled": false, "pi_enabled": false}"#,
             || {
                 let mut app = App::new();
                 seed_tree(&mut app);
@@ -11398,7 +11401,7 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
-    fn disabled_claude_blocks_pr_session_and_hides_its_menu_row() {
+    fn disabled_claude_leaves_the_pr_session_to_the_other_harnesses() {
         with_config_json(r#"{"claude_enabled": false}"#, || {
             let mut app = App::new();
             seed_tree(&mut app);
@@ -11408,16 +11411,29 @@ diff --git a/src/b.rs b/src/b.rs
             let mut out = Vec::new();
 
             press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
-            assert!(app.overlay.is_none(), "no PR SESSION picker without Claude");
-            let flash = app.flash.as_deref().expect("a flash says why");
-            assert!(flash.contains("Claude is disabled"), "{flash}");
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the PR SESSION picker, got {:?}", app.overlay);
+            };
+            let labels: Vec<&str> = menu.items.iter().map(|item| item.label.as_str()).collect();
+            assert!(
+                !labels.contains(&"Claude") && labels.contains(&"Codex"),
+                "Claude is absent, not greyed: {labels:?}"
+            );
+            assert_eq!(labels.len(), AgentKind::ALL.len() - 1);
+            assert!(app.flash.is_none(), "got {:?}", app.flash);
 
+            app.overlay = None;
             open_context_menu_for_selection(&mut app);
             let Some(Overlay::Menu(menu)) = &app.overlay else {
                 panic!("expected the OPEN PRS context menu, got {:?}", app.overlay);
             };
             let labels: Vec<&str> = menu.items.iter().map(|item| item.label.as_str()).collect();
-            assert_eq!(labels, ["Open in browser", "View diff"]);
+            assert!(
+                !labels.contains(&"New Claude session")
+                    && labels.contains(&"New Codex session")
+                    && labels.ends_with(&["Open in browser", "View diff"]),
+                "{labels:?}"
+            );
 
             app.overlay = None;
             app.hits.push((
@@ -11445,6 +11461,38 @@ diff --git a/src/b.rs b/src/b.rs
                 menu.items.iter().map(|i| &i.label).collect::<Vec<_>>()
             );
         });
+    }
+
+    /// Only a hand-edited config switches every harness off; then `n` on a
+    /// PR row flashes instead of opening an empty picker, and the CONTEXT
+    /// MENU keeps just the row's own verbs.
+    #[test]
+    fn every_harness_disabled_flashes_instead_of_a_pr_session_picker() {
+        with_config_json(
+            r#"{"claude_enabled": false, "codex_enabled": false, "cursor_enabled": false, "pi_enabled": false}"#,
+            || {
+                let mut app = App::new();
+                seed_tree(&mut app);
+                seed_open_prs(&mut app, &[(7, "Attach links")]);
+                app.focus = Focus::Worktrees;
+                app.sel_worktree = 1;
+                let mut out = Vec::new();
+
+                press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+                assert!(app.overlay.is_none(), "no picker without a harness");
+                assert_eq!(
+                    app.flash.as_deref(),
+                    Some(crate::agent_picker::NO_HARNESS_FLASH)
+                );
+
+                open_context_menu_for_selection(&mut app);
+                let Some(Overlay::Menu(menu)) = &app.overlay else {
+                    panic!("expected the OPEN PRS context menu, got {:?}", app.overlay);
+                };
+                let labels: Vec<&str> = menu.items.iter().map(|item| item.label.as_str()).collect();
+                assert_eq!(labels, ["Open in browser", "View diff"]);
+            },
+        );
     }
 
     #[test]
@@ -11487,6 +11535,7 @@ diff --git a/src/b.rs b/src/b.rs
             let (tab, claude_row) = locate(SettingKind::ClaudeEnabled).unwrap();
             let (_, codex_row) = locate(SettingKind::CodexEnabled).unwrap();
             let (_, cursor_row) = locate(SettingKind::CursorEnabled).unwrap();
+            let (_, pi_row) = locate(SettingKind::PiEnabled).unwrap();
             let mut app = App::new();
             let mut out = Vec::new();
             open_settings_on(&mut app, tab, &mut out);
@@ -11509,12 +11558,15 @@ diff --git a/src/b.rs b/src/b.rs
                 press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
             }
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(!crate::config::Config::load().cursor_enabled);
+
+            for _ in cursor_row..pi_row {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             let cfg = crate::config::Config::load();
-            assert!(
-                cfg.cursor_enabled,
-                "the last harness cannot be switched off"
-            );
-            assert_eq!(cfg.enabled_kinds(), vec![AgentKind::Cursor]);
+            assert!(cfg.pi_enabled, "the last harness cannot be switched off");
+            assert_eq!(cfg.enabled_kinds(), vec![AgentKind::Pi]);
             let (text, level) = settings_view(&app).notice.clone().expect("a warning");
             assert!(matches!(level, crate::app::NoticeLevel::Warn));
             assert!(text.contains("at least one harness"), "{text}");
@@ -15771,6 +15823,61 @@ diff --git a/src/b.rs b/src/b.rs
             crate::config::tab_count(),
             "draw records a click target per tab"
         );
+    }
+
+    #[test]
+    fn agents_tab_renders_its_harness_groups() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        let (agents, _) = crate::config::locate(crate::config::SettingKind::ClaudeEnabled).unwrap();
+        open_settings_on(&mut app, agents, &mut out);
+        // Tall enough for every row, so nothing scrolls off.
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+
+        // Each header sits above its own rows, in order, and the harness
+        // name is no longer repeated on every row under it.
+        let mut pos = 0;
+        for needle in [
+            "Quick prompt",
+            "Agent",
+            "Focus",
+            "Claude",
+            "Enabled",
+            "Model",
+            "Effort",
+            "Codex",
+            "Enabled",
+            "Model",
+            "Effort",
+            "Cursor",
+            "Enabled",
+            "Model",
+            "Effort",
+        ] {
+            let at = text[pos..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} after column {pos}:\n{text}"));
+            pos += at + needle.len();
+        }
+        assert!(
+            !text.contains("Claude model") && !text.contains("Quick prompt agent"),
+            "the old flat labels are gone:\n{text}"
+        );
+
+        // Headers and blanks are not rows the cursor can land on: two ↓
+        // from the first row reach the third setting, not a header.
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        let (_, claude_enabled) =
+            crate::config::locate(crate::config::SettingKind::ClaudeEnabled).unwrap();
+        assert_eq!(settings_view(&app).selected, claude_enabled);
+
+        // Nor can a click land on one: the "Codex" header is a dead cell.
+        let (x, y) = find_cell(&terminal, "Codex");
+        click(&mut app, x, y, &mut out);
+        assert_eq!(settings_view(&app).selected, claude_enabled);
     }
 
     // ---- settings tabs & hotkeys ----
@@ -21297,6 +21404,17 @@ diff --git a/src/b.rs b/src/b.rs
                 None,
             ),
             (
+                "FileTabs",
+                |app| {
+                    app.overlay = Some(Overlay::FileTabs(crate::file_tabs::FileTabsView::new(
+                        "/tmp/demo".into(),
+                        "vi".into(),
+                        vec!["/tmp/demo/README.md".into()],
+                    )));
+                },
+                None,
+            ),
+            (
                 "Metrics",
                 |app| app.overlay = Some(Overlay::Metrics(MetricsView::new())),
                 None,
@@ -21341,6 +21459,118 @@ diff --git a/src/b.rs b/src/b.rs
         ]
     }
 
+    fn file_tabs(app: &App) -> &crate::file_tabs::FileTabsView {
+        match &app.overlay {
+            Some(Overlay::FileTabs(v)) => v,
+            other => panic!("expected the file tabs, got {other:?}"),
+        }
+    }
+
+    fn preview_text(view: &crate::file_tabs::FileTabsView, line: usize) -> String {
+        view.preview_lines[line]
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect()
+    }
+
+    /// `nebula open` in a session: the daemon's FilesOpened raises the FILE
+    /// TABS on the files, one tab each, the first previewed, cursor on the
+    /// strip — and → walks to the next file's preview.
+    #[test]
+    fn files_opened_event_raises_the_file_tabs_previewing_the_first() {
+        with_default_config(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let a = dir.path().join("a.md");
+            let b = dir.path().join("b.rs");
+            std::fs::write(&a, "# alpha\n").unwrap();
+            std::fs::write(&b, "fn main() {}\n").unwrap();
+            let mut app = App::new();
+            let mut out = Vec::new();
+            handle_server_event(
+                &mut app,
+                ServerEvent::FilesOpened {
+                    agent: AgentId("a1".into()),
+                    root: dir.path().to_path_buf(),
+                    paths: vec![a, b],
+                },
+                &mut out,
+            );
+            let view = file_tabs(&app);
+            let labels: Vec<&str> = view.tabs.iter().map(|t| t.label.as_str()).collect();
+            assert_eq!(labels, ["a.md", "b.rs"]);
+            assert!(view.on_tabs, "opens on the strip");
+            assert!(view.preview_is_file);
+            assert_eq!(preview_text(view, 0), "# alpha");
+            assert!(app.dirty);
+
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let view = file_tabs(&app);
+            assert_eq!(view.tab, 1);
+            assert_eq!(preview_text(view, 0), "fn main() {}");
+            assert!(out.is_empty(), "nothing goes to the daemon");
+        });
+    }
+
+    /// The one modal where Ctrl+Q backs out a level: from the editor it
+    /// lands on the strip (editor killed, file re-read), from the preview
+    /// it lands on the strip, and only from the strip does it close.
+    #[test]
+    fn file_tabs_ctrl_q_steps_back_to_the_strip_before_closing() {
+        with_default_config(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let a = dir.path().join("a.md");
+            std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+            let mut app = App::new();
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            app.vim_tx = Some(tx);
+            let mut out = Vec::new();
+            // A shell stands in for vim (`sh +1 a.md` still spawns fine).
+            app.overlay = Some(Overlay::FileTabs(crate::file_tabs::FileTabsView::new(
+                dir.path().to_path_buf(),
+                "/bin/sh".into(),
+                vec![a],
+            )));
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let vim = app.vim.as_ref().expect("Enter spawns the editor");
+            assert!(vim.embedded, "embedded in the modal's body");
+            assert!(
+                matches!(&app.overlay, Some(Overlay::FileTabs(_))),
+                "the tabs stay under the editor"
+            );
+
+            press(
+                &mut app,
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert!(app.vim.is_none(), "Ctrl+Q kills the editor");
+            assert!(file_tabs(&app).on_tabs, "…and lands on the strip");
+
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            assert!(!file_tabs(&app).on_tabs, "↓ drops into the preview");
+            press(
+                &mut app,
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert!(
+                matches!(&app.overlay, Some(Overlay::FileTabs(v)) if v.on_tabs),
+                "Ctrl+Q from the preview is the strip, not the panels"
+            );
+
+            press(
+                &mut app,
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert!(app.overlay.is_none(), "from the strip it closes");
+        });
+    }
+
     /// The variant's name. Exhaustive on purpose — see `every_overlay`.
     fn overlay_label(overlay: &Overlay) -> &'static str {
         match overlay {
@@ -21354,6 +21584,7 @@ diff --git a/src/b.rs b/src/b.rs
             Overlay::Files(_) => "Files",
             Overlay::Grep(_) => "Grep",
             Overlay::Tree(_) => "Tree",
+            Overlay::FileTabs(_) => "FileTabs",
             Overlay::Metrics(_) => "Metrics",
             Overlay::Hosts(_) => "Hosts",
             Overlay::AgentPresets(_) => "AgentPresets",
@@ -21386,7 +21617,7 @@ diff --git a/src/b.rs b/src/b.rs
             let mut unique = seen.clone();
             unique.dedup();
             assert_eq!(unique, seen, "two rows for the same variant");
-            assert_eq!(seen.len(), 14, "a variant came or went: {seen:?}");
+            assert_eq!(seen.len(), 15, "a variant came or went: {seen:?}");
         });
     }
 

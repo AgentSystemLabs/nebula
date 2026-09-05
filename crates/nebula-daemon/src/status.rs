@@ -80,6 +80,13 @@ pub enum HookEvent {
     },
 }
 
+/// The tools whose call means the turn is waiting on you: Claude's
+/// `AskUserQuestion` and pi's `ask_question` (its managed extension posts
+/// the tool's own name).
+fn asks_user(tool_name: Option<&str>) -> bool {
+    matches!(tool_name, Some("AskUserQuestion" | "ask_question"))
+}
+
 impl HookEvent {
     /// Events that (re)establish which Claude session id owns this agent.
     pub fn captures_session(&self) -> bool {
@@ -258,7 +265,7 @@ impl AgentStatusMachine {
                 if subagent_id.is_some() {
                     self.note_subagent_alive(now);
                 }
-                if tool_name.as_deref() == Some("AskUserQuestion") {
+                if asks_user(tool_name.as_deref()) {
                     self.set_status(AgentStatus::NeedsFeedback, &mut effects);
                 }
             }
@@ -269,7 +276,7 @@ impl AgentStatusMachine {
                 if subagent_id.is_some() {
                     self.note_subagent_alive(now);
                 }
-                if tool_name.as_deref() == Some("AskUserQuestion") {
+                if asks_user(tool_name.as_deref()) {
                     self.set_status(AgentStatus::Running, &mut effects);
                 }
             }
@@ -490,6 +497,43 @@ mod tests {
         assert!(fx.contains(&Effect::SaveSessionId("s1".into())));
         let fx = m.handle(HookEvent::Stop, Some("s1"), now + Duration::from_secs(10));
         assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    /// pi's question tool goes through the same red-then-back flow as
+    /// Claude's AskUserQuestion; any other tool name is not a wait.
+    #[test]
+    fn pi_ask_question_reads_as_waiting_on_you() {
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        let fx = m.handle(
+            HookEvent::PreToolUse {
+                tool_name: Some("ask_question".into()),
+                subagent_id: None,
+            },
+            Some("s1"),
+            now,
+        );
+        assert_eq!(status_of(&fx), Some(AgentStatus::NeedsFeedback));
+        let fx = m.handle(
+            HookEvent::PostToolUse {
+                tool_name: Some("ask_question".into()),
+                subagent_id: None,
+            },
+            Some("s1"),
+            now,
+        );
+        assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+        let fx = m.handle(
+            HookEvent::PreToolUse {
+                tool_name: Some("bash".into()),
+                subagent_id: None,
+            },
+            Some("s1"),
+            now,
+        );
+        assert_eq!(status_of(&fx), None, "an ordinary tool changes nothing");
+        assert!(!asks_user(None));
     }
 
     #[test]

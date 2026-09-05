@@ -1,7 +1,8 @@
 //! Managed-hook installation into the agent CLI's config:
 //! `<worktree>/.claude/settings.local.json` (Claude Code),
 //! `~/.codex/hooks.json` (Codex CLI), or `<worktree>/.cursor/hooks.json`
-//! (Cursor CLI).
+//! (Cursor CLI). Pi has no hook file — its managed TypeScript extension is
+//! `pi_extension.rs`, which shares this module's atomic writer.
 //!
 //! Claude and Codex share one hooks dialect (PascalCase event names, groups
 //! of `{"hooks": [{"type": "command", ...}]}`). Cursor speaks its own
@@ -139,12 +140,14 @@ fn hook_command(endpoint: &str, event: &str) -> String {
 
 /// Permission rules letting Claude Code run nebula's own commands without a
 /// permission prompt: the auto-title `nebula rename`, and the `nebula
-/// worktree` relocation its appended system prompt tells it to use
-/// (codex/cursor run with their skip-permissions flags).
+/// worktree` relocation, `nebula spawn` sibling and `nebula open` file tabs
+/// its appended system prompt tells it to use (codex/cursor run with their
+/// skip-permissions flags).
 const CLAUDE_ALLOW_RULES: &[&str] = &[
     "Bash(nebula rename:*)",
     "Bash(nebula worktree:*)",
     "Bash(nebula spawn:*)",
+    "Bash(nebula open:*)",
 ];
 
 /// Cursor variant: the payload arrives on stdin like Claude's, but cursor
@@ -375,7 +378,7 @@ fn write_hooks_root(dir: &Path, file_name: &str, root: &Value) -> Result<()> {
     write_text_atomic(dir, file_name, &serde_json::to_string_pretty(root)?)
 }
 
-fn write_text_atomic(dir: &Path, file_name: &str, text: &str) -> Result<()> {
+pub(super) fn write_text_atomic(dir: &Path, file_name: &str, text: &str) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     // Atomic write: tmp + rename.
     let tmp = dir.join(format!(".{file_name}.nebula-tmp"));
