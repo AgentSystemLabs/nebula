@@ -11,6 +11,10 @@ just finished, so the next agent and the next teammate call things by the same n
 The MEMORY LOG records *what happened*; `TERMS.md` records *what things are called*. Do not put a work log
 in the glossary, and do not put definitions in the work log.
 
+Skip this skill for one kind of task only: git or `gh` housekeeping of finished work — a commit, push,
+PR, merge or branch cleanup (the `land` skill) — which names nothing new. Every other task runs it,
+including one that recorded no MEMORY LOG entry.
+
 ## Detect every session, promote only what recurred
 
 A TERM is a name the team actually uses. A name that appeared once — coined in one reply, one commit, one
@@ -77,9 +81,14 @@ already defines and nobody has ever misnamed.
 
 Every run, walk the ledger once:
 
-1. **Add sightings.** For each candidate, check whether *this* task used it — in the user's prompt, in
-   the memory entry you just wrote, in a commit you made — and append the sighting. `git log --oneline
-   --since=<first sighting date> --grep='<candidate>' -i` catches commits from other sessions.
+1. **Add sightings** mechanically, not by eye: grep the ledger's candidate names against the text this
+   task produced — the MEMORY LOG entry you wrote (the prompt, when it wrote none) and your commit
+   messages — and append a sighting for each hit. No hits: skip the rest of the walk.
+   ```bash
+   grep -o -i -F -f <(sed -n '/^## 14\. Candidates/,/^## Alias index/p' TERMS.md | grep -o '^| \*\*[^*]*\*\*' | sed 's/^| \*\*//;s/\*\*$//') <entry-file> | sort -u
+   ```
+   `git log --oneline --since=<first sighting date> --grep='<candidate>' -i` catches commits from other
+   sessions.
 2. **Promote** any candidate whose *Seen* now holds sightings from two or more separate tasks. Write the
    full row in the section it belongs to (format below), carry the candidate's aliases into *Also
    called* and the **Alias index**, and delete the ledger row.

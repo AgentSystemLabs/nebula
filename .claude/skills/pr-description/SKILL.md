@@ -98,15 +98,13 @@ beats a new shape — the archive is easier to read when the PRs rhyme.
 ### 3. Capture the screenshots
 
 Never screenshot the real DAEMON's screen — someone else is working in it. Use the SCREENSHOT
-HARNESS: an isolated demo daemon + a STUB AGENT per session, driven by a private tmux server, rendered to PNG. The
-recipe with its traps is the MEMORY LOG entry
-`.claude/memory/entries/2026-08-20-restyle-focus-wash-and-the-screenshot-harness.md`; the traps that
-cost the most: `NEBULA_RUNTIME_DIR` must be short (`/tmp/<short>` — the unix socket path has a
-~104-char limit), `NEBULA_AGENT_CMD=/bin/cat` must be set even when no agent is created (the PREWARM
-POOL launches a real `claude` otherwise), the whole tmux drive happens in **one** Bash call (the
-sandbox kills the private server when the call ends), and `tmux capture-pane -epN` needs the `-N` or
-the rightmost pane's background fill vanishes. Build the binary under test first — the harness runs
-whatever `target/debug/nebula` is.
+HARNESS: `make shot SCENE=<name> KEYS="Tab j"` (`scripts/shot/shot.sh`) builds the debug binary, runs
+an isolated nebula against a demo repo with a stand-in `gh` (`scripts/shot/fixtures/` — add a fixture
+or a `scripts/shot/scenes/<name>.keys` file for the screen the PR needs), drives it in a private tmux
+and writes `design-screenshots/<name>.{txt,ansi,png}`. Its traps are encoded in the script (short
+`NEBULA_RUNTIME_DIR`, `NEBULA_AGENT_CMD=/bin/cat`, one Bash call per drive, `capture-pane -epN`); the
+original recipe is the MEMORY LOG entry
+`.claude/memory/entries/2026-08-20-restyle-focus-wash-and-the-screenshot-harness.md`.
 
 Take the "before" shot from an `origin/main` build only when the template asks for a pair. Crop
 nothing; the whole screen at `190x50` is the house frame, and `design-screenshots/` shows the look.

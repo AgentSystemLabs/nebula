@@ -29,7 +29,7 @@ Write one when the task is done and it left something durable behind:
 - you hit something surprising: a flaky test, a platform quirk, an agent CLI that lies about its state, a build step that has to happen in a particular order
 - the user made a decision worth not relitigating ("we're not doing X because Y")
 
-**Do not write an entry** for: pure questions you answered without changing anything, trivial one-line edits with no surprise in them, or anything the code and `git log` already say plainly. An entry that restates a diff costs every future retrieval tokens and teaches nothing.
+**Do not write an entry** for: pure questions you answered without changing anything, trivial one-line edits with no surprise in them, plain git or `gh` housekeeping of finished work (a commit, push, merge, PR or branch cleanup that surfaced nothing new — the PR ARCHIVE already records the merge), or anything the code and `git log` already say plainly. An entry that restates a diff costs every future retrieval tokens and teaches nothing.
 
 If you found nothing durable, say so and skip the write. That is a valid outcome.
 
@@ -128,9 +128,19 @@ Delete entries you discover are flatly wrong (file, index line, gotchas lines). 
 ## Size discipline
 
 The caps are enforced by `make memory-check`: index 200 lines, standing gotchas 300 lines. Run it after
-you write (`make memory-check`). Over the gotchas cap, prune before you add: retire what tests and hooks
-now enforce, merge lines that say the same thing in two groups, and demote change-specific detail back
-to its entry file. Over the index cap, archive from the bottom.
+you write (`make memory-check`). Over the gotchas cap, prune before you add — in this order, each one a
+line freed:
+
+1. **Enforced.** `grep -n 'retire:' .claude/memory/gotchas.md` — a line whose named test, hook rule or
+   type now exists is done; delete it. Then every line whose trap a GUARD HOOK rule (`guard.py::RULES`)
+   already blocks — probe the rule with the trap if unsure.
+2. **Twins.** Two lines under one TERM about the same subject (two `CARGO_TARGET_DIR` lines, two "other
+   sessions' hunks" lines) — one line, the more specific text kept, both `⟵` sources listed.
+3. **Migration-era.** A line about a state that cannot recur (a session "still holding the old skill" a
+   week after the split) — delete; its entry file keeps the history.
+4. **Change-specific detail** — back to its entry file; the standing line keeps the one-sentence trap.
+
+Over the index cap, archive from the bottom.
 
 Then confirm to the user in one line what you recorded — the entry title, the gotcha count, any standing
 gotcha added / re-hit / retired — so they can tell you if you logged the wrong lesson.

@@ -35,8 +35,8 @@ dangling aliases).
 4. **Rewrite the prompt** — PROMPT DADDY: read `.claude/skills/prompt-daddy/SKILL.md` and follow it.
    Do this on every prompt that is a task, before planning or grepping in earnest. The refined
    prompt is the request you work from. The skill lists what it skips (a reply to your own question,
-   a bare confirmation, a specific mid-task correction, a skill trigger, and a pure question that
-   changes nothing).
+   a bare confirmation, a specific mid-task correction, a skill trigger, a pure question that
+   changes nothing, and a plain git/`gh` housekeeping ask).
 
 ## Speak in the TERMS
 
@@ -54,11 +54,12 @@ points at them.
 1. **Record it** — the NEBULA-MEMORY SKILL: read `.claude/skills/nebula-memory/SKILL.md` and follow
    it: an entry file, an index line, any durable trap into the standing gotchas. Whenever the task
    changed code or behavior, diagnosed a bug, or turned up something non-obvious about this repo,
-   the DAEMON, the TUI, the VENDORED VT100 or the agent hook dialects. Skip it for pure questions
-   and for trivial edits that held no surprise — the log is only useful if it stays free of restated
-   diffs.
+   the DAEMON, the TUI, the VENDORED VT100 or the agent hook dialects. Skip it for pure questions,
+   for trivial edits that held no surprise, and for git/`gh` housekeeping of finished work that
+   surfaced nothing — the log is only useful if it stays free of restated diffs.
 2. **Keep the glossary true** — PROJECT TERMS: read `.claude/skills/project-terms/SKILL.md` and
-   follow it, on **every** task, including one that recorded no entry.
+   follow it, on **every** task, including one that recorded no entry — except git/`gh` housekeeping
+   of finished work, which `.claude/skills/land/SKILL.md` covers end to end.
 3. **Shape the reply** — OUTPUT DOCTOR: read `.claude/skills/output-doctor/SKILL.md` and follow it,
    before you write a word of the reply that answers or closes the request. Every kind of reply,
    including a question you answered without changing anything.

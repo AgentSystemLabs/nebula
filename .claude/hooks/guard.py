@@ -6,10 +6,13 @@ instead of something an agent has to remember. A match blocks the command (exit 
 back to the agent, which then does it the right way. A rule that lands here should be deleted from
 `.claude/memory/gotchas.md` — an enforced gotcha is no longer a gotcha.
 
-Rules match the *argument* that is wrong, not any mention of the pattern, and heredoc bodies are
-stripped before matching: a file written through `cat <<'EOF'` that quotes "cargo install --path" is
-text, not a command. (Without that, the hook blocks the agent editing this very file, or a TERMS.md
-row that describes it.) Project hooks take effect immediately in every running session — no restart.
+Rules match the *argument* that is wrong, not any mention of the pattern: heredoc bodies are stripped
+before matching, and the command-phrase rules (`QUOTE_BLIND`) also see quoted strings blanked, so a
+file written through `cat <<'EOF'` that quotes "cargo install --path", or a `grep 'git stash'` over
+the gotchas, is text, not a command. (Without that, the hook blocks the agent editing this very file,
+a TERMS.md row that describes it, or any grep for the phrase.) The path rules keep the quotes: a
+quoted `"$HOME/.cargo/bin/nebula"` is still the installed binary. Project hooks take effect
+immediately in every running session — no restart.
 
 Registered in `.claude/settings.json`. Try one by hand:
     echo '{"tool_name":"Bash","tool_input":{"command":"make install"}}' | python3 .claude/hooks/guard.py; echo $?
@@ -20,6 +23,17 @@ import sys
 
 # `<<EOF` / `<<'EOF'` / `<<-EOF` … up to the terminator on its own line.
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\s*\2\s*(?=\n|$)", re.S)
+# A single- or double-quoted string: a grep pattern, an echo, a probe. Blanked before the
+# command-phrase rules run — a command that only *names* `git stash` inside quotes is not running it.
+QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"", re.S)
+# The rules whose phrase is a command name, and so cannot mean a run when it sits inside quotes.
+# (A quoted path is still a path, so the installed-binary rules keep the full text.)
+QUOTE_BLIND = {
+    "for-in-unquoted-command-substitution",
+    "piped-cargo-hides-its-exit-code",
+    "git-stash-on-the-shared-checkout",
+    "cargo-install-rewrites-in-place",
+}
 # A double-quoted or bare `-m` argument on one line that contains a backtick (single quotes are literal in zsh).
 COMMIT_MSG_WITH_BACKTICK = re.compile(
     r"\bgit\s+commit\b[^|;&\n]*?\s-(?:a?m|-message)(?:\s+|=)(?:\"[^\"\n]*`[^\"\n]*\"|[^\s\"']*`)"
@@ -100,6 +114,10 @@ def strip_heredocs(cmd):
     return HEREDOC.sub("<<HEREDOC-BODY>>", cmd)
 
 
+def strip_quotes(cmd):
+    return QUOTED.sub('""', cmd)
+
+
 def main():
     try:
         data = json.load(sys.stdin)
@@ -108,9 +126,10 @@ def main():
     if data.get("tool_name") != "Bash":
         return 0
     cmd = strip_heredocs((data.get("tool_input") or {}).get("command") or "")
+    unquoted = strip_quotes(cmd)
     for name, pred, reason in RULES:
         try:
-            if pred(cmd):
+            if pred(unquoted if name in QUOTE_BLIND else cmd):
                 sys.stderr.write("[nebula guard:%s] %s\n" % (name, reason))
                 return 2
         except Exception:

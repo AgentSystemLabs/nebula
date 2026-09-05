@@ -38,15 +38,20 @@ Skip it, and just proceed, only when the prompt is:
   take the correction. If the correction is as ambiguous as the original, run it on the correction.
 - a slash-command, an explicit skill invocation, or a phrase that triggers one (`/release`,
   "commit push release", "remember this") — the skill is the refinement
+- a plain git or `gh` housekeeping ask with no design in it — "commit push and merge", "open a PR",
+  "rebase on main", "land this" — that is the `land` skill; invoke it and go. The only blank worth a
+  sentence is the branch or PR it means, and `git status` answers that. (2026-09-04: a three-word "commit push and
+  merge" spent more than half its turn in the loop and drew "why did this take so long".)
 - a pure question that changes nothing — an explanation, an assessment, "what does X do", "is Y worth
   it". Answer it directly, in TERMS, grounded by the RECALL HOOK's context; the rewrite only earns its
   cost when work follows. A question that is a task in disguise ("why is X broken" that ends in a fix)
   is a task: run it.
 - pure conversation with no task in it
 
-When there is no interactive user (a `-p` / headless run), still rewrite and still log — but skip the
-questions: `AskUserQuestion` would hang. Write every gap you would have asked about into the rewrite as
-a stated assumption and proceed on it.
+When there is no interactive user — a `-p` / headless run, or a system prompt that says the user is
+not watching and questions block — still rewrite and still log, but skip the questions:
+`AskUserQuestion` would hang. Write every gap you would have asked about into the rewrite as a stated
+assumption and proceed on it.
 
 ## Steps
 
@@ -102,6 +107,13 @@ not reasonably expect you to know — which of two readings they meant, what the
 screen, what the feature is for when the design hinges on the purpose. Do not ask about things a
 careful colleague would just decide.
 
+**One check beats one question.** Before an alias becomes a question, try the single command that
+could settle it — a `gh` query, a grep, a `git log`, a look at the live screen state. A question
+costs the user a turn; a check costs nothing, and its answer goes into the rewrite as a stated
+assumption they can overrule. ("the pr list" split two ways until `gh pr view` in each worktree showed
+which list was showing merged PRs; "show label" resolved when `gh pr list --json labels` found no PR
+had ever carried one.)
+
 When you ask: **one** `AskUserQuestion`, with one question per gap (up to four), each question's
 `header` naming the gap in a word or two (`Which "done"`, `Evidence`, `Why`, `Scope`), and its options
 being the plausible answers written in TERMS — for a two-TERM alias, the two TERMS; for a why, the two
@@ -129,8 +141,10 @@ gap that fails the same test.
   rate limits" is worse than the original.
 - **Keep the scope the original had.** Closing an ambiguity is not license to add a feature, split the
   task into a project, or turn a fix into an investigation the user did not ask for.
-- Under ~100 words. If the original is already tight, the rewrite is nearly the original with the
-  aliases swapped for TERMS; do not pad it to look like work was done.
+- Under ~100 words — count them. Over that, cut the assumptions nobody would dispute and the
+  restated constraints; the MEMORY LOG entry keeps the long form. If the original is already tight,
+  the rewrite is nearly the original with the aliases swapped for TERMS; do not pad it to look like
+  work was done.
 
 ### 5. Log it and go
 

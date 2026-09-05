@@ -19,6 +19,12 @@ prepended dir lands behind them and breaks silently later), and an absolute path
 turns into a permission prompt).
 
 **Gotchas:**
+- **Re-hit 2026-09-05, from the user's side: "why even after `make dev`?"** MAKE DEV is `cargo build` + run
+  `target/debug/nebula` under `DEV_ENV`; it never writes `$(PREFIX)/nebula`, so the PATH client only moves on
+  MAKE INSTALL / `make cycle`. And `nebula --version` cannot show the skew: the 37→38 bump landed in PR #26
+  (`4c82532`, 23:24) an hour after the 22:21 `make install`, with no release between, so both binaries print
+  `0.21.0`. Date it with `ls -l ~/.cargo/bin/nebula target/debug/nebula` against
+  `git log -S'PROTOCOL_VERSION: u32 = 38' --format='%h %cd'`; `target/debug/nebula rename …` works meanwhile.
 - `nebula kill` is the wrong advice when the **client** is the older side, and it was the message's only
   advice. Killing the daemon just makes the live TUI respawn an identical one from `current_exe()`, so
   the skew survives every restart — a guaranteed dead end for whoever follows it.

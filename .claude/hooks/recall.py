@@ -62,7 +62,7 @@ def resolve_targets(cell, known):
     `FOCUS LEFT / FOCUS RIGHT` is the one row of that name, `MODEL / EFFORT` likewise, and an annotated
     target ("the PILL ROW's rail", "WALK EDGE — *not* LOCKED PANE") yields the TERMS written in it."""
     pat = re.compile(r"(?<![A-Z])(?:%s)(?![A-Z])" % "|".join(re.escape(n) for n in sorted(known, key=len, reverse=True)))
-    head = re.split(r" — |\s\(|; |: ", cell, 1)[0]      # the names come first; the note after them mentions others
+    head = re.split(r" — |\s\(|; |: ", cell, maxsplit=1)[0]      # the names come first; the note after them mentions others
     return list(dict.fromkeys(m.group(0) for m in pat.finditer(head))) or list(dict.fromkeys(m.group(0) for m in pat.finditer(cell)))
 
 
