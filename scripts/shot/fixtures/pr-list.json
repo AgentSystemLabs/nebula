@@ -1,0 +1,5 @@
+[
+  {"number": 42, "title": "Attach links to worktrees", "url": "https://github.com/AgentSystemLabs/nebula/pull/42", "isDraft": false, "headRefName": "attach-links"},
+  {"number": 39, "title": "Still cooking: a draft the list must sink", "url": "https://github.com/AgentSystemLabs/nebula/pull/39", "isDraft": true, "headRefName": "feature-x"},
+  {"number": 37, "title": "Wheel scroll steps one line a notch", "url": "https://github.com/AgentSystemLabs/nebula/pull/37", "isDraft": false, "headRefName": "wheel-one-line"}
+]

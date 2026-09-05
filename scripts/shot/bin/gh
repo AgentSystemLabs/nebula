@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""A stand-in `gh` for the SCREENSHOT HARNESS: answers the four calls nebula's GIT POLL and PR PREVIEW
+make from canned JSON under $NEBULA_GH_FIXTURES, so a screenshot never needs a network, a token or a
+real repository. Anything else is "couldn't ask" (exit 1) — exactly what nebula treats as no PR.
+
+  gh pr list --state open … --json …      → fixtures/pr-list.json
+  gh pr view --json …                     → fixtures/pr-view-<cwd basename>.json, else exit 1 (no PR on this branch)
+  gh pr view <n> --json …                 → fixtures/pr-<n>.json, else exit 1
+  gh pr diff <n>                          → fixtures/pr-<n>.diff, else exit 1
+  gh api user --jq .login                 → fixtures/user (a login on one line), else "shot-user"
+"""
+import os
+import sys
+
+FIX = os.environ.get("NEBULA_GH_FIXTURES") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures")
+
+
+def emit(name):
+    path = os.path.join(FIX, name)
+    if not os.path.isfile(path):
+        sys.exit(1)
+    sys.stdout.write(open(path).read())
+    return 0
+
+
+def main(argv):
+    if argv[:2] == ["pr", "list"]:
+        return emit("pr-list.json")
+    if argv[:2] == ["pr", "view"]:
+        rest = [a for a in argv[2:] if not a.startswith("--")]
+        number = next((a for a in rest if a.isdigit()), None)
+        if number:
+            return emit("pr-%s.json" % number)
+        return emit("pr-view-%s.json" % os.path.basename(os.getcwd()))
+    if argv[:2] == ["pr", "diff"]:
+        number = next((a for a in argv[2:] if a.isdigit()), None)
+        return emit("pr-%s.diff" % number) if number else 1
+    if argv[:2] == ["api", "user"]:
+        path = os.path.join(FIX, "user")
+        print(open(path).read().strip() if os.path.isfile(path) else "shot-user")
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

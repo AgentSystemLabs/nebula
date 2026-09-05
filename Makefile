@@ -52,7 +52,7 @@ DEV_ENV = NEBULA_RUNTIME_DIR=$(DEV_RUNTIME) NEBULA_DATA_DIR=$(DEV_DATA) \
 	$(if $(AGENT),NEBULA_AGENT_CMD=$(AGENT))
 
 .DEFAULT_GOAL := help
-.PHONY: help dev browser dev-prep dev-seed dev-reset dev-ls dev-stop build install kill prune cycle check fmt lint test memory-check recall-eval terms-check ci clean
+.PHONY: help dev browser dev-prep dev-seed dev-reset dev-ls dev-stop build install kill prune cycle check fmt lint test memory-check recall-eval terms-check ci clean shot
 
 help: ## Show this help
 	@grep -hE '^[a-z][a-z-]*:.*?## ' $(MAKEFILE_LIST) \
@@ -119,6 +119,12 @@ dev-seed: ## Copy real projects/workspaces/settings into the dev instance (only 
 
 dev-reset: dev-stop ## Wipe this checkout's dev data; the next `make dev` re-seeds it
 	rm -rf $(DEV_DATA)
+
+# The SCREENSHOT HARNESS: an isolated nebula against a demo repo, a stand-in `gh`, a private tmux,
+# captured to design-screenshots/<scene>.{txt,ansi,png}. `KEYS="Tab j"` walks somewhere first;
+# scenes live in scripts/shot/scenes/. Needs tmux; Pillow is installed into a venv on first run.
+shot: ## Screenshot the debug TUI with demo data (SCENE=open-prs KEYS="…")
+	scripts/shot/shot.sh $(SCENE)
 
 # Slots accumulate: a worktree you deleted leaves its DB behind under
 # ~/.nebula-dev. This lists every one with its daemon's state, so you can see

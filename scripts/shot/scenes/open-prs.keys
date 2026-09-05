@@ -1,0 +1,4 @@
+# One tmux key name per line, sent in order with a pause after each; `#` lines are comments.
+# The default scene sends nothing: the first screen already shows the WORKTREES PANEL with its
+# PROJECT OPEN PRS GROUP (drafts dimmed and last) and the SESSIONS PANEL's PR ROW for the selected
+# worktree. Add keys here (`Tab`, `j`, `Enter`, `S-Tab`, `C-q` …) to walk somewhere else first.

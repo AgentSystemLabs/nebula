@@ -257,4 +257,34 @@ mod tests {
         );
         assert!(out.contains("?1000h"), "and the modes ride along: {out:?}");
     }
+
+    /// ratatui's whole-terminal clear method opens with a cursor-position query (`CSI 6n`) and
+    /// crossterm gives up on the reply after 2 s with an error the loop turns into a fatal exit;
+    /// `repaint` clears through `Terminal::resize`, which asks nothing. So nothing in the loop may
+    /// call it — this reads the loop's own source, because the trap is a call site, not a
+    /// behaviour a TestBackend could show. (The needles are assembled so this test's own text
+    /// never matches them.)
+    #[test]
+    fn the_loop_never_calls_terminal_clear() {
+        let needles = [
+            concat!("terminal.", "clear("),
+            concat!("Terminal::", "clear("),
+        ];
+        let sources = [
+            ("event_loop.rs", include_str!("../event_loop.rs")),
+            ("event_loop/focus_walk.rs", include_str!("focus_walk.rs")),
+            (
+                "event_loop/host_terminal.rs",
+                include_str!("host_terminal.rs"),
+            ),
+        ];
+        for (name, src) in sources {
+            for needle in needles {
+                assert!(
+                    !src.contains(needle),
+                    "{name} calls Terminal::clear — use host_terminal::repaint (Terminal::resize)"
+                );
+            }
+        }
+    }
 }
