@@ -1788,7 +1788,9 @@ impl PointerShape {
 /// GitHub API call, and the list changes on the order of minutes.
 #[derive(Debug, Clone)]
 pub struct OpenPrs {
-    /// Open pull requests, in `gh`'s order (newest first).
+    /// Open pull requests: newest first, with the drafts sunk below every
+    /// finished one (`pull_request::drafts_last`, applied as the answer
+    /// lands).
     pub list: Vec<OpenPr>,
     /// When this answer landed. Switching projects pulls the next lookup
     /// forward, but never past this plus [`OPEN_PRS_MIN_AGE`] — otherwise
@@ -2968,7 +2970,6 @@ mod tests {
             number: 7,
             url: url.into(),
             title: "Attach links".into(),
-            state: "OPEN".into(),
             is_draft: false,
             activity: Vec::new(),
         }

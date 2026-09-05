@@ -3104,23 +3104,14 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 // the arrow says "leaves nebula". The group header already
                 // says these are open, so only a draft earns a badge; in a
                 // column this narrow the width is better spent on the title.
+                // A draft is also dimmed end to end (`pr_row::look`) and
+                // sits below every finished pull request, so it reads as
+                // "not ready" from across the room.
                 let pr = &prs[*i - worktrees.len()];
-                let badge = pr.is_draft.then(|| format!(" {}", pr.badge()));
-                let badge_len = badge.as_ref().map_or(0, |b| b.chars().count());
-                let label_max = (inner.width as usize)
-                    .saturating_sub(3)
-                    .saturating_sub(badge_len);
-                let mut spans = vec![
-                    Span::styled("↗ ", Style::default().fg(th.accent)),
-                    Span::styled(
-                        truncate(&pr.label(), label_max),
-                        Style::default().fg(th.muted),
-                    ),
-                ];
-                if let Some(badge) = badge {
-                    spans.push(Span::styled(badge, Style::default().fg(th.dim)));
-                }
-                // No STATUS DOT on a pull request, so the rail is the accent.
+                let look = crate::pr_row::look(pr.is_draft, th);
+                let badge = pr.is_draft.then(|| (format!(" {}", pr.badge()), th.dim));
+                let spans = crate::pr_row::spans(look, &pr.label(), inner.width as usize, badge);
+                // No STATUS DOT on a pull request, so the rail is the look's.
                 render_pill(
                     f,
                     inner,
@@ -3129,7 +3120,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     *i == app.sel_worktree,
                     focused,
                     th,
-                    th.accent,
+                    look.rail,
                 );
                 if let Some(hit) = rows_rect_at(inner, y, hit_h) {
                     app.hits.push((hit, HitTarget::Worktree(*i)));
@@ -3420,8 +3411,9 @@ fn draw_session_row(
         SessionRow::Link(l) => {
             // Same shape as an agent row — glyph, name, trailing badge — so
             // the column reads as one list. The arrow says "leaves nebula";
-            // a pull request earns the accent, everything else is as quiet
-            // as a terminal row.
+            // a pull request earns the accent (a draft the dim, end to end,
+            // like its row in the PROJECT OPEN PRS GROUP), and a bare saved
+            // link is as quiet as a terminal row.
             //
             // The badge slot is normally the dim state word, but comments
             // that landed since the row was last opened take it over and go
@@ -3434,24 +3426,16 @@ fn draw_session_row(
                 Some(pr) => Some((format!(" {}", pr.badge()), th.dim)),
                 None => None,
             };
-            let badge_len = badge.as_ref().map_or(0, |(b, _)| b.chars().count());
-            let glyph_color = match pr {
-                Some(pr) if pr.is_open() => th.accent,
-                Some(_) => th.dim,
-                None => th.muted,
+            let look = match pr {
+                Some(pr) => crate::pr_row::look(pr.is_draft, th),
+                None => crate::pr_row::Look {
+                    glyph: th.muted,
+                    label: th.muted,
+                    rail: th.accent,
+                },
             };
-            let label_max = (width.saturating_sub(3) as usize).saturating_sub(badge_len);
-            let mut spans = vec![
-                Span::styled("↗ ", Style::default().fg(glyph_color)),
-                Span::styled(
-                    truncate(&l.label(), label_max),
-                    Style::default().fg(th.muted),
-                ),
-            ];
-            if let Some((badge, color)) = badge {
-                spans.push(Span::styled(badge, Style::default().fg(color)));
-            }
-            (spans, th.accent)
+            let spans = crate::pr_row::spans(look, &l.label(), width as usize, badge);
+            (spans, look.rail)
         }
     };
     render_pill(

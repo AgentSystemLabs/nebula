@@ -19,6 +19,7 @@ pub mod links;
 pub mod overlay_close;
 pub mod palette;
 pub mod pr_preview;
+pub mod pr_row;
 pub mod preset_overlays;
 pub mod pull_request;
 pub mod quick_prompt;
