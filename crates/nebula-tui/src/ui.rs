@@ -195,8 +195,12 @@ fn draw_vim(f: &mut Frame, app: &mut App) {
         return;
     };
     if vim.embedded {
-        if let Some(Overlay::Tree(view)) = &app.overlay {
-            let inner = view.preview_area;
+        let pane = match &app.overlay {
+            Some(Overlay::Tree(view)) => Some(view.preview_area),
+            Some(Overlay::FileTabs(view)) => Some(view.body_area),
+            _ => None,
+        };
+        if let Some(inner) = pane {
             if inner.width < 2 || inner.height < 2 {
                 return; // pane not drawn yet
             }
@@ -210,8 +214,8 @@ fn draw_vim(f: &mut Frame, app: &mut App) {
             }
             return;
         }
-        // Tree overlay gone under an embedded editor — fall through to the
-        // modal so the session is never invisible.
+        // The owning overlay gone under an embedded editor — fall through
+        // to the modal so the session is never invisible.
     }
     let area = centered_rect_pct(f.area(), VIM_MODAL_PCT.0, VIM_MODAL_PCT.1);
     f.render_widget(Clear, area);
@@ -756,37 +760,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             let capturing = view.capturing();
 
             // ---- tab strip ----
-            let mut strip: Vec<Span> = Vec::new();
-            let mut hits: Vec<(u16, u16)> = Vec::new();
-            let mut x = inner.x;
-            for (i, t) in crate::config::SETTINGS_TABS.iter().enumerate() {
-                strip.push(Span::raw(" "));
-                x += 1;
-                let label = format!(" {} ", t.title);
-                let mut style = Style::default().fg(th.dim);
-                if i == tab {
-                    style = Style::default()
-                        .fg(th.accent)
-                        .bg(th.sel_bg)
-                        .add_modifier(Modifier::BOLD);
-                    // Cursor parked on the strip: brighten the active tab
-                    // so ←/→ visibly belong to it.
-                    if view.on_tabs {
-                        style = style.add_modifier(Modifier::REVERSED);
-                    }
-                }
-                let w = label.chars().count() as u16;
-                hits.push((x, x + w));
-                x += w;
-                strip.push(Span::styled(label, style));
-            }
-            let mut lines: Vec<Line> = vec![
-                Line::from(strip),
-                Line::from(Span::styled(
-                    "─".repeat(inner.width as usize),
-                    Style::default().fg(th.muted),
-                )),
-            ];
+            let (strip, hits) = tab_strip(
+                inner.x,
+                crate::config::SETTINGS_TABS.iter().map(|t| t.title),
+                tab,
+                view.on_tabs,
+                th,
+            );
+            let mut lines: Vec<Line> = vec![Line::from(strip), strip_rule(inner.width, th)];
 
             // ---- body ----
             let body_h = inner.height.saturating_sub(CHROME).max(1) as usize;
@@ -1635,6 +1616,81 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
         Overlay::AgentPresetEditor(editor) => {
             crate::preset_overlays::draw_editor(f, app, &editor, th)
         }
+        Overlay::FileTabs(view) => {
+            // The TREE BROWSER's footprint: the editor Enter opens wants the
+            // room, and the preview is a whole file.
+            let area = centered_rect_pct(f.area(), SPLIT_MODAL_PCT.0, SPLIT_MODAL_PCT.1);
+            let title = format!(" Open files ({}) ", view.tabs.len());
+            let inner = render_modal_frame(f, area, title, th);
+
+            // ---- tab strip and its rule ----
+            let (strip, hits) = tab_strip(
+                inner.x,
+                view.tabs.iter().map(|t| t.label.as_str()),
+                view.tab,
+                view.on_tabs,
+                th,
+            );
+            let head = Rect {
+                height: inner.height.min(2),
+                ..inner
+            };
+            f.render_widget(
+                Paragraph::new(vec![Line::from(strip), strip_rule(inner.width, th)]),
+                head,
+            );
+
+            // ---- body: the preview, or the embedded editor draw_vim paints
+            // over it after us ----
+            let body = Rect {
+                x: inner.x,
+                y: inner.y.saturating_add(2),
+                width: inner.width,
+                height: inner.height.saturating_sub(3),
+            };
+            let max_scroll = view
+                .preview_line_count
+                .saturating_sub(body.height as usize)
+                .min(u16::MAX as usize) as u16;
+            let scroll = view.scroll.min(max_scroll);
+            let editing = app.vim.as_ref().is_some_and(|v| v.embedded);
+            if !editing && body.height > 0 {
+                let lines = preview_window(
+                    &view.preview_lines,
+                    view.preview_line_count,
+                    view.preview_is_file,
+                    scroll,
+                    body,
+                    th,
+                );
+                f.render_widget(Paragraph::new(lines), body);
+            }
+
+            // ---- keys hint on the last row ----
+            if let Some(hint_area) = row_rect(inner, inner.height.saturating_sub(1) as usize) {
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        truncate(
+                            &format!(" {}", file_tabs_keys_hint(&view, editing)),
+                            inner.width as usize,
+                        ),
+                        Style::default().fg(th.dim),
+                    )),
+                    hint_area,
+                );
+            }
+
+            // Write-back (draw works on a clone): hit rects for the mouse,
+            // the pane for the embedded editor, the page size for paging,
+            // the scroll re-clamped so resizes never strand the view.
+            if let Some(Overlay::FileTabs(v)) = &mut app.overlay {
+                v.area = area;
+                v.tab_hits = hits;
+                v.body_area = body;
+                v.view_height = body.height;
+                v.scroll = scroll;
+            }
+        }
         Overlay::Tree(view) => {
             let area = centered_rect_pct(f.area(), SPLIT_MODAL_PCT.0, SPLIT_MODAL_PCT.1);
             f.render_widget(Clear, area);
@@ -1738,29 +1794,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 // directory listings and placeholders have no lines to
                 // number. Dropped entirely when the pane is too narrow to
                 // leave room for the code itself.
-                let num_w = view.preview_line_count.to_string().len().max(2);
-                let gutter = view.preview_is_file
-                    && (preview_inner.width as usize) > num_w + 1 + MIN_PREVIEW_TEXT_W;
-                let lines: Vec<Line> = view
-                    .preview_lines
-                    .iter()
-                    .enumerate()
-                    .skip(scroll as usize)
-                    .take(preview_inner.height as usize)
-                    .map(|(i, runs)| {
-                        let mut spans = Vec::with_capacity(runs.len() + 1);
-                        if gutter {
-                            spans.push(Span::styled(
-                                format!("{:>num_w$} ", i + 1),
-                                Style::default().fg(th.edge),
-                            ));
-                        }
-                        spans.extend(runs.iter().map(|(kind, text)| {
-                            Span::styled(text.clone(), token_style(*kind, th))
-                        }));
-                        Line::from(spans)
-                    })
-                    .collect();
+                let lines = preview_window(
+                    &view.preview_lines,
+                    view.preview_line_count,
+                    view.preview_is_file,
+                    scroll,
+                    preview_inner,
+                    th,
+                );
                 f.render_widget(Paragraph::new(lines), preview_inner);
             }
 
@@ -1792,6 +1833,106 @@ fn key_hint(app: &App, action: crate::keymap::Action) -> String {
 /// what the cursor is on, because the three places it can be — the tab
 /// strip, a value row, a hotkey row — take genuinely different keys, and a
 /// single union of all of them would read as noise.
+/// The FILE TABS' bottom-row hint: what the keys do from where the cursor
+/// is — the strip, the preview, or the editor drawn over it.
+fn file_tabs_keys_hint(view: &crate::file_tabs::FileTabsView, editing: bool) -> String {
+    let editor = editor_name(&view.editor);
+    if editing {
+        format!(
+            "{editor} has the keys  Ctrl+q: back to the tabs (kills {editor}; :q keeps the file)"
+        )
+    } else if view.on_tabs {
+        format!(
+            "←/→ or Tab: switch  1-9: jump  ↓: preview  Enter: edit in {editor}  Esc / Ctrl+q: close"
+        )
+    } else {
+        format!(
+            "j/k: scroll  Ctrl+d/u: half page  ↑ off the top: tabs  Enter: edit in {editor}  \
+             Esc / Ctrl+q: back to the tabs"
+        )
+    }
+}
+
+/// The tab strip the SETTINGS OVERLAY and the FILE TABS share: labels laid
+/// out left to right from `x`, the active one lit — and reversed while the
+/// cursor is parked on the strip, so ←/→ visibly belong to it — returning
+/// the spans and each label's screen x-range for click hit-testing.
+fn tab_strip<'a>(
+    x: u16,
+    labels: impl Iterator<Item = &'a str>,
+    active: usize,
+    on_tabs: bool,
+    th: Theme,
+) -> (Vec<Span<'static>>, Vec<(u16, u16)>) {
+    let mut strip: Vec<Span> = Vec::new();
+    let mut hits: Vec<(u16, u16)> = Vec::new();
+    let mut x = x;
+    for (i, t) in labels.enumerate() {
+        strip.push(Span::raw(" "));
+        x += 1;
+        let label = format!(" {t} ");
+        let mut style = Style::default().fg(th.dim);
+        if i == active {
+            style = Style::default()
+                .fg(th.accent)
+                .bg(th.sel_bg)
+                .add_modifier(Modifier::BOLD);
+            if on_tabs {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+        }
+        let w = label.chars().count() as u16;
+        hits.push((x, x + w));
+        x += w;
+        strip.push(Span::styled(label, style));
+    }
+    (strip, hits)
+}
+
+/// The rule under a tab strip, the modal's inner width.
+fn strip_rule(width: u16, th: Theme) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(width as usize),
+        Style::default().fg(th.muted),
+    ))
+}
+
+/// The highlighted preview the TREE BROWSER and the FILE TABS draw: the
+/// visible window of `lines` from `scroll`, with a line-number gutter when
+/// the text is a real file and the pane is wide enough to spare it and
+/// still leave room for the code itself.
+fn preview_window(
+    lines: &[Vec<(crate::syntax::TokenKind, String)>],
+    line_count: usize,
+    is_file: bool,
+    scroll: u16,
+    inner: Rect,
+    th: Theme,
+) -> Vec<Line<'static>> {
+    let num_w = line_count.to_string().len().max(2);
+    let gutter = is_file && (inner.width as usize) > num_w + 1 + MIN_PREVIEW_TEXT_W;
+    lines
+        .iter()
+        .enumerate()
+        .skip(scroll as usize)
+        .take(inner.height as usize)
+        .map(|(i, runs)| {
+            let mut spans = Vec::with_capacity(runs.len() + 1);
+            if gutter {
+                spans.push(Span::styled(
+                    format!("{:>num_w$} ", i + 1),
+                    Style::default().fg(th.edge),
+                ));
+            }
+            spans.extend(
+                runs.iter()
+                    .map(|(kind, text)| Span::styled(text.clone(), token_style(*kind, th))),
+            );
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn settings_keys_hint(view: &crate::app::SettingsView) -> &'static str {
     if view.capturing() {
         return "press the key you want   Esc: cancel";
@@ -3756,6 +3897,11 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             "type: filter  ↑/↓: file  ⇧↑/↓: scroll  Ctrl+d/u: page  Ctrl+u: clear filter  Esc: clear/close",
             Style::default().fg(th.dim),
         )
+    } else if let Some(Overlay::FileTabs(view)) = &app.overlay {
+        Span::styled(
+            file_tabs_keys_hint(view, app.vim.as_ref().is_some_and(|v| v.embedded)),
+            Style::default().fg(th.dim),
+        )
     } else if matches!(&app.overlay, Some(Overlay::Tree(_))) {
         Span::styled(
             "type: filter  ↑/↓: move  ←/→: fold  Enter: open/edit  ⇧↑/↓: scroll  Ctrl+u: clear filter  Esc: clear/close",
@@ -3881,7 +4027,7 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             // An open-PR row answers to a different set of verbs than a
             // checkout does, so the hint follows the cursor into the group.
             Focus::Worktrees if app.selected_worktree_pr().is_some() => format!(
-                "{}: claude session  {}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: search  {}: menu  {}: help",
+                "{}: new session  {}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: search  {}: menu  {}: help",
                 k(Action::New),
                 k(Action::Activate),
                 k(Action::GitDiff),
@@ -4018,17 +4164,27 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
     // clipped *flash* loses the end of a sentence, so the nameplate steps
     // aside for one that would not otherwise fit.
     let plate = format!("nebula v{}", env!("CARGO_PKG_VERSION"));
-    let plate_w = plate.chars().count() + "  ·  ".chars().count();
+    // A newer published release rides the nameplate as `⇡ v0.22.0`, in the
+    // heads-up color: the version is already what this span says, so "and
+    // a newer one exists" belongs beside it rather than anywhere else on
+    // the bar. It is part of the plate for the yield below — a flash that
+    // would be clipped drops both.
+    let update = app.update_available.as_ref().map(|v| format!(" ⇡ v{v}"));
+    let plate_w = plate.chars().count()
+        + update.as_ref().map_or(0, |u| u.chars().count())
+        + "  ·  ".chars().count();
     let body_w: usize = spans.iter().map(|s| s.width()).sum();
     if app.flash.is_none() || body_w + plate_w <= left.width as usize {
-        spans.splice(
-            1..1,
-            [
-                Span::styled(plate, Style::default().fg(th.dim)),
-                Span::styled("  ·  ", Style::default().fg(th.dim)),
-            ],
-        );
-        workspace_idx += 2;
+        let mut plate_spans = vec![Span::styled(plate, Style::default().fg(th.dim))];
+        if let Some(update) = update {
+            plate_spans.push(Span::styled(
+                update,
+                Style::default().fg(th.warn).add_modifier(Modifier::BOLD),
+            ));
+        }
+        plate_spans.push(Span::styled("  ·  ", Style::default().fg(th.dim)));
+        workspace_idx += plate_spans.len();
+        spans.splice(1..1, plate_spans);
     }
     // Where the workspace nameplate landed: everything ahead of it on the
     // bar is fixed-width chrome, so its cells are a prefix sum. Clipped

@@ -157,8 +157,9 @@ pub enum MenuAction {
         /// One-shot launch modifier for Claude. The task itself is collected
         /// after the optional name prompt and crosses IPC only on create.
         cloud: bool,
-        /// OPEN PRS launch context. Some is valid only for local Claude and
-        /// is preserved through model/effort submenus and the name prompt.
+        /// OPEN PRS launch context (a PR SESSION). Valid for every local
+        /// kind, never with `cloud`, and preserved through model/effort
+        /// submenus and the name prompt.
         pr_url: Option<String>,
         /// Set when the picker was opened from the QUICK PROMPT's `Tab`:
         /// the box to put back (with its typed text) instead of creating a
@@ -363,6 +364,9 @@ impl ContextMenu {
     /// Cloud mode is a root new-session-picker modifier, not another agent
     /// kind. Returning Some only while the Claude row itself is highlighted
     /// keeps Tab free everywhere else (including model/effort submenus).
+    /// The `"New session"` title is the gate on purpose: the PR SESSION and
+    /// QUICK PROMPT pickers share these rows (`agent_picker`) but never
+    /// launch cloud — the daemon refuses a PR launch with a cloud task.
     pub fn hovered_claude_cloud(&self) -> Option<bool> {
         if self.parent.is_some() || self.title.as_deref() != Some("New session") {
             return None;
@@ -1188,6 +1192,8 @@ pub enum Overlay {
     Files(FileFinder),
     Grep(GrepView),
     Tree(crate::tree_browser::TreeBrowser),
+    /// `nebula open <file>…` from a session: the FILE TABS.
+    FileTabs(crate::file_tabs::FileTabsView),
     Metrics(MetricsView),
     Hosts(HostsView),
     /// `e` in the SESSIONS PANEL: the AGENT PRESETS list.
@@ -1860,6 +1866,11 @@ pub struct App {
     /// process with a fresh connection.
     pub pending_ssh: Option<crate::hosts::HostEntry>,
     pub flash: Option<String>,
+    /// The newest release published on GitHub (`0.22.0`) when it is newer
+    /// than this build — the footer's `⇡ v0.22.0` beside the version
+    /// nameplate. `None` until the update check finds one; a check that
+    /// can't ask leaves it as it was.
+    pub update_available: Option<String>,
     /// The last `h`/`l` (or ←/→) that landed on the end of the panel row,
     /// or `k`/`j` (↑/↓) on a panel's first row / in the Workspaces bar, and
     /// stayed put, with when it arrived: a second press of the same action
@@ -2108,6 +2119,7 @@ impl App {
             should_quit: false,
             pending_ssh: None,
             flash: None,
+            update_available: None,
             edge_tap: None,
             bar_return: Focus::Projects,
             overlay: None,

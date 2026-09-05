@@ -7,7 +7,7 @@ Agents tab; a disabled kind is absent from the NEW SESSION PICKER (not greyed) w
 submenu; persisted in CONFIG.JSON; existing SESSIONS keep attaching / RESUME / restarting; disabling Claude
 also blocks the PR SESSION launch with a FLASH. (no questions asked)
 
-**Did:** `crates/nebula-tui/src/config.rs`: `claude_enabled` / `codex_enabled` / `cursor_enabled: bool`
+**Did:** *(2026-09-04: `claude_enabled()` and `CLAUDE_DISABLED_FLASH` are gone — the PR SESSION picker reads `enabled_kinds()` through `agent_picker.rs` like the NEW SESSION PICKER, and the test is now `disabled_claude_leaves_the_pr_session_to_the_other_harnesses`.)* `crates/nebula-tui/src/config.rs`: `claude_enabled` / `codex_enabled` / `cursor_enabled: bool`
 (default true), `SettingKind::{ClaudeEnabled, CodexEnabled, CursorEnabled}` as `on_off` toggles, the
 AGENTS TAB regrouped per kind (enabled / model / effort), `Config::kind_enabled(kind)` and
 `enabled_kinds()` (filters `AgentKind::ALL`), three `write_into` inserts. `event_loop.rs`:

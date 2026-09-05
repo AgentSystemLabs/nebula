@@ -31,6 +31,10 @@ pub const LOG: &str = "NEBULA_LOG";
 pub const INSTALL_URL: &str = "NEBULA_INSTALL_URL";
 /// Editor command the file modals open, ahead of the config's `editor`.
 pub const EDITOR: &str = "NEBULA_EDITOR";
+/// Cadence in seconds of the TUI's check for a newer published release
+/// (the footer's `⇡ vX.Y.Z` update indicator); `0` turns it off, as the
+/// e2e tests do so their footers never depend on what GitHub has published.
+pub const UPDATE_CHECK_SECS: &str = "NEBULA_UPDATE_CHECK_SECS";
 
 /// Env vars that identify an agent session to the daemon. They are set on
 /// every agent PTY and must never leak into plain terminals.
