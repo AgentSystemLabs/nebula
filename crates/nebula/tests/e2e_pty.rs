@@ -1109,6 +1109,188 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
     wait_for_exit(&mut daemon);
 }
 
+/// CLAUDE TITLE SYNC end to end, with a /bin/sh standing in for claude:
+/// the row's name reaches the CLI as the `UserPromptSubmit` reply's
+/// `sessionTitle`, and a `/rename` inside the CLI — which fires no hook,
+/// only rewrites the window title and the `custom-title.json` beside the
+/// transcript the hooks named — retitles the row.
+#[tokio::test]
+async fn claude_session_title_and_row_name_stay_tied() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    subscribe(&mut c).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: repo.clone(),
+            name: None,
+            create_missing: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(
+                e,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(_)
+                }
+            )
+        })
+    })
+    .await;
+    let worktree = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } => Some(w.clone()),
+            _ => None,
+        })
+        .unwrap();
+
+    // A name typed at creation: settled, so it is due a push into Claude.
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: worktree.id.clone(),
+            name: "Typed In Nebula".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+    let sref = SessionRef::Agent(agent_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 120,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+
+    // The transcript claude would report, in a dir this test controls.
+    let transcripts = env.tmp.path().join("transcripts");
+    std::fs::create_dir_all(&transcripts).unwrap();
+    let transcript = transcripts.join("sess-1.jsonl");
+    let body = format!(
+        r#"{{"session_id":"sess-1","transcript_path":"{}"}}"#,
+        transcript.display()
+    );
+    // The marker is split in the typed line (`D""ONE`) so the shell's echo
+    // of the command can't satisfy the wait — only curl's finished reply.
+    let curl = |marker: &str| {
+        format!(
+            "curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
+             -H 'Content-Type: application/json' -d '{body}' \
+             \"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=UserPromptSubmit\"; \
+             echo {marker}\n"
+        )
+    };
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: curl("REPLY-D\"\"ONE").into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    // nebula → Claude: the reply hands the CLI the row's name.
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        String::from_utf8_lossy(&collected_output(evs)).contains("REPLY-DONE")
+    })
+    .await;
+    let output = String::from_utf8_lossy(&collected_output(&events)).to_string();
+    assert!(
+        output.contains(r#""sessionTitle":"Typed In Nebula""#),
+        "reply carries the row name: {output}"
+    );
+
+    // Claude → nebula: `/rename` persists the title beside the transcript
+    // and rewrites the window title; no hook fires. Only the OSC bytes
+    // come from the PTY — the sidecar is claude's file, written here.
+    let sidecar_dir = transcripts.join("sess-1");
+    std::fs::create_dir_all(&sidecar_dir).unwrap();
+    std::fs::write(
+        sidecar_dir.join("custom-title.json"),
+        r#"{"customTitle":"Renamed In Claude"}"#,
+    )
+    .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: b"printf '\\033]0;\xe2\x9c\xb3 Renamed In Claude\\007'\n".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.name == "Renamed In Claude")
+        })
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.name == "Renamed In Claude")
+        }),
+        "row retitled from claude's /rename: {events:#?}"
+    );
+
+    // Now the two agree: the next prompt's reply pushes nothing.
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: curl("REPLY-T\"\"WO").into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        String::from_utf8_lossy(&collected_output(evs)).contains("REPLY-TWO")
+    })
+    .await;
+    let output = String::from_utf8_lossy(&collected_output(&events)).to_string();
+    assert!(
+        !output.contains("sessionTitle"),
+        "no push once claude holds the name: {output}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// The inverse of the cwd-rehome test: a *user* move of a live agent must
 /// relocate the process too. The PTY is killed and respawned in the target
 /// checkout — left running in the old one, its hooks would keep reporting
@@ -3056,9 +3238,19 @@ async fn auto_title_instruction_and_rename_flow() {
     })
     .await;
 
-    // Titled now: the next prompt injects nothing.
+    // Titled now: the next prompt injects no instruction — instead the
+    // reply hands Claude the row's name as its own session title (CLAUDE
+    // TITLE SYNC), so `/resume` and `/rc` show what the row shows.
     let (status, body) = hook_post(port, &submit_path, &token).await;
-    assert_eq!((status, body.as_str()), (200, ""));
+    assert_eq!(status, 200);
+    assert_eq!(
+        body,
+        nebula_daemon::hooks::user_prompt_reply(false, Some("Fix Login Redirect"))
+    );
+    assert!(
+        !body.contains("additionalContext"),
+        "no instruction: {body}"
+    );
 
     // A repeat attempt is declined as a settled answer (exit 0), not a fault.
     let out = agent_cli(&env, &agent_id, &["rename", "Another", "Title"]);

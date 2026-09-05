@@ -2,6 +2,7 @@ pub mod cloud;
 pub mod kitty;
 pub mod progress;
 pub mod ring;
+pub mod title;
 
 use anyhow::{Context, Result};
 use cloud::CloudScanner;
@@ -68,6 +69,12 @@ pub enum PtyEvent {
     Progress {
         busy: bool,
     },
+    /// The child set its window title (OSC 0/2). Claude Code's carries the
+    /// session's name (`✳ Fix Login Redirect`), and `/rename` — which
+    /// fires no hook — shows up here first (see `pty::title`).
+    Title {
+        title: String,
+    },
     /// The child printed the id of the Claude Cloud session it created or
     /// attached to. Only scanned for on `--cloud` launches (`arm_cloud_scan`).
     CloudSession {
@@ -100,6 +107,8 @@ pub struct PtySession {
     kitty: Mutex<kitty::KittyScanner>,
     /// OSC 9;4 busy/idle tracking, likewise fed from live output.
     progress: Mutex<ProgressScanner>,
+    /// OSC 0/2 window-title tracking, likewise fed from live output.
+    title: Mutex<title::TitleScanner>,
     /// Claude Cloud session id / attach-refusal scanner; `None` until a
     /// `--cloud` launch arms it, so ordinary sessions pay nothing.
     cloud: Mutex<Option<CloudScanner>>,
@@ -165,6 +174,7 @@ impl PtySession {
             last_size: Mutex::new((spec.cols, spec.rows)),
             kitty: Mutex::new(kitty::KittyScanner::new()),
             progress: Mutex::new(ProgressScanner::new()),
+            title: Mutex::new(title::TitleScanner::new()),
             cloud: Mutex::new(None),
             input_seen: AtomicBool::new(false),
         });
@@ -275,6 +285,11 @@ impl PtySession {
         self.input_seen.load(Ordering::Relaxed)
     }
 
+    /// The child's current window title, or `None` if it never set one.
+    pub fn window_title(&self) -> Option<String> {
+        self.title.lock().unwrap().title().map(str::to_string)
+    }
+
     pub fn arm_cloud_scan(&self) {
         let mut scanner = CloudScanner::new();
         let (_, replay) = self.snapshot(None);
@@ -335,6 +350,7 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
             }
         }
         let busy_edge = session.progress.lock().unwrap().feed(pending);
+        let title_change = session.title.lock().unwrap().feed(pending);
         let cloud_sightings = match session.cloud.lock().unwrap().as_mut() {
             Some(scanner) => scanner.feed(pending),
             None => Vec::new(),
@@ -351,6 +367,10 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
         if let Some(busy) = busy_edge {
             tracing::debug!(session = ?session.sref, busy, "child progress state changed");
             let _ = session.events.send(PtyEvent::Progress { busy });
+        }
+        if let Some(title) = title_change {
+            tracing::debug!(session = ?session.sref, %title, "child window title changed");
+            let _ = session.events.send(PtyEvent::Title { title });
         }
         for sighting in cloud_sightings {
             tracing::info!(session = ?session.sref, ?sighting, "cloud sighting in child output");
@@ -429,6 +449,44 @@ mod tests {
         assert!(!session.input_seen(), "an empty write is not input");
         session.write_input(b"x").unwrap();
         assert!(session.input_seen());
+        session.kill();
+    }
+
+    /// A window title set by the child reaches subscribers as its own
+    /// event, and the session remembers it.
+    #[tokio::test]
+    async fn window_title_is_read_off_the_output() {
+        let session = PtySession::spawn(
+            SessionRef::Agent(AgentId::generate()),
+            SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "printf '\\033]0;✳ Fix Login\\007'; sleep 2".into(),
+                ],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: &[],
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+            },
+        )
+        .unwrap();
+        let mut rx = session.events.subscribe();
+        let title = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match rx.recv().await {
+                    Ok(PtyEvent::Title { title }) => break title,
+                    Ok(PtyEvent::Exited { .. }) => panic!("child exited before setting a title"),
+                    Ok(_) => continue,
+                    Err(e) => panic!("event stream ended: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("title event within 10s");
+        assert_eq!(title, "✳ Fix Login");
+        assert_eq!(session.window_title().as_deref(), Some("✳ Fix Login"));
         session.kill();
     }
 }

@@ -108,7 +108,9 @@ walks straight through. The DAEMON still owns every PTY — come back with `nebu
 SESSION is exactly where you left it, scrollback replayed.
 
 Leave a new SESSION on its default name and AUTO-TITLE renames it from your first prompt — `Fix Login
-Redirect`, not `agent-3`. Type a name yourself and nebula never touches it.
+Redirect`, not `agent-3`. Type a name yourself and nebula never touches it. A Claude SESSION's own name
+is the same name: `/rename` inside Claude Code retitles the row, and a name set in nebula reaches
+Claude's prompt box and `/resume` picker on your next prompt.
 
 ## Read the dots, not the screens
 

@@ -9,10 +9,16 @@
 //! Claude-shaped payloads — so one handler serves all four. Fail-soft on
 //! both sides — a malformed payload still gets a 200 so a broken hook never
 //! faults the user's agent turn.
+//!
+//! The Claude `UserPromptSubmit` reply is also the one channel back into
+//! the CLI: its `hookSpecificOutput` carries the AUTO-TITLE instruction
+//! while a session is untitled, and a `sessionTitle` whenever the row's
+//! name is not the one Claude holds (CLAUDE TITLE SYNC, `session_title.rs`).
 
 pub mod installer;
 pub mod pi_extension;
 
+use crate::session_title::TranscriptRef;
 use crate::status::HookEvent;
 use crate::store::Store;
 use axum::extract::{Query, State};
@@ -41,13 +47,27 @@ the request. Don't mention the rename to the user.";
 /// strict — bare text is discarded); Claude Code documents the same shape
 /// as the equivalent of bare text, so both CLIs share one body.
 pub fn auto_title_injection() -> String {
-    serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": AUTO_TITLE_INSTRUCTION,
-        }
-    })
-    .to_string()
+    user_prompt_reply(true, None)
+}
+
+/// The UserPromptSubmit reply body: the AUTO-TITLE instruction when one is
+/// due, a `sessionTitle` for Claude to take as its own session name when
+/// the row's name differs from it (verified on Claude Code 2.1.261: it
+/// renames and persists exactly as `/rename` does), or nothing at all —
+/// an empty body is the only other thing that may reach the CLI's stdout.
+pub fn user_prompt_reply(instruction: bool, session_title: Option<&str>) -> String {
+    if !instruction && session_title.is_none() {
+        return String::new();
+    }
+    let mut output = serde_json::Map::new();
+    output.insert("hookEventName".into(), "UserPromptSubmit".into());
+    if instruction {
+        output.insert("additionalContext".into(), AUTO_TITLE_INSTRUCTION.into());
+    }
+    if let Some(title) = session_title {
+        output.insert("sessionTitle".into(), title.into());
+    }
+    serde_json::json!({ "hookSpecificOutput": output }).to_string()
 }
 
 /// Diagnostic bodies for the route whose responses a hook discards. Never
@@ -67,6 +87,25 @@ enum HookDialect {
     /// Cursor: every hook answers with its own gating JSON and drops the
     /// body, so the `{"ok": …}` diagnostics can stay.
     Plain,
+}
+
+/// Which CLI a route serves. Beyond the dialect, only Claude persists a
+/// session title of its own and reads `sessionTitle` from a hook reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookCli {
+    Claude,
+    Codex,
+    Cursor,
+    Pi,
+}
+
+impl HookCli {
+    fn dialect(self) -> HookDialect {
+        match self {
+            HookCli::Claude | HookCli::Codex | HookCli::Pi => HookDialect::Injectable,
+            HookCli::Cursor => HookDialect::Plain,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -93,6 +132,9 @@ pub struct HookDelivery {
     /// sends it on every event); drives cwd-based agent re-homing. Absent
     /// when the CLI doesn't report it — re-homing simply never triggers.
     pub cwd: Option<String>,
+    /// Where Claude keeps this session's transcript — and beside it the
+    /// title `/rename` persists (see `session_title`). Claude route only.
+    pub transcript: Option<TranscriptRef>,
 }
 
 /// Permissive payload: every field optional, unknown fields ignored. Hook
@@ -103,6 +145,9 @@ pub struct HookDelivery {
 pub struct HookPayload {
     pub hook_event_name: Option<String>,
     pub session_id: Option<String>,
+    /// Claude's transcript file; its directory is where the session title
+    /// lives (`<dir>/<session_id>/custom-title.json`).
+    pub transcript_path: Option<String>,
     /// Cursor names the resumable chat id `conversation_id` (== its
     /// `session_id`, but only the alias is guaranteed on every event).
     pub conversation_id: Option<String>,
@@ -195,10 +240,10 @@ pub async fn start_hook_server(
     // such channel (its hooks answer with their own gating JSON), so it
     // takes the plain route.
     let app = Router::new()
-        .route("/api/hooks/claude", post(receive_injectable_hook))
-        .route("/api/hooks/codex", post(receive_injectable_hook))
-        .route("/api/hooks/cursor", post(receive_plain_hook))
-        .route("/api/hooks/pi", post(receive_injectable_hook))
+        .route("/api/hooks/claude", post(receive_claude_hook))
+        .route("/api/hooks/codex", post(receive_codex_hook))
+        .route("/api/hooks/cursor", post(receive_cursor_hook))
+        .route("/api/hooks/pi", post(receive_pi_hook))
         .with_state(state);
 
     tokio::spawn(async move {
@@ -217,31 +262,53 @@ fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Claude/Codex route: the UserPromptSubmit hook command pipes this
-/// response's body to stdout, so it must be empty or the injected
-/// instruction — never diagnostic JSON.
-async fn receive_injectable_hook(
+/// Claude route: the UserPromptSubmit hook command pipes this response's
+/// body to stdout, so it must be empty or the reply envelope — never
+/// diagnostic JSON.
+async fn receive_claude_hook(
     State(state): State<Arc<HookServerState>>,
     Query(query): Query<HookQuery>,
     headers: HeaderMap,
     body: String,
 ) -> (StatusCode, String) {
-    receive_hook(HookDialect::Injectable, state, query, headers, body).await
+    receive_hook(HookCli::Claude, state, query, headers, body).await
+}
+
+/// Codex route: the same injectable dialect as Claude's, minus the
+/// session-title exchange Codex has no equivalent of.
+async fn receive_codex_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(HookCli::Codex, state, query, headers, body).await
 }
 
 /// Cursor route: every hook command answers cursor with its own gating JSON
 /// and discards this body, so the `{"ok": ...}` diagnostics stay.
-async fn receive_plain_hook(
+async fn receive_cursor_hook(
     State(state): State<Arc<HookServerState>>,
     Query(query): Query<HookQuery>,
     headers: HeaderMap,
     body: String,
 ) -> (StatusCode, String) {
-    receive_hook(HookDialect::Plain, state, query, headers, body).await
+    receive_hook(HookCli::Cursor, state, query, headers, body).await
+}
+
+/// `/api/hooks/pi`: pi's managed extension POSTs Claude-shaped payloads
+/// and unwraps the injectable reply body into the run's system prompt.
+async fn receive_pi_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(HookCli::Pi, state, query, headers, body).await
 }
 
 async fn receive_hook(
-    dialect: HookDialect,
+    cli: HookCli,
     state: Arc<HookServerState>,
     query: HookQuery,
     headers: HeaderMap,
@@ -249,7 +316,8 @@ async fn receive_hook(
 ) -> (StatusCode, String) {
     // On this path the response body reaches the model's context, so every
     // outcome (auth failure included) must answer with empty-or-instruction.
-    let injectable = dialect == HookDialect::Injectable && query.hook_event == "UserPromptSubmit";
+    let injectable =
+        cli.dialect() == HookDialect::Injectable && query.hook_event == "UserPromptSubmit";
     let quiet_or = |status: StatusCode, diag: &str| {
         let body = if injectable {
             String::new()
@@ -281,6 +349,14 @@ async fn receive_hook(
     // in a scratch checkout must never drag the row out from under the
     // conversation. Only foreground payloads carry a cwd onward.
     let cwd = payload.cwd().filter(|_| payload.subagent_id().is_none());
+    // Only Claude persists a session title of its own beside a transcript.
+    let transcript = match cli {
+        HookCli::Claude => TranscriptRef::from_payload(
+            payload.transcript_path.as_deref(),
+            payload.session_id.as_deref(),
+        ),
+        HookCli::Codex | HookCli::Cursor | HookCli::Pi => None,
+    };
     let _ = state
         .tx
         .send(HookDelivery {
@@ -288,6 +364,7 @@ async fn receive_hook(
             event,
             session_id: payload.session_id(),
             cwd,
+            transcript,
         })
         .await;
 
@@ -299,12 +376,23 @@ async fn receive_hook(
             .store
             .agent_auto_title_pending(&agent_id)
             .unwrap_or(false);
-        let body = if inject {
-            auto_title_injection()
-        } else {
-            String::new()
+        // A titled row whose name Claude doesn't hold yet: hand Claude the
+        // name as its own session title (Claude only — Codex has no such
+        // field). Never while the instruction is pending: the agent's
+        // `nebula rename` is about to settle the name.
+        let session_title = match cli {
+            HookCli::Claude => state
+                .store
+                .agent_title_state(&agent_id)
+                .ok()
+                .flatten()
+                .and_then(|s| s.to_push().map(str::to_string)),
+            HookCli::Codex | HookCli::Cursor | HookCli::Pi => None,
         };
-        return (StatusCode::OK, body);
+        return (
+            StatusCode::OK,
+            user_prompt_reply(inject, session_title.as_deref()),
+        );
     }
     (StatusCode::OK, HOOK_OK.to_string())
 }
@@ -382,7 +470,101 @@ mod tests {
             .insert_agent_with_auto_title(&agent("pending"), true)
             .unwrap();
         store.insert_agent(&agent("titled")).unwrap();
+        // A row the user (or AUTO-TITLE) named, that Claude doesn't hold yet.
         store
+            .insert_agent(&Agent {
+                name: "Fix Login".into(),
+                ..agent("named")
+            })
+            .unwrap();
+        store
+    }
+
+    /// The reply's `sessionTitle` is how a nebula-side name reaches
+    /// Claude: sent on the Claude route for a settled name Claude doesn't
+    /// hold, never for a default name, never on the Codex route, and no
+    /// longer once Claude holds it. The delivery carries the transcript
+    /// ref (Claude only) that the reverse direction reads from.
+    #[tokio::test]
+    async fn claude_prompt_reply_pushes_the_row_name_as_session_title() {
+        let store = seeded_store();
+        let (env, mut rx) = start_hook_server(store.clone()).await.unwrap();
+        let payload = r#"{"session_id":"s1","transcript_path":"/t/p/s1.jsonl"}"#;
+
+        let (status, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=named&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, user_prompt_reply(false, Some("Fix Login")));
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["hookSpecificOutput"]["sessionTitle"], "Fix Login");
+        assert_eq!(
+            parsed["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
+        assert!(
+            parsed["hookSpecificOutput"]
+                .get("additionalContext")
+                .is_none(),
+            "no instruction for a titled row: {body}"
+        );
+        let delivery = rx.recv().await.unwrap();
+        assert_eq!(
+            delivery.transcript,
+            TranscriptRef::from_payload(Some("/t/p/s1.jsonl"), Some("s1"))
+        );
+
+        // Codex: same dialect, but no title exchange and no transcript.
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/codex?agentId=named&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, "");
+        assert!(rx.recv().await.unwrap().transcript.is_none());
+
+        // Other Claude events deliver the transcript too (the sync reads on
+        // every hook) but keep the diagnostic body.
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=named&hookEvent=Stop",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, HOOK_OK);
+        assert!(rx.recv().await.unwrap().transcript.is_some());
+
+        // Once Claude holds the name, the reply goes quiet again.
+        store
+            .adopt_claude_title(&AgentId("named".into()), "Fix Login")
+            .unwrap();
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=named&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, "");
+
+        // A pending row still gets only the instruction — its name is the
+        // default, and the agent's `nebula rename` is about to replace it.
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=pending&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(body, auto_title_injection());
+        assert!(!body.contains("sessionTitle"), "{body}");
     }
 
     #[tokio::test]

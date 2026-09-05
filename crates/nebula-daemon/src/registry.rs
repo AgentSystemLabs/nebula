@@ -149,6 +149,11 @@ pub struct Daemon {
     /// nebula hasn't adopted yet leaves its cwd here, so the worktree sync
     /// can finish the re-home once the row exists.
     last_cwd: Mutex<HashMap<AgentId, PathBuf>>,
+    /// Where each Claude agent's transcript (and beside it, the session
+    /// title `/rename` persists) lives, from its hook payloads. Read by
+    /// the CLAUDE TITLE SYNC (`session_title.rs`) when the PTY's window
+    /// title changes, which no hook reports.
+    pub(crate) transcripts: Mutex<HashMap<AgentId, crate::session_title::TranscriptRef>>,
     /// Agents that ran `nebula worktree` and are waiting for their turn to
     /// end: the row already sits under the target worktree while the PTY
     /// still runs in the old checkout. Drained by `complete_pending_move`
@@ -195,6 +200,7 @@ impl Daemon {
             attach_counts: Mutex::new(HashMap::new()),
             session_interest: Mutex::new(HashMap::new()),
             last_cwd: Mutex::new(HashMap::new()),
+            transcripts: Mutex::new(HashMap::new()),
             pending_moves: Mutex::new(HashMap::new()),
             cloud_attach_gated: AtomicBool::new(false),
             cloud_mirrors: Mutex::new(HashMap::new()),
@@ -544,7 +550,7 @@ impl Daemon {
     /// [`Self::broadcast_agent`] for the best-effort sites — background
     /// tasks and post-respawn refreshes — where a row deleted meanwhile is
     /// not an error: nothing to show, so nothing to say.
-    fn try_broadcast_agent(&self, id: &AgentId) {
+    pub(crate) fn try_broadcast_agent(&self, id: &AgentId) {
         let _ = self.broadcast_agent(id);
     }
 
@@ -2660,6 +2666,14 @@ impl Daemon {
                             daemon.apply_hook_event(id, HookEvent::Progress { busy }, None);
                         }
                     }
+                    // The window title carries Claude's session name, and
+                    // `/rename` fires no hook — this is the cue to read the
+                    // title it persisted (see `session_title`).
+                    Ok(PtyEvent::Title { title }) => {
+                        if let SessionRef::Agent(id) = &sref {
+                            daemon.on_pty_title(id, &title);
+                        }
+                    }
                     // The Cloud session this row launched, read off the
                     // `claude --cloud` output. Persisted at once — the child
                     // is typically gone within milliseconds of printing it —
@@ -3002,7 +3016,7 @@ fn claude_cloud_spawn_command(
 /// Normalize an agent-supplied title: control characters become spaces,
 /// whitespace collapses, and over-long titles are cut — models occasionally
 /// hand over a whole sentence no matter what the instruction says.
-fn sanitize_title(raw: &str) -> String {
+pub(crate) fn sanitize_title(raw: &str) -> String {
     const MAX_CHARS: usize = 60;
     let cleaned: String = raw
         .chars()
