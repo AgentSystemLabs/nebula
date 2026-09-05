@@ -1,0 +1,670 @@
+{
+  "pr": {
+    "additions": 48,
+    "assignees": [],
+    "author": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "baseRefName": "main",
+    "body": "`/pr-reviewer` reviews a pull request the way a careful colleague would before a production merge: it reads the diff, the description, the CI state, the surrounding code and the MEMORY LOG, then leaves one review comment that weighs security and production-merge risk first, performance second, and fit with the codebase's patterns third. It never builds, tests, executes or checks out the PR \u2014 the reviewer is a reader, and whatever reading cannot settle is named for a human to run.\n\n## Contents\n\n- [\ud83d\udd12 Merge risk first, in nebula's own terms](#merge-risk-first-in-nebulas-own-terms)\n- [\ud83d\ude45 Read, never run](#read-never-run)\n- [\ud83d\udcdd One review comment, one fixed shape](#one-review-comment-one-fixed-shape)\n- [\ud83d\udcf8 Screenshots](#screenshots)\n- [\ud83e\udded How a review flows](#how-a-review-flows)\n- [\ud83d\udd27 Technical overview](#technical-overview)\n- [Notes](#notes)\n\n## \ud83d\udd12 Merge risk first, in nebula's own terms <a id=\"merge-risk-first-in-nebulas-own-terms\"></a>\n\n- **Security and production risk lead every review.** The checklist is nebula's real attack surface, taken from the 2026-08-30 security walkthrough in the MEMORY LOG: the DAEMON SOCKET as an unauthenticated control plane, the HOOK RECEIVER and its one BEARER TOKEN per boot, every spawn argv and `--append-system-prompt`, MANAGED HOOKS writes into the user's own `~/.claude`, `~/.codex`, `~/.cursor` and `~/.pi`, NEBULA BROWSER and NEBULA TUNNEL, secrets in argv or the DAEMON LOG, supply chain, and scope drift between what the description claims and what the diff touches.\n- **Rollout impact is a finding, not a footnote.** A MIGRATION runs once and irreversibly on every user's SQLITE STORE; a PROTOCOL VERSION bump makes every running DAEMON refuse the new TUI until NEBULA KILL stops every live session. The review states both plainly, with the rollback path or its absence.\n- **Performance is weighed by how often the path runs.** The draw loop, the PTY byte path into the VENDORED VT100, the SCROLLBACK RING replay, the 2 s WORKTREE SYNC, the GIT POLL, and blocking calls on the daemon's async runtime. A cost paid once at launch is a nit; the same cost per frame is a should-fix.\n- **Fit is checked against the written rules, not taste.** KEEP MODULES SMALL, reuse of an existing helper before a re-implementation, a PROTOCOL VERSION bump for a shared type and an appended MIGRATION for a schema change, the deliberately dep-light workspace, tests beside the change, and TERMS in comments and docs.\n\n## \ud83d\ude45 Read, never run <a id=\"read-never-run\"></a>\n\n- **An explicit allow list.** `gh pr view`, `gh pr diff`, `gh pr checks`, the inline-comments API, a fetch of `pull/N/head`, `git show` of the PR's files by SHA and of the base's files, and `git grep`. Every one is a read that touches no working tree and executes nothing from the PR.\n- **An explicit forbid list.** Every `cargo` and `make` target \u2014 even `cargo check` runs `build.rs` and proc-macros as you, with your `gh` token and ssh keys in reach \u2014 the `nebula` binary, INSTALL.SH, interpreters on any file the PR touches, `gh pr checkout` and every `git` command that moves the SHARED CHECKOUT, and every `gh` write except one `--comment` review. Approval stays a human's signature.\n- **A fact every review must state.** Nothing on GitHub builds or tests a PR in this repo \u2014 `gh pr checks` lists `claude-review` alone \u2014 so the review says the test gate has not run instead of reading \"pass\" as green. MAKE CI on a developer's box is the only gate there is.\n\n## \ud83d\udcdd One review comment, one fixed shape <a id=\"one-review-comment-one-fixed-shape\"></a>\n\nA verdict (\ud83d\udd34 Do not merge as-is \u00b7 \ud83d\udfe1 Merge with care \u00b7 \ud83d\udfe2 Low risk) and its basis; then security and production risk, performance, fit with the codebase, scope, and an \"unsettled by reading\" list naming the exact checks a human should run and which result would change the verdict. Every finding carries a `path:line` on the PR's side of the diff, a severity (Blocker, Should fix, Nit), and whether it is *confirmed by reading* or *suspected*. Findings the automated Claude Code Review workflow already posted inline are cited, not repeated. The review is posted with `gh pr review --comment --body-file`, which works on your own PR too; \"don't post\" keeps it in chat.\n\n## \ud83d\udcf8 Screenshots <a id=\"screenshots\"></a>\n\nThere is no screen to shoot: the change is a skill file, and the review it produces lives on GitHub. In its place, the skill's fetch block dry-run read-only against PR #26 \u2014 every command exited 0 and nothing was posted:\n\n```\n$ gh pr view 26 --json \u2026                 \u2192 head 69f60d5 \u00b7 base main \u00b7 15 files \u00b7 +1419/\u221242\n$ gh pr diff 26                          \u2192 1895 lines\n$ gh pr checks 26                        \u2192 claude-review   pass   49s\n$ git fetch origin pull/26/head\n$ git show 69f60d5:<first file> | wc -l  \u2192 176\n```\n\n## \ud83e\udded How a review flows <a id=\"how-a-review-flows\"></a>\n\n```mermaid\nflowchart LR\n  A[\"gh pr view / diff / checks<br/>+ the inline-comments API\"] --> B[\"Read the diff in risk order<br/>.github \u2192 install.sh \u2192 Cargo \u2192 server.rs \u2192 hooks \u2192 registry.rs \u2192 store.rs \u2192 protocol.rs \u2192 TUI\"]\n  B --> C[\"MEMORY LOG \u00b7 STANDING GOTCHAS \u00b7 PR ARCHIVE<br/>what the repo already knows about these files\"]\n  C --> D[\"\ud83d\udd12 Security & production risk\"]\n  D --> E[\"\u26a1 Performance\"]\n  E --> F[\"\ud83e\udde9 Fit with the codebase\"]\n  F --> G[\"pr-review.md<br/>verdict \u00b7 findings \u00b7 scope \u00b7 unsettled\"]\n  G --> H[\"gh pr review --comment --body-file\"]\n  B -. never .-> X[\"cargo \u00b7 make \u00b7 nebula \u00b7 install.sh<br/>gh pr checkout \u00b7 git checkout / merge \u00b7 --approve\"]\n  classDef never stroke:#c0392b,stroke-dasharray: 4 3\n  class X never\n```\n\n## \ud83d\udd27 Technical overview <a id=\"technical-overview\"></a>\n\n- **The skill** is `.claude/skills/pr-reviewer/SKILL.md`, user-invocable, 241 lines: the allow/forbid contract, eight steps (resolve and fetch into the scratchpad, look the touched files up in the MEMORY LOG and PR ARCHIVE, read the diff in risk order, the three weighted sections, the fixed template, the single `--comment` post), and a closing \"when the reviewer is tempted to run something\" section that routes each temptation to a read or to the unsettled list.\n- **Why no SCRATCH WORKTREE.** The 2026-08-28 SECURITY REVIEW recipe needed one because that skill snapshots the checkout it runs in. `gh pr diff` plus `git show <headRefOid>:<path>` after `git fetch origin pull/N/head` reads both sides with nothing of the PR touching a working tree. The SHA rather than `FETCH_HEAD`, because every session's fetch overwrites that one file in the shared repo.\n- **Why `--comment` only.** GitHub refuses `--approve` and `--request-changes` on the author's own PR, and an agent's approval should not count as a signature anyway. The verdict lives in the body.\n- **The MEMORY LOG carries the task.** Entry `2026-09-04-a-pr-reviewer-skill-reads-a-pr-for-merge-risk-never-runs.md` with 5 gotchas; two standing gotchas added (the PR-CI fact under MAKE CI, the `FETCH_HEAD` race under SHARED CHECKOUT) and two existing pairs merged so the file stays at its 300-line cap; the \"a rewritten SKILL.md is live at once\" line extended with the new-skill case.\n- **TERMS.md.** SECURITY REVIEW promoted from the Candidates ledger on its second sighting, PR REVIEWER SKILL ledgered, and the MAKE CI row brought up to the Makefile's real `ci` target.\n\n## Notes <a id=\"notes\"></a>\n\n- **Gate:** `make memory-check`, `make terms-check` and `make recall-eval` are green on this branch. No crate is touched, so `cargo` was not run \u2014 nothing here compiles.\n- **Dry run:** the skill's fetch block ran read-only against PR #26 (see Screenshots); no review was posted anywhere.\n- **Try it:** `/pr-reviewer <this PR's number>` from a nebula SESSION on this repo.\n- **Merge state:** branch `pr-reviewer-skill` off `origin/main` at `eb9422e`, no conflicts.\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01TmuS64UtyRD5H39njusNDe\n\n",
+    "changedFiles": 5,
+    "closedAt": "2026-09-05T02:44:57Z",
+    "closingIssuesReferences": [],
+    "comments": [],
+    "commits": [
+      {
+        "authoredDate": "2026-09-05T01:48:49Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5.1"
+          }
+        ],
+        "committedDate": "2026-09-05T01:48:49Z",
+        "messageBody": "\u2026runs the code\n\nAdds `/pr-reviewer` (`.claude/skills/pr-reviewer/SKILL.md`): it reviews one pull request by reading\nalone \u2014 the diff, the description, the CI state, the surrounding code at base and head, and the\nMEMORY LOG \u2014 and posts a single `gh pr review --comment` that weighs security and production-merge\nrisk first, performance second, and fit with the codebase's patterns third. It never builds, tests,\nexecutes or checks out the PR, and never approves or requests changes.\n\nAlso logs the task in the MEMORY LOG (entry, index line, two standing gotchas: nothing on GitHub\nbuilds or tests a PR in this repo; `FETCH_HEAD` is shared, so a PR is read by `headRefOid`), promotes\nSECURITY REVIEW to a TERM, ledgers PR REVIEWER SKILL, and brings the MAKE CI row up to the Makefile.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01TmuS64UtyRD5H39njusNDe",
+        "messageHeadline": "A read-only PR reviewer skill that weighs merge risk first and never \u2026",
+        "oid": "35c1ac70a910cd18c23d2d28c67b9c0a162edb2c"
+      },
+      {
+        "authoredDate": "2026-09-05T01:52:41Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5.1"
+          }
+        ],
+        "committedDate": "2026-09-05T01:52:41Z",
+        "messageBody": "\u2026 work stays behind\n\nExtends this task's MEMORY LOG entry with the PR #28 follow-up and four gotchas: NEBULA WORKTREE's\nlive auto-continue was exercised and worked (the 2026-08-26 \"never exercised\" caveat is retired in the\nstanding gotcha), a relocated session's uncommitted work and scratchpad do not follow it (copy by\nabsolute path, re-apply shared-file edits by content anchor, never by adjacency), `set -e` did not stop\na Bash chain after a failing heredoc, and an untracked skill in the SHARED CHECKOUT is absent from a\nworktree off `origin/main`. Records \"from a work tree\" as an alias of NEBULA WORKTREE.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01TmuS64UtyRD5H39njusNDe",
+        "messageHeadline": "Log the WORKTREE RELOCATION follow-up: it works live, and uncommitted\u2026",
+        "oid": "08796166eeb0438110cff1aabf90c50d6b9f2e1d"
+      },
+      {
+        "authoredDate": "2026-09-05T02:43:11Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5.1"
+          }
+        ],
+        "committedDate": "2026-09-05T02:43:11Z",
+        "messageBody": "main's fec7a12 already carries this branch's first commit (the PR REVIEWER SKILL, its MEMORY LOG\nentry, the standing gotchas and the TERMS rows) byte for byte, so the four shared files resolve to\nmain's version plus this branch's second commit: the WORKTREE RELOCATION follow-up in the entry,\nits index line, the extended WORKTREE RELOCATION gotcha and the \"from a work tree\" alias.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01DWJiMPRUMiQezG7h2LQuDh",
+        "messageHeadline": "Merge origin/main into pr-reviewer-skill",
+        "oid": "0913b4097937ea6a5ca8ffe280a175ccf42536f7"
+      },
+      {
+        "authoredDate": "2026-09-05T02:43:11Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5.1"
+          }
+        ],
+        "committedDate": "2026-09-05T02:43:11Z",
+        "messageBody": "- Step 2's grep is one -E pattern: the BRE `\\|` was GNU-only alternation (a literal `|` on\n  macOS) and its space-padded branches matched no backticked basename in the MEMORY LOG.\n- The forbid list carves out the SELF-IMPROVING LOOP's own files (`.claude/MEMORY.md`,\n  `.claude/memory/`, `TERMS.md`), which NEBULA-MEMORY and PROJECT TERMS write after the review\n  as on every task \u2014 \"any file inside the repo\" contradicted AGENTS.md.\n- The \"before\" side is the merge base, never `origin/<base>`: step 1 records\n  `git merge-base origin/<base> <headRefOid>` in `pr.base`, step 3 and the review's Basis line\n  read from it, since `origin/<base>` has moved on and would pin other PRs' hunks on this one.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01DWJiMPRUMiQezG7h2LQuDh",
+        "messageHeadline": "Answer the three Claude Code Review comments on the PR REVIEWER SKILL",
+        "oid": "fbe4a0f962e661738e12152db11923d5302928ea"
+      }
+    ],
+    "createdAt": "2026-09-05T01:50:46Z",
+    "deletions": 14,
+    "files": [
+      {
+        "additions": 1,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": ".claude/MEMORY.md"
+      },
+      {
+        "additions": 25,
+        "changeType": "MODIFIED",
+        "deletions": 0,
+        "path": ".claude/memory/entries/2026-09-04-a-pr-reviewer-skill-reads-a-pr-for-merge-risk-never-runs.md"
+      },
+      {
+        "additions": 1,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": ".claude/memory/gotchas.md"
+      },
+      {
+        "additions": 19,
+        "changeType": "MODIFIED",
+        "deletions": 10,
+        "path": ".claude/skills/pr-reviewer/SKILL.md"
+      },
+      {
+        "additions": 2,
+        "changeType": "MODIFIED",
+        "deletions": 2,
+        "path": "TERMS.md"
+      }
+    ],
+    "headRefName": "pr-reviewer-skill",
+    "headRefOid": "fbe4a0f962e661738e12152db11923d5302928ea",
+    "isDraft": false,
+    "labels": [],
+    "mergeCommit": {
+      "oid": "a6b8b74ee6e9d7fcb87ed02f471e432b0bf804c6"
+    },
+    "mergedAt": "2026-09-05T02:44:57Z",
+    "mergedBy": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "milestone": null,
+    "number": 28,
+    "reviewRequests": [],
+    "reviews": [
+      {
+        "author": {
+          "login": "claude"
+        },
+        "authorAssociation": "NONE",
+        "body": "",
+        "commit": {
+          "oid": "08796166eeb0438110cff1aabf90c50d6b9f2e1d"
+        },
+        "id": "PRR_kwDOTu3A5c8AAAABMSMqZw",
+        "includesCreatedEdit": false,
+        "reactionGroups": [],
+        "state": "COMMENTED",
+        "submittedAt": "2026-09-05T02:09:50Z"
+      },
+      {
+        "author": {
+          "login": "claude"
+        },
+        "authorAssociation": "NONE",
+        "body": "",
+        "commit": {
+          "oid": "08796166eeb0438110cff1aabf90c50d6b9f2e1d"
+        },
+        "id": "PRR_kwDOTu3A5c8AAAABMSMrIg",
+        "includesCreatedEdit": false,
+        "reactionGroups": [],
+        "state": "COMMENTED",
+        "submittedAt": "2026-09-05T02:09:55Z"
+      },
+      {
+        "author": {
+          "login": "claude"
+        },
+        "authorAssociation": "NONE",
+        "body": "",
+        "commit": {
+          "oid": "08796166eeb0438110cff1aabf90c50d6b9f2e1d"
+        },
+        "id": "PRR_kwDOTu3A5c8AAAABMSMrnQ",
+        "includesCreatedEdit": false,
+        "reactionGroups": [],
+        "state": "COMMENTED",
+        "submittedAt": "2026-09-05T02:09:58Z"
+      },
+      {
+        "author": {
+          "login": "webdevcody"
+        },
+        "authorAssociation": "CONTRIBUTOR",
+        "body": "",
+        "commit": {
+          "oid": "fbe4a0f962e661738e12152db11923d5302928ea"
+        },
+        "id": "PRR_kwDOTu3A5c8AAAABMSR2Fg",
+        "includesCreatedEdit": false,
+        "reactionGroups": [],
+        "state": "COMMENTED",
+        "submittedAt": "2026-09-05T02:43:28Z"
+      },
+      {
+        "author": {
+          "login": "webdevcody"
+        },
+        "authorAssociation": "CONTRIBUTOR",
+        "body": "",
+        "commit": {
+          "oid": "fbe4a0f962e661738e12152db11923d5302928ea"
+        },
+        "id": "PRR_kwDOTu3A5c8AAAABMSR2Og",
+        "includesCreatedEdit": false,
+        "reactionGroups": [],
+        "state": "COMMENTED",
+        "submittedAt": "2026-09-05T02:43:29Z"
+      },
+      {
+        "author": {
+          "login": "webdevcody"
+        },
+        "authorAssociation": "CONTRIBUTOR",
+        "body": "",
+        "commit": {
+          "oid": "fbe4a0f962e661738e12152db11923d5302928ea"
+        },
+        "id": "PRR_kwDOTu3A5c8AAAABMSR2nQ",
+        "includesCreatedEdit": false,
+        "reactionGroups": [],
+        "state": "COMMENTED",
+        "submittedAt": "2026-09-05T02:43:30Z"
+      }
+    ],
+    "state": "MERGED",
+    "title": "A read-only PR reviewer skill that weighs merge risk first and never runs the code",
+    "updatedAt": "2026-09-05T02:44:57Z",
+    "url": "https://github.com/AgentSystemLabs/nebula/pull/28"
+  },
+  "review_comments": [
+    {
+      "_links": {
+        "html": {
+          "href": "https://github.com/AgentSystemLabs/nebula/pull/28#discussion_r3939103589"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/28"
+        },
+        "self": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939103589"
+        }
+      },
+      "author_association": "NONE",
+      "body": "**Bug: this `grep` regex is broken on both GNU and BSD grep**\n\nTwo independent problems with `'<each touched file basename> \\| <each TERM the PR touches>'`:\n- `\\|` is a GNU BRE extension for alternation. On BSD/macOS `grep` it is *not* alternation \u2014 it matches a literal `|`, so the whole pattern silently matches nothing.\n- Even under GNU grep, the spaces sit inside the alternation branches (`\"server.rs \"` OR `\" DAEMON SOCKET\"`). Every real MEMORY LOG mention of a basename is followed by a backtick/comma/colon, never a space, so the file-basename branch matches 0/13 real occurrences of `server.rs` in `.claude/memory/entries` even under GNU grep.\n\nBecause an empty result is indistinguishable from \"the log has nothing on this area,\" this turns the skill's own \"check what the repo already knows\" step into a silent no-op. Compare [`AGENTS.md`'s canonical form](https://github.com/AgentSystemLabs/nebula/blob/08796166eeb0438110cff1aabf90c50d6b9f2e1d/AGENTS.md#L25), which has no alternation at all.\n\n```suggestion\ngrep -rilE '<each touched file basename>|<each TERM the PR touches>' .claude/memory/entries .claude/memory/prs | head\n```",
+      "commit_id": "08796166eeb0438110cff1aabf90c50d6b9f2e1d",
+      "created_at": "2026-09-05T02:09:50Z",
+      "diff_hunk": "@@ -0,0 +1,241 @@\n+---\n+name: pr-reviewer\n+description: \"Review a pull request by reading alone \u2014 its diff, description, CI state, the surrounding code at base and head, and the MEMORY LOG for the area \u2014 and leave one review comment on the PR that weighs, in this order, the security and production-merge risk of the change, its performance cost, and whether it follows the patterns already in this codebase. It never builds, tests, executes, installs or checks out the PR, and never approves or requests changes. Use when the user says \\\"review this PR\\\", \\\"review PR 26\\\", \\\"pr review\\\", \\\"pr reviewer\\\", \\\"is this safe to merge\\\", \\\"what would merging this break\\\", or asks for a risk read on a pull request.\"\n+user-invocable: true\n+---\n+\n+A pull request review here answers one question first: **what happens to the people running nebula\n+in production if this merges?** Nebula is a DAEMON that owns every agent PTY on a developer's box,\n+speaks to its TUI over an unauthenticated DAEMON SOCKET, installs MANAGED HOOKS into the user's own\n+`~/.claude`, `~/.codex`, `~/.cursor` and `~/.pi`, spawns `claude` / `codex` / `cursor-agent` / `pi`\n+with a composed argv and system prompt, runs `curl | sh` on remote hosts over NEBULA SSH, and migrates\n+a SQLITE STORE on every user's disk at the first launch of a new binary. A wrong line in the wrong\n+place is not a bug report; it is every user's sessions gone, or every user's shell running someone\n+else's script. So the review weighs security and merge risk first and hardest, performance second, and\n+fit with the codebase's patterns third \u2014 and says which of the three every finding belongs to.\n+\n+The second rule shapes everything else: **the reviewer reads; it never runs.** Not the PR's code, not\n+its tests, not the build, not the binary, not a script the PR adds. Three reasons, each sufficient on\n+its own. A PR \u2014 above all one from a fork (`isCrossRepository: true`) \u2014 is untrusted input, and even\n+`cargo check` executes its `build.rs` and proc-macros as you, with your `gh` token, `~/.claude` and ssh\n+keys in reach. The SHARED CHECKOUT belongs to several sessions at once, so a `gh pr checkout`, a merge\n+or a stash yanks the tree out from under them. And a review that says \"I ran the tests\" asserts\n+something the reader cannot audit anyway: CI's verdict is the test gate \u2014 and on this repo nothing on\n+GitHub builds or tests a PR at all (`claude-code-review.yml` is the only PR workflow; `release.yml`\n+runs on tags), which is itself a fact the review states. What reading cannot settle goes into the\n+review as *unsettled*, named precisely enough that a human can run it. It is never quietly run.\n+\n+## Read, never run\n+\n+Allowed \u2014 every one of these is a read: it touches no working tree and executes nothing from the PR.\n+\n+```bash\n+gh pr view <n> --json \u2026                          # metadata, description, files, checks, reviews\n+gh pr diff <n>                                   # the unified diff\n+gh pr checks <n>                                 # CI state as GitHub reports it (exit 8 = pending)\n+gh api repos/<owner>/<repo>/pulls/<n>/comments   # inline review comments \u2014 not a --json field\n+git fetch origin && git fetch origin pull/<n>/head   # refresh origin/<base>; the PR head lands in FETCH_HEAD, no ref, no checkout\n+git show <headRefOid>:<path>                     # the PR's whole file (the SHA is stable; FETCH_HEAD is not, other sessions fetch too)\n+git show origin/<base>:<path>                    # the same file before the PR\n+git log \u00b7 git grep \u00b7 grep \u00b7 cat \u00b7 sed -n \u00b7 wc \u00b7 diff   # over files, never through them\n+```\n+\n+Forbidden, whatever the PR is \u2014 when a review seems to need one of these, it needs a human instead:\n+\n+- `cargo` anything, including `cargo check`, `cargo fmt --check`, `cargo clippy`, `cargo metadata`\n+  and `cargo tree` \u2014 build scripts and proc-macros run under all of them; `make` anything; the\n+  `nebula` binary or anything under `target/`; INSTALL.SH; `python3`, `node`, `sh`, `bash`, `source`\n+  on any file the PR adds or changes \u2014 reading a script means `cat`, not `sh -n`.\n+- `gh pr checkout`, `git checkout`, `git switch`, `git merge`, `git rebase`, `git apply`,\n+  `git cherry-pick`, `git stash`, `git worktree add`, `git reset` \u2014 nothing that moves the SHARED\n+  CHECKOUT or creates a tree; editing or creating any file inside the repo.\n+- `gh pr review --approve`, `gh pr review --request-changes`, `gh pr merge`, `gh pr edit`,\n+  `gh pr close`, `gh pr comment` \u2014 the skill posts exactly one `--comment` review and changes nothing\n+  else about the PR. Approval is a human's signature.\n+\n+The `--comment` review is the only write the skill performs, and it is the last step.\n+\n+## Steps\n+\n+### 1. Resolve the PR and fetch what GitHub knows\n+\n+The PR is the number, URL or branch the user gave; otherwise the current branch's PR (`gh pr view`\n+with no argument); otherwise the PR this SESSION was opened on (a PR SESSION carries its URL in the\n+system prompt). No PR \u2192 ask for the number; never pick one from `gh pr list`.\n+\n+```bash\n+N=<number>; R=AgentSystemLabs/nebula; S=<scratchpad>\n+gh pr view $N --repo $R --json number,title,url,body,author,baseRefName,headRefName,headRefOid,isDraft,isCrossRepository,mergeable,additions,deletions,changedFiles,files,commits,reviews,comments,statusCheckRollup > $S/pr.json\n+gh pr diff $N --repo $R > $S/pr.diff\n+gh pr checks $N --repo $R > $S/pr.checks 2>&1 || true      # exit 8 = pending; the output is still the answer\n+gh api repos/$R/pulls/$N/comments --paginate --jq '.[] | \"\\(.path):\\(.line // .original_line) \\(.user.login): \\(.body)\"' > $S/pr.inline\n+git fetch -q origin && git fetch -q origin pull/$N/head\n+```\n+\n+Read `pr.json` first. `isCrossRepository` \u2014 a fork raises the bar on everything under `.github/`,\n+`build.rs`, `Cargo.toml` and INSTALL.SH. `files` \u2014 sort them into the risk order of step 3 before\n+opening the diff. `additions` / `deletions` / `changedFiles` \u2014 the only counts the review may quote.\n+`statusCheckRollup` and `pr.checks` \u2014 on this repo that is `claude-review` alone; say so. `reviews`,\n+`comments` and `pr.inline` \u2014 what the automated Claude Code Review workflow and any human already\n+said; reference it, do not repeat it. Then read the description against the diff: a body that claims a\n+focus-tint fix while the diff touches INSTALL.SH is the review's first finding.\n+\n+### 2. Read what the repo already knows about this area\n+\n+```bash\n+grep -ril '<each touched file basename> \\| <each TERM the PR touches>' .claude/memory/entries .claude/memory/prs | head",
+      "html_url": "https://github.com/AgentSystemLabs/nebula/pull/28#discussion_r3939103589",
+      "id": 3939103589,
+      "line": null,
+      "node_id": "PRRC_kwDOTu3A5c7qyfNl",
+      "original_commit_id": "08796166eeb0438110cff1aabf90c50d6b9f2e1d",
+      "original_line": 86,
+      "original_position": 86,
+      "original_start_line": null,
+      "path": ".claude/skills/pr-reviewer/SKILL.md",
+      "position": 1,
+      "pull_request_review_id": 5119355495,
+      "pull_request_url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/28",
+      "reactions": {
+        "+1": 0,
+        "-1": 0,
+        "confused": 0,
+        "eyes": 0,
+        "heart": 0,
+        "hooray": 0,
+        "laugh": 0,
+        "rocket": 0,
+        "total_count": 0,
+        "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939103589/reactions"
+      },
+      "side": "RIGHT",
+      "start_line": null,
+      "start_side": null,
+      "subject_type": "line",
+      "updated_at": "2026-09-05T02:09:50Z",
+      "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939103589",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/in/1236702?v=4",
+        "events_url": "https://api.github.com/users/claude%5Bbot%5D/events{/privacy}",
+        "followers_url": "https://api.github.com/users/claude%5Bbot%5D/followers",
+        "following_url": "https://api.github.com/users/claude%5Bbot%5D/following{/other_user}",
+        "gists_url": "https://api.github.com/users/claude%5Bbot%5D/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/apps/claude",
+        "id": 209825114,
+        "login": "claude[bot]",
+        "node_id": "BOT_kgDODIGtWg",
+        "organizations_url": "https://api.github.com/users/claude%5Bbot%5D/orgs",
+        "received_events_url": "https://api.github.com/users/claude%5Bbot%5D/received_events",
+        "repos_url": "https://api.github.com/users/claude%5Bbot%5D/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/claude%5Bbot%5D/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/claude%5Bbot%5D/subscriptions",
+        "type": "Bot",
+        "url": "https://api.github.com/users/claude%5Bbot%5D",
+        "user_view_type": "public"
+      }
+    },
+    {
+      "_links": {
+        "html": {
+          "href": "https://github.com/AgentSystemLabs/nebula/pull/28#discussion_r3939103772"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/28"
+        },
+        "self": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939103772"
+        }
+      },
+      "author_association": "NONE",
+      "body": "**Bug: \"editing or creating any file inside the repo\" is forbidden here, but the repo's own protocol makes that mandatory on every task**\n\n`AGENTS.md` requires PROJECT TERMS \"on **every** task, including one that recorded no entry\" (https://github.com/AgentSystemLabs/nebula/blob/08796166eeb0438110cff1aabf90c50d6b9f2e1d/AGENTS.md#L60-L61), and `CLAUDE.md`'s trigger table lists its skip condition as \"never\" (https://github.com/AgentSystemLabs/nebula/blob/08796166eeb0438110cff1aabf90c50d6b9f2e1d/CLAUDE.md#L12-L13). NEBULA-MEMORY is likewise mandatory whenever a task \"turned up something non-obvious about this repo.\" Both write inside the repo (`TERMS.md`, `.claude/MEMORY.md`, `.claude/memory/gotchas.md`, `.claude/memory/entries/`).\n\nThis skill's own step 6 even checks whether the PR *being reviewed* left a MEMORY LOG entry, but its forbidden list gives the reviewing agent no exception to close the loop on itself \u2014 since the reviewer never puts the PR's own files on disk, \"any file inside the repo\" can only mean the reviewer's own SHARED CHECKOUT. A `/pr-reviewer` run that surfaces a non-obvious finding (as this PR's own authoring session did, producing the gotchas added elsewhere in this diff) is left with two directly conflicting mandatory instructions. Worth adding an explicit carve-out for the SELF-IMPROVING LOOP files.",
+      "commit_id": "08796166eeb0438110cff1aabf90c50d6b9f2e1d",
+      "created_at": "2026-09-05T02:09:55Z",
+      "diff_hunk": "@@ -0,0 +1,241 @@\n+---\n+name: pr-reviewer\n+description: \"Review a pull request by reading alone \u2014 its diff, description, CI state, the surrounding code at base and head, and the MEMORY LOG for the area \u2014 and leave one review comment on the PR that weighs, in this order, the security and production-merge risk of the change, its performance cost, and whether it follows the patterns already in this codebase. It never builds, tests, executes, installs or checks out the PR, and never approves or requests changes. Use when the user says \\\"review this PR\\\", \\\"review PR 26\\\", \\\"pr review\\\", \\\"pr reviewer\\\", \\\"is this safe to merge\\\", \\\"what would merging this break\\\", or asks for a risk read on a pull request.\"\n+user-invocable: true\n+---\n+\n+A pull request review here answers one question first: **what happens to the people running nebula\n+in production if this merges?** Nebula is a DAEMON that owns every agent PTY on a developer's box,\n+speaks to its TUI over an unauthenticated DAEMON SOCKET, installs MANAGED HOOKS into the user's own\n+`~/.claude`, `~/.codex`, `~/.cursor` and `~/.pi`, spawns `claude` / `codex` / `cursor-agent` / `pi`\n+with a composed argv and system prompt, runs `curl | sh` on remote hosts over NEBULA SSH, and migrates\n+a SQLITE STORE on every user's disk at the first launch of a new binary. A wrong line in the wrong\n+place is not a bug report; it is every user's sessions gone, or every user's shell running someone\n+else's script. So the review weighs security and merge risk first and hardest, performance second, and\n+fit with the codebase's patterns third \u2014 and says which of the three every finding belongs to.\n+\n+The second rule shapes everything else: **the reviewer reads; it never runs.** Not the PR's code, not\n+its tests, not the build, not the binary, not a script the PR adds. Three reasons, each sufficient on\n+its own. A PR \u2014 above all one from a fork (`isCrossRepository: true`) \u2014 is untrusted input, and even\n+`cargo check` executes its `build.rs` and proc-macros as you, with your `gh` token, `~/.claude` and ssh\n+keys in reach. The SHARED CHECKOUT belongs to several sessions at once, so a `gh pr checkout`, a merge\n+or a stash yanks the tree out from under them. And a review that says \"I ran the tests\" asserts\n+something the reader cannot audit anyway: CI's verdict is the test gate \u2014 and on this repo nothing on\n+GitHub builds or tests a PR at all (`claude-code-review.yml` is the only PR workflow; `release.yml`\n+runs on tags), which is itself a fact the review states. What reading cannot settle goes into the\n+review as *unsettled*, named precisely enough that a human can run it. It is never quietly run.\n+\n+## Read, never run\n+\n+Allowed \u2014 every one of these is a read: it touches no working tree and executes nothing from the PR.\n+\n+```bash\n+gh pr view <n> --json \u2026                          # metadata, description, files, checks, reviews\n+gh pr diff <n>                                   # the unified diff\n+gh pr checks <n>                                 # CI state as GitHub reports it (exit 8 = pending)\n+gh api repos/<owner>/<repo>/pulls/<n>/comments   # inline review comments \u2014 not a --json field\n+git fetch origin && git fetch origin pull/<n>/head   # refresh origin/<base>; the PR head lands in FETCH_HEAD, no ref, no checkout\n+git show <headRefOid>:<path>                     # the PR's whole file (the SHA is stable; FETCH_HEAD is not, other sessions fetch too)\n+git show origin/<base>:<path>                    # the same file before the PR\n+git log \u00b7 git grep \u00b7 grep \u00b7 cat \u00b7 sed -n \u00b7 wc \u00b7 diff   # over files, never through them\n+```\n+\n+Forbidden, whatever the PR is \u2014 when a review seems to need one of these, it needs a human instead:\n+\n+- `cargo` anything, including `cargo check`, `cargo fmt --check`, `cargo clippy`, `cargo metadata`\n+  and `cargo tree` \u2014 build scripts and proc-macros run under all of them; `make` anything; the\n+  `nebula` binary or anything under `target/`; INSTALL.SH; `python3`, `node`, `sh`, `bash`, `source`\n+  on any file the PR adds or changes \u2014 reading a script means `cat`, not `sh -n`.\n+- `gh pr checkout`, `git checkout`, `git switch`, `git merge`, `git rebase`, `git apply`,\n+  `git cherry-pick`, `git stash`, `git worktree add`, `git reset` \u2014 nothing that moves the SHARED\n+  CHECKOUT or creates a tree; editing or creating any file inside the repo.",
+      "html_url": "https://github.com/AgentSystemLabs/nebula/pull/28#discussion_r3939103772",
+      "id": 3939103772,
+      "line": null,
+      "node_id": "PRRC_kwDOTu3A5c7qyfQc",
+      "original_commit_id": "08796166eeb0438110cff1aabf90c50d6b9f2e1d",
+      "original_line": 51,
+      "original_position": 51,
+      "original_start_line": 49,
+      "path": ".claude/skills/pr-reviewer/SKILL.md",
+      "position": 1,
+      "pull_request_review_id": 5119355682,
+      "pull_request_url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/28",
+      "reactions": {
+        "+1": 0,
+        "-1": 0,
+        "confused": 0,
+        "eyes": 0,
+        "heart": 0,
+        "hooray": 0,
+        "laugh": 0,
+        "rocket": 0,
+        "total_count": 0,
+        "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939103772/reactions"
+      },
+      "side": "RIGHT",
+      "start_line": null,
+      "start_side": "RIGHT",
+      "subject_type": "line",
+      "updated_at": "2026-09-05T02:09:55Z",
+      "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939103772",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/in/1236702?v=4",
+        "events_url": "https://api.github.com/users/claude%5Bbot%5D/events{/privacy}",
+        "followers_url": "https://api.github.com/users/claude%5Bbot%5D/followers",
+        "following_url": "https://api.github.com/users/claude%5Bbot%5D/following{/other_user}",
+        "gists_url": "https://api.github.com/users/claude%5Bbot%5D/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/apps/claude",
+        "id": 209825114,
+        "login": "claude[bot]",
+        "node_id": "BOT_kgDODIGtWg",
+        "organizations_url": "https://api.github.com/users/claude%5Bbot%5D/orgs",
+        "received_events_url": "https://api.github.com/users/claude%5Bbot%5D/received_events",
+        "repos_url": "https://api.github.com/users/claude%5Bbot%5D/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/claude%5Bbot%5D/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/claude%5Bbot%5D/subscriptions",
+        "type": "Bot",
+        "url": "https://api.github.com/users/claude%5Bbot%5D",
+        "user_view_type": "public"
+      }
+    },
+    {
+      "_links": {
+        "html": {
+          "href": "https://github.com/AgentSystemLabs/nebula/pull/28#discussion_r3939103881"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/28"
+        },
+        "self": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939103881"
+        }
+      },
+      "author_association": "NONE",
+      "body": "**Bug: `origin/<base>` drifts to the current tip of the base branch, not this PR's merge base**\n\nStep 1 runs `git fetch origin` first, which fast-forwards local `origin/<base>` to whatever `main` currently is \u2014 not the commit this PR actually branched from. `gh pr diff` (used elsewhere in this same skill) is merge-base-relative, so on a repo where `main` merges multiple times a day, `git show origin/<base>:<path>` and `pr.diff` will disagree about a function's \"previous shape\" whenever another PR has touched the same file since this one branched \u2014 the comment `# the same file before the PR` is not accurate in that case.\n\nThe skill then treats this comparison as evidence for a *confirmed by reading* finding \u2014 reused in [step 3](https://github.com/AgentSystemLabs/nebula/blob/08796166eeb0438110cff1aabf90c50d6b9f2e1d/.claude/skills/pr-reviewer/SKILL.md#L100-L104) and cited as the posted review's \"Basis\" \u2014 so it can fabricate a Blocker (attributing an already-merged PR's change to this one) or hide a real regression. Nothing in the skill computes an actual merge base (e.g. `git merge-base origin/<base> <headRefOid>`) anywhere.",
+      "commit_id": "08796166eeb0438110cff1aabf90c50d6b9f2e1d",
+      "created_at": "2026-09-05T02:09:58Z",
+      "diff_hunk": "@@ -0,0 +1,241 @@\n+---\n+name: pr-reviewer\n+description: \"Review a pull request by reading alone \u2014 its diff, description, CI state, the surrounding code at base and head, and the MEMORY LOG for the area \u2014 and leave one review comment on the PR that weighs, in this order, the security and production-merge risk of the change, its performance cost, and whether it follows the patterns already in this codebase. It never builds, tests, executes, installs or checks out the PR, and never approves or requests changes. Use when the user says \\\"review this PR\\\", \\\"review PR 26\\\", \\\"pr review\\\", \\\"pr reviewer\\\", \\\"is this safe to merge\\\", \\\"what would merging this break\\\", or asks for a risk read on a pull request.\"\n+user-invocable: true\n+---\n+\n+A pull request review here answers one question first: **what happens to the people running nebula\n+in production if this merges?** Nebula is a DAEMON that owns every agent PTY on a developer's box,\n+speaks to its TUI over an unauthenticated DAEMON SOCKET, installs MANAGED HOOKS into the user's own\n+`~/.claude`, `~/.codex`, `~/.cursor` and `~/.pi`, spawns `claude` / `codex` / `cursor-agent` / `pi`\n+with a composed argv and system prompt, runs `curl | sh` on remote hosts over NEBULA SSH, and migrates\n+a SQLITE STORE on every user's disk at the first launch of a new binary. A wrong line in the wrong\n+place is not a bug report; it is every user's sessions gone, or every user's shell running someone\n+else's script. So the review weighs security and merge risk first and hardest, performance second, and\n+fit with the codebase's patterns third \u2014 and says which of the three every finding belongs to.\n+\n+The second rule shapes everything else: **the reviewer reads; it never runs.** Not the PR's code, not\n+its tests, not the build, not the binary, not a script the PR adds. Three reasons, each sufficient on\n+its own. A PR \u2014 above all one from a fork (`isCrossRepository: true`) \u2014 is untrusted input, and even\n+`cargo check` executes its `build.rs` and proc-macros as you, with your `gh` token, `~/.claude` and ssh\n+keys in reach. The SHARED CHECKOUT belongs to several sessions at once, so a `gh pr checkout`, a merge\n+or a stash yanks the tree out from under them. And a review that says \"I ran the tests\" asserts\n+something the reader cannot audit anyway: CI's verdict is the test gate \u2014 and on this repo nothing on\n+GitHub builds or tests a PR at all (`claude-code-review.yml` is the only PR workflow; `release.yml`\n+runs on tags), which is itself a fact the review states. What reading cannot settle goes into the\n+review as *unsettled*, named precisely enough that a human can run it. It is never quietly run.\n+\n+## Read, never run\n+\n+Allowed \u2014 every one of these is a read: it touches no working tree and executes nothing from the PR.\n+\n+```bash\n+gh pr view <n> --json \u2026                          # metadata, description, files, checks, reviews\n+gh pr diff <n>                                   # the unified diff\n+gh pr checks <n>                                 # CI state as GitHub reports it (exit 8 = pending)\n+gh api repos/<owner>/<repo>/pulls/<n>/comments   # inline review comments \u2014 not a --json field\n+git fetch origin && git fetch origin pull/<n>/head   # refresh origin/<base>; the PR head lands in FETCH_HEAD, no ref, no checkout\n+git show <headRefOid>:<path>                     # the PR's whole file (the SHA is stable; FETCH_HEAD is not, other sessions fetch too)\n+git show origin/<base>:<path>                    # the same file before the PR",
+      "html_url": "https://github.com/AgentSystemLabs/nebula/pull/28#discussion_r3939103881",
+      "id": 3939103881,
+      "line": null,
+      "node_id": "PRRC_kwDOTu3A5c7qyfSJ",
+      "original_commit_id": "08796166eeb0438110cff1aabf90c50d6b9f2e1d",
+      "original_line": 39,
+      "original_position": 39,
+      "original_start_line": null,
+      "path": ".claude/skills/pr-reviewer/SKILL.md",
+      "position": 1,
+      "pull_request_review_id": 5119355805,
+      "pull_request_url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/28",
+      "reactions": {
+        "+1": 0,
+        "-1": 0,
+        "confused": 0,
+        "eyes": 0,
+        "heart": 0,
+        "hooray": 0,
+        "laugh": 0,
+        "rocket": 0,
+        "total_count": 0,
+        "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939103881/reactions"
+      },
+      "side": "RIGHT",
+      "start_line": null,
+      "start_side": null,
+      "subject_type": "line",
+      "updated_at": "2026-09-05T02:09:58Z",
+      "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939103881",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/in/1236702?v=4",
+        "events_url": "https://api.github.com/users/claude%5Bbot%5D/events{/privacy}",
+        "followers_url": "https://api.github.com/users/claude%5Bbot%5D/followers",
+        "following_url": "https://api.github.com/users/claude%5Bbot%5D/following{/other_user}",
+        "gists_url": "https://api.github.com/users/claude%5Bbot%5D/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/apps/claude",
+        "id": 209825114,
+        "login": "claude[bot]",
+        "node_id": "BOT_kgDODIGtWg",
+        "organizations_url": "https://api.github.com/users/claude%5Bbot%5D/orgs",
+        "received_events_url": "https://api.github.com/users/claude%5Bbot%5D/received_events",
+        "repos_url": "https://api.github.com/users/claude%5Bbot%5D/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/claude%5Bbot%5D/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/claude%5Bbot%5D/subscriptions",
+        "type": "Bot",
+        "url": "https://api.github.com/users/claude%5Bbot%5D",
+        "user_view_type": "public"
+      }
+    },
+    {
+      "_links": {
+        "html": {
+          "href": "https://github.com/AgentSystemLabs/nebula/pull/28#discussion_r3939186895"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/28"
+        },
+        "self": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939186895"
+        }
+      },
+      "author_association": "CONTRIBUTOR",
+      "body": "Fixed in fbe4a0f: step 2 is now one `-E` pattern \u2014 `grep -rilE '<basename>|<TERM>' \u2026` \u2014 with a comment on why (`\\|` is GNU-only, and a space-padded branch never matches a backticked name).\n",
+      "commit_id": "08796166eeb0438110cff1aabf90c50d6b9f2e1d",
+      "created_at": "2026-09-05T02:43:28Z",
+      "diff_hunk": "@@ -0,0 +1,241 @@\n+---\n+name: pr-reviewer\n+description: \"Review a pull request by reading alone \u2014 its diff, description, CI state, the surrounding code at base and head, and the MEMORY LOG for the area \u2014 and leave one review comment on the PR that weighs, in this order, the security and production-merge risk of the change, its performance cost, and whether it follows the patterns already in this codebase. It never builds, tests, executes, installs or checks out the PR, and never approves or requests changes. Use when the user says \\\"review this PR\\\", \\\"review PR 26\\\", \\\"pr review\\\", \\\"pr reviewer\\\", \\\"is this safe to merge\\\", \\\"what would merging this break\\\", or asks for a risk read on a pull request.\"\n+user-invocable: true\n+---\n+\n+A pull request review here answers one question first: **what happens to the people running nebula\n+in production if this merges?** Nebula is a DAEMON that owns every agent PTY on a developer's box,\n+speaks to its TUI over an unauthenticated DAEMON SOCKET, installs MANAGED HOOKS into the user's own\n+`~/.claude`, `~/.codex`, `~/.cursor` and `~/.pi`, spawns `claude` / `codex` / `cursor-agent` / `pi`\n+with a composed argv and system prompt, runs `curl | sh` on remote hosts over NEBULA SSH, and migrates\n+a SQLITE STORE on every user's disk at the first launch of a new binary. A wrong line in the wrong\n+place is not a bug report; it is every user's sessions gone, or every user's shell running someone\n+else's script. So the review weighs security and merge risk first and hardest, performance second, and\n+fit with the codebase's patterns third \u2014 and says which of the three every finding belongs to.\n+\n+The second rule shapes everything else: **the reviewer reads; it never runs.** Not the PR's code, not\n+its tests, not the build, not the binary, not a script the PR adds. Three reasons, each sufficient on\n+its own. A PR \u2014 above all one from a fork (`isCrossRepository: true`) \u2014 is untrusted input, and even\n+`cargo check` executes its `build.rs` and proc-macros as you, with your `gh` token, `~/.claude` and ssh\n+keys in reach. The SHARED CHECKOUT belongs to several sessions at once, so a `gh pr checkout`, a merge\n+or a stash yanks the tree out from under them. And a review that says \"I ran the tests\" asserts\n+something the reader cannot audit anyway: CI's verdict is the test gate \u2014 and on this repo nothing on\n+GitHub builds or tests a PR at all (`claude-code-review.yml` is the only PR workflow; `release.yml`\n+runs on tags), which is itself a fact the review states. What reading cannot settle goes into the\n+review as *unsettled*, named precisely enough that a human can run it. It is never quietly run.\n+\n+## Read, never run\n+\n+Allowed \u2014 every one of these is a read: it touches no working tree and executes nothing from the PR.\n+\n+```bash\n+gh pr view <n> --json \u2026                          # metadata, description, files, checks, reviews\n+gh pr diff <n>                                   # the unified diff\n+gh pr checks <n>                                 # CI state as GitHub reports it (exit 8 = pending)\n+gh api repos/<owner>/<repo>/pulls/<n>/comments   # inline review comments \u2014 not a --json field\n+git fetch origin && git fetch origin pull/<n>/head   # refresh origin/<base>; the PR head lands in FETCH_HEAD, no ref, no checkout\n+git show <headRefOid>:<path>                     # the PR's whole file (the SHA is stable; FETCH_HEAD is not, other sessions fetch too)\n+git show origin/<base>:<path>                    # the same file before the PR\n+git log \u00b7 git grep \u00b7 grep \u00b7 cat \u00b7 sed -n \u00b7 wc \u00b7 diff   # over files, never through them\n+```\n+\n+Forbidden, whatever the PR is \u2014 when a review seems to need one of these, it needs a human instead:\n+\n+- `cargo` anything, including `cargo check`, `cargo fmt --check`, `cargo clippy`, `cargo metadata`\n+  and `cargo tree` \u2014 build scripts and proc-macros run under all of them; `make` anything; the\n+  `nebula` binary or anything under `target/`; INSTALL.SH; `python3`, `node`, `sh`, `bash`, `source`\n+  on any file the PR adds or changes \u2014 reading a script means `cat`, not `sh -n`.\n+- `gh pr checkout`, `git checkout`, `git switch`, `git merge`, `git rebase`, `git apply`,\n+  `git cherry-pick`, `git stash`, `git worktree add`, `git reset` \u2014 nothing that moves the SHARED\n+  CHECKOUT or creates a tree; editing or creating any file inside the repo.\n+- `gh pr review --approve`, `gh pr review --request-changes`, `gh pr merge`, `gh pr edit`,\n+  `gh pr close`, `gh pr comment` \u2014 the skill posts exactly one `--comment` review and changes nothing\n+  else about the PR. Approval is a human's signature.\n+\n+The `--comment` review is the only write the skill performs, and it is the last step.\n+\n+## Steps\n+\n+### 1. Resolve the PR and fetch what GitHub knows\n+\n+The PR is the number, URL or branch the user gave; otherwise the current branch's PR (`gh pr view`\n+with no argument); otherwise the PR this SESSION was opened on (a PR SESSION carries its URL in the\n+system prompt). No PR \u2192 ask for the number; never pick one from `gh pr list`.\n+\n+```bash\n+N=<number>; R=AgentSystemLabs/nebula; S=<scratchpad>\n+gh pr view $N --repo $R --json number,title,url,body,author,baseRefName,headRefName,headRefOid,isDraft,isCrossRepository,mergeable,additions,deletions,changedFiles,files,commits,reviews,comments,statusCheckRollup > $S/pr.json\n+gh pr diff $N --repo $R > $S/pr.diff\n+gh pr checks $N --repo $R > $S/pr.checks 2>&1 || true      # exit 8 = pending; the output is still the answer\n+gh api repos/$R/pulls/$N/comments --paginate --jq '.[] | \"\\(.path):\\(.line // .original_line) \\(.user.login): \\(.body)\"' > $S/pr.inline\n+git fetch -q origin && git fetch -q origin pull/$N/head\n+```\n+\n+Read `pr.json` first. `isCrossRepository` \u2014 a fork raises the bar on everything under `.github/`,\n+`build.rs`, `Cargo.toml` and INSTALL.SH. `files` \u2014 sort them into the risk order of step 3 before\n+opening the diff. `additions` / `deletions` / `changedFiles` \u2014 the only counts the review may quote.\n+`statusCheckRollup` and `pr.checks` \u2014 on this repo that is `claude-review` alone; say so. `reviews`,\n+`comments` and `pr.inline` \u2014 what the automated Claude Code Review workflow and any human already\n+said; reference it, do not repeat it. Then read the description against the diff: a body that claims a\n+focus-tint fix while the diff touches INSTALL.SH is the review's first finding.\n+\n+### 2. Read what the repo already knows about this area\n+\n+```bash\n+grep -ril '<each touched file basename> \\| <each TERM the PR touches>' .claude/memory/entries .claude/memory/prs | head",
+      "html_url": "https://github.com/AgentSystemLabs/nebula/pull/28#discussion_r3939186895",
+      "id": 3939186895,
+      "in_reply_to_id": 3939103589,
+      "line": null,
+      "node_id": "PRRC_kwDOTu3A5c7qyzjP",
+      "original_commit_id": "08796166eeb0438110cff1aabf90c50d6b9f2e1d",
+      "original_line": 86,
+      "original_position": 86,
+      "original_start_line": null,
+      "path": ".claude/skills/pr-reviewer/SKILL.md",
+      "position": 1,
+      "pull_request_review_id": 5119440406,
+      "pull_request_url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/28",
+      "reactions": {
+        "+1": 0,
+        "-1": 0,
+        "confused": 0,
+        "eyes": 0,
+        "heart": 0,
+        "hooray": 0,
+        "laugh": 0,
+        "rocket": 0,
+        "total_count": 0,
+        "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939186895/reactions"
+      },
+      "side": "RIGHT",
+      "start_line": null,
+      "start_side": null,
+      "subject_type": "line",
+      "updated_at": "2026-09-05T02:43:28Z",
+      "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939186895",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/123222405?v=4",
+        "events_url": "https://api.github.com/users/webdevcody/events{/privacy}",
+        "followers_url": "https://api.github.com/users/webdevcody/followers",
+        "following_url": "https://api.github.com/users/webdevcody/following{/other_user}",
+        "gists_url": "https://api.github.com/users/webdevcody/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/webdevcody",
+        "id": 123222405,
+        "login": "webdevcody",
+        "node_id": "U_kgDOB1g5hQ",
+        "organizations_url": "https://api.github.com/users/webdevcody/orgs",
+        "received_events_url": "https://api.github.com/users/webdevcody/received_events",
+        "repos_url": "https://api.github.com/users/webdevcody/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/webdevcody/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/webdevcody/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/webdevcody",
+        "user_view_type": "public"
+      }
+    },
+    {
+      "_links": {
+        "html": {
+          "href": "https://github.com/AgentSystemLabs/nebula/pull/28#discussion_r3939186922"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/28"
+        },
+        "self": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939186922"
+        }
+      },
+      "author_association": "CONTRIBUTOR",
+      "body": "Fixed in fbe4a0f: the forbid list now carves out the SELF-IMPROVING LOOP's own files (`.claude/MEMORY.md`, `.claude/memory/`, `TERMS.md`), which NEBULA-MEMORY and PROJECT TERMS write after the review is posted, as on every task. Nothing from the PR lands on disk; the review body goes to the scratchpad outside the repo.\n",
+      "commit_id": "08796166eeb0438110cff1aabf90c50d6b9f2e1d",
+      "created_at": "2026-09-05T02:43:29Z",
+      "diff_hunk": "@@ -0,0 +1,241 @@\n+---\n+name: pr-reviewer\n+description: \"Review a pull request by reading alone \u2014 its diff, description, CI state, the surrounding code at base and head, and the MEMORY LOG for the area \u2014 and leave one review comment on the PR that weighs, in this order, the security and production-merge risk of the change, its performance cost, and whether it follows the patterns already in this codebase. It never builds, tests, executes, installs or checks out the PR, and never approves or requests changes. Use when the user says \\\"review this PR\\\", \\\"review PR 26\\\", \\\"pr review\\\", \\\"pr reviewer\\\", \\\"is this safe to merge\\\", \\\"what would merging this break\\\", or asks for a risk read on a pull request.\"\n+user-invocable: true\n+---\n+\n+A pull request review here answers one question first: **what happens to the people running nebula\n+in production if this merges?** Nebula is a DAEMON that owns every agent PTY on a developer's box,\n+speaks to its TUI over an unauthenticated DAEMON SOCKET, installs MANAGED HOOKS into the user's own\n+`~/.claude`, `~/.codex`, `~/.cursor` and `~/.pi`, spawns `claude` / `codex` / `cursor-agent` / `pi`\n+with a composed argv and system prompt, runs `curl | sh` on remote hosts over NEBULA SSH, and migrates\n+a SQLITE STORE on every user's disk at the first launch of a new binary. A wrong line in the wrong\n+place is not a bug report; it is every user's sessions gone, or every user's shell running someone\n+else's script. So the review weighs security and merge risk first and hardest, performance second, and\n+fit with the codebase's patterns third \u2014 and says which of the three every finding belongs to.\n+\n+The second rule shapes everything else: **the reviewer reads; it never runs.** Not the PR's code, not\n+its tests, not the build, not the binary, not a script the PR adds. Three reasons, each sufficient on\n+its own. A PR \u2014 above all one from a fork (`isCrossRepository: true`) \u2014 is untrusted input, and even\n+`cargo check` executes its `build.rs` and proc-macros as you, with your `gh` token, `~/.claude` and ssh\n+keys in reach. The SHARED CHECKOUT belongs to several sessions at once, so a `gh pr checkout`, a merge\n+or a stash yanks the tree out from under them. And a review that says \"I ran the tests\" asserts\n+something the reader cannot audit anyway: CI's verdict is the test gate \u2014 and on this repo nothing on\n+GitHub builds or tests a PR at all (`claude-code-review.yml` is the only PR workflow; `release.yml`\n+runs on tags), which is itself a fact the review states. What reading cannot settle goes into the\n+review as *unsettled*, named precisely enough that a human can run it. It is never quietly run.\n+\n+## Read, never run\n+\n+Allowed \u2014 every one of these is a read: it touches no working tree and executes nothing from the PR.\n+\n+```bash\n+gh pr view <n> --json \u2026                          # metadata, description, files, checks, reviews\n+gh pr diff <n>                                   # the unified diff\n+gh pr checks <n>                                 # CI state as GitHub reports it (exit 8 = pending)\n+gh api repos/<owner>/<repo>/pulls/<n>/comments   # inline review comments \u2014 not a --json field\n+git fetch origin && git fetch origin pull/<n>/head   # refresh origin/<base>; the PR head lands in FETCH_HEAD, no ref, no checkout\n+git show <headRefOid>:<path>                     # the PR's whole file (the SHA is stable; FETCH_HEAD is not, other sessions fetch too)\n+git show origin/<base>:<path>                    # the same file before the PR\n+git log \u00b7 git grep \u00b7 grep \u00b7 cat \u00b7 sed -n \u00b7 wc \u00b7 diff   # over files, never through them\n+```\n+\n+Forbidden, whatever the PR is \u2014 when a review seems to need one of these, it needs a human instead:\n+\n+- `cargo` anything, including `cargo check`, `cargo fmt --check`, `cargo clippy`, `cargo metadata`\n+  and `cargo tree` \u2014 build scripts and proc-macros run under all of them; `make` anything; the\n+  `nebula` binary or anything under `target/`; INSTALL.SH; `python3`, `node`, `sh`, `bash`, `source`\n+  on any file the PR adds or changes \u2014 reading a script means `cat`, not `sh -n`.\n+- `gh pr checkout`, `git checkout`, `git switch`, `git merge`, `git rebase`, `git apply`,\n+  `git cherry-pick`, `git stash`, `git worktree add`, `git reset` \u2014 nothing that moves the SHARED\n+  CHECKOUT or creates a tree; editing or creating any file inside the repo.",
+      "html_url": "https://github.com/AgentSystemLabs/nebula/pull/28#discussion_r3939186922",
+      "id": 3939186922,
+      "in_reply_to_id": 3939103772,
+      "line": null,
+      "node_id": "PRRC_kwDOTu3A5c7qyzjq",
+      "original_commit_id": "08796166eeb0438110cff1aabf90c50d6b9f2e1d",
+      "original_line": 51,
+      "original_position": 51,
+      "original_start_line": 49,
+      "path": ".claude/skills/pr-reviewer/SKILL.md",
+      "position": 1,
+      "pull_request_review_id": 5119440442,
+      "pull_request_url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/28",
+      "reactions": {
+        "+1": 0,
+        "-1": 0,
+        "confused": 0,
+        "eyes": 0,
+        "heart": 0,
+        "hooray": 0,
+        "laugh": 0,
+        "rocket": 0,
+        "total_count": 0,
+        "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939186922/reactions"
+      },
+      "side": "RIGHT",
+      "start_line": null,
+      "start_side": "RIGHT",
+      "subject_type": "line",
+      "updated_at": "2026-09-05T02:43:29Z",
+      "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939186922",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/123222405?v=4",
+        "events_url": "https://api.github.com/users/webdevcody/events{/privacy}",
+        "followers_url": "https://api.github.com/users/webdevcody/followers",
+        "following_url": "https://api.github.com/users/webdevcody/following{/other_user}",
+        "gists_url": "https://api.github.com/users/webdevcody/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/webdevcody",
+        "id": 123222405,
+        "login": "webdevcody",
+        "node_id": "U_kgDOB1g5hQ",
+        "organizations_url": "https://api.github.com/users/webdevcody/orgs",
+        "received_events_url": "https://api.github.com/users/webdevcody/received_events",
+        "repos_url": "https://api.github.com/users/webdevcody/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/webdevcody/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/webdevcody/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/webdevcody",
+        "user_view_type": "public"
+      }
+    },
+    {
+      "_links": {
+        "html": {
+          "href": "https://github.com/AgentSystemLabs/nebula/pull/28#discussion_r3939187044"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/28"
+        },
+        "self": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939187044"
+        }
+      },
+      "author_association": "CONTRIBUTOR",
+      "body": "Fixed in fbe4a0f: the \"before\" side is the merge base now. Step 1 records `git merge-base origin/<base> <headRefOid>` in `pr.base`, the allow list shows `git show <mergeBase>:<path>` in place of `origin/<base>`, step 3 reads the previous shape from `pr.base`, and the review's Basis line names the merge base and head SHAs. `origin/<base>` is only fetched, never compared against.\n",
+      "commit_id": "08796166eeb0438110cff1aabf90c50d6b9f2e1d",
+      "created_at": "2026-09-05T02:43:30Z",
+      "diff_hunk": "@@ -0,0 +1,241 @@\n+---\n+name: pr-reviewer\n+description: \"Review a pull request by reading alone \u2014 its diff, description, CI state, the surrounding code at base and head, and the MEMORY LOG for the area \u2014 and leave one review comment on the PR that weighs, in this order, the security and production-merge risk of the change, its performance cost, and whether it follows the patterns already in this codebase. It never builds, tests, executes, installs or checks out the PR, and never approves or requests changes. Use when the user says \\\"review this PR\\\", \\\"review PR 26\\\", \\\"pr review\\\", \\\"pr reviewer\\\", \\\"is this safe to merge\\\", \\\"what would merging this break\\\", or asks for a risk read on a pull request.\"\n+user-invocable: true\n+---\n+\n+A pull request review here answers one question first: **what happens to the people running nebula\n+in production if this merges?** Nebula is a DAEMON that owns every agent PTY on a developer's box,\n+speaks to its TUI over an unauthenticated DAEMON SOCKET, installs MANAGED HOOKS into the user's own\n+`~/.claude`, `~/.codex`, `~/.cursor` and `~/.pi`, spawns `claude` / `codex` / `cursor-agent` / `pi`\n+with a composed argv and system prompt, runs `curl | sh` on remote hosts over NEBULA SSH, and migrates\n+a SQLITE STORE on every user's disk at the first launch of a new binary. A wrong line in the wrong\n+place is not a bug report; it is every user's sessions gone, or every user's shell running someone\n+else's script. So the review weighs security and merge risk first and hardest, performance second, and\n+fit with the codebase's patterns third \u2014 and says which of the three every finding belongs to.\n+\n+The second rule shapes everything else: **the reviewer reads; it never runs.** Not the PR's code, not\n+its tests, not the build, not the binary, not a script the PR adds. Three reasons, each sufficient on\n+its own. A PR \u2014 above all one from a fork (`isCrossRepository: true`) \u2014 is untrusted input, and even\n+`cargo check` executes its `build.rs` and proc-macros as you, with your `gh` token, `~/.claude` and ssh\n+keys in reach. The SHARED CHECKOUT belongs to several sessions at once, so a `gh pr checkout`, a merge\n+or a stash yanks the tree out from under them. And a review that says \"I ran the tests\" asserts\n+something the reader cannot audit anyway: CI's verdict is the test gate \u2014 and on this repo nothing on\n+GitHub builds or tests a PR at all (`claude-code-review.yml` is the only PR workflow; `release.yml`\n+runs on tags), which is itself a fact the review states. What reading cannot settle goes into the\n+review as *unsettled*, named precisely enough that a human can run it. It is never quietly run.\n+\n+## Read, never run\n+\n+Allowed \u2014 every one of these is a read: it touches no working tree and executes nothing from the PR.\n+\n+```bash\n+gh pr view <n> --json \u2026                          # metadata, description, files, checks, reviews\n+gh pr diff <n>                                   # the unified diff\n+gh pr checks <n>                                 # CI state as GitHub reports it (exit 8 = pending)\n+gh api repos/<owner>/<repo>/pulls/<n>/comments   # inline review comments \u2014 not a --json field\n+git fetch origin && git fetch origin pull/<n>/head   # refresh origin/<base>; the PR head lands in FETCH_HEAD, no ref, no checkout\n+git show <headRefOid>:<path>                     # the PR's whole file (the SHA is stable; FETCH_HEAD is not, other sessions fetch too)\n+git show origin/<base>:<path>                    # the same file before the PR",
+      "html_url": "https://github.com/AgentSystemLabs/nebula/pull/28#discussion_r3939187044",
+      "id": 3939187044,
+      "in_reply_to_id": 3939103881,
+      "line": null,
+      "node_id": "PRRC_kwDOTu3A5c7qyzlk",
+      "original_commit_id": "08796166eeb0438110cff1aabf90c50d6b9f2e1d",
+      "original_line": 39,
+      "original_position": 39,
+      "original_start_line": null,
+      "path": ".claude/skills/pr-reviewer/SKILL.md",
+      "position": 1,
+      "pull_request_review_id": 5119440541,
+      "pull_request_url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/28",
+      "reactions": {
+        "+1": 0,
+        "-1": 0,
+        "confused": 0,
+        "eyes": 0,
+        "heart": 0,
+        "hooray": 0,
+        "laugh": 0,
+        "rocket": 0,
+        "total_count": 0,
+        "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939187044/reactions"
+      },
+      "side": "RIGHT",
+      "start_line": null,
+      "start_side": null,
+      "subject_type": "line",
+      "updated_at": "2026-09-05T02:43:30Z",
+      "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3939187044",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/123222405?v=4",
+        "events_url": "https://api.github.com/users/webdevcody/events{/privacy}",
+        "followers_url": "https://api.github.com/users/webdevcody/followers",
+        "following_url": "https://api.github.com/users/webdevcody/following{/other_user}",
+        "gists_url": "https://api.github.com/users/webdevcody/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/webdevcody",
+        "id": 123222405,
+        "login": "webdevcody",
+        "node_id": "U_kgDOB1g5hQ",
+        "organizations_url": "https://api.github.com/users/webdevcody/orgs",
+        "received_events_url": "https://api.github.com/users/webdevcody/received_events",
+        "repos_url": "https://api.github.com/users/webdevcody/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/webdevcody/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/webdevcody/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/webdevcody",
+        "user_view_type": "public"
+      }
+    }
+  ]
+}
