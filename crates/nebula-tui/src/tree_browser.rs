@@ -386,9 +386,10 @@ impl TreeBrowser {
     }
 }
 
-/// File contents for the preview pane, capped and binary-guarded. `Err` is
-/// the placeholder/error message to display (unhighlighted).
-fn read_preview(path: &std::path::Path) -> Result<String, String> {
+/// File contents for a preview pane (this browser's, or the FILE TABS'),
+/// capped and binary-guarded. `Err` is the placeholder/error message to
+/// display (unhighlighted).
+pub(crate) fn read_preview(path: &std::path::Path) -> Result<String, String> {
     use std::io::Read;
     let file = match std::fs::File::open(path) {
         Ok(f) => f,

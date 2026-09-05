@@ -122,6 +122,11 @@ pub struct Daemon {
     pub store: Arc<Store>,
     /// Entity/status deltas fanned out to every subscribed client.
     pub events: broadcast::Sender<ServerEvent>,
+    /// Every session the registry installs — a spawn, a respawn, a prewarm
+    /// adoption — by ref, the moment it is in `sessions`. A client's forward
+    /// task (`attach.rs`) listens so a kill-and-respawn behind an attached
+    /// pane rebinds it to the new PTY instead of leaving it on a dead one.
+    pub session_installs: broadcast::Sender<SessionRef>,
     pub shutdown: tokio_util::sync::CancellationToken,
     /// Serializes worktree create/delete with the background auto-sync so
     /// a checkout is never adopted twice while its row is mid-insert.
@@ -175,12 +180,14 @@ pub struct Daemon {
 impl Daemon {
     pub fn new(store: Arc<Store>, hook_env: HookEnv) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
+        let (session_installs, _) = broadcast::channel(64);
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             status_machines: Mutex::new(HashMap::new()),
             hook_env,
             store,
             events,
+            session_installs,
             shutdown: tokio_util::sync::CancellationToken::new(),
             worktree_ops: tokio::sync::Mutex::new(()),
             prewarmed: Mutex::new(HashMap::new()),
@@ -957,13 +964,10 @@ impl Daemon {
             None => None,
         };
         let pr_url = match pr_url {
-            Some(_) if kind != AgentKind::Claude => {
-                bail!("PR launch context is only supported for Claude")
-            }
             Some(_) if cloud_prompt.is_some() => {
                 bail!("PR launch context is not supported for Claude Cloud")
             }
-            Some(url) => Some(validate_pr_url(&url)?),
+            Some(url) => Some(crate::pr_scope::validate_pr_url(&url)?),
             None => None,
         };
         let worktree = self
@@ -1450,8 +1454,8 @@ impl Daemon {
     /// The turn an agent ran `nebula worktree` in has ended: make the
     /// process match its row. Kill it and respawn it resumed in the target,
     /// with a prompt naming the checkout it now runs in so the conversation
-    /// carries straight on (Claude takes that prompt as an argument; codex
-    /// and cursor resume silent and wait for the user). Gated on the
+    /// carries straight on (Claude and pi take that prompt as an argument;
+    /// codex and cursor resume silent and wait for the user). Gated on the
     /// turn-end hooks — Stop, and the idle notification a Stop-less end
     /// still fires — so a Bash hook from the same turn never triggers it.
     pub fn complete_pending_move(self: &Arc<Self>, id: &AgentId, event: &HookEvent) {
@@ -1483,11 +1487,14 @@ impl Daemon {
         tracing::info!(agent = %id, to = %target.branch, "relocating session into its worktree");
         self.kill_session(&sref);
         self.last_cwd.lock().unwrap().remove(id);
-        // Claude only: its `--resume <sid> "<prompt>"` is verified; whether
-        // `codex resume` / `cursor-agent --resume` take a trailing prompt is
-        // not, so their relocated sessions keep waiting for the user.
+        // Claude and pi: `claude --resume <sid> "<prompt>"` and
+        // `pi --session-id <sid> "<prompt>"` are verified to open on the
+        // prompt; whether `codex resume` / `cursor-agent --resume` take a
+        // trailing prompt is not, so their relocated sessions keep waiting
+        // for the user.
         let prompt = relocation_prompt(&target);
-        let prompt = (agent.kind == AgentKind::Claude).then_some(prompt.as_str());
+        let prompt =
+            matches!(agent.kind, AgentKind::Claude | AgentKind::Pi).then_some(prompt.as_str());
         if let Err(e) =
             self.spawn_agent_session_with(&agent, &target, DEFAULT_COLS, DEFAULT_ROWS, None, prompt)
         {
@@ -2352,6 +2359,11 @@ impl Daemon {
             // hook dialect has no context-injection channel.
             AgentKind::Cursor => hooks::installer::install_cursor_hooks(&worktree.path)
                 .and_then(|()| hooks::installer::install_cursor_title_rule(&worktree.path)),
+            // Pi runs TypeScript extensions, not shell hooks: one managed
+            // extension in its global agent dir (loaded without the trust
+            // prompt a worktree-local `.pi/extensions/` would raise) serves
+            // every worktree.
+            AgentKind::Pi => hooks::pi_extension::install(&hooks::pi_extension::pi_agent_dir()),
         };
         if let Err(e) = install_result {
             tracing::warn!(error = %e, cwd = %worktree.path.display(), "hook install failed");
@@ -2359,14 +2371,19 @@ impl Daemon {
 
         // NEBULA_AGENT_CMD overrides for tests; default is the kind's CLI.
         let cmd_override = std::env::var(env::AGENT_CMD).ok();
-        let pr_system_prompt = if cloud.is_none() {
-            self.store
-                .agent_pr_url(&agent.id)?
-                .as_deref()
-                .map(claude_pr_system_prompt)
+        // A PR SESSION's rule rides Claude's system prompt, or opens a
+        // Codex / Cursor cold spawn as its first prompt (see `pr_scope`).
+        let pr_url = if cloud.is_none() {
+            self.store.agent_pr_url(&agent.id)?
         } else {
             None
         };
+        let prompts = crate::pr_scope::launch_prompts(
+            agent.kind,
+            agent.session_id.is_some(),
+            pr_url.as_deref(),
+            initial_prompt,
+        );
         let (program, args, resumed) = match cloud {
             Some(launch) => claude_cloud_spawn_command(
                 launch,
@@ -2380,8 +2397,8 @@ impl Daemon {
                 agent.model.as_deref(),
                 agent.effort.as_deref(),
                 cmd_override.as_deref(),
-                initial_prompt,
-                pr_system_prompt.as_deref(),
+                prompts.initial.as_deref(),
+                prompts.system.as_deref(),
                 true,
             ),
         };
@@ -2445,7 +2462,8 @@ impl Daemon {
     /// A resumed session (`claude --resume` / `codex resume` /
     /// `cursor-agent --resume`) dies fast when
     /// it is stale/deleted — fall back to a fresh session instead of leaving
-    /// a dead pane.
+    /// a dead pane. (`pi --session-id` creates a missing id instead of
+    /// dying, so pi never takes this path; arming it is harmless.)
     fn arm_resume_fallback(
         self: &Arc<Self>,
         agent: Agent,
@@ -2522,6 +2540,8 @@ impl Daemon {
             .lock()
             .unwrap()
             .insert(session.sref.clone(), session.clone());
+        // After the insert: a forward task woken by this looks the ref up.
+        let _ = self.session_installs.send(session.sref.clone());
         self.watch_for_exit(session);
     }
 
@@ -2625,20 +2645,25 @@ impl Daemon {
 /// Program + args for an agent PTY. An override (tests) is used verbatim —
 /// no resume args. Otherwise the kind picks the CLI and its resume shape:
 /// `claude --resume <sid>` and `cursor-agent --resume <sid>` (flag) vs
-/// `codex resume <sid>` (subcommand, so resume args must lead). Codex and
+/// `codex resume <sid>` (subcommand, so resume args must lead); pi takes
+/// `pi --session-id <sid>`, which resumes the id where it exists and
+/// creates it where it doesn't (a relocated session's new cwd). Codex and
 /// cursor always get their skip-permissions flag (`--yolo` / `--force`),
-/// appended after the resume args — same convention as Mission Control.
+/// appended after the resume args — same convention as Mission Control;
+/// pi has no permission gate to skip.
 /// Model/effort choices follow: `claude --model m --effort e`,
-/// `codex -m m -c model_reasoning_effort=e`, and for cursor one flat id
+/// `codex -m m -c model_reasoning_effort=e`, `pi --model m --thinking e`,
+/// and for cursor one flat id
 /// joined from the two — `cursor-agent --model m-e` (`--model m` when
 /// effort is None; the CLI's catalogue bakes the effort into the id and
 /// rejects the `m[effort=e]` form its `--help` advertises).
-/// Claude then gets nebula's worktree guidance appended to its system
+/// Claude and pi then get nebula's worktree guidance appended to the system
 /// prompt, any persisted PR scope is composed into that same system-prompt
 /// argument, and an `initial_prompt` — the relocation notice a `nebula
 /// worktree` respawn opens with, or the starting prompt an AGENT PRESET
 /// launch composes — goes last, as the CLI's trailing positional prompt
-/// (`claude [prompt]`, `codex [PROMPT]`, `cursor-agent [prompt...]`).
+/// (`claude [prompt]`, `codex [PROMPT]`, `cursor-agent [prompt...]`,
+/// `pi [messages...]`).
 ///
 /// The plain shape, as every restart/resume spawns it: no initial prompt,
 /// guidance on. Tests assert against this; the daemon calls the full form.
@@ -2667,8 +2692,9 @@ fn agent_spawn_command(
 /// of Claude's own EnterWorktree tool, whose checkout lands under
 /// `<repo>/.claude/worktrees/` on a `worktree-*` branch — a layout the
 /// worktree list only adopts after the fact, and not where a nebula user
-/// keeps their worktrees. Claude only: codex and cursor have no
-/// system-prompt flag, and no EnterWorktree to steer away from.
+/// keeps their worktrees. Claude and pi (both take `--append-system-prompt`;
+/// pi has no EnterWorktree, but does run `git worktree add` on its own
+/// unless told otherwise): codex and cursor have no system-prompt flag.
 pub const CLAUDE_WORKTREE_GUIDANCE: &str = "[nebula] This session runs inside nebula, which \
 manages this project's git worktrees. When the user asks you to work in a worktree (\"do this in a \
 worktree\", \"in a new worktree\", \"branch this off in its own checkout\"), do not use the \
@@ -2690,19 +2716,6 @@ fn relocation_prompt(worktree: &Worktree) -> String {
          directory is that checkout. Continue the user's most recent request there.",
         worktree.branch,
         worktree.path.display()
-    )
-}
-
-/// The invariant attached to a Claude AGENT created from an OPEN PRS row.
-/// It is regenerated from the persisted URL for every fresh process so a
-/// RESUME cannot silently lose the scope the user chose at creation time.
-fn claude_pr_system_prompt(pr_url: &str) -> String {
-    format!(
-        "[nebula] This session was created from the OPEN PRS row for {pr_url}. All work in this \
-         session must be scoped to that pull request. Inspect the PR before acting, and do not \
-         modify or report on unrelated work. Before editing, make sure changes are made on the \
-         PR's head branch (using a dedicated worktree if necessary), never in an unrelated \
-         checkout. Keep reviews, tests, commits, pushes, and GitHub actions limited to this PR."
     )
 }
 
@@ -2732,17 +2745,18 @@ fn agent_spawn_command_with(
         (AgentKind::Claude, Some(sid)) => (vec!["--resume".to_string(), sid.to_string()], true),
         (AgentKind::Codex, Some(sid)) => (vec!["resume".to_string(), sid.to_string()], true),
         (AgentKind::Cursor, Some(sid)) => (vec!["--resume".to_string(), sid.to_string()], true),
+        (AgentKind::Pi, Some(sid)) => (vec!["--session-id".to_string(), sid.to_string()], true),
         (_, None) => (Vec::new(), false),
     };
     match kind {
         AgentKind::Codex => args.push("--yolo".to_string()),
         AgentKind::Cursor => args.push("--force".to_string()),
-        AgentKind::Claude => {}
+        AgentKind::Claude | AgentKind::Pi => {}
     }
-    // Claude and codex spell the model flag the same way, and it follows
-    // the skip-permissions flag in both (`codex --yolo --model …`). Cursor
+    // Claude, codex and pi spell the model flag the same way, and it
+    // follows the skip-permissions flag (`codex --yolo --model …`). Cursor
     // composes its own below: family and effort become one id.
-    if let (Some(m), AgentKind::Claude | AgentKind::Codex) = (model, kind) {
+    if let (Some(m), AgentKind::Claude | AgentKind::Codex | AgentKind::Pi) = (model, kind) {
         args.extend(["--model".to_string(), m.to_string()]);
     }
     match kind {
@@ -2750,20 +2764,18 @@ fn agent_spawn_command_with(
             if let Some(e) = effort {
                 args.extend(["--effort".to_string(), e.to_string()]);
             }
-            let mut system_prompt = Vec::new();
-            if guidance {
-                system_prompt.push(CLAUDE_WORKTREE_GUIDANCE);
-                system_prompt.push(crate::sibling::CLAUDE_SPAWN_GUIDANCE);
+            push_system_prompt(&mut args, guidance, additional_system_prompt);
+            if let Some(p) = initial_prompt {
+                args.push(p.to_string());
             }
-            if let Some(prompt) = additional_system_prompt {
-                system_prompt.push(prompt);
+        }
+        AgentKind::Pi => {
+            // pi's reasoning knob is `--thinking <off|minimal|…|max>`.
+            if let Some(e) = effort {
+                args.extend(["--thinking".to_string(), e.to_string()]);
             }
-            if !system_prompt.is_empty() {
-                args.extend([
-                    "--append-system-prompt".to_string(),
-                    system_prompt.join("\n\n"),
-                ]);
-            }
+            push_system_prompt(&mut args, guidance, additional_system_prompt);
+            // `pi [options] [--] [@files...] [messages...]` — trailing.
             if let Some(p) = initial_prompt {
                 args.push(p.to_string());
             }
@@ -2796,6 +2808,27 @@ fn agent_spawn_command_with(
         }
     }
     (program, args, resumed)
+}
+
+/// One `--append-system-prompt` carrying nebula's guidance (worktree, spawn,
+/// then open) and whatever else the launch adds (the PR scope), for the CLIs
+/// that take the flag — Claude and pi.
+fn push_system_prompt(args: &mut Vec<String>, guidance: bool, additional: Option<&str>) {
+    let mut system_prompt = Vec::new();
+    if guidance {
+        system_prompt.push(CLAUDE_WORKTREE_GUIDANCE);
+        system_prompt.push(crate::sibling::CLAUDE_SPAWN_GUIDANCE);
+        system_prompt.push(crate::open_files::CLAUDE_OPEN_GUIDANCE);
+    }
+    if let Some(prompt) = additional {
+        system_prompt.push(prompt);
+    }
+    if !system_prompt.is_empty() {
+        args.extend([
+            "--append-system-prompt".to_string(),
+            system_prompt.join("\n\n"),
+        ]);
+    }
 }
 
 /// Validate an AGENT PRESET's composed starting prompt before it becomes the
@@ -2860,21 +2893,6 @@ fn validate_cloud_text(raw: &str, what: &str) -> Result<String> {
         );
     }
     Ok(text)
-}
-
-/// Validate the persisted URL before it becomes part of Claude's argv on
-/// every spawn. OPEN PRS rows already supply HTTP(S), but the DAEMON treats
-/// IPC as a real boundary and rechecks the invariant itself.
-fn validate_pr_url(raw: &str) -> Result<String> {
-    const MAX_PR_URL_BYTES: usize = 4 * 1024;
-    let url = normalize_url(raw)?;
-    if url.len() > MAX_PR_URL_BYTES {
-        bail!("pull request URL is too long (max 4 KiB)");
-    }
-    if !url.contains("/pull/") {
-        bail!("not a pull request URL: {url}");
-    }
-    Ok(url)
 }
 
 /// Branch (and so directory) of the worktree a Cloud row is re-homed into
@@ -2972,7 +2990,7 @@ fn shell_has_children(session: &PtySession) -> bool {
 /// scheme-less value gets https://. Anything else — another scheme, or no
 /// host at all — is refused rather than stored: the TUI hands these to
 /// `open(1)`, and only http(s) may ever reach it.
-fn normalize_url(url: &str) -> Result<String> {
+pub(crate) fn normalize_url(url: &str) -> Result<String> {
     let url = url.trim();
     if url.is_empty() {
         bail!("link URL is empty");
@@ -3051,6 +3069,7 @@ mod tests {
                 [
                     CLAUDE_WORKTREE_GUIDANCE,
                     crate::sibling::CLAUDE_SPAWN_GUIDANCE,
+                    crate::open_files::CLAUDE_OPEN_GUIDANCE,
                 ]
                 .join("\n\n"),
             ])
@@ -3073,6 +3092,18 @@ mod tests {
         assert_eq!(
             agent_spawn_command(AgentKind::Cursor, None, None, None, None),
             ("cursor-agent".into(), vec!["--force".to_string()], false)
+        );
+        // Pi has no permission gate to skip and takes the same guidance as
+        // Claude (it has the system-prompt flag).
+        assert_eq!(
+            agent_spawn_command(AgentKind::Pi, None, None, None, None),
+            ("pi".into(), guided(&[]), false)
+        );
+        // Pi resumes by exact id — one that is missing is created, so a
+        // relocated session's new cwd never dies on a stale id.
+        assert_eq!(
+            agent_spawn_command(AgentKind::Pi, Some("sid-4"), None, None, None),
+            ("pi".into(), guided(&["--session-id", "sid-4"]), true)
         );
         // Claude resumes with a flag; codex with a subcommand (order matters).
         assert_eq!(
@@ -3150,6 +3181,20 @@ mod tests {
                 ],
                 false
             )
+        );
+        // Pi: `--model <pattern>` plus `--thinking <level>`, ahead of the
+        // guidance like Claude's.
+        assert_eq!(
+            agent_spawn_command(AgentKind::Pi, None, Some("sonnet"), Some("high"), None),
+            (
+                "pi".into(),
+                guided(&["--model", "sonnet", "--thinking", "high"]),
+                false
+            )
+        );
+        assert_eq!(
+            agent_spawn_command(AgentKind::Pi, None, None, Some("off"), None),
+            ("pi".into(), guided(&["--thinking", "off"]), false)
         );
         // Resume keeps the model/effort flags (a fallback fresh spawn needs
         // them, and the CLIs accept them alongside resume).
@@ -3306,6 +3351,24 @@ mod tests {
             .1,
             vec!["--force", "fix auth"]
         );
+        // Pi: the prompt trails the resume id and the guidance, as pi's
+        // `[messages...]` positional.
+        let mut expected = guided(&["--session-id", "sid"]);
+        expected.push("carry on".into());
+        assert_eq!(
+            agent_spawn_command_with(
+                AgentKind::Pi,
+                Some("sid"),
+                None,
+                None,
+                None,
+                Some("carry on"),
+                None,
+                true
+            )
+            .1,
+            expected
+        );
         // An override is verbatim: no guidance, no prompt.
         assert_eq!(
             agent_spawn_command_with(
@@ -3325,7 +3388,7 @@ mod tests {
     #[test]
     fn spawn_command_keeps_pr_scope_and_url_in_claudes_system_prompt() {
         let pr_url = "https://github.com/AgentSystemLabs/nebula/pull/42";
-        let pr_prompt = claude_pr_system_prompt(pr_url);
+        let pr_prompt = crate::pr_scope::rule(pr_url);
         let (_, args, resumed) = agent_spawn_command_with(
             AgentKind::Claude,
             Some("sid"),
@@ -3345,6 +3408,7 @@ mod tests {
         assert_eq!(prompts.len(), 1, "Claude gets one composed system prompt");
         assert!(prompts[0].contains(CLAUDE_WORKTREE_GUIDANCE));
         assert!(prompts[0].contains(crate::sibling::CLAUDE_SPAWN_GUIDANCE));
+        assert!(prompts[0].contains(crate::open_files::CLAUDE_OPEN_GUIDANCE));
         assert!(prompts[0].contains("All work in this session must be scoped"));
         assert!(prompts[0].contains(pr_url));
     }
@@ -3558,6 +3622,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(wrong_kind.to_string().contains("only supported for Claude"));
+    }
+
+    #[tokio::test]
+    async fn pr_launch_context_is_accepted_for_every_kind_but_never_with_cloud() {
+        let daemon = test_daemon();
+        let spec = |kind: AgentKind, cloud: Option<&str>| CreateAgentSpec {
+            worktree: WorktreeId("unused".into()),
+            name: "pr".into(),
+            kind,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: cloud.map(String::from),
+            starting_prompt: None,
+            pr_url: Some("https://github.com/o/r/pull/7".into()),
+        };
+        for kind in AgentKind::ALL {
+            // Validation passes for every harness; the missing worktree is
+            // what stops this spec, one check later.
+            let err = daemon.create_agent(spec(kind, None)).await.unwrap_err();
+            assert!(
+                err.to_string().contains("worktree not found"),
+                "{kind:?}: {err}"
+            );
+        }
+        let cloud = daemon
+            .create_agent(spec(AgentKind::Claude, Some("Fix auth")))
+            .await
+            .unwrap_err();
+        assert!(cloud.to_string().contains("not supported for Claude Cloud"));
+        let not_a_pr = CreateAgentSpec {
+            pr_url: Some("https://github.com/o/r/issues/7".into()),
+            ..spec(AgentKind::Codex, None)
+        };
+        let err = daemon.create_agent(not_a_pr).await.unwrap_err();
+        assert!(err.to_string().contains("not a pull request URL"), "{err}");
     }
 
     #[tokio::test]
@@ -4370,11 +4470,6 @@ mod tests {
         ] {
             assert!(normalize_url(bad).is_err(), "expected refusal: {bad:?}");
         }
-        assert_eq!(
-            validate_pr_url("github.com/o/r/pull/7").unwrap(),
-            "https://github.com/o/r/pull/7"
-        );
-        assert!(validate_pr_url("https://github.com/o/r/issues/7").is_err());
     }
 
     #[test]
@@ -4384,6 +4479,7 @@ mod tests {
         assert!(cli_missing_message(AgentKind::Cursor).starts_with("cursor-agent was not found"));
         assert!(cli_missing_message(AgentKind::Claude).starts_with("claude was not found"));
         assert!(cli_missing_message(AgentKind::Codex).starts_with("codex was not found"));
+        assert!(cli_missing_message(AgentKind::Pi).starts_with("pi was not found"));
         // No "restart nebula": agent CLIs are spawned through the user's
         // login shell, so a fresh install is picked up on the next try.
         for kind in AgentKind::ALL {

@@ -13,7 +13,7 @@
 //! every other session, with the composed text as the STARTING PROMPT.
 
 use crate::agent_presets::AgentPreset;
-use crate::app::{App, ContextMenu, MenuAction, MenuItem, Overlay, PromptKind};
+use crate::app::{App, Overlay, PromptKind};
 use crate::config::{fit_effort, Config};
 use nebula_core::{AgentKind, WorktreeId};
 
@@ -171,43 +171,7 @@ pub(crate) fn reopen(app: &mut App, launch: QuickLaunch, text: &str) {
 /// back here instead of creating a session, and it clears any AGENT PRESET
 /// (a launch spec has one source).
 pub(crate) fn open_launch_picker(app: &mut App, back: QuickReturn) {
-    let kinds = Config::load().enabled_kinds();
-    if kinds.is_empty() {
-        // An empty ContextMenu panics on Enter and `j`; only a hand-edited
-        // config gets here.
-        app.flash = Some("every harness is disabled — enable one in Settings › Agents".into());
-        return;
-    }
-    let hover = kinds
-        .iter()
-        .position(|k| *k == back.launch.kind)
-        .unwrap_or(0);
-    let items = kinds
-        .into_iter()
-        .map(|kind| {
-            MenuItem::new(
-                crate::event_loop::kind_label(kind),
-                MenuAction::NewAgentOfKind {
-                    worktree: back.launch.worktree.clone(),
-                    kind,
-                    model: None,
-                    effort: None,
-                    cloud: false,
-                    pr_url: None,
-                    quick: Some(Box::new(back.clone())),
-                },
-            )
-        })
-        .collect();
-    app.overlay = Some(Overlay::Menu(ContextMenu {
-        title: Some("Quick prompt agent".into()),
-        items,
-        at: None,
-        hover,
-        area: ratatui::layout::Rect::default(),
-        parent: None,
-        filter: None,
-    }));
+    crate::agent_picker::open_kind_picker(app, crate::agent_picker::KindPicker::quick_prompt(back));
 }
 
 /// `Shift+Tab` in the box: the saved AGENT PRESETS as a picker. The list is

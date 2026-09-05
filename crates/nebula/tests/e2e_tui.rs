@@ -91,6 +91,7 @@ impl TuiHarness {
         cmd.env(nebula_core::env::DATA_DIR, &data_dir);
         cmd.env(nebula_core::env::AGENT_CMD, "/bin/sh"); // stand-in for claude
         cmd.env(nebula_core::env::WORKTREE_SYNC_MS, "100"); // fast external-change pickup
+        cmd.env(nebula_core::env::UPDATE_CHECK_SECS, "0"); // the footer must not depend on GitHub
         cmd.env(nebula_core::env::LOG, "debug");
         cmd.env("SHELL", "/bin/sh");
         cmd.env("TERM", "xterm-256color");
@@ -592,6 +593,60 @@ fn tui_help_modal_grouped_keymap() {
 
     tui.send(ESC); // closes
     tui.wait_for_gone("NAVIGATE & SEARCH");
+}
+
+/// `nebula open` typed into a live session's shell — the stand-in agent is
+/// `/bin/sh`, holding the AGENT ENV a real CLI would — raises the FILE
+/// TABS in the TUI attached to that daemon: one tab per file, the first
+/// previewed. Ctrl+Q from the strip closes it and hands the pane back.
+#[test]
+fn nebula_open_from_inside_a_session_raises_the_file_tabs() {
+    let mut tui = TuiHarness::spawn();
+    let repo = tui.make_repo("open-proj");
+    let alpha = repo.join("alpha.md");
+    let beta = repo.join("beta.rs");
+    std::fs::write(&alpha, "# alpha opened from the session\n").unwrap();
+    std::fs::write(&beta, "fn beta() {}\n").unwrap();
+
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "open-proj");
+    tui.send(ENTER); // Projects → Worktrees
+    tui.wait_for_text(FOOTER_WORKTREES);
+    tui.send(ENTER); // Worktrees → Sessions
+    tui.wait_for_text(FOOTER_SESSIONS);
+
+    // ---- an agent (the stand-in shell), auto-attached and locked ----
+    tui.send(b"n");
+    tui.wait_for_text("New session");
+    tui.send(ENTER);
+    tui.wait_for_gone("New session");
+    tui.wait_for_text("New agent");
+    tui.send(ENTER);
+    tui.wait_for_gone("New agent");
+    tui.wait_for_text("agent-1");
+    tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
+
+    // ---- what the model runs, typed at the shell inside the session ----
+    tui.type_str(&format!(
+        "{} open {} {}",
+        env!("CARGO_BIN_EXE_nebula"),
+        alpha.display(),
+        beta.display()
+    ));
+    tui.send(ENTER);
+    tui.wait_for_text("Open files (2)");
+    // The preview is the file itself — text the shell never echoed.
+    tui.wait_for_text("alpha opened from the session");
+    tui.wait_for_text("Enter: edit in");
+
+    // ---- → moves to the next tab and its preview ----
+    tui.send(b"\x1b[C");
+    tui.wait_for_text("fn beta() {}");
+
+    // ---- Ctrl+Q from the strip closes; the locked pane is back ----
+    tui.send(CTRL_Q);
+    tui.wait_for_gone("Open files (2)");
+    tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
 }
 
 #[test]

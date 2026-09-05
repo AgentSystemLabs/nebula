@@ -19,6 +19,7 @@ const VISIBLE: &[&[&str]] = &[
     &["rename"],
     &["worktree"],
     &["spawn"],
+    &["open"],
     &["workspace"],
     &["workspace", "add"],
     &["workspace", "open"],
@@ -119,8 +120,8 @@ fn the_root_help_lists_one_line_per_command() {
     }
     assert_eq!(
         commands.lines().count(),
-        12,
-        "eleven commands plus `help`:\n{commands}"
+        13,
+        "twelve commands plus `help`:\n{commands}"
     );
 }
 
