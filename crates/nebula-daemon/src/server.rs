@@ -2,6 +2,7 @@
 //! PTY plane of a connection (attach replay, forwarding) lives in `attach`.
 
 use crate::attach::{self, PaneSize};
+use crate::pr_scope::CreatePrAgentSpec;
 use crate::registry::{CreateAgentSpec, Daemon};
 use anyhow::Result;
 use nebula_core::codec::{read_frame, write_frame};
@@ -362,25 +363,25 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientRequest::CreatePrAgent {
                     req_id,
-                    worktree,
+                    project,
                     name,
                     kind,
                     model,
                     effort,
                     auto_title,
                     pr_url,
+                    head,
                 } => {
                     let result = daemon
-                        .create_agent(CreateAgentSpec {
-                            worktree: worktree.clone(),
+                        .create_pr_agent(CreatePrAgentSpec {
+                            project: project.clone(),
                             name,
                             kind,
                             model,
                             effort,
                             auto_title,
-                            cloud_prompt: None,
-                            starting_prompt: None,
-                            pr_url: Some(pr_url.clone()),
+                            pr_url: pr_url.clone(),
+                            head,
                         })
                         .await;
                     match &result {
@@ -388,7 +389,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             req_id,
                             agent = %agent,
                             kind = kind.as_str(),
-                            worktree = %worktree,
+                            project = %project,
                             pr_url = %pr_url,
                             launch_mode = "pull_request",
                             "agent session spawned"
@@ -397,7 +398,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             req_id,
                             error = %error,
                             kind = kind.as_str(),
-                            worktree = %worktree,
+                            project = %project,
                             pr_url = %pr_url,
                             launch_mode = "pull_request",
                             "agent session spawn failed"

@@ -201,6 +201,42 @@ pub async fn add_worktree(repo: &Path, branch: &str, base: Option<&str>) -> Resu
     }
 }
 
+/// Check pull request `number`'s head branch `head` out into a new worktree
+/// in the WORKTREE DIR layout — where every PR SESSION for it runs. Pure
+/// git, two routes: a same-repo PR's branch is fetched from `origin` and
+/// checked out tracking it (so a plain `git push` lands on the PR); a fork's
+/// branch is not on `origin`, so the PR ref itself (`refs/pull/N/head`)
+/// seeds a local branch of that name. A branch that already exists locally
+/// is checked out as is — `add_worktree`'s own fallback — even offline.
+pub async fn add_pr_worktree(repo: &Path, number: u64, head: &str) -> Result<PathBuf> {
+    let local = git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{head}"),
+        ],
+    )
+    .await
+    .is_ok();
+    let base = match git(repo, &["fetch", "origin", head]).await {
+        Ok(_) => Some(format!("origin/{head}")),
+        Err(branch_err) => {
+            let pr_ref = format!("refs/pull/{number}/head");
+            match git(repo, &["fetch", "origin", &pr_ref]).await {
+                Ok(_) => Some("FETCH_HEAD".to_string()),
+                Err(_) if local => None,
+                Err(pr_err) => bail!(
+                    "could not fetch pull request #{number} ({head}) from origin: {pr_err} \
+                     (branch: {branch_err})"
+                ),
+            }
+        }
+    };
+    add_worktree(repo, head, base.as_deref()).await
+}
+
 pub async fn remove_worktree(repo: &Path, worktree_path: &Path, force: bool) -> Result<()> {
     // Checkout already gone (manual rm -rf): `git worktree remove` would fail,
     // but the user's intent is already satisfied — just drop git's stale
@@ -382,6 +418,80 @@ mod tests {
             "a real detached HEAD is still labelled as one, got {:?}",
             branch_of(&entries)
         );
+    }
+
+    /// A bare `origin` beside `repo`, with `repo`'s `main` pushed and a
+    /// `feat-x` branch that exists only there — the shape of a same-repo
+    /// pull request whose branch nobody has fetched yet.
+    async fn add_bare_origin(repo: &Path, tmp: &Path) -> PathBuf {
+        let origin = tmp.join("origin.git");
+        std::fs::create_dir(&origin).unwrap();
+        git(&origin, &["init", "--bare", "-b", "main"])
+            .await
+            .unwrap();
+        let origin_str = origin.to_string_lossy().into_owned();
+        git(repo, &["remote", "add", "origin", &origin_str])
+            .await
+            .unwrap();
+        git(repo, &["push", "-u", "origin", "main"]).await.unwrap();
+        git(repo, &["branch", "feat-x", "main"]).await.unwrap();
+        git(repo, &["push", "origin", "feat-x"]).await.unwrap();
+        git(repo, &["branch", "-D", "feat-x"]).await.unwrap();
+        origin
+    }
+
+    /// A same-repo PR: the branch comes from `origin` and the new checkout
+    /// tracks it, so a `git push` from a PR SESSION lands on the PR.
+    #[tokio::test]
+    async fn add_pr_worktree_tracks_the_branch_on_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        add_bare_origin(&repo, tmp.path()).await;
+
+        let wt = add_pr_worktree(&repo, 7, "feat-x").await.unwrap();
+        assert_eq!(wt, worktree_dir(&repo, "feat-x"));
+        let branch = git(&wt, &["branch", "--show-current"]).await.unwrap();
+        assert_eq!(branch.trim(), "feat-x");
+        let upstream = git(&wt, &["rev-parse", "--abbrev-ref", "feat-x@{upstream}"])
+            .await
+            .unwrap();
+        assert_eq!(upstream.trim(), "origin/feat-x");
+    }
+
+    /// A fork PR: `origin` has no branch of that name, only the PR ref, so
+    /// the checkout is seeded from `refs/pull/N/head` under the head's name.
+    #[tokio::test]
+    async fn add_pr_worktree_seeds_a_fork_branch_from_the_pr_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let origin = add_bare_origin(&repo, tmp.path()).await;
+        // The fork's commit reaches origin only as the PR ref.
+        git(&repo, &["commit", "--allow-empty", "-m", "fork work"])
+            .await
+            .unwrap();
+        git(&repo, &["push", "origin", "HEAD:refs/pull/9/head"])
+            .await
+            .unwrap();
+        git(&repo, &["reset", "--hard", "origin/main"])
+            .await
+            .unwrap();
+        let expected = git(&origin, &["rev-parse", "refs/pull/9/head"])
+            .await
+            .unwrap();
+
+        let wt = add_pr_worktree(&repo, 9, "their-fix").await.unwrap();
+        let branch = git(&wt, &["branch", "--show-current"]).await.unwrap();
+        assert_eq!(branch.trim(), "their-fix");
+        let head = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(head.trim(), expected.trim());
+
+        // Neither route: no such PR, no such branch anywhere.
+        let err = add_pr_worktree(&repo, 10, "nowhere").await.unwrap_err();
+        assert!(err.to_string().contains("#10"), "{err}");
     }
 
     #[tokio::test]

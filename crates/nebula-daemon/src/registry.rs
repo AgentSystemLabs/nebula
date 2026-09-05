@@ -805,6 +805,47 @@ impl Daemon {
             .get_project(project_id)?
             .context("project not found")?;
         let path = git::add_worktree(&project.repo_path, branch, base).await?;
+        let worktree = self.register_worktree(project_id, path, branch)?;
+        Ok(EntityId::Worktree(worktree.id))
+    }
+
+    /// The checkout every PR SESSION for pull request `number` runs in: the
+    /// PROJECT's worktree already on its head branch `head` (the ROOT
+    /// WORKTREE only when the branch is checked out there — git allows a
+    /// branch in one checkout at a time), or a new one under the WORKTREE
+    /// DIR with the branch fetched from `origin` (`git::add_pr_worktree`).
+    /// Serialized with the other worktree ops, so two PR SESSIONS launched
+    /// together get one checkout, not a race to create it.
+    pub(crate) async fn pr_worktree(
+        self: &Arc<Self>,
+        project_id: &ProjectId,
+        number: u64,
+        head: &str,
+    ) -> Result<Worktree> {
+        let _ops = self.worktree_ops.lock().await;
+        let project = self
+            .store
+            .get_project(project_id)?
+            .context("project not found")?;
+        let (_, worktrees, _, _) = self.store.load_tree()?;
+        if let Some(existing) = worktrees
+            .into_iter()
+            .find(|w| &w.project_id == project_id && w.branch == head)
+        {
+            return Ok(existing);
+        }
+        let path = git::add_pr_worktree(&project.repo_path, number, head).await?;
+        self.register_worktree(project_id, path, head)
+    }
+
+    /// Record a checkout git just made as a worktree row and tell every
+    /// client. Callers hold `worktree_ops`.
+    fn register_worktree(
+        &self,
+        project_id: &ProjectId,
+        path: PathBuf,
+        branch: &str,
+    ) -> Result<Worktree> {
         let worktree = Worktree {
             id: WorktreeId::generate(),
             project_id: project_id.clone(),
@@ -817,7 +858,7 @@ impl Daemon {
         self.broadcast(ServerEvent::EntityUpserted {
             entity: Entity::Worktree(worktree.clone()),
         });
-        Ok(EntityId::Worktree(worktree.id))
+        Ok(worktree)
     }
 
     pub async fn delete_worktree(self: &Arc<Self>, id: &WorktreeId, force: bool) -> Result<()> {
@@ -2379,15 +2420,30 @@ impl Daemon {
         let cmd_override = std::env::var(env::AGENT_CMD).ok();
         // A PR SESSION's rule rides Claude's system prompt, or opens a
         // Codex / Cursor cold spawn as its first prompt (see `pr_scope`).
+        // Rebuilt from the row's *current* worktree on every spawn, so a
+        // relocated PR SESSION is told where it now works.
         let pr_url = if cloud.is_none() {
             self.store.agent_pr_url(&agent.id)?
         } else {
             None
         };
+        let root = match &pr_url {
+            Some(_) if !worktree.is_main => self
+                .store
+                .get_project(&worktree.project_id)?
+                .map(|p| p.repo_path),
+            _ => None,
+        };
+        let scope = pr_url.as_deref().map(|url| crate::pr_scope::PrScope {
+            url,
+            worktree: &worktree.path,
+            branch: &worktree.branch,
+            root: root.as_deref(),
+        });
         let prompts = crate::pr_scope::launch_prompts(
             agent.kind,
             agent.session_id.is_some(),
-            pr_url.as_deref(),
+            scope.as_ref(),
             initial_prompt,
         );
         let (program, args, resumed) = match cloud {
@@ -3402,7 +3458,12 @@ mod tests {
     #[test]
     fn spawn_command_keeps_pr_scope_and_url_in_claudes_system_prompt() {
         let pr_url = "https://github.com/AgentSystemLabs/nebula/pull/42";
-        let pr_prompt = crate::pr_scope::rule(pr_url);
+        let pr_prompt = crate::pr_scope::rule(&crate::pr_scope::PrScope {
+            url: pr_url,
+            worktree: Path::new("/w/nebula-worktrees/fix"),
+            branch: "fix",
+            root: Some(Path::new("/w/nebula")),
+        });
         let (_, args, resumed) = agent_spawn_command_with(
             AgentKind::Claude,
             Some("sid"),
@@ -3425,6 +3486,7 @@ mod tests {
         assert!(prompts[0].contains(crate::open_files::CLAUDE_OPEN_GUIDANCE));
         assert!(prompts[0].contains("All work in this session must be scoped"));
         assert!(prompts[0].contains(pr_url));
+        assert!(prompts[0].contains("/w/nebula-worktrees/fix"));
     }
 
     #[test]
@@ -3672,6 +3734,83 @@ mod tests {
         };
         let err = daemon.create_agent(not_a_pr).await.unwrap_err();
         assert!(err.to_string().contains("not a pull request URL"), "{err}");
+    }
+
+    /// A PR SESSION's checkout is made once for the PR's head branch —
+    /// fetched from `origin`, under the WORKTREE DIR, never the ROOT
+    /// WORKTREE — and every later launch for that PR finds the same row.
+    /// Only a PR whose branch the root itself has checked out runs there.
+    #[tokio::test]
+    async fn pr_worktree_is_created_once_and_shared_by_later_launches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        let origin = root.join("origin.git");
+        std::fs::create_dir(&origin).unwrap();
+        git_in(&origin, &["init", "--bare", "-b", "main"]);
+        git_in(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git_in(&repo, &["push", "-u", "origin", "main"]);
+        git_in(&repo, &["branch", "feat-x", "main"]);
+        git_in(&repo, &["push", "origin", "feat-x"]);
+        git_in(&repo, &["branch", "-D", "feat-x"]);
+
+        let daemon = test_daemon();
+        let EntityId::Project(project) =
+            daemon.add_project(&repo, None, false, None).await.unwrap()
+        else {
+            panic!("expected a project id");
+        };
+        let mut events = daemon.events.subscribe();
+
+        let first = daemon.pr_worktree(&project, 7, "feat-x").await.unwrap();
+        assert!(!first.is_main, "never the ROOT WORKTREE");
+        assert_eq!(first.branch, "feat-x");
+        assert_eq!(first.path, git::worktree_dir(&repo, "feat-x"));
+        assert!(first.path.join(".git").exists(), "a real checkout");
+        assert!(
+            matches!(
+                events.try_recv(),
+                Ok(ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(w)
+                }) if w.id == first.id
+            ),
+            "clients hear about the new row before the agent lands in it"
+        );
+
+        let again = daemon.pr_worktree(&project, 7, "feat-x").await.unwrap();
+        assert_eq!(
+            again.id, first.id,
+            "one checkout per PR, shared by every launch"
+        );
+        assert!(events.try_recv().is_err(), "nothing new to broadcast");
+
+        let on_main = daemon.pr_worktree(&project, 8, "main").await.unwrap();
+        assert!(
+            on_main.is_main,
+            "a PR whose branch the root has checked out is already there"
+        );
+
+        // A bad head never reaches git — it is refused ahead of the lookup.
+        let err = daemon
+            .create_pr_agent(crate::pr_scope::CreatePrAgentSpec {
+                project: project.clone(),
+                name: "pr".into(),
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                auto_title: false,
+                pr_url: "https://github.com/o/r/pull/7".into(),
+                head: "--force".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not a branch name"), "{err}");
     }
 
     #[tokio::test]

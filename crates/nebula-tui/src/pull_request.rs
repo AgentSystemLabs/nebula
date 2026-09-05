@@ -252,6 +252,10 @@ pub struct OpenPr {
     pub title: String,
     pub url: String,
     pub is_draft: bool,
+    /// The branch the pull request comes from (`gh`'s `headRefName`) — the
+    /// one a PR SESSION's worktree is checked out on, so the row carries it
+    /// even though nothing on screen shows it.
+    pub head: String,
 }
 
 impl OpenPr {
@@ -271,6 +275,27 @@ impl OpenPr {
             "draft"
         } else {
             "pr"
+        }
+    }
+}
+
+/// What a PR SESSION launch carries from a PROJECT OPEN PRS GROUP row all
+/// the way to `ClientRequest::CreatePrAgent`: which pull request the work is
+/// scoped to, and the head branch the DAEMON checks its worktree out on.
+/// The two travel together — a URL without its branch cannot be launched —
+/// so they ride the pickers, the MODEL / EFFORT submenus and the name prompt
+/// as one value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrLaunch {
+    pub url: String,
+    pub head: String,
+}
+
+impl PrLaunch {
+    pub fn of(pr: &OpenPr) -> Self {
+        Self {
+            url: pr.url.clone(),
+            head: pr.head.clone(),
         }
     }
 }
@@ -305,7 +330,7 @@ pub async fn list(dir: &Path) -> Option<Vec<OpenPr>> {
             "--limit",
             &limit,
             "--json",
-            "number,url,title,isDraft",
+            "number,url,title,isDraft,headRefName",
         ],
         TIMEOUT,
     )
@@ -329,6 +354,7 @@ fn parse_list(json: &str) -> Option<Vec<OpenPr>> {
                     title: str_at(v, "title"),
                     url,
                     is_draft: bool_at(v, "isDraft"),
+                    head: str_at(v, "headRefName"),
                 })
             })
             .collect(),
@@ -689,7 +715,7 @@ mod tests {
     fn parses_a_gh_pr_list_payload() {
         let prs = parse_list(
             r#"[
-              {"number":42,"title":"Attach links","url":"https://github.com/o/r/pull/42","isDraft":false},
+              {"number":42,"title":"Attach links","url":"https://github.com/o/r/pull/42","isDraft":false,"headRefName":"attach-links"},
               {"number":7,"title":"WIP","url":"https://github.com/o/r/pull/7","isDraft":true}
             ]"#,
         )
@@ -698,6 +724,14 @@ mod tests {
         assert_eq!(prs[0].label(), "#42 Attach links");
         assert_eq!(prs[0].badge(), "pr");
         assert_eq!(prs[1].badge(), "draft");
+        assert_eq!(
+            prs[0].head, "attach-links",
+            "the branch a PR SESSION runs on"
+        );
+        assert!(
+            prs[1].head.is_empty(),
+            "a row `gh` gave no branch for still lists; only its PR SESSION is refused"
+        );
     }
 
     /// An empty repo answers with an empty array — a real answer, not a

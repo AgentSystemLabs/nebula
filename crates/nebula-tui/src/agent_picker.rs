@@ -9,7 +9,7 @@
 
 use crate::app::{App, ContextMenu, MenuAction, MenuItem, Overlay};
 use crate::config::Config;
-use crate::pull_request::OpenPr;
+use crate::pull_request::{OpenPr, PrLaunch};
 use crate::quick_prompt::QuickReturn;
 use nebula_core::{AgentKind, WorktreeId};
 
@@ -25,7 +25,7 @@ pub(crate) struct KindPicker {
     pub title: String,
     pub worktree: WorktreeId,
     /// OPEN PRS launch context (a PR SESSION picker).
-    pub pr_url: Option<String>,
+    pub pr: Option<PrLaunch>,
     /// The QUICK PROMPT box owed back (its `Tab` picker).
     pub quick: Option<Box<QuickReturn>>,
     /// The row to start on; the first row when None or not offered.
@@ -38,19 +38,21 @@ impl KindPicker {
         Self {
             title: "New session".into(),
             worktree,
-            pr_url: None,
+            pr: None,
             quick: None,
             hover: None,
         }
     }
 
-    /// The PR SESSION picker: every row carries the PR's URL and launches
-    /// in the PROJECT's ROOT WORKTREE.
+    /// The PR SESSION picker: every row carries the PR's URL and head
+    /// branch. `worktree` is the PROJECT's ROOT WORKTREE — it names the
+    /// PROJECT the create is addressed to, not where the session ends up;
+    /// the DAEMON puts a PR SESSION in the head branch's own checkout.
     pub fn pr_session(worktree: WorktreeId, pr: &OpenPr) -> Self {
         Self {
             title: format!("New PR session · #{}", pr.number),
             worktree,
-            pr_url: Some(pr.url.clone()),
+            pr: Some(PrLaunch::of(pr)),
             quick: None,
             hover: None,
         }
@@ -62,7 +64,7 @@ impl KindPicker {
         Self {
             title: "Quick prompt agent".into(),
             worktree: back.launch.worktree.clone(),
-            pr_url: None,
+            pr: None,
             hover: Some(back.launch.kind),
             quick: Some(Box::new(back)),
         }
@@ -87,7 +89,7 @@ pub(crate) fn enabled_kinds_or_flash(app: &mut App) -> Option<Vec<AgentKind>> {
 pub(crate) fn kind_rows(
     kinds: &[AgentKind],
     worktree: &WorktreeId,
-    pr_url: Option<&str>,
+    pr: Option<&PrLaunch>,
     quick: Option<&QuickReturn>,
     label: impl Fn(AgentKind) -> String,
 ) -> Vec<MenuItem> {
@@ -102,7 +104,7 @@ pub(crate) fn kind_rows(
                     model: None,
                     effort: None,
                     cloud: false,
-                    pr_url: pr_url.map(str::to_string),
+                    pr: pr.cloned(),
                     quick: quick.map(|back| Box::new(back.clone())),
                 },
             )
@@ -118,20 +120,16 @@ pub(crate) fn open_kind_picker(app: &mut App, picker: KindPicker) {
     let KindPicker {
         title,
         worktree,
-        pr_url,
+        pr,
         quick,
         hover,
     } = picker;
     let hover = hover
         .and_then(|wanted| kinds.iter().position(|kind| *kind == wanted))
         .unwrap_or(0);
-    let items = kind_rows(
-        &kinds,
-        &worktree,
-        pr_url.as_deref(),
-        quick.as_deref(),
-        |kind| kind_label(kind).to_string(),
-    );
+    let items = kind_rows(&kinds, &worktree, pr.as_ref(), quick.as_deref(), |kind| {
+        kind_label(kind).to_string()
+    });
     app.overlay = Some(Overlay::Menu(ContextMenu {
         title: Some(title),
         items,
@@ -149,7 +147,7 @@ pub(crate) fn open_kind_picker(app: &mut App, picker: KindPicker) {
 /// every harness is off.
 pub(crate) fn pr_session_menu_rows(worktree: WorktreeId, pr: &OpenPr) -> Vec<MenuItem> {
     let kinds = Config::load().enabled_kinds();
-    kind_rows(&kinds, &worktree, Some(&pr.url), None, |kind| {
+    kind_rows(&kinds, &worktree, Some(&PrLaunch::of(pr)), None, |kind| {
         format!("New {} session", kind_label(kind))
     })
 }
@@ -170,6 +168,7 @@ mod tests {
     use crate::quick_prompt::QuickLaunch;
 
     const PR_URL: &str = "https://github.com/o/r/pull/7";
+    const PR_HEAD: &str = "attach-links";
 
     /// Pin the config to a temp file holding `json`: every picker reads
     /// `Config::load`, and the dev's real file must stay out of it.
@@ -186,6 +185,7 @@ mod tests {
             title: "Attach links".into(),
             url: PR_URL.into(),
             is_draft: false,
+            head: PR_HEAD.into(),
         }
     }
 
@@ -198,7 +198,8 @@ mod tests {
     #[test]
     fn kind_rows_carry_the_launch_context_into_every_row() {
         let worktree = WorktreeId("w1".into());
-        let rows = kind_rows(&AgentKind::ALL, &worktree, Some(PR_URL), None, |kind| {
+        let pr = PrLaunch::of(&open_pr());
+        let rows = kind_rows(&AgentKind::ALL, &worktree, Some(&pr), None, |kind| {
             format!("New {} session", kind_label(kind))
         });
         let names: Vec<&str> = rows.iter().map(|row| row.label.as_str()).collect();
@@ -218,9 +219,12 @@ mod tests {
                         model: None,
                         effort: None,
                         cloud: false,
-                        pr_url: Some(url),
+                        pr: Some(pr),
                         quick: None,
-                    } if worktree.as_str() == "w1" && *kind == expected && url == PR_URL
+                    } if worktree.as_str() == "w1"
+                        && *kind == expected
+                        && pr.url == PR_URL
+                        && pr.head == PR_HEAD
                 ),
                 "{row:?}"
             );
@@ -262,7 +266,8 @@ mod tests {
             assert_eq!(labels(menu), offered);
             assert!(menu.items.iter().all(|item| matches!(
                 &item.action,
-                MenuAction::NewAgentOfKind { pr_url: Some(url), quick: None, .. } if url == PR_URL
+                MenuAction::NewAgentOfKind { pr: Some(pr), quick: None, .. }
+                    if pr.url == PR_URL && pr.head == PR_HEAD
             )));
 
             let back = QuickReturn {
@@ -284,7 +289,7 @@ mod tests {
             assert_eq!(menu.hover, 1, "starts on the box's own harness");
             assert!(menu.items.iter().all(|item| matches!(
                 &item.action,
-                MenuAction::NewAgentOfKind { pr_url: None, quick: Some(back), .. }
+                MenuAction::NewAgentOfKind { pr: None, quick: Some(back), .. }
                     if back.text == "typed so far"
             )));
 
