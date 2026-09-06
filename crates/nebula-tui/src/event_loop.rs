@@ -3949,17 +3949,33 @@ fn set_hide_worktrees(app: &mut App, hidden: bool) {
     }
 }
 
-/// Show or hide the ROOT WORKTREE row (Settings → Experimental). Hiding it
-/// shortens the list by one from the top, so a cursor past the new end
-/// is pulled back onto the last row; the pane catches up on the next
-/// move, as it does after any re-sort.
+/// Show or hide the ROOT WORKTREE row (Settings → Experimental). The row
+/// sits at the top, so every other index shifts by one either way: the
+/// cursor follows the worktree (or OPEN PRS row) it was on by identity,
+/// as `reconcile_selection` does after any list change, and a cursor on
+/// the root itself lands on the first row left. The pane catches up on
+/// the next move, as it does after any re-sort.
 fn set_hide_root_worktree(app: &mut App, hidden: bool) {
     if app.hide_root_worktree == hidden {
         return;
     }
+    let worktree = app.selected_worktree().map(|w| w.id.clone());
+    let pr = app.selected_worktree_pr().map(|pr| pr.url.clone());
     app.hide_root_worktree = hidden;
+    let index = {
+        let rows = app.visible_worktrees();
+        match (&worktree, &pr) {
+            (Some(id), _) => rows.iter().position(|w| &w.id == id),
+            (None, Some(url)) => app
+                .visible_open_prs()
+                .iter()
+                .position(|p| &p.url == url)
+                .map(|i| i + rows.len()),
+            (None, None) => None,
+        }
+    };
     let last = app.worktree_row_count().saturating_sub(1);
-    app.sel_worktree = app.sel_worktree.min(last);
+    app.sel_worktree = index.unwrap_or(app.sel_worktree).min(last);
 }
 
 fn save_panel_visibility(app: &mut App) {
@@ -20370,32 +20386,52 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     /// Settings → Experimental → Hide root worktree: the ⌂ row leaves the
-    /// WORKTREES PANEL (the checkout and its sessions stay in the tree), a
-    /// cursor past the shortened list is pulled back, and switching it
-    /// off brings the row back.
+    /// WORKTREES PANEL (the checkout and its sessions stay in the tree), the
+    /// cursor keeps naming the same branch across both toggle directions
+    /// even though every index shifts by one, a cursor on the root itself
+    /// lands on the first row left, and switching it off brings the row back.
     #[test]
     fn hide_root_worktree_drops_the_root_row_from_the_worktrees_panel() {
         with_default_config(|| {
             let mut app = App::new();
             seed_tree(&mut app);
             seed_feat_worktree(&mut app, "w2", "feat");
-            assert_eq!(worktree_branches(&app), ["main", "feat"]);
-            app.sel_worktree = 1;
+            seed_feat_worktree(&mut app, "w3", "feat-2");
+            assert_eq!(worktree_branches(&app), ["main", "feat", "feat-2"]);
+            let selected = |app: &App| app.selected_worktree().map(|w| w.branch.clone());
 
             let mut cfg = crate::config::Config {
                 hide_root_worktree: true,
                 ..Default::default()
             };
+            app.sel_worktree = 1;
+            assert_eq!(selected(&app).as_deref(), Some("feat"));
             apply_config(&mut app, &cfg);
             assert!(app.hide_root_worktree);
-            assert_eq!(worktree_branches(&app), ["feat"]);
-            assert_eq!(app.sel_worktree, 0, "pulled back onto the last row");
-            assert_eq!(app.tree.worktrees.len(), 2, "hidden, not gone");
+            assert_eq!(worktree_branches(&app), ["feat", "feat-2"]);
+            assert_eq!(
+                selected(&app).as_deref(),
+                Some("feat"),
+                "follows the row, not the index"
+            );
+            assert_eq!(app.tree.worktrees.len(), 3, "hidden, not gone");
             assert_eq!(app.tree.agents.len(), 1, "its session is still there");
 
             cfg.hide_root_worktree = false;
             apply_config(&mut app, &cfg);
-            assert_eq!(worktree_branches(&app), ["main", "feat"]);
+            assert_eq!(worktree_branches(&app), ["main", "feat", "feat-2"]);
+            assert_eq!(
+                selected(&app).as_deref(),
+                Some("feat"),
+                "showing the root again does not hand it the cursor"
+            );
+
+            // A cursor on the root itself has nowhere to follow: the first
+            // row left, not an index past the end.
+            app.sel_worktree = 0;
+            cfg.hide_root_worktree = true;
+            apply_config(&mut app, &cfg);
+            assert_eq!(selected(&app).as_deref(), Some("feat"));
         });
     }
 

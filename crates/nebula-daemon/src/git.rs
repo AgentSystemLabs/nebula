@@ -230,10 +230,12 @@ async fn add_worktree_inner(
     }
 }
 
-/// How long `default_base` waits for `git fetch origin` before branching
-/// from local HEAD instead. The fetch holds the DAEMON's worktree lock,
-/// so a stalled connection must not hold every worktree op with it.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long `default_base` waits for a call that talks to the remote —
+/// the fetch, and `remote set-head --auto` when `origin/HEAD` is unset —
+/// before branching from local HEAD instead. They run under the DAEMON's
+/// worktree lock, so a stalled connection must not hold every worktree op
+/// with it.
+const REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The start point for a new branch when the caller named none: the
 /// remote's default branch, fetched first, so it is what `origin` has
@@ -256,32 +258,43 @@ pub async fn default_base(repo: &Path) -> Option<String> {
     origin_head(repo).await
 }
 
-/// `git fetch origin`, killed and reported as an error past `FETCH_TIMEOUT`.
+/// `git fetch origin`, killed and reported as an error past `REMOTE_TIMEOUT`.
 async fn fetch_origin(repo: &Path) -> Result<()> {
+    git_remote(repo, &["fetch", "--quiet", "origin"]).await?;
+    Ok(())
+}
+
+/// `git` for a call that talks to the remote: the child is killed and the
+/// call reported as an error past `REMOTE_TIMEOUT`, so a dropped
+/// connection or a credential prompt with no tty degrades to the local
+/// fallback instead of wedging the worktree lock.
+async fn git_remote(repo: &Path, args: &[&str]) -> Result<String> {
     let run = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["fetch", "--quiet", "origin"])
+        .args(args)
         .kill_on_drop(true)
         .output();
-    let output = match tokio::time::timeout(FETCH_TIMEOUT, run).await {
+    let output = match tokio::time::timeout(REMOTE_TIMEOUT, run).await {
         Ok(output) => output.map_err(spawn_err)?,
         Err(_) => bail!(
-            "git fetch origin did not finish within {}s",
-            FETCH_TIMEOUT.as_secs()
+            "git {} did not finish within {}s",
+            args.join(" "),
+            REMOTE_TIMEOUT.as_secs()
         ),
     };
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// `origin/HEAD` as a short ref (`origin/main`). A repo whose remote was
 /// added by hand (`git remote add`, a fresh push) has no such symref, so
-/// one `git remote set-head origin --auto` asks the remote which branch
-/// it means and records the answer for next time. None only when the
-/// remote itself has no HEAD.
+/// one `git remote set-head origin --auto` — a remote round-trip, timeboxed
+/// like the fetch — asks the remote which branch it means and records the
+/// answer for next time. None when the remote has no HEAD or does not
+/// answer in time.
 async fn origin_head(repo: &Path) -> Option<String> {
     for attempt in 0..2 {
         if let Ok(out) = git(
@@ -296,7 +309,7 @@ async fn origin_head(repo: &Path) -> Option<String> {
             }
         }
         if attempt == 0
-            && git(repo, &["remote", "set-head", "origin", "--auto"])
+            && git_remote(repo, &["remote", "set-head", "origin", "--auto"])
                 .await
                 .is_err()
         {

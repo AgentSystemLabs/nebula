@@ -23,7 +23,7 @@ only when there is no origin or the fetch fails."
   with `--base origin/main`. Now `registry.rs::create_worktree` — the choke point for the TUI's
   `CreateWorktree` and for `nebula worktree` (`enter_worktree`) — routes a base-less create through
   `git::add_worktree_off_default` → `git::default_base`: `git remote get-url origin` (none → HEAD),
-  `fetch_origin` (`git fetch --quiet origin`, `kill_on_drop`, a 30 s `FETCH_TIMEOUT` because the fetch runs
+  `fetch_origin` (`git fetch --quiet origin`, `kill_on_drop`, a 30 s `REMOTE_TIMEOUT` shared with the `set-head` round-trip because both run
   under the DAEMON's `worktree_ops` lock; failure → HEAD plus a `tracing::warn!`), then `origin_head`
   (`git symbolic-ref -q --short refs/remotes/origin/HEAD`, with one `git remote set-head origin --auto`
   when the symref is missing). The branch is cut `--no-track`. An explicit `--base` (and
