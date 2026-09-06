@@ -1,0 +1,735 @@
+{
+  "pr": {
+    "additions": 1120,
+    "assignees": [],
+    "author": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "baseRefName": "main",
+    "body": "A new Experimental SETTING keeps the shared checkout out of the WORKTREES PANEL and turns `p` there into \"a fresh WORKTREE, then this task in it\" \u2014 and every new worktree, however it is created, now starts at what `origin` has rather than at the root checkout's stale HEAD.\n\n**Contents**\n- [\u2728 What you get](#user-content-what-you-get)\n  - [\ud83c\udf31 Every session in its own worktree](#user-content-every-session-in-its-own-worktree)\n  - [\ud83d\udd04 Worktrees that start at remote main](#user-content-worktrees-that-start-at-remote-main)\n- [\ud83d\udcf8 Screenshots](#user-content-screenshots)\n- [\ud83e\udded How it flows](#user-content-how-it-flows)\n- [\u26a0\ufe0f Risk](#user-content-risk)\n- [\ud83d\udd27 Technical overview](#user-content-technical-overview)\n- [\ud83d\udcdd Notes](#user-content-notes)\n\n## \u2728 What you get <a id=\"what-you-get\"></a>\n\n### \ud83c\udf31 Every session in its own worktree <a id=\"every-session-in-its-own-worktree\"></a>\n\n- **Hide the root row** \u2014 `Settings \u203a Experimental \u203a Hide root worktree` (`hide_root_worktree`, off by default)\n  - the ROOT WORKTREE row leaves the WORKTREES PANEL\n  - the checkout and its sessions keep running, and stay reachable from the PALETTE (`/`)\n  - switch it off and the row is straight back\n- **`p` cuts a worktree first** \u2014 with the setting on, `p` while the WORKTREES PANEL has FOCUS\n  - opens the QUICK PROMPT titled `Quick prompt \u00b7 new worktree yellow-fox-jumps (claude)` \u2014 the same random name the `n` prompt offers\n  - `Enter` creates the WORKTREE, moves the cursor onto its row, and starts the agent there with your text as its STARTING PROMPT\n  - a second `p` from the SESSIONS PANEL lands in that same checkout\n  - a worktree the DAEMON refuses brings the box back with your text\n- **Everything else is as it was**\n  - `p` from the PROJECTS PANEL or the SESSIONS PANEL still launches into the selected worktree\n  - FOCUS stays on the panel you pressed `p` in, unless `Settings \u203a Agents \u203a Quick prompt \u203a Focus` is on\n  - `Tab` and `Shift+Tab` still retarget one launch and hand the box back, new-worktree target intact\n\n### \ud83d\udd04 Worktrees that start at remote main <a id=\"worktrees-that-start-at-remote-main\"></a>\n\n- **Fetched `origin/HEAD`, not local HEAD** \u2014 `n` in the WORKTREES PANEL, a bare `nebula worktree`, and the flow above\n  - before: `git worktree add -b <branch>` with no start point, so every branch began at the root checkout's HEAD \u2014 two commits behind `origin/main` when this task started\n  - now: a base-less create fetches `origin` and branches from its default branch (`origin/main` here), so the new checkout already has what everyone else merged\n- **Untracked on purpose** \u2014 the new branch is cut `--no-track`\n  - a branch cut from `origin/main` would otherwise *track* it, and a bare `git push` would aim at main\n  - an explicit `nebula worktree --base <ref>` keeps git's tracking, as the PR SESSION path relies on\n- **Offline still works** \u2014 no `origin`, or a fetch that fails or stalls past 30 s\n  - falls back to HEAD, with a warning in the daemon log\n  - a worktree cut offline beats none\n\n## \ud83d\udcf8 Screenshots <a id=\"screenshots\"></a>\n\n| The Experimental tab of the SETTINGS OVERLAY, its one row switched on | The WORKTREES PANEL without its root row, and `p` there naming the worktree it will cut |\n|---|---|\n| ![The SETTINGS OVERLAY open on the Experimental tab: the \"Hide root worktree\" row reads on, with its hint about p on Worktrees cutting a fresh worktree off origin/main](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/hide-root-auto-worktree/settings-experimental.png) | ![The WORKTREES PANEL listing only feature-x and wheel-one-line, no \u2302 root row, with the QUICK PROMPT open and titled \"Quick prompt \u00b7 new worktree <name> (claude)\"](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/hide-root-auto-worktree/quick-prompt-new-worktree.png) |\n\nCaptured with the SCREENSHOT HARNESS (`make shot`) at 190\u00d750 against its demo repo, whose root and two worktrees stand in for a real project.\n\n## \ud83e\udded How it flows <a id=\"how-it-flows\"></a>\n\n```mermaid\nsequenceDiagram\n  actor U as User\n  participant T as TUI \u00b7 WORKTREES PANEL\n  participant D as DAEMON\n  participant G as git\n  U->>T: p (hide_root_worktree on)\n  T-->>U: QUICK PROMPT \u00b7 new worktree \u2039branch\u203a\n  U->>T: task, Enter\n  T->>D: CreateWorktree { branch, base: None }\n  D->>G: fetch origin\n  D->>G: origin/HEAD (set-head --auto when unset)\n  D->>G: worktree add --no-track -b \u2039branch\u203a origin/main\n  D-->>T: Ack + worktree upsert\n  T->>T: cursor onto the new row, FOCUS unchanged\n  T->>D: CreateAgent { worktree, starting_prompt }\n  D-->>T: session row, previewed in the TERMINAL PANE\n```\n\nThe same `CreateWorktree { base: None }` is what `n` sends and what `nebula worktree` without `--base` reaches, so all three start at the fetched `origin/HEAD`.\n\n## \u26a0\ufe0f Risk <a id=\"risk\"></a>\n\n**Verdict:** \ud83d\udfe2 Low risk \u2014 the setting is off by default, and the one always-on change (where a new worktree starts) has an offline fallback and its own tests.\n\n| | Level | Why |\n|---|---|---|\n| \ud83d\udd12 **Security & production** | Low | No new `ClientRequest`, route or file. The DAEMON now runs `git fetch origin` on every base-less worktree create \u2014 the same network call, with the same credentials, that the PR SESSION path already makes; it is killed after 30 s so a stalled remote cannot hold the worktree lock. |\n| \u26a1 **Performance** | Low | Off every hot path. One fetch per worktree creation (seconds, network-bound, under the DAEMON's `worktree_ops` lock); the panel filter is one boolean per row. |\n| \ud83e\udde9 **Fit with the codebase** | Low | The SETTING follows the seven-edit `config.rs` pattern plus the `apply_config` mirror; the two-step launch rides a `PendingIntent` like every other create; the new step lives in its own `event_loop/quick_launch.rs` per KEEP MODULES SMALL. The one wider touch: the quick launch's `worktree` became a `target` enum, so the `Tab` / `Shift+Tab` pickers now take a context checkout explicitly. |\n\n**Rollback:** `git revert` of the merge commit undoes all of it \u2014 no PROTOCOL VERSION bump, no MIGRATION. A `config.json` that already carries `hide_root_worktree` is ignored by older builds. Worktrees already cut from `origin/HEAD` simply stay where they are.\n\n## \ud83d\udd27 Technical overview <a id=\"technical-overview\"></a>\n\n- **Mechanism.** `QuickLaunch.target` is a `QuickTarget` \u2014 `Worktree(id)` or `NewWorktree { project, branch }`; `open_quick_prompt` picks the latter when `hide_root_worktree` is on and FOCUS is on the WORKTREES PANEL. `quick_launch::submit` sends `CreateWorktree { base: None }` with a `PendingIntent::LaunchInCreatedWorktree { launch, text }`; the Ack retargets the launch at the created id, selects its row, restores FOCUS and calls `create_agent`; an Error reopens the box. The pickers get a context checkout from `picker_context` (the hidden root for a new-worktree target) and rebuild the launch from `back.launch.target`, never from that context. On the DAEMON, `registry::create_worktree` \u2014 the choke point for the TUI and for `nebula worktree` \u2014 routes a base-less create through `git::add_worktree_off_default` \u2192 `git::default_base` (`remote get-url origin`, `fetch --quiet origin` with `kill_on_drop` and a 30 s timeout, `symbolic-ref origin/HEAD` with one `remote set-head origin --auto`), cutting with `--no-track`.\n- **Files.** `crates/nebula-daemon/src/git.rs` \u2014 `default_base`, `fetch_origin`, `origin_head`, `add_worktree_off_default`, three tests; `crates/nebula-daemon/src/registry.rs` \u2014 the base-less branch in `create_worktree`; `crates/nebula-tui/src/quick_prompt.rs` \u2014 `QuickTarget`, the new open path, `picker_context`; `crates/nebula-tui/src/event_loop/quick_launch.rs` \u2014 submit, Ack and the shared draft; `crates/nebula-tui/src/event_loop.rs` \u2014 the Ack and Error arms, `set_hide_root_worktree`, four tests; `crates/nebula-tui/src/config.rs` \u2014 the SETTING and its Experimental tab; `crates/nebula-tui/src/app.rs` \u2014 the mirror, `visible_worktrees`, `project_branches`, the intent.\n- **Not done.** Slugifying the task into the branch name (a task is a paragraph; the random name is the documented empty-prompt path). Moving FOCUS into the SESSIONS PANEL after the create (every QUICK PROMPT launch leaves FOCUS where it was \u2014 settled on 2026-08-29). A TUI notice when the fetch falls back to HEAD (`apply_config` has no request channel; the daemon log carries the warning).\n- **Gate.** `make ci` green in the task's worktree: fmt, clippy, memory-check, recall-eval, terms-check, and the suites \u2014 nebula-tui 607, nebula-daemon 196, e2e_pty 29, e2e_tui 8. New tests: `git.rs` \u00d73 (no origin; a fetch that fails; an origin that moved behind the checkout's back, asserting the new HEAD and no upstream), `config.rs` \u00d71, `event_loop.rs` \u00d73 (root row hidden and the cursor clamped; `p` on Worktrees creates then launches, through the `Tab` round trip and the error path; the default unchanged), `quick_prompt.rs` \u00d71. Not run: the live DEV INSTANCE \u2014 restarting the daemon would have killed the session doing the work.\n\n## \ud83d\udcdd Notes <a id=\"notes\"></a>\n\n- `origin/main` (v0.22.0 plus its release log) is merged in. Conflicts on the MEMORY LOG index and the Candidates ledger, both sides having prepended a line; resolved by keeping both. The auto-merge left the standing gotchas at 301 of 300 lines, fixed by merging a twin pair in the RELEASE SKILL group.\n- Nothing to do on upgrade: no PROTOCOL VERSION bump, no MIGRATION.\n- Also on this branch: the MEMORY LOG entry for the task with three standing gotchas (the `--base origin/main` tracking trap, the missing `origin/HEAD` symref, the picker round-trip retarget); three skill edits from the SKILL AUDIT HOOK; and `CLAUDE.md`, `AGENTS.md` and the `land` skill now route every PR creation through the PR DESCRIPTION SKILL \u2014 this PR's first body was the short hand-written kind that rule now forbids.\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_015VpqzNV3TGkDjrebL3mgkU\n",
+    "changedFiles": 38,
+    "closedAt": "2026-09-06T04:09:44Z",
+    "closingIssuesReferences": [],
+    "comments": [],
+    "commits": [
+      {
+        "authoredDate": "2026-09-06T03:11:59Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5.1"
+          }
+        ],
+        "committedDate": "2026-09-06T03:11:59Z",
+        "messageBody": "\u2026s a fresh WORKTREE, and worktrees branched from the fetched `origin/HEAD`\n\nSettings \u2192 Experimental \u2192 Hide root worktree (off by default) drops the ROOT WORKTREE row from the\nWORKTREES PANEL, and `p` there opens a QUICK PROMPT that first creates a fresh WORKTREE (a random\nbranch), then launches the agent in it with the cursor on the new row. Every base-less worktree \u2014\n`n`, `nebula worktree`, this flow \u2014 now fetches origin and branches from `origin/HEAD`, untracked,\ninstead of the root checkout's local HEAD; no origin or a failed fetch falls back to HEAD.\n\nAlso: the `make ci` fmt-first ordering, the `--base origin/main` tracking trap and the picker\nround-trip retarget recorded in the MEMORY LOG; three skill edits from the SKILL AUDIT HOOK.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_015VpqzNV3TGkDjrebL3mgkU",
+        "messageHeadline": "An Experimental \"Hide root worktree\" SETTING, a QUICK PROMPT that cut\u2026",
+        "oid": "9b6a466641900a9ca366b91bbaed3530fd455260"
+      },
+      {
+        "authoredDate": "2026-09-06T03:12:40Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          }
+        ],
+        "committedDate": "2026-09-06T03:13:45Z",
+        "messageBody": "Both sides prepended a MEMORY LOG index line and edited the Candidates ledger (origin/main promoted CLAUDE TITLE SYNC; this branch added EXPERIMENTAL TAB and HIDE ROOT WORKTREE).",
+        "messageHeadline": "Merge origin/main into hide-root-auto-worktree",
+        "oid": "d35d93f6c57a0fc08314d29cd84fea1d8fbeeba2"
+      },
+      {
+        "authoredDate": "2026-09-06T03:14:21Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5.1"
+          }
+        ],
+        "committedDate": "2026-09-06T03:14:21Z",
+        "messageBody": "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_015VpqzNV3TGkDjrebL3mgkU",
+        "messageHeadline": "Record the post-merge gotchas-cap overflow in the MEMORY LOG entry",
+        "oid": "0a0cb9a2707aef22d52577163afcd99d08460c45"
+      },
+      {
+        "authoredDate": "2026-09-06T03:58:54Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5.1"
+          }
+        ],
+        "committedDate": "2026-09-06T03:58:54Z",
+        "messageBody": "\u2026C links land\n\n\"make pr\" shipped a hand-written body because the land skill deferred the PR DESCRIPTION SKILL to\nan explicit ask; CLAUDE.md, AGENTS.md and land now invoke it for every pull request. Its TOC links\nname `#user-content-<id>` \u2014 the id GitHub actually renders \u2014 since nothing on the PR page bridges\nthe prefix; the skill, its checker, all ten templates and PR #30 carry the prefixed links. Two\nSCREENSHOT HARNESS scenes for the Experimental tab and the auto-worktree QUICK PROMPT; LAND SKILL\npromoted in TERMS.md; the 2026-09-04 anchor entry corrected in place.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_015VpqzNV3TGkDjrebL3mgkU",
+        "messageHeadline": "Route every PR body through the PR DESCRIPTION SKILL, and make its TO\u2026",
+        "oid": "aa18cd5514fbbe9cc969405b8e3b06ad7925c58b"
+      },
+      {
+        "authoredDate": "2026-09-06T04:04:32Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5.1"
+          }
+        ],
+        "committedDate": "2026-09-06T04:04:32Z",
+        "messageBody": "\u2026tenings\n\nThe PR DESCRIPTION SKILL now shapes every section bullet as a bold hook and indented one-fact\nsub-bullets (PR #30 restyled), folds its \"Rules of the body\" into the numbered list, and warns that\n`make shot` ignores CARGO_TARGET_DIR. The land skill merges a moved origin/main before \"make pr\"\nopens the PR and runs the post-merge gates and the merge commit as one && chain.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_015VpqzNV3TGkDjrebL3mgkU",
+        "messageHeadline": "PR bodies: a hook plus one-fact sub-bullets, and two skill-audit tigh\u2026",
+        "oid": "3ccb11f69d0229c6aa04366b071f50b98b35ed3f"
+      },
+      {
+        "authoredDate": "2026-09-06T04:08:50Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5.1"
+          }
+        ],
+        "committedDate": "2026-09-06T04:08:50Z",
+        "messageBody": "\u2026s timeboxed like the fetch\n\nCLAUDE REVIEW on PR #30: toggling Hide root worktree shifts every WORKTREES PANEL index by one, so\n`set_hide_root_worktree` now re-finds the selected worktree or OPEN PRS row by identity (a cursor on\nthe root lands on the first row left) and the test seeds three worktrees across both directions; and\n`git remote set-head origin --auto` goes through the same 30 s `kill_on_drop` timebox as the fetch\n(`git_remote`, `REMOTE_TIMEOUT`), so a stalled remote falls back to HEAD instead of holding the\nworktree lock.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_015VpqzNV3TGkDjrebL3mgkU",
+        "messageHeadline": "The hidden-root cursor follows its row, and the set-head round-trip i\u2026",
+        "oid": "40dcd41835bdd9ef9daf7d4178f02371287f2d3f"
+      }
+    ],
+    "createdAt": "2026-09-06T03:13:49Z",
+    "deletions": 192,
+    "files": [
+      {
+        "additions": 2,
+        "changeType": "MODIFIED",
+        "deletions": 0,
+        "path": ".claude/MEMORY.md"
+      },
+      {
+        "additions": 1,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": ".claude/memory/entries/2026-09-04-pr-body-headings-get-no-github-anchors-toc-links-a-id.md"
+      },
+      {
+        "additions": 88,
+        "changeType": "ADDED",
+        "deletions": 0,
+        "path": ".claude/memory/entries/2026-09-05-hide-root-worktree-setting-p-cuts-a-worktree-off-origin-head.md"
+      },
+      {
+        "additions": 60,
+        "changeType": "ADDED",
+        "deletions": 0,
+        "path": ".claude/memory/entries/2026-09-05-make-pr-hand-written-body-land-deferred-pr-description.md"
+      },
+      {
+        "additions": 10,
+        "changeType": "MODIFIED",
+        "deletions": 9,
+        "path": ".claude/memory/gotchas.md"
+      },
+      {
+        "additions": 14,
+        "changeType": "MODIFIED",
+        "deletions": 9,
+        "path": ".claude/skills/land/SKILL.md"
+      },
+      {
+        "additions": 0,
+        "changeType": "MODIFIED",
+        "deletions": 24,
+        "path": ".claude/skills/output-doctor/SKILL.md"
+      },
+      {
+        "additions": 34,
+        "changeType": "MODIFIED",
+        "deletions": 34,
+        "path": ".claude/skills/pr-description/SKILL.md"
+      },
+      {
+        "additions": 20,
+        "changeType": "MODIFIED",
+        "deletions": 12,
+        "path": ".claude/skills/pr-description/templates/01-benefit-groups.md"
+      },
+      {
+        "additions": 1,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": ".claude/skills/pr-description/templates/02-before-after.md"
+      },
+      {
+        "additions": 1,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": ".claude/skills/pr-description/templates/03-category-table.md"
+      },
+      {
+        "additions": 1,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": ".claude/skills/pr-description/templates/04-story.md"
+      },
+      {
+        "additions": 1,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": ".claude/skills/pr-description/templates/05-release-note.md"
+      },
+      {
+        "additions": 1,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": ".claude/skills/pr-description/templates/06-user-journey.md"
+      },
+      {
+        "additions": 1,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": ".claude/skills/pr-description/templates/07-collapsible.md"
+      },
+      {
+        "additions": 1,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": ".claude/skills/pr-description/templates/08-bug-fix.md"
+      },
+      {
+        "additions": 1,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": ".claude/skills/pr-description/templates/09-scorecard.md"
+      },
+      {
+        "additions": 1,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": ".claude/skills/pr-description/templates/10-crate-map.md"
+      },
+      {
+        "additions": 2,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": ".claude/skills/project-terms/SKILL.md"
+      },
+      {
+        "additions": 4,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": ".claude/skills/prompt-daddy/SKILL.md"
+      },
+      {
+        "additions": 2,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": "AGENTS.md"
+      },
+      {
+        "additions": 2,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": "CLAUDE.md"
+      },
+      {
+        "additions": 18,
+        "changeType": "MODIFIED",
+        "deletions": 13,
+        "path": "TERMS.md"
+      },
+      {
+        "additions": 210,
+        "changeType": "MODIFIED",
+        "deletions": 2,
+        "path": "crates/nebula-daemon/src/git.rs"
+      },
+      {
+        "additions": 8,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": "crates/nebula-daemon/src/registry.rs"
+      },
+      {
+        "additions": 6,
+        "changeType": "MODIFIED",
+        "deletions": 4,
+        "path": "crates/nebula-tui/src/agent_picker.rs"
+      },
+      {
+        "additions": 29,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": "crates/nebula-tui/src/app.rs"
+      },
+      {
+        "additions": 56,
+        "changeType": "MODIFIED",
+        "deletions": 0,
+        "path": "crates/nebula-tui/src/config.rs"
+      },
+      {
+        "additions": 300,
+        "changeType": "MODIFIED",
+        "deletions": 33,
+        "path": "crates/nebula-tui/src/event_loop.rs"
+      },
+      {
+        "additions": 83,
+        "changeType": "ADDED",
+        "deletions": 0,
+        "path": "crates/nebula-tui/src/event_loop/quick_launch.rs"
+      },
+      {
+        "additions": 1,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": "crates/nebula-tui/src/preset_overlays.rs"
+      },
+      {
+        "additions": 129,
+        "changeType": "MODIFIED",
+        "deletions": 29,
+        "path": "crates/nebula-tui/src/quick_prompt.rs"
+      },
+      {
+        "additions": 3,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": "crates/nebula-tui/src/ui.rs"
+      },
+      {
+        "additions": 4,
+        "changeType": "MODIFIED",
+        "deletions": 2,
+        "path": "docs/configuration.md"
+      },
+      {
+        "additions": 3,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": "docs/how-it-works.md"
+      },
+      {
+        "additions": 2,
+        "changeType": "MODIFIED",
+        "deletions": 2,
+        "path": "docs/keys.md"
+      },
+      {
+        "additions": 12,
+        "changeType": "ADDED",
+        "deletions": 0,
+        "path": "scripts/shot/scenes/quick-prompt-new-worktree.keys"
+      },
+      {
+        "additions": 8,
+        "changeType": "ADDED",
+        "deletions": 0,
+        "path": "scripts/shot/scenes/settings-experimental.keys"
+      }
+    ],
+    "headRefName": "hide-root-auto-worktree",
+    "headRefOid": "40dcd41835bdd9ef9daf7d4178f02371287f2d3f",
+    "isDraft": false,
+    "labels": [],
+    "mergeCommit": {
+      "oid": "f31bcd61cbe05f5a560aab4d7f4cabb20123f9a1"
+    },
+    "mergedAt": "2026-09-06T04:09:44Z",
+    "mergedBy": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "milestone": null,
+    "number": 30,
+    "reviewRequests": [],
+    "reviews": [
+      {
+        "author": {
+          "login": "claude"
+        },
+        "authorAssociation": "NONE",
+        "body": "",
+        "commit": {
+          "oid": "0a0cb9a2707aef22d52577163afcd99d08460c45"
+        },
+        "id": "PRR_kwDOTu3A5c8AAAABMWmS3w",
+        "includesCreatedEdit": false,
+        "reactionGroups": [],
+        "state": "COMMENTED",
+        "submittedAt": "2026-09-06T03:26:38Z"
+      },
+      {
+        "author": {
+          "login": "claude"
+        },
+        "authorAssociation": "NONE",
+        "body": "",
+        "commit": {
+          "oid": "0a0cb9a2707aef22d52577163afcd99d08460c45"
+        },
+        "id": "PRR_kwDOTu3A5c8AAAABMWmUIw",
+        "includesCreatedEdit": false,
+        "reactionGroups": [],
+        "state": "COMMENTED",
+        "submittedAt": "2026-09-06T03:26:45Z"
+      },
+      {
+        "author": {
+          "login": "webdevcody"
+        },
+        "authorAssociation": "CONTRIBUTOR",
+        "body": "",
+        "commit": {
+          "oid": "3ccb11f69d0229c6aa04366b071f50b98b35ed3f"
+        },
+        "id": "PRR_kwDOTu3A5c8AAAABMWsvxw",
+        "includesCreatedEdit": false,
+        "reactionGroups": [],
+        "state": "COMMENTED",
+        "submittedAt": "2026-09-06T04:09:40Z"
+      },
+      {
+        "author": {
+          "login": "webdevcody"
+        },
+        "authorAssociation": "CONTRIBUTOR",
+        "body": "",
+        "commit": {
+          "oid": "40dcd41835bdd9ef9daf7d4178f02371287f2d3f"
+        },
+        "id": "PRR_kwDOTu3A5c8AAAABMWsv8A",
+        "includesCreatedEdit": false,
+        "reactionGroups": [],
+        "state": "COMMENTED",
+        "submittedAt": "2026-09-06T04:09:41Z"
+      }
+    ],
+    "state": "MERGED",
+    "title": "An Experimental \"Hide root worktree\" setting, a quick prompt that cuts a fresh worktree, and worktrees branched from the fetched origin/HEAD",
+    "updatedAt": "2026-09-06T04:09:44Z",
+    "url": "https://github.com/AgentSystemLabs/nebula/pull/30"
+  },
+  "review_comments": [
+    {
+      "_links": {
+        "html": {
+          "href": "https://github.com/AgentSystemLabs/nebula/pull/30#discussion_r3942825668"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/30"
+        },
+        "self": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3942825668"
+        }
+      },
+      "author_association": "NONE",
+      "body": "**Bug:** `set_hide_root_worktree` only clamps the cursor when it falls past the new list length \u2014 it doesn't account for the fact that removing the ROOT WORKTREE row shifts every remaining row's index down by one (and restoring it shifts everything up by one).\n\nConcrete trace with `visible_worktrees() == [main(root), A, B, C]` and `sel_worktree == 1` (cursor on A): toggling hide-root on gives `worktree_row_count() == 3`, `last == 2`, `sel_worktree = min(1, 2) == 1`. But the new list is `[A, B, C]`, so index 1 is now **B** \u2014 the cursor silently moved off A even though no clamping was actually needed.\n\nWorse, toggling the setting back **off** always shifts the cursor one worktree earlier for every value (since the list grows by one at the front): from `sel_worktree == 0` (A) it lands back on **main**, the ROOT WORKTREE row this setting exists to keep users off of. The same issue affects `selected_worktree_pr()`, which can silently switch the PR preview to a different pull request.\n\nThe rest of the codebase already handles this class of problem correctly: `reconcile_selection_inner` snapshots the selected `WorktreeId` and re-finds it by identity after any list change, rather than clamping a stale index. `set_hide_root_worktree` should do the same \u2014 snapshot the selected worktree (or PR) before flipping the setting, then re-find it afterward (or shift the index by \u00b11 when the cursor wasn't on the root row itself).\n\nThe new test (`hide_root_worktree_drops_the_root_row_from_the_worktrees_panel`) only seeds 2 worktrees, where \"clamp\" and \"correct\" produce the same answer, so it can't catch this. A 3+-worktree fixture asserting the cursor still names the same branch across both toggle directions would catch it.\n\nhttps://github.com/AgentSystemLabs/nebula/blob/0a0cb9a2707aef22d52577163afcd99d08460c45/crates/nebula-tui/src/event_loop.rs#L3949-L3966",
+      "commit_id": "40dcd41835bdd9ef9daf7d4178f02371287f2d3f",
+      "created_at": "2026-09-06T03:26:38Z",
+      "diff_hunk": "@@ -3954,6 +3949,19 @@ fn set_hide_worktrees(app: &mut App, hidden: bool) {\n     }\n }\n \n+/// Show or hide the ROOT WORKTREE row (Settings \u2192 Experimental). Hiding it\n+/// shortens the list by one from the top, so a cursor past the new end\n+/// is pulled back onto the last row; the pane catches up on the next\n+/// move, as it does after any re-sort.\n+fn set_hide_root_worktree(app: &mut App, hidden: bool) {\n+    if app.hide_root_worktree == hidden {\n+        return;\n+    }\n+    app.hide_root_worktree = hidden;\n+    let last = app.worktree_row_count().saturating_sub(1);\n+    app.sel_worktree = app.sel_worktree.min(last);\n+}\n+\n fn save_panel_visibility(app: &mut App) {\n     let mut cfg = crate::config::Config::load();",
+      "html_url": "https://github.com/AgentSystemLabs/nebula/pull/30#discussion_r3942825668",
+      "id": 3942825668,
+      "line": 3982,
+      "node_id": "PRRC_kwDOTu3A5c7rAr7E",
+      "original_commit_id": "0a0cb9a2707aef22d52577163afcd99d08460c45",
+      "original_line": 3966,
+      "original_position": 50,
+      "original_start_line": 3949,
+      "path": "crates/nebula-tui/src/event_loop.rs",
+      "position": 66,
+      "pull_request_review_id": 5123969759,
+      "pull_request_url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/30",
+      "reactions": {
+        "+1": 0,
+        "-1": 0,
+        "confused": 0,
+        "eyes": 0,
+        "heart": 0,
+        "hooray": 0,
+        "laugh": 0,
+        "rocket": 0,
+        "total_count": 0,
+        "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3942825668/reactions"
+      },
+      "side": "RIGHT",
+      "start_line": 3949,
+      "start_side": "RIGHT",
+      "subject_type": "line",
+      "updated_at": "2026-09-06T03:26:39Z",
+      "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3942825668",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/in/1236702?v=4",
+        "events_url": "https://api.github.com/users/claude%5Bbot%5D/events{/privacy}",
+        "followers_url": "https://api.github.com/users/claude%5Bbot%5D/followers",
+        "following_url": "https://api.github.com/users/claude%5Bbot%5D/following{/other_user}",
+        "gists_url": "https://api.github.com/users/claude%5Bbot%5D/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/apps/claude",
+        "id": 209825114,
+        "login": "claude[bot]",
+        "node_id": "BOT_kgDODIGtWg",
+        "organizations_url": "https://api.github.com/users/claude%5Bbot%5D/orgs",
+        "received_events_url": "https://api.github.com/users/claude%5Bbot%5D/received_events",
+        "repos_url": "https://api.github.com/users/claude%5Bbot%5D/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/claude%5Bbot%5D/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/claude%5Bbot%5D/subscriptions",
+        "type": "Bot",
+        "url": "https://api.github.com/users/claude%5Bbot%5D",
+        "user_view_type": "public"
+      }
+    },
+    {
+      "_links": {
+        "html": {
+          "href": "https://github.com/AgentSystemLabs/nebula/pull/30#discussion_r3942825871"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/30"
+        },
+        "self": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3942825871"
+        }
+      },
+      "author_association": "NONE",
+      "body": "**Bug:** this `git remote set-head origin --auto` call is a network round-trip (it queries the remote to determine its HEAD when no local symref exists \u2014 exactly the case this function exists to handle), but it goes through the plain `git()` helper, which has no timeout or `kill_on_drop`. That's inconsistent with `fetch_origin` just above, which this PR deliberately wraps in `FETCH_TIMEOUT` (30s) with `kill_on_drop(true)` because, per its own comment, \"the fetch holds the DAEMON's worktree lock, so a stalled connection must not hold every worktree op with it.\"\n\n`create_worktree` (`registry.rs`) holds `self.worktree_ops` (a `tokio::sync::Mutex<()>`) across the entire call chain into `default_base` \u2192 `origin_head`, so a hang on this `set-head` call (e.g. a dropped connection between the fetch succeeding and this call, or a credential prompt with no controlling tty) wedges every worktree operation \u2014 `pr_worktree`, `delete_worktree`, and the background auto-sync all serialize on the same mutex. It also stalls the client's own request loop, since `CreateWorktree` is awaited inline there rather than spawned off (unlike `DeleteWorktree`).\n\nSuggest routing this call through a shared timeboxed helper (the same `FETCH_TIMEOUT` + `kill_on_drop(true)` pattern used for `fetch_origin`) so a stalled `set-head` degrades to `None` (branch from local HEAD) instead of hanging indefinitely, matching the fallback behavior this function already implements for every other failure mode.\n\nhttps://github.com/AgentSystemLabs/nebula/blob/0a0cb9a2707aef22d52577163afcd99d08460c45/crates/nebula-daemon/src/git.rs#L296-L304",
+      "commit_id": "40dcd41835bdd9ef9daf7d4178f02371287f2d3f",
+      "created_at": "2026-09-06T03:26:45Z",
+      "diff_hunk": "@@ -201,6 +230,82 @@ pub async fn add_worktree(repo: &Path, branch: &str, base: Option<&str>) -> Resu\n     }\n }\n \n+/// How long `default_base` waits for `git fetch origin` before branching\n+/// from local HEAD instead. The fetch holds the DAEMON's worktree lock,\n+/// so a stalled connection must not hold every worktree op with it.\n+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);\n+\n+/// The start point for a new branch when the caller named none: the\n+/// remote's default branch, fetched first, so it is what `origin` has\n+/// right now (`origin/main` for most repos) and not what the ROOT WORKTREE\n+/// happens to have pulled. `None` \u2014 git's own default, the checkout's\n+/// HEAD \u2014 when the repo has no `origin` or the fetch fails, which the\n+/// daemon log says; a worktree cut offline is better than none.\n+pub async fn default_base(repo: &Path) -> Option<String> {\n+    if git(repo, &[\"remote\", \"get-url\", \"origin\"]).await.is_err() {\n+        return None;\n+    }\n+    if let Err(e) = fetch_origin(repo).await {\n+        tracing::warn!(\n+            repo = %repo.display(),\n+            error = %e,\n+            \"fetch before worktree add failed; branching from local HEAD\"\n+        );\n+        return None;\n+    }\n+    origin_head(repo).await\n+}\n+\n+/// `git fetch origin`, killed and reported as an error past `FETCH_TIMEOUT`.\n+async fn fetch_origin(repo: &Path) -> Result<()> {\n+    let run = Command::new(\"git\")\n+        .arg(\"-C\")\n+        .arg(repo)\n+        .args([\"fetch\", \"--quiet\", \"origin\"])\n+        .kill_on_drop(true)\n+        .output();\n+    let output = match tokio::time::timeout(FETCH_TIMEOUT, run).await {\n+        Ok(output) => output.map_err(spawn_err)?,\n+        Err(_) => bail!(\n+            \"git fetch origin did not finish within {}s\",\n+            FETCH_TIMEOUT.as_secs()\n+        ),\n+    };\n+    if !output.status.success() {\n+        bail!(\"{}\", String::from_utf8_lossy(&output.stderr).trim());\n+    }\n+    Ok(())\n+}\n+\n+/// `origin/HEAD` as a short ref (`origin/main`). A repo whose remote was\n+/// added by hand (`git remote add`, a fresh push) has no such symref, so\n+/// one `git remote set-head origin --auto` asks the remote which branch\n+/// it means and records the answer for next time. None only when the\n+/// remote itself has no HEAD.\n+async fn origin_head(repo: &Path) -> Option<String> {\n+    for attempt in 0..2 {\n+        if let Ok(out) = git(\n+            repo,\n+            &[\"symbolic-ref\", \"-q\", \"--short\", \"refs/remotes/origin/HEAD\"],\n+        )\n+        .await\n+        {\n+            let short = out.trim();\n+            if !short.is_empty() {\n+                return Some(short.to_string());\n+            }\n+        }\n+        if attempt == 0\n+            && git(repo, &[\"remote\", \"set-head\", \"origin\", \"--auto\"])\n+                .await\n+                .is_err()\n+        {\n+            return None;\n+        }",
+      "html_url": "https://github.com/AgentSystemLabs/nebula/pull/30#discussion_r3942825871",
+      "id": 3942825871,
+      "line": 317,
+      "node_id": "PRRC_kwDOTu3A5c7rAr-P",
+      "original_commit_id": "0a0cb9a2707aef22d52577163afcd99d08460c45",
+      "original_line": 304,
+      "original_position": 130,
+      "original_start_line": 296,
+      "path": "crates/nebula-daemon/src/git.rs",
+      "position": 143,
+      "pull_request_review_id": 5123970083,
+      "pull_request_url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/30",
+      "reactions": {
+        "+1": 0,
+        "-1": 0,
+        "confused": 0,
+        "eyes": 0,
+        "heart": 0,
+        "hooray": 0,
+        "laugh": 0,
+        "rocket": 0,
+        "total_count": 0,
+        "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3942825871/reactions"
+      },
+      "side": "RIGHT",
+      "start_line": 309,
+      "start_side": "RIGHT",
+      "subject_type": "line",
+      "updated_at": "2026-09-06T03:26:45Z",
+      "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3942825871",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/in/1236702?v=4",
+        "events_url": "https://api.github.com/users/claude%5Bbot%5D/events{/privacy}",
+        "followers_url": "https://api.github.com/users/claude%5Bbot%5D/followers",
+        "following_url": "https://api.github.com/users/claude%5Bbot%5D/following{/other_user}",
+        "gists_url": "https://api.github.com/users/claude%5Bbot%5D/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/apps/claude",
+        "id": 209825114,
+        "login": "claude[bot]",
+        "node_id": "BOT_kgDODIGtWg",
+        "organizations_url": "https://api.github.com/users/claude%5Bbot%5D/orgs",
+        "received_events_url": "https://api.github.com/users/claude%5Bbot%5D/received_events",
+        "repos_url": "https://api.github.com/users/claude%5Bbot%5D/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/claude%5Bbot%5D/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/claude%5Bbot%5D/subscriptions",
+        "type": "Bot",
+        "url": "https://api.github.com/users/claude%5Bbot%5D",
+        "user_view_type": "public"
+      }
+    },
+    {
+      "_links": {
+        "html": {
+          "href": "https://github.com/AgentSystemLabs/nebula/pull/30#discussion_r3942896834"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/30"
+        },
+        "self": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3942896834"
+        }
+      },
+      "author_association": "CONTRIBUTOR",
+      "body": "Fixed in 40dcd41: `set_hide_root_worktree` now snapshots the selected worktree (or OPEN PRS row, by URL) before the flip and re-finds it by identity afterwards, the way `reconcile_selection` does \u2014 a cursor on the root itself lands on the first row left, never past the end. The test now seeds three worktrees and asserts the cursor still names `feat` after hiding, after showing again (the root does not get the cursor back), and after starting on the root row.\n",
+      "commit_id": "40dcd41835bdd9ef9daf7d4178f02371287f2d3f",
+      "created_at": "2026-09-06T04:09:40Z",
+      "diff_hunk": "@@ -3954,6 +3949,19 @@ fn set_hide_worktrees(app: &mut App, hidden: bool) {\n     }\n }\n \n+/// Show or hide the ROOT WORKTREE row (Settings \u2192 Experimental). Hiding it\n+/// shortens the list by one from the top, so a cursor past the new end\n+/// is pulled back onto the last row; the pane catches up on the next\n+/// move, as it does after any re-sort.\n+fn set_hide_root_worktree(app: &mut App, hidden: bool) {\n+    if app.hide_root_worktree == hidden {\n+        return;\n+    }\n+    app.hide_root_worktree = hidden;\n+    let last = app.worktree_row_count().saturating_sub(1);\n+    app.sel_worktree = app.sel_worktree.min(last);\n+}\n+\n fn save_panel_visibility(app: &mut App) {\n     let mut cfg = crate::config::Config::load();",
+      "html_url": "https://github.com/AgentSystemLabs/nebula/pull/30#discussion_r3942896834",
+      "id": 3942896834,
+      "in_reply_to_id": 3942825668,
+      "line": 3982,
+      "node_id": "PRRC_kwDOTu3A5c7rA9TC",
+      "original_commit_id": "0a0cb9a2707aef22d52577163afcd99d08460c45",
+      "original_line": 3966,
+      "original_position": 50,
+      "original_start_line": 3949,
+      "path": "crates/nebula-tui/src/event_loop.rs",
+      "position": 66,
+      "pull_request_review_id": 5124075463,
+      "pull_request_url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/30",
+      "reactions": {
+        "+1": 0,
+        "-1": 0,
+        "confused": 0,
+        "eyes": 0,
+        "heart": 0,
+        "hooray": 0,
+        "laugh": 0,
+        "rocket": 0,
+        "total_count": 0,
+        "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3942896834/reactions"
+      },
+      "side": "RIGHT",
+      "start_line": 3949,
+      "start_side": "RIGHT",
+      "subject_type": "line",
+      "updated_at": "2026-09-06T04:09:40Z",
+      "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3942896834",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/123222405?v=4",
+        "events_url": "https://api.github.com/users/webdevcody/events{/privacy}",
+        "followers_url": "https://api.github.com/users/webdevcody/followers",
+        "following_url": "https://api.github.com/users/webdevcody/following{/other_user}",
+        "gists_url": "https://api.github.com/users/webdevcody/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/webdevcody",
+        "id": 123222405,
+        "login": "webdevcody",
+        "node_id": "U_kgDOB1g5hQ",
+        "organizations_url": "https://api.github.com/users/webdevcody/orgs",
+        "received_events_url": "https://api.github.com/users/webdevcody/received_events",
+        "repos_url": "https://api.github.com/users/webdevcody/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/webdevcody/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/webdevcody/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/webdevcody",
+        "user_view_type": "public"
+      }
+    },
+    {
+      "_links": {
+        "html": {
+          "href": "https://github.com/AgentSystemLabs/nebula/pull/30#discussion_r3942896877"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/30"
+        },
+        "self": {
+          "href": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3942896877"
+        }
+      },
+      "author_association": "CONTRIBUTOR",
+      "body": "Fixed in 40dcd41: the `set-head --auto` call goes through the same timebox as the fetch \u2014 a `git_remote` helper with `kill_on_drop(true)` and the (renamed) 30 s `REMOTE_TIMEOUT` now backs both `fetch_origin` and `origin_head` \u2014 so a remote that stops answering between the two calls degrades to `None` and a branch from local HEAD, and the worktree lock is released either way.\n",
+      "commit_id": "40dcd41835bdd9ef9daf7d4178f02371287f2d3f",
+      "created_at": "2026-09-06T04:09:41Z",
+      "diff_hunk": "@@ -201,6 +230,82 @@ pub async fn add_worktree(repo: &Path, branch: &str, base: Option<&str>) -> Resu\n     }\n }\n \n+/// How long `default_base` waits for `git fetch origin` before branching\n+/// from local HEAD instead. The fetch holds the DAEMON's worktree lock,\n+/// so a stalled connection must not hold every worktree op with it.\n+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);\n+\n+/// The start point for a new branch when the caller named none: the\n+/// remote's default branch, fetched first, so it is what `origin` has\n+/// right now (`origin/main` for most repos) and not what the ROOT WORKTREE\n+/// happens to have pulled. `None` \u2014 git's own default, the checkout's\n+/// HEAD \u2014 when the repo has no `origin` or the fetch fails, which the\n+/// daemon log says; a worktree cut offline is better than none.\n+pub async fn default_base(repo: &Path) -> Option<String> {\n+    if git(repo, &[\"remote\", \"get-url\", \"origin\"]).await.is_err() {\n+        return None;\n+    }\n+    if let Err(e) = fetch_origin(repo).await {\n+        tracing::warn!(\n+            repo = %repo.display(),\n+            error = %e,\n+            \"fetch before worktree add failed; branching from local HEAD\"\n+        );\n+        return None;\n+    }\n+    origin_head(repo).await\n+}\n+\n+/// `git fetch origin`, killed and reported as an error past `FETCH_TIMEOUT`.\n+async fn fetch_origin(repo: &Path) -> Result<()> {\n+    let run = Command::new(\"git\")\n+        .arg(\"-C\")\n+        .arg(repo)\n+        .args([\"fetch\", \"--quiet\", \"origin\"])\n+        .kill_on_drop(true)\n+        .output();\n+    let output = match tokio::time::timeout(FETCH_TIMEOUT, run).await {\n+        Ok(output) => output.map_err(spawn_err)?,\n+        Err(_) => bail!(\n+            \"git fetch origin did not finish within {}s\",\n+            FETCH_TIMEOUT.as_secs()\n+        ),\n+    };\n+    if !output.status.success() {\n+        bail!(\"{}\", String::from_utf8_lossy(&output.stderr).trim());\n+    }\n+    Ok(())\n+}\n+\n+/// `origin/HEAD` as a short ref (`origin/main`). A repo whose remote was\n+/// added by hand (`git remote add`, a fresh push) has no such symref, so\n+/// one `git remote set-head origin --auto` asks the remote which branch\n+/// it means and records the answer for next time. None only when the\n+/// remote itself has no HEAD.\n+async fn origin_head(repo: &Path) -> Option<String> {\n+    for attempt in 0..2 {\n+        if let Ok(out) = git(\n+            repo,\n+            &[\"symbolic-ref\", \"-q\", \"--short\", \"refs/remotes/origin/HEAD\"],\n+        )\n+        .await\n+        {\n+            let short = out.trim();\n+            if !short.is_empty() {\n+                return Some(short.to_string());\n+            }\n+        }\n+        if attempt == 0\n+            && git(repo, &[\"remote\", \"set-head\", \"origin\", \"--auto\"])\n+                .await\n+                .is_err()\n+        {\n+            return None;\n+        }",
+      "html_url": "https://github.com/AgentSystemLabs/nebula/pull/30#discussion_r3942896877",
+      "id": 3942896877,
+      "in_reply_to_id": 3942825871,
+      "line": 317,
+      "node_id": "PRRC_kwDOTu3A5c7rA9Tt",
+      "original_commit_id": "0a0cb9a2707aef22d52577163afcd99d08460c45",
+      "original_line": 304,
+      "original_position": 130,
+      "original_start_line": 296,
+      "path": "crates/nebula-daemon/src/git.rs",
+      "position": 143,
+      "pull_request_review_id": 5124075504,
+      "pull_request_url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/30",
+      "reactions": {
+        "+1": 0,
+        "-1": 0,
+        "confused": 0,
+        "eyes": 0,
+        "heart": 0,
+        "hooray": 0,
+        "laugh": 0,
+        "rocket": 0,
+        "total_count": 0,
+        "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3942896877/reactions"
+      },
+      "side": "RIGHT",
+      "start_line": 309,
+      "start_side": "RIGHT",
+      "subject_type": "line",
+      "updated_at": "2026-09-06T04:09:41Z",
+      "url": "https://api.github.com/repos/AgentSystemLabs/nebula/pulls/comments/3942896877",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/123222405?v=4",
+        "events_url": "https://api.github.com/users/webdevcody/events{/privacy}",
+        "followers_url": "https://api.github.com/users/webdevcody/followers",
+        "following_url": "https://api.github.com/users/webdevcody/following{/other_user}",
+        "gists_url": "https://api.github.com/users/webdevcody/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/webdevcody",
+        "id": 123222405,
+        "login": "webdevcody",
+        "node_id": "U_kgDOB1g5hQ",
+        "organizations_url": "https://api.github.com/users/webdevcody/orgs",
+        "received_events_url": "https://api.github.com/users/webdevcody/received_events",
+        "repos_url": "https://api.github.com/users/webdevcody/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/webdevcody/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/webdevcody/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/webdevcody",
+        "user_view_type": "public"
+      }
+    }
+  ]
+}
