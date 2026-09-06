@@ -201,6 +201,7 @@ pub enum SettingKind {
     ShowWorkspaces,
     HideProjects,
     HideWorktrees,
+    ShowWorkflows,
     QuickPromptKind,
     QuickPromptFocus,
     ClaudeEnabled,
@@ -304,6 +305,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::HideWorktrees,
                 label: "Worktrees panel",
                 hint: "Show or hide the Worktrees panel (Shift+B toggles)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::ShowWorkflows,
+                label: "Workflows panel",
+                hint: "Progress in this workspace (Shift+O toggles)",
                 group: "",
             },
         ]),
@@ -597,6 +604,8 @@ pub struct Config {
     /// Hide the Worktrees panel and give its width to the terminal pane.
     /// Independent from `hide_projects`; Sessions always remains visible.
     pub hide_worktrees: bool,
+    /// Show the WORKFLOWS PANEL alongside WORKTREES and SESSIONS.
+    pub show_workflows: bool,
     /// Default model/effort for new Claude / Codex / Cursor sessions.
     /// "default" means "don't pass the flag" (the CLI picks); any other
     /// value is passed through verbatim, so hand-edited configs can name
@@ -665,6 +674,7 @@ impl Default for Config {
             show_workspaces: true,
             hide_projects: false,
             hide_worktrees: false,
+            show_workflows: false,
             claude_model: DEFAULT_CHOICE.into(),
             claude_models: Vec::new(),
             claude_effort: DEFAULT_CHOICE.into(),
@@ -786,6 +796,10 @@ impl Config {
         obj.insert(
             "hide_worktrees".into(),
             serde_json::json!(self.hide_worktrees),
+        );
+        obj.insert(
+            "show_workflows".into(),
+            serde_json::json!(self.show_workflows),
         );
         obj.insert("claude_model".into(), serde_json::json!(self.claude_model));
         obj.insert(
@@ -930,6 +944,7 @@ impl Config {
             SettingKind::ShowWorkspaces => on_off(self.show_workspaces).into(),
             SettingKind::HideProjects => shown_hidden(self.hide_projects).into(),
             SettingKind::HideWorktrees => shown_hidden(self.hide_worktrees).into(),
+            SettingKind::ShowWorkflows => shown_hidden(!self.show_workflows).into(),
             SettingKind::ClaudeModel => self.claude_model.clone(),
             SettingKind::ClaudeEffort => self.claude_effort.clone(),
             SettingKind::CodexModel => self.codex_model.clone(),
@@ -995,6 +1010,9 @@ impl Config {
             }
             SettingKind::HideProjects => {
                 self.hide_projects = !self.hide_projects;
+            }
+            SettingKind::ShowWorkflows => {
+                self.show_workflows = !self.show_workflows;
             }
             SettingKind::HideWorktrees => {
                 self.hide_worktrees = !self.hide_worktrees;

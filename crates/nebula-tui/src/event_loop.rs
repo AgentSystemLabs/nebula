@@ -29,6 +29,7 @@ use std::time::Duration;
 
 mod focus_walk;
 mod host_terminal;
+mod workflows;
 use focus_walk::{
     at_top_row, bar_return_target, double_tapped, enter_terminal_pane, enter_workspaces_bar,
     leave_workspaces_bar, panel_name, walk_focus_back, walk_focus_forward,
@@ -998,6 +999,8 @@ fn ui_state_json(app: &App) -> String {
         collapsed: app.collapsed,
         panel_widths: Some(app.panel_widths),
         diff_files_width: Some(app.diff_files_width),
+        workflow_width: Some(app.workflows.width),
+        workflow: app.workflows.selected.clone(),
     };
     serde_json::to_string(&state).unwrap_or_else(|_| "{}".into())
 }
@@ -1053,6 +1056,10 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
         return false;
     };
     app.show_archived = state.show_archived;
+    app.workflows.selected = state.workflow;
+    if let Some(w) = state.workflow_width {
+        app.workflows.width = w.clamp(crate::app::MIN_PANEL_W, MAX_RESTORED_WIDTH);
+    }
     if let Some(w) = state.panel_widths {
         // normalize_panel_widths re-fits to the actual screen on the next
         // draw.
@@ -1503,6 +1510,10 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             set_hide_projects(app, !app.hide_projects);
             save_panel_visibility(app);
         }
+        Action::ToggleWorkflows => {
+            workflows::set_visible(app, !app.workflows.show);
+            save_panel_visibility(app);
+        }
         Action::ToggleWorktrees => {
             set_hide_worktrees(app, !app.hide_worktrees);
             save_panel_visibility(app);
@@ -1539,6 +1550,11 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 Some(url) => open_link(app, &url, out),
                 None => app.focus = Focus::Sessions,
             },
+            Focus::Workflows => {
+                if workflows::select(app, app.workflow_selection(), out) {
+                    app.focus = Focus::Sessions;
+                }
+            }
             Focus::Sessions => attach_selected(app, out),
             // Lock input into an already-focused live pane.
             Focus::Terminal => enter_terminal_pane(app, out),
@@ -1564,7 +1580,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     open_new_agent_picker(app, worktree);
                 }
             }
-            Focus::Terminal => {}
+            Focus::Workflows | Focus::Terminal => {}
         },
         Action::Rename => match app.focus {
             Focus::Sessions => match app.selected_session_row() {
@@ -2250,6 +2266,11 @@ fn create_terminal(app: &mut App, worktree: WorktreeId, out: &mut Vec<ClientRequ
 /// project's main checkout (root) when the Projects panel has focus.
 fn worktree_in_context(app: &App) -> Option<WorktreeId> {
     match app.focus {
+        Focus::Workflows => app
+            .workflow_rows()
+            .get(app.workflow_selection())
+            .and_then(|r| r.worktree.clone())
+            .filter(|id| app.tree.worktrees.iter().any(|w| &w.id == id)),
         Focus::Projects => app.selected_project().and_then(|p| {
             app.tree
                 .worktrees
@@ -2308,7 +2329,7 @@ fn open_delete_confirm(app: &mut App) {
             let id = app.tree.active_workspace.clone();
             open_remove_workspace_confirm(app, id, None);
         }
-        Focus::Terminal => {}
+        Focus::Workflows | Focus::Terminal => {}
     }
 }
 
@@ -2483,7 +2504,7 @@ fn open_delete_all_confirm(app: &mut App) {
                 area: ratatui::layout::Rect::default(),
             }));
         }
-        Focus::Workspaces | Focus::Projects | Focus::Terminal => {}
+        Focus::Workspaces | Focus::Projects | Focus::Workflows | Focus::Terminal => {}
     }
 }
 
@@ -2996,7 +3017,7 @@ fn open_context_menu_for_selection(app: &mut App) {
             Some(SessionRow::Link(l)) => open_menu(app, menu_items_for_link(&l), at),
             None => {}
         },
-        Focus::Terminal => {}
+        Focus::Workflows | Focus::Terminal => {}
     }
 }
 
@@ -3878,6 +3899,7 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     set_show_workspaces(app, cfg.show_workspaces);
     set_hide_projects(app, cfg.hide_projects);
     set_hide_worktrees(app, cfg.hide_worktrees);
+    workflows::set_visible(app, cfg.show_workflows);
 }
 
 /// `R` in the settings overlay, confirmed: rewrite config.json from the
@@ -3958,6 +3980,7 @@ fn save_panel_visibility(app: &mut App) {
     let mut cfg = crate::config::Config::load();
     cfg.hide_projects = app.hide_projects;
     cfg.hide_worktrees = app.hide_worktrees;
+    cfg.show_workflows = app.workflows.show;
     if let Err(err) = cfg.save() {
         app.flash = Some(format!("couldn't save settings: {err}"));
     }
@@ -5031,6 +5054,7 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
         ),
         Focus::Projects => (app.project_rows().len(), app.sel_project),
         Focus::Worktrees => (app.worktree_row_count(), app.sel_worktree),
+        Focus::Workflows => (app.workflow_rows().len(), app.workflow_selection()),
         Focus::Sessions => (app.visible_session_rows().len(), app.sel_session),
         Focus::Terminal => return,
     };
@@ -5052,6 +5076,9 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
         }
         Focus::Projects => select_project_row(app, new, out),
         Focus::Worktrees => select_worktree_row(app, new, out),
+        Focus::Workflows => {
+            workflows::select(app, new, out);
+        }
         Focus::Sessions => {
             app.sel_session = new;
             preview_selected(app, out);
@@ -6334,6 +6361,17 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     enter_workspaces_bar(app);
                 }
                 Some(HitTarget::FooterWorkspace) => open_workspace_picker(app),
+                Some(HitTarget::FooterWorkflows) => {
+                    workflows::set_visible(app, true);
+                    app.collapsed = false;
+                    app.term_locked = false;
+                    app.focus = Focus::Workflows;
+                    workflows::select(app, app.workflow_selection(), out);
+                    save_panel_visibility(app);
+                }
+                Some(HitTarget::Workflow(i)) => {
+                    workflows::select(app, i, out);
+                }
                 Some(HitTarget::Project(i)) => {
                     if app.sel_project != i {
                         select_project_row(app, i, out);
@@ -6474,7 +6512,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     Some(HitTarget::Worktree(_) | HitTarget::PanelBg(Focus::Worktrees))
                 );
             let in_term = matches!(over, Some(HitTarget::TerminalPane)) || app.collapsed;
-            if over_worktrees {
+            if matches!(
+                over,
+                Some(HitTarget::Workflow(_) | HitTarget::PanelBg(Focus::Workflows))
+            ) && !app.collapsed
+            {
+                app.workflows.scroll = if up {
+                    app.workflows.scroll.saturating_sub(SESSIONS_WHEEL_STEP)
+                } else {
+                    app.workflows.scroll.saturating_add(SESSIONS_WHEEL_STEP)
+                };
+                app.dirty = true;
+            } else if over_worktrees {
                 app.worktrees_scroll = if up {
                     app.worktrees_scroll.saturating_sub(SESSIONS_WHEEL_STEP)
                 } else {
@@ -6645,7 +6694,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                                 ]
                             })
                             .unwrap_or_default(),
-                        Focus::Terminal => vec![],
+                        Focus::Workflows | Focus::Terminal => vec![],
                     };
                     open_menu(app, items, at);
                 }
@@ -6660,6 +6709,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
 fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequest>) {
     match event {
         ServerEvent::Snapshot {
+            workflows,
             workspaces,
             active_workspace,
             projects,
@@ -6670,6 +6720,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             pr_seen,
             ui_state,
         } => {
+            app.workflows.runs = workflows;
             app.tree.workspaces = workspaces;
             app.tree.active_workspace = active_workspace;
             app.tree.projects = projects;
@@ -6697,6 +6748,14 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // to see the screen they left.
             if session_restored {
                 preview_selected_now(app, out);
+            }
+            app.dirty = true;
+        }
+        ServerEvent::WorkflowUpdated { workflow } => {
+            if let Some(run) = app.workflows.runs.iter_mut().find(|r| r.id == workflow.id) {
+                *run = workflow;
+            } else {
+                app.workflows.runs.push(workflow);
             }
             app.dirty = true;
         }
@@ -7185,6 +7244,7 @@ fn clamp_selections(app: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    mod workflows;
     use super::*;
     use nebula_core::{AgentId, LinkId, ServerEvent, SessionRef};
     use ratatui::backend::TestBackend;
@@ -9832,6 +9892,7 @@ diff --git a/src/b.rs b/src/b.rs
         hse(
             &mut fresh,
             ServerEvent::Snapshot {
+                workflows: vec![],
                 workspaces: tree.workspaces,
                 active_workspace: tree.active_workspace,
                 projects: tree.projects,
@@ -9857,6 +9918,7 @@ diff --git a/src/b.rs b/src/b.rs
         seed_tree(&mut app); // p1 / w1 / a1
         let tree = app.tree.clone();
         let snapshot = |ui_state: Option<String>| ServerEvent::Snapshot {
+            workflows: vec![],
             workspaces: tree.workspaces.clone(),
             active_workspace: tree.active_workspace.clone(),
             projects: tree.projects.clone(),

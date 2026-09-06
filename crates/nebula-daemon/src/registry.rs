@@ -520,6 +520,7 @@ impl Daemon {
             }
         }
         Ok(ServerEvent::Snapshot {
+            workflows: self.store.workflow_summaries()?,
             workspaces: self.store.load_workspaces()?,
             active_workspace: self.store.active_workspace_id()?,
             projects,
@@ -809,6 +810,17 @@ impl Daemon {
             .context("project not found")?;
         let path = git::add_worktree(&project.repo_path, branch, base).await?;
         let worktree = self.register_worktree(project_id, path, branch)?;
+        Ok(EntityId::Worktree(worktree.id))
+    }
+
+    pub(crate) async fn create_workflow_worktree(
+        &self,
+        repo: &std::path::Path,
+        run: &nebula_core::workflow::WorkflowRun,
+    ) -> Result<EntityId> {
+        let _ops = self.worktree_ops.lock().await;
+        let path = git::add_new_worktree(repo, &run.branch, &run.base).await?;
+        let worktree = self.register_worktree(&run.project, path, &run.branch)?;
         Ok(EntityId::Worktree(worktree.id))
     }
 

@@ -14,6 +14,8 @@ use std::process::Command;
 /// Hidden ones (`_raw-attach`, `_stale-daemon-note`) are deliberately absent.
 const VISIBLE: &[&[&str]] = &[
     &["workflow"],
+    &["workflow", "catalog"],
+    &["workflow", "inspect"],
     &["workflow", "start"],
     &["workflow", "status"],
     &["workflow", "list"],

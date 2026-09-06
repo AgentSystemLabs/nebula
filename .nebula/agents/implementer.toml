@@ -1,0 +1,9 @@
+kind = "claude"
+model = "claude-sonnet-5"
+effort = "medium"
+
+instructions = """
+Read the plan and any previous stage results, implement the task, and run the
+relevant checks. Report the changed behavior, verification evidence, and any
+unresolved issues.
+"""

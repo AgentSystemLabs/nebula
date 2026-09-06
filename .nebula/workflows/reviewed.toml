@@ -1,0 +1,16 @@
+version = 1
+name = "Plan, implement, and review"
+description = "Implement a task and have a separate AGENT review the result."
+timeout_seconds = 1800
+
+[[stages]]
+id = "planner"
+agent = "planner"
+
+[[stages]]
+id = "implementer"
+agent = "implementer"
+
+[[stages]]
+id = "reviewer"
+agent = "reviewer"

@@ -1,5 +1,7 @@
 //! TUI state: the Elm-ish Model.
 
+mod panel_layout;
+
 use crate::git_diff::DiffFile;
 use crate::pull_request::{OpenPr, PrDetail, PullRequest};
 use crate::text_input::TextInput;
@@ -32,6 +34,7 @@ pub enum Focus {
     Workspaces,
     Projects,
     Worktrees,
+    Workflows,
     Sessions,
     Terminal,
 }
@@ -44,6 +47,8 @@ pub enum HitTarget {
     /// The `◇ workspace` nameplate on the footer; a click opens the
     /// workspace switcher.
     FooterWorkspace,
+    FooterWorkflows,
+    Workflow(usize),
     /// Row index into `App::project_rows()`.
     Project(usize),
     Worktree(usize),
@@ -1712,6 +1717,10 @@ pub struct UiState {
     /// Diff modal file-list width; absent in older blobs.
     #[serde(default)]
     pub diff_files_width: Option<u16>,
+    #[serde(default)]
+    pub workflow_width: Option<u16>,
+    #[serde(default)]
+    pub workflow: Option<String>,
 }
 
 /// A mouse selection over the terminal pane (drag or double-click word), in
@@ -1832,6 +1841,7 @@ pub const OPEN_PRS_MIN_AGE: std::time::Duration = std::time::Duration::from_secs
 
 pub struct App {
     pub tree: Tree,
+    pub workflows: crate::workflows::Workflows,
     pub focus: Focus,
     /// Selected row in the Projects panel — indexes `project_rows()`, the
     /// open workspace's projects in display order.
@@ -2107,6 +2117,7 @@ impl App {
     pub fn new() -> Self {
         Self {
             tree: Tree::default(),
+            workflows: crate::workflows::Workflows::default(),
             focus: Focus::Projects,
             sel_project: 0,
             sel_worktree: 0,
@@ -2294,81 +2305,6 @@ impl App {
             WORKSPACES_BAR_H
         } else {
             0
-        }
-    }
-
-    /// Visible sidebar indices, left to right. Sessions is always present.
-    pub fn visible_panel_indices(&self) -> Vec<usize> {
-        (0..3).filter(|idx| self.panel_visible(*idx)).collect()
-    }
-
-    pub fn panel_visible(&self, idx: usize) -> bool {
-        match idx {
-            0 => !self.hide_projects,
-            1 => !self.hide_worktrees,
-            2 => true,
-            _ => false,
-        }
-    }
-
-    /// Every visible sidebar owns the draggable boundary on its right.
-    pub fn splitter_indices(&self) -> Vec<usize> {
-        self.visible_panel_indices()
-    }
-
-    /// Screen x of splitter `idx` — the column where the panel to its right
-    /// starts, i.e. the right edge of panel `idx`.
-    pub fn splitter_x(&self, idx: usize) -> u16 {
-        self.visible_panel_indices()
-            .into_iter()
-            .filter(|visible| *visible <= idx)
-            .map(|visible| self.panel_widths[visible])
-            .sum()
-    }
-
-    /// Move splitter `idx` so its boundary lands at `boundary_x`, clamped so
-    /// the panel keeps `MIN_PANEL_W` and the terminal pane keeps `MIN_TERM_W`.
-    pub fn set_splitter(&mut self, idx: usize, boundary_x: i32, body_w: u16) {
-        let want = boundary_x.max(0) as u16;
-        if !self.panel_visible(idx) {
-            return;
-        }
-        let visible = self.visible_panel_indices();
-        let left: u16 = visible
-            .iter()
-            .copied()
-            .filter(|visible| *visible < idx)
-            .map(|visible| self.panel_widths[visible])
-            .sum();
-        let fixed_right: u16 = visible
-            .iter()
-            .copied()
-            .filter(|visible| *visible > idx)
-            .map(|visible| self.panel_widths[visible])
-            .sum();
-        let max = body_w.saturating_sub(left + fixed_right + MIN_TERM_W);
-        if max < MIN_PANEL_W {
-            return; // terminal too small to honor the minimums
-        }
-        self.panel_widths[idx] = want.saturating_sub(left).clamp(MIN_PANEL_W, max);
-    }
-
-    /// Re-fit panel widths to the current body width, shrinking the rightmost
-    /// panel first, each floored at `MIN_PANEL_W`. Keeps the terminal pane at
-    /// `MIN_TERM_W` whenever the screen allows it at all. The Workspaces bar
-    /// spans the full width above them, so it costs the panels nothing here.
-    pub fn normalize_panel_widths(&mut self, body_w: u16) {
-        let budget = body_w.saturating_sub(MIN_TERM_W);
-        let visible = self.visible_panel_indices();
-        for i in visible.iter().rev().copied() {
-            let others: u16 = visible
-                .iter()
-                .copied()
-                .filter(|j| *j != i)
-                .map(|j| self.panel_widths[j])
-                .sum();
-            let max = budget.saturating_sub(others);
-            self.panel_widths[i] = self.panel_widths[i].clamp(MIN_PANEL_W, max.max(MIN_PANEL_W));
         }
     }
 
@@ -2808,6 +2744,8 @@ impl App {
             Focus::Projects
         } else if !self.hide_worktrees {
             Focus::Worktrees
+        } else if self.workflows.show {
+            Focus::Workflows
         } else {
             Focus::Sessions
         }
@@ -2818,6 +2756,7 @@ impl App {
             Focus::Workspaces => self.show_workspaces,
             Focus::Projects => !self.hide_projects,
             Focus::Worktrees => !self.hide_worktrees,
+            Focus::Workflows => self.workflows.show,
             Focus::Sessions | Focus::Terminal => true,
         }
     }
@@ -2827,8 +2766,9 @@ impl App {
             Focus::Workspaces => 0,
             Focus::Projects => 1,
             Focus::Worktrees => 2,
-            Focus::Sessions => 3,
-            Focus::Terminal => 4,
+            Focus::Workflows => 3,
+            Focus::Sessions => 4,
+            Focus::Terminal => 5,
         }
     }
 
@@ -2838,6 +2778,7 @@ impl App {
             Focus::Workspaces,
             Focus::Projects,
             Focus::Worktrees,
+            Focus::Workflows,
             Focus::Sessions,
             Focus::Terminal,
         ]
@@ -2851,6 +2792,7 @@ impl App {
         [
             Focus::Terminal,
             Focus::Sessions,
+            Focus::Workflows,
             Focus::Worktrees,
             Focus::Projects,
             Focus::Workspaces,

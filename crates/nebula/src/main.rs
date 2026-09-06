@@ -4,6 +4,7 @@ mod ssh;
 mod tunnel;
 mod upgrade;
 mod workflow_cli;
+mod workflow_config;
 
 use anyhow::Result;
 use clap::Parser;

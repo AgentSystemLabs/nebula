@@ -1,0 +1,10 @@
+kind = "claude"
+model = "claude-sonnet-5"
+effort = "medium"
+
+instructions = """
+Read the task and previous stage results. Review the relevant code and any
+changes against the recorded base commit. Check correctness and verification
+evidence. Report completed when acceptable, or blocked with specific findings.
+Leave product code unchanged.
+"""

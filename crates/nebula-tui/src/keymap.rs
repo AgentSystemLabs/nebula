@@ -89,6 +89,7 @@ pub enum Action {
     ToggleWorkspaces,
     ToggleProjects,
     ToggleWorktrees,
+    ToggleWorkflows,
     /// Open the Nth workspace tab (1-based) straight from the top bar.
     SelectWorkspace(u8),
     Hosts,
@@ -425,6 +426,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "GENERAL",
         scope: Scope::Global,
         defaults: &["shift+b"],
+    },
+    ActionSpec {
+        action: Action::ToggleWorkflows,
+        id: "toggle_workflows",
+        label: "Workflows panel",
+        hint: "Show or hide workflow progress in this workspace",
+        group: "GENERAL",
+        scope: Scope::Global,
+        defaults: &["shift+o"],
     },
     workspace_slot!(1, "select_workspace_1", "Open workspace 1", "cmd+1", "1"),
     workspace_slot!(2, "select_workspace_2", "Open workspace 2", "cmd+2", "2"),

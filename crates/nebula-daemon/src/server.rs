@@ -97,6 +97,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientRequest::Subscribe => {
                     let snapshot = daemon.snapshot().unwrap_or(ServerEvent::Snapshot {
+                        workflows: vec![],
                         workspaces: vec![],
                         active_workspace: Default::default(),
                         projects: vec![],

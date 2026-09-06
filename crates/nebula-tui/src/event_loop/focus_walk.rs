@@ -120,6 +120,7 @@ pub(super) fn at_top_row(app: &App) -> bool {
     match app.focus {
         Focus::Projects => app.sel_project == 0,
         Focus::Worktrees => app.sel_worktree == 0,
+        Focus::Workflows => app.workflow_selection() == 0,
         Focus::Sessions => app.sel_session == 0,
         Focus::Workspaces | Focus::Terminal => false,
     }
@@ -132,6 +133,7 @@ pub(super) fn panel_name(focus: Focus) -> &'static str {
         Focus::Workspaces => "workspaces",
         Focus::Projects => "projects",
         Focus::Worktrees => "worktrees",
+        Focus::Workflows => "workflows",
         Focus::Sessions => "sessions",
         Focus::Terminal => "terminal",
     }

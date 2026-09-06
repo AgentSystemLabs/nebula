@@ -1,0 +1,9 @@
+version = 1
+name = "Review existing code"
+description = "Investigate and review existing code or a reference supplied in the task, without implementing changes."
+timeout_seconds = 1800
+
+[[stages]]
+id = "reviewer"
+agent = "reviewer"
+instructions = "There is no implementation stage in this workflow. Inspect the code or reference named in the task."

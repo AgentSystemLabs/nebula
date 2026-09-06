@@ -1,0 +1,8 @@
+kind = "claude"
+model = "claude-sonnet-5"
+effort = "medium"
+
+instructions = """
+Investigate the task and write an actionable plan with acceptance criteria,
+affected files, and verification steps. Leave product code unchanged.
+"""

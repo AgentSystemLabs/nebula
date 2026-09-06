@@ -1,5 +1,8 @@
 //! Prototype workflow CLI. The DAEMON owns all scheduling and durable state.
 
+mod output;
+
+use crate::workflow_config::{self, read_text};
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Subcommand};
 use nebula_core::{
@@ -7,11 +10,7 @@ use nebula_core::{
     workflow::*,
     AgentId, ClientRequest, ServerEvent,
 };
-use std::{
-    io::Read,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{path::PathBuf, time::Duration};
 
 #[derive(Args)]
 #[command(
@@ -27,6 +26,26 @@ pub(crate) struct WorkflowCli {
 
 #[derive(Subcommand)]
 enum WorkflowCommand {
+    /// List this checkout's workflow definitions.
+    ///
+    /// Reads .nebula/workflows locally, including invalid definitions and
+    /// their errors. Does not start a DAEMON or an AGENT.
+    #[command(after_help = "Example:\n  nebula workflow catalog --json")]
+    Catalog,
+    /// Preview a workflow's resolved AGENTS and instructions.
+    ///
+    /// Resolves AGENT references and MODEL / EFFORT defaults locally. Without
+    /// a selector, uses default.toml, the sole definition, or legacy JSON.
+    #[command(
+        after_help = "Examples:\n  nebula workflow inspect default\n  nebula workflow inspect --definition task.toml"
+    )]
+    Inspect {
+        /// Filename selector from .nebula/workflows (without .toml).
+        workflow: Option<String>,
+        /// Read an explicit TOML or legacy JSON workflow.
+        #[arg(long, conflicts_with = "workflow")]
+        definition: Option<PathBuf>,
+    },
     /// Start an ordered workflow from main.
     ///
     /// Run inside a NEBULA AGENT in the ROOT WORKTREE on main. Creates a new
@@ -39,9 +58,12 @@ enum WorkflowCommand {
         /// Read the task from a UTF-8 file.
         #[arg(long)]
         task_file: Option<PathBuf>,
-        /// Versioned workflow definition with stage order and MODEL / EFFORT.
-        #[arg(long, default_value = ".nebula/workflow.json")]
-        definition: PathBuf,
+        /// Filename selector from .nebula/workflows (without .toml).
+        #[arg(long, conflicts_with = "definition")]
+        workflow: Option<String>,
+        /// Read an explicit TOML or legacy JSON workflow.
+        #[arg(long)]
+        definition: Option<PathBuf>,
     },
     /// Inspect a workflow and its stage results.
     ///
@@ -51,7 +73,7 @@ enum WorkflowCommand {
         after_help = "Examples:\n  nebula workflow status <run-id>\n  nebula workflow status --json"
     )]
     Status { id: Option<String> },
-    /// List the 50 most recently updated runs.
+    /// List workflow runs, most recently updated first.
     ///
     /// Shows summaries across this DAEMON; status --json reads one run in full.
     #[command(after_help = "Example:\n  nebula workflow list")]
@@ -97,49 +119,50 @@ fn caller() -> Result<AgentId> {
         .context("run this command inside a NEBULA AGENT SESSION")
 }
 
-fn read_file(path: &Path, limit: u64) -> Result<String> {
-    let mut value = String::new();
-    std::fs::File::open(path)
-        .with_context(|| format!("open {}", path.display()))?
-        .take(limit + 1)
-        .read_to_string(&mut value)?;
-    ensure!(
-        value.len() as u64 <= limit,
-        "{} exceeds {limit} bytes",
-        path.display()
-    );
-    Ok(value)
-}
-
 impl WorkflowCli {
     pub(crate) fn run(self) -> Result<()> {
         let op = match self.command {
+            WorkflowCommand::Catalog => {
+                return output::catalog(
+                    workflow_config::catalog(
+                        &std::env::current_dir()?,
+                        &nebula_tui::config::Config::load(),
+                    )?,
+                    self.json,
+                );
+            }
+            WorkflowCommand::Inspect {
+                workflow,
+                definition,
+            } => {
+                return output::inspect(
+                    workflow_config::load(
+                        &std::env::current_dir()?,
+                        workflow.as_deref(),
+                        definition.as_deref(),
+                        &nebula_tui::config::Config::load(),
+                    )?,
+                    self.json,
+                );
+            }
             WorkflowCommand::Start {
                 task,
                 task_file,
+                workflow,
                 definition,
             } => {
                 let caller = caller()?;
                 let task = match task_file {
-                    Some(path) => read_file(&path, 8000)?,
+                    Some(path) => read_text(&path, 8000)?,
                     None => task.context("task required")?,
                 };
-                let mut definition: WorkflowDefinition =
-                    serde_json::from_str(&read_file(&definition, 64 * 1024)?)?;
-                let config = nebula_tui::config::Config::load();
-                for stage in &mut definition.stages {
-                    ensure!(
-                        config.kind_enabled(stage.kind),
-                        "{} is disabled in NEBULA",
-                        stage.kind.as_str()
-                    );
-                    if stage.model.is_none() {
-                        stage.model = config.default_model(stage.kind);
-                    }
-                    if stage.effort.is_none() {
-                        stage.effort = config.default_effort(stage.kind);
-                    }
-                }
+                let definition = workflow_config::load(
+                    &std::env::current_dir()?,
+                    workflow.as_deref(),
+                    definition.as_deref(),
+                    &nebula_tui::config::Config::load(),
+                )?
+                .definition;
                 WorkflowOp::Start {
                     caller,
                     task,
@@ -169,7 +192,7 @@ impl WorkflowCli {
                     "completed requires --file"
                 );
                 let artifact = file
-                    .map(|p| read_file(&p, 64 * 1024))
+                    .map(|p| read_text(&p, 64 * 1024))
                     .transpose()?
                     .unwrap_or_default();
                 WorkflowOp::Report {
@@ -191,48 +214,7 @@ impl WorkflowCli {
                     "workflow request timed out; inspect `nebula workflow list` before retrying",
                 )?
         })?;
-        if self.json {
-            println!("{}", serde_json::to_string_pretty(&reply)?);
-        } else {
-            match reply {
-                WorkflowReply::Run(run) => {
-                    println!(
-                        "Workflow: {}\nStatus: {:?}\n{}",
-                        run.id, run.status, run.message
-                    );
-                    if let Some(worktree) = &run.worktree {
-                        println!("WORKTREE: {}", worktree.path.display());
-                    }
-                    for (definition, stage) in run.definition.stages.iter().zip(&run.stages) {
-                        println!(
-                            "  {}: {:?} ({}, model {}, effort {}){}",
-                            definition.id,
-                            stage.status,
-                            definition.kind.as_str(),
-                            definition.model.as_deref().unwrap_or("default"),
-                            definition.effort.as_deref().unwrap_or("default"),
-                            stage
-                                .agent
-                                .as_ref()
-                                .map(|id| format!(" SESSION {id}"))
-                                .unwrap_or_default()
-                        );
-                    }
-                }
-                WorkflowReply::List(runs) => {
-                    if runs.is_empty() {
-                        println!("No workflows.");
-                    }
-                    for run in runs {
-                        println!(
-                            "{}  {:?}  {}/{}  {}",
-                            run.id, run.status, run.current, run.total, run.message
-                        );
-                    }
-                }
-            }
-        }
-        Ok(())
+        output::reply(reply, self.json)
     }
 }
 

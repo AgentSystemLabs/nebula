@@ -185,9 +185,65 @@ pub fn worktree_dir(repo: &Path, branch: &str) -> PathBuf {
         .join(safe_branch)
 }
 
+/// Readable MANAGED WORKFLOW names, with numbered repeats of the same task.
+pub async fn workflow_branch(repo: &Path, task: &str) -> Result<String> {
+    let slug: String = task
+        .chars()
+        .take(80)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let slug = slug.chars().take(48).collect::<String>();
+    let slug = slug.trim_end_matches('-');
+    let base = format!("workflow-{}", if slug.is_empty() { "task" } else { slug });
+    let branches = git(
+        repo,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+    )
+    .await?;
+    for number in 1..=10_000 {
+        let name = if number == 1 {
+            base.clone()
+        } else {
+            format!("{base}-{number}")
+        };
+        let conflicts = branches.lines().any(|b| {
+            b == name || b.starts_with(&format!("{name}/")) || name.starts_with(&format!("{b}/"))
+        });
+        if !conflicts && !worktree_dir(repo, &name).exists() {
+            return Ok(name);
+        }
+    }
+    bail!("could not choose an unused workflow branch name")
+}
+
 /// `git worktree add <path> -b <branch> [base]`. Falls back to checking out an
 /// existing branch when `-b` fails because it already exists.
 pub async fn add_worktree(repo: &Path, branch: &str, base: Option<&str>) -> Result<PathBuf> {
+    add_worktree_inner(repo, branch, base, true).await
+}
+
+/// A MANAGED WORKFLOW must never adopt a branch created by a concurrent caller.
+pub async fn add_new_worktree(repo: &Path, branch: &str, base: &str) -> Result<PathBuf> {
+    add_worktree_inner(repo, branch, Some(base), false).await
+}
+
+async fn add_worktree_inner(
+    repo: &Path,
+    branch: &str,
+    base: Option<&str>,
+    reuse_existing: bool,
+) -> Result<PathBuf> {
     let path = worktree_dir(repo, branch);
     if path.exists() {
         bail!("worktree path already exists: {}", path.display());
@@ -202,7 +258,7 @@ pub async fn add_worktree(repo: &Path, branch: &str, base: Option<&str>) -> Resu
     }
     match git(repo, &args).await {
         Ok(_) => Ok(path),
-        Err(e) if e.to_string().contains("already exists") => {
+        Err(e) if reuse_existing && e.to_string().contains("already exists") => {
             // Branch exists: check it out instead of creating.
             git(repo, &["worktree", "add", &path_str, branch]).await?;
             Ok(path)
@@ -357,6 +413,43 @@ mod tests {
             "Permission denied (os error 13)",
         ));
         assert!(!is_missing(&err), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn workflow_branches_are_readable_and_avoid_existing_refs_and_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        assert_eq!(
+            workflow_branch(&repo, "Fix login!").await.unwrap(),
+            "workflow-fix-login"
+        );
+        git(&repo, &["branch", "workflow-fix-login"]).await.unwrap();
+        let base = main_commit(&repo).await.unwrap();
+        assert!(
+            add_new_worktree(&repo, "workflow-fix-login", &base)
+                .await
+                .is_err(),
+            "a workflow cannot reuse an existing branch"
+        );
+        std::fs::create_dir_all(worktree_dir(&repo, "workflow-fix-login-2")).unwrap();
+        assert_eq!(
+            workflow_branch(&repo, "Fix login!").await.unwrap(),
+            "workflow-fix-login-3"
+        );
+        assert_eq!(
+            workflow_branch(&repo, "修复").await.unwrap(),
+            "workflow-task"
+        );
+        assert!(!workflow_branch(
+            &repo,
+            "../../ bad
+name"
+        )
+        .await
+        .unwrap()
+        .contains('/'));
     }
 
     #[tokio::test]

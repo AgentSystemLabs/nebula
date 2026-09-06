@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 39;
+pub const PROTOCOL_VERSION: u32 = 41;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -438,6 +438,7 @@ pub enum ServerEvent {
         daemon_protocol_version: u32,
     },
     Snapshot {
+        workflows: Vec<crate::workflow::WorkflowSummary>,
         workspaces: Vec<Workspace>,
         /// The workspace to scope this client's project lists to: the
         /// last one opened anywhere, which is only ever a starting point —
@@ -470,6 +471,9 @@ pub enum ServerEvent {
     },
 
     // -- deltas (pushed to all subscribers) --
+    WorkflowUpdated {
+        workflow: crate::workflow::WorkflowSummary,
+    },
     EntityUpserted {
         entity: Entity,
     },

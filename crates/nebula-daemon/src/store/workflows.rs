@@ -80,19 +80,11 @@ impl Store {
 
     pub fn workflow_summaries(&self) -> Result<Vec<WorkflowSummary>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT json FROM workflow_runs ORDER BY updated_at DESC LIMIT 50")?;
+        let mut stmt = conn.prepare("SELECT json FROM workflow_runs ORDER BY updated_at DESC")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.map(|row| {
             let run: WorkflowRun = serde_json::from_str(&row?)?;
-            Ok(WorkflowSummary {
-                id: run.id,
-                branch: run.branch,
-                status: run.status,
-                current: run.current,
-                total: run.stages.len(),
-                message: run.message,
-            })
+            Ok(run.summary())
         })
         .collect()
     }

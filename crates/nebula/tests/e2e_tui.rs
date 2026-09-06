@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[path = "e2e_tui/workflows.rs"]
+mod workflows;
+
 const COLS: u16 = 120;
 const ROWS: u16 = 36;
 const WAIT: Duration = Duration::from_secs(20);

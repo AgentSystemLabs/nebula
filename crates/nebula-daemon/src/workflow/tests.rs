@@ -12,6 +12,8 @@ fn run(id: &str) -> WorkflowRun {
         task: "Make a plan".into(),
         definition: WorkflowDefinition {
             version: 1,
+            id: None,
+            name: None,
             timeout_seconds: 60,
             stages: vec![StageDefinition {
                 id: "planner".into(),
@@ -59,6 +61,59 @@ fn workflow_and_artifacts_survive_reopening_the_database() {
     );
     assert_eq!(store.active_workflow_ids().unwrap(), ["run-1"]);
     assert_eq!(store.workflow_summaries().unwrap()[0].total, 1);
+}
+
+#[test]
+fn workflow_summaries_keep_old_running_and_paused_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("nebula.db")).unwrap();
+    for i in 0..60 {
+        let mut entry = run(&format!("run-{i}"));
+        entry.stages[0].agent = None;
+        entry.status = if i == 0 {
+            WorkflowStatus::Running
+        } else if i == 1 {
+            WorkflowStatus::Paused
+        } else {
+            WorkflowStatus::Completed
+        };
+        entry.updated_at = i;
+        store.save_workflow(&entry).unwrap();
+    }
+    let rows = store.workflow_summaries().unwrap();
+    assert_eq!(rows.len(), 60);
+    assert!(rows.iter().any(|r| r.id == "run-0" && r.status.active()));
+    assert!(rows
+        .iter()
+        .any(|r| r.id == "run-1" && r.status == WorkflowStatus::Paused));
+    assert!(!serde_json::to_string(&rows).unwrap().contains("artifact"));
+}
+
+#[test]
+fn persisted_runs_from_before_named_workflows_still_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nebula.db");
+    let expected = run("legacy");
+    Store::open(&path)
+        .unwrap()
+        .save_workflow(&expected)
+        .unwrap();
+    let mut old = serde_json::to_value(&expected).unwrap();
+    old["definition"].as_object_mut().unwrap().remove("id");
+    old["definition"].as_object_mut().unwrap().remove("name");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE workflow_runs SET json = ?1 WHERE id = 'legacy'",
+            [old.to_string()],
+        )
+        .unwrap();
+    let store = Store::open(&path).unwrap();
+    let restored = store.workflow("legacy").unwrap();
+    assert!(restored.definition.id.is_none());
+    assert!(restored.definition.name.is_none());
+    assert_eq!(restored.stages[0].result, expected.stages[0].result);
+    assert!(store.workflow_summaries().unwrap()[0].workflow.is_none());
 }
 
 #[test]

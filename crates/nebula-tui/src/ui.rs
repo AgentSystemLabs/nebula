@@ -1,6 +1,8 @@
 //! View layer: draws the visible panels + terminal pane + footer, and
 //! records hit regions for mouse interaction.
 
+mod workflows;
+
 use crate::app::{App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, SessionRow};
 use crate::git_diff::{classify_diff_line, DiffLineKind};
 use crate::keymap::Action;
@@ -125,10 +127,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let visible_panels = app.visible_panel_indices();
     let constraints = visible_panels
         .iter()
-        .map(|idx| Constraint::Length(app.panel_widths[*idx]))
+        .map(|idx| Constraint::Length(app.panel_width(*idx)))
         .chain(std::iter::once(Constraint::Min(crate::app::MIN_TERM_W)));
     let areas = panels_a.layout_vec(&Layout::horizontal(constraints));
-    let mut panel_areas: [Option<Rect>; 3] = [None; 3];
+    let mut panel_areas: [Option<Rect>; 4] = [None; 4];
     for (idx, area) in visible_panels.iter().copied().zip(areas.iter().copied()) {
         panel_areas[idx] = Some(area);
     }
@@ -159,6 +161,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if let Some(area) = panel_areas[1] {
         draw_worktrees(f, app, area);
     }
+    if let Some(area) = panel_areas[3] {
+        workflows::draw(f, app, area);
+    }
     draw_sessions(
         f,
         app,
@@ -175,6 +180,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Focus::Workspaces => Some(shrink_b(workspaces_a)),
         Focus::Projects => panel_areas[0].map(shrink_r),
         Focus::Worktrees => panel_areas[1].map(shrink_r),
+        Focus::Workflows => panel_areas[3].map(shrink_r),
         Focus::Sessions => panel_areas[2].map(shrink_r),
         Focus::Terminal => Some(term_a),
     };
@@ -2759,7 +2765,7 @@ type ProjectRowData = (String, Option<String>, Option<AgentStatus>, usize, i64);
 
 /// The same for the Worktrees panel: branch, is-root, rollup,
 /// unwatched-finish count, last-turn stamp.
-type WorktreeRowData = (String, bool, Option<AgentStatus>, usize, i64);
+type WorktreeRowData = (String, bool, Option<AgentStatus>, usize, i64, bool);
 
 /// Columns between the `WORKSPACES` label and the first tab.
 const TAB_GAP: u16 = 2;
@@ -2921,11 +2927,12 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|w| {
             (
-                w.branch.clone(),
+                app.worktree_label(w).to_string(),
                 w.is_main,
                 app.worktree_rollup(&w.id),
                 app.worktree_unseen(&w.id),
                 app.worktree_recency(&w.id).stamped,
+                app.workflow_for_worktree(&w.id).is_some(),
             )
         })
         .collect();
@@ -3039,7 +3046,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
             WorktreeEntry::Row(i) if *i < worktrees.len() => {
-                let (branch, is_main, roll, unseen, stamped) = &worktrees[*i];
+                let (branch, is_main, roll, unseen, stamped, workflow) = &worktrees[*i];
                 let (badges, badge_len) = row_badges(*unseen, th);
                 let ramp = sweep_ramp(*roll, th, app.animations);
                 // 3, not 2: the dot's two cells plus the pill marker
@@ -3069,7 +3076,14 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     None
                 };
                 let max = free - root.map_or(0, |r| r.chars().count());
-                let mut spans = vec![status_dot(*roll, *unseen > 0, th)];
+                let mut spans = vec![if *workflow {
+                    Span::styled(
+                        format!("{} ", crate::workflows::ICON),
+                        Style::default().fg(status_color(*roll, *unseen > 0, th)),
+                    )
+                } else {
+                    status_dot(*roll, *unseen > 0, th)
+                }];
                 spans.extend(status_name_spans(
                     truncate(branch, max),
                     Style::default(),
@@ -3379,7 +3393,7 @@ fn draw_session_row(
             };
             let mut spans = vec![dot];
             spans.extend(status_name_spans(
-                truncate(&a.name, name_max),
+                truncate(app.agent_label(a), name_max),
                 name_style,
                 ramp,
                 app.sweep_phase(),
@@ -3575,7 +3589,17 @@ fn titled_frame(
     if let Some(r) = row_rect(area, 1) {
         let mut spans = vec![Span::styled(format!("  {title}"), header_style)];
         spans.extend(left);
-        f.render_widget(Paragraph::new(Line::from(spans)), r);
+        let right = right.filter(|tag| 2 + title.len() + 2 + tag.width() <= r.width as usize);
+        let left_width = r
+            .width
+            .saturating_sub(right.as_ref().map_or(0, |tag| tag.width() as u16 + 2));
+        f.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect {
+                width: left_width,
+                ..r
+            },
+        );
         if let Some(tag) = right {
             f.render_widget(
                 Paragraph::new(Line::from(vec![tag, Span::raw(" ")]))
@@ -3774,7 +3798,7 @@ fn attached_session_name(app: &App) -> Option<String> {
             .agents
             .iter()
             .find(|a| &a.id == id)
-            .map(|a| a.name.clone()),
+            .map(|a| app.agent_label(a).to_string()),
         SessionRef::Terminal(id) => app
             .tree
             .terminals
@@ -3808,14 +3832,19 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
     spans.push(seg(&project.name, app.focus == Focus::Projects));
     if let Some(worktree) = app.selected_worktree() {
         spans.push(sep());
-        spans.push(seg(&worktree.branch, app.focus == Focus::Worktrees));
+        spans.push(seg(
+            app.worktree_label(worktree),
+            matches!(app.focus, Focus::Worktrees | Focus::Workflows),
+        ));
         if let Some(session) = app.selected_session_row() {
             spans.push(sep());
             // A link's crumb is its display label, not the raw URL — the
             // crumb has 20 cells and "https://" would eat eight of them.
-            let name = match session.as_link() {
-                Some(link) => link.label(),
-                None => session.name().to_string(),
+            let name = match &session {
+                SessionRow::Agent(a) => app.agent_label(a).to_string(),
+                _ => session
+                    .as_link()
+                    .map_or_else(|| session.name().to_string(), |l| l.label()),
             };
             spans.push(seg(
                 &name,
@@ -3840,6 +3869,7 @@ fn editor_name(cmd: &str) -> &str {
 /// The bar is drawn under the splash and the collapsed view too, so the
 /// registration lives here rather than in `draw`'s panel branch.
 fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
+    let area = workflows::footer(f, app, area);
     if let Some(rect) = draw_footer_bar(f, app, area) {
         app.hits.push((rect, HitTarget::FooterWorkspace));
     }
@@ -3998,6 +4028,7 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::ToggleWorkspaces),
                 k(Action::Help)
             ),
+            Focus::Workflows => format!("{}: sessions  ↑/↓: workflow  {}: hide", k(Action::Activate), k(Action::ToggleWorkflows)),
             Focus::Projects => format!(
                 "{}/{}: add  {}: rename  {}: remove  {}: search  {}: menu  {}: help",
                 k(Action::New),

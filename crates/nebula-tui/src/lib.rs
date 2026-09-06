@@ -34,6 +34,7 @@ pub mod tree_browser;
 pub mod ui;
 pub mod update_check;
 pub mod vim_term;
+pub mod workflows;
 
 use anyhow::Result;
 

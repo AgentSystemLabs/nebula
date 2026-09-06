@@ -1,6 +1,7 @@
 //! Prototype sequential workflows. Only the DAEMON writes run state or launches stages.
 
 mod prompts;
+pub use prompts::validate_definition;
 #[cfg(test)]
 mod tests;
 mod watcher;
@@ -112,7 +113,7 @@ impl Daemon {
         );
         let id = ulid::Ulid::generate().to_string();
         let mut run = WorkflowRun {
-            branch: format!("workflow-{}", id.to_lowercase()),
+            branch: git::workflow_branch(&root.path, &task).await?,
             id,
             project: root.project_id.clone(),
             worktree: None,
@@ -135,10 +136,8 @@ impl Daemon {
             created_at: now_ms(),
             updated_at: now_ms(),
         };
-        self.store.save_workflow(&run)?;
-        let created = self
-            .create_worktree(&run.project, &run.branch, Some(&run.base))
-            .await;
+        self.persist_workflow(&mut run)?;
+        let created = self.create_workflow_worktree(&root.path, &run).await;
         match created {
             Ok(EntityId::Worktree(id)) => {
                 run.worktree = self.store.get_worktree(&id)?;
@@ -157,7 +156,11 @@ impl Daemon {
 
     fn persist_workflow(&self, run: &mut WorkflowRun) -> Result<()> {
         run.updated_at = now_ms();
-        self.store.save_workflow(run)
+        self.store.save_workflow(run)?;
+        self.broadcast(nebula_core::ServerEvent::WorkflowUpdated {
+            workflow: run.summary(),
+        });
+        Ok(())
     }
 
     fn report_workflow(

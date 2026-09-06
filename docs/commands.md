@@ -68,9 +68,16 @@ nebula open <file>…       # show the files in this nebula's FILE TABS — a mo
 ## Ordered workflows (prototype)
 
 `nebula workflow start "task"` creates a separate WORKTREE from `main` and queues the
-AGENTS declared in `.nebula/workflow.json`. The DAEMON stores run state and stage results
-in the SQLITE STORE. `status`, `list`, `report`, `pause`, and `resume` inspect and manage
-the run. See [Workflows](workflows.md) for configuration, all commands, and restart recovery.
+AGENTS declared in `.nebula/workflows/default.toml`. Choose another definition with
+`--workflow <filename-without-extension>`. `catalog` lists definitions; `inspect <selector>`
+previews resolved AGENTS from `.nebula/agents/` or inline tables without starting SESSIONS.
+The DAEMON stores run state and stage results in the SQLITE STORE. `status`, `list`,
+`report`, `pause`, and `resume` inspect and manage runs. See [Workflows](workflows.md) for
+configuration, all commands, legacy JSON support, and restart recovery.
+
+In the TUI, **Shift+O** toggles the WORKFLOWS PANEL. Its rows show current/next steps
+and steps left for runs in the open WORKSPACE. Click the FOOTER workflow count to
+open it; select a run and press Enter to reach its SESSIONS.
 
 ## Workspaces
 

@@ -12,7 +12,26 @@ fn checked(value: &str, label: &str, max: usize) -> Result<()> {
 
 pub(super) fn validate(task: &str, definition: &WorkflowDefinition) -> Result<()> {
     checked(task, "task", 8000)?;
+    validate_definition(definition)
+}
+
+/// Shared by configuration previews and the DAEMON's IPC trust boundary.
+pub fn validate_definition(definition: &WorkflowDefinition) -> Result<()> {
     ensure!(definition.version == 1, "workflow version must be 1");
+    if let Some(id) = &definition.id {
+        checked(id, "workflow id", 64)?;
+        ensure!(
+            id.starts_with(|c: char| c.is_ascii_lowercase())
+                && id
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"_-".contains(&c)),
+            "workflow id must be a lowercase slug"
+        );
+    }
+    if let Some(name) = &definition.name {
+        checked(name, "workflow name", 120)?;
+        ensure!(!name.chars().any(char::is_control), "invalid workflow name");
+    }
     ensure!(
         (10..=86400).contains(&definition.timeout_seconds),
         "timeout_seconds must be 10..86400"

@@ -97,6 +97,8 @@ async fn workflow_cli_handoffs_are_durable_and_require_an_explicit_result() {
     let caller = create_agent_get_id(&mut c, &root.id, "kickoff", 2).await;
     let definition = WorkflowDefinition {
         version: 1,
+        id: None,
+        name: None,
         timeout_seconds: 60,
         stages: vec![
             StageDefinition {
@@ -121,18 +123,41 @@ async fn workflow_cli_handoffs_are_durable_and_require_an_explicit_result() {
         serde_json::to_string(&definition).unwrap(),
     )
     .unwrap();
-    let out = workflow_cli(
-        &env,
-        &caller,
-        &[
+    let configs = repo.join(".nebula");
+    std::fs::create_dir_all(configs.join("workflows")).unwrap();
+    std::fs::create_dir_all(configs.join("agents")).unwrap();
+    let agent_file = configs.join("agents/implementer.toml");
+    std::fs::write(&agent_file, "kind = 'codex'\nmodel = 'test-implementer-model'\neffort = 'medium'\ninstructions = 'Implement it'\n").unwrap();
+    std::fs::write(
+        configs.join("workflows/build.toml"),
+        r#"
+version = 1
+name = "Build with reviewable checkpoints"
+description = "Named workflow E2E"
+timeout_seconds = 60
+[[stages]]
+id = "planner"
+agent = { kind = "claude", model = "test-planner-model", effort = "high", instructions = "Plan it" }
+[[stages]]
+id = "implementer"
+agent = "implementer"
+"#,
+    )
+    .unwrap();
+    let out = env
+        .cli()
+        .current_dir(&repo)
+        .env(env::AGENT_ID, caller.as_str())
+        .args([
             "workflow",
             "start",
             "Change README",
-            "--definition",
-            definition_file.to_str().unwrap(),
+            "--workflow",
+            "build",
             "--json",
-        ],
-    );
+        ])
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "{}",
@@ -142,6 +167,19 @@ async fn workflow_cli_handoffs_are_durable_and_require_an_explicit_result() {
         panic!("expected run");
     };
     let id = run.id.clone();
+    assert_eq!(run.branch, "workflow-change-readme");
+    assert_eq!(run.definition.id.as_deref(), Some("build"));
+    assert_eq!(
+        run.definition.name.as_deref(),
+        Some("Build with reviewable checkpoints")
+    );
+    // Sources can change or disappear before the second stage: the DAEMON owns the snapshot.
+    std::fs::write(
+        &agent_file,
+        "kind = 'claude'\nmodel = 'changed-model'\neffort = 'low'\ninstructions = 'Changed'\n",
+    )
+    .unwrap();
+    std::fs::remove_file(configs.join("workflows/build.toml")).unwrap();
     let first = wait_for_run(&env, &id, |r| r.stages[0].agent.is_some()).await;
     let planner = first.stages[0].agent.clone().unwrap();
     assert_ne!(first.worktree.as_ref().unwrap().id, root.id);
@@ -249,6 +287,11 @@ async fn workflow_cli_handoffs_are_durable_and_require_an_explicit_result() {
     assert_eq!(second.current, 1);
     assert_eq!(second.stages[0].agent.as_ref(), Some(&planner));
     assert_eq!(second.definition.stages[1].kind, AgentKind::Codex);
+    assert_eq!(
+        second.definition.stages[1].model.as_deref(),
+        Some("test-implementer-model")
+    );
+    assert_eq!(second.definition.id.as_deref(), Some("build"));
     workflow_hook(&env_dir, &implementer, "codex", "UserPromptSubmit").await;
 
     // An interrupted active stage blocks; recovery keeps the same SESSION id.
@@ -408,9 +451,21 @@ async fn workflow_cli_handoffs_are_durable_and_require_an_explicit_result() {
         .all(|s| s.status == StageStatus::Completed));
 
     let snapshots = subscribe(&mut c).await;
-    let ServerEvent::Snapshot { agents, .. } = snapshots.last().unwrap() else {
+    let ServerEvent::Snapshot {
+        agents, workflows, ..
+    } = snapshots.last().unwrap()
+    else {
         panic!("snapshot");
     };
+    let summary = workflows.iter().find(|r| r.id == id).unwrap();
+    assert_eq!(summary.status, WorkflowStatus::Completed);
+    assert_eq!(summary.current, 2);
+    assert_eq!(summary.title, "Change README");
+    assert_eq!(
+        summary.worktree,
+        completed.worktree.as_ref().map(|w| w.id.clone())
+    );
+    assert_eq!(summary.stages[1].agent.as_ref(), Some(&implementer));
     assert_eq!(
         agents.len(),
         3,
@@ -428,6 +483,27 @@ async fn workflow_cli_handoffs_are_durable_and_require_an_explicit_result() {
             .unwrap()
             .worktree_id
     );
+    let old = workflow_cli(
+        &env,
+        &caller,
+        &[
+            "workflow",
+            "start",
+            "Legacy task",
+            "--definition",
+            definition_file.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        old.status.success(),
+        "{}",
+        String::from_utf8_lossy(&old.stderr)
+    );
+    let WorkflowReply::Run(legacy) = serde_json::from_slice(&old.stdout).unwrap() else {
+        panic!("expected legacy run")
+    };
+    assert!(legacy.definition.id.is_none());
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
 }

@@ -1,0 +1,13 @@
+# The filename is the selector. default.toml is used when none is supplied.
+version = 1
+name = "Plan and implement"
+description = "Implement a task after a dedicated planning stage."
+timeout_seconds = 1800
+
+[[stages]]
+id = "planner"
+agent = "planner"
+
+[[stages]]
+id = "implementer"
+agent = "implementer"
