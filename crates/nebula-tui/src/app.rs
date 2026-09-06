@@ -1245,6 +1245,14 @@ pub enum PendingIntent {
     SelectCreatedProject,
     /// Select the created worktree in the Worktrees panel.
     SelectCreatedWorktree,
+    /// A QUICK PROMPT whose target was a worktree that did not exist yet:
+    /// the Ack names the checkout the DAEMON cut, the cursor moves onto
+    /// its row, and `launch` fires there with `text` as the task. On
+    /// Error the box comes back with the text, like every other launch.
+    LaunchInCreatedWorktree {
+        launch: crate::quick_prompt::QuickLaunch,
+        text: String,
+    },
     /// Open the workspace this Ack just created (switcher's "New workspace…"
     /// flow: creating from there means you want to be in it).
     OpenCreatedWorkspace,
@@ -1899,6 +1907,10 @@ pub struct App {
     pub hide_projects: bool,
     /// Worktrees panel hidden; mirrors CONFIG.JSON's `hide_worktrees`.
     pub hide_worktrees: bool,
+    /// The ROOT WORKTREE row left out of the Worktrees panel, and `p`
+    /// there cutting a fresh worktree; mirrors CONFIG.JSON's
+    /// `hide_root_worktree` (Settings → Experimental).
+    pub hide_root_worktree: bool,
     pub next_req_id: u64,
     pub pending: HashMap<u64, PendingIntent>,
     /// `nebula --workspace <name>`: the workspace this instance was asked
@@ -2133,6 +2145,7 @@ impl App {
             show_workspaces: true,
             hide_projects: false,
             hide_worktrees: false,
+            hide_root_worktree: false,
             next_req_id: 1,
             pending: HashMap::new(),
             startup_workspace: None,
@@ -2561,11 +2574,15 @@ impl App {
             return vec![];
         };
         let now = now_ms();
+        // With `hide_root_worktree` on the ROOT WORKTREE is not a row: it
+        // is still in the tree (its sessions keep running, the PALETTE
+        // still knows them), it just cannot be selected here, so nothing
+        // launched from this panel ever lands in the shared checkout.
         let mut rows: Vec<&Worktree> = self
             .tree
             .worktrees
             .iter()
-            .filter(|w| w.project_id == project.id)
+            .filter(|w| w.project_id == project.id && !(self.hide_root_worktree && w.is_main))
             .collect();
         rows.sort_by_key(|w| {
             (
@@ -2574,6 +2591,17 @@ impl App {
             )
         });
         rows
+    }
+
+    /// Every branch `project` already has a checkout for — hidden ROOT
+    /// WORKTREE included — so a generated branch name never collides.
+    pub fn project_branches(&self, project: &ProjectId) -> Vec<String> {
+        self.tree
+            .worktrees
+            .iter()
+            .filter(|w| &w.project_id == project)
+            .map(|w| w.branch.clone())
+            .collect()
     }
 
     /// The selected project's open pull requests — the group under the

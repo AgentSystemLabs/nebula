@@ -203,6 +203,7 @@ pub enum SettingKind {
     HideWorktrees,
     QuickPromptKind,
     QuickPromptFocus,
+    HideRootWorktree,
     ClaudeEnabled,
     ClaudeModel,
     ClaudeEffort,
@@ -399,6 +400,18 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 group: "Pi",
             },
         ]),
+    },
+    // Behaviors that change how the tree is worked, off by default until
+    // they have earned a tab of their own. Before Hotkeys, which stays
+    // last for the reason above.
+    SettingsTab {
+        title: "Experimental",
+        body: TabBody::Values(&[SettingSpec {
+            kind: SettingKind::HideRootWorktree,
+            label: "Hide root worktree",
+            hint: "Drop the ⌂ root row; p on Worktrees cuts a fresh worktree off origin/main",
+            group: "",
+        }]),
     },
     SettingsTab {
         title: "Hotkeys",
@@ -597,6 +610,12 @@ pub struct Config {
     /// Hide the Worktrees panel and give its width to the terminal pane.
     /// Independent from `hide_projects`; Sessions always remains visible.
     pub hide_worktrees: bool,
+    /// Experimental: leave the ROOT WORKTREE row out of the WORKTREES
+    /// PANEL, so nothing launched there lands in the shared checkout, and
+    /// make `p` on that panel cut a fresh worktree (off the fetched
+    /// `origin/HEAD`) before launching into it. Off by default: the root
+    /// row is where most people start.
+    pub hide_root_worktree: bool,
     /// Default model/effort for new Claude / Codex / Cursor sessions.
     /// "default" means "don't pass the flag" (the CLI picks); any other
     /// value is passed through verbatim, so hand-edited configs can name
@@ -665,6 +684,7 @@ impl Default for Config {
             show_workspaces: true,
             hide_projects: false,
             hide_worktrees: false,
+            hide_root_worktree: false,
             claude_model: DEFAULT_CHOICE.into(),
             claude_models: Vec::new(),
             claude_effort: DEFAULT_CHOICE.into(),
@@ -786,6 +806,10 @@ impl Config {
         obj.insert(
             "hide_worktrees".into(),
             serde_json::json!(self.hide_worktrees),
+        );
+        obj.insert(
+            "hide_root_worktree".into(),
+            serde_json::json!(self.hide_root_worktree),
         );
         obj.insert("claude_model".into(), serde_json::json!(self.claude_model));
         obj.insert(
@@ -930,6 +954,7 @@ impl Config {
             SettingKind::ShowWorkspaces => on_off(self.show_workspaces).into(),
             SettingKind::HideProjects => shown_hidden(self.hide_projects).into(),
             SettingKind::HideWorktrees => shown_hidden(self.hide_worktrees).into(),
+            SettingKind::HideRootWorktree => on_off(self.hide_root_worktree).into(),
             SettingKind::ClaudeModel => self.claude_model.clone(),
             SettingKind::ClaudeEffort => self.claude_effort.clone(),
             SettingKind::CodexModel => self.codex_model.clone(),
@@ -998,6 +1023,9 @@ impl Config {
             }
             SettingKind::HideWorktrees => {
                 self.hide_worktrees = !self.hide_worktrees;
+            }
+            SettingKind::HideRootWorktree => {
+                self.hide_root_worktree = !self.hide_root_worktree;
             }
             SettingKind::ClaudeModel => {
                 self.claude_model =
@@ -1538,6 +1566,34 @@ mod tests {
         // A config predating the key reads as off.
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(!cfg.quick_prompt_focus);
+    }
+
+    /// The Experimental tab's one row: off by default, a plain toggle,
+    /// persisted under its own key, and unknown to a config written
+    /// before it (which reads as off).
+    #[test]
+    fn hide_root_worktree_is_off_by_default_on_the_experimental_tab_and_persists() {
+        let mut cfg = Config::default();
+        assert!(
+            !cfg.hide_root_worktree,
+            "the root row is where most people start"
+        );
+        assert_eq!(cfg.value_label(SettingKind::HideRootWorktree), "off");
+
+        let (tab, row) = locate(SettingKind::HideRootWorktree).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Experimental");
+        assert_eq!(tab + 1, hotkeys_tab(), "Hotkeys stays last");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.hide_root_worktree);
+        assert_eq!(cfg.value_label(SettingKind::HideRootWorktree), "on");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).hide_root_worktree);
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.hide_root_worktree);
     }
 
     /// The QUICK PROMPT's harness: one name, cycled over every AGENT KIND,

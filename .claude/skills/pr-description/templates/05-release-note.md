@@ -3,7 +3,7 @@
 
 **This PR:** <the release in half a sentence, naming the headline items in the order the groups use.>
 
-**Contents:** [🎁 Highlights](#highlights) · [🚧 Heads up](#heads-up) · [📸 Screenshots](#screenshots) · [🧭 Diagram](#diagram) · [⚠️ Risk](#risk) · [🔧 Technical overview](#technical-overview) · [📝 Notes](#notes)
+**Contents:** [🎁 Highlights](#user-content-highlights) · [🚧 Heads up](#user-content-heads-up) · [📸 Screenshots](#user-content-screenshots) · [🧭 Diagram](#user-content-diagram) · [⚠️ Risk](#user-content-risk) · [🔧 Technical overview](#user-content-technical-overview) · [📝 Notes](#user-content-notes)
 
 ## 🎁 Highlights <a id="highlights"></a>
 

@@ -24,10 +24,11 @@ convenience stores: missing or malformed reads as empty.
 
 ## Every setting
 
-Twenty-six keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
+Twenty-seven keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
 exists only in the file, so it is hand-edit-only. The Agents tab groups its rows under **Quick prompt**,
 **Claude**, **Codex** and **Cursor** headers, so a harness's rows read `Enabled` / `Model` / `Effort`
-under its name rather than repeating it.
+under its name rather than repeating it. The **Experimental** tab holds behaviors that change how the
+tree is worked; every row there is off by default.
 
 | Key | Type | Default | Overlay | What it does |
 |---|---|---|---|---|
@@ -43,6 +44,7 @@ under its name rather than repeating it.
 | `show_workspaces` | bool | `true` | Appearance | Whether the WORKSPACES BAR is drawn across the top. `Shift+W` writes the key as it toggles, so a hidden bar stays hidden across restarts. |
 | `hide_projects` | bool | `false` | Appearance | Hide the PROJECTS PANEL and give its width to the TERMINAL PANE (`Shift+P`). |
 | `hide_worktrees` | bool | `false` | Appearance | Hide the WORKTREES PANEL (`Shift+B`), independently of `hide_projects`. |
+| `hide_root_worktree` | bool | `false` | Experimental | Leave the ROOT WORKTREE row out of the WORKTREES PANEL, so nothing launched from that panel lands in the shared checkout, and make `p` there open a QUICK PROMPT that first cuts a fresh WORKTREE — a random `<adj>-<noun>-<verb>` branch off the freshly fetched `origin/HEAD` — then starts the agent in it, with the cursor moved onto the new row (FOCUS stays on the panel, as every QUICK PROMPT launch leaves it). The root's sessions keep running and stay reachable from the PALETTE (`/`). |
 | `quick_prompt_kind` | string | `"claude"` | Agents | Which AGENT KIND the QUICK PROMPT (`p`) launches: `claude`, `codex`, `cursor` or `pi`. Its model and effort come from that kind's own defaults below, so this is one name, not a third pair. A kind switched off here is stepped around. |
 | `quick_prompt_focus` | bool | `false` | Agents | QUICK PROMPT FOCUS: whether a QUICK PROMPT launch enters and locks the new session's TERMINAL PANE. Off, its row is selected and previewed but FOCUS stays on the panel you fired from. Only the QUICK PROMPT reads it — every other launch takes the pane. |
 | `claude_enabled` | bool | `true` | Agents | HARNESS TOGGLE. Off leaves Claude out of the NEW SESSION PICKER and the PR SESSION picker, and skips the standing PREWARM POOL slot; existing sessions keep attaching and resuming. The last kind left on cannot be switched off. |

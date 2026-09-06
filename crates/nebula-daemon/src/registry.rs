@@ -804,7 +804,14 @@ impl Daemon {
             .store
             .get_project(project_id)?
             .context("project not found")?;
-        let path = git::add_worktree(&project.repo_path, branch, base).await?;
+        // A base the caller named (`nebula worktree --base`) is taken as
+        // is; every other new WORKTREE — `n` in the WORKTREES PANEL, a
+        // bare `nebula worktree`, the QUICK PROMPT's auto-created one —
+        // starts at the fetched `origin/HEAD`, never at this checkout's.
+        let path = match base {
+            Some(base) => git::add_worktree(&project.repo_path, branch, Some(base)).await?,
+            None => git::add_worktree_off_default(&project.repo_path, branch).await?,
+        };
         let worktree = self.register_worktree(project_id, path, branch)?;
         Ok(EntityId::Worktree(worktree.id))
     }

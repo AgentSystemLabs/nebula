@@ -18,8 +18,8 @@ checkout", never "feat(tui): add tabs").
 
 1. **A table of contents at the top**, one link per `##` section, so the reader clicks straight to
    the part they want. GitHub gives a PR body's headings no anchors of their own, so every linked
-   heading ends with `<a id="…"></a>` and the link names that id — see *GitHub anchors* below; a
-   dead TOC is worse than none.
+   heading ends with `<a id="…"></a>` and the link names that id *with GitHub's prefix*,
+   `#user-content-…` — see *GitHub anchors* below; a dead TOC is worse than none.
 2. **Screenshots of the change.** A TUI change without a picture is a claim. At least one PNG of the
    screen after the change; a before/after pair when the change replaces something. Captured with
    the SCREENSHOT HARNESS, hosted on the `pr-assets` branch (recipe below). A change with no screen
@@ -31,7 +31,12 @@ checkout", never "feat(tui): add tabs").
    show which fits which shape.
 4. **Categories a reader can scan.** Benefit groups (`🚀 Launch faster`, `🔔 Know when it's done`)
    or change classes (✨ Feature · 🐛 Fix · 📝 Docs · 🧪 Tests · ♻️ Refactor) — one emoji per
-   heading, never on the bullets. A fix files under the feature whose promise it keeps.
+   heading, never on the bullets. A fix files under the feature whose promise it keeps. Inside a section a bullet is a **bold hook** and a dash, then two to four indented sub-bullets of
+   one fact each — the key or command in backticks, a setting in the `Settings › Sessions › done_sound`
+   form, a behaviour — never a paragraph (2026-09-05: PR #30's first cut could not be glanced through).
+   When the change touches something the user likes, one bullet says what stayed the same. Credit
+   contributors inline: `Thanks @handle (#NN).` No file paths, symbols or line numbers above the
+   technical overview.
 5. **A technical overview section**, last before the notes, for the reviewer: the mechanism in a
    few sentences, the files that matter with a clause each, the rejected approach they would ask
    about, the gate ("`make ci` green: fmt, clippy, 687 tests"). Everything above it stays high level.
@@ -98,7 +103,9 @@ beats a new shape — the archive is easier to read when the PRs rhyme.
 ### 3. Capture the screenshots
 
 Never screenshot the real DAEMON's screen — someone else is working in it. Use the SCREENSHOT
-HARNESS: `make shot SCENE=<name> KEYS="Tab j"` (`scripts/shot/shot.sh`) builds the debug binary, runs
+HARNESS: `make shot SCENE=<name> KEYS="Tab j"` (`scripts/shot/shot.sh`) builds the debug binary — into the
+repo's own `target/`, so do not export `CARGO_TARGET_DIR` for it, and start `cargo build` in the
+background while gathering the facts or the first shot waits on a full rebuild — then runs
 an isolated nebula against a demo repo with a stand-in `gh` (`scripts/shot/fixtures/` — add a fixture
 or a `scripts/shot/scenes/<name>.keys` file for the screen the PR needs), drives it in a private tmux
 and writes `design-screenshots/<name>.{txt,ansi,png}`. Its traps are encoded in the script (short
@@ -149,8 +156,8 @@ the fence exactly ```` ```mermaid ```` — a language tag GitHub does not know r
 
 ### 6. Write the body to a file, and fix the anchors
 
-Write the finished body to `<scratchpad>/pr-body.md`. Then check that every TOC link has its
-`<a id>` anchor — the script in *GitHub anchors* does it in one call. Read the body once as the
+Write the finished body to `<scratchpad>/pr-body.md`. Then check that every TOC link names
+`#user-content-<id>` and has its `<a id>` anchor — the script in *GitHub anchors* does it in one call. Read the body once as the
 reviewer: does the overview say what the user gets, does every picture have a caption, is the risk
 verdict one the diff supports, does the technical overview name the file the reviewer would open
 first?
@@ -176,24 +183,29 @@ A PR body is rendered by GitHub's *comment* pipeline (`gh api /markdown` with `"
 emits a bare `<h2 dir="auto">` for every heading — no id, no permalink. Only *file* views (a README,
 a blob, a wiki page) get the auto-generated `#-screenshots`-style slugs, so a TOC that links to a
 heading's slug is dead in every PR, however carefully the slug is computed. What survives the
-sanitizer is an explicit anchor: GitHub keeps `<a id="…"></a>`, prefixes the id with `user-content-`,
-and its hash handler puts the prefix back on click (`getElementById(…) || getElementsByName(…)`).
+sanitizer is an explicit anchor: GitHub keeps `<a id="…"></a>` and prefixes the id with
+`user-content-`. Nothing puts that prefix back on click: a `#screenshots` link finds no element on
+the PR page (PR #30, 2026-09-05 — the user clicked and nothing moved; the file-view hash handler that
+bridges the prefix is not on the PR conversation page). So the link names the id *as rendered*,
+`#user-content-<id>`, and the browser's own fragment navigation does the rest, no JS involved.
 
-So every heading a TOC link targets ends with its own anchor, and the link names that id:
+So every heading a TOC link targets ends with its own anchor, and the link names that id with the
+prefix:
 
 | Heading | Link |
 |---|---|
-| `## 📸 Screenshots <a id="screenshots"></a>` | `#screenshots` |
-| `## Before / After <a id="before-after"></a>` | `#before-after` |
-| `## 1. What changed <a id="1-what-changed"></a>` | `#1-what-changed` |
-| `### 🚀 Launch faster <a id="launch-faster"></a>` | `#launch-faster` |
+| `## 📸 Screenshots <a id="screenshots"></a>` | `#user-content-screenshots` |
+| `## Before / After <a id="before-after"></a>` | `#user-content-before-after` |
+| `## 1. What changed <a id="1-what-changed"></a>` | `#user-content-1-what-changed` |
+| `### 🚀 Launch faster <a id="launch-faster"></a>` | `#user-content-launch-faster` |
 
 The id is the heading text lower-cased, emoji and punctuation dropped, spaces to single hyphens, no
 leading hyphen (GitHub's *file* slugs keep one after a stripped emoji; ours never do). Two headings
 with the same text get `-1`, `-2`. The anchor sits at the *end* of the heading line so the raw
-Markdown — the PR PREVIEW, the PR ARCHIVE, `gh pr view` — still reads as a heading. The templates
-already carry the anchors for their own headings; when you rename or add a heading, add its anchor
-and recompute the link. This checks a body file:
+Markdown — the PR PREVIEW, the PR ARCHIVE, `gh pr view` — still reads as a heading; the anchor itself
+never carries the prefix (GitHub would double it). The templates already carry the anchors and the
+prefixed links for their own headings; when you rename or add a heading, add its anchor and recompute
+the link. This checks a body file:
 
 ```bash
 python3 - <scratchpad>/pr-body.md <<'PY'
@@ -201,27 +213,15 @@ import re, sys
 body = open(sys.argv[1]).read()
 anchors = set(re.findall(r'<a id="([^"]+)"></a>', body))
 links = set(re.findall(r'\]\(#([^)]+)\)', body))
-bare = [h for h in re.findall(r'^## +(.+?)\s*$', body, re.M) if '<a id=' not in h]
-print('dead TOC links:', sorted(links - anchors) or 'none')
+unprefixed = sorted(l for l in links if not l.startswith('user-content-'))
+targets = {l.removeprefix('user-content-') for l in links}
+bare = [h for h in re.findall(r'^## +(.+?)[ \t]*$', body, re.M) if '<a id=' not in h]
+print('links missing the user-content- prefix:', unprefixed or 'none')
+print('dead TOC links:', sorted(targets - anchors) or 'none')
+print('anchors carrying the prefix themselves:', sorted(a for a in anchors if a.startswith('user-content-')) or 'none')
 print('## headings without an anchor:', bare or 'none')
 PY
 ```
 
 To see what GitHub will really render, `gh api /markdown --input body.json` with `"mode":"gfm"` —
 `"mode":"markdown"` is the file pipeline and shows anchors a PR body will never have.
-
-## Rules of the body
-
-- **High level above the fold.** The opener and the category sections are for someone who will not
-  open the diff. No file paths, no symbols, no line numbers until the technical overview.
-- **Bold lead-ins, one emoji per heading, none on bullets.** Keys and identifiers in backticks.
-- **Say what stayed the same** when the change touches something the user likes: "the tab underline
-  and the current tab order are exactly as they were."
-- **No invented facts.** A number comes from a command you ran; a behaviour from code you read; a
-  why from the MEMORY LOG entry or the user's prompt.
-- **The risk section is a read, not a reassurance.** Medium when unsure; a 🟢 with an empty *why* is
-  the first thing the PR REVIEWER SKILL flags.
-- **`## Notes` carries the gate and the merge state**, one bullet each: what was run and passed, what
-  was not run and why, what `origin/main` merge happened and what it broke.
-- **Credit contributors inline**: `Thanks @handle (#NN).`
-- **The footer is last, verbatim, after a blank line.** Nothing after it.

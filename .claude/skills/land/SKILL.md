@@ -23,7 +23,10 @@ git diff --stat origin/main -- <the dirty paths>                                
   theirs as well as yours; take the file if your lines are in it, they ride along).
 - **A branch with an open PR** (a PR SESSION, "fix conflicts … babysit … merge") → shape B: bring
   `origin/main` in, answer the comments, wait for the check, merge.
-- **"make pr"** → shape A up to the pull request, then stop.
+- **"make pr"** → shape A up to the pull request, then stop. When the third command's right-hand
+  count is above zero and the moved paths overlap yours (`git diff --stat HEAD...origin/main`), merge
+  `origin/main` first (§5) so the PR opens CLEAN, not CONFLICTING (2026-09-05: one commit into the
+  same three memory files).
 
 ## 2. The gate — before anything leaves the machine
 
@@ -45,12 +48,13 @@ shows the register). Body: two or three lines, then the attribution trailer the 
 
 ## 4. The pull request
 
-```bash
-gh pr create --title "<subject>" --body-file <scratchpad>/pr-body.md   # a short body: what, why, gate
-```
-
-The PR DESCRIPTION SKILL only when the user asks for a description; `--draft` when the gate did not
-run. `gh auth status` first — `webdevcody` is the admin account, `codyseibert` is read-only.
+The body is the PR DESCRIPTION SKILL's, every time: `Skill(skill: "pr-description")` before
+`gh pr create`. It gathers the facts, captures the screenshots on the SCREENSHOT HARNESS, draws the
+diagram, writes the risk read and the technical overview, and runs
+`gh pr create --title "<subject>" --body-file <scratchpad>/pr-body.md` itself. A short hand-written
+body is not a shape this skill has (2026-09-05: "make pr" shipped one and the user asked why).
+`--draft` when the gate did not run. `gh auth status` first — `webdevcody` is the admin account,
+`codyseibert` is read-only.
 
 ## 5. Shape B: conflicts, comments, checks
 
@@ -59,8 +63,9 @@ run. `gh auth status` first — `webdevcody` is the admin account, `codyseibert`
   origin/main`. A squash of the SHARED CHECKOUT often pre-landed the branch's own commits: when every
   `+` line of `git diff <merge-base> <commit> -- <file>` is already in `git show origin/main:<file>`,
   the resolution is main's file plus only the later commits' hunks (`git checkout origin/main --
-  <paths>` when nothing is left). Run the Markdown gates after; `cargo check --workspace` when a crate
-  differs from `origin/main`. Commit the merge.
+  <paths>` when nothing is left). Run the Markdown gates after, `cargo check --workspace` when a crate
+  differs from `origin/main`, and the merge commit as one `&&` chain — a `;` chain commits over a red
+  gate (2026-09-05: gotchas at 301/300, amended).
 - **Comments.** `gh api repos/$R/pulls/$N/comments --paginate --jq '.[] | "\(.id) \(.path):\(.line //
   .original_line) \(.body)"'` — CLAUDE REVIEW's inline findings. Fix each in the code, or reply with
   `gh api -X POST repos/$R/pulls/$N/comments/<id>/replies -F body=@<file>`; push.

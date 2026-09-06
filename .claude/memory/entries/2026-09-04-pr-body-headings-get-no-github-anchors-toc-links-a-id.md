@@ -7,7 +7,7 @@ ten templates, and the skill's anchor rule and checker — so the TOC links land
 (assuming: the GitHub PR page, not the PR PREVIEW pane). Keep every section, heading and the rest of the
 bodies exactly as they are. (no questions asked)
 
-**Did:** Diagnosed from GitHub itself, not from the slug: `gh api repos/AgentSystemLabs/nebula/pulls/27 -H
+**Did:** *(corrected 2026-09-05: the `#slug` link does **not** resolve on the PR page — GitHub renders the anchor as `id="user-content-slug"` and nothing bridges the prefix there; since PR #30 the TOC links name `#user-content-slug` directly, see the entry ""Make Pr" Shipped A Hand-Written Body".)* Diagnosed from GitHub itself, not from the slug: `gh api repos/AgentSystemLabs/nebula/pulls/27 -H
 'Accept: application/vnd.github.html+json'` and an anonymous `curl` of the PR page both render every heading
 as a bare `<h2 dir="auto">` — no `id`, no `class="anchor"`. GitHub's *comment* pipeline (what PR and issue
 bodies use; `gh api /markdown` with `"mode":"gfm"`) never emits heading anchors; only the *file* pipeline

@@ -3,7 +3,7 @@
 
 <One sentence that names the problem and the fix together: "X made Y happen; now Z."> 
 
-**Contents:** [1. The problem](#1-the-problem) · [2. What changed](#2-what-changed) · [3. How it looks](#3-how-it-looks) · [4. How it works](#4-how-it-works) · [5. Risk](#5-risk) · [6. Technical overview](#6-technical-overview) · [7. Notes](#7-notes)
+**Contents:** [1. The problem](#user-content-1-the-problem) · [2. What changed](#user-content-2-what-changed) · [3. How it looks](#user-content-3-how-it-looks) · [4. How it works](#user-content-4-how-it-works) · [5. Risk](#user-content-5-risk) · [6. Technical overview](#user-content-6-technical-overview) · [7. Notes](#user-content-7-notes)
 
 ## 1. The problem <a id="1-the-problem"></a>
 

@@ -3,7 +3,7 @@
 
 <One sentence: what was replaced, and the one-clause reason.>
 
-**Contents:** [🔁 Before / After](#before-after) · [📸 Screenshots](#screenshots) · [🧭 What moved](#what-moved) · [⚠️ Risk](#risk) · [🔧 Technical overview](#technical-overview) · [📝 Notes](#notes)
+**Contents:** [🔁 Before / After](#user-content-before-after) · [📸 Screenshots](#user-content-screenshots) · [🧭 What moved](#user-content-what-moved) · [⚠️ Risk](#user-content-risk) · [🔧 Technical overview](#user-content-technical-overview) · [📝 Notes](#user-content-notes)
 
 ## 🔁 Before / After <a id="before-after"></a>
 

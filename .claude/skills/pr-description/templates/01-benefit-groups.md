@@ -4,26 +4,34 @@
 <One or two sentences: what landed and why — the two things a reader must know before the diff.>
 
 **Contents**
-- [✨ What you get](#what-you-get)
-  - [🚀 <Benefit group one>](#benefit-group-one)
-  - [🔔 <Benefit group two>](#benefit-group-two)
-- [📸 Screenshots](#screenshots)
-- [🧭 How it flows](#how-it-flows)
-- [⚠️ Risk](#risk)
-- [🔧 Technical overview](#technical-overview)
-- [📝 Notes](#notes)
+- [✨ What you get](#user-content-what-you-get)
+  - [🚀 <Benefit group one>](#user-content-benefit-group-one)
+  - [🔔 <Benefit group two>](#user-content-benefit-group-two)
+- [📸 Screenshots](#user-content-screenshots)
+- [🧭 How it flows](#user-content-how-it-flows)
+- [⚠️ Risk](#user-content-risk)
+- [🔧 Technical overview](#user-content-technical-overview)
+- [📝 Notes](#user-content-notes)
 
 ## ✨ What you get <a id="what-you-get"></a>
 
 ### 🚀 <Benefit group one> <a id="benefit-group-one"></a>
 
-- **<Two-to-five-word hook>.** <What it does, in two or three sentences for someone who has not read the diff: the key or command in backticks, the setting in the `Settings › Sessions › done_sound` form, where it lives.>
-- **<Hook>.** <…>
+- **<Two-to-five-word hook>** — <the key, command or setting it hangs on: backticks, or the `Settings › Sessions › done_sound` form>
+  - <one fact: what it does>
+  - <one fact: what you see>
+  - <one fact: the edge — a refusal, offline, the old way>
+- **<Hook>** — <…>
+  - <…>
+  - <…>
 
 ### 🔔 <Benefit group two> <a id="benefit-group-two"></a>
 
-- **<Hook>.** <…>
-- **<A fix, filed here because this is the promise it keeps>.** <The cause in one clause, the new behaviour in the next.>
+- **<Hook>** — <…>
+  - <…>
+- **<A fix, filed here because this is the promise it keeps>** — <the symptom>
+  - <the cause, one clause>
+  - <the new behaviour>
 
 <!-- A group with one bullet merges into its neighbour. Two or three bullets per group. -->
 

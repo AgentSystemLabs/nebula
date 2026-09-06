@@ -3,7 +3,7 @@
 
 Closes #<N>. <One sentence: what was wrong, and what is true now.>
 
-**Contents:** [🐛 Symptom](#symptom) · [🔍 Cause](#cause) · [✅ Fix](#fix) · [📸 Before / After](#before-after) · [🔁 State](#state) · [⚠️ Risk](#risk) · [🔧 Technical overview](#technical-overview) · [🧪 Proof](#proof) · [📝 Notes](#notes)
+**Contents:** [🐛 Symptom](#user-content-symptom) · [🔍 Cause](#user-content-cause) · [✅ Fix](#user-content-fix) · [📸 Before / After](#user-content-before-after) · [🔁 State](#user-content-state) · [⚠️ Risk](#user-content-risk) · [🔧 Technical overview](#user-content-technical-overview) · [🧪 Proof](#user-content-proof) · [📝 Notes](#user-content-notes)
 
 ## 🐛 Symptom <a id="symptom"></a>
 

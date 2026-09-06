@@ -29,6 +29,7 @@ use std::time::Duration;
 
 mod focus_walk;
 mod host_terminal;
+mod quick_launch;
 use focus_walk::{
     at_top_row, bar_return_target, double_tapped, enter_terminal_pane, enter_workspaces_bar,
     leave_workspaces_bar, panel_name, walk_focus_back, walk_focus_forward,
@@ -1683,14 +1684,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
 /// The project's existing branches are excluded, so Enter on an empty
 /// input can't land on a name `git worktree add` would reject.
 fn open_new_worktree_prompt(app: &mut App, project: nebula_core::ProjectId) {
-    let taken: Vec<String> = app
-        .tree
-        .worktrees
-        .iter()
-        .filter(|w| w.project_id == project)
-        .map(|w| w.branch.clone())
-        .collect();
-    let suggestion = crate::branch_name::random_name(&taken);
+    let suggestion = crate::branch_name::random_name(&app.project_branches(&project));
     open_prompt(
         app,
         PromptKind::NewWorktree {
@@ -3878,6 +3872,7 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     set_show_workspaces(app, cfg.show_workspaces);
     set_hide_projects(app, cfg.hide_projects);
     set_hide_worktrees(app, cfg.hide_worktrees);
+    set_hide_root_worktree(app, cfg.hide_root_worktree);
 }
 
 /// `R` in the settings overlay, confirmed: rewrite config.json from the
@@ -3952,6 +3947,35 @@ fn set_hide_worktrees(app: &mut App, hidden: bool) {
     if hidden && app.focus == Focus::Worktrees {
         app.focus = app.next_visible_focus(Focus::Worktrees);
     }
+}
+
+/// Show or hide the ROOT WORKTREE row (Settings → Experimental). The row
+/// sits at the top, so every other index shifts by one either way: the
+/// cursor follows the worktree (or OPEN PRS row) it was on by identity,
+/// as `reconcile_selection` does after any list change, and a cursor on
+/// the root itself lands on the first row left. The pane catches up on
+/// the next move, as it does after any re-sort.
+fn set_hide_root_worktree(app: &mut App, hidden: bool) {
+    if app.hide_root_worktree == hidden {
+        return;
+    }
+    let worktree = app.selected_worktree().map(|w| w.id.clone());
+    let pr = app.selected_worktree_pr().map(|pr| pr.url.clone());
+    app.hide_root_worktree = hidden;
+    let index = {
+        let rows = app.visible_worktrees();
+        match (&worktree, &pr) {
+            (Some(id), _) => rows.iter().position(|w| &w.id == id),
+            (None, Some(url)) => app
+                .visible_open_prs()
+                .iter()
+                .position(|p| &p.url == url)
+                .map(|i| i + rows.len()),
+            (None, None) => None,
+        }
+    };
+    let last = app.worktree_row_count().saturating_sub(1);
+    app.sel_worktree = index.unwrap_or(app.sel_worktree).min(last);
 }
 
 fn save_panel_visibility(app: &mut App) {
@@ -4166,30 +4190,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 out,
             );
         }
-        PromptKind::QuickPrompt(launch) => {
-            // Sized above, with the task — composing cannot fail here.
-            let starting_prompt = launch.compose(&value);
-            // An empty name opts the row into AUTO-TITLE, so the session
-            // names itself from the very prompt that started it.
-            create_agent(
-                app,
-                AgentLaunchDraft {
-                    worktree: launch.worktree.clone(),
-                    kind: launch.kind,
-                    model: launch.model.clone(),
-                    effort: launch.effort.clone(),
-                    name: String::new(),
-                    cloud_prompt: None,
-                    starting_prompt: Some(starting_prompt),
-                    reopen_on_error: Some((PromptKind::QuickPrompt(launch), value)),
-                    pr: None,
-                    // The QUICK PROMPT is the one launch that stays out of
-                    // the way by default: `p`, type, Enter, keep working.
-                    focus_pane: crate::config::Config::load().quick_prompt_focus,
-                },
-                out,
-            );
-        }
+        PromptKind::QuickPrompt(launch) => quick_launch::submit(app, launch, value, out),
         PromptKind::CloudMessage { id } => {
             let intent = PendingIntent::ReopenPromptOnError {
                 kind: PromptKind::CloudMessage { id: id.clone() },
@@ -4416,8 +4417,10 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             // adopt a WARM SPARE), and the SETTING is untouched. The
             // resolve/fit below is `QuickLaunch::of_kind`'s job instead.
             if let Some(back) = quick {
+                // The picker's `worktree` is only what its menu was built
+                // against; where the launch lands is the box's own target.
                 let launch = crate::quick_prompt::QuickLaunch::of_kind(
-                    worktree,
+                    back.launch.target.clone(),
                     kind,
                     model.filter(|m| m != "default"),
                     effort.filter(|e| e != "default"),
@@ -6821,6 +6824,10 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         app.select_worktree_when_seen = Some(id);
                     }
                 }
+                (
+                    Some(PendingIntent::LaunchInCreatedWorktree { launch, text }),
+                    Some(EntityId::Worktree(id)),
+                ) => quick_launch::launch_in_created_worktree(app, launch, text, id, out),
                 (Some(PendingIntent::OpenCreatedWorkspace), Some(EntityId::Workspace(id))) => {
                     // A workspace created from the WORKSPACE SWITCHER or the
                     // WORKSPACES BAR: show it right away, with the cursor on
@@ -6912,6 +6919,15 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     | PendingIntent::ReopenPromptOnError { kind, text, .. },
                 ) => {
                     open_prompt(app, kind);
+                    if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
+                        prompt.input.set_text(text);
+                    }
+                }
+                // The worktree the QUICK PROMPT wanted to cut first was
+                // refused (a fetch that failed, a branch that exists):
+                // the box comes back, its target untouched, for a retry.
+                Some(PendingIntent::LaunchInCreatedWorktree { launch, text }) => {
+                    open_prompt(app, PromptKind::QuickPrompt(launch));
                     if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
                         prompt.input.set_text(text);
                     }
@@ -20342,6 +20358,257 @@ diff --git a/src/b.rs b/src/b.rs
                 ));
             },
         );
+    }
+
+    /// A second, linked checkout beside the seeded ROOT WORKTREE.
+    fn seed_feat_worktree(app: &mut App, id: &str, branch: &str) {
+        use nebula_core::{Entity, ProjectId, Worktree, WorktreeId};
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId(id.into()),
+                    project_id: ProjectId("p1".into()),
+                    path: format!("/tmp/demo-worktrees/{branch}").into(),
+                    branch: branch.into(),
+                    is_main: false,
+                    sort_order: 1,
+                }),
+            },
+        );
+    }
+
+    fn worktree_branches(app: &App) -> Vec<String> {
+        app.visible_worktrees()
+            .iter()
+            .map(|w| w.branch.clone())
+            .collect()
+    }
+
+    /// Settings → Experimental → Hide root worktree: the ⌂ row leaves the
+    /// WORKTREES PANEL (the checkout and its sessions stay in the tree), the
+    /// cursor keeps naming the same branch across both toggle directions
+    /// even though every index shifts by one, a cursor on the root itself
+    /// lands on the first row left, and switching it off brings the row back.
+    #[test]
+    fn hide_root_worktree_drops_the_root_row_from_the_worktrees_panel() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            seed_feat_worktree(&mut app, "w2", "feat");
+            seed_feat_worktree(&mut app, "w3", "feat-2");
+            assert_eq!(worktree_branches(&app), ["main", "feat", "feat-2"]);
+            let selected = |app: &App| app.selected_worktree().map(|w| w.branch.clone());
+
+            let mut cfg = crate::config::Config {
+                hide_root_worktree: true,
+                ..Default::default()
+            };
+            app.sel_worktree = 1;
+            assert_eq!(selected(&app).as_deref(), Some("feat"));
+            apply_config(&mut app, &cfg);
+            assert!(app.hide_root_worktree);
+            assert_eq!(worktree_branches(&app), ["feat", "feat-2"]);
+            assert_eq!(
+                selected(&app).as_deref(),
+                Some("feat"),
+                "follows the row, not the index"
+            );
+            assert_eq!(app.tree.worktrees.len(), 3, "hidden, not gone");
+            assert_eq!(app.tree.agents.len(), 1, "its session is still there");
+
+            cfg.hide_root_worktree = false;
+            apply_config(&mut app, &cfg);
+            assert_eq!(worktree_branches(&app), ["main", "feat", "feat-2"]);
+            assert_eq!(
+                selected(&app).as_deref(),
+                Some("feat"),
+                "showing the root again does not hand it the cursor"
+            );
+
+            // A cursor on the root itself has nowhere to follow: the first
+            // row left, not an index past the end.
+            app.sel_worktree = 0;
+            cfg.hide_root_worktree = true;
+            apply_config(&mut app, &cfg);
+            assert_eq!(selected(&app).as_deref(), Some("feat"));
+        });
+    }
+
+    /// With the root hidden, `p` on the WORKTREES PANEL is "a fresh
+    /// worktree, then this task in it": Enter asks the DAEMON for the
+    /// checkout (no base — it fetches `origin/HEAD` itself), the Ack moves
+    /// the cursor onto the new row and fires the create there with the
+    /// typed prompt, and FOCUS stays on the panel `p` was pressed in. A
+    /// refused worktree brings the box back with the text.
+    #[test]
+    fn p_on_the_worktrees_panel_cuts_a_fresh_worktree_first_when_the_root_is_hidden() {
+        use crate::quick_prompt::QuickTarget;
+        use nebula_core::{EntityId, ProjectId, WorktreeId};
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            seed_feat_worktree(&mut app, "w2", "feat");
+            app.hide_root_worktree = true;
+            app.focus = Focus::Worktrees;
+            app.sel_worktree = 0;
+
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            let branch = match &app.overlay {
+                Some(Overlay::Prompt(prompt)) => match &prompt.kind {
+                    PromptKind::QuickPrompt(launch) => match &launch.target {
+                        QuickTarget::NewWorktree { project, branch } => {
+                            assert_eq!(project, &ProjectId("p1".into()));
+                            assert_eq!(
+                                prompt.title,
+                                format!("Quick prompt · new worktree {branch} (claude)")
+                            );
+                            branch.clone()
+                        }
+                        other => panic!("expected a new-worktree target, got {other:?}"),
+                    },
+                    other => panic!("expected the quick prompt, got {other:?}"),
+                },
+                other => panic!("p should open the quick prompt, got {other:?}"),
+            };
+            assert!(
+                !["main", "feat"].contains(&branch.as_str()),
+                "{branch} is taken"
+            );
+            assert!(out.is_empty(), "opening it sends nothing: {out:?}");
+
+            // The Tab picker round trip hands the new-worktree target back
+            // untouched: its menu is built against the hidden root, and the
+            // launch must not be rebuilt from that.
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Menu(menu))
+                    if menu.title.as_deref() == Some("Quick prompt agent")),
+                "{:?}",
+                app.overlay
+            );
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            match &app.overlay {
+                Some(Overlay::Prompt(prompt)) => {
+                    assert_eq!(
+                        prompt.title,
+                        format!("Quick prompt · new worktree {branch} (codex)")
+                    );
+                    assert!(matches!(
+                        &prompt.kind,
+                        PromptKind::QuickPrompt(launch)
+                            if matches!(&launch.target, QuickTarget::NewWorktree { branch: b, .. } if b == &branch)
+                    ));
+                }
+                other => panic!("the pick should hand the box back, got {other:?}"),
+            }
+
+            assert!(paste_into_overlay(&mut app, "Fix auth"));
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "launching closes the box");
+            let req_id = match out.as_slice() {
+                [ClientRequest::CreateWorktree {
+                    req_id,
+                    project,
+                    branch: b,
+                    base: None,
+                }] if project == &ProjectId("p1".into()) && b == &branch => *req_id,
+                other => panic!("one base-less CreateWorktree first: {other:?}"),
+            };
+            out.clear();
+
+            // The daemon: the row's upsert, then the Ack naming it.
+            seed_feat_worktree(&mut app, "w3", &branch);
+            handle_server_event(
+                &mut app,
+                ServerEvent::Ack {
+                    req_id,
+                    created: Some(EntityId::Worktree(WorktreeId("w3".into()))),
+                },
+                &mut out,
+            );
+            assert_eq!(
+                app.selected_worktree().map(|w| w.id.0.as_str()),
+                Some("w3"),
+                "the cursor is on the new row"
+            );
+            assert_eq!(
+                app.focus,
+                Focus::Worktrees,
+                "focus stays where p was pressed"
+            );
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [ClientRequest::CreateAgent {
+                        worktree,
+                        kind: AgentKind::Codex,
+                        auto_title: true,
+                        cloud_prompt: None,
+                        starting_prompt: Some(text),
+                        ..
+                    }] if worktree.0 == "w3" && text == "Fix auth"
+                ),
+                "then one create in it carrying the typed prompt: {out:?}"
+            );
+            out.clear();
+
+            // A worktree the daemon refuses (a branch that exists, a fetch
+            // that failed) hands the text back for a retry.
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(paste_into_overlay(&mut app, "Try again"));
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let req_id = match out.as_slice() {
+                [ClientRequest::CreateWorktree { req_id, .. }] => *req_id,
+                other => panic!("expected a CreateWorktree, got {other:?}"),
+            };
+            handle_server_event(
+                &mut app,
+                ServerEvent::Error {
+                    req_id: Some(req_id),
+                    message: "branch exists".into(),
+                },
+                &mut out,
+            );
+            assert_eq!(app.flash.as_deref(), Some("branch exists"));
+            assert!(matches!(
+                &app.overlay,
+                Some(Overlay::Prompt(prompt))
+                    if matches!(
+                        &prompt.kind,
+                        PromptKind::QuickPrompt(launch)
+                            if matches!(launch.target, QuickTarget::NewWorktree { .. })
+                    ) && prompt.input.as_str() == "Try again"
+            ));
+        });
+    }
+
+    /// The SETTING off — the default — leaves `p` on the WORKTREES PANEL
+    /// exactly as it was: the selected checkout, root included.
+    #[test]
+    fn p_on_the_worktrees_panel_launches_in_the_selected_checkout_by_default() {
+        use crate::quick_prompt::QuickTarget;
+        use nebula_core::WorktreeId;
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Worktrees;
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            match &app.overlay {
+                Some(Overlay::Prompt(prompt)) => {
+                    assert_eq!(prompt.title, "Quick prompt (claude)");
+                    assert!(matches!(
+                        &prompt.kind,
+                        PromptKind::QuickPrompt(launch)
+                            if launch.target == QuickTarget::Worktree(WorktreeId("w1".into()))
+                    ));
+                }
+                other => panic!("p should open the quick prompt, got {other:?}"),
+            }
+        });
     }
 
     /// A QUICK PROMPT is fire-and-forget: its Ack selects the new SESSION's
