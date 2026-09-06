@@ -79,7 +79,10 @@ eleven.
 
 Map every noun in the prompt onto `TERMS.md` first — the **Alias index** at its bottom turns the user's
 word into the TERM, and the TERM's row names the file and symbol, so most grounding is a lookup, not a
-grep. A noun with no TERM is worth noticing: the rewrite should name it in words the user can confirm,
+grep. Do the lookup with `grep -n -i '"<word>' TERMS.md` (and a TERM's gotchas with
+`grep -n '^- \*\*<TERM>\*\*' .claude/memory/gotchas.md`), never a whole-file read: both files exceed the
+tool-output cap, so a `cat` lands in a persisted file you grep anyway (2026-09-05: three such reads
+before the first useful line). A noun with no TERM is worth noticing: the rewrite should name it in words the user can confirm,
 and `project-terms` will record it when the task ends.
 
 Then use the MEMORY LOG entries you already read and the ones the RECALL HOOK injected: a related gotcha, a recorded decision, the file where

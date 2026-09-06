@@ -200,27 +200,3 @@ Count before you send:
 
 Over budget, cut the DETAILS bullets the diff already shows, then the OVERVIEW sentences that restate
 them. Never cut a 🚧 step, a "left out" sentence, or the skills' one-line results.
-
-## Worked examples
-
-One, the pure-question shape (the task and blocked-task examples stood here until 2026-09-05; the
-format block and "Which sections a reply has" already determine those and they were cut):
-
-A pure question — two sections, no `YOU ASKED` because PROMPT DADDY skipped it, no `DETAILS` because
-the answer fit:
-
-```
----
-
-## 📋 ==== OVERVIEW ====
-
-No code changed. The DONE BADGE counts UNSEEN SESSIONS — the ones that finished while you weren't
-looking — and clears each one the moment you focus it. A FINISHED SESSION you have already looked at
-is not counted.
-
----
-
-## 👉 ==== NEXT STEPS ====
-
-Nothing — this is done.
-```

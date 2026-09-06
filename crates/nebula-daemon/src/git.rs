@@ -4,6 +4,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::process::Command;
 
 /// Shown when the `git` binary itself is missing. Every other git failure
@@ -176,8 +177,32 @@ pub fn worktree_dir(repo: &Path, branch: &str) -> PathBuf {
 }
 
 /// `git worktree add <path> -b <branch> [base]`. Falls back to checking out an
-/// existing branch when `-b` fails because it already exists.
+/// existing branch when `-b` fails because it already exists. `None` is
+/// git's own default — the checkout's HEAD; a base that is a
+/// remote-tracking branch becomes the new branch's upstream, as git does.
 pub async fn add_worktree(repo: &Path, branch: &str, base: Option<&str>) -> Result<PathBuf> {
+    add_worktree_inner(repo, branch, base, true).await
+}
+
+/// `add_worktree` for a branch nobody named a base for: it starts at the
+/// fetched `origin/HEAD` (see `default_base`) — what everyone else sees as
+/// main — instead of the ROOT WORKTREE's HEAD, which is routinely commits
+/// behind or on some other branch. Cut with `--no-track`: the branch is
+/// new work, not a copy of main, and a branch tracking `origin/main`
+/// aims its first `git push` at main (`push.default=simple` refuses it,
+/// `upstream` sends it). Falls back to HEAD when there is no `origin` or
+/// the fetch fails (offline).
+pub async fn add_worktree_off_default(repo: &Path, branch: &str) -> Result<PathBuf> {
+    let base = default_base(repo).await;
+    add_worktree_inner(repo, branch, base.as_deref(), false).await
+}
+
+async fn add_worktree_inner(
+    repo: &Path,
+    branch: &str,
+    base: Option<&str>,
+    track: bool,
+) -> Result<PathBuf> {
     let path = worktree_dir(repo, branch);
     if path.exists() {
         bail!("worktree path already exists: {}", path.display());
@@ -186,7 +211,11 @@ pub async fn add_worktree(repo: &Path, branch: &str, base: Option<&str>) -> Resu
         std::fs::create_dir_all(parent)?;
     }
     let path_str = path.to_string_lossy().into_owned();
-    let mut args = vec!["worktree", "add", &path_str, "-b", branch];
+    let mut args = vec!["worktree", "add", &path_str];
+    if !track {
+        args.push("--no-track");
+    }
+    args.extend(["-b", branch]);
     if let Some(base) = base {
         args.push(base);
     }
@@ -199,6 +228,82 @@ pub async fn add_worktree(repo: &Path, branch: &str, base: Option<&str>) -> Resu
         }
         Err(e) => Err(e),
     }
+}
+
+/// How long `default_base` waits for `git fetch origin` before branching
+/// from local HEAD instead. The fetch holds the DAEMON's worktree lock,
+/// so a stalled connection must not hold every worktree op with it.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The start point for a new branch when the caller named none: the
+/// remote's default branch, fetched first, so it is what `origin` has
+/// right now (`origin/main` for most repos) and not what the ROOT WORKTREE
+/// happens to have pulled. `None` — git's own default, the checkout's
+/// HEAD — when the repo has no `origin` or the fetch fails, which the
+/// daemon log says; a worktree cut offline is better than none.
+pub async fn default_base(repo: &Path) -> Option<String> {
+    if git(repo, &["remote", "get-url", "origin"]).await.is_err() {
+        return None;
+    }
+    if let Err(e) = fetch_origin(repo).await {
+        tracing::warn!(
+            repo = %repo.display(),
+            error = %e,
+            "fetch before worktree add failed; branching from local HEAD"
+        );
+        return None;
+    }
+    origin_head(repo).await
+}
+
+/// `git fetch origin`, killed and reported as an error past `FETCH_TIMEOUT`.
+async fn fetch_origin(repo: &Path) -> Result<()> {
+    let run = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["fetch", "--quiet", "origin"])
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(FETCH_TIMEOUT, run).await {
+        Ok(output) => output.map_err(spawn_err)?,
+        Err(_) => bail!(
+            "git fetch origin did not finish within {}s",
+            FETCH_TIMEOUT.as_secs()
+        ),
+    };
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
+}
+
+/// `origin/HEAD` as a short ref (`origin/main`). A repo whose remote was
+/// added by hand (`git remote add`, a fresh push) has no such symref, so
+/// one `git remote set-head origin --auto` asks the remote which branch
+/// it means and records the answer for next time. None only when the
+/// remote itself has no HEAD.
+async fn origin_head(repo: &Path) -> Option<String> {
+    for attempt in 0..2 {
+        if let Ok(out) = git(
+            repo,
+            &["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"],
+        )
+        .await
+        {
+            let short = out.trim();
+            if !short.is_empty() {
+                return Some(short.to_string());
+            }
+        }
+        if attempt == 0
+            && git(repo, &["remote", "set-head", "origin", "--auto"])
+                .await
+                .is_err()
+        {
+            return None;
+        }
+    }
+    None
 }
 
 /// Check pull request `number`'s head branch `head` out into a new worktree
@@ -492,6 +597,96 @@ mod tests {
         // Neither route: no such PR, no such branch anywhere.
         let err = add_pr_worktree(&repo, 10, "nowhere").await.unwrap_err();
         assert!(err.to_string().contains("#10"), "{err}");
+    }
+
+    /// No `origin`, no default base: the branch starts at HEAD, as before.
+    #[tokio::test]
+    async fn default_base_is_none_without_an_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        assert_eq!(default_base(&repo).await, None);
+        let wt = add_worktree_off_default(&repo, "feat").await.unwrap();
+        let head = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
+        let root = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(head, root);
+    }
+
+    /// Offline (here: an origin that does not exist) the fetch fails and
+    /// the branch starts at HEAD rather than not at all.
+    #[tokio::test]
+    async fn default_base_falls_back_to_head_when_the_fetch_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let gone = tmp.path().join("gone.git");
+        git(&repo, &["remote", "add", "origin", gone.to_str().unwrap()])
+            .await
+            .unwrap();
+        assert_eq!(default_base(&repo).await, None);
+        let wt = add_worktree_off_default(&repo, "feat").await.unwrap();
+        let head = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
+        let root = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(head, root);
+    }
+
+    /// The checkout is a commit behind `origin/main` and has not fetched
+    /// since: a worktree nobody named a base for still starts at what
+    /// origin has right now, and its branch does not track `origin/main`.
+    #[tokio::test]
+    async fn a_worktree_off_the_default_base_starts_at_the_fetched_origin_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let origin = add_bare_origin(&repo, tmp.path()).await;
+        // Someone else lands a commit on main; this checkout never fetches.
+        let other = tmp.path().join("other");
+        git(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+        git(&other, &["config", "user.email", "t@t"]).await.unwrap();
+        git(&other, &["config", "user.name", "t"]).await.unwrap();
+        git(
+            &other,
+            &["commit", "--allow-empty", "-m", "landed elsewhere"],
+        )
+        .await
+        .unwrap();
+        git(&other, &["push", "-q", "origin", "main"])
+            .await
+            .unwrap();
+        let landed = git(&other, &["rev-parse", "HEAD"]).await.unwrap();
+        let local = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_ne!(landed, local, "the checkout is behind origin");
+        // `git remote add` + a push leave no origin/HEAD symref behind;
+        // resolving it is default_base's job, not the user's.
+        assert!(
+            git(&repo, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
+                .await
+                .is_err()
+        );
+
+        assert_eq!(default_base(&repo).await.as_deref(), Some("origin/main"));
+        let wt = add_worktree_off_default(&repo, "feat").await.unwrap();
+        let head = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(head, landed, "starts at origin's main, not the checkout's");
+        assert!(
+            git(&wt, &["rev-parse", "--abbrev-ref", "feat@{upstream}"])
+                .await
+                .is_err(),
+            "a new branch must not track origin/main"
+        );
     }
 
     #[tokio::test]

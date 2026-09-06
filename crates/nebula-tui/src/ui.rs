@@ -4664,7 +4664,9 @@ mod tests {
     fn task_prompt_hints_fit_the_border_they_sit_on() {
         use crate::app::PromptKind;
         let quick = PromptKind::QuickPrompt(crate::quick_prompt::QuickLaunch {
-            worktree: nebula_core::WorktreeId::from("wt".to_string()),
+            target: crate::quick_prompt::QuickTarget::Worktree(nebula_core::WorktreeId::from(
+                "wt".to_string(),
+            )),
             kind: nebula_core::AgentKind::Claude,
             model: None,
             effort: None,

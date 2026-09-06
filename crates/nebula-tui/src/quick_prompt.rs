@@ -4,18 +4,33 @@
 //!
 //! What lives here is the launch spec — [`QuickLaunch`]: which AGENT KIND
 //! and MODEL / EFFORT the `quick_prompt_kind` SETTING resolves to, which
-//! AGENT PRESET (if any) wraps the text, and the WORKTREE it lands in —
-//! plus the two pickers that rewrite it for one launch (`Tab`, `Shift+Tab`)
-//! and the [`QuickReturn`] they carry so the round trip loses neither the
-//! spec nor the typed text. The dialog itself is an ordinary multi-line
+//! AGENT PRESET (if any) wraps the text, and the [`QuickTarget`] it lands
+//! in — the selected WORKTREE, or one that does not exist yet — plus the
+//! two pickers that rewrite it for one launch (`Tab`, `Shift+Tab`) and
+//! the [`QuickReturn`] they carry so the round trip loses neither the spec
+//! nor the typed text. The dialog itself is an ordinary multi-line
 //! `PromptDialog` (`PromptKind::QuickPrompt`) drawn by `ui::draw_overlay`,
 //! and the create it ends in goes through `event_loop::create_agent` like
-//! every other session, with the composed text as the STARTING PROMPT.
+//! every other session, with the composed text as the STARTING PROMPT
+//! (`event_loop::quick_launch` holds that last step).
 
 use crate::agent_presets::AgentPreset;
-use crate::app::{App, Overlay, PromptKind};
+use crate::app::{App, Focus, Overlay, PromptKind};
 use crate::config::{fit_effort, Config};
-use nebula_core::{AgentKind, WorktreeId};
+use nebula_core::{AgentKind, ProjectId, WorktreeId};
+
+/// Where a QUICK PROMPT launch lands.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuickTarget {
+    /// The WORKTREE selected when the box opened.
+    Worktree(WorktreeId),
+    /// A WORKTREE that does not exist yet — `p` on the WORKTREES PANEL
+    /// while the `hide_root_worktree` SETTING is on. Enter cuts `branch`
+    /// off the PROJECT's fetched default base first
+    /// (`ClientRequest::CreateWorktree`), and the launch follows into the
+    /// checkout the DAEMON made once its Ack lands.
+    NewWorktree { project: ProjectId, branch: String },
+}
 
 /// Everything one QUICK PROMPT will launch with. Resolved from the config
 /// when the box opens and rewritten in place by the box's own pickers —
@@ -24,7 +39,7 @@ use nebula_core::{AgentKind, WorktreeId};
 /// starts from the `quick_prompt_kind` SETTING again.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuickLaunch {
-    pub worktree: WorktreeId,
+    pub target: QuickTarget,
     pub kind: AgentKind,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -48,10 +63,10 @@ impl QuickLaunch {
     /// A Cursor effort is re-fitted to the configured family, as every
     /// other launch surface does — the daemon joins the two into one
     /// `--model` id.
-    pub fn from_config(worktree: WorktreeId, cfg: &Config) -> Self {
+    pub fn from_config(target: QuickTarget, cfg: &Config) -> Self {
         let kind = cfg.quick_prompt_kind();
         Self::of_kind(
-            worktree,
+            target,
             kind,
             cfg.default_model(kind),
             cfg.default_effort(kind),
@@ -63,7 +78,7 @@ impl QuickLaunch {
     /// describes: anything left unpicked falls back to that kind's
     /// configured default, and the effort is fitted to the model.
     pub fn of_kind(
-        worktree: WorktreeId,
+        target: QuickTarget,
         kind: AgentKind,
         model: Option<String>,
         effort: Option<String>,
@@ -76,7 +91,7 @@ impl QuickLaunch {
             effort.or_else(|| cfg.default_effort(kind)),
         );
         Self {
-            worktree,
+            target,
             kind,
             model,
             effort,
@@ -88,9 +103,9 @@ impl QuickLaunch {
     /// MODEL / EFFORT where it has them and that kind's defaults where it
     /// does not — the same resolution an AGENT PRESET launch from the
     /// SESSIONS PANEL does — and its prefix/postfix kept for the compose.
-    pub fn of_preset(worktree: WorktreeId, preset: AgentPreset, cfg: &Config) -> Self {
+    pub fn of_preset(target: QuickTarget, preset: AgentPreset, cfg: &Config) -> Self {
         let mut launch = Self::of_kind(
-            worktree,
+            target,
             preset.kind,
             preset.model.clone(),
             preset.effort.clone(),
@@ -109,18 +124,24 @@ impl QuickLaunch {
         }
     }
 
-    /// The dialog's title: the preset (when one is applied) and the flags
-    /// it will actually launch with, so Enter is never a surprise —
-    /// `Quick prompt · reviewer (claude · opus · high)`.
+    /// The dialog's title: the preset (when one is applied), the worktree
+    /// Enter will cut first (when it is a new one) and the flags it will
+    /// actually launch with, so Enter is never a surprise —
+    /// `Quick prompt · reviewer (claude · opus · high)`,
+    /// `Quick prompt · new worktree yellow-fox-jumps (claude)`.
     pub fn title(&self) -> String {
         let opts: Vec<&str> = std::iter::once(self.kind.as_str())
             .chain(self.model.as_deref())
             .chain(self.effort.as_deref())
             .collect();
-        match &self.preset {
-            Some(preset) => format!("Quick prompt · {} ({})", preset.name, opts.join(" · ")),
-            None => format!("Quick prompt ({})", opts.join(" · ")),
+        let mut head = vec!["Quick prompt".to_string()];
+        if let Some(preset) = &self.preset {
+            head.push(preset.name.clone());
         }
+        if let QuickTarget::NewWorktree { branch, .. } = &self.target {
+            head.push(format!("new worktree {branch}"));
+        }
+        format!("{} ({})", head.join(" · "), opts.join(" · "))
     }
 
     /// The line under the title: what Enter will send.
@@ -140,19 +161,52 @@ impl QuickLaunch {
 /// the point of a quick prompt is that it works from wherever you are —
 /// but it still needs a checkout to run in, so a PROJECT with no worktree
 /// selected (or a cursor parked on an OPEN PRS row) flashes instead.
+///
+/// The one exception is the WORKTREES PANEL with the `hide_root_worktree`
+/// SETTING on: `p` there means "a fresh worktree, then this task in it",
+/// whatever row the cursor is parked on — the checkout does not exist
+/// yet, so only the PROJECT has to be selected. Its branch is the same
+/// random name the `n` prompt would have offered.
 pub(crate) fn open_quick_prompt(app: &mut App) {
+    if app.hide_root_worktree && app.focus == Focus::Worktrees {
+        let Some(project) = app.selected_project().map(|p| p.id.clone()) else {
+            app.flash = Some("quick prompt: select a project first".into());
+            return;
+        };
+        let branch = crate::branch_name::random_name(&app.project_branches(&project));
+        open_for(app, QuickTarget::NewWorktree { project, branch });
+        return;
+    }
     let Some(worktree) = app.selected_worktree().map(|w| w.id.clone()) else {
         app.flash = Some("quick prompt: select a worktree first".into());
         return;
     };
-    open_for(app, worktree);
+    open_for(app, QuickTarget::Worktree(worktree));
 }
 
-/// Open the box for a known WORKTREE, resolving the launch options now so
+/// Open the box for a known target, resolving the launch options now so
 /// the title can name what Enter is about to start.
-pub(crate) fn open_for(app: &mut App, worktree: WorktreeId) {
-    let launch = QuickLaunch::from_config(worktree, &Config::load());
+pub(crate) fn open_for(app: &mut App, target: QuickTarget) {
+    let launch = QuickLaunch::from_config(target, &Config::load());
     crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch));
+}
+
+/// The checkout a picker opened from the box is built against — the
+/// `KindPicker` and the `AgentPresetsView` each carry one. For a WORKTREE
+/// that does not exist yet it is the PROJECT's ROOT WORKTREE, which every
+/// project has whether the panel shows it or not: in quick mode neither
+/// picker launches into it, they hand the pick back and the launch keeps
+/// its own `target`. None only if the project vanished meanwhile.
+fn picker_context(app: &App, launch: &QuickLaunch) -> Option<WorktreeId> {
+    match &launch.target {
+        QuickTarget::Worktree(id) => Some(id.clone()),
+        QuickTarget::NewWorktree { project, .. } => app
+            .tree
+            .worktrees
+            .iter()
+            .find(|w| &w.project_id == project && w.is_main)
+            .map(|w| w.id.clone()),
+    }
 }
 
 /// Put the box back after one of its pickers — on a pick, with the new
@@ -171,7 +225,14 @@ pub(crate) fn reopen(app: &mut App, launch: QuickLaunch, text: &str) {
 /// back here instead of creating a session, and it clears any AGENT PRESET
 /// (a launch spec has one source).
 pub(crate) fn open_launch_picker(app: &mut App, back: QuickReturn) {
-    crate::agent_picker::open_kind_picker(app, crate::agent_picker::KindPicker::quick_prompt(back));
+    let Some(context) = picker_context(app, &back.launch) else {
+        app.flash = Some("project no longer exists".into());
+        return;
+    };
+    crate::agent_picker::open_kind_picker(
+        app,
+        crate::agent_picker::KindPicker::quick_prompt(context, back),
+    );
 }
 
 /// `Shift+Tab` in the box: the saved AGENT PRESETS as a picker. The list is
@@ -191,8 +252,11 @@ pub(crate) fn open_preset_picker(app: &mut App, back: QuickReturn) {
         .as_ref()
         .and_then(|p| presets.iter().position(|row| row.name == p.name))
         .unwrap_or(0);
-    let mut view =
-        crate::preset_overlays::AgentPresetsView::new(back.launch.worktree.clone(), presets);
+    let Some(context) = picker_context(app, &back.launch) else {
+        app.flash = Some("project no longer exists".into());
+        return;
+    };
+    let mut view = crate::preset_overlays::AgentPresetsView::new(context, presets);
     view.selected = selected;
     view.quick = Some(back);
     app.overlay = Some(Overlay::AgentPresets(view));
@@ -202,8 +266,15 @@ pub(crate) fn open_preset_picker(app: &mut App, back: QuickReturn) {
 mod tests {
     use super::*;
 
-    fn worktree() -> WorktreeId {
-        WorktreeId::from("wt-1".to_string())
+    fn worktree() -> QuickTarget {
+        QuickTarget::Worktree(WorktreeId::from("wt-1".to_string()))
+    }
+
+    fn new_worktree(branch: &str) -> QuickTarget {
+        QuickTarget::NewWorktree {
+            project: ProjectId::from("p-1".to_string()),
+            branch: branch.into(),
+        }
     }
 
     fn preset(name: &str, kind: AgentKind) -> AgentPreset {
@@ -335,5 +406,34 @@ mod tests {
 
         let bare = QuickLaunch::of_preset(worktree(), preset("scratch", AgentKind::Cursor), &cfg);
         assert_eq!(bare.label(), "scratch — sent as the first prompt");
+    }
+
+    /// A launch into a worktree that does not exist yet says so — and
+    /// names the branch Enter is about to cut — before the flags.
+    #[test]
+    fn the_title_names_the_worktree_a_launch_will_cut_first() {
+        let cfg = Config::default();
+        let fresh = QuickLaunch::of_kind(
+            new_worktree("yellow-fox-jumps"),
+            AgentKind::Claude,
+            Some("opus".into()),
+            None,
+            &cfg,
+        );
+        assert_eq!(
+            fresh.title(),
+            "Quick prompt · new worktree yellow-fox-jumps (claude · opus)"
+        );
+        assert_eq!(fresh.label(), "what should the agent do?");
+
+        let wrapped = QuickLaunch::of_preset(
+            new_worktree("yellow-fox-jumps"),
+            preset("reviewer", AgentKind::Cursor),
+            &cfg,
+        );
+        assert_eq!(
+            wrapped.title(),
+            "Quick prompt · reviewer · new worktree yellow-fox-jumps (cursor)"
+        );
     }
 }

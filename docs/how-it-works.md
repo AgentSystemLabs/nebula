@@ -24,7 +24,9 @@
   row.
 - **Projects → worktrees → sessions.** All work happens in the main checkout or a git worktree.
   Worktrees are real (`git worktree add/remove`), created under
-  `<repo>/../<repo-name>-worktrees/<branch>`.
+  `<repo>/../<repo-name>-worktrees/<branch>` and branched from the freshly fetched `origin/HEAD`
+  unless `nebula worktree --base` names another start (no `origin`, or a fetch that fails: the
+  checkout's HEAD).
 - **Worktrees made outside nebula show up anyway — WORKTREE SYNC.** Every 2 s the DAEMON mtime-probes
   the git files a worktree operation touches — the repo's shared `.git/HEAD`, the `.git/worktrees`
   directory, and each linked checkout's own `HEAD` — and only when the newest of those stamps has moved

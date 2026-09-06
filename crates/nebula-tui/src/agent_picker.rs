@@ -60,10 +60,12 @@ impl KindPicker {
 
     /// The QUICK PROMPT's `Tab` picker: every row hands the box back, and
     /// the cursor starts on the harness the box is already set to.
-    pub fn quick_prompt(back: QuickReturn) -> Self {
+    /// `worktree` is the checkout the menu is built against, not where
+    /// the launch lands — that stays the box's own `QuickLaunch::target`.
+    pub fn quick_prompt(worktree: WorktreeId, back: QuickReturn) -> Self {
         Self {
             title: "Quick prompt agent".into(),
-            worktree: back.launch.worktree.clone(),
+            worktree,
             pr: None,
             hover: Some(back.launch.kind),
             quick: Some(Box::new(back)),
@@ -272,7 +274,7 @@ mod tests {
 
             let back = QuickReturn {
                 launch: QuickLaunch {
-                    worktree: worktree.clone(),
+                    target: crate::quick_prompt::QuickTarget::Worktree(worktree.clone()),
                     kind: AgentKind::Cursor,
                     model: None,
                     effort: None,
@@ -280,7 +282,7 @@ mod tests {
                 },
                 text: "typed so far".into(),
             };
-            open_kind_picker(&mut app, KindPicker::quick_prompt(back));
+            open_kind_picker(&mut app, KindPicker::quick_prompt(worktree.clone(), back));
             let Some(Overlay::Menu(menu)) = &app.overlay else {
                 panic!("{:?}", app.overlay);
             };

@@ -193,4 +193,5 @@ Keep meanings to two sentences. When a section grows past what fits on one scree
 adding more — `terms_check.py` names the merge pairs (`merge?`) and the TERMS nobody says (`dead`,
 `once`); `--merge` folds one into the other. Retired TERMS get one line each and `--prune` drops them
 once nothing under `.claude/memory/` mentions them. The Candidates ledger should stay under about twenty
-rows: if it is longer, you are sighting helpers, not vocabulary — prune harder and ledger less.
+rows; `--prune` is its only pruning, so when it is over twenty, ledger nothing new this run unless the
+user named the thing or a TERM row can carry it in its meaning.
