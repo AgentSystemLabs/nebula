@@ -80,3 +80,9 @@ only when there is no origin or the fetch fails."
 - `git worktree add --no-track -b <branch> <path> [base]`: the flag has to come before `-b`; with no
   base it is harmless (HEAD is never a remote-tracking branch), which is why `add_worktree_inner` can
   pass it unconditionally on the default path.
+- Landing this from a WORKTREE branch: `origin/main` had gained one commit that also prepended a MEMORY LOG
+  index line and edited the Candidates ledger (two `UU` files, `gotchas.md` auto-merged) — and the
+  auto-merge put `gotchas.md` at 301/300, each side having been under the cap alone. Run
+  `make memory-check recall-eval terms-check` *after* the merge and before the merge commit, with `&&`
+  between them: a `;` chain committed over the red gate and had to be amended; the twin to merge was in
+  the RELEASE SKILL group, the largest.
