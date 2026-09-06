@@ -17,13 +17,21 @@
 
 ### 🚀 <Benefit group one> <a id="benefit-group-one"></a>
 
-- **<Two-to-five-word hook>.** <What it does, in two or three sentences for someone who has not read the diff: the key or command in backticks, the setting in the `Settings › Sessions › done_sound` form, where it lives.>
-- **<Hook>.** <…>
+- **<Two-to-five-word hook>** — <the key, command or setting it hangs on: backticks, or the `Settings › Sessions › done_sound` form>
+  - <one fact: what it does>
+  - <one fact: what you see>
+  - <one fact: the edge — a refusal, offline, the old way>
+- **<Hook>** — <…>
+  - <…>
+  - <…>
 
 ### 🔔 <Benefit group two> <a id="benefit-group-two"></a>
 
-- **<Hook>.** <…>
-- **<A fix, filed here because this is the promise it keeps>.** <The cause in one clause, the new behaviour in the next.>
+- **<Hook>** — <…>
+  - <…>
+- **<A fix, filed here because this is the promise it keeps>** — <the symptom>
+  - <the cause, one clause>
+  - <the new behaviour>
 
 <!-- A group with one bullet merges into its neighbour. Two or three bullets per group. -->
 

@@ -31,7 +31,12 @@ checkout", never "feat(tui): add tabs").
    show which fits which shape.
 4. **Categories a reader can scan.** Benefit groups (`🚀 Launch faster`, `🔔 Know when it's done`)
    or change classes (✨ Feature · 🐛 Fix · 📝 Docs · 🧪 Tests · ♻️ Refactor) — one emoji per
-   heading, never on the bullets. A fix files under the feature whose promise it keeps.
+   heading, never on the bullets. A fix files under the feature whose promise it keeps. Inside a section a bullet is a **bold hook** and a dash, then two to four indented sub-bullets of
+   one fact each — the key or command in backticks, a setting in the `Settings › Sessions › done_sound`
+   form, a behaviour — never a paragraph (2026-09-05: PR #30's first cut could not be glanced through).
+   When the change touches something the user likes, one bullet says what stayed the same. Credit
+   contributors inline: `Thanks @handle (#NN).` No file paths, symbols or line numbers above the
+   technical overview.
 5. **A technical overview section**, last before the notes, for the reviewer: the mechanism in a
    few sentences, the files that matter with a clause each, the rejected approach they would ask
    about, the gate ("`make ci` green: fmt, clippy, 687 tests"). Everything above it stays high level.
@@ -98,7 +103,9 @@ beats a new shape — the archive is easier to read when the PRs rhyme.
 ### 3. Capture the screenshots
 
 Never screenshot the real DAEMON's screen — someone else is working in it. Use the SCREENSHOT
-HARNESS: `make shot SCENE=<name> KEYS="Tab j"` (`scripts/shot/shot.sh`) builds the debug binary, runs
+HARNESS: `make shot SCENE=<name> KEYS="Tab j"` (`scripts/shot/shot.sh`) builds the debug binary — into the
+repo's own `target/`, so do not export `CARGO_TARGET_DIR` for it, and start `cargo build` in the
+background while gathering the facts or the first shot waits on a full rebuild — then runs
 an isolated nebula against a demo repo with a stand-in `gh` (`scripts/shot/fixtures/` — add a fixture
 or a `scripts/shot/scenes/<name>.keys` file for the screen the PR needs), drives it in a private tmux
 and writes `design-screenshots/<name>.{txt,ansi,png}`. Its traps are encoded in the script (short
@@ -218,19 +225,3 @@ PY
 
 To see what GitHub will really render, `gh api /markdown --input body.json` with `"mode":"gfm"` —
 `"mode":"markdown"` is the file pipeline and shows anchors a PR body will never have.
-
-## Rules of the body
-
-- **High level above the fold.** The opener and the category sections are for someone who will not
-  open the diff. No file paths, no symbols, no line numbers until the technical overview.
-- **Bold lead-ins, one emoji per heading, none on bullets.** Keys and identifiers in backticks.
-- **Say what stayed the same** when the change touches something the user likes: "the tab underline
-  and the current tab order are exactly as they were."
-- **No invented facts.** A number comes from a command you ran; a behaviour from code you read; a
-  why from the MEMORY LOG entry or the user's prompt.
-- **The risk section is a read, not a reassurance.** Medium when unsure; a 🟢 with an empty *why* is
-  the first thing the PR REVIEWER SKILL flags.
-- **`## Notes` carries the gate and the merge state**, one bullet each: what was run and passed, what
-  was not run and why, what `origin/main` merge happened and what it broke.
-- **Credit contributors inline**: `Thanks @handle (#NN).`
-- **The footer is last, verbatim, after a blank line.** Nothing after it.

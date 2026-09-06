@@ -28,6 +28,10 @@ obvious to invoke that skill anytime a pr is created"
   checker (which now also flags an unprefixed link and a prefixed anchor), all ten templates, and PR
   #30's body (`gh pr edit`, then `body_html` re-read to confirm the hrefs). The 2026-09-04 entry and its
   standing gotcha were corrected in place.
+- The user could not glance through the benefit sections (three-sentence bullets): PR #30's groups are
+  now a **bold hook** and a dash, then two to four indented one-fact sub-bullets; the PR DESCRIPTION
+  SKILL's rule 4 and template 01 carry that shape, and its "Rules of the body" section was folded into
+  the numbered list (SKILL AUDIT).
 - Gate: `make memory-check recall-eval terms-check` (no crate changed).
 
 **Gotchas:**
@@ -52,5 +56,5 @@ obvious to invoke that skill anytime a pr is created"
   anchor must not — GitHub would double the prefix. `body_html` from the pulls API is the only honest
   check short of clicking; `gh api /markdown` in any mode shows the source, not the page.
 
-**Corrections:** 2 — the user asked why "make pr" had produced no full description, then reported the
-TOC links did not navigate.
+**Corrections:** 3 — the user asked why "make pr" had produced no full description, reported the TOC
+links did not navigate, then asked for sections that can be glanced through.
