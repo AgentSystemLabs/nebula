@@ -12,7 +12,8 @@ rules:
 | the task changed code or behavior, diagnosed a bug, or surfaced something non-obvious | `Skill(skill: "nebula-memory")` | pure questions, trivial edits that held no surprise, and git/`gh` housekeeping of finished work that surfaced nothing |
 | every task, right after `nebula-memory` | `Skill(skill: "project-terms")` | git/`gh` housekeeping of finished work (a `land` run) |
 | before writing the reply that answers or closes the request | `Skill(skill: "output-doctor")` | never — a pure question takes its short form, not no form |
-| a landing chore — "commit push and merge", "make pr", "fix conflicts … babysit … merge" | `Skill(skill: "land")` — it replaces the three rows above it for that prompt | the change itself is not finished, or the user asks for a PR *description* (PR DESCRIPTION SKILL) |
+| a landing chore — "commit push and merge", "make pr", "fix conflicts … babysit … merge" | `Skill(skill: "land")` — it replaces the three rows above it for that prompt | the change itself is not finished |
+| **a pull request is about to be created, or its body rewritten** — inside `land` ("make pr", "commit push and merge", "open a PR") or on any other path | `Skill(skill: "pr-description")` before `gh pr create` — every PR body is the house style: TOC, screenshots, mermaid diagram, risk read, technical overview | never — a short hand-written body is not a shape (2026-09-05: "make pr" shipped one and the user asked why) |
 
 Three hooks run on their own:
 

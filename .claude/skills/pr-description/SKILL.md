@@ -18,8 +18,8 @@ checkout", never "feat(tui): add tabs").
 
 1. **A table of contents at the top**, one link per `##` section, so the reader clicks straight to
    the part they want. GitHub gives a PR body's headings no anchors of their own, so every linked
-   heading ends with `<a id="…"></a>` and the link names that id — see *GitHub anchors* below; a
-   dead TOC is worse than none.
+   heading ends with `<a id="…"></a>` and the link names that id *with GitHub's prefix*,
+   `#user-content-…` — see *GitHub anchors* below; a dead TOC is worse than none.
 2. **Screenshots of the change.** A TUI change without a picture is a claim. At least one PNG of the
    screen after the change; a before/after pair when the change replaces something. Captured with
    the SCREENSHOT HARNESS, hosted on the `pr-assets` branch (recipe below). A change with no screen
@@ -149,8 +149,8 @@ the fence exactly ```` ```mermaid ```` — a language tag GitHub does not know r
 
 ### 6. Write the body to a file, and fix the anchors
 
-Write the finished body to `<scratchpad>/pr-body.md`. Then check that every TOC link has its
-`<a id>` anchor — the script in *GitHub anchors* does it in one call. Read the body once as the
+Write the finished body to `<scratchpad>/pr-body.md`. Then check that every TOC link names
+`#user-content-<id>` and has its `<a id>` anchor — the script in *GitHub anchors* does it in one call. Read the body once as the
 reviewer: does the overview say what the user gets, does every picture have a caption, is the risk
 verdict one the diff supports, does the technical overview name the file the reviewer would open
 first?
@@ -176,24 +176,29 @@ A PR body is rendered by GitHub's *comment* pipeline (`gh api /markdown` with `"
 emits a bare `<h2 dir="auto">` for every heading — no id, no permalink. Only *file* views (a README,
 a blob, a wiki page) get the auto-generated `#-screenshots`-style slugs, so a TOC that links to a
 heading's slug is dead in every PR, however carefully the slug is computed. What survives the
-sanitizer is an explicit anchor: GitHub keeps `<a id="…"></a>`, prefixes the id with `user-content-`,
-and its hash handler puts the prefix back on click (`getElementById(…) || getElementsByName(…)`).
+sanitizer is an explicit anchor: GitHub keeps `<a id="…"></a>` and prefixes the id with
+`user-content-`. Nothing puts that prefix back on click: a `#screenshots` link finds no element on
+the PR page (PR #30, 2026-09-05 — the user clicked and nothing moved; the file-view hash handler that
+bridges the prefix is not on the PR conversation page). So the link names the id *as rendered*,
+`#user-content-<id>`, and the browser's own fragment navigation does the rest, no JS involved.
 
-So every heading a TOC link targets ends with its own anchor, and the link names that id:
+So every heading a TOC link targets ends with its own anchor, and the link names that id with the
+prefix:
 
 | Heading | Link |
 |---|---|
-| `## 📸 Screenshots <a id="screenshots"></a>` | `#screenshots` |
-| `## Before / After <a id="before-after"></a>` | `#before-after` |
-| `## 1. What changed <a id="1-what-changed"></a>` | `#1-what-changed` |
-| `### 🚀 Launch faster <a id="launch-faster"></a>` | `#launch-faster` |
+| `## 📸 Screenshots <a id="screenshots"></a>` | `#user-content-screenshots` |
+| `## Before / After <a id="before-after"></a>` | `#user-content-before-after` |
+| `## 1. What changed <a id="1-what-changed"></a>` | `#user-content-1-what-changed` |
+| `### 🚀 Launch faster <a id="launch-faster"></a>` | `#user-content-launch-faster` |
 
 The id is the heading text lower-cased, emoji and punctuation dropped, spaces to single hyphens, no
 leading hyphen (GitHub's *file* slugs keep one after a stripped emoji; ours never do). Two headings
 with the same text get `-1`, `-2`. The anchor sits at the *end* of the heading line so the raw
-Markdown — the PR PREVIEW, the PR ARCHIVE, `gh pr view` — still reads as a heading. The templates
-already carry the anchors for their own headings; when you rename or add a heading, add its anchor
-and recompute the link. This checks a body file:
+Markdown — the PR PREVIEW, the PR ARCHIVE, `gh pr view` — still reads as a heading; the anchor itself
+never carries the prefix (GitHub would double it). The templates already carry the anchors and the
+prefixed links for their own headings; when you rename or add a heading, add its anchor and recompute
+the link. This checks a body file:
 
 ```bash
 python3 - <scratchpad>/pr-body.md <<'PY'
@@ -201,8 +206,12 @@ import re, sys
 body = open(sys.argv[1]).read()
 anchors = set(re.findall(r'<a id="([^"]+)"></a>', body))
 links = set(re.findall(r'\]\(#([^)]+)\)', body))
-bare = [h for h in re.findall(r'^## +(.+?)\s*$', body, re.M) if '<a id=' not in h]
-print('dead TOC links:', sorted(links - anchors) or 'none')
+unprefixed = sorted(l for l in links if not l.startswith('user-content-'))
+targets = {l.removeprefix('user-content-') for l in links}
+bare = [h for h in re.findall(r'^## +(.+?)[ \t]*$', body, re.M) if '<a id=' not in h]
+print('links missing the user-content- prefix:', unprefixed or 'none')
+print('dead TOC links:', sorted(targets - anchors) or 'none')
+print('anchors carrying the prefix themselves:', sorted(a for a in anchors if a.startswith('user-content-')) or 'none')
 print('## headings without an anchor:', bare or 'none')
 PY
 ```

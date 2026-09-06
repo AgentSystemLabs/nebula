@@ -3,7 +3,7 @@
 
 <One or two sentences: the theme that ties the branch together, and the headline item.>
 
-**Contents:** [📋 At a glance](#at-a-glance) · [✨ Features](#features) · [🐛 Fixes](#fixes) · [📝 Docs](#docs) · [🧪 Tests](#tests) · [📸 Screenshots](#screenshots) · [🧭 Diagram](#diagram) · [⚠️ Risk](#risk) · [🔧 Technical overview](#technical-overview) · [📓 Notes](#notes)
+**Contents:** [📋 At a glance](#user-content-at-a-glance) · [✨ Features](#user-content-features) · [🐛 Fixes](#user-content-fixes) · [📝 Docs](#user-content-docs) · [🧪 Tests](#user-content-tests) · [📸 Screenshots](#user-content-screenshots) · [🧭 Diagram](#user-content-diagram) · [⚠️ Risk](#user-content-risk) · [🔧 Technical overview](#user-content-technical-overview) · [📓 Notes](#user-content-notes)
 
 ## 📋 At a glance <a id="at-a-glance"></a>
 

@@ -3,7 +3,7 @@
 
 <Two sentences: what this PR is, and the one number that says how big (files, tests, a version).>
 
-**Contents:** [🎯 Summary](#summary) · [✨ Changes](#changes) · [📸 Screenshots](#screenshots) · [🧩 Architecture](#architecture) · [⚠️ Risk](#risk) · [🔧 Technical overview](#technical-overview) · [📝 Notes](#notes)
+**Contents:** [🎯 Summary](#user-content-summary) · [✨ Changes](#user-content-changes) · [📸 Screenshots](#user-content-screenshots) · [🧩 Architecture](#user-content-architecture) · [⚠️ Risk](#user-content-risk) · [🔧 Technical overview](#user-content-technical-overview) · [📝 Notes](#user-content-notes)
 
 ## 🎯 Summary <a id="summary"></a>
 

@@ -45,12 +45,13 @@ shows the register). Body: two or three lines, then the attribution trailer the 
 
 ## 4. The pull request
 
-```bash
-gh pr create --title "<subject>" --body-file <scratchpad>/pr-body.md   # a short body: what, why, gate
-```
-
-The PR DESCRIPTION SKILL only when the user asks for a description; `--draft` when the gate did not
-run. `gh auth status` first — `webdevcody` is the admin account, `codyseibert` is read-only.
+The body is the PR DESCRIPTION SKILL's, every time: `Skill(skill: "pr-description")` before
+`gh pr create`. It gathers the facts, captures the screenshots on the SCREENSHOT HARNESS, draws the
+diagram, writes the risk read and the technical overview, and runs
+`gh pr create --title "<subject>" --body-file <scratchpad>/pr-body.md` itself. A short hand-written
+body is not a shape this skill has (2026-09-05: "make pr" shipped one and the user asked why).
+`--draft` when the gate did not run. `gh auth status` first — `webdevcody` is the admin account,
+`codyseibert` is read-only.
 
 ## 5. Shape B: conflicts, comments, checks
 

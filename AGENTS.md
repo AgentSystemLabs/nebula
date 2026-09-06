@@ -59,7 +59,8 @@ points at them.
    surfaced nothing — the log is only useful if it stays free of restated diffs.
 2. **Keep the glossary true** — PROJECT TERMS: read `.claude/skills/project-terms/SKILL.md` and
    follow it, on **every** task, including one that recorded no entry — except git/`gh` housekeeping
-   of finished work, which `.claude/skills/land/SKILL.md` covers end to end.
+   of finished work, which `.claude/skills/land/SKILL.md` covers end to end. A pull request's
+   body — on that path or any other — is `.claude/skills/pr-description/SKILL.md`'s, never hand-written.
 3. **Shape the reply** — OUTPUT DOCTOR: read `.claude/skills/output-doctor/SKILL.md` and follow it,
    before you write a word of the reply that answers or closes the request. Every kind of reply,
    including a question you answered without changing anything.

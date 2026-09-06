@@ -3,7 +3,7 @@
 
 <One sentence: the journey this PR adds or changes, from the first key to the last screen.>
 
-**Contents:** [🪜 The journey](#the-journey) · [📸 Screenshots](#screenshots) · [🧭 Under the hood](#under-the-hood) · [⚠️ Risk](#risk) · [🔧 Technical overview](#technical-overview) · [📝 Notes](#notes)
+**Contents:** [🪜 The journey](#user-content-the-journey) · [📸 Screenshots](#user-content-screenshots) · [🧭 Under the hood](#user-content-under-the-hood) · [⚠️ Risk](#user-content-risk) · [🔧 Technical overview](#user-content-technical-overview) · [📝 Notes](#user-content-notes)
 
 ## 🪜 The journey <a id="the-journey"></a>
 

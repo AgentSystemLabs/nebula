@@ -3,7 +3,7 @@
 
 <Two sentences: what landed across the workspace, and the one place a reviewer should start.>
 
-**Contents:** [📦 By crate](#by-crate) · [🧩 Workspace map](#workspace-map) · [📸 Screenshots](#screenshots) · [⚠️ Risk](#risk) · [🔧 Technical overview](#technical-overview) · [📝 Notes](#notes)
+**Contents:** [📦 By crate](#user-content-by-crate) · [🧩 Workspace map](#user-content-workspace-map) · [📸 Screenshots](#user-content-screenshots) · [⚠️ Risk](#user-content-risk) · [🔧 Technical overview](#user-content-technical-overview) · [📝 Notes](#user-content-notes)
 
 ## 📦 By crate <a id="by-crate"></a>
 

@@ -3,7 +3,7 @@
 
 <One sentence: what got faster, smaller or safer, with the headline number.>
 
-**Contents:** [📊 Scorecard](#scorecard) · [✨ What changed](#what-changed) · [📸 Screenshots](#screenshots) · [🧭 Where the time goes](#where-the-time-goes) · [⚠️ Risk](#risk) · [🔧 Technical overview](#technical-overview) · [📝 Notes](#notes)
+**Contents:** [📊 Scorecard](#user-content-scorecard) · [✨ What changed](#user-content-what-changed) · [📸 Screenshots](#user-content-screenshots) · [🧭 Where the time goes](#user-content-where-the-time-goes) · [⚠️ Risk](#user-content-risk) · [🔧 Technical overview](#user-content-technical-overview) · [📝 Notes](#user-content-notes)
 
 ## 📊 Scorecard <a id="scorecard"></a>
 

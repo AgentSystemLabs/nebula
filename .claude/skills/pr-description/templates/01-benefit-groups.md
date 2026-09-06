@@ -4,14 +4,14 @@
 <One or two sentences: what landed and why — the two things a reader must know before the diff.>
 
 **Contents**
-- [✨ What you get](#what-you-get)
-  - [🚀 <Benefit group one>](#benefit-group-one)
-  - [🔔 <Benefit group two>](#benefit-group-two)
-- [📸 Screenshots](#screenshots)
-- [🧭 How it flows](#how-it-flows)
-- [⚠️ Risk](#risk)
-- [🔧 Technical overview](#technical-overview)
-- [📝 Notes](#notes)
+- [✨ What you get](#user-content-what-you-get)
+  - [🚀 <Benefit group one>](#user-content-benefit-group-one)
+  - [🔔 <Benefit group two>](#user-content-benefit-group-two)
+- [📸 Screenshots](#user-content-screenshots)
+- [🧭 How it flows](#user-content-how-it-flows)
+- [⚠️ Risk](#user-content-risk)
+- [🔧 Technical overview](#user-content-technical-overview)
+- [📝 Notes](#user-content-notes)
 
 ## ✨ What you get <a id="what-you-get"></a>
 
