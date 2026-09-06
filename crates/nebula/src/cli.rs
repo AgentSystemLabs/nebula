@@ -77,6 +77,11 @@ fn parse_agent_kind(s: &str) -> Result<nebula_core::AgentKind, String> {
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
+    /// Run ordered AGENT workflows (prototype).
+    ///
+    /// A versioned definition chooses the stages. The DAEMON stores runtime
+    /// state in SQLite, creates the WORKTREE, and hands work between SESSIONS.
+    Workflow(crate::workflow_cli::WorkflowCli),
     /// Register a git checkout as a project.
     ///
     /// Adds a directory to the project list of the open workspace, named after

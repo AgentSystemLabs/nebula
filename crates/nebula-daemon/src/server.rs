@@ -137,6 +137,16 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         }
                     });
                 }
+                ClientRequest::Workflow { req_id, op } => {
+                    let reply = match daemon.workflow_op(op).await {
+                        Ok(reply) => ServerEvent::Workflow { req_id, reply },
+                        Err(err) => ServerEvent::Error {
+                            req_id: Some(req_id),
+                            message: format!("{err:#}"),
+                        },
+                    };
+                    let _ = out_tx.send(reply).await;
+                }
                 ClientRequest::Attach {
                     session: sref,
                     from_seq,

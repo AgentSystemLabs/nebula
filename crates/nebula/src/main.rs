@@ -3,6 +3,7 @@ mod cli;
 mod ssh;
 mod tunnel;
 mod upgrade;
+mod workflow_cli;
 
 use anyhow::Result;
 use clap::Parser;
@@ -12,6 +13,7 @@ use std::path::Path;
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Some(Command::Workflow(workflow)) => workflow.run(),
         Some(Command::Daemon { foreground }) => {
             init_daemon_logging(foreground)?;
             log_fatal(

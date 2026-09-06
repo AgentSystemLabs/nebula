@@ -13,6 +13,7 @@ nebula-core = { workspace = true }
 nebula-daemon = { workspace = true }
 nebula-tui = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
 clap = { version = "4", features = ["derive", "wrap_help"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -21,6 +22,5 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
-serde_json = { workspace = true }
 portable-pty = "0.9"
 vt100 = "0.16"

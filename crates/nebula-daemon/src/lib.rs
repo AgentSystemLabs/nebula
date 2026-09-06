@@ -13,6 +13,7 @@ pub mod session_title;
 pub mod sibling;
 pub mod status;
 pub mod store;
+pub mod workflow;
 
 use anyhow::{bail, Context, Result};
 use nebula_core::{env, paths};
@@ -81,6 +82,7 @@ async fn serve() -> Result<()> {
     tracing::info!(port = hook_env.port, "hook receiver listening");
 
     let daemon = registry::Daemon::new(store, hook_env);
+    daemon.start_workflow_watcher();
 
     // Drain hook events into the status machines; a payload that reports a
     // cwd inside another worktree of the same project re-homes the agent row.

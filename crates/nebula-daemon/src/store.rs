@@ -12,6 +12,8 @@ use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+mod workflows;
+
 const MIGRATIONS: &[&str] = &[
     // 1: initial schema
     "
@@ -240,6 +242,21 @@ const MIGRATIONS: &[&str] = &[
     // the first sync, so every existing row simply starts unsynced.
     "
     ALTER TABLE agents ADD COLUMN claude_title TEXT;
+    ",
+    // 24: prototype workflows. Historical SESSION/WORKTREE ids intentionally
+    // survive entity deletion; the watcher blocks when their rows disappear.
+    "
+    CREATE TABLE workflow_runs (
+      id TEXT PRIMARY KEY,
+      active INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      json TEXT NOT NULL
+    );
+    CREATE INDEX workflow_runs_active ON workflow_runs(active);
+    CREATE TABLE workflow_sessions (
+      agent_id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE
+    );
     ",
 ];
 

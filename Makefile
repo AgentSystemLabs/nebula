@@ -94,8 +94,8 @@ dev-prep:
 
 # A blank dev instance is useless for eyeballing a change — you'd re-add every
 # project by hand first. So the first `make dev` snapshots the real DB and
-# settings, minus `agents` and `terminals`: those rows are the live sessions
-# the real daemon owns, and the dev daemon must not resume them. `.backup`
+# settings, minus live SESSIONS and workflow runs: the development DAEMON
+# must not resume work already owned by the real DAEMON. `.backup`
 # reads the WAL, so the copy is consistent even with the real daemon running.
 # The real dir is where `directories::ProjectDirs::from("dev","nebula","nebula")`
 # puts it (nebula-core/src/paths.rs); keep the two in step.
@@ -110,8 +110,16 @@ dev-seed: ## Copy real projects/workspaces/settings into the dev instance (only 
 	if ! command -v sqlite3 >/dev/null 2>&1; then \
 		echo "sqlite3 not on PATH — dev instance starts empty"; exit 0; fi; \
 	mkdir -p $(DEV_DATA); \
-	sqlite3 "$$real/nebula.db" ".backup '$(DEV_DATA)/nebula.db'"; \
-	sqlite3 $(DEV_DATA)/nebula.db "DELETE FROM agents; DELETE FROM terminals;"; \
+	seed_db=$$(mktemp '$(DEV_DATA)/seed.XXXXXX') || exit 1; \
+	trap 'rm -f "$$seed_db"' EXIT; \
+	sqlite3 "$$real/nebula.db" ".backup '$$seed_db'" || exit 1; \
+	sqlite3 "$$seed_db" "DELETE FROM agents; DELETE FROM terminals;" || exit 1; \
+	workflow_table=$$(sqlite3 "$$seed_db" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='workflow_runs';") || exit 1; \
+	if [ "$$workflow_table" = 1 ]; then \
+		sqlite3 "$$seed_db" "BEGIN; DELETE FROM workflow_sessions; DELETE FROM workflow_runs; COMMIT;" || exit 1; \
+	fi; \
+	mv "$$seed_db" '$(DEV_DATA)/nebula.db' || exit 1; \
+	trap - EXIT; \
 	for f in config.json reviewed.json; do \
 		if [ -f "$$real/$$f" ]; then cp "$$real/$$f" $(DEV_DATA)/; fi; \
 	done; \

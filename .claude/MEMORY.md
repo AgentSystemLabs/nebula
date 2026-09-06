@@ -16,6 +16,7 @@ Line shape: `- DATE · [Title](memory/entries/DATE-slug.md) · TERMS: A; B · fi
 > `.claude/MEMORY.md` was split into this index plus per-entry files on 2026-08-28.
 
 ## Index
+- 2026-09-06 · [Ordered AGENT Workflows Use The SQLITE STORE](memory/entries/2026-09-06-ordered-agent-workflows-use-the-sqlite-store.md) · TERMS: SQLITE STORE; DAEMON; WORKTREE; SESSION; MODEL / EFFORT; STARTING PROMPT · files: workflow.rs; watcher.rs; workflows.rs; workflow_cli.rs · gotchas: 5
 - 2026-09-05 · [Released v0.22.0 Level With `origin/main`: Nothing To Carry, 38 Commits To Explain](memory/entries/2026-09-05-released-v0-22-0-level-with-origin-nothing-to-carry.md) · TERMS: RELEASE SKILL; RELEASE NOTES; RELEASE WORKTREE; SHARED CHECKOUT; CARRY SET; PROTOCOL VERSION · files: Cargo.toml; Cargo.lock; commands.md; gotchas.md · gotchas: 3
 - 2026-09-05 · [The `for … in $(…)` GUARD HOOK Block Was Right, But Its zsh Premise Is False](memory/entries/2026-09-05-for-in-guard-block-was-right-its-zsh-premise-is-false.md) · TERMS: GUARD HOOK; SESSION; RELEASE SKILL; RELEASE WORKTREE; WORKTREE · files: guard.py; gotchas.md · gotchas: 4
 - 2026-09-05 · [A SKILL AUDIT HOOK On Stop, Housekeeping Skips For PROMPT DADDY And NEBULA-MEMORY, A Quote-Aware GUARD HOOK](memory/entries/2026-09-05-skill-audit-hook-housekeeping-skips-quote-aware-guard.md) · TERMS: SELF-IMPROVING LOOP; GUARD HOOK; PROMPT DADDY; OUTPUT DOCTOR; NEBULA-MEMORY SKILL; SCREENSHOT HARNESS · files: skill_audit.py; guard.py; shot.sh; SKILL.md · gotchas: 7

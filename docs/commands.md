@@ -17,6 +17,7 @@ nebula kill                 shut the running daemon down (stops all sessions)
 nebula rename <title>       title the session this runs inside          (agents run this)
 nebula worktree [name]      move this session into a worktree           (agents run this)
 nebula spawn <task>         start another agent session beside it       (agents run this)
+nebula workflow <cmd>       run ordered AGENT workflows (prototype)
 nebula open <file>…         show files in this nebula's file tabs       (agents run this)
 nebula workspace <cmd>      manage workspaces — named groups of projects
 nebula browser              serve this TUI in a web browser via ttyd
@@ -63,6 +64,13 @@ nebula open <file>…       # show the files in this nebula's FILE TABS — a mo
                           # file, the focused one previewed, Enter editing it (agents run this when
                           # you ask to see a file, or to put their own work in front of you)
 ```
+
+## Ordered workflows (prototype)
+
+`nebula workflow start "task"` creates a separate WORKTREE from `main` and queues the
+AGENTS declared in `.nebula/workflow.json`. The DAEMON stores run state and stage results
+in the SQLITE STORE. `status`, `list`, `report`, `pause`, and `resume` inspect and manage
+the run. See [Workflows](workflows.md) for configuration, all commands, and restart recovery.
 
 ## Workspaces
 

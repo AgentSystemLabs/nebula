@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 38;
+pub const PROTOCOL_VERSION: u32 = 39;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -26,6 +26,11 @@ pub enum SessionRef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientRequest {
+    /// Prototype ordered workflows; persisted and advanced by the DAEMON.
+    Workflow {
+        req_id: u64,
+        op: crate::workflow::WorkflowOp,
+    },
     Hello {
         protocol_version: u32,
     },
@@ -421,6 +426,10 @@ pub enum EnterOutcome {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerEvent {
+    Workflow {
+        req_id: u64,
+        reply: crate::workflow::WorkflowReply,
+    },
     HelloOk {
         protocol_version: u32,
         daemon_pid: u32,

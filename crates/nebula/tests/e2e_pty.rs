@@ -2,6 +2,9 @@
 //! attach/detach with scrollback replay, git worktree ops, and persistence
 //! across a daemon restart.
 
+#[path = "e2e_pty/workflow.rs"]
+mod workflow;
+
 use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::env;
 use nebula_core::{

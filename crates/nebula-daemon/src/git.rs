@@ -67,6 +67,16 @@ pub async fn current_branch(repo: &Path) -> Result<String> {
     Ok(branch.to_string())
 }
 
+/// Pin the local main branch before creating a workflow's WORKTREE.
+pub async fn main_commit(repo: &Path) -> Result<String> {
+    Ok(
+        git(repo, &["rev-parse", "--verify", "refs/heads/main^{commit}"])
+            .await?
+            .trim()
+            .to_string(),
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct WorktreeEntry {
     pub path: PathBuf,
