@@ -136,7 +136,9 @@ line freed:
 
 1. **Enforced.** `grep -n 'retire:' .claude/memory/gotchas.md` — a line whose named test, hook rule or
    type now exists is done; delete it. Then every line whose trap a GUARD HOOK rule (`guard.py::RULES`)
-   already blocks — probe the rule with the trap if unsure.
+   already blocks — probe the rule with the trap if unsure. Read the `retire:` tails only when this
+   task built a test, type or GUARD HOOK rule — one of them may be it; otherwise start at twins
+   (2026-09-06: four unenforced tails cost a read and a `guard.py` check for nothing).
 2. **Twins.** Two lines under one TERM about the same subject (two `CARGO_TARGET_DIR` lines, two "other
    sessions' hunks" lines) — one line, the more specific text kept, both `⟵` sources listed.
 3. **Migration-era.** A line about a state that cannot recur (a session "still holding the old skill" a

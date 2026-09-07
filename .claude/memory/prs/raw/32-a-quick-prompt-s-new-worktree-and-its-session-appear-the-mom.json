@@ -1,0 +1,200 @@
+{
+  "pr": {
+    "additions": 1192,
+    "assignees": [],
+    "author": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "baseRefName": "main",
+    "body": "With HIDE ROOT WORKTREE on, `p` on the WORKTREES PANEL showed nothing for the seconds git spent cutting the checkout and the CLI spent booting; now the new WORKTREE row and its SESSION row are on screen the moment Enter is pressed, and the DAEMON's answers slide in underneath them.\n\n**Contents:** [1. The problem](#user-content-1-the-problem) \u00b7 [2. What changed](#user-content-2-what-changed) \u00b7 [3. How it looks](#user-content-3-how-it-looks) \u00b7 [4. How it works](#user-content-4-how-it-works) \u00b7 [5. Risk](#user-content-5-risk) \u00b7 [6. Technical overview](#user-content-6-technical-overview) \u00b7 [7. Notes](#user-content-7-notes)\n\n## 1. The problem <a id=\"1-the-problem\"></a>\n\nA QUICK PROMPT into a WORKTREE that does not exist yet is two DAEMON round-trips: a `CreateWorktree` (a fetch of `origin/HEAD`, then `git worktree add`) and, once that is acked, a `CreateAgent` (a CLI spawn). For those seconds neither the WORKTREES PANEL nor the SESSIONS PANEL showed anything new, so Enter read as dropped \u2014 and then two rows appeared at once, already selected, with no sign of where they had come from.\n\n> \"right now there is a few second delay before the worktree or session even shows up in the list, it would be nice if they showed up instantly and hooked into the real directories or sessions later after they actually get created. on failure, just undo the optimistic updates.\"\n\n## 2. What changed <a id=\"2-what-changed\"></a>\n\n- **Both rows appear on Enter.**\n  - The WORKTREE row carries the BRANCH NAME GENERATOR name the box offered.\n  - The SESSION row carries the default `agent-1` name and the launch's AGENT KIND.\n  - The cursor lands on them exactly as the real create leaves it; FOCUS stays on the panel `p` was pressed in.\n  - The TERMINAL PANE shows `starting session\u2026` for the stand-in, as it does for any booting session.\n- **They read as pending.**\n  - A hollow `\u25cb` dot and no status sweep, on both rows.\n  - ` creating` where the worktree's ago label sits; ` starting` where the session's harness badge sits.\n- **The DAEMON's answers slide in underneath.**\n  - The `CreateWorktree` Ack turns the stand-in checkout into the real one and moves the session row under it.\n  - The `CreateAgent` Ack turns the stand-in session into the real one and attaches it.\n  - No row jumps in RECENCY ORDER: the stand-in carries the same stamp the DAEMON gives a fresh row.\n- **A refusal undoes it.**\n  - A refused checkout takes both rows down and puts the cursor back where it was before `p`.\n  - A refused session takes only its row down; the checkout is real and stays.\n  - The box comes back with the typed text either way \u2014 as before.\n- **Nothing reaches the DAEMON under a stand-in id.**\n  - Attaching, typing into the pane, the PREWARM POOL and a WORKTREE DELETE all stop at a stand-in.\n  - `n`, `p`, `t` and `d` on one flash `worktree is still being created`.\n- **Unchanged.**\n  - `p` on a selected checkout is one `CreateAgent`, as before.\n  - QUICK PROMPT FOCUS still decides on the Ack whether the pane is entered.\n\n## 3. How it looks <a id=\"3-how-it-looks\"></a>\n\n| The first seconds: stand-in rows, git still cutting the checkout | Settled: the DAEMON's rows in the same places |\n|---|---|\n| ![Right after Enter: a hollow-dot worktree row reading \"sunny-s\u2026 creating\" and a session row reading \"agent-1 starting\", both selected, the pane saying \"starting session\u2026\"](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/rustic-orbit-rambles/quick-prompt-stand-in.png) | ![After the Acks: the same rows now real \u2014 \"amber-w\u2026 just now\" and \"agent-1 just now claude\" \u2014 selected in the same places](https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/rustic-orbit-rambles/quick-prompt-landed.png) |\n\n## 4. How it works <a id=\"4-how-it-works\"></a>\n\n```mermaid\nsequenceDiagram\n  participant U as User\n  participant T as TUI\n  participant D as DAEMON\n  U->>T: Enter in the QUICK PROMPT (a new WORKTREE)\n  Note over T: stage(): stand-in WORKTREE + SESSION rows,<br/>cursor on them, pane reads \"starting\u2026\"\n  T->>D: CreateWorktree \u2014 its PENDING INTENT carries both ids\n  alt the checkout is cut\n    D-->>T: EntityUpserted(Worktree), then Ack\n    Note over T: resolve_worktree(): stand-in becomes the real row,<br/>session row re-homed under it\n    T->>D: CreateAgent \u2014 its intent carries the stand-in session\n    alt the CLI spawns\n      D-->>T: EntityUpserted(Agent), then Ack\n      Note over T: resolve_agent(): stand-in becomes the real row, Attach\n    else refused\n      D-->>T: Error\n      Note over T: discard_agent(): session row down, box back\n    end\n  else refused\n    D-->>T: Error\n    Note over T: discard(): both rows down, cursor back, box back\n  end\n```\n\n## 5. Risk <a id=\"5-risk\"></a>\n\n**Verdict:** \ud83d\udfe2 Low risk \u2014 client-only rows, every DAEMON-facing path checks for a stand-in first, and the full suite is green.\n\n| | Level | Why |\n|---|---|---|\n| \ud83d\udd12 **Security & production** | Low | No new `ClientRequest` and no PROTOCOL VERSION change. The stand-in ids are client-made ULIDs that never leave the TUI: attach, the pane's input, the prewarm, a launch, a terminal and a delete all refuse one. |\n| \u26a1 **Performance** | Low | `is_placeholder_*` scans `app.pending` \u2014 a handful of in-flight intents \u2014 once per drawn row and once per keystroke into the pane. The event drain and the PTY byte path are untouched. |\n| \ud83e\udde9 **Fit with the codebase** | Low | The same PENDING INTENT idiom WORKTREE DELETE's optimistic rollback uses, in its own module. One departure: the stand-in's mark is the intent itself, not a separate set to keep in sync. |\n\n**Rollback:** `git revert <merge>` undoes all of it \u2014 no PROTOCOL VERSION bump, no store migration; the images on `pr-assets` stay.\n\n## 6. Technical overview <a id=\"6-technical-overview\"></a>\n\n- **Mechanism.** `PlaceholderRows { worktree, agent }` rides `PendingIntent::LaunchInCreatedWorktree`, and the `CreateAgent`'s `AttachCreatedWithCloudRetry { placeholder }` carries the session id on (via `AgentLaunchDraft.placeholder`). `App::is_placeholder_worktree` / `is_placeholder_agent` / `is_placeholder_session` scan `app.pending`, so the Ack or Error that removes the intent is what un-marks the row. `stage` pushes real `Worktree` / `Agent` entries into `app.tree` \u2014 an empty `path`, `status_changed_at = now_ms()` to match the DAEMON's stamp \u2014 so every list, sort and count treats them as it would the real ones; `resolve_*` drop the stand-in when the upsert arrived first and rename it in place when the Ack did.\n- **Files.** `crates/nebula-tui/src/event_loop/placeholder.rs` \u2014 stage / resolve / discard, and six tests; `crates/nebula-tui/src/event_loop/quick_launch.rs` \u2014 stages before the `CreateWorktree`, resolves on its Ack; `crates/nebula-tui/src/event_loop.rs` \u2014 `attach_created`, `reopen_prompt_with`, and the guards in `send_attach`, `release_attachment`, `create_agent`, `create_terminal`, the prewarm and the three `Input` sites; `crates/nebula-tui/src/app.rs` \u2014 `PlaceholderRows`, the intent fields, the predicates; `crates/nebula-tui/src/ui.rs` \u2014 the pending look.\n- **Why not a separate placeholder set on `App`.** It would have to be cleared on exactly the Ack or Error that removes the intent \u2014 the intent already is that record, and a set would drift from it.\n- **Two ordering traps the tests caught.** The intent is allocated by `send_with` *after* `stage` runs and removed by the Ack arm *before* the intent runs, so in both windows a stand-in looks real: `stage` builds the pane's `AttachedTerm` by hand (an `attach_now` sent an `Attach` for a made-up id), and `create_agent` takes the name off the stand-in row (`default_session_name` counted it as taken and named the real create `agent-2`).\n- **Gate.** `make ci` green \u2014 fmt, clippy `-D warnings`, the memory / recall / terms checks, and 613 nebula-tui + 196 daemon + 29 e2e tests.\n\n## 7. Notes <a id=\"7-notes\"></a>\n\n- Level with `origin/main`; merges clean.\n- Screenshots from the SCREENSHOT HARNESS: the new `quick-prompt-stand-in` scene, run with `NEBULA_SHOT_SLOW_GIT_SECS=6` \u2014 a new env the harness's stand-in `git` reads so `worktree add` stays open long enough to capture \u2014 and `quick-prompt-landed`, the same keys settled.\n- Also lands three skill-audit edits: PROJECT TERMS' sightings grep now matches code spellings, NEBULA-MEMORY reads `retire:` tails only when enforcement was built, and PROMPT DADDY's worked examples are cut.\n- MEMORY LOG entry: `.claude/memory/entries/2026-09-06-quick-prompt-new-worktree-and-session-rows-show-up-at-once.md`.\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01ATGUFbYKgB5j7uvZWEa1Wh\n",
+    "changedFiles": 16,
+    "closedAt": "2026-09-07T02:24:28Z",
+    "closingIssuesReferences": [],
+    "comments": [],
+    "commits": [
+      {
+        "authoredDate": "2026-09-07T01:30:54Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5.1"
+          }
+        ],
+        "committedDate": "2026-09-07T01:30:54Z",
+        "messageBody": "\u2026 is pressed\n\nWith the HIDE ROOT WORKTREE setting on, `p` on the WORKTREES PANEL used to show nothing for the\nseconds git spent cutting the checkout and the CLI spent booting. Enter now puts the WORKTREE row and\nits SESSION row up at once as stand-ins under client-made ids, carried by the two creates' PENDING\nINTENTs; the DAEMON's Acks turn them into the real rows in place, and an Error takes them down and\nhands the box back. Nothing reaches the DAEMON under a stand-in id.\n\nAlso three skill-audit edits: the PROJECT TERMS sightings grep matches code spellings, NEBULA-MEMORY\nskips the `retire:` reads unless enforcement was built, and PROMPT DADDY drops its worked examples.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01ATGUFbYKgB5j7uvZWEa1Wh",
+        "messageHeadline": "A quick prompt's new worktree and its session appear the moment Enter\u2026",
+        "oid": "f61430740f0be3228eb89c3d602b417945842658"
+      },
+      {
+        "authoredDate": "2026-09-07T01:34:48Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          },
+          {
+            "email": "noreply@anthropic.com",
+            "id": "MDQ6VXNlcjgxODQ3",
+            "login": "claude",
+            "name": "Claude Fable 5.1"
+          }
+        ],
+        "committedDate": "2026-09-07T01:34:48Z",
+        "messageBody": "\u2026es behind the PR's pictures\n\n`scripts/shot/bin/git` is the real git unless NEBULA_SHOT_SLOW_GIT_SECS is set, when `worktree add`\nsleeps that long first \u2014 the window in which a QUICK PROMPT's stand-in rows are on screen.\n`quick-prompt-stand-in` captures that window; `quick-prompt-landed` the same keys settled.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01ATGUFbYKgB5j7uvZWEa1Wh",
+        "messageHeadline": "Screenshot harness: a slow-git stand-in and the two quick-prompt scen\u2026",
+        "oid": "da518c8711da96e26dd3523d178e104326ad76f5"
+      },
+      {
+        "authoredDate": "2026-09-07T01:35:08Z",
+        "authors": [
+          {
+            "email": "webdevcody@gmail.com",
+            "id": "U_kgDOB1g5hQ",
+            "login": "webdevcody",
+            "name": "webdevcody"
+          }
+        ],
+        "committedDate": "2026-09-07T01:35:08Z",
+        "messageBody": "",
+        "messageHeadline": "Record the slow-git screenshot trap in the MEMORY LOG entry",
+        "oid": "bf8e11bf3ada8e6c6fe75386a2695fcaa5ffcacc"
+      }
+    ],
+    "createdAt": "2026-09-07T01:34:51Z",
+    "deletions": 123,
+    "files": [
+      {
+        "additions": 1,
+        "changeType": "MODIFIED",
+        "deletions": 0,
+        "path": ".claude/MEMORY.md"
+      },
+      {
+        "additions": 67,
+        "changeType": "ADDED",
+        "deletions": 0,
+        "path": ".claude/memory/entries/2026-09-06-quick-prompt-new-worktree-and-session-rows-show-up-at-once.md"
+      },
+      {
+        "additions": 4,
+        "changeType": "MODIFIED",
+        "deletions": 4,
+        "path": ".claude/memory/gotchas.md"
+      },
+      {
+        "additions": 3,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": ".claude/skills/nebula-memory/SKILL.md"
+      },
+      {
+        "additions": 6,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": ".claude/skills/project-terms/SKILL.md"
+      },
+      {
+        "additions": 0,
+        "changeType": "MODIFIED",
+        "deletions": 34,
+        "path": ".claude/skills/prompt-daddy/SKILL.md"
+      },
+      {
+        "additions": 5,
+        "changeType": "MODIFIED",
+        "deletions": 3,
+        "path": "TERMS.md"
+      },
+      {
+        "additions": 74,
+        "changeType": "MODIFIED",
+        "deletions": 1,
+        "path": "crates/nebula-tui/src/app.rs"
+      },
+      {
+        "additions": 186,
+        "changeType": "MODIFIED",
+        "deletions": 61,
+        "path": "crates/nebula-tui/src/event_loop.rs"
+      },
+      {
+        "additions": 708,
+        "changeType": "ADDED",
+        "deletions": 0,
+        "path": "crates/nebula-tui/src/event_loop/placeholder.rs"
+      },
+      {
+        "additions": 38,
+        "changeType": "MODIFIED",
+        "deletions": 8,
+        "path": "crates/nebula-tui/src/event_loop/quick_launch.rs"
+      },
+      {
+        "additions": 6,
+        "changeType": "MODIFIED",
+        "deletions": 0,
+        "path": "crates/nebula-tui/src/quick_prompt.rs"
+      },
+      {
+        "additions": 47,
+        "changeType": "MODIFIED",
+        "deletions": 10,
+        "path": "crates/nebula-tui/src/ui.rs"
+      },
+      {
+        "additions": 18,
+        "changeType": "ADDED",
+        "deletions": 0,
+        "path": "scripts/shot/bin/git"
+      },
+      {
+        "additions": 14,
+        "changeType": "ADDED",
+        "deletions": 0,
+        "path": "scripts/shot/scenes/quick-prompt-landed.keys"
+      },
+      {
+        "additions": 15,
+        "changeType": "ADDED",
+        "deletions": 0,
+        "path": "scripts/shot/scenes/quick-prompt-stand-in.keys"
+      }
+    ],
+    "headRefName": "rustic-orbit-rambles",
+    "headRefOid": "bf8e11bf3ada8e6c6fe75386a2695fcaa5ffcacc",
+    "isDraft": false,
+    "labels": [],
+    "mergeCommit": {
+      "oid": "6bcdcf71a5482c285e47f0d15f32e6774e4ffea2"
+    },
+    "mergedAt": "2026-09-07T02:24:28Z",
+    "mergedBy": {
+      "id": "U_kgDOB1g5hQ",
+      "is_bot": false,
+      "login": "webdevcody",
+      "name": "Web Dev Cody"
+    },
+    "milestone": null,
+    "number": 32,
+    "reviewRequests": [],
+    "reviews": [],
+    "state": "MERGED",
+    "title": "A quick prompt's new worktree and its session appear the moment Enter is pressed",
+    "updatedAt": "2026-09-07T02:24:28Z",
+    "url": "https://github.com/AgentSystemLabs/nebula/pull/32"
+  },
+  "review_comments": []
+}
