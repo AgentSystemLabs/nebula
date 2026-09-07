@@ -61,3 +61,7 @@ passed, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo te
 - The main loop drains every queued `ServerEvent` (`while let Ok(ev) = channels.rx.try_recv()`) before a
   draw, so the DAEMON's upsert + Ack pair resolves within one frame — resolution keys on the Ack's id
   alone, no (project, branch) matching against the upsert needed.
+- A transient screen cannot be shot on the SCREENSHOT HARNESS as is: its demo repo has no origin, so
+  the DAEMON's `git worktree add` closes the stand-in window in milliseconds. `scripts/shot/bin/git`
+  is now the real git plus a `NEBULA_SHOT_SLOW_GIT_SECS` sleep before `worktree add`; the
+  `quick-prompt-stand-in` scene runs with it set to 6 (capture lands 1.6 s after the last key).
