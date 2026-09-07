@@ -1,0 +1,14 @@
+# Two quick-prompt sessions, one per checkout; the cursor rests on the second (feature-x).
+# attention-after sends the same keys and then `]`. (tmux spells Shift+Tab `BTab` — `S-Tab`
+# arrives as a plain Tab, which walks INTO the pane and locks input.)
+Tab
+Tab
+p
+Fix the login redirect
+Enter
+BTab
+j
+Tab
+p
+Sort the changelog by date
+Enter
