@@ -50,7 +50,7 @@ dot on a collapsed PROJECT tells you exactly where to look without opening anyth
 | **Agents that drive nebula back** | Tell a Claude SESSION *"do this in a worktree"* and it runs `nebula worktree`, then restarts itself resumed inside the new checkout. Say *"show me the file"* and `nebula open` puts it in front of you in a tabbed modal. Say *"start a new nebula session that…"* and `nebula spawn` has a second agent working beside it before you look. |
 | **Every open pull request, in place** | nebula asks `gh` what's still open on the repo. Rest on a PR ROW and the PR PREVIEW reads it to you — description, stats, the whole conversation. `g` for its diff, `Enter` for the browser, `n` for a SESSION on any harness, scoped to that PR. |
 | **Diff, find, grep, browse** | `g` opens the DIFF VIEWER with REVIEWED MARKS, `f` the FILE FINDER, `F` a `git grep`, `b` the TREE BROWSER — all scoped to the selected WORKTREE, all one key from anywhere. |
-| **`/` finds anything, anywhere** | The PALETTE spans every WORKSPACE, not just the open one. Before you type it sorts by attention: NEEDS FEEDBACK first, then RUNNING, then UNSEEN — so `/` `Enter` is the fastest way back to whatever needs you. |
+| **`/` finds anything, anywhere** | The PALETTE spans every WORKSPACE, not just the open one. Before you type it sorts by attention: NEEDS FEEDBACK first, then RUNNING, then UNSEEN — so `/` `Enter` is the fastest way back to whatever needs you, and `]` / `[` cycle that same attention order with no modal at all, one session per press, workspaces included. |
 | **It follows you to other machines** | `nebula ssh <host>` opens nebula there, installing it if missing. `nebula tunnel <host>` puts that machine's TUI in a browser tab over a single ssh tunnel. |
 
 ## Install
@@ -135,7 +135,8 @@ A dot going violet while you were looking elsewhere is easy to miss, so nebula c
 a turn finishes in a pane that isn't on screen, its WORKTREE and PROJECT rows grow a violet `n done`
 DONE BADGE — the number of terminals you have left to go read — and the SESSION row says `done` where its
 HARNESS BADGE normally sits. Walking the cursor onto a SESSION previews it, which reads it: the badges
-count down as you go and disappear at zero. The flag lives in the DAEMON, so it survives closing the TUI
+count down as you go and disappear at zero — `]` walks you onto the next one owed a look without hunting
+for it. The flag lives in the DAEMON, so it survives closing the TUI
 and is shared by every client; a turn that finishes in the pane you're already looking at never counts.
 
 ## Where the status actually comes from
