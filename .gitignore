@@ -11,5 +11,5 @@ design-screenshots/
 # nebula-managed git worktrees for agent sessions
 /.claude/worktrees/
 
-# python tooling under .claude/ (recall.py, recall_eval.py, terms_check.py)
+# python tooling under scripts/
 __pycache__/

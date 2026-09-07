@@ -5,12 +5,11 @@ user-invocable: true
 ---
 
 A PR description is read three times: by the reviewer deciding whether to open the diff, by the
-person six weeks later asking why the code looks like this, and by the PR ARCHIVE
-(`.claude/memory/prs/`), which renders every merged PR into Markdown so a future agent can grep the
-*why* without a network call. Write for all three: high level first, a picture before a paragraph, the
-mechanism at the bottom where only the reviewer scrolls.
+person six weeks later asking why the code looks like this, and by whoever searches the merged PRs
+for the *why* behind a change. Write for all three: high level first, a picture before a paragraph,
+the mechanism at the bottom where only the reviewer scrolls.
 
-This skill produces the **body**. The title is the commit-subject rule from the RELEASE SKILL: what a
+This skill produces the **body**. The title follows the commit-subject rule: what a
 *user* now gets, not what the diff did ("Workspaces as a top tab bar, and one nebula instance per
 checkout", never "feat(tui): add tabs").
 
@@ -51,16 +50,16 @@ checkout", never "feat(tui): add tabs").
    `🤖 Generated with [Claude Code](https://claude.com/claude-code)` plus the session link) — keep
    it verbatim, last, after a blank line.
 
-Every fact comes from the diff, the commits and the MEMORY LOG entry of the task; do not add a claim
+Every fact comes from the diff and the commits; do not add a claim
 the code does not make. A gate that did not run is stated as such (PR #22: "`cargo test` could not be
 run in this headless session — please run the test suite before merging"), never implied.
 
-## The house style, from the PR ARCHIVE
+## The house style
 
-`.claude/memory/prs/16-*.md` is the reference shape: an opening paragraph that says what landed and
-why in two sentences, `##` sections named for what the user gets, bullets with a **bold lead-in** and
-the key or setting in backticks, a `## Notes` section for merge state and the gate, the footer. Speak
-in the TERMS from `TERMS.md`, in caps, as `AGENTS.md` requires — the archive is grep'd by TERM.
+PR #16 is the reference shape: an opening paragraph that says what landed and why in two sentences,
+`##` sections named for what the user gets, bullets with a **bold lead-in** and the key or setting in
+backticks, a `## Notes` section for merge state and the gate, the footer. Name nebula's mechanisms by
+their capitalised names (DAEMON, TUI, HOOK RECEIVER) so the PRs rhyme.
 
 ## Steps
 
@@ -71,12 +70,11 @@ git fetch origin
 git log --oneline origin/main..HEAD                 # the commits: the story in order
 git diff --stat origin/main...HEAD                  # the files: what the technical overview names
 gh pr view --json number,title,url,body 2>/dev/null # an existing PR to update, or nothing
-grep -ril '<slug or TERM>' .claude/memory/entries   # the task's MEMORY LOG entry: the why and the gotchas
 ```
 
-Read the entry before writing a word: its **Asked** line is the user's own framing of the change,
-its **Gotchas** are the technical overview's best material, and a decision recorded there ("we're not
-doing X because Y") belongs in the body so the reviewer does not re-ask it.
+Read the commit messages before writing a word: they carry the user's framing of the change, and a
+decision recorded there ("we're not doing X because Y") belongs in the body so the reviewer does not
+re-ask it.
 
 ### 2. Pick a template
 
@@ -109,9 +107,7 @@ background while gathering the facts or the first shot waits on a full rebuild �
 an isolated nebula against a demo repo with a stand-in `gh` (`scripts/shot/fixtures/` — add a fixture
 or a `scripts/shot/scenes/<name>.keys` file for the screen the PR needs), drives it in a private tmux
 and writes `design-screenshots/<name>.{txt,ansi,png}`. Its traps are encoded in the script (short
-`NEBULA_RUNTIME_DIR`, `NEBULA_AGENT_CMD=/bin/cat`, one Bash call per drive, `capture-pane -epN`); the
-original recipe is the MEMORY LOG entry
-`.claude/memory/entries/2026-08-20-restyle-focus-wash-and-the-screenshot-harness.md`.
+`NEBULA_RUNTIME_DIR`, `NEBULA_AGENT_CMD=/bin/cat`, one Bash call per drive, `capture-pane -epN`).
 
 Take the "before" shot from an `origin/main` build only when the template asks for a pair. Crop
 nothing; the whole screen at `190x50` is the house frame, and `design-screenshots/` shows the look.
@@ -135,8 +131,8 @@ git -C "$R" worktree remove "$W"
 Then reference each image as
 `https://raw.githubusercontent.com/AgentSystemLabs/nebula/pr-assets/<branch-name>/<name>.png`.
 Two images side by side is a two-column table with one `![…](url)` per cell — GitHub scales them to
-the cell. Give every image alt text that says what it shows; the PR ARCHIVE keeps the alt text, not
-the pixels.
+the cell. Give every image alt text that says what it shows; a text search of the PR keeps the alt
+text, not the pixels.
 
 When no screenshot can be produced (no display path, harness broken, a pure daemon change), leave
 the section in with the fenced terminal output and one line saying why there is no PNG. Do not delete
@@ -165,7 +161,7 @@ first?
 ### 7. Open or update the PR
 
 Always `--body-file`, never `--body "$(cat …)"`: backticks in the body would be command-substituted
-by zsh, and the GUARD HOOK only catches that for `git commit -m`.
+by zsh.
 
 ```bash
 gh pr create --title "<title>" --body-file <scratchpad>/pr-body.md          # new
@@ -175,7 +171,7 @@ gh pr edit <number> --body-file <scratchpad>/pr-body.md                     # up
 `gh pr create` needs the branch pushed and an account with write access — `gh auth status`; the
 admin account is `webdevcody`, and `gh auth switch --hostname github.com --user webdevcody` if it
 drifted. Add `--draft` when the gate has not run. Put `Closes #N` in the body, not the title, so
-GitHub links the issue. After it lands, print the PR URL; the PR ARCHIVE picks it up on merge.
+GitHub links the issue. After it lands, print the PR URL.
 
 ## GitHub anchors
 
@@ -202,7 +198,7 @@ prefix:
 The id is the heading text lower-cased, emoji and punctuation dropped, spaces to single hyphens, no
 leading hyphen (GitHub's *file* slugs keep one after a stripped emoji; ours never do). Two headings
 with the same text get `-1`, `-2`. The anchor sits at the *end* of the heading line so the raw
-Markdown — the PR PREVIEW, the PR ARCHIVE, `gh pr view` — still reads as a heading; the anchor itself
+Markdown — the PR PREVIEW, `gh pr view` — still reads as a heading; the anchor itself
 never carries the prefix (GitHub would double it). The templates already carry the anchors and the
 prefixed links for their own headings; when you rename or add a heading, add its anchor and recompute
 the link. This checks a body file:

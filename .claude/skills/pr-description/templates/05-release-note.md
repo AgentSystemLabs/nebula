@@ -1,5 +1,5 @@
-<!-- 05 · Release note — the PR is most of a release. The groups mirror the RELEASE NOTES the
-     RELEASE SKILL writes, so the changelog can be lifted from the body when the tag is cut. -->
+<!-- 05 · Release note — the PR is most of a release. The groups mirror the GitHub RELEASE NOTES,
+     so the changelog can be lifted from the body when the tag is cut. -->
 
 **This PR:** <the release in half a sentence, naming the headline items in the order the groups use.>
 
@@ -21,7 +21,7 @@
 
 - **<Hook>.** <…>
 
-<!-- Reuse the RELEASE SKILL's group names when they fit: 🚀 Launch faster · 🔔 Know when it's done ·
+<!-- Reuse the release notes' group names when they fit: 🚀 Launch faster · 🔔 Know when it's done ·
      🧭 Lists that look after themselves · 🫥 Shape the screen · 🔌 Reach it from anywhere. -->
 
 ## 🚧 Heads up <a id="heads-up"></a>

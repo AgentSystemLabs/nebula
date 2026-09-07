@@ -1,6 +1,6 @@
 ---
 name: pr-reviewer
-description: "Review a pull request by reading alone — its diff, description, CI state, the surrounding code at base and head, and the MEMORY LOG for the area — and leave one review comment on the PR that weighs, in this order, the security and production-merge risk of the change, its performance cost, and whether it follows the patterns already in this codebase. It never builds, tests, executes, installs or checks out the PR, and never approves or requests changes. Use when the user says \"review this PR\", \"review PR 26\", \"pr review\", \"pr reviewer\", \"is this safe to merge\", \"what would merging this break\", or asks for a risk read on a pull request."
+description: "Review a pull request by reading alone — its diff, description, CI state and the surrounding code at base and head — and leave one review comment on the PR that weighs, in this order, the security and production-merge risk of the change, its performance cost, and whether it follows the patterns already in this codebase. It never builds, tests, executes, installs or checks out the PR, and never approves or requests changes. Use when the user says \"review this PR\", \"review PR 26\", \"pr review\", \"pr reviewer\", \"is this safe to merge\", \"what would merging this break\", or asks for a risk read on a pull request."
 user-invocable: true
 ---
 
@@ -49,10 +49,8 @@ Forbidden, whatever the PR is — when a review seems to need one of these, it n
   on any file the PR adds or changes — reading a script means `cat`, not `sh -n`.
 - `gh pr checkout`, `git checkout`, `git switch`, `git merge`, `git rebase`, `git apply`,
   `git cherry-pick`, `git stash`, `git worktree add`, `git reset` — nothing that moves the SHARED
-  CHECKOUT or creates a tree; editing or creating any file inside the repo, with one carve-out: the
-  SELF-IMPROVING LOOP's own files — `.claude/MEMORY.md`, `.claude/memory/`, `TERMS.md` — which
-  NEBULA-MEMORY and PROJECT TERMS write *after* the review is posted, as on every other task. Nothing
-  from the PR ever lands on disk; the review itself is written to the scratchpad, outside the repo.
+  CHECKOUT or creates a tree; editing or creating any file inside the repo. Nothing from the PR ever
+  lands on disk; the review itself is written to the scratchpad, outside the repo.
 - `gh pr review --approve`, `gh pr review --request-changes`, `gh pr merge`, `gh pr edit`,
   `gh pr close`, `gh pr comment` — the skill posts exactly one `--comment` review and changes nothing
   else about the PR. Approval is a human's signature.
@@ -91,22 +89,21 @@ INSTALL.SH is the review's first finding.
 ### 2. Read what the repo already knows about this area
 
 ```bash
-grep -rilE '<each touched file basename>|<each TERM the PR touches>' .claude/memory/entries .claude/memory/prs | head   # one -E pattern: BRE `\|` is GNU-only, and a branch padded with spaces never matches a backticked name
-grep -n '<TERM>' .claude/memory/gotchas.md
+git log --oneline -15 origin/<baseRefName> -- <each touched path>                  # the last changes to the same files, and the PRs that made them
+gh pr list --repo $R --state merged --search '<touched file basename>' --limit 5     # earlier PRs on the same area, and what their reviews pushed back on
 ```
 
-A STANDING GOTCHAS line the diff steps on again is a finding, with the entry as evidence. A recorded
-decision ("we are not doing X because Y") the diff reverses is a finding unless the description shows
-it knows. The PR ARCHIVE shows what a reviewer pushed back on the last time this file changed.
-`TERMS.md` names the mechanism each file belongs to — use those names in the review.
+A decision an earlier commit or PR recorded ("we are not doing X because Y") that the diff reverses
+is a finding unless the description shows it knows. The earlier PRs on the same file show what a
+reviewer pushed back on the last time it changed.
 
 ### 3. Read the diff, then the code around it
 
 Read `pr.diff` hunk by hunk in risk order: `.github/`, INSTALL.SH, `Cargo.toml` / `Cargo.lock`,
 `build.rs`; then `nebula-daemon/src/server.rs`, `hooks/`, `registry.rs` (spawn, argv, system prompt),
 `store.rs` (`MIGRATIONS`), `nebula-core/src/protocol.rs` (PROTOCOL VERSION), `sibling.rs`, `ssh.rs`,
-`tunnel.rs`, `upgrade.rs`, `browser.rs`, `paths.rs`, `lifecycle.rs`; then the TUI; then docs and the
-MEMORY LOG files. A hunk is not a unit of meaning: for every function the diff touches, `git show
+`tunnel.rs`, `upgrade.rs`, `browser.rs`, `paths.rs`, `lifecycle.rs`; then the TUI; then docs.
+A hunk is not a unit of meaning: for every function the diff touches, `git show
 <headRefOid>:<path>` the whole function and `git show $(cat $S/pr.base):<path>` its previous shape —
 the merge base, never `origin/<base>` — and `git grep` the callers of anything whose signature or
 contract moved.
@@ -114,7 +111,7 @@ contract moved.
 ### 4. Security and production-merge risk — first and heaviest
 
 Ask of each hunk: who can reach it, and what can it reach. Nebula's surfaces, with the facts a review
-can lean on (the 2026-08-30 security walkthrough in the MEMORY LOG is the source):
+can lean on:
 
 - **DAEMON SOCKET.** `handle_client` (`server.rs`) checks only the PROTOCOL VERSION, then honours every
   `ClientRequest`; the boundary is the 0700 runtime dir, on macOS under world-writable `/tmp`. A new or
@@ -165,7 +162,7 @@ more often than it must. A cost paid once at launch is a Nit; the same cost per 
 
 The patterns are written down; check the diff against them rather than against taste:
 
-- **KEEP MODULES SMALL** (`.claude/rules/rust-modules.md`): a change that grows `event_loop.rs`,
+- **Keep modules small**: a change that grows `event_loop.rs`,
   `ui.rs` or `registry.rs` where a new module beside it would do; a `match` that gained arms it should
   have delegated.
 - **Reuse before re-implementation** — `git grep` for the helper before flagging: `shell_single_quote`
@@ -179,9 +176,8 @@ The patterns are written down; check the diff against them rather than against t
   timestamps compare as strings; there is no `chrono`).
 - **Tests beside the change**: TESTBACKEND for TUI drawing, `handle_key`-driven unit tests, E2E TUI and
   E2E PTY for DAEMON behaviour; a behaviour change with no test is a Should fix.
-- **The words**: TERMS in comments, docs and messages; `docs/*.md` and the `--help` page updated when a
-  key, command or setting changes; a MEMORY LOG entry for a non-trivial change — the SELF-IMPROVING
-  LOOP expects one.
+- **The words**: the codebase's capitalised names (DAEMON, HOOK RECEIVER, STATUS MACHINE) in comments,
+  docs and messages; `docs/*.md` and the `--help` page updated when a key, command or setting changes.
 
 Compare the new code's shape to its nearest sibling — a new overlay to an existing overlay, a new hook
 dialect to `install_codex_hooks`. The sibling is the pattern.
@@ -225,7 +221,7 @@ What the description claims · what the diff touches · anything outside the cla
 Rules of the body: every finding carries a `path:line` from the PR's side of the diff and a severity;
 *confirmed* and *suspected* are never blurred; a number comes from `pr.json` or a command you ran;
 nothing the automated Claude Code Review already posted inline is re-listed — cite it ("the inline
-comment at `app.rs:1204` stands"); TERMS in caps; bold lead-ins, one emoji per heading, none on
+comment at `app.rs:1204` stands"); the codebase's names in caps; bold lead-ins, one emoji per heading, none on
 bullets; under ~70 lines unless the Blockers need more. Speak to the author, not about them.
 
 ### 8. Post it — the one write
@@ -235,8 +231,7 @@ gh auth status                                                      # the accoun
 gh pr review $N --repo $R --comment --body-file <scratchpad>/pr-review.md
 ```
 
-Always `--body-file` — backticks in `--body "…"` are command-substituted by zsh, and the GUARD HOOK
-only catches that for `git commit -m`. `--comment` works on your own PR too (GitHub refuses
+Always `--body-file` — backticks in `--body "…"` are command-substituted by zsh. `--comment` works on your own PR too (GitHub refuses
 `--approve` and `--request-changes` there). Then print the review URL and the body in the reply. When
 the user asks for the review in chat only ("don't post", "just tell me"), stop before this step and
 print the body — the file is the deliverable either way.
