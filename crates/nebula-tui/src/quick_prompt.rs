@@ -181,6 +181,12 @@ pub(crate) fn open_quick_prompt(app: &mut App) {
         app.flash = Some("quick prompt: select a worktree first".into());
         return;
     };
+    // The stand-in a previous `p` put up: git is still cutting it, and
+    // the box would only be refused at Enter.
+    if app.is_placeholder_worktree(&worktree) {
+        app.flash = Some("quick prompt: worktree is still being created".into());
+        return;
+    }
     open_for(app, QuickTarget::Worktree(worktree));
 }
 

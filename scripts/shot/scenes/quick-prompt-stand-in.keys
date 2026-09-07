@@ -1,0 +1,15 @@
+# Hide root worktree on, p on the WORKTREES PANEL, a task typed, Enter — captured while git is still
+# cutting the checkout (run with NEBULA_SHOT_SLOW_GIT_SECS=6): the stand-in WORKTREE and SESSION rows.
+s
+Tab
+Tab
+Tab
+Tab
+j
+Enter
+Escape
+Escape
+Tab
+p
+Add a retry to the login redirect
+Enter

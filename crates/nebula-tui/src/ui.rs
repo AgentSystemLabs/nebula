@@ -2219,6 +2219,12 @@ const MIN_NAME_W: usize = 8;
 /// been working for an hour says "1h ago" — when you last spoke to it —
 /// instead of a permanent "just now". Worktree and project rows pass the
 /// newest stamp under them and read the same way.
+/// The trailing badge of a QUICK PROMPT stand-in row, in the slot the
+/// ago label (worktree) or the harness name (session) takes on a real
+/// row.
+pub(crate) const PENDING_WORKTREE_BADGE: &str = " creating";
+pub(crate) const PENDING_SESSION_BADGE: &str = " starting";
+
 fn ago_badge(status_changed_at: i64) -> String {
     if status_changed_at <= 0 {
         return String::new();
@@ -2759,7 +2765,10 @@ type ProjectRowData = (String, Option<String>, Option<AgentStatus>, usize, i64);
 
 /// The same for the Worktrees panel: branch, is-root, rollup,
 /// unwatched-finish count, last-turn stamp.
-type WorktreeRowData = (String, bool, Option<AgentStatus>, usize, i64);
+/// One WORKTREES PANEL row: branch, root-ness, status rollup, unseen
+/// count, recency stamp, and whether it is a QUICK PROMPT stand-in the
+/// DAEMON has not cut yet.
+type WorktreeRowData = (String, bool, Option<AgentStatus>, usize, i64, bool);
 
 /// Columns between the `WORKSPACES` label and the first tab.
 const TAB_GAP: u16 = 2;
@@ -2926,6 +2935,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 app.worktree_rollup(&w.id),
                 app.worktree_unseen(&w.id),
                 app.worktree_recency(&w.id).stamped,
+                app.is_placeholder_worktree(&w.id),
             )
         })
         .collect();
@@ -3039,9 +3049,13 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
             WorktreeEntry::Row(i) if *i < worktrees.len() => {
-                let (branch, is_main, roll, unseen, stamped) = &worktrees[*i];
+                let (branch, is_main, roll, unseen, stamped, pending) = &worktrees[*i];
                 let (badges, badge_len) = row_badges(*unseen, th);
-                let ramp = sweep_ramp(*roll, th, app.animations);
+                // A stand-in checkout (QUICK PROMPT, git still cutting
+                // it) reads as not-there-yet: hollow dot, no sweep, and
+                // the word where the ago label would sit.
+                let roll = if *pending { None } else { *roll };
+                let ramp = sweep_ramp(roll, th, app.animations);
                 // 3, not 2: the dot's two cells plus the pill marker
                 // `render_pill` prepends — bill them here or the trailing
                 // badge is what falls off the end of a twenty-cell column.
@@ -3050,7 +3064,12 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 // something — the stamp the group is sorted on, so the
                 // label is what makes the order legible. It yields to the
                 // branch name first (same rule as the session rows)...
-                let (ago, free) = fit_ago(ago_badge(*stamped), free);
+                let ago = if *pending {
+                    PENDING_WORKTREE_BADGE.to_string()
+                } else {
+                    ago_badge(*stamped)
+                };
+                let (ago, free) = fit_ago(ago, free);
                 // ...and the root badge then yields to a branch it would push
                 // into an ellipsis: in a narrow column `main 1 done` beats
                 // `ma… ⌂ root 1 done` — the ⌂ is the least load-bearing
@@ -3069,7 +3088,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     None
                 };
                 let max = free - root.map_or(0, |r| r.chars().count());
-                let mut spans = vec![status_dot(*roll, *unseen > 0, th)];
+                let mut spans = vec![status_dot(roll, *unseen > 0, th)];
                 spans.extend(status_name_spans(
                     truncate(branch, max),
                     Style::default(),
@@ -3093,7 +3112,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     *i == app.sel_worktree,
                     focused,
                     th,
-                    status_color(*roll, *unseen > 0, th),
+                    status_color(roll, *unseen > 0, th),
                 );
                 if let Some(hit) = rows_rect_at(inner, y, hit_h) {
                     app.hits.push((hit, HitTarget::Worktree(*i)));
@@ -3327,8 +3346,14 @@ fn draw_session_row(
     // agent row, the accent on the rows that have no dot.
     let (spans, mark) = match row {
         SessionRow::Agent(a) => {
+            // A stand-in session (QUICK PROMPT, its create still in
+            // flight) reads as not-there-yet: hollow dot, no sweep, and
+            // the word in the badge slot the harness would take.
+            let pending = app.is_placeholder_agent(&a.id);
             let dot = if a.archived {
                 Span::styled("⊘ ", Style::default().fg(th.dim))
+            } else if pending {
+                status_dot(None, false, th)
             } else {
                 status_dot(Some(a.status), a.unseen && !a.archived, th)
             };
@@ -3347,7 +3372,12 @@ fn draw_session_row(
             // goes loud (as a link row's unread count does): these rows
             // are what the parent rows' counts are counting, so each one
             // says so until the cursor lands on it.
-            let (badge, badge_style) = if a.unseen && !a.archived {
+            let (badge, badge_style) = if pending {
+                (
+                    PENDING_SESSION_BADGE.to_string(),
+                    Style::default().fg(th.dim),
+                )
+            } else if a.unseen && !a.archived {
                 (" done".to_string(), Style::default().fg(th.done))
             } else if a.cloud_mirroring && !a.archived {
                 // Following the cloud session: the pane is re-pulled on a
@@ -3366,13 +3396,20 @@ fn draw_session_row(
             // How long since this session last did anything, sat between
             // the name and the harness. The list is sorted on this stamp,
             // so the label is what makes the order legible.
-            let ago = ago_badge(a.status_changed_at);
+            // A stand-in carries the DAEMON's create stamp so it sorts
+            // where the real row will, but "just now" beside "starting"
+            // would say it has done something.
+            let ago = if pending {
+                String::new()
+            } else {
+                ago_badge(a.status_changed_at)
+            };
             // 3 = the pill's selection marker plus the status dot, both of
             // which render ahead of the name.
             let free = (width.saturating_sub(3) as usize).saturating_sub(badge.chars().count());
             let (ago, name_max) = fit_ago(ago, free);
             // Archived rows stay quiet even if their last status was live.
-            let ramp = if a.archived {
+            let ramp = if a.archived || pending {
                 None
             } else {
                 sweep_ramp(Some(a.status), th, app.animations)
@@ -3388,7 +3425,7 @@ fn draw_session_row(
                 spans.push(Span::styled(ago, Style::default().fg(th.dim)));
             }
             spans.push(Span::styled(badge, badge_style));
-            let mark = if a.archived {
+            let mark = if a.archived || pending {
                 th.dim
             } else {
                 status_color(Some(a.status), a.unseen, th)
