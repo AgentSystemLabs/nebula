@@ -27,6 +27,7 @@ use ratatui::Terminal;
 use std::io::{BufWriter, Stdout};
 use std::time::Duration;
 
+mod alerts;
 mod focus_walk;
 mod host_terminal;
 mod placeholder;
@@ -502,9 +503,27 @@ async fn main_loop(
 
         // A turn reached FINISHED: ring the DONE SOUND. The bell goes out
         // through the same terminal as the OSC writes above, so over ssh it
-        // rings the terminal the user is sitting at.
+        // rings the terminal the user is sitting at. CONFIG.JSON is read
+        // fresh, like every other setting.
         if std::mem::take(&mut app.pending_ding) {
-            play_done_sound(terminal.backend_mut());
+            if let Some(sound) = crate::config::Config::load().done_sound() {
+                alerts::play_sound(terminal.backend_mut(), sound);
+            }
+        }
+
+        // One or more turns stopped to ask the user: ring the FEEDBACK
+        // SOUND once for the lot and, while the terminal window is in the
+        // background, name each of them in a desktop notification — never
+        // over ssh, where the desktop is the wrong machine's. `off` is
+        // silence for both.
+        let alerts = std::mem::take(&mut app.pending_feedback);
+        if !alerts.is_empty() {
+            if let Some(sound) = crate::config::Config::load().feedback_sound() {
+                alerts::play_sound(terminal.backend_mut(), sound);
+                if !app.window_focused && !app.is_remote {
+                    alerts::notify_desktop(&alerts);
+                }
+            }
         }
 
         for req in out.drain(..) {
@@ -1207,7 +1226,13 @@ fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientReques
         Event::Resize(_, _) => app.dirty = true,
         // The terminal window took focus again — most often back from a
         // browser tab where a pull request was just merged or closed.
-        Event::FocusGained => schedule_pull_request_refresh(app),
+        Event::FocusGained => {
+            app.window_focused = true;
+            schedule_pull_request_refresh(app);
+        }
+        // …and left it: from here until it is back, a session that stops
+        // to ask gets a desktop notification, since the pane can't be seen.
+        Event::FocusLost => app.window_focused = false,
         _ => {}
     }
 }
@@ -5747,33 +5772,6 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Ring the DONE SOUND once: a named system sound goes to `afplay`
-/// (detached; a helper thread reaps it so no zombie lingers), anything
-/// else — and an `afplay` that won't start — is the terminal BEL written
-/// through `backend`. Reads CONFIG.JSON fresh, like every other setting.
-fn play_done_sound<W: std::io::Write>(backend: &mut W) {
-    let Some(sound) = crate::config::Config::load().done_sound() else {
-        return;
-    };
-    if let crate::config::DoneSound::File(path) = &sound {
-        use std::process::{Command, Stdio};
-        if let Ok(mut child) = Command::new("afplay")
-            .arg(path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-            return;
-        }
-    }
-    let _ = backend.write_all(b"\x07");
-    let _ = backend.flush();
-}
-
 /// Copy to *this machine's* system clipboard.
 /// macOS: pbcopy. Linux: wl-copy on Wayland, xclip (or xsel) on X11.
 fn copy_to_clipboard(text: &str) -> bool {
@@ -6825,6 +6823,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // re-sorts those columns too.
             // Every cursor stays on the row it was on.
             let before = selection_snapshot(app);
+            let mut went_red = false;
             if let Some(a) = app.tree.agents.iter_mut().find(|a| a.id == agent) {
                 // The RUNNING / NEEDS FEEDBACK → FINISHED edge — the one
                 // that raises UNSEEN — rings the DONE SOUND, whether or not
@@ -6838,6 +6837,10 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 {
                     app.pending_ding = true;
                 }
+                // The edge *into* NEEDS FEEDBACK is the FEEDBACK SOUND's;
+                // a re-stamp of a row already red is not.
+                went_red = status == nebula_core::AgentStatus::NeedsFeedback
+                    && a.status != nebula_core::AgentStatus::NeedsFeedback;
                 a.status = status;
                 a.status_changed_at = changed_at;
                 a.unseen = unseen;
@@ -6851,6 +6854,17 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 .is_some_and(|t| t.sref == SessionRef::Agent(agent.clone()));
             if unseen && on_screen {
                 mark_agent_seen(app, &agent, out);
+            }
+            // A prompt in the pane the user is locked into typing at, with
+            // the window focused, is already under their hands: a sound
+            // there is noise. Previewing the pane from a panel is not
+            // typing at it, and a window in the background can't be seen —
+            // both ring, and the second is the whole point.
+            let under_hands = on_screen && app.term_locked && app.window_focused;
+            if went_red && !under_hands {
+                if let Some(alert) = alerts::alert_for(&app.tree, &agent) {
+                    app.pending_feedback.push(alert);
+                }
             }
             // Nothing left any list, so this only re-seats the cursors.
             reconcile_selection_inner(app, before, out);
@@ -7322,6 +7336,7 @@ fn clamp_selections(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::FeedbackAlert;
     use nebula_core::{AgentId, LinkId, ServerEvent, SessionRef};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -7498,6 +7513,131 @@ mod tests {
                 .any(|r| matches!(r, ClientRequest::MarkAgentSeen { id } if *id == a2)),
             "{out:?}"
         );
+    }
+
+    /// The FEEDBACK SOUND queues on the edge into NEEDS FEEDBACK only — not
+    /// on a re-stamp of a row already red, not on the way out to FINISHED
+    /// (that edge is the DONE SOUND's) — and every session that stops in
+    /// one frame is queued once, named as its row reads, so the desktop
+    /// notification can say who and where. The frame's drain rings once
+    /// for the lot.
+    #[test]
+    fn a_turn_stopping_to_ask_queues_the_feedback_alert() {
+        use nebula_core::AgentStatus;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_agent(&mut app, AgentStatus::Running);
+        assert!(app.pending_feedback.is_empty(), "the snapshot is silent");
+        let flip = |agent: &str, status: AgentStatus| ServerEvent::StatusChanged {
+            agent: AgentId(agent.into()),
+            status,
+            changed_at: crate::app::now_ms(),
+            unseen: status == AgentStatus::Finished,
+        };
+
+        hse(&mut app, flip("a2", AgentStatus::NeedsFeedback));
+        assert_eq!(
+            app.pending_feedback,
+            vec![FeedbackAlert {
+                session: "agent-2".into(),
+                place: "demo · main".into(),
+            }]
+        );
+        assert!(!app.pending_ding, "waiting on the user is not done");
+
+        hse(&mut app, flip("a2", AgentStatus::NeedsFeedback));
+        assert_eq!(
+            app.pending_feedback.len(),
+            1,
+            "a re-stamp of a red row is silent"
+        );
+
+        app.pending_feedback.clear();
+        hse(&mut app, flip("a2", AgentStatus::Finished));
+        assert!(
+            app.pending_feedback.is_empty(),
+            "leaving red is the done sound's edge"
+        );
+        assert!(app.pending_ding);
+
+        // Two sessions stopping in one frame: two names for the
+        // notification; the drain plays the sound once for both.
+        hse(&mut app, flip("a1", AgentStatus::Running));
+        hse(&mut app, flip("a1", AgentStatus::NeedsFeedback));
+        hse(&mut app, flip("a2", AgentStatus::Running));
+        hse(&mut app, flip("a2", AgentStatus::NeedsFeedback));
+        let names: Vec<_> = app
+            .pending_feedback
+            .iter()
+            .map(|a| a.session.as_str())
+            .collect();
+        assert_eq!(names, ["agent-1", "agent-2"]);
+    }
+
+    /// A turn that stops to ask in the pane the user is locked into typing
+    /// at, terminal window focused, is already in front of them: nothing
+    /// is queued. Previewing that pane from a panel (unlocked) still
+    /// rings — the cursor may be on another row — and so does a locked
+    /// pane in a window that lost focus, which is the whole point.
+    #[test]
+    fn a_red_turn_in_the_pane_you_are_typing_at_is_silent() {
+        use nebula_core::AgentStatus;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_agent(&mut app, AgentStatus::Running);
+        let a2 = AgentId("a2".into());
+        let flip = |status: AgentStatus| ServerEvent::StatusChanged {
+            agent: a2.clone(),
+            status,
+            changed_at: crate::app::now_ms(),
+            unseen: false,
+        };
+        app.term = Some(AttachedTerm::new(SessionRef::Agent(a2.clone()), 40, 10));
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        assert!(
+            app.window_focused,
+            "a fresh TUI assumes the window has focus"
+        );
+
+        hse(&mut app, flip(AgentStatus::NeedsFeedback));
+        assert!(
+            app.pending_feedback.is_empty(),
+            "the prompt is on screen, under the user's hands"
+        );
+
+        // Unlocked: the pane merely previews it, the user is on the panels.
+        hse(&mut app, flip(AgentStatus::Running));
+        app.term_locked = false;
+        hse(&mut app, flip(AgentStatus::NeedsFeedback));
+        assert_eq!(app.pending_feedback.len(), 1, "previewing is not typing at");
+
+        // Locked, but the terminal window went to the background.
+        app.pending_feedback.clear();
+        hse(&mut app, flip(AgentStatus::Running));
+        app.term_locked = true;
+        let mut out = Vec::new();
+        handle_terminal_event(&mut app, Event::FocusLost, &mut out);
+        assert!(!app.window_focused);
+        hse(&mut app, flip(AgentStatus::NeedsFeedback));
+        assert_eq!(
+            app.pending_feedback.len(),
+            1,
+            "nobody is looking at that pane"
+        );
+        handle_terminal_event(&mut app, Event::FocusGained, &mut out);
+        assert!(app.window_focused);
+
+        // Another session's pane on screen, locked, makes no difference.
+        app.pending_feedback.clear();
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            40,
+            10,
+        ));
+        hse(&mut app, flip(AgentStatus::Running));
+        hse(&mut app, flip(AgentStatus::NeedsFeedback));
+        assert_eq!(app.pending_feedback.len(), 1);
     }
 
     /// The badges: project and worktree rows count their unwatched finishes
