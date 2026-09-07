@@ -3,8 +3,8 @@
 
 Fires once per closed task: after a turn in which the NEBULA-MEMORY SKILL ran (the SELF-IMPROVING
 LOOP's own "a task ended" signal), not again until another task closes, and not within the per-project
-cooldown (off by default — every closed task is audited; `NEBULA_SKILL_AUDIT_COOLDOWN_MIN` spaces them
-out when several sessions run at once). It judges nothing
+cooldown (a week by default since 2026-09-06 — the state lives in /tmp, so a reboot restarts the clock;
+`NEBULA_SKILL_AUDIT_COOLDOWN_MIN=0` audits every closed task again). It judges nothing
 itself. It hands the agent — which still holds the whole turn in context — a short brief: which skills
 it invoked this session, how long each body is, and what to answer about each (what in the body it
 followed, what it ignored, what cost tokens and changed nothing), then asks it to put at most three
@@ -22,7 +22,7 @@ Stop hook; that is the audit turn itself, and it is never re-triggered.
 State (ephemeral on purpose): /tmp/nebula-skill-audit-<uid>/ — per session, how many memory writes had
 happened at the last audit; per project, when the last audit ran.
 
-Env: NEBULA_SKILL_AUDIT=off disables it · NEBULA_SKILL_AUDIT_COOLDOWN_MIN (default 0) ·
+Env: NEBULA_SKILL_AUDIT=off disables it · NEBULA_SKILL_AUDIT_COOLDOWN_MIN (default 10080, a week) ·
 NEBULA_SKILL_AUDIT_TRIGGER=any fires after any skill, not only nebula-memory ·
 NEBULA_SKILL_AUDIT_STATE overrides the state dir (tests).
 
@@ -36,7 +36,7 @@ import sys
 import time
 
 TRIGGER_SKILL = "nebula-memory"
-DEFAULT_COOLDOWN_MIN = 0  # every closed task (the user's pick, 2026-09-05); raise it to space audits out
+DEFAULT_COOLDOWN_MIN = 7 * 24 * 60  # weekly (2026-09-06: per-task audits were ceremony the A/B priced); 0 = every closed task
 MAX_PROPOSALS = 3
 
 

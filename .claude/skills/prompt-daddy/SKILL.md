@@ -1,6 +1,6 @@
 ---
 name: prompt-daddy
-description: "Before starting any new task, rewrite the user's prompt once into the best fully specified version of it — the ambiguous words closed, the unstated \"keep X as-is\" named, the why and the evidence in place, the user's aliases replaced by the ALL-CAPS TERMS from TERMS.md — asking the user only for the context the work cannot proceed without (who, what, when, where, why, how), then log the final prompt and proceed on it without asking whether it is right. Use on every new request: feature asks, bug reports, questions, refactors. Also use when the user says \"prompt daddy\", \"prompt doctor\", \"improve my prompt\", \"tighten this prompt\", or \"what should I have asked\"."
+description: "Before starting any new task, rewrite the user's prompt once into the best fully specified version of it — the ambiguous words closed, the unstated \"keep X as-is\" named, the why and the evidence in place, the user's aliases replaced by the ALL-CAPS TERMS from TERMS.md — asking the user only for the context the work cannot proceed without (who, what, when, where, why, how), then log the final prompt and proceed on it without asking whether it is right. Use on a new request whose words the recall hook could not settle: an alias that maps to two TERMS, a spec hanging on one word, a bug report with no evidence, a visual ask with no target; a prompt that already says what to change, what to keep and why is worked from as written. Also use when the user says \"prompt daddy\", \"prompt doctor\", \"improve my prompt\", \"tighten this prompt\", or \"what should I have asked\"."
 user-invocable: true
 ---
 
@@ -25,7 +25,10 @@ a question, not a guess.
 
 ## When to run it
 
-On every new prompt from the user — a feature, a bug report, a question, a refactor, a "debug this".
+On a new prompt whose words the RECALL HOOK could not settle — an alias that maps to two TERMS, a spec
+hanging on one word, a bug report with no evidence, a visual ask with no target, a change that never
+says what stays. A prompt that already names what to change, what to keep and why is worked from as
+written; `CLAUDE.md`'s trigger table is the gate.
 Run it after reading `.claude/MEMORY.md` (the index), `.claude/memory/gotchas.md`, `TERMS.md` and
 whatever the RECALL HOOK injected under `[nebula recall]`, and before planning, grepping the code in
 earnest, or answering.
@@ -183,37 +186,3 @@ Downstream, this logged text is what the other skills use:
   the rewrite underneath on the correction line it already allows — "→ refined: ‹text›" — with each
   question asked and its answer in a following parenthesis ("(asked: which 'done' → UNSEEN)"). Future
   analysis of how prompts get refined depends on both surviving.
-
-## Worked examples
-
-**A prompt that has to ask.** Original (from the MEMORY LOG, 2026-08-27): *"can you make the status dot for
-done a different color than green so it's obvious something needs to be addressed"*
-
-"done" sits in the Alias index under both UNSEEN and FINISHED, and the two are different code paths
-(one flag that clears on focus, one status that never does). The work hinges on which — so one
-question, header `Which "done"`, options *UNSEEN — finished while I wasn't looking, back to green once
-I focus it (Recommended)* / *FINISHED — every finished SESSION, whether or not I've looked*. The user
-picks the first. The logged prompt:
-
-> Refined prompt:
->
-> > SESSIONS that finished while I wasn't looking (UNSEEN) should show a violet STATUS DOT; once I
-> > focus that SESSION it goes back to the normal green. Use the same UNSEEN flag the DONE BADGE
-> > already counts — don't add a second notion of "needs attention". RUNNING stays yellow.
-
-That is the sentence the user eventually typed by hand, three turns later.
-
-**A prompt that does not.** Original: *"the top nav should show the branch name next to each
-workspace, keep it short"*
-
-Every blank has a default: "top nav" is the WORKSPACES BAR by the Alias index, "the branch name" is the
-WORKTREE's branch, and "short" has a literal example in the MEMORY LOG's own tab-title convention. No
-question. The logged prompt:
-
-> Refined prompt:
->
-> > In the WORKSPACES BAR (the top nav), show each WORKSPACE's WORKTREE branch name after its title,
-> > dimmed, truncated to ~16 characters with `…` (assuming `fix-login-redirect` → `fix-login-redir…`).
-> > Keep the tab underline and the current tab order exactly as they are.
-
-Then the work starts.

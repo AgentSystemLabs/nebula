@@ -1,6 +1,6 @@
 ---
 name: project-terms
-description: "Keep TERMS.md — nebula's shared glossary of ALL-CAPS canonical names for its features, panels, keys, CLI commands, hook routes, daemon mechanisms, statuses and dev workflows — true after a task. Use at the end of every task, right after nebula-memory. Every run detects the vocabulary the task surfaced and runs terms_check.py to prune: only a concept that has recurred across separate tasks is promoted to a TERM, the rest wait in the Candidates ledger; dead TERMS, merge pairs, stale pointers and overdue candidates are merged, retired or pruned with --merge / --retire / --prune. Aliases the user typed for an existing TERM, renames, and retirements land immediately. Also use when the user says \"add this to terms\", \"what do we call this\", \"name this\", \"promote this\", or \"update the glossary\"."
+description: "Keep TERMS.md — nebula's shared glossary of ALL-CAPS canonical names for its features, panels, keys, CLI commands, hook routes, daemon mechanisms, statuses and dev workflows — true after a task. Use at the end of a task that surfaced vocabulary (a new name, a word the user typed that a row does not list, a rename or a removal), right after nebula-memory; most tasks surface none and skip it. Every run detects the vocabulary the task surfaced and runs terms_check.py to prune: only a concept that has recurred across separate tasks is promoted to a TERM, the rest wait in the Candidates ledger; dead TERMS, merge pairs, stale pointers and overdue candidates are merged, retired or pruned with --merge / --retire / --prune. Aliases the user typed for an existing TERM, renames, and retirements land immediately. Also use when the user says \"add this to terms\", \"what do we call this\", \"name this\", \"promote this\", or \"update the glossary\"."
 user-invocable: true
 ---
 
@@ -11,9 +11,10 @@ just finished, so the next agent and the next teammate call things by the same n
 The MEMORY LOG records *what happened*; `TERMS.md` records *what things are called*. Do not put a work log
 in the glossary, and do not put definitions in the work log.
 
-Skip this skill for one kind of task only: git or `gh` housekeeping of finished work — a commit, push,
-PR, merge or branch cleanup (the `land` skill) — which names nothing new. Every other task runs it,
-including one that recorded no MEMORY LOG entry.
+Run it when the task surfaced vocabulary: the user typed a word for a thing that has no TERM or that
+its row does not list, or the task added, renamed, moved or removed something people will name out
+loud. Most tasks surface none and skip it — including tasks that wrote a MEMORY LOG entry. Git or `gh`
+housekeeping of finished work (the `land` skill) always skips it; it names nothing new.
 
 ## Detect every session, promote only what recurred
 
@@ -71,7 +72,9 @@ out loud — goes to the **Candidates** ledger, not to a numbered section. One r
   the user already used; invent only when none of them has one.
 - **Seen** lists every sighting as `date source` — `prompt`, `commit abc1234`, `MEMORY "Entry Title"`,
   `README`, `reply` — so the next run can tell whether a new sighting is a separate task or the same one.
-- **Where** is the greppable pointer, verified, same as a TERM's.
+- **Where** is the greppable pointer, verified, same as a TERM's. A thing that lives outside the repo (a
+  scratch harness, a clone directory) cannot have one and gets no ledger row; its MEMORY LOG entry is its
+  record.
 
 Do **not** ledger: internal helpers nobody will say out loud (`fn row_badges`), a restated diff, a name
 already present as a TERM or a candidate under a different spelling (grep first), or anything `README.md`
