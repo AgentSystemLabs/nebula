@@ -1,6 +1,6 @@
 ---
 name: prompt-daddy
-description: "Before starting any new task, rewrite the user's prompt once into the best fully specified version of it — the ambiguous words closed, the unstated \"keep X as-is\" named, the why and the evidence in place, the user's aliases replaced by the ALL-CAPS TERMS from TERMS.md — asking the user only for the context the work cannot proceed without (who, what, when, where, why, how), then log the final prompt and proceed on it without asking whether it is right. Use on every new request: feature asks, bug reports, questions, refactors. Also use when the user says \"prompt daddy\", \"prompt doctor\", \"improve my prompt\", \"tighten this prompt\", or \"what should I have asked\"."
+description: "Before starting any new task, rewrite the user's prompt once into the best fully specified version of it — the ambiguous words closed, the unstated \"keep X as-is\" named, the why and the evidence in place, the user's aliases replaced by the ALL-CAPS TERMS from TERMS.md — asking the user only for the context the work cannot proceed without (who, what, when, where, why, how), then log the final prompt and proceed on it without asking whether it is right. Use on a new request whose words the recall hook could not settle: an alias that maps to two TERMS, a spec hanging on one word, a bug report with no evidence, a visual ask with no target; a prompt that already says what to change, what to keep and why is worked from as written. Also use when the user says \"prompt daddy\", \"prompt doctor\", \"improve my prompt\", \"tighten this prompt\", or \"what should I have asked\"."
 user-invocable: true
 ---
 
@@ -25,7 +25,10 @@ a question, not a guess.
 
 ## When to run it
 
-On every new prompt from the user — a feature, a bug report, a question, a refactor, a "debug this".
+On a new prompt whose words the RECALL HOOK could not settle — an alias that maps to two TERMS, a spec
+hanging on one word, a bug report with no evidence, a visual ask with no target, a change that never
+says what stays. A prompt that already names what to change, what to keep and why is worked from as
+written; `CLAUDE.md`'s trigger table is the gate.
 Run it after reading `.claude/MEMORY.md` (the index), `.claude/memory/gotchas.md`, `TERMS.md` and
 whatever the RECALL HOOK injected under `[nebula recall]`, and before planning, grepping the code in
 earnest, or answering.

@@ -32,11 +32,13 @@ dangling aliases).
 3. **Map every noun in the prompt onto `TERMS.md`** through its **Alias index** ("top nav" →
    WORKSPACES BAR). A word that maps to two TERMS is an ambiguity to settle before working, not to
    guess.
-4. **Rewrite the prompt** — PROMPT DADDY: read `.claude/skills/prompt-daddy/SKILL.md` and follow it.
-   Do this on every prompt that is a task, before planning or grepping in earnest. The refined
-   prompt is the request you work from. The skill lists what it skips (a reply to your own question,
-   a bare confirmation, a specific mid-task correction, a skill trigger, a pure question that
-   changes nothing, and a plain git/`gh` housekeeping ask).
+4. **Rewrite the prompt only when it needs it** — PROMPT DADDY: read
+   `.claude/skills/prompt-daddy/SKILL.md` and follow it when the RECALL HOOK could not settle the
+   prompt's words: a word that maps to two TERMS, a spec hanging on one word ("done", "new", "move",
+   "fix it"), a bug report with no evidence, a visual ask with no target, a change that never says
+   what stays. A prompt that already names what to change, what to keep and why is worked from as
+   written — the 2026-09-06 A/B showed a rewrite of a clear prompt costs about $2 and asks nothing.
+   The refined prompt, when one is logged, is the request you work from.
 
 ## Speak in the TERMS
 
@@ -52,14 +54,17 @@ points at them.
 ## After you finish a task
 
 1. **Record it** — the NEBULA-MEMORY SKILL: read `.claude/skills/nebula-memory/SKILL.md` and follow
-   it: an entry file, an index line, any durable trap into the standing gotchas. Whenever the task
-   changed code or behavior, diagnosed a bug, or turned up something non-obvious about this repo,
-   the DAEMON, the TUI, the VENDORED VT100 or the agent hook dialects. Skip it for pure questions,
-   for trivial edits that held no surprise, and for git/`gh` housekeeping of finished work that
-   surfaced nothing — the log is only useful if it stays free of restated diffs.
+   it: an entry file, an index line, any durable trap into the standing gotchas. When the task
+   surfaced a gotcha, a diagnosed cause, a decision not to relitigate, or a non-obvious fact about
+   this repo, the DAEMON, the TUI, the VENDORED VT100 or the agent hook dialects. A code change that
+   held no surprise, however large, gets no entry — the diff and `git log` already record it, and
+   the log is only useful if it stays free of restated diffs. Skip it for pure questions and for
+   git/`gh` housekeeping of finished work.
 2. **Keep the glossary true** — PROJECT TERMS: read `.claude/skills/project-terms/SKILL.md` and
-   follow it, on **every** task, including one that recorded no entry — except git/`gh` housekeeping
-   of finished work, which `.claude/skills/land/SKILL.md` covers end to end. A pull request's
+   follow it when the task surfaced vocabulary: the user used a word for a thing that has no TERM or
+   that its row does not list, or the task added, renamed, moved or removed something people will
+   name out loud. Most tasks surface none and skip it; git/`gh` housekeeping of finished work always
+   does, since `.claude/skills/land/SKILL.md` covers it end to end. A pull request's
    body — on that path or any other — is `.claude/skills/pr-description/SKILL.md`'s, never hand-written.
 3. **Shape the reply** — OUTPUT DOCTOR: read `.claude/skills/output-doctor/SKILL.md` and follow it,
    before you write a word of the reply that answers or closes the request. Every kind of reply,
