@@ -7,7 +7,7 @@ Closes #<N>. <One sentence: what was wrong, and what is true now.>
 
 ## 🐛 Symptom <a id="symptom"></a>
 
-<What the user saw, in their words (the issue title or the MEMORY LOG **Asked** line): the screen, the key, the terminal, the version. Two or three sentences.>
+<What the user saw, in their words (the issue title): the screen, the key, the terminal, the version. Two or three sentences.>
 
 ## 🔍 Cause <a id="cause"></a>
 

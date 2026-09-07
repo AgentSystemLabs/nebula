@@ -7,7 +7,7 @@
 
 ## 1. The problem <a id="1-the-problem"></a>
 
-<Two to four sentences, in the user's words where possible (the MEMORY LOG entry's **Asked** line): what they saw, when, why it mattered. No code yet.>
+<Two to four sentences, in the user's words where possible: what they saw, when, why it mattered. No code yet.>
 
 > <Optional: the user's own sentence, quoted.>
 

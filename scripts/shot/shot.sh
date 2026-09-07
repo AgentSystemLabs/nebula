@@ -6,7 +6,7 @@
 # repository with two worktrees, drives it inside a private tmux server, and captures the screen as
 # design-screenshots/<scene>.{txt,ansi,png}. Never touches the real daemon or the real data dir.
 #
-# Traps this encodes (MEMORY LOG, 2026-08-20 / 2026-08-21): NEBULA_RUNTIME_DIR must be short (the unix
+# Traps this encodes (learned 2026-08-20 / 2026-08-21): NEBULA_RUNTIME_DIR must be short (the unix
 # socket path caps at ~104 chars); NEBULA_AGENT_CMD must be set even with no agent (the PREWARM POOL
 # launches a real claude otherwise); the first exec of a fresh binary can stall on macOS signature
 # validation (warm it before the TUI's connect deadline); capture with `-epN` or trailing styled cells

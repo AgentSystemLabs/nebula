@@ -24,9 +24,9 @@
 
 - **<Hook>.** <The subcommand or flag, `nebula <sub>`, and what it prints.>
 
-### 📚 docs / memory
+### 📚 docs
 
-- **<Hook>.** <Which of the DOCS PAGES or which MEMORY LOG entry changed.>
+- **<Hook>.** <Which of the DOCS PAGES changed.>
 
 ## 🧩 Workspace map <a id="workspace-map"></a>
 
