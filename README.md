@@ -138,6 +138,13 @@ HARNESS BADGE normally sits. Walking the cursor onto a SESSION previews it, whic
 count down as you go and disappear at zero. The flag lives in the DAEMON, so it survives closing the TUI
 and is shared by every client; a turn that finishes in the pane you're already looking at never counts.
 
+A dot going red is the one you can't afford to miss — a blocked agent burns the clock while you're in
+another window — so that one reaches you: the FEEDBACK SOUND rings (`Sosumi` by default, distinct from
+the `Glass` DONE SOUND a finish gets), and when the terminal window is in the background a desktop
+notification names the session and its worktree. Neither fires for the pane you're locked into typing
+at with the window focused — that prompt is already under your hands. One setting, `feedback_sound`,
+owns both; `off` silences the pair. See [Configuration](docs/configuration.md).
+
 ## Where the status actually comes from
 
 nebula doesn't poll the agents and it doesn't guess from the screen. At spawn it merges MANAGED HOOKS
