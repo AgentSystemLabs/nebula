@@ -29,6 +29,7 @@ use std::time::Duration;
 
 mod focus_walk;
 mod host_terminal;
+mod placeholder;
 mod quick_launch;
 use focus_walk::{
     at_top_row, bar_return_target, double_tapped, enter_terminal_pane, enter_workspaces_bar,
@@ -1191,7 +1192,9 @@ fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientReques
         // filter or the ssh destination lands where the caret is.
         Event::Paste(text) if paste_into_overlay(app, &text) => {}
         Event::Paste(text) => {
-            if app.focus == Focus::Terminal && app.term_locked {
+            // A stand-in pane (QUICK PROMPT, checkout still being cut) has
+            // no PTY to paste into.
+            if app.focus == Focus::Terminal && app.term_locked && !app.pane_shows_placeholder() {
                 if let Some(term) = &app.term {
                     // Bracketed paste so the child (claude, vim…) knows.
                     out.push(ClientRequest::Input {
@@ -1332,6 +1335,10 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             return;
         }
         let exited = app.term.as_ref().is_some_and(|t| t.exited);
+        // A stand-in pane (QUICK PROMPT, checkout still being cut) has no
+        // PTY behind it: the keystroke has nowhere to go until the real
+        // session attaches, and must not land in the previous one.
+        let stand_in = app.pane_shows_placeholder();
         if !exited {
             if let Some(term) = &mut app.term {
                 // Typing changes the content under a persisted selection
@@ -1340,6 +1347,9 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 // Typing exits scroll mode (tmux behavior).
                 if term.scroll > 0 {
                     term.set_scroll(0);
+                }
+                if stand_in {
+                    return;
                 }
                 if let Some(data) = keys::encode_key(&key, term.kitty_flags) {
                     out.push(ClientRequest::Input {
@@ -2228,6 +2238,10 @@ fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
 
 /// Ask the daemon for a shell terminal in `worktree`; the Ack attaches it.
 fn create_terminal(app: &mut App, worktree: WorktreeId, out: &mut Vec<ClientRequest>) {
+    if app.is_placeholder_worktree(&worktree) {
+        app.flash = Some(WORKTREE_STILL_CREATING.into());
+        return;
+    }
     send_with(
         app,
         out,
@@ -2269,6 +2283,10 @@ fn open_delete_confirm(app: &mut App) {
             if let Some(w) = app.selected_worktree() {
                 if w.is_main {
                     app.flash = Some("cannot delete the main checkout".into());
+                    return;
+                }
+                if app.is_placeholder_worktree(&w.id) {
+                    app.flash = Some(WORKTREE_STILL_CREATING.into());
                     return;
                 }
                 let live_here = app
@@ -4131,6 +4149,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                         reopen_on_error: None,
                         pr,
                         focus_pane: true,
+                        placeholder: None,
                     },
                     out,
                 );
@@ -4154,6 +4173,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 reopen_on_error: None,
                 pr: None,
                 focus_pane: true,
+                placeholder: None,
             },
             out,
         ),
@@ -4186,6 +4206,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                     )),
                     pr: None,
                     focus_pane: true,
+                    placeholder: None,
                 },
                 out,
             );
@@ -4476,6 +4497,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                             reopen_on_error: None,
                             pr,
                             focus_pane: true,
+                            placeholder: None,
                         },
                         out,
                     );
@@ -4519,7 +4541,9 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             }
         }
         MenuAction::DeleteWorktree(id) => {
-            if let Some(w) = app.tree.worktrees.iter().find(|w| w.id == id).cloned() {
+            if app.is_placeholder_worktree(&id) {
+                app.flash = Some(WORKTREE_STILL_CREATING.into());
+            } else if let Some(w) = app.tree.worktrees.iter().find(|w| w.id == id).cloned() {
                 app.overlay = Some(Overlay::Confirm(ConfirmDialog {
                     title: "Delete worktree".into(),
                     message: format!("Delete worktree '{}' from disk?", w.branch),
@@ -5276,6 +5300,13 @@ fn send_attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     if let Some(old) = app.attached_sref.take() {
         out.push(ClientRequest::Detach { session: old });
     }
+    // A QUICK PROMPT stand-in has no PTY behind it yet: the pane keeps its
+    // "starting…" with nothing attached, and the create's Ack attaches
+    // the real session. Letting go of the previous one above still
+    // matters — a keystroke must not land there through a stale hold.
+    if app.is_placeholder_session(&sref) {
+        return;
+    }
     let (cols, rows) = pane_size(app);
     app.attached_sref = Some(sref.clone());
     out.push(ClientRequest::Attach {
@@ -5301,10 +5332,14 @@ fn fire_pending_attach(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// has no attachment for costs it a hash lookup and nothing else.
 fn release_attachment(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.pending_attach = None;
-    let session = app
-        .attached_sref
-        .take()
-        .or_else(|| app.term.as_ref().map(|t| t.sref.clone()));
+    // A QUICK PROMPT stand-in in the pane was never attached — `send_attach`
+    // stops at it — so there is nothing to let go of there.
+    let session = app.attached_sref.take().or_else(|| {
+        app.term
+            .as_ref()
+            .map(|t| t.sref.clone())
+            .filter(|s| !app.is_placeholder_session(s))
+    });
     if let Some(session) = session {
         out.push(ClientRequest::Detach { session });
     }
@@ -5343,6 +5378,11 @@ fn fire_pending_prewarm(app: &mut App, out: &mut Vec<ClientRequest>) {
     let Some((worktree, _)) = app.pending_prewarm.take() else {
         return;
     };
+    // A QUICK PROMPT stand-in checkout is not on disk yet; the launch that
+    // made it re-arms this once the real one is.
+    if app.is_placeholder_worktree(&worktree) {
+        return;
+    }
     let (cols, rows) = pane_size(app);
     out.push(ClientRequest::PrewarmWorktreeSessions {
         worktree: worktree.clone(),
@@ -5381,7 +5421,15 @@ struct AgentLaunchDraft {
     /// every launch the user walked a picker to reach; the QUICK PROMPT
     /// passes the `quick_prompt_focus` SETTING, which is off by default.
     focus_pane: bool,
+    /// The stand-in session row already on screen for this create (a
+    /// QUICK PROMPT into a worktree that did not exist): the Ack turns it
+    /// into the created row, an Error drops it.
+    placeholder: Option<AgentId>,
 }
+
+/// Flashed at a launch, a delete or a terminal aimed at a QUICK PROMPT
+/// stand-in checkout the DAEMON has not cut yet.
+const WORKTREE_STILL_CREATING: &str = "worktree is still being created";
 
 /// The PROJECT a checkout belongs to — what `CreatePrAgent` is addressed
 /// to. None only if the row went away between the picker and Enter.
@@ -5405,12 +5453,27 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
         reopen_on_error,
         pr,
         focus_pane,
+        placeholder,
     } = draft;
+    // A QUICK PROMPT stand-in checkout is not a place the DAEMON knows;
+    // the launch that made it follows on its own Ack.
+    if app.is_placeholder_worktree(&worktree) {
+        app.flash = Some(WORKTREE_STILL_CREATING.into());
+        return;
+    }
+    // A stand-in row was named for this very create when it went up, so
+    // the name comes off it — `default_session_name` would count it as
+    // taken and move on to the next number.
+    let stand_in_name = placeholder
+        .as_ref()
+        .and_then(|id| app.tree.agents.iter().find(|a| &a.id == id))
+        .map(|a| a.name.clone());
     let intent = match (reopen_on_error, &cloud_prompt) {
         (Some((kind, task)), _) => PendingIntent::AttachCreatedWithCloudRetry {
             kind,
             task,
             focus: focus_pane,
+            placeholder,
         },
         (None, Some(task)) => PendingIntent::AttachCreatedWithCloudRetry {
             kind: PromptKind::ClaudeCloudTask {
@@ -5421,14 +5484,15 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
             },
             task: task.clone(),
             focus: focus_pane,
+            placeholder: None,
         },
         (None, None) => PendingIntent::AttachCreated { focus: focus_pane },
     };
     let auto_title = name.is_empty();
-    let name = if auto_title {
-        app.default_session_name("agent")
-    } else {
-        name
+    let name = match (auto_title, stand_in_name) {
+        (false, _) => name,
+        (true, Some(name)) => name,
+        (true, None) => app.default_session_name("agent"),
     };
     let cloud = cloud_prompt.is_some();
     let with_first_prompt = starting_prompt.is_some();
@@ -5526,7 +5590,11 @@ fn fire_keepwarm(app: &mut App, out: &mut Vec<ClientRequest>) {
         app.next_keepwarm = None;
         return;
     };
-    out.extend(default_claude_prewarm(worktree));
+    // The beat keeps going past a QUICK PROMPT stand-in — it is the real
+    // checkout a moment later — but nothing is asked for it.
+    if !app.is_placeholder_worktree(&worktree) {
+        out.extend(default_claude_prewarm(worktree));
+    }
     app.next_keepwarm = Some(std::time::Instant::now() + KEEPWARM_REFRESH);
 }
 
@@ -6504,12 +6572,19 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 };
                 app.dirty = true;
             } else if in_term {
+                // A stand-in pane has no PTY to forward the wheel to; its
+                // grid is empty, so there is nothing to scroll either.
+                let stand_in = app.pane_shows_placeholder();
                 if let Some(term) = &mut app.term {
                     // Scrolling shifts the content under a (screen-anchored)
                     // selection highlight — drop it.
                     app.term_selection = None;
                     let screen = term.parser.screen();
-                    let mouse_mode = screen.mouse_protocol_mode();
+                    let mouse_mode = if stand_in {
+                        vt100::MouseProtocolMode::None
+                    } else {
+                        screen.mouse_protocol_mode()
+                    };
                     let sgr = screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr;
                     let alternate = screen.alternate_screen();
                     if mouse_mode != vt100::MouseProtocolMode::None {
@@ -6782,33 +6857,15 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         }
         ServerEvent::Ack { req_id, created } => {
             match (app.pending.remove(&req_id), created) {
-                (
-                    Some(
-                        PendingIntent::AttachCreated { focus }
-                        | PendingIntent::AttachCreatedWithCloudRetry { focus, .. },
-                    ),
-                    Some(id),
-                ) => {
-                    let sref = match id {
-                        EntityId::Agent(id) => Some(SessionRef::Agent(id)),
-                        EntityId::Terminal(id) => Some(SessionRef::Terminal(id)),
-                        _ => None,
-                    };
-                    if let Some(sref) = sref {
-                        app.select_when_seen = Some(sref.clone());
-                        // Its upsert usually lands just before this Ack; land
-                        // the selection now, or on the upsert otherwise.
-                        land_pending_selection(app, out);
-                        attach_now(app, sref, out);
-                        // Without `focus` the row is selected and the pane
-                        // shows it, but the cursor stays where the create
-                        // was fired from — see `quick_prompt_focus`.
-                        if focus {
-                            app.focus = Focus::Terminal;
-                            app.term_locked = true;
-                        }
-                    }
+                (Some(PendingIntent::AttachCreated { focus }), Some(id)) => {
+                    attach_created(app, id, focus, None, out);
                 }
+                (
+                    Some(PendingIntent::AttachCreatedWithCloudRetry {
+                        focus, placeholder, ..
+                    }),
+                    Some(id),
+                ) => attach_created(app, id, focus, placeholder, out),
                 (Some(PendingIntent::ReopenPromptOnError { note, .. }), _) => {
                     app.flash = Some(note);
                 }
@@ -6825,9 +6882,20 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     }
                 }
                 (
-                    Some(PendingIntent::LaunchInCreatedWorktree { launch, text }),
+                    Some(PendingIntent::LaunchInCreatedWorktree {
+                        launch,
+                        text,
+                        placeholder,
+                    }),
                     Some(EntityId::Worktree(id)),
-                ) => quick_launch::launch_in_created_worktree(app, launch, text, id, out),
+                ) => quick_launch::launch_in_created_worktree(
+                    app,
+                    launch,
+                    text,
+                    placeholder,
+                    id,
+                    out,
+                ),
                 (Some(PendingIntent::OpenCreatedWorkspace), Some(EntityId::Workspace(id))) => {
                     // A workspace created from the WORKSPACE SWITCHER or the
                     // WORKSPACES BAR: show it right away, with the cursor on
@@ -6912,25 +6980,33 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 Some(PendingIntent::DeleteWorktree(rollback)) => {
                     restore_worktree_rows(app, rollback)
                 }
-                Some(
-                    PendingIntent::AttachCreatedWithCloudRetry {
-                        kind, task: text, ..
+                Some(PendingIntent::AttachCreatedWithCloudRetry {
+                    kind,
+                    task: text,
+                    placeholder,
+                    ..
+                }) => {
+                    // The stand-in session a QUICK PROMPT put up comes
+                    // down with the refusal; its checkout is real and stays.
+                    if let Some(stand_in) = placeholder {
+                        placeholder::discard_agent(app, &stand_in, out);
                     }
-                    | PendingIntent::ReopenPromptOnError { kind, text, .. },
-                ) => {
-                    open_prompt(app, kind);
-                    if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
-                        prompt.input.set_text(text);
-                    }
+                    reopen_prompt_with(app, kind, text);
+                }
+                Some(PendingIntent::ReopenPromptOnError { kind, text, .. }) => {
+                    reopen_prompt_with(app, kind, text);
                 }
                 // The worktree the QUICK PROMPT wanted to cut first was
                 // refused (a fetch that failed, a branch that exists):
-                // the box comes back, its target untouched, for a retry.
-                Some(PendingIntent::LaunchInCreatedWorktree { launch, text }) => {
-                    open_prompt(app, PromptKind::QuickPrompt(launch));
-                    if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
-                        prompt.input.set_text(text);
-                    }
+                // both stand-in rows go, and the box comes back, its
+                // target untouched, for a retry.
+                Some(PendingIntent::LaunchInCreatedWorktree {
+                    launch,
+                    text,
+                    placeholder,
+                }) => {
+                    placeholder::discard(app, &placeholder, out);
+                    reopen_prompt_with(app, PromptKind::QuickPrompt(launch), text);
                 }
                 _ => {}
             }
@@ -6938,6 +7014,50 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.dirty = true;
         }
         _ => {}
+    }
+}
+
+/// The Ack of a create: select the new session and show it — `focus` also
+/// enters and locks the pane. A QUICK PROMPT's stand-in row, when one was
+/// up for this create, becomes the created row first, so the cursor and
+/// the pane carry over instead of jumping.
+fn attach_created(
+    app: &mut App,
+    id: EntityId,
+    focus: bool,
+    placeholder: Option<AgentId>,
+    out: &mut Vec<ClientRequest>,
+) {
+    if let (Some(stand_in), EntityId::Agent(real)) = (&placeholder, &id) {
+        placeholder::resolve_agent(app, stand_in, real);
+    }
+    let sref = match id {
+        EntityId::Agent(id) => Some(SessionRef::Agent(id)),
+        EntityId::Terminal(id) => Some(SessionRef::Terminal(id)),
+        _ => None,
+    };
+    let Some(sref) = sref else {
+        return;
+    };
+    app.select_when_seen = Some(sref.clone());
+    // Its upsert usually lands just before this Ack; land the selection
+    // now, or on the upsert otherwise.
+    land_pending_selection(app, out);
+    attach_now(app, sref, out);
+    // Without `focus` the row is selected and the pane shows it, but the
+    // cursor stays where the create was fired from — see
+    // `quick_prompt_focus`.
+    if focus {
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+    }
+}
+
+/// A refused request's prompt comes back with what was typed in it.
+fn reopen_prompt_with(app: &mut App, kind: PromptKind, text: String) {
+    open_prompt(app, kind);
+    if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
+        prompt.input.set_text(text);
     }
 }
 
@@ -7471,12 +7591,12 @@ mod tests {
         );
     }
 
-    fn hse(app: &mut App, ev: ServerEvent) {
+    pub(super) fn hse(app: &mut App, ev: ServerEvent) {
         let mut out = Vec::new();
         handle_server_event(app, ev, &mut out);
     }
 
-    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+    pub(super) fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
         let buffer = terminal.backend().buffer();
         let mut out = String::new();
         for y in 0..buffer.area.height {
@@ -7502,7 +7622,7 @@ mod tests {
         panic!("{needle:?} is not on screen");
     }
 
-    fn seed_tree(app: &mut App) {
+    pub(super) fn seed_tree(app: &mut App) {
         use nebula_core::{Agent, AgentStatus, Entity, Project, ProjectId, Worktree, WorktreeId};
         let project_id = ProjectId("p1".into());
         let worktree_id = WorktreeId("w1".into());
@@ -10779,7 +10899,7 @@ diff --git a/src/b.rs b/src/b.rs
 
     /// Picker/submenu tests resolve model/effort through `Config::load`, so
     /// pin the config to an empty temp file to stay off the dev's real one.
-    fn with_default_config<T>(f: impl FnOnce() -> T) -> T {
+    pub(super) fn with_default_config<T>(f: impl FnOnce() -> T) -> T {
         let dir = tempfile::tempdir().unwrap();
         crate::config::with_config_path(dir.path().join("config.json"), f)
     }
@@ -14365,7 +14485,12 @@ diff --git a/src/b.rs b/src/b.rs
 
     // ---- git-diff modal ----
 
-    fn press(app: &mut App, code: KeyCode, mods: KeyModifiers, out: &mut Vec<ClientRequest>) {
+    pub(super) fn press(
+        app: &mut App,
+        code: KeyCode,
+        mods: KeyModifiers,
+        out: &mut Vec<ClientRequest>,
+    ) {
         handle_key(app, KeyEvent::new(code, mods), out);
     }
 
@@ -20361,7 +20486,7 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     /// A second, linked checkout beside the seeded ROOT WORKTREE.
-    fn seed_feat_worktree(app: &mut App, id: &str, branch: &str) {
+    pub(super) fn seed_feat_worktree(app: &mut App, id: &str, branch: &str) {
         use nebula_core::{Entity, ProjectId, Worktree, WorktreeId};
         hse(
             app,
@@ -20378,7 +20503,7 @@ diff --git a/src/b.rs b/src/b.rs
         );
     }
 
-    fn worktree_branches(app: &App) -> Vec<String> {
+    pub(super) fn worktree_branches(app: &App) -> Vec<String> {
         app.visible_worktrees()
             .iter()
             .map(|w| w.branch.clone())

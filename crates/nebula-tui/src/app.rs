@@ -1216,6 +1216,18 @@ pub struct WorktreeRollback {
     pub agents: Vec<(usize, Agent)>,
 }
 
+/// The rows a QUICK PROMPT into a WORKTREE that does not exist yet puts up
+/// the moment Enter is pressed — a checkout row and its one session row,
+/// under ids this client made up — so the panels never wait on the
+/// DAEMON's `git worktree add` and CLI spawn. Carried by the PENDING
+/// INTENTs of the two creates: the Acks turn them into the real rows,
+/// an Error takes them down (`event_loop::placeholder`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaceholderRows {
+    pub worktree: WorktreeId,
+    pub agent: AgentId,
+}
+
 /// What to do when an Ack (or Error) for this req_id arrives.
 #[derive(Debug, Clone)]
 pub enum PendingIntent {
@@ -1232,6 +1244,9 @@ pub enum PendingIntent {
         kind: PromptKind,
         task: String,
         focus: bool,
+        /// The stand-in session row a QUICK PROMPT put up for this create:
+        /// the Ack turns it into the created row, an Error drops it.
+        placeholder: Option<AgentId>,
     },
     /// Flash `note` on success; on failure, reopen this prompt with `text`
     /// restored. Same bargain as the Cloud task: a message worth typing into
@@ -1252,6 +1267,8 @@ pub enum PendingIntent {
     LaunchInCreatedWorktree {
         launch: crate::quick_prompt::QuickLaunch,
         text: String,
+        /// The stand-in rows on screen meanwhile.
+        placeholder: PlaceholderRows,
     },
     /// Open the workspace this Ack just created (switcher's "New workspace…"
     /// flow: creating from there means you want to be in it).
@@ -1259,6 +1276,27 @@ pub enum PendingIntent {
     /// Worktree removed optimistically; restore these rows on Error.
     DeleteWorktree(WorktreeRollback),
     None,
+}
+
+impl PendingIntent {
+    /// The stand-in worktree row this in-flight request is holding up.
+    pub fn placeholder_worktree(&self) -> Option<&WorktreeId> {
+        match self {
+            PendingIntent::LaunchInCreatedWorktree { placeholder, .. } => {
+                Some(&placeholder.worktree)
+            }
+            _ => None,
+        }
+    }
+
+    /// The stand-in session row this in-flight request is holding up.
+    pub fn placeholder_agent(&self) -> Option<&AgentId> {
+        match self {
+            PendingIntent::LaunchInCreatedWorktree { placeholder, .. } => Some(&placeholder.agent),
+            PendingIntent::AttachCreatedWithCloudRetry { placeholder, .. } => placeholder.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2392,6 +2430,38 @@ impl App {
         id
     }
 
+    /// Is this worktree row a QUICK PROMPT stand-in the DAEMON has not
+    /// answered for yet? The in-flight intent is the one record of it —
+    /// once the Ack or Error takes the intent, the row is real or gone.
+    pub fn is_placeholder_worktree(&self, id: &WorktreeId) -> bool {
+        self.pending
+            .values()
+            .any(|intent| intent.placeholder_worktree() == Some(id))
+    }
+
+    /// Is this session row a QUICK PROMPT stand-in the DAEMON has not
+    /// answered for yet?
+    pub fn is_placeholder_agent(&self, id: &AgentId) -> bool {
+        self.pending
+            .values()
+            .any(|intent| intent.placeholder_agent() == Some(id))
+    }
+
+    pub fn is_placeholder_session(&self, sref: &SessionRef) -> bool {
+        match sref {
+            SessionRef::Agent(id) => self.is_placeholder_agent(id),
+            SessionRef::Terminal(_) => false,
+        }
+    }
+
+    /// The pane is showing a stand-in: there is no PTY behind it to type
+    /// into, and nothing to attach.
+    pub fn pane_shows_placeholder(&self) -> bool {
+        self.term
+            .as_ref()
+            .is_some_and(|t| self.is_placeholder_session(&t.sref))
+    }
+
     /// Projects panel rows in display order, each an index into the FULL
     /// `tree.projects` list. Scoped to the open workspace — other
     /// workspaces' projects get no row.
@@ -2548,7 +2618,10 @@ impl App {
             .collect()
     }
 
-    /// First free `prefix-N` name within the selected worktree.
+    /// First free `prefix-N` name within the selected worktree. A QUICK
+    /// PROMPT stand-in counts as taken: its create is in flight and will
+    /// land under that name (the create it stands for takes the name off
+    /// the stand-in itself — see `create_agent`).
     pub fn default_session_name(&self, prefix: &str) -> String {
         let taken: Vec<String> = self
             .visible_sessions()

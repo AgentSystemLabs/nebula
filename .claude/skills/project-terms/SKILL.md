@@ -85,8 +85,13 @@ Every run, walk the ledger once:
    task produced — the MEMORY LOG entry you wrote (the prompt, when it wrote none) and your commit
    messages — and append a sighting for each hit. No hits: skip the rest of the walk.
    ```bash
-   grep -o -i -F -f <(sed -n '/^## 14\. Candidates/,/^## Alias index/p' TERMS.md | grep -o '^| \*\*[^*]*\*\*' | sed 's/^| \*\*//;s/\*\*$//') <entry-file> | sort -u
+   names() { sed -n '/^## 14\. Candidates/,/^## Alias index/p' TERMS.md | grep -o '^| \*\*[^*]*\*\*' | sed 's/^| \*\*//;s/\*\*$//'; }
+   grep -o -i -F -f <(names) <entry-file> | sort -u
+   grep -o -i -F -f <(names | tr ' ' '_') <entry-file> | sort -u
    ```
+   The second grep is the code spelling: a candidate the code writes in snake_case
+   (`hide_root_worktree` for HIDE ROOT WORKTREE) matches only through it (2026-09-06: the names grep
+   found nothing while the entry said the setting four times, and the promotion happened by eye).
    `git log --oneline --since=<first sighting date> --grep='<candidate>' -i` catches commits from other
    sessions.
 2. **Promote** any candidate whose *Seen* now holds sightings from two or more separate tasks. Write the
