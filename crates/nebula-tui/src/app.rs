@@ -1876,6 +1876,17 @@ pub struct PreviewedPr {
 /// coalesce those while still beating the steady beat by a wide margin.
 pub const OPEN_PRS_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// One session that stopped to ask the user, as the desktop notification
+/// names it: the row's name and where it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedbackAlert {
+    /// The session row's name.
+    pub session: String,
+    /// `<project> · <branch>`, the worktree it runs in; empty when the tree
+    /// no longer holds them.
+    pub place: String,
+}
+
 pub struct App {
     pub tree: Tree,
     pub focus: Focus,
@@ -2047,6 +2058,19 @@ pub struct App {
     /// the DONE SOUND (`Config::done_sound`) once and clears it — once per
     /// frame however many rows finished together.
     pub pending_ding: bool,
+    /// Sessions that reached NEEDS FEEDBACK since the last frame, one entry
+    /// each: the main loop rings the FEEDBACK SOUND (`Config::feedback_sound`)
+    /// once for the lot, posts a desktop notification per entry while the
+    /// terminal window is in the background, and clears it. A session whose
+    /// pane the user is locked into typing at, window focused, is never
+    /// queued — that prompt is already in front of them.
+    pub pending_feedback: Vec<FeedbackAlert>,
+    /// Whether the terminal window has focus, from the focus reports
+    /// (mode 1004) `setup_terminal` asks for. True until the terminal says
+    /// otherwise, so one that never reports (tmux without `focus-events`)
+    /// keeps every desktop notification off rather than posting them while
+    /// the user is looking.
+    pub window_focused: bool,
     /// Body rect (everything above the footer) from the last draw; bounds
     /// splitter drags.
     pub body_area: Rect,
@@ -2214,6 +2238,8 @@ impl App {
             pointer_shape: PointerShape::default(),
             pending_clipboard: None,
             pending_ding: false,
+            pending_feedback: Vec::new(),
+            window_focused: true,
             body_area: Rect::default(),
             hostname: nebula_core::host::hostname(),
             is_remote: nebula_core::host::is_remote_session(),

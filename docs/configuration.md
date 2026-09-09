@@ -24,7 +24,7 @@ convenience stores: missing or malformed reads as empty.
 
 ## Every setting
 
-Twenty-seven keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
+Thirty-two keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
 exists only in the file, so it is hand-edit-only. The Agents tab groups its rows under **Quick prompt**,
 **Claude**, **Codex** and **Cursor** headers, so a harness's rows read `Enabled` / `Model` / `Effort`
 under its name rather than repeating it. The **Experimental** tab holds behaviors that change how the
@@ -39,6 +39,7 @@ tree is worked; every row there is off by default.
 | `skip_session_naming` | bool | `false` | Sessions | New AGENTS launch straight from the NEW SESSION PICKER with no name prompt, taking the generated name and opting into AUTO-TITLE — exactly as accepting an empty prompt does. |
 | `session_idle_timeout` | string | `"5m"` | Sessions | DAEMON-owned IDLE TIMEOUT: how long a session in a WORKTREE no client is viewing goes unwatched before the IDLE REAPER kills its PTY. See the values below. |
 | `done_sound` | string | `"Glass"` | Sessions | The DONE SOUND rung when a turn reaches FINISHED: `off`, `bell` (the terminal BEL — silent in Ghostty unless its `bell-features` include `audio`), or a macOS system sound from `/System/Library/Sounds` played with `afplay` (`Glass`, `Ping`, `Pop`, `Hero`, …). Over `nebula ssh` and off macOS it is always the bell. |
+| `feedback_sound` | string | `"Sosumi"` | Sessions | The FEEDBACK SOUND rung when a turn stops at NEEDS FEEDBACK — a permission prompt or a question — with the same values and fallbacks as `done_sound`, and a different default so red and green sound different from the next room. It never rings for the session whose pane you are locked into typing at while the terminal window has focus: that prompt is already under your hands. The one switch for the DESKTOP NOTIFICATION too: while the terminal window is in the background (from the focus reports nebula asks the terminal for — tmux needs `focus-events on`), each session that goes red is also named in a desktop notification (`osascript` on macOS, `notify-send` on Linux; never over `nebula ssh`, where the desktop is the wrong machine's; a notifier that is missing or fails is a debug line, not an error). `off` silences the sound and the notification together. |
 | `theme` | string | `"default"` | Appearance | The THEME: `default`, `ocean`, `forest`, `rose`, `amber`. An unknown name falls back to `default`. |
 | `animations` | bool | `true` | Appearance | Master switch for the STATUS SWEEP and the SPLASH's motion. Off trades them for fewer repaints on a constrained machine. |
 | `show_workspaces` | bool | `true` | Appearance | Whether the WORKSPACES BAR is drawn across the top. `Shift+W` writes the key as it toggles, so a hidden bar stays hidden across restarts. |
@@ -100,7 +101,10 @@ on the next ATTACH or prewarm, and an agent RESUMES its conversation there.
   and reasoning effort, the idle timeout, the done sound (`done_sound`: a ding
   when a turn finishes — a macOS system sound such as `Glass`, the default; `bell` for the terminal
   bell, which Ghostty keeps silent unless its `bell-features` include `audio`; or `off`. Over
-  `nebula ssh` and off macOS it is always the bell), and whether new sessions stop to ask for a
+  `nebula ssh` and off macOS it is always the bell), the feedback sound (`feedback_sound`: the same
+  choices, `Sosumi` by default, rung when a turn stops to ask you — and, while the terminal window
+  is in the background, a desktop notification naming the session and its worktree; `off` silences
+  both), and whether new sessions stop to ask for a
   name. `R` inside the overlay puts every setting — hotkeys included — back to its default, after a
   confirmation.
 - **Every panel key is rebindable.** The overlay's Hotkeys tab lists every action and what it answers to,

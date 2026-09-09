@@ -22,14 +22,15 @@ pub const SESSION_IDLE_TIMEOUTS: &[&str] = &["off", "1m", "5m", "15m", "30m", "1
 /// models, hand-edited configs can name any command the list doesn't.
 pub const EDITORS: &[&str] = &["vim", "nvim", "nano", "emacs", "hx"];
 
-/// Values the settings overlay cycles through for `done_sound` — what rings
-/// when a turn reaches FINISHED. `off` is silence, `bell` the terminal BEL
+/// Values the settings overlay cycles through for `done_sound` (what rings
+/// when a turn reaches FINISHED) and `feedback_sound` (what rings when one
+/// stops at NEEDS FEEDBACK). `off` is silence, `bell` the terminal BEL
 /// (the one sound that reaches the local terminal over `nebula ssh` — but
 /// silent in Ghostty out of the box, whose `bell-features` default to
 /// `no-audio`), the rest are macOS system sounds in `/System/Library/Sounds`,
 /// played with `afplay`; see [`Config::done_sound`] for where a name falls
 /// back to the bell. Hand-edited configs can name any sound in that folder.
-pub const DONE_SOUNDS: &[&str] = &[
+pub const SOUNDS: &[&str] = &[
     "off",
     "bell",
     "Glass",
@@ -196,6 +197,7 @@ pub enum SettingKind {
     SkipSessionNaming,
     SessionIdleTimeout,
     DoneSound,
+    FeedbackSound,
     Theme,
     Animations,
     ShowWorkspaces,
@@ -270,6 +272,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::DoneSound,
                 label: "Done sound",
                 hint: "Ding when a turn finishes: off, the terminal bell, or a macOS system sound",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::FeedbackSound,
+                label: "Feedback sound",
+                hint: "Ring, and notify an unfocused window, when a turn stops to ask you (off silences both)",
                 group: "",
             },
         ]),
@@ -586,10 +594,17 @@ pub struct Config {
     pub session_idle_timeout: String,
     /// What rings when a turn reaches FINISHED: "off", "bell" (terminal
     /// BEL) or the name of a macOS system sound (`Glass` by default,
-    /// `Ping`, …; see [`DONE_SOUNDS`]). Resolved by [`Config::done_sound`],
+    /// `Ping`, …; see [`SOUNDS`]). Resolved by [`Config::done_sound`],
     /// which falls back to the bell wherever `afplay` can't reach the
     /// user's speakers.
     pub done_sound: String,
+    /// What rings when a turn stops at NEEDS FEEDBACK — a permission
+    /// prompt or a question the agent is parked on. Same values and
+    /// resolution as `done_sound`; `Sosumi` by default so red and green
+    /// sound different from the next room. The one knob for both the
+    /// FEEDBACK SOUND and the desktop notification an unfocused terminal
+    /// window gets: "off" silences the pair.
+    pub feedback_sound: String,
     /// Color theme name (see `theme::THEMES`). Unknown names fall back to
     /// the default theme.
     pub theme: String,
@@ -679,6 +694,7 @@ impl Default for Config {
             skip_session_naming: false,
             session_idle_timeout: "5m".into(),
             done_sound: "Glass".into(),
+            feedback_sound: "Sosumi".into(),
             theme: "default".into(),
             animations: true,
             show_workspaces: true,
@@ -793,6 +809,10 @@ impl Config {
             serde_json::json!(self.session_idle_timeout),
         );
         obj.insert("done_sound".into(), serde_json::json!(self.done_sound));
+        obj.insert(
+            "feedback_sound".into(),
+            serde_json::json!(self.feedback_sound),
+        );
         obj.insert("theme".into(), serde_json::json!(self.theme));
         obj.insert("animations".into(), serde_json::json!(self.animations));
         obj.insert(
@@ -949,6 +969,7 @@ impl Config {
             SettingKind::SkipSessionNaming => on_off(self.skip_session_naming).into(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
             SettingKind::DoneSound => self.done_sound.clone(),
+            SettingKind::FeedbackSound => self.feedback_sound.clone(),
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
             SettingKind::ShowWorkspaces => on_off(self.show_workspaces).into(),
@@ -1007,7 +1028,10 @@ impl Config {
                     cycle_choice(&self.session_idle_timeout, SESSION_IDLE_TIMEOUTS, step).into();
             }
             SettingKind::DoneSound => {
-                self.done_sound = cycle_choice(&self.done_sound, DONE_SOUNDS, step).into();
+                self.done_sound = cycle_choice(&self.done_sound, SOUNDS, step).into();
+            }
+            SettingKind::FeedbackSound => {
+                self.feedback_sound = cycle_choice(&self.feedback_sound, SOUNDS, step).into();
             }
             SettingKind::Theme => {
                 self.theme = cycle_choice(&self.theme, crate::theme::THEMES, step).into();
@@ -1089,10 +1113,10 @@ impl Config {
     }
 }
 
-/// What the TUI plays when a turn reaches FINISHED — the `done_sound`
-/// SETTING resolved against where the TUI is running.
+/// What the TUI plays for a status edge — the `done_sound` or
+/// `feedback_sound` SETTING resolved against where the TUI is running.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DoneSound {
+pub enum Sound {
     /// The terminal BEL (`\x07`), written through the attached terminal,
     /// which decides whether that is a sound, a flash, or a dock bounce.
     Bell,
@@ -1106,33 +1130,45 @@ impl Config {
     /// terminal, and when the file exists — over ssh `afplay` would ring
     /// the *remote* box, so the bell stands in there, as it does off
     /// macOS and for a name the sound folder doesn't hold.
-    pub fn done_sound(&self) -> Option<DoneSound> {
-        resolve_done_sound(
+    pub fn done_sound(&self) -> Option<Sound> {
+        resolve_sound(
             &self.done_sound,
+            nebula_core::host::is_remote_session(),
+            cfg!(target_os = "macos"),
+        )
+    }
+
+    /// The sound to play when a turn stops to ask the user, or `None` for
+    /// silence — which also stands down the desktop notification, since
+    /// `feedback_sound` is the one switch for both. Same fallbacks as
+    /// [`Config::done_sound`].
+    pub fn feedback_sound(&self) -> Option<Sound> {
+        resolve_sound(
+            &self.feedback_sound,
             nebula_core::host::is_remote_session(),
             cfg!(target_os = "macos"),
         )
     }
 }
 
-fn resolve_done_sound(configured: &str, remote: bool, macos: bool) -> Option<DoneSound> {
+fn resolve_sound(configured: &str, remote: bool, macos: bool) -> Option<Sound> {
     let name = configured.trim();
     if name.is_empty() || name.eq_ignore_ascii_case("off") {
         return None;
     }
     if name.eq_ignore_ascii_case("bell") || remote || !macos {
-        return Some(DoneSound::Bell);
+        return Some(Sound::Bell);
     }
     // A sound name is a bare file stem; anything else (a path, a dot) is
     // not one, and the bell covers the typo.
     if !name.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Some(DoneSound::Bell);
+        return Some(Sound::Bell);
     }
     let path = Path::new(MACOS_SOUNDS_DIR).join(format!("{name}.aiff"));
     if path.is_file() {
-        Some(DoneSound::File(path))
+        Some(Sound::File(path))
     } else {
-        Some(DoneSound::Bell)
+        Some(Sound::Bell)
     }
 }
 
@@ -1342,37 +1378,79 @@ mod tests {
         assert_eq!(load_from(&path).done_sound, "Glass");
 
         // Silence, the bell, and every reason a name falls back to it.
-        assert_eq!(resolve_done_sound("off", false, true), None);
-        assert_eq!(resolve_done_sound("OFF", false, true), None);
-        assert_eq!(resolve_done_sound("", false, true), None);
+        assert_eq!(resolve_sound("off", false, true), None);
+        assert_eq!(resolve_sound("OFF", false, true), None);
+        assert_eq!(resolve_sound("", false, true), None);
+        assert_eq!(resolve_sound("bell", false, true), Some(Sound::Bell));
         assert_eq!(
-            resolve_done_sound("bell", false, true),
-            Some(DoneSound::Bell)
-        );
-        assert_eq!(
-            resolve_done_sound("Glass", true, true),
-            Some(DoneSound::Bell),
+            resolve_sound("Glass", true, true),
+            Some(Sound::Bell),
             "over ssh afplay would ring the remote box"
         );
         assert_eq!(
-            resolve_done_sound("Glass", false, false),
-            Some(DoneSound::Bell),
+            resolve_sound("Glass", false, false),
+            Some(Sound::Bell),
             "no system sounds off macOS"
         );
+        assert_eq!(resolve_sound("NoSuchSound", false, true), Some(Sound::Bell));
         assert_eq!(
-            resolve_done_sound("NoSuchSound", false, true),
-            Some(DoneSound::Bell)
-        );
-        assert_eq!(
-            resolve_done_sound("../etc/passwd", false, true),
-            Some(DoneSound::Bell)
+            resolve_sound("../etc/passwd", false, true),
+            Some(Sound::Bell)
         );
         #[cfg(target_os = "macos")]
         assert_eq!(
-            resolve_done_sound("Glass", false, true),
-            Some(DoneSound::File(
-                Path::new(MACOS_SOUNDS_DIR).join("Glass.aiff")
-            ))
+            resolve_sound("Glass", false, true),
+            Some(Sound::File(Path::new(MACOS_SOUNDS_DIR).join("Glass.aiff")))
+        );
+    }
+
+    #[test]
+    fn feedback_sound_defaults_to_sosumi_cycles_persists_and_resolves() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.feedback_sound, "Sosumi");
+        assert_ne!(
+            cfg.feedback_sound, cfg.done_sound,
+            "red and green must sound different"
+        );
+        // A config predating the key rings too.
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.feedback_sound, "Sosumi");
+        // …and one that only ever set the done sound keeps it.
+        let old: Config = serde_json::from_str(r#"{"done_sound": "Ping"}"#).unwrap();
+        assert_eq!(old.done_sound, "Ping");
+        assert_eq!(old.feedback_sound, "Sosumi");
+
+        // Its row sits right after the done sound on the Sessions tab.
+        let (tab, row) = locate(SettingKind::FeedbackSound).unwrap();
+        assert_eq!(locate(SettingKind::DoneSound).unwrap(), (tab, row - 1));
+        assert_eq!(SETTINGS_TABS[tab].title, "Sessions");
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.feedback_sound, "Basso");
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.feedback_sound, "off", "the list wraps");
+        cfg.cycle(tab, row, -1);
+        cfg.cycle(tab, row, -1);
+        assert_eq!(cfg.feedback_sound, "Sosumi");
+        assert_eq!(cfg.value_label(SettingKind::FeedbackSound), "Sosumi");
+        assert_eq!(cfg.done_sound, "Glass", "the done sound is its own row");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.feedback_sound = "off".into();
+        cfg.save_to(&path).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.feedback_sound, "off");
+        assert_eq!(loaded.feedback_sound(), None, "off is silence for both");
+        assert_eq!(loaded.done_sound, "Glass");
+
+        // The same resolution as the done sound: the bell over ssh and off
+        // macOS, silence for off.
+        assert_eq!(resolve_sound("Sosumi", true, true), Some(Sound::Bell));
+        assert_eq!(resolve_sound("Sosumi", false, false), Some(Sound::Bell));
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            resolve_sound("Sosumi", false, true),
+            Some(Sound::File(Path::new(MACOS_SOUNDS_DIR).join("Sosumi.aiff")))
         );
     }
 
