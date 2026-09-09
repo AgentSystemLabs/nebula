@@ -207,6 +207,26 @@ fn attention_rank(items: &[PaletteItem]) -> Vec<usize> {
     rank
 }
 
+/// The SESSION rows of the `/` palette in its attention order — what `]`
+/// and `[` step through with no modal open: the same [`attention_rank`]
+/// the palette applies before a query is typed, kept to the rows that are
+/// sessions. Every workspace contributes, not only the open one, and
+/// archived sessions are left out whatever the SESSIONS PANEL's toggle
+/// says: a released PTY has nothing left to ask of anyone.
+pub fn attention_sessions(tree: &Tree) -> Vec<AgentId> {
+    let items = build_palette_items(tree, false, &HashMap::new());
+    let rank = attention_rank(&items);
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by_key(|&i| rank[i]);
+    order
+        .into_iter()
+        .filter_map(|i| match &items[i].target {
+            PaletteTarget::Session(id) => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The tier a session row sorts into — its own status, read against the
 /// UNSEEN flag the DONE BADGE counts; an archived row sinks whatever its
 /// last status was.
@@ -522,6 +542,23 @@ mod tests {
             rows(&tree, false, "read"),
             ["default/demo/feat/read", "default/demo/feat/unread"]
         );
+    }
+
+    /// The `]` / `[` ring is the palette's session rows in the palette's
+    /// order — attention tiers, then recency, never-run last — with the
+    /// workspaces, projects, worktrees and archived sessions left out.
+    #[test]
+    fn attention_sessions_is_the_palette_order_kept_to_live_sessions() {
+        let mut tree = tree();
+        let mut gone = agent("gone", "w1", AgentStatus::NeedsFeedback, false, 9_000);
+        gone.archived = true;
+        gone.archived_at = 9_000;
+        tree.agents.push(gone);
+        let ring: Vec<String> = attention_sessions(&tree)
+            .into_iter()
+            .map(|id| id.0)
+            .collect();
+        assert_eq!(ring, ["ask", "run", "unread", "read", "fresh"]);
     }
 
     #[test]

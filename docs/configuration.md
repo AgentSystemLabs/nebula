@@ -32,7 +32,7 @@ tree is worked; every row there is off by default.
 
 | Key | Type | Default | Overlay | What it does |
 |---|---|---|---|---|
-| `palette_enter_attaches` | bool | `true` | General | `Enter` on a PALETTE (`/`) session attaches and focuses the TERMINAL PANE. Off, `Enter` only lands on the row in the SESSIONS PANEL and previews it; `Ctrl+o` / `Ctrl+f` still pick open / focus explicitly either way. |
+| `palette_enter_attaches` | bool | `true` | General | `Enter` on a PALETTE (`/`) session attaches and focuses the TERMINAL PANE. Off, `Enter` only lands on the row in the SESSIONS PANEL and previews it; `Ctrl+o` / `Ctrl+f` still pick open / focus explicitly either way. The `]` / `[` attention jump lands the same way this setting says. |
 | `git_init_on_create` | bool | `true` | General | DAEMON-owned: run `git init` when adding a project whose directory does not exist yet and the ADD PROJECT BROWSER (`o`) creates it. |
 | `editor` | string | `"vim"` | General | The EDITOR the FILE FINDER (`f`), TREE BROWSER (`b`), find-in-files (`Shift+F`) and ⌥click launch, invoked as `<editor> +<line> <file>`. The overlay cycles `vim`, `nvim`, `nano`, `emacs`, `hx`; any command passes through verbatim, so a hand edit can name one the picker doesn't. `NEBULA_EDITOR` overrides it for the process. |
 | `close_finder_on_open` | bool | `true` | General | Opening a file closes the FILE FINDER behind the editor modal, so quitting the editor is one Esc instead of two. Off leaves the results underneath. Never touches the TREE BROWSER (its editor is its own preview pane) or ⌥click. |

@@ -59,6 +59,10 @@ pub enum Action {
     MoveUp,
     Activate,
     Palette,
+    /// `]`: the next session in the PALETTE's attention order, no modal.
+    NextAttention,
+    /// `[`: the same walk backwards.
+    PrevAttention,
     // projects & worktrees
     AddProject,
     New,
@@ -213,6 +217,24 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["/"],
+    },
+    ActionSpec {
+        action: Action::NextAttention,
+        id: "next_attention",
+        label: "Next session needing you",
+        hint: "Jump to the next session in the palette's attention order (needs feedback, running, unseen, then recency) in any workspace, wrapping",
+        group: "NAVIGATE",
+        scope: Scope::Global,
+        defaults: &["]"],
+    },
+    ActionSpec {
+        action: Action::PrevAttention,
+        id: "prev_attention",
+        label: "Prev session needing you",
+        hint: "The same walk backwards: the session before this one in the palette's attention order, wrapping at the top",
+        group: "NAVIGATE",
+        scope: Scope::Global,
+        defaults: &["["],
     },
     // ---- PROJECTS & WORKTREES ----
     ActionSpec {

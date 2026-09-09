@@ -83,6 +83,8 @@ const SELECT_CONTEXT_FIRST: &str = "select a project or worktree first";
 
 /// Flash for a session pick that lost a race with its removal.
 const SESSION_GONE: &str = "session no longer exists";
+/// `]` / `[` with no session anywhere to land on.
+const NO_SESSIONS_TO_JUMP: &str = "no sessions to jump to";
 
 /// Flash for an action an archived agent refuses until it's unarchived.
 const AGENT_ARCHIVED: &str = "agent is archived — unarchive first (u)";
@@ -1677,6 +1679,18 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     &app.open_prs,
                 )));
             }
+        }
+        // `]` / `[`: the palette's attention order as a ring, no modal —
+        // one press lands on the next session that needs you, in whatever
+        // workspace it lives, the way `/` Enter would (same setting, same
+        // landing). Like the workspace digits, live from any panel.
+        Action::NextAttention => {
+            let landing = Landing::for_enter(crate::config::Config::load().palette_enter_attaches);
+            jump_attention(app, 1, landing, out);
+        }
+        Action::PrevAttention => {
+            let landing = Landing::for_enter(crate::config::Config::load().palette_enter_attaches);
+            jump_attention(app, -1, landing, out);
         }
         Action::Delete => open_delete_confirm(app),
         // Delete EVERY row of the focused panel (behind a confirm that
@@ -5072,6 +5086,38 @@ impl Landing {
             Landing::FocusOnly
         }
     }
+}
+
+/// `]` / `[`: land on the next (`step` 1) or previous (`step` -1) session
+/// in the PALETTE's attention order — NEEDS FEEDBACK, then RUNNING, then
+/// UNSEEN, then everything else by recency — across every workspace,
+/// wrapping at both ends. It is `/` `Enter` with no modal: the ring is the
+/// palette's session rows before a query is typed
+/// ([`crate::palette::attention_sessions`]), and the landing is the
+/// palette's, so a session in another workspace switches this instance
+/// there, selects its project and worktree, and puts the cursor on the
+/// row — reading it, if it was an unwatched finish. The walk starts from
+/// the session under the SESSIONS PANEL cursor; when nothing on the ring is
+/// selected (a terminal, a link, an archived row, an empty worktree) `]`
+/// starts at the top and `[` at the bottom, so the two stay each other's
+/// reverse.
+fn jump_attention(app: &mut App, step: i64, landing: Landing, out: &mut Vec<ClientRequest>) {
+    let ring = crate::palette::attention_sessions(&app.tree);
+    if ring.is_empty() {
+        app.flash = Some(NO_SESSIONS_TO_JUMP.into());
+        return;
+    }
+    let len = ring.len() as i64;
+    let at = app
+        .selected_session()
+        .and_then(|a| ring.iter().position(|id| *id == a.id));
+    let next = match at {
+        Some(i) => (i as i64 + step).rem_euclid(len),
+        None if step > 0 => 0,
+        None => len - 1,
+    };
+    let target = PaletteTarget::Session(ring[next as usize].clone());
+    jump_to_target(app, target, landing, out);
 }
 
 fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
@@ -15670,6 +15716,323 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(app.selected_session().unwrap().name, "codex-1");
         assert_eq!(app.focus, Focus::Sessions);
         assert!(!app.term_locked);
+    }
+
+    // ---- `]` / `[`: the palette's attention order with no modal ----
+
+    /// Three more sessions across the two seeded projects, one per
+    /// attention tier: `ask` waits on you in nebula/feat-x, `run` is
+    /// mid-turn and `unread` finished unwatched in demo/main — beside the
+    /// never-run `agent-1` (demo/main) and `codex-1` (nebula/feat-x) the
+    /// seeds already have, and the archived `old-1` that must stay off the
+    /// ring.
+    fn seed_attention_ring(app: &mut App) {
+        use nebula_core::{Agent, AgentStatus, Entity, WorktreeId};
+        let agent = |id: &str, wt: &str, status: AgentStatus, unseen: bool| Agent {
+            id: AgentId(id.into()),
+            worktree_id: WorktreeId(wt.into()),
+            name: id.into(),
+            status,
+            archived: false,
+            archived_at: 0,
+            unseen,
+            kind: nebula_core::AgentKind::Claude,
+            model: None,
+            effort: None,
+            session_id: None,
+            cloud_session_id: None,
+            sort_order: 5,
+            status_changed_at: 500,
+            alive: true,
+            cloud_mirroring: false,
+        };
+        for a in [
+            agent("ask", "w2", AgentStatus::NeedsFeedback, false),
+            agent("run", "w1", AgentStatus::Running, false),
+            agent("unread", "w1", AgentStatus::Finished, true),
+        ] {
+            hse(
+                app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(a),
+                },
+            );
+        }
+    }
+
+    /// The session names `step` visits from the cursor's current row,
+    /// `n` presses in a row, landing without attaching.
+    fn walk_attention(app: &mut App, step: i64, n: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        (0..n)
+            .map(|_| {
+                jump_attention(app, step, Landing::FocusOnly, &mut out);
+                app.selected_session().expect("landed on a session").name
+            })
+            .collect()
+    }
+
+    /// `]` walks the ring `/` shows before a query: NEEDS FEEDBACK, then
+    /// RUNNING, then UNSEEN, then the rest — crossing projects as it goes,
+    /// skipping the archived row, and wrapping from the bottom to the top.
+    #[test]
+    fn next_attention_walks_the_palette_order_and_wraps() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        seed_attention_ring(&mut app);
+        app.show_archived = true;
+        app.focus = Focus::Sessions;
+        app.sel_session = row_of(&app, "a1");
+
+        assert_eq!(
+            walk_attention(&mut app, 1, 6),
+            ["codex-1", "ask", "run", "unread", "agent-1", "codex-1"]
+        );
+        assert_eq!(app.selected_project().unwrap().name, "nebula");
+        assert_eq!(app.selected_worktree().unwrap().branch, "feat-x");
+        assert!(app.flash.is_none(), "flash: {:?}", app.flash);
+    }
+
+    /// `[` is the same ring backwards, wrapping from the top to the bottom.
+    #[test]
+    fn prev_attention_walks_the_same_ring_backwards() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        seed_attention_ring(&mut app);
+        app.focus = Focus::Sessions;
+        app.sel_session = row_of(&app, "a1");
+
+        assert_eq!(
+            walk_attention(&mut app, -1, 6),
+            ["unread", "run", "ask", "codex-1", "agent-1", "unread"]
+        );
+    }
+
+    /// With the cursor off the ring — here a worktree with no sessions at
+    /// all — `]` starts at the top (the row that needs you most) and `[` at
+    /// the bottom, so the two stay each other's reverse.
+    #[test]
+    fn attention_jump_from_off_the_ring_starts_at_either_end() {
+        use nebula_core::{Entity, ProjectId, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        seed_attention_ring(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w3".into()),
+                    project_id: ProjectId("p1".into()),
+                    path: "/tmp/demo-empty".into(),
+                    branch: "empty".into(),
+                    is_main: false,
+                    sort_order: 1,
+                }),
+            },
+        );
+        let mut out = Vec::new();
+        let empty = app
+            .visible_worktrees()
+            .iter()
+            .position(|w| w.branch == "empty")
+            .unwrap();
+        select_worktree_row(&mut app, empty, &mut out);
+        assert!(app.selected_session().is_none(), "nothing to start from");
+
+        assert_eq!(walk_attention(&mut app, 1, 1), ["ask"]);
+
+        select_worktree_row(&mut app, empty, &mut out);
+        assert_eq!(walk_attention(&mut app, -1, 1), ["codex-1"]);
+    }
+
+    /// The keys are wired: `]` and `[` are the panel chords, live from any
+    /// panel, and the landing is the palette's — with the default setting
+    /// on, the pick attaches and locks input exactly like `/` Enter.
+    #[test]
+    fn bracket_keys_jump_and_land_like_the_palettes_enter() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        seed_attention_ring(&mut app);
+        app.focus = Focus::Projects;
+        app.sel_session = row_of(&app, "a1");
+        let mut out = Vec::new();
+
+        with_default_config(|| {
+            press(&mut app, KeyCode::Char(']'), KeyModifiers::NONE, &mut out);
+        });
+        assert!(app.overlay.is_none(), "no modal opened");
+        assert_eq!(app.selected_session().unwrap().name, "codex-1");
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(
+            app.term_locked,
+            "the default landing attaches, like / Enter"
+        );
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. }
+                    if *session == SessionRef::Agent(AgentId("a2".into())))),
+            "the pick attaches: {out:?}"
+        );
+
+        // From the locked pane, `[` is forwarded to the agent, so unlock
+        // first — then it walks back to where we came from.
+        leave_terminal_lock(&mut app);
+        out.clear();
+        with_default_config(|| {
+            press(&mut app, KeyCode::Char('['), KeyModifiers::NONE, &mut out);
+        });
+        assert_eq!(app.selected_session().unwrap().name, "agent-1");
+    }
+
+    /// `palette_enter_attaches` off lands the cursor on the row and
+    /// previews it, no input lock — the palette's quieter Enter.
+    #[test]
+    fn bracket_keys_only_focus_the_row_when_auto_attach_is_off() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        seed_attention_ring(&mut app);
+        app.focus = Focus::Sessions;
+        app.sel_session = row_of(&app, "a1");
+        let mut out = Vec::new();
+
+        with_config_json(r#"{"palette_enter_attaches": false}"#, || {
+            press(&mut app, KeyCode::Char(']'), KeyModifiers::NONE, &mut out);
+        });
+        assert_eq!(app.selected_session().unwrap().name, "codex-1");
+        assert_eq!(app.focus, Focus::Sessions, "lands on the list");
+        assert!(!app.term_locked, "no input lock");
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. }
+                    if *session == SessionRef::Agent(AgentId("a2".into())))),
+            "the pane still previews the picked session: {out:?}"
+        );
+    }
+
+    /// The ring spans every workspace: a RUNNING session in a workspace
+    /// that isn't open outranks the never-run one under the cursor, so `]`
+    /// switches there — project, worktree and session row all selected, the
+    /// daemon told — and a second `]` wraps back home.
+    #[test]
+    fn next_attention_crosses_into_another_workspace_and_back() {
+        use nebula_core::WorkspaceId;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_default_workspace(&mut app);
+        seed_other_workspace(&mut app);
+        seed_background_run(&mut app);
+        app.focus = Focus::Sessions;
+        app.sel_session = row_of(&app, "a1");
+        let mut out = Vec::new();
+
+        jump_attention(&mut app, 1, Landing::FocusOnly, &mut out);
+        assert_eq!(app.tree.active_workspace, WorkspaceId("ws2".into()));
+        assert_eq!(app.selected_project().unwrap().name, "secret");
+        assert_eq!(app.selected_worktree().unwrap().branch, "main");
+        assert_eq!(app.selected_session().unwrap().name, "bg-run");
+        assert_eq!(app.focus, Focus::Sessions);
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::OpenWorkspace { .. })),
+            "the daemon is told which workspace this connection is on: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. }
+                    if *session == SessionRef::Agent(AgentId("a9".into())))),
+            "the pane previews the session over there: {out:?}"
+        );
+
+        out.clear();
+        jump_attention(&mut app, 1, Landing::FocusOnly, &mut out);
+        assert_eq!(app.tree.active_workspace, WorkspaceId::default());
+        assert_eq!(app.selected_project().unwrap().name, "demo");
+        assert_eq!(app.selected_session().unwrap().name, "agent-1");
+    }
+
+    /// Landing on an unwatched finish reads it, the way ↑/↓ onto the row
+    /// does: violet to green, the DONE BADGE counts down, the daemon hears.
+    #[test]
+    fn next_attention_reads_the_unseen_finish_it_lands_on() {
+        use nebula_core::{AgentStatus, ProjectId, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_agent(&mut app, AgentStatus::Running);
+        let a2 = AgentId("a2".into());
+        let (w1, p1) = (WorktreeId("w1".into()), ProjectId("p1".into()));
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            40,
+            10,
+        ));
+        app.focus = Focus::Sessions;
+        app.sel_session = row_of(&app, "a1");
+        hse(
+            &mut app,
+            ServerEvent::StatusChanged {
+                agent: a2.clone(),
+                status: AgentStatus::Finished,
+                changed_at: crate::app::now_ms(),
+                unseen: true,
+            },
+        );
+        assert_eq!(app.worktree_unseen(&w1), 1, "one terminal to go read");
+
+        let mut out = Vec::new();
+        jump_attention(&mut app, 1, Landing::FocusOnly, &mut out);
+        assert_eq!(app.selected_session().unwrap().name, "agent-2");
+        assert_eq!(app.worktree_unseen(&w1), 0, "landing on the row reads it");
+        assert_eq!(app.project_unseen(&p1), 0);
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::MarkAgentSeen { id } if *id == a2)),
+            "the daemon is told: {out:?}"
+        );
+    }
+
+    /// No sessions anywhere: nothing moves, the footer says so.
+    #[test]
+    fn next_attention_with_no_sessions_flashes() {
+        use nebula_core::{Entity, Project, ProjectId, Worktree, WorktreeId};
+        let mut app = App::new();
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(Project {
+                    workspace_id: Default::default(),
+                    id: ProjectId("p1".into()),
+                    name: "demo".into(),
+                    repo_path: "/tmp/demo".into(),
+                    sort_order: 0,
+                }),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w1".into()),
+                    project_id: ProjectId("p1".into()),
+                    path: "/tmp/demo".into(),
+                    branch: "main".into(),
+                    is_main: true,
+                    sort_order: 0,
+                }),
+            },
+        );
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+        with_default_config(|| {
+            press(&mut app, KeyCode::Char(']'), KeyModifiers::NONE, &mut out);
+        });
+        assert_eq!(app.flash.as_deref(), Some(NO_SESSIONS_TO_JUMP));
+        assert_eq!(app.focus, Focus::Sessions);
+        assert!(out.is_empty(), "nothing to attach: {out:?}");
     }
 
     #[test]
