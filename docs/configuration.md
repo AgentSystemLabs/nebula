@@ -121,6 +121,72 @@ on the next ATTACH or prewarm, and an agent RESUMES its conversation there.
   `^←` on stock macOS. `Ctrl+q` is the one exception to all of it: it unlocks a terminal no matter what
   you bind, since unbinding your way out would trap you in the session.
 
+## Worktree hooks
+
+A checkout often owns things outside its own directory — a dev-server port, a Caddy or nginx route, a
+docker compose project, a database — that nebula knows nothing about. WORKTREE HOOKS are two
+executables of yours the DAEMON runs after it creates or deletes a worktree, so a project can provision
+and release those itself. They are the one setting that is not in CONFIG.JSON: a hook is per
+repository, so it lives in git config, read fresh at each use:
+
+```sh
+git config nebula.worktreeCreateHook /absolute/path/to/worktree-setup
+git config nebula.worktreeDeleteHook /absolute/path/to/worktree-cleanup
+```
+
+Git resolves the key the usual way, so `git config --global` sets one script for every project and a
+repo's own `.git/config` overrides it. Nebula never reads a hook from a file inside the checkout — a
+committed hook would run whatever a clone brought with it, which is why git refuses working-tree hooks
+too. Keep the executable outside the worktrees it serves; the delete hook runs after its checkout is
+gone.
+
+What a hook gets:
+
+- **Two arguments**, both absolute: the main repository path, then the created or deleted worktree
+  path. The value is spawned directly as an executable — no shell — so a space in either path arrives
+  intact.
+- **The main checkout as its working directory**, since the deleted directory no longer exists.
+- **Environment**: `NEBULA_HOOK` (`worktree-create` or `worktree-delete`, so one script can serve
+  both keys), `NEBULA_WORKTREE_BRANCH` and `NEBULA_WORKTREE_ID`.
+
+When they run, and what a failure means:
+
+- **Only after a nebula operation that succeeded.** The create hook fires once the checkout exists and
+  its row is in every client — `n` in the WORKTREES PANEL, `nebula worktree`, the QUICK PROMPT's fresh
+  worktree, a PR SESSION's checkout. The delete hook fires once `git worktree remove` (forced or not)
+  and the row drop went through, including a checkout you had already `rm -rf`'d by hand. A delete
+  that fails or is cancelled runs nothing. Worktrees created or removed outside nebula, which WORKTREE
+  SYNC merely notices, run nothing either.
+- **Skipped while the directory is still there.** When git had already stopped tracking a checkout
+  and nebula leaves the untracked directory alone, the delete hook does not run against live files;
+  the warning says so.
+- **Hooks never overlap.** They run under the DAEMON's worktree lock, so a create of a path waits
+  for the delete hook still releasing it, and `Shift+D`'s batch runs its hooks one after another. A
+  stuck hook holds the next worktree operation for at most the timeout; keystrokes never wait on it.
+- **A hook only reports.** It exits non-zero, cannot start, or runs past the timeout (30 s; then it
+  and every process it started are killed) — nebula shows a one-line warning naming the hook and the
+  last line it wrote to stderr, and logs the tail of its output in `daemon.log`. The worktree stays
+  created or deleted, because it already was. Nothing is retried.
+- **It may start something that outlives it.** A hook that launches a dev server in the background
+  and exits 0 is a success the moment it exits — its output goes to a file, not a pipe, so a child
+  holding it open never stalls the wait — and the server is left running. Only a timeout takes down
+  what the hook started.
+- **The DAEMON's environment is not a login shell.** On macOS a launchd-started daemon has a thin
+  `PATH`; a script that calls `caddy` or `docker` sets its own.
+
+A cleanup script in the spirit of the request that introduced this — release a routing entry and a
+development slot keyed by the deleted path:
+
+```sh
+#!/bin/sh
+# $1 = main repo, $2 = deleted worktree
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+name=$(basename "$2")
+[ -e "$HOME/.config/dev-slots/$name" ] || exit 0
+rm -f "$HOME/.config/dev-slots/$name" "/etc/caddy/sites/$name.caddy"
+caddy reload --config /etc/caddy/Caddyfile
+```
+
 ## Logs
 
 `daemon.log` and `tui.log` live in the state dir, which is not the DATA DIR on Linux and *is* on
@@ -154,6 +220,7 @@ Overrides for tests and parallel instances — real, but not things a normal ins
 | `NEBULA_UPDATE_CHECK_SECS` | `3600` | How often the TUI asks GitHub whether a newer release is published, for the FOOTER's `⇡ vX.Y.Z` indicator (one `curl` to the release page's redirect, no `gh` token); `0` turns it off. See [Keys](keys.md#chips-and-readouts). |
 | `NEBULA_IDLE_REAP_MS` | `15000` | IDLE REAPER sweep period in ms. This is how often it looks, not how long a session may idle — that is `session_idle_timeout`. |
 | `NEBULA_WORKTREE_SYNC_MS` | `2000` | WORKTREE SYNC probe period in ms: how often the DAEMON reconciles `git worktree list` so worktrees made outside nebula appear. |
+| `NEBULA_HOOK_TIMEOUT_MS` | `30000` | How long a WORKTREE HOOK may run before the DAEMON kills it and warns; tests shorten it. |
 
 `NEBULA_AGENT_ID`, `NEBULA_API_URL` and `NEBULA_API_TOKEN` are set *by* the DAEMON on every agent
 PTY (and scrubbed from plain terminals) so hooks can reach the HOOK RECEIVER — never something you

@@ -13,6 +13,7 @@ pub mod session_title;
 pub mod sibling;
 pub mod status;
 pub mod store;
+pub mod worktree_hooks;
 
 use anyhow::{bail, Context, Result};
 use nebula_core::{env, paths};

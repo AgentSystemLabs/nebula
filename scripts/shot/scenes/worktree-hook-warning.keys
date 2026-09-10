@@ -1,0 +1,6 @@
+# Walk to the WORKTREES PANEL, land on a linked worktree, delete it: the checkout goes, the row
+# goes, and the configured delete hook's refusal lands in the footer as a warning.
+Tab
+j
+d
+y

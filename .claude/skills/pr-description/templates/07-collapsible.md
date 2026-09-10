@@ -64,6 +64,15 @@ flowchart TB
 
 ## ⚠️ Risk <a id="risk"></a>
 
+<!-- Only when the change ADDS A SURFACE — the DAEMON execs a program, opens a socket, route or
+     ClientRequest, reads a new config source, writes a file it did not before. One bullet per way
+     in: who or what reaches it, what holds it, what does not. The 🔒 row below then rates the
+     residue. A PR that adds no surface deletes this subsection. -->
+### 🎯 Attack surface <a id="attack-surface"></a>
+
+- **<Way in>.** <Who or what reaches it. Held by: <mitigation>. Not held: <what remains>.>
+- **<Way in>.** <…>
+
 **Verdict:** <🟢 Low risk · 🟡 Merge with care · 🔴 Do not merge as-is — pick one, then one clause saying why. The author's own read; the PR REVIEWER SKILL checks it against the diff.>
 
 | | Level | Why |

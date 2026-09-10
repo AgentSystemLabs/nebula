@@ -36,6 +36,15 @@
   `stat` calls (`NEBULA_WORKTREE_SYNC_MS` overrides the 2 s beat; the e2e tests turn it down to
   100 ms). This structural sync is the *only* git polling the DAEMON does — the pull request lookups
   further down are the TUI's own.
+- **A worktree's outside resources are yours to hook — WORKTREE HOOKS.** `git config
+  nebula.worktreeCreateHook` / `nebula.worktreeDeleteHook` name an executable the DAEMON runs after it
+  creates or removes a checkout, from the main repository, with the repo path and the worktree path as
+  its two arguments — so a project can claim a dev-server port or a Caddy route on create and release
+  it on delete. The hook runs after the git operation and the row change have gone through, still
+  under the worktree lock — so hooks never overlap and a create of a path waits for the delete hook
+  releasing it — and under a 30 s timeout that kills the hook and everything it started; a failure is
+  a warning in every client, never a rolled-back create or delete. Per repo in git config rather than in CONFIG.JSON, and never a file inside the
+  checkout. See [Configuration](configuration.md#worktree-hooks).
 - **Agents boot `claude`, `codex`, `cursor-agent`, or `pi`.** Creating an agent (`n`) first asks which CLI to
   run, then spawns it in the worktree. Claude's picker can also dispatch a one-shot Cloud task as
   `claude --cloud <task>`; because Claude accepts that description as a process argument, don't put
