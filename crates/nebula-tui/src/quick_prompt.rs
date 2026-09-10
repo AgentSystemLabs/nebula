@@ -6,9 +6,11 @@
 //! and MODEL / EFFORT the `quick_prompt_kind` SETTING resolves to, which
 //! AGENT PRESET (if any) wraps the text, and the [`QuickTarget`] it lands
 //! in — the selected WORKTREE, or one that does not exist yet — plus the
-//! two pickers that rewrite it for one launch (`Tab`, `Shift+Tab`) and
-//! the [`QuickReturn`] they carry so the round trip loses neither the spec
-//! nor the typed text. The dialog itself is an ordinary multi-line
+//! two pickers that rewrite it for one launch (`Tab`, `Shift+Tab`), the
+//! [`QuickReturn`] they carry so the round trip loses neither the spec
+//! nor the typed text, and the `Ctrl+N` toggle that flips the target
+//! between the selected checkout and a fresh worktree from any panel
+//! (`toggle_new_worktree`). The dialog itself is an ordinary multi-line
 //! `PromptDialog` (`PromptKind::QuickPrompt`) drawn by `ui::draw_overlay`,
 //! and the create it ends in goes through `event_loop::create_agent` like
 //! every other session, with the composed text as the STARTING PROMPT
@@ -17,6 +19,7 @@
 use crate::agent_presets::AgentPreset;
 use crate::app::{App, Focus, Overlay, PromptKind};
 use crate::config::{fit_effort, Config};
+use crate::text_input::TextInput;
 use nebula_core::{AgentKind, ProjectId, WorktreeId};
 
 /// Where a QUICK PROMPT launch lands.
@@ -24,9 +27,8 @@ use nebula_core::{AgentKind, ProjectId, WorktreeId};
 pub enum QuickTarget {
     /// The WORKTREE selected when the box opened.
     Worktree(WorktreeId),
-    /// A WORKTREE that does not exist yet — `p` on the WORKTREES PANEL
-    /// while the `hide_root_worktree` SETTING is on. Enter cuts `branch`
-    /// off the PROJECT's fetched default base first
+    /// A WORKTREE that does not exist yet — `p` on the WORKTREES PANEL.
+    /// Enter cuts `branch` off the PROJECT's fetched default base first
     /// (`ClientRequest::CreateWorktree`), and the launch follows into the
     /// checkout the DAEMON made once its Ack lands.
     NewWorktree { project: ProjectId, branch: String },
@@ -154,6 +156,13 @@ impl QuickLaunch {
             None => "what should the agent do?".into(),
         }
     }
+
+    /// Does Enter cut a fresh worktree before it launches? The box's frame
+    /// turns green and its target row wears a NEW WORKTREE chip while so,
+    /// whether the target came from the WORKTREES PANEL or from `Ctrl+N`.
+    pub fn is_new_worktree(&self) -> bool {
+        matches!(self.target, QuickTarget::NewWorktree { .. })
+    }
 }
 
 /// The hotkey: open the task box for the selected WORKTREE. Unlike the
@@ -162,13 +171,14 @@ impl QuickLaunch {
 /// but it still needs a checkout to run in, so a PROJECT with no worktree
 /// selected (or a cursor parked on an OPEN PRS row) flashes instead.
 ///
-/// The one exception is the WORKTREES PANEL with the `hide_root_worktree`
-/// SETTING on: `p` there means "a fresh worktree, then this task in it",
-/// whatever row the cursor is parked on — the checkout does not exist
-/// yet, so only the PROJECT has to be selected. Its branch is the same
-/// random name the `n` prompt would have offered.
+/// The one exception is the WORKTREES PANEL: `p` there means "a fresh
+/// worktree, then this task in it", whatever row the cursor is parked on
+/// (the root, another checkout, an OPEN PRS row) and whether or not the
+/// `hide_root_worktree` SETTING has taken the root row out — the checkout
+/// does not exist yet, so only the PROJECT has to be selected. Its branch
+/// is the same random name the `n` prompt would have offered.
 pub(crate) fn open_quick_prompt(app: &mut App) {
-    if app.hide_root_worktree && app.focus == Focus::Worktrees {
+    if app.focus == Focus::Worktrees {
         let Some(project) = app.selected_project().map(|p| p.id.clone()) else {
             app.flash = Some("quick prompt: select a project first".into());
             return;
@@ -222,6 +232,65 @@ pub(crate) fn reopen(app: &mut App, launch: QuickLaunch, text: &str) {
     crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch));
     if let Some(crate::app::Overlay::Prompt(prompt)) = &mut app.overlay {
         prompt.input.insert_multiline_str(text);
+    }
+}
+
+/// `Ctrl+N` in the box: flip this one launch between the selected
+/// WORKTREE and a fresh one, from whichever panel `p` was pressed in —
+/// the WORKTREES PANEL's "cut a worktree first" without walking over to
+/// it, and the way back into the checkout under the cursor from there.
+/// Flipping on mints the same random branch `n` would offer; flipping off
+/// needs a real checkout under the cursor (not an OPEN PRS row, not a
+/// stand-in git is still cutting) and says so while keeping the fresh one
+/// otherwise. The box is rebuilt so its title and frame follow the
+/// target, with the typed text and the caret exactly where they were.
+pub(crate) fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: TextInput) {
+    let target = match &launch.target {
+        QuickTarget::NewWorktree { .. } => match app.selected_worktree().map(|w| w.id.clone()) {
+            None => Err("quick prompt: no worktree under the cursor — keeping the new one"),
+            Some(worktree) if app.is_placeholder_worktree(&worktree) => {
+                Err("quick prompt: worktree is still being created — keeping the new one")
+            }
+            Some(worktree) => Ok(QuickTarget::Worktree(worktree)),
+        },
+        QuickTarget::Worktree(id) => match app
+            .tree
+            .worktrees
+            .iter()
+            .find(|w| &w.id == id)
+            .map(|w| w.project_id.clone())
+        {
+            None => Err("quick prompt: worktree no longer exists"),
+            Some(project) => {
+                let branch = crate::branch_name::random_name(&app.project_branches(&project));
+                Ok(QuickTarget::NewWorktree { project, branch })
+            }
+        },
+    };
+    match target {
+        Err(msg) => app.flash = Some(msg.into()),
+        Ok(target) => {
+            let launch = QuickLaunch { target, ..launch };
+            crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch));
+            if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
+                prompt.input = input;
+            }
+        }
+    }
+}
+
+/// The branch the box's target row names: the selected checkout's, or the
+/// one Enter will cut. None only if the selected worktree vanished while
+/// the box was up.
+pub(crate) fn target_branch(app: &App, launch: &QuickLaunch) -> Option<String> {
+    match &launch.target {
+        QuickTarget::Worktree(id) => app
+            .tree
+            .worktrees
+            .iter()
+            .find(|w| &w.id == id)
+            .map(|w| w.branch.clone()),
+        QuickTarget::NewWorktree { branch, .. } => Some(branch.clone()),
     }
 }
 

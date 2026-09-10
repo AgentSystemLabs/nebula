@@ -1,0 +1,7 @@
+# The same box after Ctrl+N: the frame turns green, the NEW WORKTREE chip names the branch Enter will
+# cut, `[✓] new worktree` is ticked, and the typed text is still there.
+Tab
+Tab
+p
+Add a retry to the login redirect
+C-n

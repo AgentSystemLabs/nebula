@@ -162,11 +162,12 @@ pub(crate) enum Command {
     },
     /// Show files to the user inside this nebula.
     ///
-    /// Run from inside a nebula agent session; agents run it when you ask to
-    /// see a file, or to put their own work in front of you. The files open
-    /// in nebula's file tabs — a modal with one tab per file, the focused one
-    /// previewed, Enter editing it — in every nebula attached to this
-    /// daemon, and this session carries on untouched.
+    /// Run from inside a nebula agent session; agents run it only when you
+    /// ask to see a file, never unprompted. Text files only: an image or any
+    /// other binary is refused, since a terminal has nothing to show for it.
+    /// The files open in nebula's file tabs — a modal with one tab per file,
+    /// the focused one previewed, Enter editing it — in every nebula
+    /// attached to this daemon, and this session carries on untouched.
     #[command(after_help = OPEN_EXAMPLES)]
     Open {
         /// The files to show, relative to the current directory or absolute.

@@ -65,16 +65,17 @@ const CLAUDE_EVENTS: &[(&str, Option<&str>)] = &[
     // that arrives when a turn ends without a Stop. See status.rs.
     ("Notification", None),
     ("PreToolUse", Some("AskUserQuestion")),
-    ("PostToolUse", Some("AskUserQuestion")),
-    // Not a status signal — a position one. Claude reports the session's
-    // working directory on every hook payload, and these are the tools that
-    // change it: EnterWorktree/ExitWorktree relocate the whole session (what
-    // "do this in a worktree" actually runs), and a Bash `cd` moves it too.
-    // Hooking them re-homes the row seconds after the session moves instead
-    // of at the turn's Stop, which can be many minutes later. Matchers are
-    // regexes, so one group covers all three.
-    // See registry::reparent_agent_by_cwd.
-    ("PostToolUse", Some("Bash|EnterWorktree|ExitWorktree")),
+    // Every tool's end, unmatched. Three signals ride it: the answer to an
+    // `AskUserQuestion` (the row leaves red); the approval of a permission
+    // prompt, which fires no hook of its own — the gated tool simply runs,
+    // and its PostToolUse is the first word that the user said yes, for
+    // Edit and WebFetch as much as for Bash (see status.rs); and the
+    // session's position — Claude reports its working directory on every
+    // payload, and EnterWorktree/ExitWorktree (what "do this in a
+    // worktree" actually runs) or a Bash `cd` move it, so the row re-homes
+    // seconds after the move instead of at the turn's Stop, which can be
+    // many minutes later (see registry::reparent_agent_by_cwd).
+    ("PostToolUse", None),
     ("SubagentStart", None),
     ("SubagentStop", None),
 ];
@@ -422,10 +423,9 @@ fn merge_managed_hooks(
     let hooks = root_obj.entry("hooks").or_insert_with(|| json!({}));
     let hooks_obj = object_mut(hooks, "\"hooks\"", path)?;
 
-    // One event can carry several managed groups (PostToolUse has one per
-    // matcher), so the strip-and-rebuild happens once per event name —
-    // stripping again for the second matcher would delete the group the
-    // first one just added.
+    // One event may carry several managed groups (one per matcher), so the
+    // strip-and-rebuild happens once per event name — stripping again for
+    // a second matcher would delete the group the first one just added.
     let mut stripped: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (event, matcher) in events {
         let groups = hooks_obj
@@ -537,25 +537,41 @@ mod tests {
     }
 
     #[test]
-    fn post_tool_use_keeps_both_matchers_across_reinstalls() {
-        // Two managed groups share the PostToolUse event: AskUserQuestion is
-        // the waiting-on-user signal, the other is the cwd probe that
-        // re-homes a session into a worktree it just entered. A reinstall
-        // (every spawn) must leave exactly one of each.
+    fn post_tool_use_is_one_unmatched_group_across_reinstalls() {
+        // PostToolUse carries no matcher: a permission prompt's approval is
+        // only ever visible as the gated tool's completion, whatever the
+        // tool, and the AskUserQuestion answer and the cwd probe ride the
+        // same group. A reinstall (every spawn) must leave exactly one —
+        // and must replace the two matched groups an older nebula wrote.
         let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = |matcher: &str| {
+            let mut g = managed_group("claude", "PostToolUse", Some(matcher));
+            g["_nebulaManaged"] = json!(true);
+            g
+        };
+        std::fs::write(
+            dir.join("settings.local.json"),
+            serde_json::to_string(&json!({
+                "hooks": {
+                    "PostToolUse": [old("AskUserQuestion"), old("Bash|EnterWorktree|ExitWorktree")]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         install_claude_hooks(tmp.path()).unwrap();
         install_claude_hooks(tmp.path()).unwrap();
         let settings = read_settings(tmp.path());
         let groups = settings["hooks"]["PostToolUse"].as_array().unwrap();
-        let matchers: Vec<&str> = groups
-            .iter()
-            .map(|g| g["matcher"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            matchers,
-            vec!["AskUserQuestion", "Bash|EnterWorktree|ExitWorktree"]
-        );
-        assert!(groups.iter().all(|g| g["_nebulaManaged"] == json!(true)));
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert!(groups[0].get("matcher").is_none());
+        assert_eq!(groups[0]["_nebulaManaged"], json!(true));
+        assert!(groups[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("hookEvent=PostToolUse"));
     }
 
     #[test]
@@ -779,7 +795,7 @@ mod tests {
         install_claude_hooks(tmp.path()).unwrap();
         let settings = read_settings(tmp.path());
         for (event, _) in CLAUDE_EVENTS {
-            // One group per (event, matcher) pair — PostToolUse carries two.
+            // One group per (event, matcher) pair.
             let expected = CLAUDE_EVENTS.iter().filter(|(e, _)| e == event).count();
             assert_eq!(
                 settings["hooks"][*event].as_array().unwrap().len(),

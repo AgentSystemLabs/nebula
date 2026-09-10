@@ -7,7 +7,11 @@
   or `/tmp/nebula-<uid>/`, mode 0700). Quit the TUI, relaunch later, and your sessions are still alive
   with scrollback replayed. When the daemon swaps the process under a session you are looking at — a
   restart, or the `nebula worktree` relocation at the end of a turn — the pane is rebound to the new
-  one on its own.
+  one on its own. Moving the cursor onto a live session — a row in the Sessions panel, or a worktree,
+  project or workspace switch that brings one back — attaches it on the keypress; only a session the
+  idle reaper took waits a moment, so that walking past its row doesn't boot a CLI. The screens of the
+  last two sessions shown are kept, so returning to one paints on the same frame and fetches only the
+  bytes it missed instead of replaying the whole ring.
 - **Every pane is the same truecolor terminal.** A session paints nebula's own grid, not the terminal
   nebula runs in, so the daemon tells each child `TERM=xterm-256color` and `COLORTERM=truecolor` and
   drops any `NO_COLOR` / `FORCE_COLOR` it inherited. An agent launch runs through your login shell
@@ -97,13 +101,26 @@
   session whose worker died can sit yellow far longer than you expect, and it is generous on purpose:
   one silent `cargo test` can run for many minutes, and a wrong green is the bug it exists to prevent.
   An individually tracked subagent older than 2 h is dropped from the set outright.
-- **Which of those signals you get depends on the harness.** Claude is installed with all ten hook
+- **Answering is a hook too — just not its own.** Approving a permission prompt fires nothing: the
+  gated tool simply runs, and its `PostToolUse` is the first word that you said yes. So the
+  `PostToolUse` group is unmatched — every tool's end reaches nebula — and a tool event from the same
+  origin as the open dialog (the foreground turn, or the one subagent whose prompt it was) moves the
+  row from red back to yellow; another subagent's traffic says nothing about a dialog it did not
+  raise. An `AskUserQuestion` answer is that tool's own `PostToolUse`. The one signal nebula treats
+  with suspicion is Claude's `permission_prompt` notification: Claude sends it from a timer once a
+  dialog has sat 6 s with no keystroke, detached from the turn, and its question dialog sends the
+  same type — so one can land just *after* the answer that closed the dialog. Inside 5 s of the row
+  leaving red that notification is taken as the echo it is and ignored; a genuinely new dialog
+  announces itself through `PermissionRequest` or `PreToolUse` first, never through that notification
+  alone.
+- **Which of those signals you get depends on the harness.** Claude is installed with all nine hook
   groups — `UserPromptSubmit`, `Stop`, `SessionStart`, `PermissionRequest`, `Notification`, a
-  `PreToolUse` and a `PostToolUse` on `AskUserQuestion`, and a `PostToolUse` on
-  `Bash|EnterWorktree|ExitWorktree` so a session that moves re-homes its row seconds later instead of
-  at the turn's `Stop`, plus `SubagentStart` and `SubagentStop`. Codex gets six of them: no
+  `PreToolUse` on `AskUserQuestion`, an unmatched `PostToolUse` (the question's answer, a permission
+  prompt's approval, and the cwd probe that re-homes a session that moves seconds later instead of
+  at the turn's `Stop`), plus `SubagentStart` and `SubagentStop`. Codex gets six of them: no
   `Notification` and neither `*ToolUse` group, because it has no `AskUserQuestion` tool and its native
-  `PermissionRequest` already covers waiting on you. Cursor gets five camelCase events —
+  `PermissionRequest` already covers waiting on you — which also means a Codex row approved out of a
+  permission prompt stays red until the turn ends. Cursor gets five camelCase events —
   `sessionStart`, `beforeSubmitPrompt`, `stop`, `subagentStart`, `subagentStop` — and no permission
   event at all; nebula runs `cursor-agent --force`, so waiting-on-you is simply not detectable there
   and a Cursor session never reaches NEEDS FEEDBACK, only busy or idle. Pi runs TypeScript extensions
@@ -164,9 +181,12 @@
   and the session runs `nebula open <file>…`; every TUI attached to the daemon raises its file tabs on
   them — a modal with one tab per file, the focused one previewed with syntax highlighting, `Enter`
   editing it in place — so the agent puts the file in front of you instead of pasting it into the
-  reply. The CLI resolves the paths against the session's own directory and refuses a path that isn't
-  there; the daemon only checks the caller is a known session and passes the agent's checkout along as
-  the editor's working directory. Same appended prompt, plus a `Bash(nebula open:*)` permission.
+  reply. Only when you ask: the appended prompt forbids opening anything unprompted, so an agent that
+  wants you to look at its work names the path and waits. And text only: the CLI resolves the paths
+  against the session's own directory and refuses a path that isn't there or isn't a text file (a NUL
+  byte in its first 8 KiB, git's own test — a terminal has nothing to show for a PNG); the daemon only
+  checks the caller is a known session and passes the agent's checkout along as the editor's working
+  directory. Same appended prompt, plus a `Bash(nebula open:*)` permission.
 - **Everything persists in SQLite** (`~/.local/share/nebula/nebula.db` or the platform equivalent):
   projects, worktrees, agents (with kind + CLI session ids), links, workspaces, and your
   last selection.

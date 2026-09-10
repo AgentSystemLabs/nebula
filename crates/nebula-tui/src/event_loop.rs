@@ -1,6 +1,7 @@
 //! The main TUI loop: terminal setup/teardown, message routing, update logic.
 
 use crate::agent_picker::{self, kind_label, KindPicker};
+use crate::app::PrDiffAnswer;
 use crate::app::{
     clamp_selection, App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView,
     FileFinder, Focus, GrepView, HelpView, HitTarget, LinkRow, MenuAction, MenuFilter, MenuItem,
@@ -8,7 +9,7 @@ use crate::app::{
     PromptDialog, PromptKind, RowKey, SessionRow, SettingsView, SplitterDrag, SubmenuKind,
     TermSelection, WorktreeRollback,
 };
-use crate::pull_request::PullRequest;
+use crate::pull_request::Lookup;
 use crate::text_input::TextInput;
 use crate::tree_browser::TreeBrowser;
 use crate::vim_term::{VimEvent, VimTerm};
@@ -107,10 +108,14 @@ const AGO_REFRESH: Duration = Duration::from_secs(30);
 /// list doesn't boot every CLI passed, short enough that the sessions are
 /// booting well before the user picks one.
 const PREWARM_DEBOUNCE: Duration = Duration::from_millis(250);
-/// How long a selection-driven attach waits for the cursor to settle. Long
-/// enough that walking a list (or the Workspaces column, where every step is
-/// a whole workspace switch) attaches only where the cursor stops; short
-/// enough to feel immediate when it does stop.
+/// How long a selection-driven attach to a *reaped* session waits for the
+/// cursor to settle: attaching one makes the daemon fork an agent CLI, and a
+/// cursor merely passing through a row — walking a list, or the Workspaces
+/// column, where every step is a whole workspace switch — has not asked for
+/// that. Long enough that a walk boots only where it stops; short enough to
+/// feel immediate when it does. A session the daemon still holds never
+/// waits: attaching it only replays its ring, so every path (`attach_inner`)
+/// attaches it on the keypress.
 const ATTACH_DEBOUNCE: Duration = Duration::from_millis(180);
 
 /// How often the standing keep-warm request for the selected worktree's
@@ -176,9 +181,19 @@ const PR_SWEEP_REFRESH: Duration = Duration::from_secs(5 * 60);
 /// `OPEN_PRS_MIN_AGE` so walking the project list can't spend a call per
 /// row. `Shift+R` (`refresh_pull_requests`) is the one gesture that skips
 /// the floor: a deliberate keypress may spend the call.
-const OPEN_PRS_REFRESH: Duration = Duration::from_secs(15);
-const OPEN_PRS_RECHECK_MIN: Duration = Duration::from_secs(30);
+pub(crate) const OPEN_PRS_REFRESH: Duration = Duration::from_secs(15);
+pub(crate) const OPEN_PRS_RECHECK_MIN: Duration = Duration::from_secs(30);
 const OPEN_PRS_RECHECK_MAX: Duration = Duration::from_secs(10 * 60);
+/// How often the open list of a project the cursor is *not* on is re-asked
+/// — the background pass that keeps every project's group warm, so
+/// switching to one shows a list minutes old at worst (and the cache the
+/// next launch hydrates from is as fresh as that). One `gh pr list` per
+/// project per beat, one project per tick (`sweep_open_prs`): twelve
+/// calls an hour per project against the budget above, and a project that
+/// answers empty keeps its own backoff on top. Same reasoning and cadence
+/// as `PR_SWEEP_REFRESH`; the selected project's list stays on
+/// `OPEN_PRS_REFRESH`.
+const OPEN_PRS_SWEEP_REFRESH: Duration = Duration::from_secs(5 * 60);
 
 /// How long the Worktrees cursor must rest on an open-PR row before its
 /// description and conversation are fetched. Long enough that arrowing
@@ -241,6 +256,11 @@ async fn main_loop(
     let cfg = crate::config::Config::load();
     apply_config(&mut app, &cfg);
     app.keymap = cfg.keymap();
+    // Every pull request the last run knew about, painted before the
+    // daemon's snapshot even lands; the lookups below refresh them all in
+    // the background (`pr_cache`).
+    app.pr_cache = Some(crate::pr_cache::PrCache::default_location());
+    crate::pr_cache::hydrate(&mut app);
     // The Cursor MODEL / EFFORT lists: cached `cursor-agent --list-models`
     // now, a background refresh when the cache is a day old.
     crate::cursor_catalogue::bootstrap(cfg.cursor_enabled);
@@ -255,10 +275,13 @@ async fn main_loop(
     let mut pointer_sent = PointerShape::default();
     let mut next_draw = tokio::time::Instant::now();
     let mut next_git_poll = tokio::time::Instant::now();
+    // The changed-file badge's `git status`, run off the loop; the count
+    // lands here and in `app.git_changes`.
+    let (git_tx, mut git_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(WorktreeId, Option<usize>)>();
     // Pull-request lookups run off the loop (they hit the network); answers
     // come back here and land in `app.pull_requests`.
-    let (pr_tx, mut pr_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(WorktreeId, Option<PullRequest>)>();
+    let (pr_tx, mut pr_rx) = tokio::sync::mpsc::unbounded_channel::<(WorktreeId, Lookup)>();
     // The selected project's open-pull-request list, on the same off-loop
     // footing. `None` is "couldn't ask", which keeps the last good list.
     let (prs_tx, mut prs_rx) = tokio::sync::mpsc::unbounded_channel::<(
@@ -268,9 +291,9 @@ async fn main_loop(
     // One pull request's body and conversation, for the preview pane.
     let (detail_tx, mut detail_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, Option<crate::pull_request::PrDetail>)>();
-    // A whole `gh pr diff`, which opens the diff modal when it lands.
-    let (prdiff_tx, mut prdiff_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(u64, String, Option<String>)>();
+    // A whole `gh pr diff`, which opens the diff modal when it lands — or
+    // refreshes the one already open on the cached copy.
+    let (prdiff_tx, mut prdiff_rx) = tokio::sync::mpsc::unbounded_channel::<PrDiffAnswer>();
     app.pr_diff_tx = Some(prdiff_tx);
     // A newer nebula published on GitHub, probed off the loop at start and
     // then on a slow beat (`update_check::interval`; the e2e tests turn it
@@ -292,10 +315,11 @@ async fn main_loop(
 
     loop {
         if app.dirty && tokio::time::Instant::now() >= next_draw {
-            // A selection change must never paint another checkout's badge;
-            // between selections the slow poll keeps the count fresh.
+            // A selection change must never paint another checkout's badge:
+            // the badge stays off until this checkout's count lands, and
+            // between selections the slow poll keeps it fresh.
             if app.git_changes_stale() {
-                refresh_git_changes(&mut app);
+                request_git_changes(&mut app, &git_tx);
             }
             terminal.draw(|f| ui::draw(f, &mut app))?;
             app.dirty = false;
@@ -313,7 +337,7 @@ async fn main_loop(
             // Fixed deadline (not a fresh sleep per iteration) so heavy PTY
             // traffic can't starve the badge refresh.
             _ = tokio::time::sleep_until(next_git_poll) => {
-                refresh_git_changes(&mut app);
+                request_git_changes(&mut app, &git_tx);
                 // Rides the git tick rather than the repaint, so walking the
                 // worktree list with j/k can't spawn a `gh` per row passed —
                 // only whatever the selection is resting on when it fires,
@@ -322,6 +346,14 @@ async fn main_loop(
                 lookup_pull_request(&mut app, &pr_tx);
                 sweep_pull_request(&mut app, &pr_tx);
                 lookup_open_prs(&mut app, &prs_tx, &mut out);
+                sweep_open_prs(&mut app, &prs_tx, &mut out);
+                // Whatever the answers above changed since the last tick
+                // goes to disk, off the loop; the next launch paints from it.
+                if let Some((cache, store, live)) = crate::pr_cache::take_flush(&mut app) {
+                    tokio::task::spawn_blocking(move || {
+                        crate::pr_cache::write_all(&cache, &store, &live)
+                    });
+                }
                 next_git_poll = tokio::time::Instant::now() + GIT_POLL;
             }
             // `Shift+R` asked for the pull requests now: the same lookups
@@ -427,10 +459,19 @@ async fn main_loop(
             }
             answer = pr_rx.recv() => {
                 // Never None: `pr_tx` lives as long as the loop.
-                if let Some((worktree, pr)) = answer {
-                    app.pr_inflight.remove(&worktree);
-                    note_pr_answer(&mut app, &worktree, pr.is_some());
-                    app.dirty |= app.pull_requests.insert(worktree, pr.clone()) != Some(pr);
+                if let Some((worktree, answer)) = answer {
+                    land_pull_request(&mut app, worktree, answer);
+                }
+            }
+            answer = git_rx.recv() => {
+                // Never None: `git_tx` lives as long as the loop.
+                if let Some((worktree, count)) = answer {
+                    land_git_changes(&mut app, worktree, count);
+                    // The selection moved on while this one was being read:
+                    // ask for where it is now, rather than wait a poll.
+                    if app.git_changes_stale() {
+                        request_git_changes(&mut app, &git_tx);
+                    }
                 }
             }
             answer = prs_rx.recv() => {
@@ -460,28 +501,12 @@ async fn main_loop(
             }
             answer = detail_rx.recv() => {
                 if let Some((url, detail)) = answer {
-                    app.pr_detail_inflight.remove(&url);
-                    match detail {
-                        Some(detail) => {
-                            // GitHub's answer about this one pull request is
-                            // the authoritative one: if it has been merged or
-                            // closed since the list was fetched, the row goes
-                            // now rather than at the next refresh.
-                            let retired = !detail.is_open();
-                            adopt_pr_state(&mut app, &detail);
-                            app.pr_detail.insert(url.clone(), detail);
-                            if retired {
-                                drop_retired_pr(&mut app, &url, &mut out);
-                            }
-                        }
-                        None => { app.pr_detail_failed.insert(url); }
-                    }
-                    app.dirty = true;
+                    land_pr_detail(&mut app, url, detail, &mut out);
                 }
             }
             answer = prdiff_rx.recv() => {
-                if let Some((number, title, diff)) = answer {
-                    open_pr_diff_view(&mut app, number, title, diff);
+                if let Some(answer) = answer {
+                    land_pr_diff(&mut app, answer);
                 }
             }
         }
@@ -565,6 +590,12 @@ async fn main_loop(
         }
 
         if app.should_quit {
+            // Whatever the pull-request lookups learned since the last tick,
+            // written inline: the process is about to end, and a write
+            // handed to a thread here could be cut off with it.
+            if let Some((cache, store, live)) = crate::pr_cache::take_flush(&mut app) {
+                crate::pr_cache::write_all(&cache, &store, &live);
+            }
             // Persist selection so the next launch restores it.
             let _ = channels
                 .tx
@@ -577,21 +608,57 @@ async fn main_loop(
     }
 }
 
-/// Recompute the changed-file count behind the worktree panel's badge.
-/// Synchronous `git status` on purpose (the git_diff.rs precedent): it runs
-/// once per `GIT_POLL` plus on selection changes, off the input hot path.
-fn refresh_git_changes(app: &mut App) {
-    let next = app
+/// Read the changed-file count behind the worktree panel's badge for the
+/// selected checkout, off the loop: a `git status` is tens of milliseconds
+/// on a big checkout, and it used to run inline before the first frame of
+/// every worktree switch — a late frame on the one keypress that should
+/// feel instant — and on every poll, a hitch under the user's typing.
+/// Skipped while one is in flight (a repaint must never stack processes);
+/// the answer arrives on `git_tx` and lands in `land_git_changes`.
+fn request_git_changes(
+    app: &mut App,
+    git_tx: &tokio::sync::mpsc::UnboundedSender<(WorktreeId, Option<usize>)>,
+) {
+    if app.git_changes_inflight.is_some() {
+        return;
+    }
+    let Some((id, path)) = app
         .selected_worktree()
         .map(|w| (w.id.clone(), w.path.clone()))
-        .map(|(id, path)| {
-            let count = crate::git_diff::changed_files(&path).ok().map(|f| f.len());
-            (id, count)
-        });
+    else {
+        return;
+    };
+    app.git_changes_inflight = Some(id.clone());
+    let git_tx = git_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let count = crate::git_diff::changed_files(&path).ok().map(|f| f.len());
+        let _ = git_tx.send((id, count));
+    });
+}
+
+/// Record a checkout's changed-file count. Stored whichever checkout it is
+/// for — `App::selected_worktree_changes` shows it only while that one is
+/// selected — and a value change redraws.
+fn land_git_changes(app: &mut App, worktree: WorktreeId, count: Option<usize>) {
+    app.git_changes_inflight = None;
+    let next = Some((worktree, count));
     if app.git_changes != next {
         app.git_changes = next;
         app.dirty = true;
     }
+}
+
+/// The two halves above in one synchronous step, for tests of the badge.
+#[cfg(test)]
+fn refresh_git_changes(app: &mut App) {
+    let Some((id, path)) = app
+        .selected_worktree()
+        .map(|w| (w.id.clone(), w.path.clone()))
+    else {
+        return;
+    };
+    let count = crate::git_diff::changed_files(&path).ok().map(|f| f.len());
+    land_git_changes(app, id, count);
 }
 
 /// Ask `gh` for the selected worktree's pull request, off the loop. Skipped
@@ -600,7 +667,7 @@ fn refresh_git_changes(app: &mut App) {
 /// `pr_tx`.
 fn lookup_pull_request(
     app: &mut App,
-    pr_tx: &tokio::sync::mpsc::UnboundedSender<(WorktreeId, Option<PullRequest>)>,
+    pr_tx: &tokio::sync::mpsc::UnboundedSender<(WorktreeId, Lookup)>,
 ) {
     let Some((id, path)) = app
         .selected_worktree()
@@ -636,7 +703,7 @@ fn lookup_pull_request(
 /// idles on `PR_SWEEP_REFRESH`. The reply lands on `pr_tx` like any other.
 fn sweep_pull_request(
     app: &mut App,
-    pr_tx: &tokio::sync::mpsc::UnboundedSender<(WorktreeId, Option<PullRequest>)>,
+    pr_tx: &tokio::sync::mpsc::UnboundedSender<(WorktreeId, Lookup)>,
 ) {
     let Some((id, path)) = sweep_target(app) else {
         return;
@@ -703,6 +770,28 @@ fn note_pr_answer(app: &mut App, worktree: &WorktreeId, found: bool) {
         .insert(worktree.clone(), (std::time::Instant::now() + step, step));
 }
 
+/// A branch lookup landed. The row takes a found pull request, or clears on
+/// a definite "no pull request"; a call that never reached GitHub leaves it
+/// as it was — this run's last answer, or the one the cache hydrated — and
+/// only backs off the next attempt (`note_pr_answer`). A row that changed
+/// goes to the cache at the next flush.
+fn land_pull_request(app: &mut App, worktree: WorktreeId, answer: Lookup) {
+    app.pr_inflight.remove(&worktree);
+    let row = match answer {
+        Lookup::Found(pr) => Some(Some(pr)),
+        Lookup::Absent => Some(None),
+        Lookup::Unavailable => None,
+    };
+    note_pr_answer(app, &worktree, matches!(row, Some(Some(_))));
+    let Some(row) = row else {
+        return;
+    };
+    let changed = app.pull_requests.get(&worktree) != Some(&row);
+    app.pull_requests.insert(worktree, row);
+    app.dirty |= changed;
+    app.pr_cache_dirty |= changed;
+}
+
 /// Ask `gh` for every pull request open on the selected project's repo, off
 /// the loop. Only the selected project is ever asked — the group only shows
 /// for the project on screen, and a workspace of thirty repos must not cost
@@ -738,6 +827,57 @@ fn lookup_open_prs(
         let list = crate::pull_request::list(&path).await;
         let _ = prs_tx.send((id, list));
     });
+}
+
+/// Ask `gh` for the open list of one project the cursor is *not* on, off
+/// the loop — the background pass that keeps every project's group, and
+/// the cache the next launch paints from, warm without the user visiting
+/// it. One process per tick at most: the first project in row order whose
+/// list is missing, or older than `OPEN_PRS_SWEEP_REFRESH` (or its own
+/// backoff, when that is longer), gets this tick. The reply lands on
+/// `prs_tx` like the selected project's own, which stays `lookup_open_prs`'s
+/// on its faster beat.
+fn sweep_open_prs(
+    app: &mut App,
+    prs_tx: &tokio::sync::mpsc::UnboundedSender<(
+        nebula_core::ProjectId,
+        Option<Vec<crate::pull_request::OpenPr>>,
+    )>,
+    out: &mut Vec<ClientRequest>,
+) {
+    let Some((id, path)) = open_prs_sweep_target(app) else {
+        return;
+    };
+    // Not on disk: noted as a miss without spending a process, and left to
+    // the backoff — the checkout can come back.
+    if !path.is_dir() {
+        note_open_prs_answer(app, id, None, out);
+        return;
+    }
+    app.open_prs_inflight.insert(id.clone());
+    let prs_tx = prs_tx.clone();
+    tokio::spawn(async move {
+        let list = crate::pull_request::list(&path).await;
+        let _ = prs_tx.send((id, list));
+    });
+}
+
+/// The project the sweep should spend this tick on, if any: the first of
+/// the workspace's projects, in row order, that isn't selected, isn't in
+/// flight, and was never asked or was last asked longer ago than the
+/// sweep's beat allows.
+fn open_prs_sweep_target(app: &App) -> Option<(ProjectId, std::path::PathBuf)> {
+    let selected = app.selected_project().map(|p| p.id.clone());
+    let now = std::time::Instant::now();
+    app.project_rows()
+        .into_iter()
+        .map(|i| &app.tree.projects[i])
+        .filter(|p| Some(&p.id) != selected.as_ref() && !app.open_prs_inflight.contains(&p.id))
+        .find(|p| match app.open_prs.get(&p.id) {
+            Some(open) => now >= open.at + open.step.max(OPEN_PRS_SWEEP_REFRESH),
+            None => true,
+        })
+        .map(|p| (p.id.clone(), p.repo_path.clone()))
 }
 
 /// Record what a list lookup came back with, and arm the next one. A repo
@@ -788,7 +928,9 @@ fn note_open_prs_answer(
     // answer lands through; the cursor reconcile below follows its PR by
     // URL, so the reorder never moves the selection off it.
     crate::pull_request::drafts_last(&mut list);
-    app.dirty |= previous.map(|o| &o.list) != Some(&list);
+    let changed = previous.map(|o| &o.list) != Some(&list);
+    app.dirty |= changed;
+    app.pr_cache_dirty |= changed;
     reask_checkouts_whose_pr_left(app, &left);
     app.open_prs.insert(
         project,
@@ -887,21 +1029,15 @@ fn reconcile_open_pr_cursor(
 /// about numbers that have long stopped being on screen. A checkout's own
 /// PR ROW counts as a row whatever its state: a merged pull request stays
 /// on it (see `pull_request::PullRequest`), and forgetting its body on every
-/// list refresh would re-fetch it every time the pane is read.
+/// list refresh would re-fetch it every time the pane is read. The diffs
+/// on disk are pruned to the same set, at the next flush.
 fn forget_retired_prs(app: &mut App) {
-    let live: std::collections::HashSet<String> = app
-        .open_prs
-        .values()
-        .flat_map(|o| o.list.iter().map(|pr| pr.url.clone()))
-        .chain(
-            app.pull_requests
-                .values()
-                .flatten()
-                .map(|pr| pr.url.clone()),
-        )
-        .collect();
+    let live = app.live_pr_urls();
+    let before = app.pr_detail.len();
     app.pr_detail.retain(|url, _| live.contains(url));
+    app.pr_detail_stale.retain(|url| live.contains(url));
     app.pr_detail_failed.retain(|url| live.contains(url));
+    app.pr_cache_dirty |= app.pr_detail.len() != before;
 }
 
 /// Carry the state GitHub just gave for one pull request over to the
@@ -944,6 +1080,24 @@ fn drop_retired_pr(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
     app.dirty = true;
 }
 
+/// Drop every cached pull-request row and list whose checkout or project is
+/// not in the tree — a worktree deleted while nebula was closed, a project
+/// removed — and the bodies that hung off them. What the daemon sends is
+/// the truth about what exists; the cache only ever said what those rows
+/// last showed.
+fn prune_pull_requests_to_tree(app: &mut App) {
+    let worktrees: std::collections::HashSet<WorktreeId> =
+        app.tree.worktrees.iter().map(|w| w.id.clone()).collect();
+    let projects: std::collections::HashSet<ProjectId> =
+        app.tree.projects.iter().map(|p| p.id.clone()).collect();
+    let before = (app.pull_requests.len(), app.open_prs.len());
+    app.pull_requests.retain(|w, _| worktrees.contains(w));
+    app.pr_recheck.retain(|w, _| worktrees.contains(w));
+    app.open_prs.retain(|p, _| projects.contains(p));
+    app.pr_cache_dirty |= before != (app.pull_requests.len(), app.open_prs.len());
+    forget_retired_prs(app);
+}
+
 /// Arm (or disarm) the debounced fetch of the pull request the pane is
 /// reading (`App::previewed_pr`) — the Worktrees cursor's open-PR row or the
 /// Sessions cursor's PR ROW. Called wherever the Worktrees cursor moves, and
@@ -951,14 +1105,14 @@ fn drop_retired_pr(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
 /// other reason. A PR already fetched, already in flight, or already known
 /// to be unanswerable arms nothing — the pane has something to show either
 /// way, and re-asking would spend an API call on a row the user is only
-/// passing through.
+/// passing through. A body the cache hydrated (`pr_detail_stale`) is the
+/// one exception: the pane shows it at once, and the rest that would have
+/// fetched a missing body fetches a fresh copy over it.
 fn schedule_pr_detail(app: &mut App) {
     let pending = app.previewed_pr().and_then(|pr| {
         let url = pr.url;
-        if app.pr_detail.contains_key(&url)
-            || app.pr_detail_inflight.contains(&url)
-            || app.pr_detail_failed.contains(&url)
-        {
+        let fresh = app.pr_detail.contains_key(&url) && !app.pr_detail_stale.contains(&url);
+        if fresh || app.pr_detail_inflight.contains(&url) || app.pr_detail_failed.contains(&url) {
             return None;
         }
         // Either row lives in the selected project's repo; `gh pr view`
@@ -1011,14 +1165,53 @@ fn lookup_pr_detail(
     });
 }
 
+/// A body and conversation landed. It replaces whatever the pane was
+/// showing for the URL — most often the copy the cache hydrated — and
+/// GitHub's word on this one pull request is the authoritative one: if it
+/// has been merged or closed since the list was fetched, the row goes now
+/// rather than at the next refresh (`adopt_pr_state`, `drop_retired_pr`).
+/// A fetch that failed leaves a cached copy where it is; stale is still
+/// the best answer there is.
+fn land_pr_detail(
+    app: &mut App,
+    url: String,
+    detail: Option<crate::pull_request::PrDetail>,
+    out: &mut Vec<ClientRequest>,
+) {
+    app.pr_detail_inflight.remove(&url);
+    match detail {
+        Some(detail) => {
+            let retired = !detail.is_open();
+            adopt_pr_state(app, &detail);
+            let changed = app.pr_detail.get(&url) != Some(&detail);
+            app.pr_detail.insert(url.clone(), detail);
+            app.pr_detail_stale.remove(&url);
+            app.pr_cache_dirty |= changed;
+            if retired {
+                drop_retired_pr(app, &url, out);
+            }
+        }
+        None => {
+            app.pr_detail_failed.insert(url);
+        }
+    }
+    app.dirty = true;
+}
+
 /// `g` on an open-PR row: fetch the whole pull request diff off the loop and
 /// open the ordinary diff modal on it when it lands. One `gh pr diff` gets
 /// every file at once, which is why this view carries its diffs with it
 /// instead of shelling out per file the way the worktree view does.
+///
+/// A diff read before — this run or a previous one (`pr_cache`) — opens
+/// the modal at once instead, and the fetch runs underneath it: what lands
+/// replaces the modal's contents in place when it differs, and only goes to
+/// the cache if the modal has since been closed (`land_pr_diff`).
 fn request_pr_diff(app: &mut App) {
-    let Some((number, title)) = app.previewed_pr().map(|pr| (pr.number, pr.label)) else {
+    let Some(pr) = app.previewed_pr() else {
         return;
     };
+    let (number, url, title) = (pr.number, pr.url, pr.label);
     if app.pr_diff_inflight == Some(number) {
         app.flash = Some(format!("still fetching the diff for #{number}…"));
         return;
@@ -1033,20 +1226,121 @@ fn request_pr_diff(app: &mut App) {
     let Some(prdiff_tx) = app.pr_diff_tx.clone() else {
         return; // never: the loop installs it at startup
     };
+    if open_cached_pr_diff(app, number, &url, &title) {
+        app.pr_diff_refreshing.insert(url.clone());
+    } else {
+        app.flash = Some(format!("fetching the diff for #{number}…"));
+    }
     app.pr_diff_inflight = Some(number);
-    app.flash = Some(format!("fetching the diff for #{number}…"));
     app.dirty = true;
     tokio::spawn(async move {
         let diff = crate::pull_request::diff(&dir, number).await;
-        let _ = prdiff_tx.send((number, title, diff));
+        let _ = prdiff_tx.send(PrDiffAnswer {
+            number,
+            url,
+            title,
+            diff,
+        });
     });
 }
 
-/// Land a fetched pull-request diff in the diff modal. The files come from
-/// splitting the unified diff rather than from `git status`, and every
-/// entry is marked `M` — a pull request's own diff already renders the
+/// Open the modal on the diff last read for `url`, when the cache kept one
+/// with files in it. Whether it did.
+fn open_cached_pr_diff(app: &mut App, number: u64, url: &str, title: &str) -> bool {
+    let Some(cached) = crate::pr_cache::recall_diff(app, url) else {
+        return false;
+    };
+    open_pr_diff_view(app, number, url, title.to_string(), Some(cached));
+    matches!(&app.overlay, Some(Overlay::Diff(view)) if view.pr_url.as_deref() == Some(url))
+}
+
+/// A `gh pr diff` landed. It goes to the cache for next time, and then: a
+/// modal opened on this pull request's cached copy is refreshed in place
+/// (`refresh_pr_diff_view`), the reader keeping their file and their place
+/// in it; one closed since stays closed; and a request that had nothing
+/// cached opens the modal now, as it always did.
+fn land_pr_diff(app: &mut App, answer: PrDiffAnswer) {
+    let PrDiffAnswer {
+        number,
+        url,
+        title,
+        diff,
+    } = answer;
+    if let Some(diff) = &diff {
+        crate::pr_cache::remember_diff(app, &url, diff);
+    }
+    if !app.pr_diff_refreshing.remove(&url) {
+        open_pr_diff_view(app, number, &url, title, diff);
+        return;
+    }
+    if app.pr_diff_inflight == Some(number) {
+        app.pr_diff_inflight = None;
+    }
+    // A fetch that failed leaves the cached copy on screen: it was the best
+    // answer there was when `g` was pressed, and still is.
+    let Some(diff) = diff else {
+        return;
+    };
+    let Some(Overlay::Diff(view)) = &mut app.overlay else {
+        return;
+    };
+    if view.pr_url.as_deref() != Some(url.as_str()) {
+        return;
+    }
+    if refresh_pr_diff_view(view, &diff) {
+        app.flash = Some(format!("#{number}'s diff changed since it was last read"));
+        app.dirty = true;
+    }
+}
+
+/// Swap a fresh diff into an open pull-request modal: the file list and the
+/// per-file chunks are rebuilt, the selection follows the file the reader
+/// was on by path — keeping their scroll in it — and falls back to the
+/// first row when that file is no longer in the diff. Whether anything
+/// changed; an identical diff leaves the view untouched.
+fn refresh_pr_diff_view(view: &mut DiffView, diff: &str) -> bool {
+    let chunks = crate::pull_request::split_unified_diff(diff);
+    let fresh: std::collections::HashMap<String, String> = chunks.iter().cloned().collect();
+    if view.prefetched.as_ref() == Some(&fresh) {
+        return false;
+    }
+    let was_on = view.selected_file().map(|f| f.path.clone());
+    let scroll = view.scroll;
+    view.files = pr_diff_files(&chunks);
+    view.prefetched = Some(fresh);
+    view.recompute_matches();
+    let same = was_on.and_then(|path| {
+        view.matches
+            .iter()
+            .position(|m| view.files[m.file].path == path)
+    });
+    view.selected = same.unwrap_or(0);
+    crate::git_diff::load_selected_diff(view);
+    if same.is_some() {
+        view.scroll = scroll.min(view.max_scroll());
+    }
+    true
+}
+
+/// The file rows of a pull-request diff: one per chunk, in git's order,
+/// every entry marked `M` — a pull request's own diff already renders the
 /// add/delete headers, and porcelain codes would be an invention.
-fn open_pr_diff_view(app: &mut App, number: u64, title: String, diff: Option<String>) {
+fn pr_diff_files(chunks: &[(String, String)]) -> Vec<crate::git_diff::DiffFile> {
+    chunks
+        .iter()
+        .map(|(path, _)| crate::git_diff::DiffFile {
+            path: path.clone(),
+            orig_path: None,
+            xy: ['M', ' '],
+        })
+        .collect()
+}
+
+/// Land a fetched pull-request diff in the diff modal. The files come from
+/// splitting the unified diff rather than from `git status`
+/// (`pr_diff_files`), and the view is tagged with the pull request's URL
+/// so a later fetch can tell it is still the one on screen.
+fn open_pr_diff_view(app: &mut App, number: u64, url: &str, title: String, diff: Option<String>) {
     if app.pr_diff_inflight == Some(number) {
         app.pr_diff_inflight = None;
     }
@@ -1061,14 +1355,7 @@ fn open_pr_diff_view(app: &mut App, number: u64, title: String, diff: Option<Str
         app.flash = Some(format!("#{number} changes no files"));
         return;
     }
-    let files = chunks
-        .iter()
-        .map(|(path, _)| crate::git_diff::DiffFile {
-            path: path.clone(),
-            orig_path: None,
-            xy: ['M', ' '],
-        })
-        .collect();
+    let files = pr_diff_files(&chunks);
     // `root` is only ever used to shell out at git, which a prefetched view
     // never does — but the reviewed-mark store keys on it, so it stays the
     // repo path rather than something invented.
@@ -1078,6 +1365,7 @@ fn open_pr_diff_view(app: &mut App, number: u64, title: String, diff: Option<Str
         .unwrap_or_default();
     let mut view = DiffView::new(root, title, files, true);
     view.prefetched = Some(chunks.into_iter().collect());
+    view.pr_url = Some(url.to_string());
     view.files_width = app.diff_files_width;
     crate::git_diff::load_selected_diff(&mut view);
     app.overlay = Some(Overlay::Diff(view));
@@ -2931,6 +3219,12 @@ fn open_menu(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
 /// A plain TERMINAL SESSION is not offered here: NEW TERMINAL (`t`) and the
 /// CONTEXT MENU's "New terminal" already cover it.
 fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
+    // A stand-in checkout is not a place the DAEMON knows yet; better to
+    // say so here than after a kind, a model and a name were picked.
+    if app.is_placeholder_worktree(&worktree) {
+        app.flash = Some(WORKTREE_STILL_CREATING.into());
+        return;
+    }
     // Only the AGENT KINDS still enabled in the SETTINGS OVERLAY's Agents
     // tab are offered; a disabled harness is absent, not greyed.
     agent_picker::open_kind_picker(app, KindPicker::new_session(worktree));
@@ -3577,6 +3871,20 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
             KeyCode::BackTab if matches!(prompt.kind, PromptKind::QuickPrompt(_)) => {
                 if let Some(back) = quick_return_of(prompt) {
                     crate::quick_prompt::open_preset_picker(app, back);
+                }
+            }
+            // Ctrl+N flips the launch between the selected WORKTREE and a
+            // fresh one — what `p` on the WORKTREES PANEL does, from any
+            // panel, and the way back from there. Free here too: the line
+            // editor leaves ^N alone. The box is rebuilt around the new
+            // target with the text and the caret kept.
+            KeyCode::Char('n' | 'N')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(prompt.kind, PromptKind::QuickPrompt(_)) =>
+            {
+                if let Some(back) = quick_return_of(prompt) {
+                    let input = prompt.input.clone();
+                    crate::quick_prompt::toggle_new_worktree(app, back.launch, input);
                 }
             }
             KeyCode::Tab if prompt.completes_paths() => {
@@ -4459,18 +4767,35 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             // the random name the prompt was offering.
             let branch = crate::branch_name::slugify(&value);
             let branch = if branch.is_empty() {
-                suggestion
+                suggestion.clone()
             } else {
                 branch
             };
-            send_with(app, out, PendingIntent::SelectCreatedWorktree, |req_id| {
-                ClientRequest::CreateWorktree {
+            // The row first, selected as the Ack would leave it, so the
+            // panel never waits on the DAEMON's fetch and `git worktree
+            // add`. An Error takes it down and hands this box back.
+            let focus = app.focus;
+            let placeholder =
+                placeholder::stage_worktree(app, project.clone(), branch.clone(), out);
+            send_with(
+                app,
+                out,
+                PendingIntent::SelectCreatedWorktree {
+                    placeholder,
+                    focus,
+                    prompt: PromptKind::NewWorktree {
+                        project: project.clone(),
+                        suggestion,
+                    },
+                    text: value,
+                },
+                |req_id| ClientRequest::CreateWorktree {
                     req_id,
                     project,
                     branch,
                     base: None,
-                }
-            });
+                },
+            );
         }
         PromptKind::NewAgent {
             worktree,
@@ -4969,6 +5294,9 @@ fn detach_if_attached(app: &mut App, sref: &SessionRef, out: &mut Vec<ClientRequ
             app.focus = Focus::Sessions;
         }
     }
+    // Archived, deleted or killed: whatever comes back under this ref is
+    // a new process, so its kept screen is stale.
+    app.term_cache.retain(|t| &t.sref != sref);
 }
 
 fn shellexpand_home(path: &str) -> std::path::PathBuf {
@@ -5576,28 +5904,7 @@ fn preview_inner(app: &mut App, delay: Duration, out: &mut Vec<ClientRequest>) {
     let Some(sref) = row.sref() else {
         return;
     };
-    // Walking onto a session the daemon still holds is as immediate as
-    // clicking it: there is no CLI to fork, so there is nothing to wait to
-    // see whether the user meant it, and the pane never flashes the
-    // `starting session…` notice on the way past. Only a reaped session —
-    // the one case the debounce exists for — keeps the wait.
-    let delay = if session_has_live_pty(app, &sref) {
-        Duration::ZERO
-    } else {
-        delay
-    };
     attach_inner(app, sref, delay, out);
-}
-
-/// Whether the daemon currently holds a live PTY for `sref`. Attaching to
-/// one only replays its ring; attaching to a session the IDLE REAPER took
-/// cold-spawns an agent CLI, which is the only thing [`ATTACH_DEBOUNCE`]
-/// exists to keep a cursor merely passing through a row from doing.
-fn session_has_live_pty(app: &App, sref: &SessionRef) -> bool {
-    match sref {
-        SessionRef::Agent(id) => app.tree.agents.iter().any(|a| &a.id == id && a.alive),
-        SessionRef::Terminal(id) => app.tree.terminals.iter().any(|t| &t.id == id && t.alive),
-    }
 }
 
 /// Enter on the Sessions panel: attach the session under the cursor, or —
@@ -5681,10 +5988,10 @@ fn mark_agent_seen(app: &mut App, id: &AgentId, out: &mut Vec<ClientRequest>) {
 
 /// Show `sref` in the pane, telling the daemon once the selection settles.
 /// The pane swaps immediately — the header must never name a session other
-/// than the selected one — but the Attach itself waits out
-/// [`ATTACH_DEBOUNCE`], because attaching a reaped session makes the daemon
-/// fork an agent CLI, and a cursor merely passing through a row has not
-/// asked for that.
+/// than the selected one — and a live session is attached on the spot; only
+/// a reaped one waits out [`ATTACH_DEBOUNCE`], because attaching it makes
+/// the daemon fork an agent CLI, and a cursor merely passing through a row
+/// has not asked for that.
 fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     attach_inner(app, sref, ATTACH_DEBOUNCE, out);
 }
@@ -5708,13 +6015,43 @@ fn attach_inner(app: &mut App, sref: SessionRef, delay: Duration, out: &mut Vec<
         .term
         .as_ref()
         .is_some_and(|t| t.sref == sref && !t.exited);
+    let live = app.session_is_live(&sref);
     if !showing {
         let (cols, rows) = pane_size(app);
         // Fresh screen, so any persisted selection would point at stale cells.
         app.term_selection = None;
-        app.term = Some(AttachedTerm::new(sref.clone(), cols, rows));
+        // The screen being left goes aside for a quick return, and the one
+        // arriving comes back from there when it was shown recently: its
+        // last screen is up on this frame, and the Attach below asks only
+        // for what it missed. Anything else starts blank and replays.
+        if let Some(leaving) = app.term.take() {
+            app.stash_term(leaving);
+        }
+        let term = match app.take_cached_term(&sref) {
+            Some(mut kept) => {
+                kept.resize(cols, rows);
+                kept.set_scroll(0);
+                kept
+            }
+            None => {
+                let mut fresh = AttachedTerm::new(sref.clone(), cols, rows);
+                // A reaped session is about to be booted by this attach:
+                // the pane can say so while it waits, rather than show
+                // the void a live session's replay fills within a frame.
+                fresh.booting = !live;
+                fresh
+            }
+        };
+        app.term = Some(term);
         app.dirty = true;
     }
+    // Attaching a session the daemon still holds only replays its ring —
+    // there is no CLI to fork, so there is nothing to wait to see whether
+    // the user meant it. Walking onto one, or switching a worktree,
+    // project or workspace onto one, is as immediate as clicking it. Only
+    // a reaped session — the one case the debounce exists for — keeps the
+    // wait.
+    let delay = if live { Duration::ZERO } else { delay };
     if delay.is_zero() {
         app.pending_attach = None;
         send_attach(app, sref, out);
@@ -5743,10 +6080,20 @@ fn send_attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
         return;
     }
     let (cols, rows) = pane_size(app);
+    // A screen kept from an earlier visit asks for the bytes it missed
+    // rather than the whole ring; the daemon answers with a replay that
+    // starts exactly there (`AttachedTerm::apply_scrollback` appends it
+    // onto the screen), or with the whole ring when that point has fallen
+    // off, which rebuilds the screen as a first attach would.
+    let from_seq = app
+        .term
+        .as_ref()
+        .filter(|t| t.sref == sref && t.painted)
+        .map(|t| t.next_seq);
     app.attached_sref = Some(sref.clone());
     out.push(ClientRequest::Attach {
         session: sref,
-        from_seq: None,
+        from_seq,
         cols,
         rows,
     });
@@ -5780,10 +6127,13 @@ fn release_attachment(app: &mut App, out: &mut Vec<ClientRequest>) {
     }
 }
 
-/// Blank the pane and release the daemon-side attachment.
+/// Blank the pane and release the daemon-side attachment. The screen is
+/// kept for a quick return (`App::term_cache`); the session is still there.
 fn detach_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
     release_attachment(app, out);
-    app.term = None;
+    if let Some(leaving) = app.term.take() {
+        app.stash_term(leaving);
+    }
     app.term_locked = false;
 }
 
@@ -7190,6 +7540,10 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.tree.terminals = terminals;
             app.tree.links = links;
             app.pr_seen = pr_seen.into_iter().map(|s| (s.url, s.marker)).collect();
+            // The cache painted rows for whatever the last run's tree had;
+            // the ones this tree no longer has go, before they could be
+            // written back.
+            prune_pull_requests_to_tree(app);
             // `--workspace <name>` overrides the daemon's last-opened one.
             // Before the UI-state restore, whose remembered project only
             // resolves against the workspace actually on screen.
@@ -7212,23 +7566,27 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             }
             app.dirty = true;
         }
-        ServerEvent::Scrollback { session, data, .. } => {
+        ServerEvent::Scrollback {
+            session,
+            base_seq,
+            data,
+        } => {
             if let Some(term) = &mut app.term {
                 if term.sref == session {
-                    // Full replay: the screen is rebuilt from scratch.
-                    app.term_selection = None;
-                    term.reset();
-                    term.painted = !data.is_empty();
-                    term.parser.process(&data);
+                    // A replay continuing a kept screen lands on it; any
+                    // other rebuilds the screen from scratch, and a
+                    // selection anchored to the old cells goes with it.
+                    if term.apply_scrollback(base_seq, &data) {
+                        app.term_selection = None;
+                    }
                     app.dirty = true;
                 }
             }
         }
-        ServerEvent::Output { session, data, .. } => {
+        ServerEvent::Output { session, seq, data } => {
             if let Some(term) = &mut app.term {
                 if term.sref == session {
-                    term.painted |= !data.is_empty();
-                    term.parser.process(&data);
+                    term.apply_output(seq, &data);
                     app.dirty = true;
                 }
             }
@@ -7326,9 +7684,18 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         app.select_project_when_seen = Some(id);
                     }
                 }
-                (Some(PendingIntent::SelectCreatedWorktree), Some(EntityId::Worktree(id))) => {
-                    if !select_worktree_by_id(app, &id, out) {
-                        app.select_worktree_when_seen = Some(id);
+                (
+                    Some(PendingIntent::SelectCreatedWorktree { placeholder, .. }),
+                    Some(EntityId::Worktree(id)),
+                ) => {
+                    // The cursor and FOCUS landed on the stand-in when
+                    // Enter was pressed; a cursor the user moved since
+                    // stays where they put it. The prewarm that landing
+                    // armed was skipped as the checkout was not on disk —
+                    // it is now.
+                    placeholder::resolve_worktree(app, &placeholder, &id);
+                    if app.selected_worktree().is_some_and(|w| w.id == id) {
+                        schedule_prewarm(app);
                     }
                 }
                 (
@@ -7398,6 +7765,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 _ => None,
             };
             apply_removal(app, &id);
+            app.prune_term_cache();
             // The cursor that was on the removed row now sits on its
             // neighbor — show that neighbor's session/context.
             reconcile_selection(app, before, out);
@@ -7457,6 +7825,23 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 }) => {
                     placeholder::discard(app, &placeholder, out);
                     reopen_prompt_with(app, PromptKind::QuickPrompt(launch), text);
+                }
+                // The NEW WORKTREE modal's checkout was refused: its
+                // stand-in row goes, and with it the FOCUS it took — the
+                // SESSIONS PANEL of a row that is no longer there — goes
+                // back to the panel the box was opened from, when the
+                // cursor was still on the row. The box comes back with the
+                // name for a retry.
+                Some(PendingIntent::SelectCreatedWorktree {
+                    placeholder,
+                    focus,
+                    prompt,
+                    text,
+                }) => {
+                    if placeholder::discard_worktree(app, &placeholder, out) {
+                        app.focus = focus;
+                    }
+                    reopen_prompt_with(app, prompt, text);
                 }
                 _ => {}
             }
@@ -7589,6 +7974,8 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
             app.tree.links.retain(|l| !wt_ids.contains(&l.worktree_id));
             app.pull_requests.retain(|w, _| !wt_ids.contains(w));
             app.pr_recheck.retain(|w, _| !wt_ids.contains(w));
+            app.open_prs.remove(id);
+            app.pr_cache_dirty = true;
             app.tree.worktrees.retain(|w| &w.project_id != id);
             app.tree.projects.retain(|p| &p.id != id);
         }
@@ -7596,7 +7983,7 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
             app.tree.agents.retain(|a| &a.worktree_id != id);
             app.tree.terminals.retain(|t| &t.worktree_id != id);
             app.tree.links.retain(|l| &l.worktree_id != id);
-            app.pull_requests.remove(id);
+            app.pr_cache_dirty |= app.pull_requests.remove(id).is_some();
             app.pr_recheck.remove(id);
             app.tree.worktrees.retain(|w| &w.id != id);
         }
@@ -10125,7 +10512,13 @@ diff --git a/src/b.rs b/src/b.rs
 +y
 ";
         app.pr_diff_inflight = Some(7);
-        open_pr_diff_view(&mut app, 7, "#7 Attach links".into(), Some(diff.into()));
+        open_pr_diff_view(
+            &mut app,
+            7,
+            &pr_url(7),
+            "#7 Attach links".into(),
+            Some(diff.into()),
+        );
         assert!(app.pr_diff_inflight.is_none(), "the fetch is done");
         let Some(Overlay::Diff(view)) = &app.overlay else {
             panic!("expected the diff modal, got {:?}", app.overlay);
@@ -10169,7 +10562,7 @@ diff --git a/src/b.rs b/src/b.rs
         app.sel_worktree = 1;
 
         app.pr_diff_inflight = Some(7);
-        open_pr_diff_view(&mut app, 7, "#7 Attach links".into(), None);
+        open_pr_diff_view(&mut app, 7, &pr_url(7), "#7 Attach links".into(), None);
         assert!(app.overlay.is_none());
         assert!(
             app.flash
@@ -10180,7 +10573,7 @@ diff --git a/src/b.rs b/src/b.rs
         );
 
         // An empty diff is not a modal with no rows in it.
-        open_pr_diff_view(&mut app, 7, "#7".into(), Some(String::new()));
+        open_pr_diff_view(&mut app, 7, &pr_url(7), "#7".into(), Some(String::new()));
         assert!(app.overlay.is_none());
         assert_eq!(app.flash.as_deref(), Some("#7 changes no files"));
 
@@ -10192,6 +10585,410 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(
             app.flash.as_deref(),
             Some("still fetching the diff for #7…")
+        );
+    }
+
+    /// A pull request as the cache would hand it back, for the rows.
+    fn cached_pr(number: u64) -> crate::pull_request::PullRequest {
+        crate::pull_request::PullRequest {
+            number,
+            url: pr_url(number),
+            title: format!("PR {number}"),
+            state: crate::pull_request::STATE_OPEN.into(),
+            is_draft: false,
+            activity: Vec::new(),
+        }
+    }
+
+    fn cached_open(number: u64) -> crate::pull_request::OpenPr {
+        crate::pull_request::OpenPr {
+            number,
+            title: format!("PR {number}"),
+            url: pr_url(number),
+            is_draft: false,
+            head: format!("head-{number}"),
+        }
+    }
+
+    /// A branch lookup that never reached GitHub leaves the row alone — the
+    /// one a previous launch cached included — while a definite "no pull
+    /// request" clears it and a found one paints it; only an answer that
+    /// changes the row marks the cache for writing.
+    #[test]
+    fn an_unavailable_lookup_keeps_the_cached_row() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let w1 = nebula_core::WorktreeId("w1".into());
+        seed_branch_pr(&mut app, 7, "Attach links");
+        app.pr_cache_dirty = false;
+
+        app.pr_inflight.insert(w1.clone());
+        land_pull_request(&mut app, w1.clone(), Lookup::Unavailable);
+        assert!(!app.pr_inflight.contains(&w1));
+        assert_eq!(
+            app.pull_requests[&w1].as_ref().map(|p| p.number),
+            Some(7),
+            "the last answer stays on the row"
+        );
+        assert!(!app.pr_cache_dirty, "nothing changed, nothing to write");
+        assert!(
+            !app.pr_lookup_due(&w1),
+            "but the next attempt is backed off"
+        );
+
+        land_pull_request(&mut app, w1.clone(), Lookup::Absent);
+        assert_eq!(app.pull_requests[&w1], None, "a definite miss clears it");
+        assert!(app.pr_cache_dirty);
+
+        app.pr_cache_dirty = false;
+        let found = cached_pr(8);
+        land_pull_request(&mut app, w1.clone(), Lookup::Found(found.clone()));
+        assert_eq!(app.pull_requests[&w1].as_ref(), Some(&found));
+        assert!(app.pr_cache_dirty);
+        app.pr_cache_dirty = false;
+        land_pull_request(&mut app, w1, Lookup::Found(found));
+        assert!(!app.pr_cache_dirty, "the same answer again is not a change");
+    }
+
+    /// A body hydrated from the cache is shown the moment the cursor rests
+    /// on its row — no "loading…" — and that same rest fetches a fresh copy
+    /// over it, the way it would fetch a missing one. A failed fetch leaves
+    /// the cached copy up; a landed one takes the body off the stale list
+    /// and marks the cache for writing.
+    #[test]
+    fn a_cached_body_is_shown_at_once_and_refreshed_underneath() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        let url = pr_url(7);
+        app.pr_detail
+            .insert(url.clone(), a_detail(7, "from the cache", Vec::new()));
+        app.pr_detail_stale.insert(url.clone());
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 1;
+        schedule_pr_detail(&mut app);
+        assert_eq!(
+            app.pending_pr_detail.as_ref().map(|(p, _)| p.url.as_str()),
+            Some(url.as_str()),
+            "stale: re-asked"
+        );
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("from the cache"), "{text}");
+        assert!(!text.contains("loading…"), "{text}");
+
+        let mut out = Vec::new();
+        app.pending_pr_detail = None;
+        app.pr_detail_inflight.insert(url.clone());
+        land_pr_detail(&mut app, url.clone(), None, &mut out);
+        assert_eq!(
+            app.pr_detail.get(&url).map(|d| d.body.as_str()),
+            Some("from the cache"),
+            "a failed refresh keeps the cached copy"
+        );
+
+        app.pr_detail_failed.clear();
+        app.pr_detail_inflight.insert(url.clone());
+        app.pr_cache_dirty = false;
+        land_pr_detail(
+            &mut app,
+            url.clone(),
+            Some(a_detail(7, "rewritten", Vec::new())),
+            &mut out,
+        );
+        assert_eq!(app.pr_detail[&url].body, "rewritten");
+        assert!(!app.pr_detail_stale.contains(&url));
+        assert!(app.pr_cache_dirty);
+        schedule_pr_detail(&mut app);
+        assert!(app.pending_pr_detail.is_none(), "fresh: nothing to ask");
+    }
+
+    /// The daemon's snapshot is the truth about which checkouts and
+    /// projects exist: cached rows for ones it no longer has go, before
+    /// they could be written back, and the bodies hanging off them with
+    /// them.
+    #[test]
+    fn the_snapshot_prunes_cached_rows_the_tree_no_longer_has() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let tree = app.tree.clone();
+
+        let mut fresh = App::new();
+        let w1 = nebula_core::WorktreeId("w1".into());
+        let p1 = nebula_core::ProjectId("p1".into());
+        let gone_w = nebula_core::WorktreeId("w-gone".into());
+        let gone_p = nebula_core::ProjectId("p-gone".into());
+        fresh.pull_requests.insert(w1.clone(), Some(cached_pr(7)));
+        fresh
+            .pull_requests
+            .insert(gone_w.clone(), Some(cached_pr(8)));
+        let now = std::time::Instant::now();
+        fresh
+            .pr_recheck
+            .insert(gone_w.clone(), (now, PR_RECHECK_MIN));
+        let open = |list| crate::app::OpenPrs {
+            list,
+            at: now,
+            due: now,
+            step: OPEN_PRS_REFRESH,
+        };
+        fresh
+            .open_prs
+            .insert(p1.clone(), open(vec![cached_open(9)]));
+        fresh
+            .open_prs
+            .insert(gone_p.clone(), open(vec![cached_open(10)]));
+        for number in [7, 8, 9, 10] {
+            fresh
+                .pr_detail
+                .insert(pr_url(number), a_detail(number, "body", Vec::new()));
+            fresh.pr_detail_stale.insert(pr_url(number));
+        }
+
+        hse(
+            &mut fresh,
+            ServerEvent::Snapshot {
+                workspaces: tree.workspaces,
+                active_workspace: tree.active_workspace,
+                projects: tree.projects,
+                worktrees: tree.worktrees,
+                agents: tree.agents,
+                terminals: tree.terminals,
+                links: tree.links,
+                pr_seen: Vec::new(),
+                ui_state: None,
+            },
+        );
+        assert!(fresh.pull_requests.contains_key(&w1));
+        assert!(!fresh.pull_requests.contains_key(&gone_w));
+        assert!(!fresh.pr_recheck.contains_key(&gone_w));
+        assert!(fresh.open_prs.contains_key(&p1));
+        assert!(!fresh.open_prs.contains_key(&gone_p));
+        let mut kept: Vec<u64> = fresh.pr_detail.values().map(|d| d.number).collect();
+        kept.sort();
+        assert_eq!(kept, [7, 9], "bodies follow their rows");
+        assert!(!fresh.pr_detail_stale.contains(&pr_url(8)));
+        assert!(fresh.pr_cache_dirty);
+    }
+
+    /// The background pass over the projects the cursor is not on: the
+    /// first in row order that was never asked, or whose list is older
+    /// than the sweep's beat (or its own backoff, when longer), gets the
+    /// tick. The selected project never does — it has its own, faster beat
+    /// — nor does one already in flight.
+    #[test]
+    fn the_open_list_sweep_visits_the_other_projects_on_a_slow_beat() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let p1 = nebula_core::ProjectId("p1".into());
+        let p2 = nebula_core::ProjectId("p2".into());
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Project(nebula_core::Project {
+                    workspace_id: Default::default(),
+                    id: p2.clone(),
+                    name: "other".into(),
+                    repo_path: "/tmp/other".into(),
+                    sort_order: 1,
+                }),
+            },
+        );
+        assert_eq!(
+            app.selected_project().map(|p| p.id.clone()),
+            Some(p1.clone())
+        );
+        let target = |app: &App| open_prs_sweep_target(app).map(|(id, _)| id);
+        assert_eq!(target(&app), Some(p2.clone()), "never asked: due");
+
+        let now = std::time::Instant::now();
+        app.open_prs.insert(
+            p2.clone(),
+            crate::app::OpenPrs {
+                list: Vec::new(),
+                at: now,
+                due: now,
+                step: OPEN_PRS_RECHECK_MIN,
+            },
+        );
+        assert_eq!(target(&app), None, "asked just now");
+
+        let stale = now
+            .checked_sub(OPEN_PRS_SWEEP_REFRESH + Duration::from_secs(1))
+            .expect("machine up for minutes");
+        app.open_prs.get_mut(&p2).unwrap().at = stale;
+        assert_eq!(target(&app), Some(p2.clone()), "older than the beat");
+
+        app.open_prs.get_mut(&p2).unwrap().step = OPEN_PRS_RECHECK_MAX;
+        assert_eq!(target(&app), None, "its own, longer backoff holds it");
+        app.open_prs.get_mut(&p2).unwrap().step = OPEN_PRS_RECHECK_MIN;
+
+        app.open_prs_inflight.insert(p2.clone());
+        assert_eq!(target(&app), None, "already in flight");
+        app.open_prs_inflight.clear();
+
+        app.open_prs.remove(&p1);
+        assert_eq!(
+            target(&app),
+            Some(p2),
+            "the selected project is never the sweep's, even unasked"
+        );
+        app.open_prs
+            .get_mut(&nebula_core::ProjectId("p2".into()))
+            .unwrap()
+            .at = now;
+        assert_eq!(target(&app), None);
+    }
+
+    /// `g` with a diff in the cache opens the modal on it at once; the
+    /// fresh fetch landing underneath replaces the contents in place when
+    /// they differ — the reader keeps the file they were on — and only
+    /// goes to the cache when the modal has been closed since. A failed
+    /// refresh leaves the cached copy up, and a request that had nothing
+    /// cached opens on landing, as it always did.
+    #[test]
+    fn a_cached_diff_opens_at_once_and_is_refreshed_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        app.pr_cache = Some(crate::pr_cache::PrCache::at(dir.path().to_path_buf()));
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        app.sel_worktree = 1;
+        let url = pr_url(7);
+        let title = || "#7 Attach links".to_string();
+        let cached = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/src/b.rs b/src/b.rs
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -1 +1 @@
+-x
++y
+";
+        let answer = |diff: Option<&str>| PrDiffAnswer {
+            number: 7,
+            url: pr_url(7),
+            title: title(),
+            diff: diff.map(str::to_string),
+        };
+        assert!(
+            !open_cached_pr_diff(&mut app, 7, &url, &title()),
+            "nothing cached yet"
+        );
+        app.pr_cache
+            .as_ref()
+            .unwrap()
+            .store_diff(&url, cached)
+            .unwrap();
+
+        assert!(open_cached_pr_diff(&mut app, 7, &url, &title()));
+        let Some(Overlay::Diff(view)) = &mut app.overlay else {
+            panic!("expected the diff modal, got {:?}", app.overlay);
+        };
+        assert_eq!(view.pr_url.as_deref(), Some(url.as_str()));
+        assert!(view.diff.contains("+new"));
+        // The reader moves on to the second file.
+        view.select(1);
+        crate::git_diff::load_selected_diff(view);
+        assert!(view.diff.contains("+y"));
+
+        // The same diff lands: nothing moves, and the fetch is done.
+        app.pr_diff_refreshing.insert(url.clone());
+        app.pr_diff_inflight = Some(7);
+        land_pr_diff(&mut app, answer(Some(cached)));
+        assert!(app.pr_diff_inflight.is_none());
+        assert!(app.pr_diff_refreshing.is_empty());
+        assert!(!app.flash.as_deref().unwrap_or("").contains("changed"));
+        let Some(Overlay::Diff(view)) = &app.overlay else {
+            panic!("still open");
+        };
+        assert!(view.diff.contains("+y"), "still on b.rs");
+
+        // A changed diff: b.rs stays under the cursor with its new text,
+        // and a new file joins the list.
+        let fresh = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1 +1 @@
+-old
++newer
+diff --git a/src/b.rs b/src/b.rs
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -1 +1 @@
+-x
++z
+diff --git a/src/c.rs b/src/c.rs
+--- /dev/null
++++ b/src/c.rs
+@@ -0,0 +1 @@
++c
+";
+        app.pr_diff_refreshing.insert(url.clone());
+        land_pr_diff(&mut app, answer(Some(fresh)));
+        let Some(Overlay::Diff(view)) = &app.overlay else {
+            panic!("still open");
+        };
+        assert_eq!(
+            view.files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/a.rs", "src/b.rs", "src/c.rs"]
+        );
+        assert!(
+            view.diff.contains("+z"),
+            "the reader's file, refreshed: {}",
+            view.diff
+        );
+        assert!(app.flash.as_deref().is_some_and(|f| f.contains("changed")));
+        assert_eq!(
+            crate::pr_cache::recall_diff(&app, &url).as_deref(),
+            Some(fresh),
+            "the fresh diff is what the next launch reads"
+        );
+
+        // Closed before the answer landed: cached, not reopened.
+        app.overlay = None;
+        app.pr_diff_refreshing.insert(url.clone());
+        land_pr_diff(&mut app, answer(Some(cached)));
+        assert!(app.overlay.is_none());
+        assert_eq!(
+            crate::pr_cache::recall_diff(&app, &url).as_deref(),
+            Some(cached)
+        );
+
+        // A refresh `gh` couldn't do leaves the cached copy on screen.
+        assert!(open_cached_pr_diff(&mut app, 7, &url, &title()));
+        app.pr_diff_refreshing.insert(url.clone());
+        land_pr_diff(&mut app, answer(None));
+        assert!(matches!(&app.overlay, Some(Overlay::Diff(_))));
+
+        // Nothing cached for #9: its diff opens on landing, as always.
+        app.overlay = None;
+        land_pr_diff(
+            &mut app,
+            PrDiffAnswer {
+                number: 9,
+                url: pr_url(9),
+                title: "#9".into(),
+                diff: Some(cached.into()),
+            },
+        );
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Diff(v)) if v.pr_url.as_deref() == Some(pr_url(9).as_str()))
+        );
+        assert_eq!(
+            crate::pr_cache::recall_diff(&app, &pr_url(9)).as_deref(),
+            Some(cached),
+            "and is cached for next time"
         );
     }
 
@@ -13668,6 +14465,314 @@ diff --git a/src/b.rs b/src/b.rs
         );
     }
 
+    /// Switching worktrees onto a live session attaches it on the keypress
+    /// — the same instant replay a click gets — so the pane is never left
+    /// blank for a debounce that exists only to keep a reaped session from
+    /// being booted by a passing cursor.
+    #[test]
+    fn switching_worktrees_onto_a_live_session_attaches_at_once() {
+        let mut app = App::new();
+        seed_tree(&mut app); // p1/w1(main) + a1 (live)
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: wt_entity("w2", "p1", "other", false),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: agent_entity("a2", "w2", "agent-2", false),
+            },
+        );
+        let a2 = SessionRef::Agent(AgentId("a2".into()));
+        let mut out = Vec::new();
+        attach_now(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        out.clear();
+
+        select_worktree_row(&mut app, 1, &mut out);
+        assert!(
+            app.pending_attach.is_none(),
+            "a live session needs no debounce: {out:?}"
+        );
+        assert!(
+            matches!(out.last(), Some(ClientRequest::Attach { session, .. }) if *session == a2),
+            "the switch attaches the worktree's session at once: {out:?}"
+        );
+        assert!(
+            !app.term.as_ref().expect("pane").booting,
+            "nothing is booting, so the pane shows no notice while the replay lands"
+        );
+    }
+
+    /// The other half: a worktree whose session the daemon reaped still
+    /// waits out ATTACH_DEBOUNCE before attaching, because that attach
+    /// cold-spawns an agent CLI — and the pane says so meanwhile.
+    #[test]
+    fn switching_worktrees_onto_a_reaped_session_waits_out_the_debounce() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: wt_entity("w2", "p1", "other", false),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: agent_entity("a2", "w2", "agent-2", false),
+            },
+        );
+        app.tree
+            .agents
+            .iter_mut()
+            .find(|a| a.id == AgentId("a2".into()))
+            .expect("a2 seeded")
+            .alive = false;
+        let a2 = SessionRef::Agent(AgentId("a2".into()));
+        let mut out = Vec::new();
+
+        select_worktree_row(&mut app, 1, &mut out);
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { .. })),
+            "a passing cursor boots nothing: {out:?}"
+        );
+        assert_eq!(
+            app.pending_attach.as_ref().map(|(s, _)| s.clone()),
+            Some(a2.clone()),
+            "the attach is armed for when the cursor settles"
+        );
+        assert!(
+            app.term.as_ref().expect("pane").booting,
+            "the pane says the session is booting while it waits"
+        );
+        fire_pending_attach(&mut app, &mut out);
+        assert!(
+            matches!(out.last(), Some(ClientRequest::Attach { session, .. }) if *session == a2),
+            "settling attaches so the CLI boots: {out:?}"
+        );
+    }
+
+    /// Coming back to a session shown a moment ago puts its last screen up
+    /// on the same frame and asks the daemon only for the bytes it missed.
+    /// A replay continuing from there lands on the kept screen; one from
+    /// anywhere else — the ring wrapped past what was seen, or a new
+    /// process — rebuilds it.
+    #[test]
+    fn returning_to_a_session_keeps_its_screen_and_asks_for_the_delta() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: agent_entity("a2", "w1", "agent-2", false),
+            },
+        );
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        let a2 = SessionRef::Agent(AgentId("a2".into()));
+        let mut out = Vec::new();
+        attach_now(&mut app, a1.clone(), &mut out);
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: a1.clone(),
+                base_seq: 0,
+                data: b"hello".to_vec(),
+            },
+        );
+
+        // Away, and back.
+        attach_now(&mut app, a2.clone(), &mut out);
+        assert_eq!(
+            app.term_cache
+                .iter()
+                .map(|t| t.sref.clone())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&a1),
+            "the screen left behind is kept"
+        );
+        out.clear();
+        attach_now(&mut app, a1.clone(), &mut out);
+        let term = app.term.as_ref().expect("pane");
+        let contents = term.parser.screen().contents();
+        assert!(
+            term.painted && contents.contains("hello"),
+            "the kept screen is up before the daemon answers: {contents:?}"
+        );
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::Attach { session, from_seq: Some(5), .. }) if *session == a1
+            ),
+            "the attach asks for what it missed: {out:?}"
+        );
+        assert!(
+            app.term_cache.is_empty(),
+            "the screen is back in the pane, not the cache"
+        );
+
+        // A continuation lands on the kept screen.
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: a1.clone(),
+                base_seq: 5,
+                data: b" world".to_vec(),
+            },
+        );
+        let contents = app.term.as_ref().expect("pane").parser.screen().contents();
+        assert!(contents.contains("hello world"), "{contents:?}");
+
+        // Anything else starts the screen over.
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: a1.clone(),
+                base_seq: 100,
+                data: b"fresh".to_vec(),
+            },
+        );
+        let term = app.term.as_ref().expect("pane");
+        let contents = term.parser.screen().contents();
+        assert!(
+            contents.contains("fresh") && !contents.contains("hello"),
+            "{contents:?}"
+        );
+        assert_eq!(term.next_seq, 105, "and the delta point follows the replay");
+    }
+
+    /// A kept screen is shown only for a session the daemon still holds:
+    /// one that died comes back as a new process with a ring of its own,
+    /// and its old screen would mislead for the frame before the replay.
+    #[test]
+    fn a_session_that_died_is_not_shown_from_the_cache() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: agent_entity("a2", "w1", "agent-2", false),
+            },
+        );
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        let a2 = SessionRef::Agent(AgentId("a2".into()));
+        let mut out = Vec::new();
+        attach_now(&mut app, a1.clone(), &mut out);
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: a1.clone(),
+                base_seq: 0,
+                data: b"hello".to_vec(),
+            },
+        );
+        attach_now(&mut app, a2.clone(), &mut out);
+        assert_eq!(app.term_cache.len(), 1);
+
+        app.tree
+            .agents
+            .iter_mut()
+            .find(|a| a.id == AgentId("a1".into()))
+            .expect("a1 seeded")
+            .alive = false;
+        out.clear();
+        attach_now(&mut app, a1.clone(), &mut out);
+        assert!(
+            !app.term.as_ref().expect("pane").painted,
+            "a fresh, blank pane"
+        );
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::Attach { from_seq: None, .. })
+            ),
+            "and a whole-ring replay is asked for: {out:?}"
+        );
+        assert!(
+            app.term_cache.is_empty(),
+            "the dead session's screen is gone"
+        );
+    }
+
+    /// The cache holds the last two screens shown, most recent first; an
+    /// older one is re-parsed on the way back like a first visit.
+    #[test]
+    fn the_screen_cache_keeps_the_last_two_sessions() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        for id in ["a2", "a3", "a4"] {
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: agent_entity(id, "w1", id, false),
+                },
+            );
+        }
+        let mut out = Vec::new();
+        for id in ["a1", "a2", "a3", "a4"] {
+            let sref = SessionRef::Agent(AgentId(id.into()));
+            attach_now(&mut app, sref.clone(), &mut out);
+            hse(
+                &mut app,
+                ServerEvent::Scrollback {
+                    session: sref,
+                    base_seq: 0,
+                    data: id.as_bytes().to_vec(),
+                },
+            );
+        }
+        assert_eq!(
+            app.term_cache
+                .iter()
+                .map(|t| t.sref.clone())
+                .collect::<Vec<_>>(),
+            [
+                SessionRef::Agent(AgentId("a3".into())),
+                SessionRef::Agent(AgentId("a2".into()))
+            ],
+            "two kept, newest first; a1 was evicted"
+        );
+    }
+
+    /// A session that leaves the tree takes its kept screen with it.
+    #[test]
+    fn a_removed_session_leaves_the_screen_cache() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: agent_entity("a2", "w1", "agent-2", false),
+            },
+        );
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        let a2 = SessionRef::Agent(AgentId("a2".into()));
+        let mut out = Vec::new();
+        attach_now(&mut app, a1.clone(), &mut out);
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: a1.clone(),
+                base_seq: 0,
+                data: b"hello".to_vec(),
+            },
+        );
+        attach_now(&mut app, a2.clone(), &mut out);
+        assert_eq!(app.term_cache.len(), 1);
+        hse(
+            &mut app,
+            ServerEvent::EntityRemoved {
+                id: nebula_core::EntityId::Agent(AgentId("a1".into())),
+            },
+        );
+        assert!(
+            app.term_cache.is_empty(),
+            "the removed session's screen is gone"
+        );
+    }
+
     fn archived_agent(id: &str, name: &str, archived_at: i64, sort: i64) -> nebula_core::Entity {
         use nebula_core::{Agent, AgentStatus, Entity, WorktreeId};
         Entity::Agent(Agent {
@@ -15357,9 +16462,10 @@ diff --git a/src/b.rs b/src/b.rs
         };
         let req_id = *req_id;
 
-        // The daemon broadcasts the upsert, then acks — selection lands on
-        // the new worktree, children reset, sessions panel focused so `n`
-        // creates a session right away.
+        // Enter already selected a stand-in row for the checkout, children
+        // reset, sessions panel focused so `n` creates a session right
+        // away (`event_loop::placeholder`); the daemon's upsert, then its
+        // Ack, swap the real row in under that same cursor.
         let w2 = Worktree {
             id: WorktreeId("w2".into()),
             project_id: nebula_core::ProjectId("p1".into()),
@@ -16054,6 +17160,33 @@ diff --git a/src/b.rs b/src/b.rs
         run_git(&repo, &["commit", "-m", "wip"]);
         refresh_git_changes(&mut app);
         assert_eq!(app.selected_worktree_changes(), Some(0), "commit clears");
+    }
+
+    /// A count that lands for a checkout the cursor has since left is kept
+    /// for that checkout and never shown for the selected one, which reads
+    /// as stale until its own count lands.
+    #[test]
+    fn a_count_for_another_checkout_keeps_the_badge_quiet() {
+        let mut app = App::new();
+        seed_tree(&mut app); // w1 selected
+        app.git_changes_inflight = Some(WorktreeId("w2".into()));
+        land_git_changes(&mut app, WorktreeId("w2".into()), Some(5));
+        assert!(
+            app.git_changes_inflight.is_none(),
+            "the answer frees the slot"
+        );
+        assert_eq!(
+            app.selected_worktree_changes(),
+            None,
+            "another checkout's count never shows"
+        );
+        assert!(
+            app.git_changes_stale(),
+            "so the selection still wants its own"
+        );
+        land_git_changes(&mut app, WorktreeId("w1".into()), Some(3));
+        assert_eq!(app.selected_worktree_changes(), Some(3));
+        assert!(!app.git_changes_stale());
     }
 
     #[test]
@@ -20340,20 +21473,15 @@ diff --git a/src/b.rs b/src/b.rs
             Some(a2.clone()),
             "the remembered session comes back in the pane too"
         );
-        // The Attach itself waits out ATTACH_DEBOUNCE: walking the
-        // Workspaces column runs a full switch per row, and a workspace
-        // merely passed through must not cold-boot its agent CLI.
-        assert!(
-            !out.iter()
-                .any(|r| matches!(r, ClientRequest::Attach { .. })),
-            "the attach is debounced, not sent on the switch itself, got {out:?}"
-        );
-        fire_pending_attach(&mut app, &mut out);
+        // a2 is live, so the switch attaches it on the spot: its ring
+        // replays, no CLI is booted. (A reaped session would wait out
+        // ATTACH_DEBOUNCE instead — see the walk test below.)
         assert!(
             out.iter()
                 .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == a2)),
-            "and lands once the cursor settles, got {out:?}"
+            "a live session attaches on the switch itself, got {out:?}"
         );
+        assert!(app.pending_attach.is_none(), "nothing left to settle");
     }
 
     /// The 'default' workspace as an entity — `seed_tree`'s project points
@@ -20433,9 +21561,10 @@ diff --git a/src/b.rs b/src/b.rs
     }
     /// Stepping through the Workspaces column runs a full `switch_workspace`
     /// per row, and each one restores that workspace's remembered session.
-    /// Without the attach debounce every row merely passed through
-    /// cold-boots an agent CLI nobody asked to see, and the boot the user IS
-    /// waiting on queues behind them — the workspace-switch lag.
+    /// A reaped session waits out the attach debounce, so a row merely
+    /// passed through never cold-boots an agent CLI nobody asked to see —
+    /// while a live one, whose attach is only a ring replay, comes up on
+    /// arrival.
     #[test]
     fn walking_the_workspaces_column_attaches_only_where_it_stops() {
         use nebula_core::{
@@ -20517,22 +21646,37 @@ diff --git a/src/b.rs b/src/b.rs
             SessionRef::Agent(AgentId("a7".into())),
         );
 
+        // The workspace walked *through* holds a session the daemon reaped:
+        // attaching it would boot a CLI, which a passing cursor must never
+        // do. The one the walk ends on is live, so it attaches on arrival.
+        app.tree
+            .agents
+            .iter_mut()
+            .find(|a| a.id == AgentId("a9".into()))
+            .expect("a9 seeded")
+            .alive = false;
+
         app.focus = Focus::Workspaces;
         let mut out = Vec::new();
         move_selection(&mut app, 1, &mut out); // onto ws2…
-        move_selection(&mut app, 1, &mut out); // …and straight through to ws3
         assert!(
             !out.iter()
                 .any(|r| matches!(r, ClientRequest::Attach { .. })),
-            "nothing attaches while the cursor is still moving: {out:?}"
+            "a reaped session waits for the cursor to settle: {out:?}"
         );
+        move_selection(&mut app, 1, &mut out); // …and straight through to ws3
         assert!(
             !out.iter()
                 .any(|r| matches!(r, ClientRequest::Attach { session, .. }
                 if *session == SessionRef::Agent(AgentId("a9".into())))),
             "the workspace passed through never boots its agent: {out:?}"
         );
+        assert!(
+            app.pending_attach.is_none(),
+            "and nothing is left armed to boot it later"
+        );
 
+        // A live destination needs no settling: the fire is a no-op.
         fire_pending_attach(&mut app, &mut out);
         let attaches: Vec<_> = out
             .iter()
@@ -20544,8 +21688,9 @@ diff --git a/src/b.rs b/src/b.rs
             "exactly one attach, for the row it stopped on: {out:?}"
         );
         assert!(
-            matches!(out.last(), Some(ClientRequest::Attach { session, .. })
-                if *session == SessionRef::Agent(AgentId("a7".into()))),
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. }
+                if *session == SessionRef::Agent(AgentId("a7".into())))),
             "and it's the workspace the walk ended on: {out:?}"
         );
     }
@@ -20565,15 +21710,18 @@ diff --git a/src/b.rs b/src/b.rs
         app.show_workspaces = false;
         let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
 
+        // Before the daemon answers, the pane is simply blank: a live
+        // session's replay fills it within a frame, and a notice for that
+        // frame would only flash on every switch.
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(
-            text.contains("starting"),
-            "a session with no output yet reads as starting:\n{text}"
+            !text.contains("starting"),
+            "a live session's pane is blank, not \"starting\", until the replay lands:\n{text}"
         );
 
-        // The empty replay on attach is not output — it must not clear the
-        // notice, or the pane goes blank again with nothing to explain it.
+        // The empty replay on attach is the daemon saying nothing has
+        // painted yet — now the pane says so rather than look hung.
         hse(
             &mut app,
             ServerEvent::Scrollback {
@@ -20583,9 +21731,10 @@ diff --git a/src/b.rs b/src/b.rs
             },
         );
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
         assert!(
-            buffer_text(&terminal).contains("starting"),
-            "an empty replay still means nothing has painted"
+            text.contains("starting"),
+            "an empty replay means the session is booting:\n{text}"
         );
 
         // First real bytes: the notice gives way to the PTY screen.
@@ -22450,14 +23599,15 @@ diff --git a/src/b.rs b/src/b.rs
         });
     }
 
-    /// With the root hidden, `p` on the WORKTREES PANEL is "a fresh
-    /// worktree, then this task in it": Enter asks the DAEMON for the
-    /// checkout (no base — it fetches `origin/HEAD` itself), the Ack moves
-    /// the cursor onto the new row and fires the create there with the
-    /// typed prompt, and FOCUS stays on the panel `p` was pressed in. A
-    /// refused worktree brings the box back with the text.
+    /// `p` on the WORKTREES PANEL is "a fresh worktree, then this task in
+    /// it", whatever row the cursor is on — here the root itself: Enter
+    /// asks the DAEMON for the checkout (no base — it fetches `origin/HEAD`
+    /// itself), the Ack moves the cursor onto the new row and fires the
+    /// create there with the typed prompt, and FOCUS stays on the panel
+    /// `p` was pressed in. A refused worktree brings the box back with the
+    /// text.
     #[test]
-    fn p_on_the_worktrees_panel_cuts_a_fresh_worktree_first_when_the_root_is_hidden() {
+    fn p_on_the_worktrees_panel_cuts_a_fresh_worktree_first() {
         use crate::quick_prompt::QuickTarget;
         use nebula_core::{EntityId, ProjectId, WorktreeId};
         with_default_config(|| {
@@ -22465,9 +23615,13 @@ diff --git a/src/b.rs b/src/b.rs
             let mut out = Vec::new();
             seed_tree(&mut app);
             seed_feat_worktree(&mut app, "w2", "feat");
-            app.hide_root_worktree = true;
             app.focus = Focus::Worktrees;
             app.sel_worktree = 0;
+            assert_eq!(
+                app.selected_worktree().map(|w| w.branch.as_str()),
+                Some("main"),
+                "the cursor is on the root row"
+            );
 
             press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
             let branch = match &app.overlay {
@@ -22494,8 +23648,8 @@ diff --git a/src/b.rs b/src/b.rs
             assert!(out.is_empty(), "opening it sends nothing: {out:?}");
 
             // The Tab picker round trip hands the new-worktree target back
-            // untouched: its menu is built against the hidden root, and the
-            // launch must not be rebuilt from that.
+            // untouched: its menu is built against the ROOT WORKTREE, and
+            // the launch must not be rebuilt from that.
             press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
             assert!(
                 matches!(&app.overlay, Some(Overlay::Menu(menu))
@@ -22600,28 +23754,53 @@ diff --git a/src/b.rs b/src/b.rs
         });
     }
 
-    /// The SETTING off — the default — leaves `p` on the WORKTREES PANEL
-    /// exactly as it was: the selected checkout, root included.
+    /// The fresh worktree is the WORKTREES PANEL's doing, not the
+    /// `hide_root_worktree` SETTING's: `p` there cuts one with the root
+    /// row shown or hidden, and `p` from the SESSIONS PANEL launches into
+    /// the selected checkout — the root included — either way.
     #[test]
-    fn p_on_the_worktrees_panel_launches_in_the_selected_checkout_by_default() {
+    fn only_the_worktrees_panel_cuts_a_fresh_worktree_whatever_the_root_setting() {
         use crate::quick_prompt::QuickTarget;
-        use nebula_core::WorktreeId;
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
             seed_tree(&mut app);
-            app.focus = Focus::Worktrees;
-            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
-            match &app.overlay {
-                Some(Overlay::Prompt(prompt)) => {
-                    assert_eq!(prompt.title, "Quick prompt (claude)");
-                    assert!(matches!(
-                        &prompt.kind,
-                        PromptKind::QuickPrompt(launch)
-                            if launch.target == QuickTarget::Worktree(WorktreeId("w1".into()))
-                    ));
-                }
-                other => panic!("p should open the quick prompt, got {other:?}"),
+            seed_feat_worktree(&mut app, "w2", "feat");
+            // Open the box, read where it would launch, close it again.
+            let target = |app: &mut App, out: &mut Vec<ClientRequest>| {
+                press(app, KeyCode::Char('p'), KeyModifiers::NONE, out);
+                let target = match &app.overlay {
+                    Some(Overlay::Prompt(prompt)) => match &prompt.kind {
+                        PromptKind::QuickPrompt(launch) => launch.target.clone(),
+                        other => panic!("expected the quick prompt, got {other:?}"),
+                    },
+                    other => panic!("p should open the quick prompt, got {other:?}"),
+                };
+                press(app, KeyCode::Esc, KeyModifiers::NONE, out);
+                assert!(app.overlay.is_none(), "Esc closes the box");
+                assert!(out.is_empty(), "nothing was sent: {out:?}");
+                target
+            };
+            for hidden in [false, true] {
+                app.hide_root_worktree = hidden;
+                app.focus = Focus::Worktrees;
+                app.sel_worktree = 0;
+                assert!(
+                    matches!(target(&mut app, &mut out), QuickTarget::NewWorktree { .. }),
+                    "hide_root_worktree = {hidden}"
+                );
+                app.focus = Focus::Sessions;
+                let selected = app.selected_worktree().unwrap();
+                assert_eq!(
+                    selected.is_main, !hidden,
+                    "row 0 is the root iff it is shown"
+                );
+                let selected = selected.id.clone();
+                assert_eq!(
+                    target(&mut app, &mut out),
+                    QuickTarget::Worktree(selected),
+                    "hide_root_worktree = {hidden}"
+                );
             }
         });
     }
@@ -22929,12 +24108,277 @@ diff --git a/src/b.rs b/src/b.rs
                 "the head scrolled off rather than the tail: {text}"
             );
             assert!(
-                text.contains("⇧Enter/^J: newline") && text.contains("Esc"),
+                text.contains("^J newline") && text.contains("Esc"),
                 "the newline and cancel keys are on the border: {text}"
             );
             assert!(
-                text.contains("Tab: agent") && text.contains("⇧Tab: preset"),
-                "and so are the two pickers: {text}"
+                text.contains("Tab agent")
+                    && text.contains("⇧Tab preset")
+                    && text.contains("^N worktree"),
+                "and so are the two pickers and the worktree toggle: {text}"
+            );
+        });
+    }
+
+    /// `Ctrl+N` in the box flips where the launch lands — the selected
+    /// checkout or a fresh worktree — from whichever panel `p` was pressed
+    /// in, keeping the text and the caret, and Enter then takes the route
+    /// the WORKTREES PANEL's `p` takes: a `CreateWorktree` first, the
+    /// create following its Ack into the new checkout.
+    #[test]
+    fn ctrl_n_in_the_quick_prompt_flips_the_launch_into_a_fresh_worktree() {
+        use crate::quick_prompt::QuickTarget;
+        use nebula_core::{EntityId, ProjectId, WorktreeId};
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            seed_feat_worktree(&mut app, "w2", "feat");
+            app.focus = Focus::Sessions;
+            let selected = app.selected_worktree().unwrap().id.clone();
+            // Where the box would launch, what it is titled, and the text
+            // and caret in it.
+            let state = |app: &App| match &app.overlay {
+                Some(Overlay::Prompt(prompt)) => match &prompt.kind {
+                    PromptKind::QuickPrompt(launch) => (
+                        launch.target.clone(),
+                        prompt.title.clone(),
+                        prompt.input.as_str().to_string(),
+                        prompt.input.cursor_chars(),
+                    ),
+                    other => panic!("expected the quick prompt, got {other:?}"),
+                },
+                other => panic!("expected the box, got {other:?}"),
+            };
+
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(paste_into_overlay(&mut app, "Fix auth"));
+            // The caret parked mid-text, to prove the flip keeps it.
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE, &mut out);
+            assert_eq!(state(&app).0, QuickTarget::Worktree(selected.clone()));
+
+            press(
+                &mut app,
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            let (target, title, text, caret) = state(&app);
+            let branch = match target {
+                QuickTarget::NewWorktree { project, branch } => {
+                    assert_eq!(project, ProjectId("p1".into()));
+                    branch
+                }
+                other => panic!("^N should aim at a fresh worktree, got {other:?}"),
+            };
+            assert!(
+                !["main", "feat"].contains(&branch.as_str()),
+                "{branch} is taken"
+            );
+            assert_eq!(
+                title,
+                format!("Quick prompt · new worktree {branch} (claude)")
+            );
+            assert_eq!(text, "Fix auth", "the text survives the flip");
+            assert_eq!(caret, 6, "and so does the caret");
+            assert!(out.is_empty(), "flipping sends nothing: {out:?}");
+
+            // And back: the selected checkout, text and caret still there.
+            press(
+                &mut app,
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            let (target, title, text, caret) = state(&app);
+            assert_eq!(target, QuickTarget::Worktree(selected.clone()));
+            assert_eq!(title, "Quick prompt (claude)");
+            assert_eq!((text.as_str(), caret), ("Fix auth", 6));
+
+            // On again and Enter: the worktree is cut first, the launch
+            // follows the Ack into it, and FOCUS stays where p was pressed.
+            press(
+                &mut app,
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            let branch = match state(&app).0 {
+                QuickTarget::NewWorktree { branch, .. } => branch,
+                other => panic!("{other:?}"),
+            };
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "launching closes the box");
+            let req_id = match out.as_slice() {
+                [ClientRequest::CreateWorktree {
+                    req_id,
+                    project,
+                    branch: b,
+                    base: None,
+                }] if project == &ProjectId("p1".into()) && b == &branch => *req_id,
+                other => panic!("one base-less CreateWorktree first: {other:?}"),
+            };
+            out.clear();
+            seed_feat_worktree(&mut app, "w3", &branch);
+            handle_server_event(
+                &mut app,
+                ServerEvent::Ack {
+                    req_id,
+                    created: Some(EntityId::Worktree(WorktreeId("w3".into()))),
+                },
+                &mut out,
+            );
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [ClientRequest::CreateAgent {
+                        worktree,
+                        starting_prompt: Some(text),
+                        ..
+                    }] if worktree.0 == "w3" && text == "Fix auth"
+                ),
+                "then one create in it carrying the typed prompt: {out:?}"
+            );
+            assert_eq!(
+                app.selected_worktree().map(|w| w.id.0.as_str()),
+                Some("w3"),
+                "the cursor is on the new row"
+            );
+            assert_eq!(
+                app.focus,
+                Focus::Sessions,
+                "focus stays where p was pressed"
+            );
+        });
+    }
+
+    /// From the WORKTREES PANEL the box opens on a fresh worktree; `Ctrl+N`
+    /// there is the way back into the checkout under the cursor. With no
+    /// checkout there — the root hidden and nothing else cut yet — it says
+    /// so and keeps the fresh one, rather than aiming at nothing.
+    #[test]
+    fn ctrl_n_on_the_worktrees_panel_flips_back_to_the_selected_checkout() {
+        use crate::quick_prompt::QuickTarget;
+        use nebula_core::WorktreeId;
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Worktrees;
+            app.sel_worktree = 0;
+            let target = |app: &App| match &app.overlay {
+                Some(Overlay::Prompt(prompt)) => match &prompt.kind {
+                    PromptKind::QuickPrompt(launch) => launch.target.clone(),
+                    other => panic!("expected the quick prompt, got {other:?}"),
+                },
+                other => panic!("expected the box, got {other:?}"),
+            };
+
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(matches!(target(&app), QuickTarget::NewWorktree { .. }));
+            assert!(paste_into_overlay(&mut app, "Fix auth"));
+            press(
+                &mut app,
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert_eq!(
+                target(&app),
+                QuickTarget::Worktree(WorktreeId("w1".into())),
+                "back into the root under the cursor"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+            // The root hidden and no other checkout: nothing to flip to.
+            app.hide_root_worktree = true;
+            assert!(app.selected_worktree().is_none());
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(paste_into_overlay(&mut app, "Fix auth"));
+            press(
+                &mut app,
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert!(
+                matches!(target(&app), QuickTarget::NewWorktree { .. }),
+                "the fresh worktree stays"
+            );
+            assert_eq!(
+                app.flash.as_deref(),
+                Some("quick prompt: no worktree under the cursor — keeping the new one")
+            );
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("the box should stay up, got {:?}", app.overlay);
+            };
+            assert_eq!(prompt.input.as_str(), "Fix auth");
+            assert!(out.is_empty(), "{out:?}");
+        });
+    }
+
+    /// The box says where Enter will land, both ways round: a quiet
+    /// `worktree: main` with the toggle unticked inside the usual accent
+    /// frame, or — flipped — the NEW WORKTREE chip, the branch to be cut
+    /// and the toggle ticked, inside a frame turned green.
+    #[test]
+    fn the_quick_prompt_box_shows_the_worktree_toggle_both_ways() {
+        use crate::quick_prompt::QuickTarget;
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            let frame_fg = |app: &App, terminal: &Terminal<TestBackend>| {
+                let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                    panic!("expected the box, got {:?}", app.overlay);
+                };
+                terminal.backend().buffer()[(prompt.area.x, prompt.area.y)].fg
+            };
+
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("worktree: main"), "{text}");
+            assert!(text.contains("[ ] new worktree"), "{text}");
+            assert!(!text.contains("NEW WORKTREE"), "{text}");
+            assert!(
+                text.contains("^N worktree"),
+                "the key is on the border: {text}"
+            );
+            assert_eq!(frame_fg(&app, &terminal), app.theme.accent);
+
+            press(
+                &mut app,
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            let branch = match &app.overlay {
+                Some(Overlay::Prompt(prompt)) => match &prompt.kind {
+                    PromptKind::QuickPrompt(launch) => match &launch.target {
+                        QuickTarget::NewWorktree { branch, .. } => branch.clone(),
+                        other => panic!("{other:?}"),
+                    },
+                    other => panic!("{other:?}"),
+                },
+                other => panic!("{other:?}"),
+            };
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains(&format!("NEW WORKTREE  {branch}")), "{text}");
+            assert!(text.contains("[✓] new worktree"), "{text}");
+            assert!(!text.contains("worktree: main"), "{text}");
+            assert!(
+                text.contains(&format!("new worktree {branch}")),
+                "the title names it too: {text}"
+            );
+            assert_eq!(
+                frame_fg(&app, &terminal),
+                app.theme.ok,
+                "the frame turns green"
             );
         });
     }
@@ -22961,7 +24405,9 @@ diff --git a/src/b.rs b/src/b.rs
 
     /// The agent has to run somewhere: with no checkout under the cursor
     /// (an empty tree, or a cursor parked on an OPEN PRS row) `p` says so
-    /// instead of opening a box that cannot launch.
+    /// instead of opening a box that cannot launch. On the WORKTREES PANEL
+    /// the checkout is cut on the way, so only a PROJECT is needed — and an
+    /// empty tree has none of those either.
     #[test]
     fn the_quick_prompt_needs_a_worktree() {
         with_default_config(|| {
@@ -22972,6 +24418,15 @@ diff --git a/src/b.rs b/src/b.rs
             assert_eq!(
                 app.flash.as_deref(),
                 Some("quick prompt: select a worktree first")
+            );
+            assert!(out.is_empty(), "{out:?}");
+
+            app.focus = Focus::Worktrees;
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert_eq!(
+                app.flash.as_deref(),
+                Some("quick prompt: select a project first")
             );
             assert!(out.is_empty(), "{out:?}");
         });

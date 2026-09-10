@@ -1,22 +1,26 @@
 //! The pull request on a worktree's branch, discovered with the GitHub CLI
-//! (`gh pr view`). The PR itself is never persisted — the row it feeds sits
-//! above the worktree's saved links and refreshes on its own, so a PR
-//! opened outside nebula shows up without anyone typing its URL, and one
-//! that has since been merged or closed stays on the row, badged, for as
-//! long as the checkout does: the worktree outlives its pull request, and
-//! the PR is what you check before archiving or deleting it. The one thing
-//! that outlives the process is how far the user has read into the
-//! conversation, which the daemon keeps (`pr_seen`) so the row can say how
-//! many comments landed while they were away.
+//! (`gh pr view`). The row it feeds sits above the worktree's saved links
+//! and refreshes on its own, so a PR opened outside nebula shows up without
+//! anyone typing its URL, and one that has since been merged or closed
+//! stays on the row, badged, for as long as the checkout does: the worktree
+//! outlives its pull request, and the PR is what you check before archiving
+//! or deleting it. Nothing here is the source of truth — GitHub is — but
+//! every answer is remembered on disk (`pr_cache`) so the next launch paints
+//! the rows from what the last one knew while the lookups catch up. How far
+//! the user has read into the conversation is the daemon's (`pr_seen`), so
+//! the row can say how many comments landed while they were away.
 //!
 //! The same `gh` also answers the wider question this module's other half
 //! asks — every pull request still open on the *project's* repo, for the
 //! group at the bottom of the worktrees panel (see [`list`]).
 //!
 //! `gh` may be missing, unauthenticated, or pointed at a repo with no
-//! remote; every one of those is an ordinary "no PR" answer, not an error
-//! worth a flash. Lookups are async because they hit the network.
+//! remote; every one of those is an ordinary "couldn't ask", not an error
+//! worth a flash — and, since the last answer is cached, not a reason to
+//! blank a row either (see [`Lookup`]). Lookups are async because they hit
+//! the network.
 
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// How long a lookup may run before we give up on it. `gh` retries and can
@@ -78,19 +82,31 @@ impl Standing {
 /// stdout on success. Every failure — no `gh`, bad exit, timeout — is
 /// `None`, since each is an ordinary "couldn't ask" to every caller.
 async fn gh(dir: Option<&Path>, args: &[&str], timeout: std::time::Duration) -> Option<String> {
+    run_gh(dir, args, timeout).await.ok()
+}
+
+/// [`gh`] with the failure kept: `Err` carries what `gh` printed to stderr
+/// on a bad exit, and nothing at all when it could not be run or timed
+/// out. Only [`lookup`] reads it — `gh pr view` says "no pull request" and
+/// "no network" with the same exit code and only the message apart.
+async fn run_gh(
+    dir: Option<&Path>,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new("gh");
     cmd.args(args).stdin(std::process::Stdio::null());
     if let Some(dir) = dir {
         cmd.current_dir(dir);
     }
-    let out = tokio::time::timeout(timeout, cmd.output())
-        .await
-        .ok()?
-        .ok()?;
+    let out = match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(_)) | Err(_) => return Err(String::new()),
+    };
     if !out.status.success() {
-        return None;
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
     }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// `v[key]` as a string, `""` when absent or not a string.
@@ -146,7 +162,7 @@ fn web_url(v: &serde_json::Value) -> Option<String> {
 /// first, so the row stays put and its badge says `merged` or `closed`
 /// instead. The PROJECT OPEN PRS GROUP is where closed pull requests fall
 /// out; this row is per checkout, and the checkout is still here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
     pub number: u64,
     pub url: String,
@@ -197,10 +213,40 @@ impl PullRequest {
     }
 }
 
-/// Ask `gh` for the pull request on `dir`'s current branch. `None` covers
-/// every ordinary miss: no PR, no `gh`, no remote, not logged in.
-pub async fn lookup(dir: &Path) -> Option<PullRequest> {
-    let out = gh(
+/// What a branch lookup came back with. The two misses are kept apart
+/// because the row they feed is remembered across launches (`pr_cache`):
+/// a branch GitHub says has no pull request clears its row, while a call
+/// that never reached GitHub leaves whatever the row last showed — the
+/// last known state of a pull request is worth more than a blank, and an
+/// offline launch must not wipe out every badge within a sweep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lookup {
+    Found(PullRequest),
+    /// `gh` answered: the branch has no pull request at all.
+    Absent,
+    /// `gh` couldn't answer — missing, not logged in, no remote, no
+    /// network, a detached checkout, a timeout.
+    Unavailable,
+}
+
+/// The one message `gh pr view` prints for a branch with no pull request
+/// (`no pull requests found for branch "x"`). Everything else it can fail
+/// with is a reason it couldn't ask, not an answer.
+const NO_PR_MARKER: &str = "no pull requests found";
+
+/// Sort a failed `gh pr view` into [`Lookup::Absent`] or
+/// [`Lookup::Unavailable`] by what it printed.
+pub(crate) fn classify_miss(stderr: &str) -> Lookup {
+    if stderr.contains(NO_PR_MARKER) {
+        Lookup::Absent
+    } else {
+        Lookup::Unavailable
+    }
+}
+
+/// Ask `gh` for the pull request on `dir`'s current branch.
+pub async fn lookup(dir: &Path) -> Lookup {
+    let out = run_gh(
         Some(dir),
         &[
             "pr",
@@ -210,10 +256,16 @@ pub async fn lookup(dir: &Path) -> Option<PullRequest> {
         ],
         TIMEOUT,
     )
-    .await?;
-    // Only asked once `gh` has proved it works, so a machine without it
-    // never pays for the extra process.
-    parse(&out, viewer_login().await)
+    .await;
+    match out {
+        // Only asked once `gh` has proved it works, so a machine without
+        // it never pays for the extra process.
+        Ok(out) => match parse(&out, viewer_login().await) {
+            Some(pr) => Lookup::Found(pr),
+            None => Lookup::Absent,
+        },
+        Err(stderr) => classify_miss(&stderr),
+    }
 }
 
 /// Your own GitHub login, resolved once per process. Needed only to keep
@@ -303,7 +355,7 @@ fn activity(v: &serde_json::Value, viewer: Option<&str>) -> Vec<String> {
 pub const LIST_LIMIT: usize = 100;
 
 /// One row of a project's open-pull-request list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenPr {
     pub number: u64,
     pub title: String,
@@ -440,10 +492,10 @@ const DIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// The readable contents of one pull request: what it says it does, and
 /// what people said back. Fetched on demand — only for the row the cursor
-/// actually rests on — and cached for the session, because this is a second
-/// API call on top of the list and the body of a merged-or-not pull request
-/// does not change while you read it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// actually rests on — and cached for the session and across launches,
+/// because this is a second API call on top of the list and the body of a
+/// merged-or-not pull request does not change while you read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrDetail {
     pub number: u64,
     pub url: String,
@@ -479,7 +531,7 @@ impl PrDetail {
 }
 
 /// One thing somebody said on a pull request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrComment {
     pub author: String,
     /// RFC 3339, as GitHub gives it.
@@ -985,5 +1037,33 @@ rename to new.rs
     fn a_deleted_comment_does_not_invent_unread_ones() {
         let pr = with_activity(&["2024-04-25T19:55:42Z"]);
         assert_eq!(pr.unseen(Some("2024-04-27T09:00:00Z")), 0);
+    }
+
+    /// `gh pr view` exits 1 both for a branch with no pull request and for
+    /// a network it couldn't reach; only the message tells them apart. The
+    /// first clears the row, the second keeps whatever it last showed —
+    /// including the row a previous launch cached.
+    #[test]
+    fn a_failed_view_is_absent_only_when_gh_says_no_pull_request() {
+        assert_eq!(
+            classify_miss("no pull requests found for branch \"main\"\n"),
+            Lookup::Absent
+        );
+        assert_eq!(
+            classify_miss(
+                "Post \"https://api.github.com/graphql\": dial tcp: connect: connection refused\n"
+            ),
+            Lookup::Unavailable
+        );
+        assert_eq!(
+            classify_miss("could not determine current branch: not on any branch\n"),
+            Lookup::Unavailable,
+            "a detached checkout mid-rebase keeps its row"
+        );
+        assert_eq!(
+            classify_miss(""),
+            Lookup::Unavailable,
+            "no gh at all, or a timeout"
+        );
     }
 }

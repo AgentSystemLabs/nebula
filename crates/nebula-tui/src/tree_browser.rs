@@ -386,6 +386,27 @@ impl TreeBrowser {
     }
 }
 
+/// How much of a file's head the binary test reads: git's own 8 KiB.
+const BINARY_SNIFF_BYTES: usize = 8192;
+
+/// git's own test for "not text": a NUL byte anywhere in the first 8 KiB.
+/// The preview pane says `(binary file)` on it; `nebula open` refuses the
+/// file outright on it, since a tab of a PNG's bytes shows nobody anything.
+pub(crate) fn looks_binary(head: &[u8]) -> bool {
+    head.iter().take(BINARY_SNIFF_BYTES).any(|b| *b == 0)
+}
+
+/// Is this a text file by that test? Reads only the head. An unreadable
+/// file is the caller's error to word.
+pub(crate) fn is_text_file(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(BINARY_SNIFF_BYTES);
+    std::fs::File::open(path)?
+        .take(BINARY_SNIFF_BYTES as u64)
+        .read_to_end(&mut head)?;
+    Ok(!looks_binary(&head))
+}
+
 /// File contents for a preview pane (this browser's, or the FILE TABS'),
 /// capped and binary-guarded. `Err` is the placeholder/error message to
 /// display (unhighlighted).
@@ -402,7 +423,7 @@ pub(crate) fn read_preview(path: &std::path::Path) -> Result<String, String> {
     {
         return Err(format!("couldn't read file: {e}"));
     }
-    if bytes.iter().take(8192).any(|b| *b == 0) {
+    if looks_binary(&bytes) {
         return Err("(binary file)".to_string());
     }
     let byte_capped = bytes.len() > MAX_PREVIEW_BYTES;
@@ -657,5 +678,25 @@ mod tests {
             vec!["blob.bin".into()],
         );
         assert_eq!(b.preview, "(binary file)");
+    }
+
+    /// The test `nebula open` refuses a file on, shared with the preview:
+    /// git's NUL in the first 8 KiB. A PNG's header has one; text, however
+    /// odd its characters, has none; an empty file is not binary.
+    #[test]
+    fn is_text_file_is_gits_nul_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+        let text = dir.path().join("notes.md");
+        std::fs::write(&text, "# notes\nwith \u{e9} and \u{2192} in it\n").unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "").unwrap();
+        assert!(!is_text_file(&png).unwrap());
+        assert!(is_text_file(&text).unwrap());
+        assert!(is_text_file(&empty).unwrap());
+        assert!(is_text_file(&dir.path().join("missing")).is_err());
+        assert!(!looks_binary(b"plain"));
+        assert!(looks_binary(b"a\0b"));
     }
 }

@@ -62,8 +62,9 @@ nebula spawn <task> [--kind <claude|codex|cursor|pi>]  # start a new agent sessi
                           # one, in the same worktree, opening on <task> (agents run this when you
                           # ask for a new nebula session; --kind defaults to this session's harness)
 nebula open <file>…       # show the files in this nebula's FILE TABS — a modal with one tab per
-                          # file, the focused one previewed, Enter editing it (agents run this when
-                          # you ask to see a file, or to put their own work in front of you)
+                          # file, the focused one previewed, Enter editing it (agents run this only
+                          # when you ask to see a file; text files only — an image or any other
+                          # binary is refused, and the agent names the path instead)
 ```
 
 ## Workspaces

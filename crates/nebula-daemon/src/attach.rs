@@ -66,7 +66,20 @@ pub async fn bind(
             flags: session.kitty_flags(),
         })
         .await;
-    let _ = session.resize_with_jiggle(size.cols, size.rows);
+    // A replay that gives the client the app's exact screen — the whole
+    // history (a ring that never wrapped), or a gap-free continuation of a
+    // screen the client kept from its last visit — needs no repaint nudge:
+    // a plain resize is silent at the same size and a real SIGWINCH at a
+    // new one. Only a ring that wrapped, where the replay may start
+    // mid-frame and whatever was painted before it is lost, gets the
+    // jiggle that makes the app paint everything again — at the cost of
+    // the pane visibly redrawing just after it came up.
+    let exact = base_seq == 0 || from_seq == Some(base_seq);
+    let _ = if exact {
+        session.resize(size.cols, size.rows)
+    } else {
+        session.resize_with_jiggle(size.cols, size.rows)
+    };
     (rx, replay_end)
 }
 

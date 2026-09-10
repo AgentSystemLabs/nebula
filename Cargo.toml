@@ -32,6 +32,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = { version = "3", features = ["serde"] }
 directories = "6"
 
+# Dependencies at full optimisation in dev builds too. The terminal
+# emulation (vt100, tui-term, ratatui) is the TUI's hot path: unoptimised,
+# a 1 MB scrollback replay parses in 50–140 ms against under 15 ms, and
+# every session switch paid it — a `cargo run` build felt sluggish where
+# the release one didn't. Only the workspace crates stay at opt-level 0,
+# so incremental builds are as quick as before.
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 # Keep the symbol table (drop only debug info) so the crash-log panic

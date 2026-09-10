@@ -100,7 +100,9 @@ two agents in two WORKTREES edit two directories and never collide.
 **4. Start the agent.** `n` in the SESSIONS PANEL opens the NEW SESSION PICKER — **Claude**, **Codex**,
 **Cursor** or **Pi**, `→` for MODEL and EFFORT, `Enter` for your defaults. Or skip the picker entirely: `p` from any
 PANEL opens the QUICK PROMPT, you type the task, and an agent starts working on it in the selected
-WORKTREE. Save a framing you keep retyping as an AGENT PRESET (`e`) and it becomes one keystroke.
+WORKTREE — or, from the WORKTREES PANEL or with `Ctrl+N` inside the box, in a fresh worktree cut for the
+job, the box turning green to say so. Save a framing you keep retyping as an AGENT PRESET (`e`) and it
+becomes one keystroke.
 
 **5. Walk away.** `Ctrl+q` leaves the TERMINAL PANE for the panels; `q` asks first — a CONFIRM DIALOG
 reading *Leave the TUI? Sessions keep running in the daemon.* that `Enter` accepts and a second `Ctrl+C`

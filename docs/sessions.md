@@ -49,10 +49,13 @@ harness with that in mind, especially in the ROOT WORKTREE.
 
 The same choice reaches the STATUS DOT, because an AGENT can only report what its hook set can see.
 Claude installs the full set — `UserPromptSubmit`, `Stop`, `SessionStart`, `PermissionRequest`,
-`Notification` (which is where the idle prompt comes from) and `PreToolUse` / `PostToolUse` on
-`AskUserQuestion` — so a Claude row walks the whole range of states, red NEEDS FEEDBACK included. Codex
+`Notification` (which is where the idle prompt comes from), `PreToolUse` on `AskUserQuestion` and an
+unmatched `PostToolUse` — so a Claude row walks the whole range of states, red NEEDS FEEDBACK
+included, and leaves red the moment you answer: a question's answer is its own tool's `PostToolUse`,
+and an approved permission prompt shows up as the gated tool running, whichever tool it was. Codex
 has no `Notification` hook and no `AskUserQuestion` tool, but its native `PermissionRequest` is
-installed, so the red state stays reachable there. Cursor has no `PermissionRequest` hook to install,
+installed, so the red state stays reachable there (and, with no `PostToolUse` to say you approved,
+a Codex row stays red until the turn ends). Cursor has no `PermissionRequest` hook to install,
 and since nebula runs it with `--force` there is nothing left to wait on anyway: its hooks are
 `sessionStart`, `beforeSubmitPrompt`, `stop`, `subagentStart` and `subagentStop`, which is busy versus
 idle and nothing else. **A Cursor SESSION can never show the red NEEDS FEEDBACK dot** — if you are

@@ -29,14 +29,14 @@ const TASK_PROMPT_SIZE: (u16, u16) = (76, 14);
 
 /// The key hints on a task box's bottom border, widest that fits inside
 /// `width` (the block's, so two columns go to its edges). The QUICK PROMPT
-/// has two more keys to advertise than the cloud and preset boxes — `Tab`
-/// retargets the harness, `⇧Tab` picks an AGENT PRESET — and a hint wider
-/// than the border is silently chopped, hence the tiers and the test that
-/// measures them.
+/// has three more keys to advertise than the cloud and preset boxes —
+/// `Tab` retargets the harness, `⇧Tab` picks an AGENT PRESET, `^N` flips
+/// the launch into a fresh worktree — and a hint wider than the border is
+/// silently chopped, hence the tiers and the test that measures them.
 fn task_prompt_hint(kind: &crate::app::PromptKind, width: u16) -> &'static str {
     if matches!(kind, crate::app::PromptKind::QuickPrompt(_)) {
-        return if width >= 72 {
-            " Enter: launch · ⇧Enter/^J: newline · Tab: agent · ⇧Tab: preset · Esc "
+        return if width >= 75 {
+            " Enter launch · ^J newline · Tab agent · ⇧Tab preset · ^N worktree · Esc "
         } else if width >= 61 {
             " Enter launch · ^J newline · Tab agent · ⇧Tab preset · Esc "
         } else if width >= 44 {
@@ -56,6 +56,60 @@ fn task_prompt_hint(kind: &crate::app::PromptKind, width: u16) -> &'static str {
     } else {
         " Esc · ^J · Enter "
     }
+}
+
+/// The QUICK PROMPT's target row, the first inside its frame. Off — the
+/// launch lands in the selected checkout — it is a quiet `worktree: feat`
+/// with the `[ ] new worktree ^N` toggle pinned right. On, it is the
+/// loudest row in the box: a filled NEW WORKTREE chip, the branch Enter
+/// will cut beside it in bold, and the toggle ticked, all in the green
+/// the frame has turned. The right half is dropped whole before the left
+/// is cut short.
+fn quick_target_line(
+    app: &App,
+    launch: &crate::quick_prompt::QuickLaunch,
+    width: u16,
+    th: Theme,
+) -> Line<'static> {
+    let branch =
+        crate::quick_prompt::target_branch(app, launch).unwrap_or_else(|| "(worktree gone)".into());
+    let (left, right) = if launch.is_new_worktree() {
+        let chip = Style::default()
+            .fg(th.on_accent)
+            .bg(th.ok)
+            .add_modifier(Modifier::BOLD);
+        let on = Style::default().fg(th.ok).add_modifier(Modifier::BOLD);
+        (
+            vec![
+                Span::styled(" NEW WORKTREE ", chip),
+                Span::styled(format!(" {branch}"), on),
+            ],
+            vec![
+                Span::styled("[✓] new worktree", on),
+                Span::styled(" ^N ", Style::default().fg(th.dim)),
+            ],
+        )
+    } else {
+        let dim = Style::default().fg(th.dim);
+        (
+            vec![
+                Span::styled("worktree: ", dim),
+                Span::styled(branch, Style::default().fg(th.muted)),
+            ],
+            vec![
+                Span::styled("[ ] new worktree", dim),
+                Span::styled(" ^N ", dim),
+            ],
+        )
+    };
+    let left_w: usize = left.iter().map(|s| s.width()).sum();
+    let right_w: usize = right.iter().map(|s| s.width()).sum();
+    let mut spans = left;
+    if usize::from(width) > left_w + right_w {
+        spans.push(Span::raw(" ".repeat(usize::from(width) - left_w - right_w)));
+        spans.extend(right);
+    }
+    Line::from(spans)
 }
 /// Width of a one-line prompt, and of the wider one carrying a directory
 /// listing under its input.
@@ -387,24 +441,44 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
         }
         Overlay::Prompt(prompt) if prompt.is_multiline() => {
-            let area = centered_rect(f.area(), TASK_PROMPT_SIZE.0, TASK_PROMPT_SIZE.1);
+            // The QUICK PROMPT carries one row the other task boxes do not
+            // — where the launch lands — and takes it in height rather
+            // than out of the editor. Its frame turns green while Enter
+            // will cut a fresh worktree first, so the state reads from
+            // across the room, before the row or the title does.
+            let quick = match &prompt.kind {
+                crate::app::PromptKind::QuickPrompt(launch) => Some(launch),
+                _ => None,
+            };
+            let new_worktree = quick.is_some_and(|launch| launch.is_new_worktree());
+            let frame = if new_worktree { th.ok } else { th.accent };
+            let height = TASK_PROMPT_SIZE.1 + u16::from(quick.is_some());
+            let area = centered_rect(f.area(), TASK_PROMPT_SIZE.0, height);
             f.render_widget(Clear, area);
             let hint = task_prompt_hint(&prompt.kind, area.width);
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.accent))
+                .border_style(Style::default().fg(frame))
                 .title(Span::styled(
                     format!(" {} ", prompt.title),
-                    Style::default().fg(th.accent),
+                    Style::default().fg(frame),
                 ))
                 .title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
             let inner = block.inner(area);
             f.render_widget(block, area);
 
-            let label_rows = usize::from(inner.height >= 4);
+            // The QUICK PROMPT's target row above the label: the toggle
+            // and its state in one glance, whichever way it stands.
+            let target_rows = u16::from(quick.is_some() && inner.height >= 5);
+            if let (1, Some(launch)) = (target_rows, quick) {
+                let row = row_rect(inner, 0).expect("a five-row inner area has a target row");
+                f.render_widget(quick_target_line(app, launch, row.width, th), row);
+            }
+            let label_rows = u16::from(inner.height.saturating_sub(target_rows) >= 4);
             if label_rows == 1 {
-                let row = row_rect(inner, 0).expect("a four-row inner area has a label row");
+                let row = row_rect(inner, usize::from(target_rows))
+                    .expect("a four-row inner area has a label row");
                 f.render_widget(
                     Paragraph::new(Span::styled(prompt.label, Style::default().fg(th.dim))),
                     row,
@@ -414,11 +488,12 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // A bordered, multi-row task editor. Its own wrapping helper
             // keeps words intact and follows the caret once the task grows
             // beyond the visible rows.
+            let head_rows = target_rows + label_rows;
             let editor_area = Rect {
                 x: inner.x,
-                y: inner.y.saturating_add(label_rows as u16),
+                y: inner.y.saturating_add(head_rows),
                 width: inner.width,
-                height: inner.height.saturating_sub(label_rows as u16),
+                height: inner.height.saturating_sub(head_rows),
             };
             let editor_inner = if editor_area.height >= 3 && editor_area.width >= 4 {
                 let editor_block = Block::default()
@@ -3875,10 +3950,12 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
             format!("scroll {}", t.scroll),
             Style::default().fg(th.warn).add_modifier(Modifier::BOLD),
         )),
-        // Nothing has come off the PTY yet: the session was reaped while the
-        // user was elsewhere and its CLI is booting. Say so — the blank grid
-        // on its own reads as a hang.
-        Some(t) if !t.painted => Some(Span::styled(
+        // Nothing has come off the PTY yet and nothing will for a while:
+        // the session was reaped while the user was elsewhere and its CLI
+        // is booting. Say so — the blank grid on its own reads as a hang.
+        // (A live session's replay lands within a frame; that blank is
+        // not worth a word that would only flash.)
+        Some(t) if t.booting => Some(Span::styled(
             "starting…".to_string(),
             Style::default().fg(th.dim),
         )),
@@ -3902,7 +3979,7 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         // Booting: the grid is empty because the CLI hasn't painted yet, so
         // there is nothing to render and nothing to scan for links. A word
         // in the middle of the pane beats an unexplained void.
-        Some(term) if !term.painted && !term.exited => {
+        Some(term) if term.booting && !term.exited => {
             let msg = Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -4940,10 +5017,12 @@ mod tests {
                 );
             }
         }
-        // The full-width box advertises the two pickers.
+        // The full-width box advertises the two pickers and the toggle.
         let full = task_prompt_hint(&quick, TASK_PROMPT_SIZE.0);
         assert!(
-            full.contains("Tab: agent") && full.contains("⇧Tab: preset"),
+            full.contains("Tab agent")
+                && full.contains("⇧Tab preset")
+                && full.contains("^N worktree"),
             "{full}"
         );
         assert!(!task_prompt_hint(&cloud, TASK_PROMPT_SIZE.0).contains("Tab"));

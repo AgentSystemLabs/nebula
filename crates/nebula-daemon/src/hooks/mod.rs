@@ -204,7 +204,9 @@ pub fn parse_event(hook_event: &str, payload: &HookPayload) -> Option<HookEvent>
         "SessionStart" => HookEvent::SessionStart {
             source: payload.source.clone(),
         },
-        "PermissionRequest" => HookEvent::PermissionRequest,
+        "PermissionRequest" => HookEvent::PermissionRequest {
+            subagent_id: payload.subagent_id(),
+        },
         "Notification" => HookEvent::Notification {
             notification_type: payload.notification_type.clone(),
         },

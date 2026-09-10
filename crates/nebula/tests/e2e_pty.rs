@@ -3357,7 +3357,8 @@ async fn auto_title_instruction_and_rename_flow() {
 /// processes: the CLI (what the model runs) resolves the paths against its
 /// own cwd, the daemon checks the caller and fans the files out to every
 /// subscriber as one `FilesOpened` carrying the agent's checkout — and a
-/// path that does not exist fails in the CLI before anything is sent.
+/// path that does not exist, or is not a text file, fails in the CLI
+/// before anything is sent.
 #[tokio::test]
 async fn nebula_open_cli_hands_the_files_to_every_subscriber() {
     let env = TestEnv::new();
@@ -3415,6 +3416,15 @@ async fn nebula_open_cli_hands_the_files_to_every_subscriber() {
     assert!(!out.status.success(), "a missing file must fail: {out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("no such file"), "stderr: {stderr}");
+
+    // So is a binary file: a terminal has nothing to show for a PNG, and
+    // the model is told to name the path instead.
+    let png = repo.join("shot.png");
+    std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+    let out = agent_cli(&env, &agent_id, &["open", png.to_str().unwrap()]);
+    assert!(!out.status.success(), "a binary file must fail: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not a text file"), "stderr: {stderr}");
 
     // Outside a session there is no row to open for.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))

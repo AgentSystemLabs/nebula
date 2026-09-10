@@ -1,13 +1,12 @@
 //! The QUICK PROMPT's last step: the box's `QuickLaunch` plus the typed
 //! text, turned into the create the DAEMON sees. A launch into a selected
 //! WORKTREE is one `CreateAgent`. A launch into a worktree that does not
-//! exist yet (`QuickTarget::NewWorktree` — `p` on the WORKTREES PANEL with
-//! the `hide_root_worktree` SETTING on) is a `CreateWorktree` first, the
-//! launch riding its PENDING INTENT, and the same `CreateAgent` once the
-//! Ack names the checkout: retargeted at it, the cursor moved onto its
-//! row, FOCUS left on the panel `p` was pressed in. Both rows are on
-//! screen from the moment Enter is pressed — stand-ins (`placeholder`)
-//! that the Acks turn into the real rows.
+//! exist yet (`QuickTarget::NewWorktree` — `p` on the WORKTREES PANEL) is
+//! a `CreateWorktree` first, the launch riding its PENDING INTENT, and
+//! the same `CreateAgent` once the Ack names the checkout: retargeted at
+//! it, the cursor moved onto its row, FOCUS left on the panel `p` was
+//! pressed in. Both rows are on screen from the moment Enter is pressed —
+//! stand-ins (`placeholder`) that the Acks turn into the real rows.
 
 use super::{
     create_agent, placeholder, schedule_prewarm, select_worktree_by_id, send_with, AgentLaunchDraft,
@@ -64,7 +63,7 @@ pub(super) fn launch_in_created_worktree(
 ) {
     // The stand-in checkout becomes the real one — its session row moves
     // under it — before anything is selected or sent by the real id.
-    placeholder::resolve_worktree(app, &placeholder, &worktree);
+    placeholder::resolve_worktree(app, &placeholder.worktree, &worktree);
     // The new row is the context every later `p` / `n` runs in, so the
     // cursor moves onto it — but FOCUS stays on the panel `p` was pressed
     // in, as every QUICK PROMPT launch leaves it (`quick_prompt_focus`

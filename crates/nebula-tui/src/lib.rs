@@ -18,6 +18,7 @@ pub mod keys;
 pub mod links;
 pub mod overlay_close;
 pub mod palette;
+pub mod pr_cache;
 pub mod pr_preview;
 pub mod pr_row;
 pub mod preset_overlays;

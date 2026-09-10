@@ -16,6 +16,16 @@ use std::path::PathBuf;
 /// size of [`App::sweep_phase`] (one text cell per frame).
 pub const SWEEP_FRAME: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// How many recently shown sessions keep their screen ([`App::term_cache`]).
+/// Two covers the flip between a pair of worktrees and a three-way rotation;
+/// each entry is a whole `vt100` parser, so this is not a number to grow.
+pub const TERM_CACHE_MAX: usize = 2;
+/// The largest screen worth keeping, in grid cells (32 bytes each, so this
+/// is about 12 MB). An alt-screen CLI is a screen's worth; a shell whose
+/// 10 000-line scrollback has filled is tens of megabytes, and re-parsing
+/// that on the way back is cheaper than holding it.
+pub const TERM_CACHE_CELLS: usize = 400_000;
+
 /// Wall-clock epoch ms, comparable to the daemon's `status_changed_at`.
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -734,6 +744,11 @@ pub struct DiffView {
     /// marks are stored under the worktree path and pruned when that path
     /// isn't a directory, and a pull request has no path of its own.
     pub prefetched: Option<HashMap<String, String>>,
+    /// The pull request a prefetched view is showing, by URL — what a
+    /// fresh `gh pr diff` landing later checks before replacing the
+    /// contents of a modal opened on the cached copy. `None` for the
+    /// worktree view.
+    pub pr_url: Option<String>,
     /// Reviewed ✓ marks: file path → fingerprint of the approved diff text.
     /// Nebula-side bookkeeping only (persisted via `review::store_marks`);
     /// never stages or otherwise touches git state.
@@ -762,6 +777,7 @@ impl DiffView {
             files_drag: None,
             head_ok,
             prefetched: None,
+            pr_url: None,
             reviewed: HashMap::new(),
             head_key: String::new(),
         };
@@ -1236,7 +1252,9 @@ pub struct WorktreeRollback {
 /// under ids this client made up — so the panels never wait on the
 /// DAEMON's `git worktree add` and CLI spawn. Carried by the PENDING
 /// INTENTs of the two creates: the Acks turn them into the real rows,
-/// an Error takes them down (`event_loop::placeholder`).
+/// an Error takes them down (`event_loop::placeholder`). The NEW
+/// WORKTREE modal puts up the checkout row alone, under
+/// `PendingIntent::SelectCreatedWorktree`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaceholderRows {
     pub worktree: WorktreeId,
@@ -1273,8 +1291,17 @@ pub enum PendingIntent {
     },
     /// Select the added project and step into its Worktrees panel.
     SelectCreatedProject,
-    /// Select the created worktree in the Worktrees panel.
-    SelectCreatedWorktree,
+    /// The NEW WORKTREE modal's create. The stand-in row `placeholder`
+    /// went up and took the cursor when Enter was pressed, exactly as the
+    /// Ack used to leave the real row: the Ack only swaps the real id in.
+    /// An Error takes the row down, puts the cursor and `focus` back where
+    /// they were, and reopens `prompt` with `text` for a retry.
+    SelectCreatedWorktree {
+        placeholder: WorktreeId,
+        focus: Focus,
+        prompt: PromptKind,
+        text: String,
+    },
     /// A QUICK PROMPT whose target was a worktree that did not exist yet:
     /// the Ack names the checkout the DAEMON cut, the cursor moves onto
     /// its row, and `launch` fires there with `text` as the task. On
@@ -1300,6 +1327,7 @@ impl PendingIntent {
             PendingIntent::LaunchInCreatedWorktree { placeholder, .. } => {
                 Some(&placeholder.worktree)
             }
+            PendingIntent::SelectCreatedWorktree { placeholder, .. } => Some(placeholder),
             _ => None,
         }
     }
@@ -1730,6 +1758,19 @@ pub struct AttachedTerm {
     /// to paint its first frame. The pane says so instead of showing an
     /// unexplained void.
     pub painted: bool,
+    /// The grid is blank because the session has no screen yet — the
+    /// daemon replayed an empty ring, or the session was reaped and this
+    /// attach is what boots it — as opposed to a replay that hasn't landed.
+    /// The pane's "starting session…" notice shows only in the first case:
+    /// flashing it for the frame a live session's replay takes reads as a
+    /// hiccup on every switch.
+    pub booting: bool,
+    /// Byte offset the next PTY byte should carry, in the daemon's ring
+    /// numbering: the end of everything this parser has processed. A
+    /// re-attach asks for output from here, so a session shown a moment ago
+    /// comes back as a gap-free delta onto the screen it left rather than a
+    /// megabyte replay into a fresh parser (see [`App::term_cache`]).
+    pub next_seq: u64,
 }
 
 impl AttachedTerm {
@@ -1743,6 +1784,8 @@ impl AttachedTerm {
             scroll: 0,
             kitty_flags: 0,
             painted: false,
+            booting: false,
+            next_seq: 0,
         }
     }
 
@@ -1752,6 +1795,70 @@ impl AttachedTerm {
         self.exited = false;
         self.scroll = 0;
         self.painted = false;
+        self.booting = false;
+        self.next_seq = 0;
+    }
+
+    /// Apply a ring replay. One that continues exactly where this parser
+    /// left off (`base_seq == next_seq`, the answer to an attach that asked
+    /// `from_seq`) is appended and the screen stays; anything else — a
+    /// first attach, a ring that wrapped past what was seen, a new process
+    /// under the same session — rebuilds the screen from scratch. Returns
+    /// whether it was rebuilt, so a selection anchored to the old cells can
+    /// be dropped. An empty replay is the daemon saying nothing has painted
+    /// yet, which is what `booting` reports.
+    pub fn apply_scrollback(&mut self, base_seq: u64, data: &[u8]) -> bool {
+        // A parser that watched its process exit has nothing worth
+        // continuing: the only replay that can follow is the next process's.
+        let rebuilt = base_seq != self.next_seq || self.exited;
+        if rebuilt {
+            self.reset();
+        }
+        self.next_seq = base_seq + data.len() as u64;
+        self.feed(data);
+        if !self.painted {
+            self.booting = true;
+        }
+        rebuilt
+    }
+
+    /// Apply live output that follows what the parser holds.
+    pub fn apply_output(&mut self, seq: u64, data: &[u8]) {
+        self.next_seq = seq + data.len() as u64;
+        self.feed(data);
+    }
+
+    fn feed(&mut self, data: &[u8]) {
+        if !data.is_empty() {
+            self.painted = true;
+            self.booting = false;
+        }
+        self.parser.process(data);
+    }
+
+    /// Regrid to `cols`×`rows` when that differs from the current size.
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        if (self.cols, self.rows) != (cols, rows) {
+            self.cols = cols;
+            self.rows = rows;
+            self.parser.screen_mut().set_size(rows, cols);
+        }
+    }
+
+    /// Rough footprint in grid cells: the visible grid plus every
+    /// scrollback row of the screen in use. `vt100` doesn't expose the
+    /// scrollback length, but its offset setter clamps to it. On the
+    /// alternate screen (a CLI in full-screen mode) this sees only that
+    /// screen's own, empty scrollback, so a shell with a long history
+    /// parked inside a full-screen program is under-counted — the one way
+    /// a cached screen can exceed [`TERM_CACHE_CELLS`].
+    pub fn estimated_cells(&mut self) -> usize {
+        let screen = self.parser.screen_mut();
+        let keep = screen.scrollback();
+        screen.set_scrollback(usize::MAX);
+        let lines = screen.scrollback();
+        screen.set_scrollback(keep);
+        (lines + self.rows as usize) * self.cols as usize
     }
 
     pub fn set_scroll(&mut self, scroll: usize) {
@@ -1878,6 +1985,18 @@ pub struct PendingPrDetail {
     pub dir: PathBuf,
 }
 
+/// A finished `gh pr diff`, back on the loop: which pull request, what to
+/// title the modal, and the diff — `None` when `gh` couldn't answer. The
+/// URL is what the cache files it under and what says whether a modal
+/// already open on a cached copy is this one's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrDiffAnswer {
+    pub number: u64,
+    pub url: String,
+    pub title: String,
+    pub diff: Option<String>,
+}
+
 /// The pull request the TERMINAL PANE is reading instead of a session,
 /// wherever the cursor found it — a PROJECT OPEN PRS GROUP row or the
 /// SESSIONS PANEL's PR ROW. Just enough to fetch, title and scroll it.
@@ -1934,6 +2053,15 @@ pub struct App {
     /// `(sel_project, sel_worktree)` as of the last draw.
     pub worktrees_anchor: Option<(usize, usize)>,
     pub term: Option<AttachedTerm>,
+    /// Screens of the sessions the pane showed most recently, most recent
+    /// first — at most [`TERM_CACHE_MAX`], each under [`TERM_CACHE_CELLS`].
+    /// Coming back to one puts its last screen up on the frame the cursor
+    /// moves and asks the daemon only for the bytes it missed
+    /// ([`AttachedTerm::next_seq`]), instead of replaying the whole ring
+    /// into a fresh parser. Only live, painted, real sessions are kept: a
+    /// reaped or exited one comes back as a new process whose ring starts
+    /// over, and a QUICK PROMPT stand-in never had a PTY.
+    pub term_cache: Vec<AttachedTerm>,
     /// Input lock: keys forward to the attached PTY. Focusing the terminal
     /// pane alone (Tab / arrows) does NOT lock — Enter, a click, or `z` does.
     pub term_locked: bool,
@@ -1980,9 +2108,8 @@ pub struct App {
     pub hide_projects: bool,
     /// Worktrees panel hidden; mirrors CONFIG.JSON's `hide_worktrees`.
     pub hide_worktrees: bool,
-    /// The ROOT WORKTREE row left out of the Worktrees panel, and `p`
-    /// there cutting a fresh worktree; mirrors CONFIG.JSON's
-    /// `hide_root_worktree` (Settings → Experimental).
+    /// The ROOT WORKTREE row left out of the Worktrees panel; mirrors
+    /// CONFIG.JSON's `hide_root_worktree` (Settings → Experimental).
     pub hide_root_worktree: bool,
     /// How many RECENT PROMPTS the SESSIONS PANEL lists under each
     /// session, newest at the bottom; 0 draws none. Mirrors CONFIG.JSON's
@@ -2122,8 +2249,14 @@ pub struct App {
     /// unstaged + untracked), the worktree panel's bottom badge. Keyed by
     /// worktree so a selection change can't show another checkout's count;
     /// the inner `None` means the checkout wasn't readable. The event loop
-    /// refreshes it on a slow poll and before drawing a changed selection.
+    /// refreshes it on a slow poll and on a changed selection — off the
+    /// loop, since a `git status` is tens of milliseconds on a big checkout
+    /// and the badge is not worth a late frame; the selection guard means a
+    /// pending answer shows nothing rather than another checkout's count.
     pub git_changes: Option<(WorktreeId, Option<usize>)>,
+    /// The checkout whose count is being read right now, so a repaint can't
+    /// stack `git status` processes; the answer clears it.
+    pub git_changes_inflight: Option<WorktreeId>,
     /// What `gh pr view` last said about each worktree's branch: `Some(pr)`
     /// when one exists, `None` when the lookup came back empty (no PR, no
     /// `gh`, no remote). A missing key means "not looked up yet" — briefly,
@@ -2132,7 +2265,9 @@ pub struct App {
     /// merge without being visited. An empty answer is re-asked on a
     /// backing-off timer (`pr_recheck`), since the PR a session opens
     /// appears well after the first lookup; a found one keeps being
-    /// re-asked on a beat, for its conversation and its state.
+    /// re-asked on a beat, for its conversation and its state. At startup
+    /// the found ones come back from the last run's cache (`pr_cache`), so
+    /// the rows are painted before the first lookup answers.
     pub pull_requests: HashMap<WorktreeId, Option<PullRequest>>,
     /// How far the user has read into each pull request's conversation,
     /// keyed by PR URL — the daemon's `pr_seen` rows, plus whatever this
@@ -2184,10 +2319,29 @@ pub struct App {
     /// The pull request whose full diff is being fetched, if any — one at a
     /// time, so mashing the key can't spawn a `gh pr diff` per press.
     pub pr_diff_inflight: Option<u64>,
+    /// Pull requests whose *cached* diff the modal opened on while a fresh
+    /// `gh pr diff` runs underneath. When that lands it replaces the modal's
+    /// contents in place if the modal is still on the same pull request,
+    /// and is only cached otherwise — never a second modal popping up over
+    /// whatever the user moved on to.
+    pub pr_diff_refreshing: std::collections::HashSet<String>,
     /// Where a finished `gh pr diff` is sent back to the loop; the main loop
     /// installs it at startup (the `vim_tx` precedent). Key handlers can
     /// therefore start a network fetch without the loop's channels in hand.
-    pub pr_diff_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, String, Option<String>)>>,
+    pub pr_diff_tx: Option<tokio::sync::mpsc::UnboundedSender<PrDiffAnswer>>,
+    /// The on-disk memory of every pull-request answer (`pr_cache`), when
+    /// this instance has one: the main loop installs the real one at
+    /// startup and hydrates from it; the unit tests leave it `None`, so no
+    /// test touches the real user's cache. Written whenever
+    /// `pr_cache_dirty` says something in it changed — at most once per
+    /// GIT POLL, plus once on quit.
+    pub pr_cache: Option<crate::pr_cache::PrCache>,
+    pub pr_cache_dirty: bool,
+    /// Bodies in `pr_detail` that came from the cache rather than from
+    /// `gh`. The pane shows them at once; resting the cursor on their row
+    /// fetches a fresh copy over the top, as it would fetch a missing one,
+    /// and the answer takes the URL out of here.
+    pub pr_detail_stale: std::collections::HashSet<String>,
     /// Latest daemon metrics reading (daemon + per-session process trees),
     /// for the footer's memory/session readout. Refreshed on a slow poll;
     /// the metrics modal shares the same replies at a faster cadence.
@@ -2228,6 +2382,7 @@ impl App {
             worktrees_scroll: 0,
             worktrees_anchor: None,
             term: None,
+            term_cache: Vec::new(),
             term_locked: false,
             conn: ConnState::Disconnected,
             hits: Vec::new(),
@@ -2288,6 +2443,7 @@ impl App {
             vim_tx: None,
             vim_generation: 0,
             git_changes: None,
+            git_changes_inflight: None,
             pull_requests: HashMap::new(),
             pr_seen: HashMap::new(),
             pr_inflight: std::collections::HashSet::new(),
@@ -2302,7 +2458,11 @@ impl App {
             pr_preview_scroll: 0,
             pr_preview_lines: 0,
             pr_diff_inflight: None,
+            pr_diff_refreshing: std::collections::HashSet::new(),
             pr_diff_tx: None,
+            pr_cache: None,
+            pr_cache_dirty: false,
+            pr_detail_stale: std::collections::HashSet::new(),
             last_metrics: None,
             client_rss_bytes: 0,
             splash_epoch: std::time::Instant::now(),
@@ -2503,8 +2663,9 @@ impl App {
         id
     }
 
-    /// Is this worktree row a QUICK PROMPT stand-in the DAEMON has not
-    /// answered for yet? The in-flight intent is the one record of it —
+    /// Is this worktree row a stand-in (a QUICK PROMPT's, or the NEW
+    /// WORKTREE modal's) the DAEMON has not answered for yet? The
+    /// in-flight intent is the one record of it —
     /// once the Ack or Error takes the intent, the row is real or gone.
     pub fn is_placeholder_worktree(&self, id: &WorktreeId) -> bool {
         self.pending
@@ -2592,6 +2753,60 @@ impl App {
     /// never lags a j/k by a poll interval.
     pub fn git_changes_stale(&self) -> bool {
         self.git_changes.as_ref().map(|(id, _)| id) != self.selected_worktree().map(|w| &w.id)
+    }
+
+    /// Whether the daemon currently holds a live PTY for `sref`. Attaching
+    /// to one only replays its ring; attaching to a session the IDLE REAPER
+    /// took cold-spawns an agent CLI.
+    pub fn session_is_live(&self, sref: &SessionRef) -> bool {
+        match sref {
+            SessionRef::Agent(id) => self.tree.agents.iter().any(|a| &a.id == id && a.alive),
+            SessionRef::Terminal(id) => self.tree.terminals.iter().any(|t| &t.id == id && t.alive),
+        }
+    }
+
+    /// Put a screen the pane is leaving aside for a quick return, when it
+    /// is worth keeping: a real session that has painted, is still live
+    /// and fits the budget (see [`App::term_cache`]). The cache is
+    /// most-recent-first and bounded; whatever it already held for this
+    /// session is replaced.
+    pub fn stash_term(&mut self, mut term: AttachedTerm) {
+        self.term_cache.retain(|t| t.sref != term.sref);
+        let keep = term.painted
+            && !term.exited
+            && !self.is_placeholder_session(&term.sref)
+            && self.session_is_live(&term.sref)
+            && term.estimated_cells() <= TERM_CACHE_CELLS;
+        if !keep {
+            return;
+        }
+        self.term_cache.insert(0, term);
+        self.term_cache.truncate(TERM_CACHE_MAX);
+        self.prune_term_cache();
+    }
+
+    /// The kept screen for `sref`, if there is one and its session is
+    /// still live — a session that died meanwhile comes back as a new
+    /// process, and its old screen would only mislead for a frame.
+    pub fn take_cached_term(&mut self, sref: &SessionRef) -> Option<AttachedTerm> {
+        let i = self.term_cache.iter().position(|t| &t.sref == sref)?;
+        let term = self.term_cache.remove(i);
+        self.session_is_live(sref).then_some(term)
+    }
+
+    /// Drop kept screens whose session is gone or no longer live.
+    pub fn prune_term_cache(&mut self) {
+        let live: Vec<bool> = self
+            .term_cache
+            .iter()
+            .map(|t| self.session_is_live(&t.sref))
+            .collect();
+        let mut i = 0;
+        self.term_cache.retain(|_| {
+            let keep = live[i];
+            i += 1;
+            keep
+        });
     }
 
     /// The full row list the panel shows — `sel_session` indexes this.
@@ -2946,6 +3161,24 @@ impl App {
         Some(self.pr_detail.get(&pr.url))
     }
 
+    /// Every pull request still on some row, by URL: each project's open
+    /// list, and each checkout's own PR ROW whatever its state — a merged
+    /// pull request stays on that row (see `pull_request::PullRequest`).
+    /// What the per-URL caches — bodies in memory, diffs on disk — are
+    /// pruned to.
+    pub fn live_pr_urls(&self) -> std::collections::HashSet<String> {
+        self.open_prs
+            .values()
+            .flat_map(|o| o.list.iter().map(|pr| pr.url.clone()))
+            .chain(
+                self.pull_requests
+                    .values()
+                    .flatten()
+                    .map(|pr| pr.url.clone()),
+            )
+            .collect()
+    }
+
     /// Delay until the standing keep-warm re-send is due. None when disarmed.
     pub fn keepwarm_delay(&self) -> Option<std::time::Duration> {
         let at = self.next_keepwarm.as_ref()?;
@@ -3089,6 +3322,47 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- the pane's screen ----
+
+    /// A screen that watched its process exit is rebuilt by whatever replay
+    /// comes next, even one numbered as a continuation: the only bytes
+    /// that can follow an exit are the next process's, from a ring of its
+    /// own.
+    #[test]
+    fn an_exited_screen_is_rebuilt_by_the_next_replay() {
+        let mut term = AttachedTerm::new(SessionRef::Agent(AgentId("a".into())), 20, 4);
+        assert!(
+            !term.apply_scrollback(0, b"old"),
+            "a first replay onto an empty parser continues it"
+        );
+        term.exited = true;
+        assert!(
+            term.apply_scrollback(3, b"new"),
+            "after an exit the screen starts over"
+        );
+        assert!(!term.exited, "the exit mark clears with it");
+        let contents = term.parser.screen().contents();
+        assert!(
+            contents.contains("new") && !contents.contains("old"),
+            "{contents:?}"
+        );
+        assert_eq!(term.next_seq, 6);
+    }
+
+    /// The "starting session…" notice is the daemon's empty replay, not the
+    /// wait for the replay: unknown before it lands, booting after an empty
+    /// one, gone with the first byte.
+    #[test]
+    fn an_empty_replay_means_booting_until_bytes_arrive() {
+        let mut term = AttachedTerm::new(SessionRef::Agent(AgentId("a".into())), 20, 4);
+        assert!(!term.booting, "before the daemon answers, nothing is known");
+        term.apply_scrollback(0, b"");
+        assert!(term.booting && !term.painted, "an empty replay: booting");
+        term.apply_output(0, b"hi");
+        assert!(term.painted && !term.booting, "the first bytes end it");
+        assert_eq!(term.next_seq, 2);
+    }
 
     // ---- shared list arithmetic ----
 

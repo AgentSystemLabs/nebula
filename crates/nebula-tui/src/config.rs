@@ -468,7 +468,7 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             SettingSpec {
                 kind: SettingKind::HideRootWorktree,
                 label: "Hide root worktree",
-                hint: "Drop the ⌂ root row; p on Worktrees cuts a fresh worktree off origin/main",
+                hint: "Drop the ⌂ root row so nothing launched from Worktrees lands in the shared checkout",
                 group: "",
             },
             SettingSpec {
@@ -726,9 +726,9 @@ pub struct Config {
     /// Independent from `hide_projects`; Sessions always remains visible.
     pub hide_worktrees: bool,
     /// Experimental: leave the ROOT WORKTREE row out of the WORKTREES
-    /// PANEL, so nothing launched there lands in the shared checkout, and
-    /// make `p` on that panel cut a fresh worktree (off the fetched
-    /// `origin/HEAD`) before launching into it. Off by default: the root
+    /// PANEL, so nothing launched there lands in the shared checkout. (A
+    /// `p` on that panel cuts a fresh worktree with this on or off — that
+    /// is the panel's doing, not this switch's.) Off by default: the root
     /// row is where most people start.
     pub hide_root_worktree: bool,
     /// Experimental: list each session's RECENT PROMPTS — the last few

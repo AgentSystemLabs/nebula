@@ -24,6 +24,22 @@
 //!   (OSC 9;4, see `pty::progress`). It is the only signal that survives a
 //!   user cancel — no hook fires at all there, and Claude suppresses
 //!   `idle_prompt` precisely because the user just touched the keyboard.
+//! - Approving a permission prompt fires no hook of its own: the next news
+//!   is the gated tool's `PostToolUse` (or the following call's
+//!   `PreToolUse`). So a tool event from the same origin as the open
+//!   dialog — the foreground turn, or the one subagent whose prompt it was
+//!   — is the answer and moves the agent back to `running`. Another
+//!   subagent's tool traffic says nothing about a dialog it did not raise.
+//! - Claude's `permission_prompt` notification is *deferred*: a dialog
+//!   sends it once it has sat 6 s with no keystroke, from a timer, with the
+//!   hook detached from the turn, and its `AskUserQuestion` dialog sends
+//!   the same type (it is a permission dialog in Claude's UI). One can
+//!   therefore land just after the answer that closed the dialog, and
+//!   would pin a row red for the rest of the turn. Inside
+//!   `LATE_PROMPT_NOTIFICATION_GRACE` of leaving `needs_feedback` it is
+//!   that echo and is ignored — a genuinely new dialog announces itself
+//!   through `PermissionRequest` / `PreToolUse` first, and its own
+//!   notification cannot arrive inside the grace.
 
 use nebula_core::AgentStatus;
 use std::collections::HashMap;
@@ -40,6 +56,16 @@ pub const SUBAGENT_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 /// against.
 pub const SUBAGENT_QUIET_GRACE: Duration = Duration::from_secs(30 * 60);
 pub const MAX_TRACKED_SUBAGENTS: usize = 512;
+/// Claude Code sends a dialog's `permission_prompt` notification only once
+/// the dialog has been open, and the keyboard untouched, for 6 s — from a
+/// timer, with the Notification hook run detached from the turn (verified
+/// against Claude Code 2.1.267, where a permission prompt and the
+/// `AskUserQuestion` dialog both carry that type). One that lands within
+/// this long of the status leaving `needs_feedback` is the echo of a dialog
+/// the user already answered. Must stay under Claude's 6 s: a new dialog's
+/// own notification never comes sooner than that after the
+/// `PermissionRequest` / `PreToolUse` that opened it.
+pub const LATE_PROMPT_NOTIFICATION_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HookEvent {
@@ -48,7 +74,11 @@ pub enum HookEvent {
     SessionStart {
         source: Option<String>,
     },
-    PermissionRequest,
+    PermissionRequest {
+        /// Set when the gated tool call is a subagent's: that subagent's
+        /// next tool event, not the foreground's, is the approval.
+        subagent_id: Option<String>,
+    },
     Notification {
         notification_type: Option<String>,
     },
@@ -101,6 +131,24 @@ impl HookEvent {
 pub enum Effect {
     SetStatus(AgentStatus),
     SaveSessionId(String),
+}
+
+/// Who raised the dialog the agent is waiting on: the foreground turn, or
+/// one Task-tool subagent (claude stamps `agent_id` on its hook traffic).
+/// Only a tool event from the same origin counts as the dialog's answer.
+#[derive(Debug, Clone, PartialEq)]
+enum Origin {
+    Foreground,
+    Subagent(String),
+}
+
+impl Origin {
+    fn of(subagent_id: Option<&str>) -> Self {
+        match subagent_id {
+            Some(id) => Origin::Subagent(id.to_string()),
+            None => Origin::Foreground,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -174,6 +222,13 @@ pub struct AgentStatusMachine {
     /// the hold began. `tick` gives up on the hold once this is
     /// `SUBAGENT_QUIET_GRACE` old.
     subagent_alive_at: Option<Instant>,
+    /// While `needs_feedback`: who raised the open dialog. A tool event
+    /// from that origin is its answer.
+    waiting_on: Option<Origin>,
+    /// When the status last left `needs_feedback` — the user answered, or
+    /// the turn ended around the dialog. A `permission_prompt` notification
+    /// inside `LATE_PROMPT_NOTIFICATION_GRACE` of it is a late echo.
+    feedback_left_at: Option<Instant>,
 }
 
 impl AgentStatusMachine {
@@ -186,6 +241,8 @@ impl AgentStatusMachine {
             stop_held: false,
             drain_idle_since: None,
             subagent_alive_at: None,
+            waiting_on: None,
+            feedback_left_at: None,
         }
     }
 
@@ -223,6 +280,7 @@ impl AgentStatusMachine {
             }
         }
 
+        let was_waiting = self.status == AgentStatus::NeedsFeedback;
         match event {
             HookEvent::UserPromptSubmit => {
                 self.stop_held = false;
@@ -241,13 +299,18 @@ impl AgentStatusMachine {
                     self.subagent_alive_at = None;
                 }
             }
-            HookEvent::PermissionRequest => {
-                self.set_status(AgentStatus::NeedsFeedback, &mut effects);
+            HookEvent::PermissionRequest { subagent_id } => {
+                self.wait_on(Origin::of(subagent_id.as_deref()), &mut effects);
             }
             HookEvent::Notification { notification_type } => {
                 match notification_type.as_deref() {
+                    // Deferred by 6 s on Claude's side, so it is never the
+                    // first word of a dialog nebula can see — and it can be
+                    // the last word of one the user has already closed.
                     Some("permission_prompt") => {
-                        self.set_status(AgentStatus::NeedsFeedback, &mut effects)
+                        if !self.late_prompt_echo(now) {
+                            self.wait_on(Origin::Foreground, &mut effects);
+                        }
                     }
                     // "Claude is waiting for your input". Claude fires this
                     // only with nothing in flight and no dialog open, so it
@@ -266,7 +329,11 @@ impl AgentStatusMachine {
                     self.note_subagent_alive(now);
                 }
                 if asks_user(tool_name.as_deref()) {
-                    self.set_status(AgentStatus::NeedsFeedback, &mut effects);
+                    self.wait_on(Origin::of(subagent_id.as_deref()), &mut effects);
+                } else {
+                    // The next call is being made: whatever this origin was
+                    // waiting on has been answered.
+                    self.dialog_closed(Origin::of(subagent_id.as_deref()), &mut effects);
                 }
             }
             HookEvent::PostToolUse {
@@ -277,7 +344,13 @@ impl AgentStatusMachine {
                     self.note_subagent_alive(now);
                 }
                 if asks_user(tool_name.as_deref()) {
+                    // The question's answer: the turn has it and is running
+                    // again, whoever asked.
                     self.set_status(AgentStatus::Running, &mut effects);
+                } else {
+                    // The gated tool ran: the permission prompt was
+                    // approved. This is the only hook an approval fires.
+                    self.dialog_closed(Origin::of(subagent_id.as_deref()), &mut effects);
                 }
             }
             HookEvent::SubagentStart { subagent_id } => {
@@ -351,6 +424,10 @@ impl AgentStatusMachine {
                 }
             }
         }
+        if was_waiting && self.status != AgentStatus::NeedsFeedback {
+            self.waiting_on = None;
+            self.feedback_left_at = Some(now);
+        }
         effects
     }
 
@@ -398,6 +475,35 @@ impl AgentStatusMachine {
     /// restart the quiet clock the hold is measured against.
     fn note_subagent_alive(&mut self, now: Instant) {
         self.subagent_alive_at = Some(now);
+    }
+
+    /// A dialog opened (or is reported open): wait on its origin. A second
+    /// report while already red keeps the first origin — one dialog shows
+    /// at a time, and the notification never names one anyway.
+    fn wait_on(&mut self, origin: Origin, effects: &mut Vec<Effect>) {
+        if self.status != AgentStatus::NeedsFeedback {
+            self.waiting_on = Some(origin);
+        }
+        self.set_status(AgentStatus::NeedsFeedback, effects);
+    }
+
+    /// A tool event from `origin` — its call completing, or its next call
+    /// starting — means no dialog of that origin can be open. If that is
+    /// the one being waited on, the user answered it: back to `running`.
+    /// Only from red — a tool hook never starts a turn nebula did not see
+    /// begin, and never revives a dead agent.
+    fn dialog_closed(&mut self, origin: Origin, effects: &mut Vec<Effect>) {
+        if self.status == AgentStatus::NeedsFeedback && self.waiting_on.as_ref() == Some(&origin) {
+            self.set_status(AgentStatus::Running, effects);
+        }
+    }
+
+    /// A `permission_prompt` notification this soon after the status left
+    /// `needs_feedback` is Claude's deferred timer catching up with a
+    /// dialog the user already closed — see `LATE_PROMPT_NOTIFICATION_GRACE`.
+    fn late_prompt_echo(&self, now: Instant) -> bool {
+        self.feedback_left_at
+            .is_some_and(|left| now.duration_since(left) < LATE_PROMPT_NOTIFICATION_GRACE)
     }
 
     /// The foreground turn ended — a `Stop`, or the CLI clearing its
@@ -536,24 +642,254 @@ mod tests {
         assert!(!asks_user(None));
     }
 
+    fn tool(name: &str, subagent: Option<&str>, post: bool) -> HookEvent {
+        let tool_name = Some(name.to_string());
+        let subagent_id = subagent.map(str::to_string);
+        if post {
+            HookEvent::PostToolUse {
+                tool_name,
+                subagent_id,
+            }
+        } else {
+            HookEvent::PreToolUse {
+                tool_name,
+                subagent_id,
+            }
+        }
+    }
+
+    fn prompt_notification(m: &mut AgentStatusMachine, now: Instant) -> Vec<Effect> {
+        m.handle(
+            HookEvent::Notification {
+                notification_type: Some("permission_prompt".into()),
+            },
+            Some("s1"),
+            now,
+        )
+    }
+
     #[test]
     fn permission_prompt_flow() {
+        // The reported bug: approving a permission prompt fires no hook of
+        // its own, and the row sat red until the turn ended. The gated
+        // tool's PostToolUse is the approval.
         let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
         let now = t0();
         m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
-        let fx = m.handle(HookEvent::PermissionRequest, Some("s1"), now);
-        assert_eq!(status_of(&fx), Some(AgentStatus::NeedsFeedback));
-        // Answering the prompt resumes the turn (next event is tool traffic /
-        // eventually Stop; a PostToolUse AskUserQuestion also flips back).
         let fx = m.handle(
-            HookEvent::PostToolUse {
-                tool_name: Some("AskUserQuestion".into()),
-                subagent_id: None,
+            HookEvent::PermissionRequest { subagent_id: None },
+            Some("s1"),
+            now,
+        );
+        assert_eq!(status_of(&fx), Some(AgentStatus::NeedsFeedback));
+        let fx = m.handle(
+            tool("Bash", None, true),
+            Some("s1"),
+            now + Duration::from_secs(9),
+        );
+        assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+        // …and Edit, WebFetch, an MCP tool: whatever was gated.
+        for name in ["Edit", "WebFetch", "mcp__github__create_issue"] {
+            m.handle(
+                HookEvent::PermissionRequest { subagent_id: None },
+                Some("s1"),
+                now,
+            );
+            assert_eq!(m.status(), AgentStatus::NeedsFeedback);
+            let fx = m.handle(tool(name, None, true), Some("s1"), now);
+            assert_eq!(status_of(&fx), Some(AgentStatus::Running), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_next_calls_pre_tool_use_also_answers_a_prompt() {
+        // A permission prompt on a call whose PostToolUse nebula never sees
+        // (a harness with a narrower hook set): the following call's
+        // PreToolUse still proves the dialog is gone.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        m.handle(
+            HookEvent::PermissionRequest { subagent_id: None },
+            Some("s1"),
+            now,
+        );
+        let fx = m.handle(tool("Bash", None, false), Some("s1"), now);
+        assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+        // A question opening is not an answer, whichever hook carries it.
+        let fx = m.handle(tool("AskUserQuestion", None, false), Some("s1"), now);
+        assert_eq!(status_of(&fx), Some(AgentStatus::NeedsFeedback));
+    }
+
+    #[test]
+    fn a_subagents_traffic_never_answers_the_foreground_prompt() {
+        // Background workers keep calling tools while the foreground turn
+        // waits on the user; none of that is the user answering.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        m.handle(
+            HookEvent::SubagentStart {
+                subagent_id: Some("sub1".into()),
             },
             Some("s1"),
             now,
         );
+        m.handle(
+            HookEvent::PermissionRequest { subagent_id: None },
+            Some("s1"),
+            now,
+        );
+        for post in [false, true] {
+            let fx = m.handle(tool("Bash", Some("sub1"), post), Some("s1"), now);
+            assert!(fx.is_empty(), "{fx:?}");
+            assert_eq!(m.status(), AgentStatus::NeedsFeedback);
+        }
+        let fx = m.handle(tool("Bash", None, true), Some("s1"), now);
         assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+    }
+
+    #[test]
+    fn a_subagents_own_prompt_is_answered_by_its_own_traffic() {
+        // A worker's gated call prompts the user too; only that worker's
+        // next tool event says it was approved — the foreground's traffic
+        // (or another worker's) is not it.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        let fx = m.handle(
+            HookEvent::PermissionRequest {
+                subagent_id: Some("sub1".into()),
+            },
+            Some("s1"),
+            now,
+        );
+        assert_eq!(status_of(&fx), Some(AgentStatus::NeedsFeedback));
+        for origin in [None, Some("sub2")] {
+            let fx = m.handle(tool("Bash", origin, true), Some("s1"), now);
+            assert!(fx.is_empty(), "{origin:?}: {fx:?}");
+        }
+        let fx = m.handle(tool("Bash", Some("sub1"), true), Some("s1"), now);
+        assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+    }
+
+    #[test]
+    fn a_tool_hook_never_starts_a_turn_or_revives_the_dead() {
+        for start in [
+            AgentStatus::Fresh,
+            AgentStatus::Finished,
+            AgentStatus::Terminated,
+            AgentStatus::Disconnected,
+        ] {
+            let mut m = AgentStatusMachine::new(start, Some("s1".into()));
+            for post in [false, true] {
+                let fx = m.handle(tool("Bash", None, post), Some("s1"), t0());
+                assert!(fx.is_empty(), "{start:?} must not be touched: {fx:?}");
+                assert_eq!(m.status(), start);
+            }
+        }
+    }
+
+    #[test]
+    fn late_permission_prompt_notification_after_an_answer_is_ignored() {
+        // The reported bug: Claude sends a dialog's `permission_prompt`
+        // notification from a 6 s timer, detached from the turn, and its
+        // AskUserQuestion dialog uses that type too. When the timer and the
+        // user's answer coincide, the notification lands after the
+        // PostToolUse and pinned the row red for the rest of the turn.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        m.handle(tool("AskUserQuestion", None, false), Some("s1"), now);
+        assert_eq!(m.status(), AgentStatus::NeedsFeedback);
+        let answered = now + Duration::from_secs(6);
+        let fx = m.handle(tool("AskUserQuestion", None, true), Some("s1"), answered);
+        assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+        let fx = prompt_notification(&mut m, answered + Duration::from_millis(80));
+        assert!(fx.is_empty(), "the echo must not re-redden: {fx:?}");
+        assert_eq!(m.status(), AgentStatus::Running);
+        // Same for a permission prompt approved as its timer fired.
+        m.handle(
+            HookEvent::PermissionRequest { subagent_id: None },
+            Some("s1"),
+            answered,
+        );
+        let approved = answered + Duration::from_secs(6);
+        m.handle(tool("Bash", None, true), Some("s1"), approved);
+        let fx = prompt_notification(&mut m, approved + Duration::from_millis(80));
+        assert!(fx.is_empty(), "{fx:?}");
+        assert_eq!(m.status(), AgentStatus::Running);
+    }
+
+    #[test]
+    fn permission_prompt_notification_outside_the_grace_still_flags() {
+        // Past the grace it is news again: a dialog whose opening nebula
+        // missed (a lost hook) must still be able to go red on it.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        m.handle(tool("AskUserQuestion", None, false), Some("s1"), now);
+        let answered = now + Duration::from_secs(6);
+        m.handle(tool("AskUserQuestion", None, true), Some("s1"), answered);
+        let fx = prompt_notification(&mut m, answered + LATE_PROMPT_NOTIFICATION_GRACE);
+        assert_eq!(status_of(&fx), Some(AgentStatus::NeedsFeedback));
+        // A row that never waited has no echo to absorb.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        let fx = prompt_notification(&mut m, now + Duration::from_secs(7));
+        assert_eq!(status_of(&fx), Some(AgentStatus::NeedsFeedback));
+    }
+
+    #[test]
+    fn a_new_dialog_right_after_an_answer_still_goes_red() {
+        // The grace only mutes the deferred notification; the hooks that
+        // open a dialog are never deferred, so a fresh prompt seconds after
+        // an answer reads red at once, and its own (6 s later) notification
+        // is a no-op on a row already red.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        m.handle(tool("AskUserQuestion", None, false), Some("s1"), now);
+        m.handle(
+            tool("AskUserQuestion", None, true),
+            Some("s1"),
+            now + Duration::from_secs(6),
+        );
+        let fx = m.handle(
+            HookEvent::PermissionRequest { subagent_id: None },
+            Some("s1"),
+            now + Duration::from_secs(7),
+        );
+        assert_eq!(status_of(&fx), Some(AgentStatus::NeedsFeedback));
+        let fx = prompt_notification(&mut m, now + Duration::from_secs(13));
+        assert!(fx.is_empty());
+        assert_eq!(m.status(), AgentStatus::NeedsFeedback);
+        let fx = m.handle(
+            tool("Bash", None, true),
+            Some("s1"),
+            now + Duration::from_secs(20),
+        );
+        assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+    }
+
+    #[test]
+    fn late_permission_prompt_notification_after_a_rejected_prompt_is_ignored() {
+        // Escape out of a prompt as its timer fires: the turn is over
+        // (progress cleared), and the echo must not paint a finished row red.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        m.handle(
+            HookEvent::PermissionRequest { subagent_id: None },
+            Some("s1"),
+            now,
+        );
+        let rejected = now + Duration::from_secs(6);
+        let fx = progress(&mut m, false, rejected);
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+        let fx = prompt_notification(&mut m, rejected + Duration::from_millis(80));
+        assert!(fx.is_empty(), "{fx:?}");
+        assert_eq!(m.status(), AgentStatus::Finished);
     }
 
     fn idle(m: &mut AgentStatusMachine, now: Instant) -> Vec<Effect> {
@@ -674,7 +1010,11 @@ mod tests {
         let now = t0();
         m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
         subagent(&mut m, true, "sub1", now);
-        m.handle(HookEvent::PermissionRequest, Some("s1"), now);
+        m.handle(
+            HookEvent::PermissionRequest { subagent_id: None },
+            Some("s1"),
+            now,
+        );
         assert_eq!(m.status(), AgentStatus::NeedsFeedback);
         let fx = idle(&mut m, now + Duration::from_secs(60));
         assert_eq!(status_of(&fx), Some(AgentStatus::Running));
@@ -769,7 +1109,11 @@ mod tests {
         let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
         let now = t0();
         m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
-        m.handle(HookEvent::PermissionRequest, Some("s1"), now);
+        m.handle(
+            HookEvent::PermissionRequest { subagent_id: None },
+            Some("s1"),
+            now,
+        );
         let fx = m.handle(
             HookEvent::Notification {
                 notification_type: Some("idle_prompt".into()),
@@ -894,7 +1238,11 @@ mod tests {
         let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
         let now = t0();
         m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
-        m.handle(HookEvent::PermissionRequest, Some("s1"), now);
+        m.handle(
+            HookEvent::PermissionRequest { subagent_id: None },
+            Some("s1"),
+            now,
+        );
         assert_eq!(m.status(), AgentStatus::NeedsFeedback);
         let fx = progress(&mut m, false, now + Duration::from_secs(5));
         assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
@@ -1004,13 +1352,14 @@ mod tests {
         m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
         progress(&mut m, true, now);
         m.handle(
-            HookEvent::PermissionRequest,
+            HookEvent::PermissionRequest { subagent_id: None },
             Some("s1"),
             now + Duration::from_secs(3),
         );
         assert_eq!(m.status(), AgentStatus::NeedsFeedback);
         // Approving does not move the progress bar — it never left "busy".
-        m.handle(
+        // The gated tool's PostToolUse is the approval.
+        let fx = m.handle(
             HookEvent::PostToolUse {
                 tool_name: Some("Bash".into()),
                 subagent_id: None,
@@ -1018,6 +1367,7 @@ mod tests {
             Some("s1"),
             now + Duration::from_secs(19),
         );
+        assert_eq!(status_of(&fx), Some(AgentStatus::Running));
         let fx = progress(&mut m, false, now + Duration::from_secs(20));
         assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
     }
