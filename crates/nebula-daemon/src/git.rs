@@ -355,6 +355,18 @@ pub async fn add_pr_worktree(repo: &Path, number: u64, head: &str) -> Result<Pat
     add_worktree(repo, head, base.as_deref()).await
 }
 
+/// One git config value for `repo`, resolved the way git resolves it —
+/// the repo's own `.git/config`, then the user's global file, then the
+/// system's — or None when the key is unset (git exits 1 with nothing on
+/// stderr), empty, or git itself is missing.
+pub async fn config_get(repo: &Path, key: &str) -> Option<String> {
+    git(repo, &["config", "--get", key])
+        .await
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 pub async fn remove_worktree(repo: &Path, worktree_path: &Path, force: bool) -> Result<()> {
     // Checkout already gone (manual rm -rf): `git worktree remove` would fail,
     // but the user's intent is already satisfied — just drop git's stale

@@ -6,6 +6,7 @@ use crate::hooks::{self, HookEnv};
 use crate::pty::{PtyEvent, PtySession, SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
 use crate::status::{AgentStatusMachine, Effect, HookEvent};
 use crate::store::Store;
+use crate::worktree_hooks::{self, HookContext, WorktreeHook};
 use anyhow::{bail, Context, Result};
 use nebula_core::env;
 use nebula_core::{
@@ -799,7 +800,7 @@ impl Daemon {
         if branch.trim().is_empty() {
             bail!("branch name is empty");
         }
-        let _ops = self.worktree_ops.lock().await;
+        let ops = self.worktree_ops.lock().await;
         let project = self
             .store
             .get_project(project_id)?
@@ -813,6 +814,13 @@ impl Daemon {
             None => git::add_worktree_off_default(&project.repo_path, branch).await?,
         };
         let worktree = self.register_worktree(project_id, path, branch)?;
+        // The row is out; the WORKTREE HOOK runs outside the lock so a
+        // slow script holds up neither the next create nor the sync probe.
+        // The Ack still waits for it, so whatever the hook provisions is
+        // in place before anything is launched in the checkout.
+        drop(ops);
+        self.run_worktree_hook(WorktreeHook::Create, &project.repo_path, &worktree)
+            .await;
         Ok(EntityId::Worktree(worktree.id))
     }
 
@@ -829,7 +837,7 @@ impl Daemon {
         number: u64,
         head: &str,
     ) -> Result<Worktree> {
-        let _ops = self.worktree_ops.lock().await;
+        let ops = self.worktree_ops.lock().await;
         let project = self
             .store
             .get_project(project_id)?
@@ -842,7 +850,11 @@ impl Daemon {
             return Ok(existing);
         }
         let path = git::add_pr_worktree(&project.repo_path, number, head).await?;
-        self.register_worktree(project_id, path, head)
+        let worktree = self.register_worktree(project_id, path, head)?;
+        drop(ops);
+        self.run_worktree_hook(WorktreeHook::Create, &project.repo_path, &worktree)
+            .await;
+        Ok(worktree)
     }
 
     /// Record a checkout git just made as a worktree row and tell every
@@ -869,7 +881,7 @@ impl Daemon {
     }
 
     pub async fn delete_worktree(self: &Arc<Self>, id: &WorktreeId, force: bool) -> Result<()> {
-        let _ops = self.worktree_ops.lock().await;
+        let ops = self.worktree_ops.lock().await;
         let worktree = self.store.get_worktree(id)?.context("worktree not found")?;
         if worktree.is_main {
             bail!("cannot delete the main checkout — remove the project instead");
@@ -888,7 +900,40 @@ impl Daemon {
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Worktree(id.clone()),
         });
+        // The delete has happened as far as git and every client are
+        // concerned; the WORKTREE HOOK only releases what the checkout
+        // owned elsewhere, so it runs after, outside the lock, and its
+        // failure is a warning — never an Error for this request, which
+        // would put the rows back in the TUI.
+        drop(ops);
+        self.run_worktree_hook(WorktreeHook::Delete, &project.repo_path, &worktree)
+            .await;
         Ok(())
+    }
+
+    /// Run the repository's WORKTREE HOOK for `hook`, if it configures
+    /// one, and turn anything it has to say into a client warning.
+    async fn run_worktree_hook(&self, hook: WorktreeHook, repo: &Path, worktree: &Worktree) {
+        let ctx = HookContext {
+            repo,
+            worktree: &worktree.path,
+            branch: &worktree.branch,
+            id: &worktree.id,
+        };
+        if let Err(e) = worktree_hooks::run(hook, ctx).await {
+            self.warn_clients(format!("{e:#}"));
+        }
+    }
+
+    /// Tell every client about something that went wrong after a request
+    /// had already succeeded. Rides `ServerEvent::Error` with no `req_id`,
+    /// which the TUI shows as a flash and ties to no pending intent.
+    fn warn_clients(&self, message: String) {
+        tracing::warn!("{message}");
+        self.broadcast(ServerEvent::Error {
+            req_id: None,
+            message,
+        });
     }
 
     /// Reconcile a project's worktree rows with `git worktree list` so
@@ -4556,6 +4601,191 @@ mod tests {
         );
         let rt = worktrees.iter().find(|w| w.id.as_str() == "rt").unwrap();
         assert!(rt.is_main, "the surviving root row keeps the badge");
+    }
+
+    /// A fresh repo with one commit, at a canonical path (the macOS
+    /// tempdir is a symlink, and git reports worktrees canonically).
+    fn init_repo(root: &Path) -> PathBuf {
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        repo
+    }
+
+    fn hook_script(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("hook.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn project_at(daemon: &Daemon, repo: &Path) -> Project {
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId("p".into()),
+            name: "p".into(),
+            repo_path: repo.to_path_buf(),
+            sort_order: 0,
+        };
+        daemon.store.insert_project(&project).unwrap();
+        seed_worktree(daemon, "p", "rt", &repo.to_string_lossy(), true);
+        project
+    }
+
+    /// Every `Error` a daemon broadcast with no `req_id` — the warnings a
+    /// WORKTREE HOOK raises after its request already succeeded.
+    fn drain_warnings(events: &mut broadcast::Receiver<ServerEvent>) -> Vec<String> {
+        let mut warnings = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if let ServerEvent::Error {
+                req_id: None,
+                message,
+            } = ev
+            {
+                warnings.push(message);
+            }
+        }
+        warnings
+    }
+
+    /// The create hook runs once the checkout exists and its row is out,
+    /// with the main repo and the new checkout as its arguments and the
+    /// branch in its environment.
+    #[tokio::test]
+    async fn create_worktree_runs_the_create_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = init_repo(&root);
+        let log = root.join("hook.log");
+        let hook = hook_script(
+            &root,
+            &format!(
+                "printf '%s %s %s %s\\n' \"$NEBULA_HOOK\" \"$1\" \"$2\" \"$NEBULA_WORKTREE_BRANCH\" > '{}'",
+                log.display()
+            ),
+        );
+        git_in(
+            &repo,
+            &[
+                "config",
+                "nebula.worktreeCreateHook",
+                &hook.to_string_lossy(),
+            ],
+        );
+        let daemon = test_daemon();
+        let project = project_at(&daemon, &repo);
+        let mut events = daemon.events.subscribe();
+
+        let created = daemon
+            .create_worktree(&project.id, "feat", None)
+            .await
+            .unwrap();
+        let EntityId::Worktree(id) = created else {
+            panic!("a worktree id: {created:?}");
+        };
+        let worktree = daemon.store.get_worktree(&id).unwrap().unwrap();
+        assert!(worktree.path.exists(), "the checkout is real");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!(
+                "worktree-create {} {} feat\n",
+                repo.display(),
+                worktree.path.display()
+            )
+        );
+        assert!(
+            drain_warnings(&mut events).is_empty(),
+            "a clean run warns nobody"
+        );
+    }
+
+    /// The delete hook runs after the checkout is gone and the row is
+    /// dropped, sees the deleted path, and its failure is a broadcast
+    /// warning: the request still succeeds and the row stays gone.
+    #[tokio::test]
+    async fn delete_worktree_runs_the_delete_hook_and_survives_its_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = init_repo(&root);
+        let wt = root.join("repo-worktrees").join("feat");
+        git_in(
+            &repo,
+            &["worktree", "add", &wt.to_string_lossy(), "-b", "feat"],
+        );
+        let log = root.join("hook.log");
+        let hook = hook_script(
+            &root,
+            &format!(
+                "printf '%s %s %s\\n' \"$NEBULA_HOOK\" \"$1\" \"$2\" > '{}'\n\
+                 [ -e \"$2\" ] && echo 'still there' >&2\n\
+                 echo 'slot 7 was not ours' >&2\n\
+                 exit 2",
+                log.display()
+            ),
+        );
+        git_in(
+            &repo,
+            &[
+                "config",
+                "nebula.worktreeDeleteHook",
+                &hook.to_string_lossy(),
+            ],
+        );
+        let daemon = test_daemon();
+        project_at(&daemon, &repo);
+        seed_worktree(&daemon, "p", "feat", &wt.to_string_lossy(), false);
+        let mut events = daemon.events.subscribe();
+
+        daemon
+            .delete_worktree(&WorktreeId("feat".into()), false)
+            .await
+            .unwrap();
+
+        assert!(!wt.exists(), "the checkout is gone");
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        assert!(
+            worktrees.iter().all(|w| w.id.as_str() != "feat"),
+            "the row stays deleted despite the hook: {worktrees:#?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!("worktree-delete {} {}\n", repo.display(), wt.display())
+        );
+        let warnings = drain_warnings(&mut events);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("worktree-delete hook")
+                && warnings[0].contains("exited 2: slot 7 was not ours"),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    /// No hook configured: a delete is exactly what it was.
+    #[tokio::test]
+    async fn delete_worktree_without_a_hook_warns_nobody() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = init_repo(&root);
+        let wt = root.join("repo-worktrees").join("feat");
+        git_in(
+            &repo,
+            &["worktree", "add", &wt.to_string_lossy(), "-b", "feat"],
+        );
+        let daemon = test_daemon();
+        project_at(&daemon, &repo);
+        seed_worktree(&daemon, "p", "feat", &wt.to_string_lossy(), false);
+        let mut events = daemon.events.subscribe();
+
+        daemon
+            .delete_worktree(&WorktreeId("feat".into()), false)
+            .await
+            .unwrap();
+
+        assert!(!wt.exists());
+        assert!(drain_warnings(&mut events).is_empty());
     }
 
     fn git_in(repo: &Path, args: &[&str]) {
