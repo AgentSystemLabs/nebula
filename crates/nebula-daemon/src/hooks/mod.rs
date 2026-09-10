@@ -135,6 +135,10 @@ pub struct HookDelivery {
     /// Where Claude keeps this session's transcript — and beside it the
     /// title `/rename` persists (see `session_title`). Claude route only.
     pub transcript: Option<TranscriptRef>,
+    /// The submitted prompt, condensed for the row's RECENT PROMPTS
+    /// (`prompt_history::condense`). Only a `UserPromptSubmit` carries
+    /// one, and only when the payload had a non-blank, user-written one.
+    pub prompt: Option<String>,
 }
 
 /// Permissive payload: every field optional, unknown fields ignored. Hook
@@ -145,6 +149,10 @@ pub struct HookDelivery {
 pub struct HookPayload {
     pub hook_event_name: Option<String>,
     pub session_id: Option<String>,
+    /// The prompt text on `UserPromptSubmit` — Claude, Codex and Cursor
+    /// (`beforeSubmitPrompt`) all name it `prompt`, and pi's extension
+    /// posts it under the same key.
+    pub prompt: Option<String>,
     /// Claude's transcript file; its directory is where the session title
     /// lives (`<dir>/<session_id>/custom-title.json`).
     pub transcript_path: Option<String>,
@@ -357,6 +365,15 @@ async fn receive_hook(
         ),
         HookCli::Codex | HookCli::Cursor | HookCli::Pi => None,
     };
+    // The prompt rides only its own event, condensed here so the channel
+    // never carries a pasted file whole.
+    let prompt = match event {
+        HookEvent::UserPromptSubmit => payload
+            .prompt
+            .as_deref()
+            .and_then(crate::prompt_history::condense),
+        _ => None,
+    };
     let _ = state
         .tx
         .send(HookDelivery {
@@ -365,6 +382,7 @@ async fn receive_hook(
             session_id: payload.session_id(),
             cwd,
             transcript,
+            prompt,
         })
         .await;
 
@@ -465,6 +483,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         };
         store
             .insert_agent_with_auto_title(&agent("pending"), true)
@@ -696,6 +715,56 @@ mod tests {
         assert_eq!(status, 200);
         let delivery = rx.recv().await.unwrap();
         assert!(delivery.cwd.is_none(), "subagent cwd: {:?}", delivery.cwd);
+    }
+
+    /// The prompt reaches the drain loop condensed, on its own event
+    /// only, and never for a blank or nebula-written one.
+    #[tokio::test]
+    async fn user_prompt_submit_carries_the_condensed_prompt() {
+        let store = seeded_store();
+        let (env, mut rx) = start_hook_server(store).await.unwrap();
+        let post = |event: &'static str, body: &'static str| {
+            let port = env.port;
+            let token = env.token.clone();
+            async move {
+                http_post(
+                    port,
+                    &format!("/api/hooks/claude?agentId=titled&hookEvent={event}"),
+                    &token,
+                    body,
+                )
+                .await
+            }
+        };
+
+        post(
+            "UserPromptSubmit",
+            r#"{"session_id":"s1","prompt":"  fix the\n\n login   redirect \n"}"#,
+        )
+        .await;
+        assert_eq!(
+            rx.recv().await.unwrap().prompt.as_deref(),
+            Some("fix the login redirect")
+        );
+
+        // Blank, absent and nebula-authored prompts record nothing, but
+        // the status delivery still flows.
+        for body in [
+            r#"{"session_id":"s1","prompt":"   "}"#,
+            r#"{"session_id":"s1"}"#,
+            r#"{"session_id":"s1","prompt":"[nebula] This session now runs inside a worktree"}"#,
+        ] {
+            post("UserPromptSubmit", body).await;
+            let delivery = rx.recv().await.unwrap();
+            assert_eq!(delivery.event, HookEvent::UserPromptSubmit);
+            assert!(delivery.prompt.is_none(), "{body}");
+        }
+
+        // Another event with a prompt field is not a prompt.
+        post("Stop", r#"{"session_id":"s1","prompt":"leftover"}"#).await;
+        let delivery = rx.recv().await.unwrap();
+        assert_eq!(delivery.event, HookEvent::Stop);
+        assert!(delivery.prompt.is_none());
     }
 
     #[test]

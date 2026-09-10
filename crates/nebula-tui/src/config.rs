@@ -16,6 +16,11 @@ use std::path::{Path, PathBuf};
 /// (daemon-owned: how long unwatched idle sessions live before their PTY
 /// is reaped).
 pub const SESSION_IDLE_TIMEOUTS: &[&str] = &["off", "1m", "5m", "15m", "30m", "1h"];
+/// How many RECENT PROMPTS the SESSIONS PANEL draws under a session while
+/// the feature is on: the Experimental tab's choices. A hand edit may go
+/// as high as the daemon keeps (`RECENT_PROMPTS_KEPT`).
+pub const RECENT_PROMPT_COUNTS: &[&str] = &["1", "2", "3", "4", "5"];
+pub const DEFAULT_RECENT_PROMPTS_COUNT: usize = 3;
 
 /// Editor commands the settings overlay cycles through. Every entry
 /// accepts `+<line> <file>`, which is how the overlays launch it. As with
@@ -55,6 +60,11 @@ const MACOS_SOUNDS_DIR: &str = "/System/Library/Sounds";
 /// The model/effort sentinel meaning "don't pass the flag — let the CLI
 /// pick"; it heads every choice list and is what the daemon sees as None.
 pub const DEFAULT_CHOICE: &str = "default";
+
+/// What the overlay shows for an empty `worktree_base_branch`: the daemon
+/// picks origin's default branch itself. Display only — the file holds
+/// `""`, never this word.
+pub const AUTO_CHOICE: &str = "auto";
 
 /// Model/effort choices for the new-session submenus and the settings
 /// overlay. [`DEFAULT_CHOICE`] everywhere means "don't pass the flag — let
@@ -192,9 +202,11 @@ pub struct SettingsTab {
 pub enum SettingKind {
     PaletteEnterAttaches,
     GitInitOnCreate,
+    WorktreeBaseBranch,
     Editor,
     CloseFinderOnOpen,
     SkipSessionNaming,
+    ConfirmOnArchive,
     SessionIdleTimeout,
     PrewarmAgents,
     PrewarmSessions,
@@ -208,6 +220,8 @@ pub enum SettingKind {
     QuickPromptKind,
     QuickPromptFocus,
     HideRootWorktree,
+    RecentPrompts,
+    RecentPromptsCount,
     ClaudeEnabled,
     ClaudeModel,
     ClaudeEffort,
@@ -220,6 +234,16 @@ pub enum SettingKind {
     PiEnabled,
     PiModel,
     PiEffort,
+}
+
+impl SettingKind {
+    /// A row whose value is typed, not toggled or cycled: Enter on it opens
+    /// a one-line prompt pre-filled with the current value, and ←/→ have
+    /// nothing to step through. [`Config::cycle`] leaves such a row alone;
+    /// [`Config::set_text`] is what writes it.
+    pub fn is_text(self) -> bool {
+        matches!(self, SettingKind::WorktreeBaseBranch)
+    }
 }
 
 /// The tab strip, left to right. Ordered by how often a setting gets
@@ -239,6 +263,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::GitInitOnCreate,
                 label: "git init new projects",
                 hint: "When adding a missing directory, run git init in it",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::WorktreeBaseBranch,
+                label: "Worktree base branch",
+                hint: "Branch new worktrees start from; Enter types one (empty = origin's default)",
                 group: "",
             },
             SettingSpec {
@@ -262,6 +292,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::SkipSessionNaming,
                 label: "Skip session naming",
                 hint: "New agents skip the name prompt and take the auto-title the agent sets",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::ConfirmOnArchive,
+                label: "Confirm on archive",
+                hint: "a asks before archiving the selected session (off archives at once; u undoes)",
                 group: "",
             },
             SettingSpec {
@@ -428,12 +464,26 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
     // last for the reason above.
     SettingsTab {
         title: "Experimental",
-        body: TabBody::Values(&[SettingSpec {
-            kind: SettingKind::HideRootWorktree,
-            label: "Hide root worktree",
-            hint: "Drop the ⌂ root row; p on Worktrees cuts a fresh worktree off origin/main",
-            group: "",
-        }]),
+        body: TabBody::Values(&[
+            SettingSpec {
+                kind: SettingKind::HideRootWorktree,
+                label: "Hide root worktree",
+                hint: "Drop the ⌂ root row; p on Worktrees cuts a fresh worktree off origin/main",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::RecentPrompts,
+                label: "Recent prompts",
+                hint: "List a session's last prompts under its row, newest at the bottom, each with how long ago",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::RecentPromptsCount,
+                label: "Recent prompts shown",
+                hint: "How many of a session's recent prompts the Sessions panel lists",
+                group: "",
+            },
+        ]),
     },
     SettingsTab {
         title: "Hotkeys",
@@ -487,6 +537,14 @@ pub fn locate(kind: SettingKind) -> Option<(usize, usize)> {
         }
         .map(|i| (t, i))
     })
+}
+
+/// The row declared for `kind`, wherever it sits — for anything that
+/// wants its label or hint by name (the typed-row prompt's title).
+pub fn spec_for(kind: SettingKind) -> Option<&'static SettingSpec> {
+    all_settings()
+        .map(|(_, _, spec)| spec)
+        .find(|spec| spec.kind == kind)
 }
 
 /// Every value setting, tab by tab, for coverage checks.
@@ -580,6 +638,16 @@ pub struct Config {
     /// Owned by the daemon; the TUI writes it so the settings overlay can
     /// toggle every key in the shared file.
     pub git_init_on_create: bool,
+    /// The branch every new WORKTREE nobody named a base for starts from
+    /// (`n` in the WORKTREES PANEL, a bare `nebula worktree`, the QUICK
+    /// PROMPT's auto-created one). Empty — the default, shown as `auto` —
+    /// is origin's own default branch, `origin/HEAD` freshly fetched; a
+    /// name (`master`, `develop`) is origin's fetched copy of that branch
+    /// when origin has one, else the checkout's local branch of that name,
+    /// else the default again. Owned by the daemon, which does the
+    /// resolving (`git::add_worktree_off_configured`); the TUI writes it so
+    /// the settings overlay can edit every key in the shared file.
+    pub worktree_base_branch: String,
     /// Editor command the file finder (`f`), tree browser (`b`),
     /// find-in-files (`F`), and ⌥click file links launch, invoked as
     /// `<editor> +<line> <file>`. Any command passes through verbatim, so
@@ -601,6 +669,12 @@ pub struct Config {
     /// prompt does. Off by default — naming a session is the deliberate
     /// choice, and skipping it is opting out of that.
     pub skip_session_naming: bool,
+    /// Put a CONFIRM DIALOG in front of archiving a session — the `a` key
+    /// and the row menu's Archive alike. Off by default: archive is cheap
+    /// to undo with `u`, so it is the one verb on the SESSIONS PANEL that
+    /// skips the dialog `d` goes behind. On, for anyone whose typing keeps
+    /// landing on the panel and archiving the session under the cursor.
+    pub confirm_on_archive: bool,
     /// How long an idle session in an unviewed worktree lives before the
     /// daemon reaps its PTY: "1m", "5m", "15m", "30m", "1h"; "off"
     /// disables. Owned by the daemon (which does the parsing and reaping);
@@ -657,6 +731,17 @@ pub struct Config {
     /// `origin/HEAD`) before launching into it. Off by default: the root
     /// row is where most people start.
     pub hide_root_worktree: bool,
+    /// Experimental: list each session's RECENT PROMPTS — the last few
+    /// things typed into it, as the daemon captured them off the
+    /// `UserPromptSubmit` hook — under its row in the SESSIONS PANEL,
+    /// newest at the bottom, each with an ago label. Off by default: the
+    /// rows are three lines taller with it on.
+    pub recent_prompts: bool,
+    /// How many of those prompts to list while `recent_prompts` is on.
+    /// The overlay cycles [`RECENT_PROMPT_COUNTS`]; a hand edit is clamped
+    /// to what the daemon keeps. Read through
+    /// [`Config::recent_prompts_shown`].
+    pub recent_prompts_count: usize,
     /// Default model/effort for new Claude / Codex / Cursor sessions.
     /// "default" means "don't pass the flag" (the CLI picks); any other
     /// value is passed through verbatim, so hand-edited configs can name
@@ -715,9 +800,11 @@ impl Default for Config {
         Self {
             palette_enter_attaches: true,
             git_init_on_create: true,
+            worktree_base_branch: String::new(),
             editor: "vim".into(),
             close_finder_on_open: true,
             skip_session_naming: false,
+            confirm_on_archive: false,
             session_idle_timeout: "5m".into(),
             prewarm_agents: true,
             prewarm_sessions: true,
@@ -729,6 +816,8 @@ impl Default for Config {
             hide_projects: false,
             hide_worktrees: false,
             hide_root_worktree: false,
+            recent_prompts: false,
+            recent_prompts_count: DEFAULT_RECENT_PROMPTS_COUNT,
             claude_model: DEFAULT_CHOICE.into(),
             claude_models: Vec::new(),
             claude_effort: DEFAULT_CHOICE.into(),
@@ -823,6 +912,10 @@ impl Config {
             "git_init_on_create".into(),
             serde_json::json!(self.git_init_on_create),
         );
+        obj.insert(
+            "worktree_base_branch".into(),
+            serde_json::json!(self.worktree_base_branch),
+        );
         obj.insert("editor".into(), serde_json::json!(self.editor));
         obj.insert(
             "close_finder_on_open".into(),
@@ -831,6 +924,10 @@ impl Config {
         obj.insert(
             "skip_session_naming".into(),
             serde_json::json!(self.skip_session_naming),
+        );
+        obj.insert(
+            "confirm_on_archive".into(),
+            serde_json::json!(self.confirm_on_archive),
         );
         obj.insert(
             "session_idle_timeout".into(),
@@ -866,6 +963,14 @@ impl Config {
         obj.insert(
             "hide_root_worktree".into(),
             serde_json::json!(self.hide_root_worktree),
+        );
+        obj.insert(
+            "recent_prompts".into(),
+            serde_json::json!(self.recent_prompts),
+        );
+        obj.insert(
+            "recent_prompts_count".into(),
+            serde_json::json!(self.recent_prompts_count),
         );
         obj.insert("claude_model".into(), serde_json::json!(self.claude_model));
         obj.insert(
@@ -990,6 +1095,18 @@ impl Config {
         self.enabled_kinds().first().copied().unwrap_or(configured)
     }
 
+    /// How many RECENT PROMPTS the SESSIONS PANEL lists under a session:
+    /// zero while the feature is off, else the count clamped to what the
+    /// daemon keeps (a hand-edited `0` or `50` reads as `1` or the cap,
+    /// never as nothing while the switch says on).
+    pub fn recent_prompts_shown(&self) -> usize {
+        if !self.recent_prompts {
+            return 0;
+        }
+        self.recent_prompts_count
+            .clamp(1, nebula_core::RECENT_PROMPTS_KEPT)
+    }
+
     /// Hotkeys as the event loop dispatches them: defaults with this
     /// config's overrides applied.
     pub fn keymap(&self) -> crate::keymap::Keymap {
@@ -1000,9 +1117,14 @@ impl Config {
         match kind {
             SettingKind::PaletteEnterAttaches => on_off(self.palette_enter_attaches).into(),
             SettingKind::GitInitOnCreate => on_off(self.git_init_on_create).into(),
+            SettingKind::WorktreeBaseBranch => match self.worktree_base_branch.trim() {
+                "" => AUTO_CHOICE.into(),
+                name => name.to_string(),
+            },
             SettingKind::Editor => self.editor.clone(),
             SettingKind::CloseFinderOnOpen => on_off(self.close_finder_on_open).into(),
             SettingKind::SkipSessionNaming => on_off(self.skip_session_naming).into(),
+            SettingKind::ConfirmOnArchive => on_off(self.confirm_on_archive).into(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
             SettingKind::PrewarmAgents => on_off(self.prewarm_agents).into(),
             SettingKind::PrewarmSessions => on_off(self.prewarm_sessions).into(),
@@ -1014,6 +1136,11 @@ impl Config {
             SettingKind::HideProjects => shown_hidden(self.hide_projects).into(),
             SettingKind::HideWorktrees => shown_hidden(self.hide_worktrees).into(),
             SettingKind::HideRootWorktree => on_off(self.hide_root_worktree).into(),
+            SettingKind::RecentPrompts => on_off(self.recent_prompts).into(),
+            SettingKind::RecentPromptsCount => self
+                .recent_prompts_count
+                .clamp(1, nebula_core::RECENT_PROMPTS_KEPT)
+                .to_string(),
             SettingKind::ClaudeModel => self.claude_model.clone(),
             SettingKind::ClaudeEffort => self.claude_effort.clone(),
             SettingKind::CodexModel => self.codex_model.clone(),
@@ -1052,6 +1179,8 @@ impl Config {
             SettingKind::GitInitOnCreate => {
                 self.git_init_on_create = !self.git_init_on_create;
             }
+            // Typed, not cycled: see `SettingKind::is_text` / `set_text`.
+            SettingKind::WorktreeBaseBranch => {}
             SettingKind::Editor => {
                 self.editor = cycle_choice(&self.editor, EDITORS, step).into();
             }
@@ -1060,6 +1189,9 @@ impl Config {
             }
             SettingKind::SkipSessionNaming => {
                 self.skip_session_naming = !self.skip_session_naming;
+            }
+            SettingKind::ConfirmOnArchive => {
+                self.confirm_on_archive = !self.confirm_on_archive;
             }
             SettingKind::SessionIdleTimeout => {
                 self.session_idle_timeout =
@@ -1094,6 +1226,16 @@ impl Config {
             }
             SettingKind::HideRootWorktree => {
                 self.hide_root_worktree = !self.hide_root_worktree;
+            }
+            SettingKind::RecentPrompts => {
+                self.recent_prompts = !self.recent_prompts;
+            }
+            SettingKind::RecentPromptsCount => {
+                // A hand-edited count off the list steps onto it.
+                let current = self.recent_prompts_count.to_string();
+                self.recent_prompts_count = cycle_choice(&current, RECENT_PROMPT_COUNTS, step)
+                    .parse()
+                    .unwrap_or(DEFAULT_RECENT_PROMPTS_COUNT);
             }
             SettingKind::ClaudeModel => {
                 self.claude_model =
@@ -1153,6 +1295,29 @@ impl Config {
                     self.cursor_effort = cycle_choice(&self.cursor_effort, choices, step).into();
                 }
             }
+        }
+    }
+
+    /// The stored text of a typed row ([`SettingKind::is_text`]) as the
+    /// prompt should pre-fill it — `""` for an unset row, never the `auto`
+    /// the overlay shows in its place. Empty for a row that is not typed.
+    pub fn text_value(&self, kind: SettingKind) -> String {
+        match kind {
+            SettingKind::WorktreeBaseBranch => self.worktree_base_branch.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// Write a typed value into a text row ([`SettingKind::is_text`]),
+    /// trimmed. Empty puts the row back on its default (`auto`). False for
+    /// a row that is not typed — nothing changes.
+    pub fn set_text(&mut self, kind: SettingKind, value: &str) -> bool {
+        match kind {
+            SettingKind::WorktreeBaseBranch => {
+                self.worktree_base_branch = value.trim().to_string();
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -1427,6 +1592,90 @@ mod tests {
         let path = dir.path().join("config.json");
         cfg.save_to(&path).unwrap();
         assert!(load_from(&path).skip_session_naming);
+    }
+
+    #[test]
+    fn confirm_on_archive_defaults_off_toggles_and_persists() {
+        assert!(
+            !Config::default().confirm_on_archive,
+            "archive skips the confirm by default; the dialog is opt-in"
+        );
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.confirm_on_archive);
+
+        let mut cfg = Config::default();
+        let (tab, row) = locate(SettingKind::ConfirmOnArchive).unwrap();
+        assert_eq!(
+            SETTINGS_TABS[tab].title, "Sessions",
+            "lives on the Sessions tab"
+        );
+        assert_eq!(cfg.value_label(SettingKind::ConfirmOnArchive), "off");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.confirm_on_archive);
+        assert_eq!(cfg.value_label(SettingKind::ConfirmOnArchive), "on");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).confirm_on_archive);
+    }
+
+    #[test]
+    fn worktree_base_branch_is_a_typed_row_that_defaults_to_auto() {
+        assert_eq!(Config::default().worktree_base_branch, "");
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.worktree_base_branch, "");
+        assert_eq!(
+            cfg.value_label(SettingKind::WorktreeBaseBranch),
+            AUTO_CHOICE
+        );
+        assert!(SettingKind::WorktreeBaseBranch.is_text());
+
+        let (tab, row) = locate(SettingKind::WorktreeBaseBranch).unwrap();
+        assert_eq!(
+            SETTINGS_TABS[tab].title, "General",
+            "sits beside git init new projects"
+        );
+        // Enter / ←/→ on a typed row change nothing; the prompt does.
+        let mut cfg = Config::default();
+        for delta in [0, 1, -1] {
+            cfg.cycle(tab, row, delta);
+            assert_eq!(cfg.worktree_base_branch, "");
+        }
+
+        assert_eq!(cfg.text_value(SettingKind::WorktreeBaseBranch), "");
+        assert!(cfg.set_text(SettingKind::WorktreeBaseBranch, "  master "));
+        assert_eq!(cfg.worktree_base_branch, "master", "trimmed");
+        assert_eq!(cfg.value_label(SettingKind::WorktreeBaseBranch), "master");
+        assert_eq!(cfg.text_value(SettingKind::WorktreeBaseBranch), "master");
+        assert_eq!(
+            spec_for(SettingKind::WorktreeBaseBranch).map(|s| s.label),
+            Some("Worktree base branch")
+        );
+        assert!(
+            !cfg.set_text(SettingKind::Editor, "nvim"),
+            "a cycled row is not a typed one"
+        );
+        assert_eq!(cfg.editor, "vim");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["worktree_base_branch"], "master");
+        assert_eq!(load_from(&path).worktree_base_branch, "master");
+
+        // Empty is the way back to auto, and is stored as "", not "auto".
+        assert!(cfg.set_text(SettingKind::WorktreeBaseBranch, "   "));
+        cfg.save_to(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["worktree_base_branch"], "");
+        assert_eq!(
+            load_from(&path).value_label(SettingKind::WorktreeBaseBranch),
+            AUTO_CHOICE
+        );
     }
 
     #[test]
@@ -1725,7 +1974,7 @@ mod tests {
         assert!(!cfg.quick_prompt_focus);
     }
 
-    /// The Experimental tab's one row: off by default, a plain toggle,
+    /// The Experimental tab's first row: off by default, a plain toggle,
     /// persisted under its own key, and unknown to a config written
     /// before it (which reads as off).
     #[test]
@@ -1751,6 +2000,77 @@ mod tests {
 
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(!cfg.hide_root_worktree);
+    }
+
+    /// RECENT PROMPTS: an Experimental switch that is off by default and
+    /// a count beside it, read together through `recent_prompts_shown`
+    /// — zero while off, the count while on, a hand edit clamped to what
+    /// the daemon keeps — and both persisted under their own keys.
+    #[test]
+    fn recent_prompts_are_off_by_default_and_the_count_cycles_and_persists() {
+        let mut cfg = Config::default();
+        assert!(!cfg.recent_prompts, "rows stay short until asked");
+        assert_eq!(cfg.recent_prompts_count, DEFAULT_RECENT_PROMPTS_COUNT);
+        assert_eq!(cfg.recent_prompts_shown(), 0, "off means none drawn");
+        assert_eq!(cfg.value_label(SettingKind::RecentPrompts), "off");
+        assert_eq!(cfg.value_label(SettingKind::RecentPromptsCount), "3");
+
+        let (tab, row) = locate(SettingKind::RecentPrompts).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Experimental");
+        let (count_tab, count_row) = locate(SettingKind::RecentPromptsCount).unwrap();
+        assert_eq!(count_tab, tab);
+        assert_eq!(count_row, row + 1, "the count sits under its switch");
+
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.recent_prompts);
+        assert_eq!(cfg.recent_prompts_shown(), 3);
+
+        // The count walks the list both ways and wraps.
+        cfg.cycle(count_tab, count_row, 1);
+        assert_eq!(cfg.recent_prompts_count, 4);
+        cfg.cycle(count_tab, count_row, 1);
+        cfg.cycle(count_tab, count_row, 1);
+        assert_eq!(cfg.recent_prompts_count, 1, "wraps past 5");
+        cfg.cycle(count_tab, count_row, -1);
+        assert_eq!(cfg.recent_prompts_count, 5);
+        assert_eq!(cfg.value_label(SettingKind::RecentPromptsCount), "5");
+        let most: usize = RECENT_PROMPT_COUNTS.last().unwrap().parse().unwrap();
+        assert!(
+            most <= nebula_core::RECENT_PROMPTS_KEPT,
+            "the overlay never asks for more than the daemon keeps"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let loaded = load_from(&path);
+        assert!(loaded.recent_prompts);
+        assert_eq!(loaded.recent_prompts_count, 5);
+        assert_eq!(loaded.recent_prompts_shown(), 5);
+
+        // A hand edit past the list is clamped, not refused; a count that
+        // is off the list steps back onto it when cycled.
+        let mut cfg: Config =
+            serde_json::from_str(r#"{"recent_prompts": true, "recent_prompts_count": 50}"#)
+                .unwrap();
+        assert_eq!(cfg.recent_prompts_shown(), nebula_core::RECENT_PROMPTS_KEPT);
+        assert_eq!(
+            cfg.value_label(SettingKind::RecentPromptsCount),
+            nebula_core::RECENT_PROMPTS_KEPT.to_string()
+        );
+        cfg.cycle(count_tab, count_row, 1);
+        assert_eq!(
+            cfg.recent_prompts_count, 2,
+            "off-list steps from the first choice"
+        );
+        let cfg: Config =
+            serde_json::from_str(r#"{"recent_prompts": true, "recent_prompts_count": 0}"#).unwrap();
+        assert_eq!(cfg.recent_prompts_shown(), 1);
+
+        // A config predating the keys reads as off, with the default count.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.recent_prompts);
+        assert_eq!(cfg.recent_prompts_count, DEFAULT_RECENT_PROMPTS_COUNT);
     }
 
     /// The QUICK PROMPT's harness: one name, cycled over every AGENT KIND,

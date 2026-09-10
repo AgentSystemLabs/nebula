@@ -1,0 +1,10 @@
+# Settings › General (the overlay opens on the tab strip; j steps into the list), Enter on the
+# Worktree base branch row, `master` typed and saved: the overlay lands back on the row with the
+# saved value in its notice line.
+s
+j
+j
+j
+Enter
+master
+Enter

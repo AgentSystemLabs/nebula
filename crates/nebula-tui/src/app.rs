@@ -51,6 +51,9 @@ pub enum HitTarget {
     /// The ARCHIVED group header (either form); a click toggles the group
     /// open/closed, same as the A key.
     ArchivedHeader,
+    /// The Worktrees panel's OPEN PRS group header (either form); a click
+    /// folds the group down to its count or opens it back up.
+    OpenPrsHeader,
     /// Panel background (registered after rows, so rows win).
     PanelBg(Focus),
     TerminalPane,
@@ -198,6 +201,8 @@ pub enum MenuAction {
     RenameWorkspace(WorkspaceId),
     RemoveWorkspace(WorkspaceId),
     ToggleArchived,
+    /// Fold / unfold the PROJECT OPEN PRS GROUP (Worktrees panel menu).
+    ToggleOpenPrs,
 }
 
 /// Which submenu → (right arrow) opens from a menu row.
@@ -408,6 +413,9 @@ pub enum PendingAction {
     /// AddProject aimed at a path that doesn't exist yet: create the
     /// directory (daemon-side, `git init` per its config) and add it.
     CreateProjectDir(std::path::PathBuf),
+    /// `a` (or the row menu's Archive) with the `confirm_on_archive`
+    /// SETTING on: archive the agent once the dialog is answered.
+    ArchiveAgent(AgentId),
     DeleteAgent(AgentId),
     CloseTerminal(TerminalId),
     DeleteWorktree(WorktreeId),
@@ -520,6 +528,13 @@ pub enum PromptKind {
     /// name puts the row back on the folder's own name.
     RenameProject {
         id: ProjectId,
+    },
+    /// A typed SETTINGS OVERLAY row (`SettingKind::is_text`), opened by
+    /// Enter on it: the one-line prompt stands in for the overlay while the
+    /// value is typed, and both Enter and Esc put the overlay back on the
+    /// row it left. An empty value is the row's default, not a cancel.
+    SettingText {
+        kind: crate::config::SettingKind,
     },
     /// Name for a workspace created from the switcher; opened on Ack.
     NewWorkspace,
@@ -1305,8 +1320,9 @@ pub enum ConnState {
     Disconnected,
 }
 
-/// One row of the Sessions panel's OPEN PRS group: a previously saved URL,
-/// or the pull request nebula found on the worktree's branch.
+/// One row of the Sessions panel's PULL REQUESTS group: a previously saved
+/// URL, or the pull request nebula found on the worktree's branch — open,
+/// draft, merged or closed alike.
 #[derive(Debug, Clone)]
 pub enum LinkRow {
     /// Discovered by `gh pr view`, backed by nothing in the store — so it
@@ -1752,6 +1768,10 @@ pub struct UiState {
     pub session_agent: Option<String>,
     pub show_archived: bool,
     pub collapsed: bool,
+    /// The PROJECT OPEN PRS GROUP folded down to its header; absent in
+    /// older blobs, which keep it open.
+    #[serde(default)]
+    pub open_prs_collapsed: bool,
     /// Panel widths (projects, worktrees, sessions); absent in older blobs.
     #[serde(default)]
     pub panel_widths: Option<[u16; 3]>,
@@ -1945,6 +1965,10 @@ pub struct App {
     pub bar_return: Focus,
     pub overlay: Option<Overlay>,
     pub show_archived: bool,
+    /// The Worktrees panel's OPEN PRS group folded down to its header (a
+    /// click on it). Like `show_archived`, it rides the UI-state blob so a
+    /// restart brings it back folded.
+    pub open_prs_collapsed: bool,
     /// Sidebars collapsed (z) — terminal takes the full width.
     pub collapsed: bool,
     /// Workspaces bar shown across the top of the body, with the panels
@@ -1960,6 +1984,11 @@ pub struct App {
     /// there cutting a fresh worktree; mirrors CONFIG.JSON's
     /// `hide_root_worktree` (Settings → Experimental).
     pub hide_root_worktree: bool,
+    /// How many RECENT PROMPTS the SESSIONS PANEL lists under each
+    /// session, newest at the bottom; 0 draws none. Mirrors CONFIG.JSON's
+    /// `recent_prompts` switch and `recent_prompts_count` (Settings →
+    /// Experimental), resolved through `Config::recent_prompts_shown`.
+    pub recent_prompts: usize,
     pub next_req_id: u64,
     pub pending: HashMap<u64, PendingIntent>,
     /// `nebula --workspace <name>`: the workspace this instance was asked
@@ -2139,6 +2168,10 @@ pub struct App {
     /// its lookup is due. Re-armed on every move, so walking a list of a
     /// hundred rows fetches only the ones actually paused on.
     pub pending_pr_detail: Option<(PendingPrDetail, std::time::Instant)>,
+    /// `r` on a worktree or pull-request row asked for the pull requests
+    /// *now*: the event loop runs the two list lookups on its next turn
+    /// instead of waiting for the git tick, then clears this.
+    pub pr_refresh_requested: bool,
     /// Top visible line of the pull-request preview pane, and the pane's
     /// total line count as of the last draw (for clamping).
     pub pr_preview_scroll: u16,
@@ -2203,11 +2236,13 @@ impl App {
             bar_return: Focus::Projects,
             overlay: None,
             show_archived: false,
+            open_prs_collapsed: false,
             collapsed: false,
             show_workspaces: true,
             hide_projects: false,
             hide_worktrees: false,
             hide_root_worktree: false,
+            recent_prompts: 0,
             next_req_id: 1,
             pending: HashMap::new(),
             startup_workspace: None,
@@ -2258,6 +2293,7 @@ impl App {
             pr_detail_inflight: std::collections::HashSet::new(),
             pr_detail_failed: std::collections::HashSet::new(),
             pending_pr_detail: None,
+            pr_refresh_requested: false,
             pr_preview_scroll: 0,
             pr_preview_lines: 0,
             pr_diff_inflight: None,
@@ -2567,7 +2603,7 @@ impl App {
         rows
     }
 
-    /// The selected worktree's OPEN PRS group: the pull request on its branch
+    /// The selected worktree's PULL REQUESTS group: the pull request on its branch
     /// first (however it got there), then any previously saved links in list
     /// order. New saved links are no longer exposed through the TUI.
     /// A saved link that *is* the pull request is shown once, as the
@@ -2703,14 +2739,26 @@ impl App {
             .collect()
     }
 
-    /// The selected project's open pull requests — the group under the
-    /// checkouts. Empty until the first `gh pr list` answers (or when the
-    /// repo genuinely has none).
-    pub fn visible_open_prs(&self) -> &[OpenPr] {
+    /// The selected project's open pull requests, whether or not the group
+    /// under the checkouts is showing them: what its header counts while
+    /// it is folded. Empty until the first `gh pr list` answers (or when
+    /// the repo genuinely has none).
+    pub fn all_open_prs(&self) -> &[OpenPr] {
         self.selected_project()
             .and_then(|p| self.open_prs.get(&p.id))
             .map(|o| o.list.as_slice())
             .unwrap_or_default()
+    }
+
+    /// The open pull requests with rows under the checkouts: the whole
+    /// list, or none while the group is folded — a folded group has no
+    /// rows for the cursor to walk into, the way a collapsed ARCHIVED
+    /// group has none.
+    pub fn visible_open_prs(&self) -> &[OpenPr] {
+        if self.open_prs_collapsed {
+            return &[];
+        }
+        self.all_open_prs()
     }
 
     /// How many rows the Worktrees panel has: the project's checkouts, then
@@ -3097,6 +3145,7 @@ mod tests {
             number: 7,
             url: url.into(),
             title: "Attach links".into(),
+            state: crate::pull_request::STATE_OPEN.into(),
             is_draft: false,
             activity: Vec::new(),
         }
@@ -3178,6 +3227,7 @@ mod tests {
             sort_order: 0,
             alive: true,
             cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         });
         app.tree.agents.push(Agent {
             id: AgentId("a2".into()),

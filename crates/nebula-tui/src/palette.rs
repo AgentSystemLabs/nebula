@@ -406,6 +406,7 @@ mod tests {
             status_changed_at: stamp,
             alive: true,
             cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         }
     }
 

@@ -614,6 +614,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[New]), "new worktree (PR row: Claude)"),
                         (Act(&[GitDiff]), "git diff (^r: mark reviewed ✓)"),
                         (Act(&[OpenRepo]), "open the repo on GitHub"),
+                        (Act(&[RefreshPullRequests]), "refresh pull requests now"),
                         (Act(&[Delete, DeleteAll]), "delete one / delete all"),
                     ],
                 ),
@@ -1950,6 +1951,9 @@ fn settings_keys_hint(view: &crate::app::SettingsView) -> &'static str {
     if view.is_hotkeys() {
         return "Enter: rebind  a: add  ⌫: default  x: unbind  R: reset all  Tab: next  ↑: tabs";
     }
+    if crate::config::setting_at(view.tab, view.selected).is_some_and(|s| s.kind.is_text()) {
+        return "↑/↓: move  Enter: type a value (empty = default)  R: reset all  Tab: next tab";
+    }
     "↑/↓: move  Enter: toggle  ←/→: cycle  R: reset all  Tab: next tab  ↑ at top: tabs"
 }
 
@@ -2903,7 +2907,9 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
 /// rows share a single virtual-row layout, computed unbounded by the panel
 /// height, so a project with a long open-PR list scrolls as one column.
 enum WorktreeEntry {
-    Header(String),
+    /// The OPEN PRS group header — the panel's one group header, in
+    /// whichever form the fold is in. A click target.
+    PrHeader(String),
     /// Index into `visible_worktree_rows()`.
     Row(usize),
 }
@@ -2944,7 +2950,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     let prs = app.visible_open_prs().to_vec();
-    if worktrees.is_empty() && prs.is_empty() {
+    // The header counts the whole list even while the group is folded and
+    // `prs` — the rows actually on screen — is empty.
+    let pr_total = app.all_open_prs().len();
+    if worktrees.is_empty() && pr_total == 0 {
         if app.tree.has_visible_projects() {
             f.render_widget(
                 Paragraph::new(hint_line(&[("n", " starts a worktree")], th)),
@@ -2966,7 +2975,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         if *vrow > 0 {
             *vrow += 1;
         }
-        let e = WorktreeEntry::Header(text);
+        let e = WorktreeEntry::PrHeader(text);
         let h = e.height();
         layout.push((*vrow, e));
         *vrow += h;
@@ -2980,18 +2989,22 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             vrow += 1;
         }
     }
-    if !prs.is_empty() {
+    if pr_total > 0 {
         // A list cut off at the fetch cap says so rather than passing
         // itself off as the whole set.
-        let more = if prs.len() >= crate::pull_request::LIST_LIMIT {
+        let more = if pr_total >= crate::pull_request::LIST_LIMIT {
             "+"
         } else {
             ""
         };
+        // The disclosure triangle is the state: ▾ over the rows, ▸ when a
+        // click (or ↓ off the last checkout) would open them. Folded, the
+        // header is the whole group and its count says what it hides.
+        let fold = if app.open_prs_collapsed { "▸" } else { "▾" };
         header(
             &mut layout,
             &mut vrow,
-            format!("OPEN PRS · {}{more}", prs.len()),
+            format!("{fold} OPEN PRS · {pr_total}{more}"),
         );
         for i in 0..prs.len() {
             layout.push((vrow, WorktreeEntry::Row(worktrees.len() + i)));
@@ -3017,7 +3030,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             // Scrolling up to the first row of a group brings that group's
             // header along, so the cursor never sits under a bare edge.
             let up_to = match pos.checked_sub(1).map(|p| &layout[p]) {
-                Some((h, WorktreeEntry::Header(_))) => *h,
+                Some((h, WorktreeEntry::PrHeader(_))) => *h,
                 _ => *top,
             };
             let bottom = top + entry.height();
@@ -3047,9 +3060,12 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         }
         let hit_h = pill_hit_height(*top, layout.get(pos + 1).map(|(t, _)| *t));
         match entry {
-            WorktreeEntry::Header(text) => {
+            WorktreeEntry::PrHeader(text) => {
+                // Both forms are click targets: a click folds or unfolds
+                // the group, like the ARCHIVED header in Sessions.
                 if let Some(r) = row_rect_at(inner, y) {
                     f.render_widget(Paragraph::new(Span::styled(format!(" {text}"), dim)), r);
+                    app.hits.push((r, HitTarget::OpenPrsHeader));
                 }
             }
             WorktreeEntry::Row(i) if *i < worktrees.len() => {
@@ -3131,8 +3147,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 // sits below every finished pull request, so it reads as
                 // "not ready" from across the room.
                 let pr = &prs[*i - worktrees.len()];
-                let look = crate::pr_row::look(pr.is_draft, th);
-                let badge = pr.is_draft.then(|| (format!(" {}", pr.badge()), th.dim));
+                let look = crate::pr_row::look(pr.standing(), th);
+                let badge = pr
+                    .is_draft
+                    .then(|| (format!(" {}", pr.badge()), look.badge));
                 let spans = crate::pr_row::spans(look, &pr.label(), inner.width as usize, badge);
                 // No STATUS DOT on a pull request, so the rail is the look's.
                 render_pill(
@@ -3163,18 +3181,79 @@ enum SessionEntry {
     Header(String),
     /// The ARCHIVED group header, in whichever form the toggle is in.
     ArchivedHeader(String),
-    /// Index into `visible_session_rows()`.
-    Row(usize),
+    /// Index into `visible_session_rows()`, plus how many RECENT PROMPTS
+    /// lines hang under its pill (see [`session_prompt_lines`]).
+    Row {
+        index: usize,
+        prompts: usize,
+    },
 }
 
 impl SessionEntry {
     /// Rows the entry occupies: a header one, a pill its 3-row cell (they
-    /// stack on a `PILL_H` stride, so neighboring pads overlap).
+    /// stack on a `PILL_H` stride, so neighboring pads overlap) plus any
+    /// prompt lines under it.
     fn height(&self) -> usize {
         match self {
-            SessionEntry::Row(_) => PILL_H as usize + 1,
+            SessionEntry::Row { prompts, .. } => PILL_H as usize + 1 + prompts,
             _ => 1,
         }
+    }
+}
+
+/// How many RECENT PROMPTS lines a row carries under its pill: the
+/// `recent_prompts` setting, capped at what the session has. None for a
+/// terminal or a link (they take no prompts), an archived session (its
+/// history is over, and the group is for scanning names) or a QUICK
+/// PROMPT stand-in (its row has not been created yet).
+fn session_prompt_lines(app: &App, row: &SessionRow) -> usize {
+    match row {
+        SessionRow::Agent(a) if !a.archived && !app.is_placeholder_agent(&a.id) => {
+            app.recent_prompts.min(a.recent_prompts.len())
+        }
+        _ => 0,
+    }
+}
+
+/// What a prompt line opens with: two columns to land under the name
+/// (past the pill's rail and the status dot), and a bullet so the lines
+/// read as a list hanging off the row rather than as more rows.
+const PROMPT_INDENT: &str = "  · ";
+
+/// The RECENT PROMPTS under a session pill, from `first_row`: the newest
+/// `count` of `prompts`, oldest first so the bottom line is the latest
+/// thing asked, each clipped to fit with its ago label pinned right. Dim,
+/// with the newest lifted to muted so the eye lands on it — these are
+/// context for the row, not rows of their own, and they never take the
+/// selection fill.
+fn draw_prompt_lines(
+    f: &mut Frame,
+    inner: Rect,
+    first_row: isize,
+    prompts: &[nebula_core::PromptEntry],
+    count: usize,
+    th: Theme,
+) {
+    let skip = prompts.len().saturating_sub(count);
+    let free = (inner.width as usize).saturating_sub(PROMPT_INDENT.chars().count());
+    for (i, entry) in prompts.iter().skip(skip).enumerate() {
+        let Some(area) = row_rect_at(inner, first_row + i as isize) else {
+            continue;
+        };
+        let newest = skip + i + 1 == prompts.len();
+        let text_color = if newest { th.muted } else { th.dim };
+        let (ago, text_max) = fit_ago(ago_badge(entry.submitted_at), free);
+        let text = truncate(&entry.text, text_max);
+        let mut spans = vec![
+            Span::styled(PROMPT_INDENT, Style::default().fg(th.dim)),
+            Span::styled(text.clone(), Style::default().fg(text_color)),
+        ];
+        if !ago.is_empty() {
+            let gap = text_max.saturating_sub(text.chars().count());
+            spans.push(Span::raw(" ".repeat(gap)));
+            spans.push(Span::styled(ago, Style::default().fg(th.dim)));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 }
 
@@ -3221,9 +3300,17 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let push_rows =
         |layout: &mut Vec<(usize, SessionEntry)>, vrow: &mut usize, start: usize, len: usize| {
-            for i in start..(start + len).min(rows.len()) {
-                layout.push((*vrow, SessionEntry::Row(i)));
+            let end = (start + len).min(rows.len());
+            for (i, row) in rows.iter().enumerate().take(end).skip(start) {
+                let prompts = session_prompt_lines(app, row);
+                layout.push((*vrow, SessionEntry::Row { index: i, prompts }));
+                // Pills stack on a `PILL_H` stride, sharing their pads;
+                // one with prompt lines under it keeps its bottom pad
+                // and the next pill starts below the lines.
                 *vrow += PILL_H as usize;
+                if prompts > 0 {
+                    *vrow += 1 + prompts;
+                }
             }
         };
 
@@ -3239,10 +3326,13 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         push_rows(&mut layout, &mut vrow, active_count, terminal_count);
     }
     if link_count > 0 {
+        // Not "OPEN PRS": the branch's pull request stays on its row after
+        // it is merged or closed (`pull_request::PullRequest`), so the
+        // header names the thing, not a state it may have left.
         header(
             &mut layout,
             &mut vrow,
-            SessionEntry::Header("OPEN PRS".into()),
+            SessionEntry::Header("PULL REQUESTS".into()),
         );
         push_rows(
             &mut layout,
@@ -3277,10 +3367,9 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     let anchor = (app.sel_worktree, app.sel_session);
     if app.sessions_anchor != Some(anchor) {
         app.sessions_anchor = Some(anchor);
-        if let Some(pos) = layout
-            .iter()
-            .position(|(_, e)| matches!(e, SessionEntry::Row(i) if *i == app.sel_session))
-        {
+        if let Some(pos) = layout.iter().position(
+            |(_, e)| matches!(e, SessionEntry::Row { index, .. } if *index == app.sel_session),
+        ) {
             let (top, entry) = &layout[pos];
             // Scrolling up to the first row of a group brings that group's
             // header along, so the cursor never sits under a bare edge.
@@ -3307,7 +3396,7 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         if y >= view_h as isize {
             break;
         }
-        let hit_h = pill_hit_height(*top, layout.get(pos + 1).map(|(t, _)| *t));
+        let next_top = layout.get(pos + 1).map(|(t, _)| *t);
         match entry {
             SessionEntry::Header(text) => {
                 if let Some(r) = row_rect_at(inner, y) {
@@ -3322,8 +3411,19 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
                     app.hits.push((r, HitTarget::ArchivedHeader));
                 }
             }
-            SessionEntry::Row(i) => {
-                draw_session_row(f, app, inner, y, hit_h, *i, &rows[*i], focused)
+            SessionEntry::Row { index, prompts } => {
+                let hit_h = row_hit_height(*top, next_top, *prompts);
+                draw_session_row(
+                    f,
+                    app,
+                    inner,
+                    y,
+                    hit_h,
+                    *index,
+                    *prompts,
+                    &rows[*index],
+                    focused,
+                )
             }
         }
     }
@@ -3332,7 +3432,8 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     app.hits.push((inner, HitTarget::PanelBg(Focus::Sessions)));
 }
 
-/// `hit_h` is the row's click target height (see [`pill_hit_height`]).
+/// `hit_h` is the row's click target height (see [`row_hit_height`]);
+/// `prompts` how many RECENT PROMPTS lines to hang under the pill.
 #[allow(clippy::too_many_arguments)]
 fn draw_session_row(
     f: &mut Frame,
@@ -3341,6 +3442,7 @@ fn draw_session_row(
     top: isize,
     hit_h: u16,
     index: usize,
+    prompts: usize,
     row: &SessionRow,
     focused: bool,
 ) {
@@ -3452,28 +3554,31 @@ fn draw_session_row(
         SessionRow::Link(l) => {
             // Same shape as an agent row — glyph, name, trailing badge — so
             // the column reads as one list. The arrow says "leaves nebula";
-            // a pull request earns the accent (a draft the dim, end to end,
-            // like its row in the PROJECT OPEN PRS GROUP), and a bare saved
+            // an open pull request earns the accent (a draft the dim, end
+            // to end, like its row in the PROJECT OPEN PRS GROUP; a merged
+            // or closed one the PR PREVIEW's state color), and a bare saved
             // link is as quiet as a terminal row.
             //
-            // The badge slot is normally the dim state word, but comments
-            // that landed since the row was last opened take it over and go
-            // loud: an unread count is the one thing here worth walking
-            // over to look at, and the state is already in the glyph.
+            // The badge slot is normally the state word in the look's badge
+            // color, but comments that landed since the row was last opened
+            // take it over and go loud: an unread count is the one thing
+            // here worth walking over to look at, and the state is already
+            // in the glyph.
             let pr = l.pull_request();
             let unseen = l.unseen_comments(&app.pr_seen);
-            let badge = match pr {
-                Some(_) if unseen > 0 => Some((format!(" {unseen} new"), th.warn)),
-                Some(pr) => Some((format!(" {}", pr.badge()), th.dim)),
-                None => None,
-            };
             let look = match pr {
-                Some(pr) => crate::pr_row::look(pr.is_draft, th),
+                Some(pr) => crate::pr_row::look(pr.standing(), th),
                 None => crate::pr_row::Look {
                     glyph: th.muted,
                     label: th.muted,
                     rail: th.accent,
+                    badge: th.dim,
                 },
+            };
+            let badge = match pr {
+                Some(_) if unseen > 0 => Some((format!(" {unseen} new"), th.warn)),
+                Some(pr) => Some((format!(" {}", pr.badge()), look.badge)),
+                None => None,
             };
             let spans = crate::pr_row::spans(look, &l.label(), width as usize, badge);
             (spans, look.rail)
@@ -3489,6 +3594,14 @@ fn draw_session_row(
         th,
         mark,
     );
+    if prompts > 0 {
+        if let SessionRow::Agent(a) = row {
+            // Under the pill's bottom pad, so a selected row keeps its
+            // rounded lower edge above its history.
+            let first_row = top + PILL_H as isize + 1;
+            draw_prompt_lines(f, inner, first_row, &a.recent_prompts, prompts, th);
+        }
+    }
     if let Some(hit) = rows_rect_at(inner, top, hit_h) {
         app.hits.push((hit, HitTarget::Session(index)));
     }
@@ -3649,7 +3762,7 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     // A cursor is resting on an open pull request — the Worktrees cursor
     // on a PROJECT OPEN PRS GROUP row, or the focused Sessions cursor on
     // the PR ROW: the pane reads it. The attachment underneath stays live —
-    // walking down into either OPEN PRS group and back must not churn
+    // walking down into either pull-request group and back must not churn
     // detach/attach.
     if app.previewed_pr().is_some() {
         draw_pr_preview(f, app, area, focused);
@@ -4052,35 +4165,39 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             // An open-PR row answers to a different set of verbs than a
             // checkout does, so the hint follows the cursor into the group.
             Focus::Worktrees if app.selected_worktree_pr().is_some() => format!(
-                "{}: new session  {}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: search  {}: menu  {}: help",
+                "{}: new session  {}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: refresh  {}: search  {}: menu  {}: help",
                 k(Action::New),
                 k(Action::Activate),
                 k(Action::GitDiff),
+                k(Action::RefreshPullRequests),
                 k(Action::Palette),
                 k(Action::ContextMenu),
                 k(Action::Help)
             ),
             Focus::Worktrees => format!(
-                "{}: new worktree  {}: terminal  {}: delete  {}: search  {}: menu  {}: help",
+                "{}: new worktree  {}: terminal  {}: delete  {}: refresh PRs  {}: search  {}: menu  {}: help",
                 k(Action::New),
                 k(Action::NewTerminal),
                 k(Action::Delete),
+                k(Action::RefreshPullRequests),
                 k(Action::Palette),
                 k(Action::ContextMenu),
                 k(Action::Help)
             ),
             // A discovered pull request opens, reads in the pane and shows
-            // its diff; it has no stored row to edit or delete. Previously
-            // saved rows retain those two verbs.
+            // its diff; it has no stored row to edit or delete, and the
+            // refresh key re-asks GitHub for it. Previously saved rows
+            // retain the edit and delete verbs.
             Focus::Sessions
                 if app
                     .selected_link()
                     .is_some_and(|row| row.id().is_none()) =>
             {
                 format!(
-                    "{}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: menu  {}: help",
+                    "{}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: refresh  {}: menu  {}: help",
                     k(Action::Activate),
                     k(Action::GitDiff),
+                    k(Action::RefreshPullRequests),
                     k(Action::ContextMenu),
                     k(Action::Help)
                 )
@@ -4561,7 +4678,14 @@ fn rows_rect_at(inner: Rect, i: isize, height: u16) -> Option<Rect> {
 /// its bottom pad, or the lower half of the pill would be a click on the
 /// panel background.
 fn pill_hit_height(top: usize, next_top: Option<usize>) -> u16 {
-    let cell = PILL_H as usize + 1;
+    row_hit_height(top, next_top, 0)
+}
+
+/// [`pill_hit_height`] for a pill with `extra` rows of its own under its
+/// bottom pad — a session's RECENT PROMPTS lines — which the target runs
+/// over too, so a click on a prompt line lands on its session.
+fn row_hit_height(top: usize, next_top: Option<usize>, extra: usize) -> u16 {
+    let cell = PILL_H as usize + 1 + extra;
     next_top.map_or(cell, |n| n.saturating_sub(top).min(cell)) as u16
 }
 
@@ -5051,6 +5175,7 @@ mod tests {
                 sort_order: i as i64,
                 alive: false,
                 cloud_mirroring: false,
+                recent_prompts: Vec::new(),
             });
         }
         for (i, name) in terminals.iter().enumerate() {
@@ -5101,6 +5226,86 @@ mod tests {
             "last pill keeps its bottom pad"
         );
         assert_eq!(at(11), Some(HitTarget::PanelBg(Focus::Worktrees)));
+    }
+
+    /// RECENT PROMPTS under a session pill. Off (the default), the list is
+    /// as it was; on, the newest N follow the pill oldest-first, each
+    /// with its ago label, the next group moves down by that much, a
+    /// click over the lines lands on their session, and a session with
+    /// fewer prompts than asked lists only what it has. Archived rows and
+    /// terminals list none.
+    #[test]
+    fn recent_prompts_hang_under_the_session_pill_newest_last() {
+        use nebula_core::PromptEntry;
+        let mut app = hit_test_app(&["main"], &["agent"], &["shell"]);
+        let now = crate::app::now_ms();
+        app.tree.agents[0].recent_prompts = (1..=4)
+            .map(|n| PromptEntry {
+                text: format!("prompt {n}"),
+                submitted_at: now - (5 - n) * 10 * 60_000,
+            })
+            .collect();
+        let area = Rect::new(0, 0, 32, 24);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(32, 24)).unwrap();
+        let row_text = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>, y: u16| {
+            let buf = terminal.backend().buffer();
+            (0..buf.area.width)
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect::<String>()
+        };
+
+        // Off: the pill at 3..=5, the TERMINALS header at 6, as ever.
+        app.hits.clear();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        let all: String = (0..24).map(|y| row_text(&terminal, y)).collect();
+        assert!(!all.contains("prompt"), "off draws no history");
+        assert!(row_text(&terminal, 6).contains("TERMINALS"));
+
+        // On, three of four: the newest three, oldest first, under the
+        // pill's bottom pad — rows 6..=8 — pushing the header (and the
+        // blank every header keeps above it) down to 10.
+        app.recent_prompts = 3;
+        app.hits.clear();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        assert!(row_text(&terminal, 4).contains("agent"));
+        for (y, n, ago) in [(6, 2, "30m ago"), (7, 3, "20m ago"), (8, 4, "10m ago")] {
+            let line = row_text(&terminal, y);
+            assert!(line.contains(&format!("prompt {n}")), "y={y}: {line:?}");
+            // Pinned to the column's right edge, just inside its border.
+            let inside = line.trim_end().trim_end_matches('│').trim_end();
+            assert!(inside.ends_with(ago), "y={y}: {line:?}");
+            assert!(line.contains(PROMPT_INDENT.trim_start()), "y={y}: {line:?}");
+        }
+        let all: String = (0..24).map(|y| row_text(&terminal, y)).collect();
+        assert!(!all.contains("prompt 1"), "only the newest three");
+        assert!(row_text(&terminal, 10).contains("TERMINALS"));
+        let at = |app: &App, y: u16| app.hit_at(1, y);
+        for y in 3..=8 {
+            assert_eq!(at(&app, y), Some(HitTarget::Session(0)), "y={y}");
+        }
+        for y in 9..=10 {
+            assert_eq!(at(&app, y), Some(HitTarget::PanelBg(Focus::Sessions)));
+        }
+        for y in 11..=13 {
+            assert_eq!(at(&app, y), Some(HitTarget::Session(1)), "y={y}");
+        }
+
+        // Asked for more than the session has: its four, and no blank.
+        app.recent_prompts = 5;
+        app.hits.clear();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        assert!(row_text(&terminal, 6).contains("prompt 1"));
+        assert!(row_text(&terminal, 9).contains("prompt 4"));
+        assert!(row_text(&terminal, 11).contains("TERMINALS"));
+
+        // Archived: the history is over and the row is back to a pill.
+        app.tree.agents[0].archived = true;
+        app.show_archived = true;
+        app.hits.clear();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        let all: String = (0..24).map(|y| row_text(&terminal, y)).collect();
+        assert!(!all.contains("prompt"), "archived rows list none: {all}");
     }
 
     /// The same rule in the Sessions panel: the last pill of a group has

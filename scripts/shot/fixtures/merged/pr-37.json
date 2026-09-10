@@ -1,0 +1,5 @@
+{"number": 37, "url": "https://github.com/AgentSystemLabs/nebula/pull/37", "title": "Wheel scroll steps one line a notch", "state": "MERGED", "isDraft": false,
+ "author": {"login": "shot-user"}, "baseRefName": "main", "headRefName": "wheel-one-line", "additions": 58, "deletions": 12, "changedFiles": 4,
+ "body": "The mouse wheel used to scroll the pane three lines a notch, which skipped past short outputs. One line a notch now, and the trackpad's fine-grained events coalesce into the same step.\n\nMerged; the checkout under this row is the one to archive next.",
+ "comments": [{"author": {"login": "reviewer"}, "createdAt": "2026-09-03T15:12:00Z", "body": "Tried it on a Magic Trackpad — smooth. One question inline."}],
+ "reviews": [{"author": {"login": "reviewer"}, "submittedAt": "2026-09-03T16:40:00Z", "state": "APPROVED", "body": "Ship it."}]}

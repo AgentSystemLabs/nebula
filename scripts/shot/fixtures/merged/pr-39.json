@@ -1,0 +1,5 @@
+{"number": 39, "url": "https://github.com/AgentSystemLabs/nebula/pull/39", "title": "Still cooking: a draft the list must sink", "state": "OPEN", "isDraft": true,
+ "author": {"login": "shot-user"}, "baseRefName": "main", "headRefName": "feature-x", "additions": 41, "deletions": 7, "changedFiles": 3,
+ "body": "A draft pull request the PROJECT OPEN PRS GROUP shows dimmed and last.\n\nThe body is plain markdown; nebula wraps it as text.",
+ "comments": [{"author": {"login": "reviewer"}, "createdAt": "2026-09-01T10:00:00Z", "body": "Looks promising — is the sort stable?"}],
+ "reviews": [{"author": {"login": "reviewer"}, "submittedAt": "2026-09-02T09:30:00Z", "state": "COMMENTED", "body": "One nit inline."}]}

@@ -1,0 +1,8 @@
+# Onto the wheel-one-line checkout, a click on the OPEN PRS header folds the group, Tab into the
+# Sessions panel lands on the checkout's merged PR ROW (the pane reads it), then Shift+R for the flash.
+Tab
+j
+j
+click 24 16
+Tab
+R

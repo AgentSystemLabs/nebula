@@ -1,0 +1,13 @@
+# Three quick prompts on the root checkout; the stand-in agent (see the .setup.sh) posts each
+# session's prompts through the hooks, so every row grows its RECENT PROMPTS lines.
+Tab
+Tab
+p
+Fix the login redirect
+Enter
+p
+Sort the changelog by date
+Enter
+p
+Profile the daemon startup
+Enter

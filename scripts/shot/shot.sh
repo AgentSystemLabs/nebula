@@ -40,10 +40,12 @@ git -C "$DEMO" -c user.name=shot -c user.email=shot@example.invalid commit -q --
 git -C "$DEMO" worktree add -q -b feature-x "$WORK/demo-worktrees/feature-x" main
 git -C "$DEMO" worktree add -q -b wheel-one-line "$WORK/demo-worktrees/wheel-one-line" main
 # A scene that needs more than the stock demo — a git config key, a file in a checkout — ships a
-# scenes/<scene>.setup.sh beside its .keys, sourced here with DEMO, WORK and RUNTIME in scope.
+# scenes/<scene>.setup.sh beside its .keys, sourced here with DEMO, WORK, RUNTIME and BIN in scope. It may
+# also export NEBULA_AGENT_CMD (a stand-in agent that talks to the HOOK RECEIVER) or NEBULA_GH_FIXTURES
+# (its own fixtures directory) before the defaults below fill in.
 if [ -f "$HERE/scenes/$SCENE.setup.sh" ]; then DEMO="$DEMO" WORK="$WORK" RUNTIME="$RUNTIME" . "$HERE/scenes/$SCENE.setup.sh"; fi
 
-export NEBULA_RUNTIME_DIR="$RUNTIME" NEBULA_DATA_DIR="$WORK/data" NEBULA_AGENT_CMD=/bin/cat \
+export NEBULA_RUNTIME_DIR="$RUNTIME" NEBULA_DATA_DIR="$WORK/data" NEBULA_AGENT_CMD="${NEBULA_AGENT_CMD:-/bin/cat}" \
        NEBULA_UPDATE_CHECK_SECS=0 NEBULA_GH_FIXTURES="${NEBULA_GH_FIXTURES:-$HERE/fixtures}" \
        PATH="$HERE/bin:$PATH" TERM=xterm-256color
 "$BIN" add "$DEMO" >/dev/null                                # registers the PROJECT (spawns the demo daemon)
@@ -51,7 +53,17 @@ export NEBULA_RUNTIME_DIR="$RUNTIME" NEBULA_DATA_DIR="$WORK/data" NEBULA_AGENT_C
 # --- drive it ---
 $TMUX new-session -d -x "$COLS" -y "$ROWS" "$BIN"
 sleep "${SHOT_BOOT_SECS:-4}"                                 # first paint + the first GIT POLL answers
-send() { $TMUX send-keys "$1"; sleep "${SHOT_KEY_SECS:-0.6}"; }
+# A keys line is a tmux key name or literal text; `click <col> <row>` / `rclick <col> <row>` (1-based
+# cells) are an SGR mouse press and release typed straight into the pane, for the targets no key reaches.
+send() {
+  case "$1" in
+    click\ *|rclick\ *)
+      set -- $1; b=0; [ "$1" = rclick ] && b=2
+      $TMUX send-keys -l "$(printf '\033[<%d;%d;%dM\033[<%d;%d;%dm' "$b" "$2" "$3" "$b" "$2" "$3")";;
+    *) $TMUX send-keys "$1";;
+  esac
+  sleep "${SHOT_KEY_SECS:-0.6}"
+}
 if [ -f "$HERE/scenes/$SCENE.keys" ]; then
   while IFS= read -r key; do case "$key" in ''|'#'*) continue;; esac; send "$key"; done < "$HERE/scenes/$SCENE.keys"
 fi

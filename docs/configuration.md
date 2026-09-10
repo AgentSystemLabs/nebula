@@ -10,12 +10,12 @@ what the `s` SETTINGS OVERLAY writes:
 - `NEBULA_DATA_DIR` moves the whole directory, config included (tests, parallel instances).
 
 Both halves of nebula read that one file. The TUI owns most keys; the DAEMON owns
-`git_init_on_create`, `session_idle_timeout`, `prewarm_agents` and `prewarm_sessions`. Each side
-deserializes only its own fields and ignores the rest, and both load it fresh on every use — so a
-hand edit applies without restarting either. No key is required: a missing file is all defaults, an
-unknown field is skipped, and a malformed file is logged and ignored rather than failing the
-operation that read it. The overlay patches only the keys it knows and leaves everything else in the
-JSON untouched, so hand-written fields survive a save.
+`git_init_on_create`, `worktree_base_branch`, `session_idle_timeout`, `prewarm_agents` and
+`prewarm_sessions`. Each side deserializes only its own fields and ignores the rest, and both load it
+fresh on every use — so a hand edit applies without restarting either. No key is required: a missing
+file is all defaults, an unknown field is skipped, and a malformed file is logged and ignored rather
+than failing the operation that read it. The overlay patches only the keys it knows and leaves
+everything else in the JSON untouched, so hand-written fields survive a save.
 
 Files beside it in the DATA DIR: `nebula.db` (the SQLITE STORE), `agent_presets.json` (AGENT
 PRESETS), `cursor_models.json` (the cached `cursor-agent --list-models` answer, refreshed after 24h),
@@ -24,19 +24,23 @@ convenience stores: missing or malformed reads as empty.
 
 ## Every setting
 
-Thirty-two keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
-exists only in the file, so it is hand-edit-only. The Agents tab groups its rows under **Quick prompt**,
-**Claude**, **Codex** and **Cursor** headers, so a harness's rows read `Enabled` / `Model` / `Effort`
-under its name rather than repeating it. The **Experimental** tab holds behaviors that change how the
-tree is worked; every row there is off by default.
+Thirty-six keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
+exists only in the file, so it is hand-edit-only. Most rows toggle or cycle on `Enter` / `←` / `→`; a
+*typed* row (`worktree_base_branch`) opens a one-line prompt on `Enter` instead, pre-filled with the
+stored value, and an empty answer puts its default back. The Agents tab groups its rows under **Quick
+prompt**, **Claude**, **Codex** and **Cursor** headers, so a harness's rows read `Enabled` / `Model` /
+`Effort` under its name rather than repeating it. The **Experimental** tab holds behaviors that change
+how the tree is worked; every switch there is off by default.
 
 | Key | Type | Default | Overlay | What it does |
 |---|---|---|---|---|
 | `palette_enter_attaches` | bool | `true` | General | `Enter` on a PALETTE (`/`) session attaches and focuses the TERMINAL PANE. Off, `Enter` only lands on the row in the SESSIONS PANEL and previews it; `Ctrl+o` / `Ctrl+f` still pick open / focus explicitly either way. The `]` / `[` attention jump lands the same way this setting says. |
 | `git_init_on_create` | bool | `true` | General | DAEMON-owned: run `git init` when adding a project whose directory does not exist yet and the ADD PROJECT BROWSER (`o`) creates it. |
+| `worktree_base_branch` | string | `""` | General | DAEMON-owned WORKTREE BASE BRANCH: where every new WORKTREE nobody named a base for starts — `n` in the WORKTREES PANEL, a bare `nebula worktree`, the QUICK PROMPT's auto-created one (`nebula worktree --base` always wins). Empty, shown as `auto` in the overlay, is origin's own default branch: `origin/HEAD` freshly fetched, normally `origin/main`. A name — `master`, `develop` — is resolved the way `--base` resolves one: origin is fetched and origin's copy of that branch (`origin/master`) is the start point, untracked, never the checkout's local branch of that name, which is only as new as its last pull; a branch origin lacks that the checkout has locally is used as named. The setting is one name for every project, so a repo with no branch of that name at all does not fail the `n`: it falls back to `origin/HEAD` as if the key were empty, and `daemon.log` says which repo ignored it. A leading `origin/` is dropped (`origin/master` means `master`); a tag or SHA is not a branch and falls back too — name those with `--base`. Typed, not cycled: `Enter` on the row opens a prompt, an empty answer puts `auto` back. |
 | `editor` | string | `"vim"` | General | The EDITOR the FILE FINDER (`f`), TREE BROWSER (`b`), find-in-files (`Shift+F`) and ⌥click launch, invoked as `<editor> +<line> <file>`. The overlay cycles `vim`, `nvim`, `nano`, `emacs`, `hx`; any command passes through verbatim, so a hand edit can name one the picker doesn't. `NEBULA_EDITOR` overrides it for the process. |
 | `close_finder_on_open` | bool | `true` | General | Opening a file closes the FILE FINDER behind the editor modal, so quitting the editor is one Esc instead of two. Off leaves the results underneath. Never touches the TREE BROWSER (its editor is its own preview pane) or ⌥click. |
 | `skip_session_naming` | bool | `false` | Sessions | New AGENTS launch straight from the NEW SESSION PICKER with no name prompt, taking the generated name and opting into AUTO-TITLE — exactly as accepting an empty prompt does. |
+| `confirm_on_archive` | bool | `false` | Sessions | Put a CONFIRM DIALOG in front of archiving a session — `a` and the row menu's **Archive** alike — for when typing aimed at an agent keeps landing on the SESSIONS PANEL and archiving the session under the cursor. Off, archive is the one verb on that panel that skips the dialog `d` goes behind: it is cheap to undo with `u`, and the dialog says so. |
 | `session_idle_timeout` | string | `"5m"` | Sessions | DAEMON-owned IDLE TIMEOUT: how long a session in a WORKTREE no client is viewing goes unwatched before the IDLE REAPER kills its PTY. See the values below. |
 | `done_sound` | string | `"Glass"` | Sessions | The DONE SOUND rung when a turn reaches FINISHED: `off`, `bell` (the terminal BEL — silent in Ghostty unless its `bell-features` include `audio`), or a macOS system sound from `/System/Library/Sounds` played with `afplay` (`Glass`, `Ping`, `Pop`, `Hero`, …). Over `nebula ssh` and off macOS it is always the bell. |
 | `feedback_sound` | string | `"Sosumi"` | Sessions | The FEEDBACK SOUND rung when a turn stops at NEEDS FEEDBACK — a permission prompt or a question — with the same values and fallbacks as `done_sound`, and a different default so red and green sound different from the next room. It never rings for the session whose pane you are locked into typing at while the terminal window has focus: that prompt is already under your hands. The one switch for the DESKTOP NOTIFICATION too: while the terminal window is in the background (from the focus reports nebula asks the terminal for — tmux needs `focus-events on`), each session that goes red is also named in a desktop notification (`osascript` on macOS, `notify-send` on Linux; never over `nebula ssh`, where the desktop is the wrong machine's; a notifier that is missing or fails is a debug line, not an error). `off` silences the sound and the notification together. |
@@ -45,7 +49,9 @@ tree is worked; every row there is off by default.
 | `show_workspaces` | bool | `true` | Appearance | Whether the WORKSPACES BAR is drawn across the top. `Shift+W` writes the key as it toggles, so a hidden bar stays hidden across restarts. |
 | `hide_projects` | bool | `false` | Appearance | Hide the PROJECTS PANEL and give its width to the TERMINAL PANE (`Shift+P`). |
 | `hide_worktrees` | bool | `false` | Appearance | Hide the WORKTREES PANEL (`Shift+B`), independently of `hide_projects`. |
-| `hide_root_worktree` | bool | `false` | Experimental | Leave the ROOT WORKTREE row out of the WORKTREES PANEL, so nothing launched from that panel lands in the shared checkout, and make `p` there open a QUICK PROMPT that first cuts a fresh WORKTREE — a random `<adj>-<noun>-<verb>` branch off the freshly fetched `origin/HEAD` — then starts the agent in it, with the cursor moved onto the new row (FOCUS stays on the panel, as every QUICK PROMPT launch leaves it). The root's sessions keep running and stay reachable from the PALETTE (`/`). |
+| `hide_root_worktree` | bool | `false` | Experimental | Leave the ROOT WORKTREE row out of the WORKTREES PANEL, so nothing launched from that panel lands in the shared checkout, and make `p` there open a QUICK PROMPT that first cuts a fresh WORKTREE — a random `<adj>-<noun>-<verb>` branch off the freshly fetched `origin/HEAD`, or the `worktree_base_branch` above — then starts the agent in it, with the cursor moved onto the new row (FOCUS stays on the panel, as every QUICK PROMPT launch leaves it). The root's sessions keep running and stay reachable from the PALETTE (`/`). |
+| `recent_prompts` | bool | `false` | Experimental | RECENT PROMPTS: list the last few prompts typed into each session under its row in the SESSIONS PANEL — the text the `UserPromptSubmit` hook carried, condensed to one line — oldest first so the bottom line is the latest ask, each with a dim `30m ago` pinned right; a click on any line lands on its session. Every harness reports its prompt (Claude, Codex and Cursor in the hook payload, Pi through its managed extension). Prompts nebula composes itself — a PR SESSION's scope, the note a `nebula worktree` relocation reopens on — are left out, and archived rows list none. Off, the rows are the single pills they always were. See [Sessions](sessions.md#recent-prompts). |
+| `recent_prompts_count` | integer | `3` | Experimental | How many of those prompts to list while `recent_prompts` is on. The overlay cycles `1` to `5`; a hand edit is clamped to the ten the DAEMON keeps per session (`0` reads as `1`, `50` as `10`). |
 | `quick_prompt_kind` | string | `"claude"` | Agents | Which AGENT KIND the QUICK PROMPT (`p`) launches: `claude`, `codex`, `cursor` or `pi`. Its model and effort come from that kind's own defaults below, so this is one name, not a third pair. A kind switched off here is stepped around. |
 | `quick_prompt_focus` | bool | `false` | Agents | QUICK PROMPT FOCUS: whether a QUICK PROMPT launch enters and locks the new session's TERMINAL PANE. Off, its row is selected and previewed but FOCUS stays on the panel you fired from. Only the QUICK PROMPT reads it — every other launch takes the pane. |
 | `claude_enabled` | bool | `true` | Agents | HARNESS TOGGLE. Off leaves Claude out of the NEW SESSION PICKER and the PR SESSION picker, and skips the standing PREWARM POOL slot; existing sessions keep attaching and resuming. The last kind left on cannot be switched off. |
@@ -103,7 +109,9 @@ on the next ATTACH or prewarm, and an agent RESUMES its conversation there.
   the daemon and the TUI, so hand edits apply without a restart. `s` opens the settings overlay over the
   same file: color theme, animations, whether the Workspaces bar, PROJECTS PANEL,
   and WORKTREES PANEL are shown,
-  editor, which agent CLIs the new-session menu offers (at least one stays on) and their default model
+  editor, the branch new worktrees start from (`worktree_base_branch`: `auto` for origin's default
+  branch, or a name such as `master`, typed into a prompt that `Enter` opens on the row), which
+  agent CLIs the new-session menu offers (at least one stays on) and their default model
   and reasoning effort, the idle timeout, whether a warm spare and a worktree's dead sessions are
   pre-booted (`prewarm_agents`, `prewarm_sessions`), the done sound (`done_sound`: a ding
   when a turn finishes — a macOS system sound such as `Glass`, the default; `bell` for the terminal
@@ -111,8 +119,9 @@ on the next ATTACH or prewarm, and an agent RESUMES its conversation there.
   `nebula ssh` and off macOS it is always the bell), the feedback sound (`feedback_sound`: the same
   choices, `Sosumi` by default, rung when a turn stops to ask you — and, while the terminal window
   is in the background, a desktop notification naming the session and its worktree; `off` silences
-  both), and whether new sessions stop to ask for a
-  name. `R` inside the overlay puts every setting — hotkeys included — back to its default, after a
+  both), whether new sessions stop to ask for a
+  name, and whether `a` asks before archiving one (`confirm_on_archive`, off unless you turn it
+  on). `R` inside the overlay puts every setting — hotkeys included — back to its default, after a
   confirmation.
 - **Every panel key is rebindable.** The overlay's Hotkeys tab lists every action and what it answers to,
   and writes overrides into the same file (`"keybindings": {"git_diff": "ctrl+g, g"}`); an empty value

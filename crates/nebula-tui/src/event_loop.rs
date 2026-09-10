@@ -34,7 +34,7 @@ mod placeholder;
 mod quick_launch;
 use focus_walk::{
     at_top_row, bar_return_target, double_tapped, enter_terminal_pane, enter_workspaces_bar,
-    leave_workspaces_bar, panel_name, walk_focus_back, walk_focus_forward,
+    land_click_focus, leave_workspaces_bar, panel_name, walk_focus_back, walk_focus_forward,
 };
 pub use host_terminal::restore_terminal;
 use host_terminal::{
@@ -159,7 +159,8 @@ const PR_REFRESH: Duration = Duration::from_secs(15);
 /// afford. Arriving at a project, or focusing a sidebar panel or the
 /// terminal window, pulls the next lookup forward, floored by
 /// `OPEN_PRS_MIN_AGE` so walking the project list can't spend a call per
-/// row.
+/// row. `Shift+R` (`refresh_pull_requests`) is the one gesture that skips
+/// the floor: a deliberate keypress may spend the call.
 const OPEN_PRS_REFRESH: Duration = Duration::from_secs(15);
 const OPEN_PRS_RECHECK_MIN: Duration = Duration::from_secs(30);
 const OPEN_PRS_RECHECK_MAX: Duration = Duration::from_secs(10 * 60);
@@ -305,6 +306,13 @@ async fn main_loop(
                 lookup_open_prs(&mut app, &prs_tx, &mut out);
                 next_git_poll = tokio::time::Instant::now() + GIT_POLL;
             }
+            // `r` asked for the pull requests now: the same two lookups the
+            // git tick runs, on this turn instead of up to `GIT_POLL` later.
+            _ = std::future::ready(()), if app.pr_refresh_requested => {
+                app.pr_refresh_requested = false;
+                lookup_pull_request(&mut app, &pr_tx);
+                lookup_open_prs(&mut app, &prs_tx, &mut out);
+            }
             // Metrics poll: always on for the footer's memory/session
             // readout, tightened while the metrics modal is open (its
             // initial reading is requested by the M keypress itself).
@@ -440,6 +448,7 @@ async fn main_loop(
                             // closed since the list was fetched, the row goes
                             // now rather than at the next refresh.
                             let retired = !detail.is_open();
+                            adopt_pr_state(&mut app, &detail);
                             app.pr_detail.insert(url.clone(), detail);
                             if retired {
                                 drop_retired_pr(&mut app, &url, &mut out);
@@ -753,19 +762,47 @@ fn reconcile_open_pr_cursor(
 }
 
 /// Forget the description and conversation of every pull request that is no
-/// longer open anywhere. `pr_detail` is a session cache — deliberately, a
-/// PR's body doesn't change while you read it — so without this a workspace
-/// left running for a week accumulates the full text of every pull request
-/// that has since been merged, and `pr_detail_failed` keeps refusing to
-/// re-ask about numbers that have long stopped being on screen.
+/// longer on any row. `pr_detail` is a session cache — deliberately, a PR's
+/// body doesn't change while you read it — so without this a workspace left
+/// running for a week accumulates the full text of every pull request that
+/// has since been merged, and `pr_detail_failed` keeps refusing to re-ask
+/// about numbers that have long stopped being on screen. A checkout's own
+/// PR ROW counts as a row whatever its state: a merged pull request stays
+/// on it (see `pull_request::PullRequest`), and forgetting its body on every
+/// list refresh would re-fetch it every time the pane is read.
 fn forget_retired_prs(app: &mut App) {
     let live: std::collections::HashSet<String> = app
         .open_prs
         .values()
         .flat_map(|o| o.list.iter().map(|pr| pr.url.clone()))
+        .chain(
+            app.pull_requests
+                .values()
+                .flatten()
+                .map(|pr| pr.url.clone()),
+        )
         .collect();
     app.pr_detail.retain(|url, _| live.contains(url));
     app.pr_detail_failed.retain(|url| live.contains(url));
+}
+
+/// Carry the state GitHub just gave for one pull request over to the
+/// checkout row that shows the same one, ahead of that row's own
+/// `PR_REFRESH` beat. The PR ROW keeps a merged or closed pull request
+/// rather than retiring it, so what changes here is its badge — `pr` to
+/// `merged` the moment the pane learns it, not up to fifteen seconds later
+/// — and, on the Sessions panel, its look.
+fn adopt_pr_state(app: &mut App, detail: &crate::pull_request::PrDetail) {
+    for pr in app.pull_requests.values_mut().flatten() {
+        if pr.url != detail.url {
+            continue;
+        }
+        if pr.state != detail.state || pr.is_draft != detail.is_draft {
+            pr.state = detail.state.clone();
+            pr.is_draft = detail.is_draft;
+            app.dirty = true;
+        }
+    }
 }
 
 /// Retire one pull request from every project's list ahead of the next
@@ -967,6 +1004,56 @@ fn schedule_pull_request_refresh(app: &mut App) {
     schedule_pr_lookup(app);
 }
 
+/// `Shift+R`, from any panel: ask GitHub again *now* — the selected
+/// project's open list, the selected worktree's own PR, and the body and
+/// conversation of the pull request the pane is reading — past
+/// every timer and floor the beats keep. `schedule_pull_request_refresh`
+/// is what a focus event may do; this is what a deliberate keypress may
+/// do, so the list's `OPEN_PRS_MIN_AGE` floor does not apply and the two
+/// list lookups fire on the loop's next turn rather than the next git
+/// tick. The flash is the only immediate feedback: the rows repaint once
+/// the answers land, and a machine with no `gh` never repaints at all.
+fn refresh_pull_requests(app: &mut App) {
+    let Some(project) = app.selected_project().map(|p| p.id.clone()) else {
+        return;
+    };
+    if let Some(open) = app.open_prs.get_mut(&project) {
+        open.due = std::time::Instant::now();
+    }
+    schedule_pr_lookup(app);
+    refetch_pr_detail(app);
+    app.pr_refresh_requested = true;
+    app.flash = Some("refreshing pull requests…".into());
+    app.dirty = true;
+}
+
+/// Fetch the previewed pull request's body and conversation again, over
+/// the cached copy. Unlike `schedule_pr_detail` this asks even when an
+/// answer is cached or was refused — that is the point — and leaves the
+/// scroll alone: the reader asked for this, so they must not be sent back
+/// to the top. The cached copy stays on screen until the new one lands;
+/// a lookup already in flight is left to land on its own.
+fn refetch_pr_detail(app: &mut App) {
+    let Some(pr) = app.previewed_pr() else {
+        return;
+    };
+    if app.pr_detail_inflight.contains(&pr.url) {
+        return;
+    }
+    let Some(dir) = app.selected_project().map(|p| p.repo_path.clone()) else {
+        return;
+    };
+    app.pr_detail_failed.remove(&pr.url);
+    app.pending_pr_detail = Some((
+        crate::app::PendingPrDetail {
+            url: pr.url,
+            number: pr.number,
+            dir,
+        },
+        std::time::Instant::now(),
+    ));
+}
+
 /// The panel focus just moved. Landing on the Worktrees or Sessions panel —
 /// the two that show pull requests — is a reason to re-ask GitHub; walking
 /// off them into the pane is not.
@@ -1019,6 +1106,7 @@ fn ui_state_json(app: &App) -> String {
         session_agent: app.selected_session().map(|a| a.id.to_string()),
         show_archived: app.show_archived,
         collapsed: app.collapsed,
+        open_prs_collapsed: app.open_prs_collapsed,
         panel_widths: Some(app.panel_widths),
         diff_files_width: Some(app.diff_files_width),
     };
@@ -1076,6 +1164,7 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
         return false;
     };
     app.show_archived = state.show_archived;
+    app.open_prs_collapsed = state.open_prs_collapsed;
     if let Some(w) = state.panel_widths {
         // normalize_panel_widths re-fits to the actual screen on the next
         // draw.
@@ -1625,8 +1714,12 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 let id = app.tree.active_workspace.clone();
                 open_prompt(app, PromptKind::RenameWorkspace { id });
             }
-            _ => {}
+            Focus::Worktrees | Focus::Terminal => {}
         },
+        // Its own key rather than a meaning `r` takes on where nothing can
+        // be renamed: the selection it acts on is the selected project and
+        // worktree, which every panel has, so it is not scoped to a row.
+        Action::RefreshPullRequests => refresh_pull_requests(app),
         Action::Archive => {
             if app.focus == Focus::Sessions {
                 match app.selected_session_row() {
@@ -1860,6 +1953,21 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
                 .map(|w| w.name.clone())
                 .unwrap_or_default();
             ("Rename workspace".into(), "name".into(), current)
+        }
+        PromptKind::SettingText { kind } => {
+            // Pre-filled with the stored value, not its display label: an
+            // empty row reads `auto` on the overlay but edits as "".
+            let cfg = crate::config::Config::load();
+            let title = crate::config::spec_for(*kind)
+                .map(|s| s.label)
+                .unwrap_or("Setting");
+            let label = match kind {
+                crate::config::SettingKind::WorktreeBaseBranch => {
+                    "branch new worktrees start from (empty = auto: origin's default branch)"
+                }
+                _ => "value (empty = default)",
+            };
+            (title.into(), label.into(), cfg.text_value(*kind))
         }
 
         PromptKind::EditLink { id } => {
@@ -2245,13 +2353,41 @@ fn handle_vim_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Archive is cheap to undo (u), so it skips the confirm dialog.
+/// Archive is cheap to undo (u), so by default it skips the confirm
+/// dialog `d` goes behind. The `confirm_on_archive` SETTING puts one in
+/// front of it — for anyone whose typing keeps landing on the panel and
+/// archiving the session under the cursor. The `a` key and the row menu
+/// both come through here, so the two never differ.
 fn archive_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
+    if crate::config::Config::load().confirm_on_archive {
+        if let Some(a) = app.tree.agents.iter().find(|a| a.id == id) {
+            app.overlay = Some(Overlay::Confirm(confirm_archive_agent(&a.name, id)));
+        }
+        return;
+    }
+    archive_agent_now(app, id, out);
+}
+
+/// The archive itself: release the pane if it shows the agent, then ask
+/// the daemon. Straight from `a` with the confirm off, or from the
+/// dialog's Enter with it on.
+fn archive_agent_now(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
     detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
     send(app, out, |req_id| ClientRequest::ArchiveAgent {
         req_id,
         id,
     });
+}
+
+/// The confirm before an agent is archived, when the setting asks for
+/// one. The message says why saying yes is cheap: `u` undoes it.
+fn confirm_archive_agent(name: &str, id: AgentId) -> ConfirmDialog {
+    ConfirmDialog {
+        title: "Archive agent".into(),
+        message: format!("Archive agent '{name}'? It leaves the list; u brings it back."),
+        action: PendingAction::ArchiveAgent(id),
+        area: ratatui::layout::Rect::default(),
+    }
 }
 
 /// Expand/collapse the ARCHIVED group (A key, header click, context menu).
@@ -2261,6 +2397,30 @@ fn toggle_archived(app: &mut App, out: &mut Vec<ClientRequest>) {
     let before = selection_snapshot(app);
     app.show_archived = !app.show_archived;
     reconcile_selection(app, before, out);
+}
+
+/// Fold/unfold the Worktrees panel's OPEN PRS group (header click, context
+/// menu; ↓ off the last checkout unfolds it too — see `move_selection`).
+/// Folding while the cursor sits on a pull request re-lands it on the last
+/// checkout and brings that checkout's session up, as an arrow key onto it
+/// would: the PTY underneath is deliberately left attached while the
+/// cursor is in the group, so without this the pane would keep showing a
+/// session the cursor is no longer on.
+fn toggle_open_prs(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let on_pr = app.selected_worktree_pr().is_some();
+    app.open_prs_collapsed = !app.open_prs_collapsed;
+    if on_pr {
+        app.sel_worktree = app.worktree_row_count().saturating_sub(1);
+        if app.selected_worktree().is_some() {
+            restore_session(app, out);
+            // A fold is an explicit act, like an archive: the row the
+            // cursor got pushed onto is where it stays, so there is no
+            // key-walk sweep to wait out before attaching.
+            fire_pending_attach(app, out);
+        }
+        schedule_pr_detail(app);
+    }
+    app.dirty = true;
 }
 
 /// Shift+T: create a shell terminal whose pwd is the selection's checkout —
@@ -3236,9 +3396,14 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                     }
                     _ => None,
                 };
+                // A typed setting's prompt stood in for the overlay: Esc
+                // keeps the old value and puts the overlay back on its row.
+                let back_to_settings = matches!(prompt.kind, PromptKind::SettingText { .. });
                 app.overlay = None;
                 out.extend(restore);
-                if let Some((worktree, name)) = back_to_presets {
+                if back_to_settings {
+                    reopen_settings(app);
+                } else if let Some((worktree, name)) = back_to_presets {
                     let index = crate::agent_presets::load()
                         .iter()
                         .position(|p| p.name == name)
@@ -3904,6 +4069,20 @@ fn save_config(app: &mut App, cfg: &crate::config::Config) -> bool {
 }
 
 fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i32) {
+    if let Some(spec) = crate::config::setting_at(tab, index) {
+        if spec.kind.is_text() {
+            // Enter (and a second click) on a typed row opens its prompt in
+            // the overlay's place; Enter and Esc there both bring the
+            // overlay back (`submit_prompt`, the Esc arm). ←/→ have nothing
+            // to step through — say so instead of no-op'ing.
+            if delta == 0 {
+                open_prompt(app, PromptKind::SettingText { kind: spec.kind });
+            } else if let Some(view) = settings_mut(app) {
+                view.info("Enter: type a value   (empty puts the default back)");
+            }
+            return;
+        }
+    }
     let mut cfg = crate::config::Config::load();
     cfg.cycle(tab, index, delta);
     if cfg.enabled_kinds().is_empty() {
@@ -3930,6 +4109,7 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     set_hide_projects(app, cfg.hide_projects);
     set_hide_worktrees(app, cfg.hide_worktrees);
     set_hide_root_worktree(app, cfg.hide_root_worktree);
+    app.recent_prompts = cfg.recent_prompts_shown();
 }
 
 /// `R` in the settings overlay, confirmed: rewrite config.json from the
@@ -4095,16 +4275,18 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
         }
     }
     // An empty agent name falls back to the next free default (agent-1, …),
-    // an empty worktree name to the random branch the prompt offered, and an
+    // an empty worktree name to the random branch the prompt offered, an
     // empty project name undoes the rename — the row goes back to the
-    // folder's own name, which is the only way back from a rename. For every
-    // other prompt an empty field is a cancel.
+    // folder's own name, which is the only way back from a rename — and an
+    // empty typed setting is that row's default (`auto`), which is the only
+    // way back to it. For every other prompt an empty field is a cancel.
     if value.is_empty()
         && !matches!(
             prompt.kind,
             PromptKind::NewAgent { .. }
                 | PromptKind::NewWorktree { .. }
                 | PromptKind::RenameProject { .. }
+                | PromptKind::SettingText { .. }
         )
     {
         app.flash = Some("cancelled: empty input".into());
@@ -4301,6 +4483,28 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 name: value,
             });
         }
+        PromptKind::SettingText { kind } => {
+            // Same path as a toggled row (`apply_setting_at`): write the
+            // file, adopt it live, and land back on the overlay — with the
+            // row's new value in the notice line so the save is visible
+            // even when the label column is what changed.
+            let mut cfg = crate::config::Config::load();
+            cfg.set_text(kind, &value);
+            let saved = save_config(app, &cfg);
+            if saved {
+                apply_config(app, &cfg);
+            }
+            reopen_settings(app);
+            if saved {
+                let label = crate::config::spec_for(kind)
+                    .map(|s| s.label)
+                    .unwrap_or("setting");
+                let shown = cfg.value_label(kind);
+                if let Some(view) = settings_mut(app) {
+                    view.info(format!("{label}: {shown}"));
+                }
+            }
+        }
 
         PromptKind::EditLink { id } => {
             send(app, out, |req_id| ClientRequest::UpdateLink {
@@ -4324,6 +4528,7 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
                 }
             });
         }
+        PendingAction::ArchiveAgent(id) => archive_agent_now(app, id, out),
         PendingAction::DeleteAgent(id) => delete_agent(app, id, out),
         PendingAction::CloseTerminal(id) => close_terminal(app, id, out),
         PendingAction::DeleteLink(id) => {
@@ -4605,6 +4810,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             }
         }
         MenuAction::ToggleArchived => toggle_archived(app, out),
+        MenuAction::ToggleOpenPrs => toggle_open_prs(app, out),
     }
 }
 
@@ -4660,8 +4866,8 @@ fn remember_context(app: &mut App) {
     }
     let row = app.selected_session_row();
     // A link row is not a session. Leaving the worktree with the cursor
-    // parked on one must not forget which session it was last on — that
-    // would blank the pane on the way back.
+    // parked on one must not forget which session it was last on — the way
+    // back would land on the top row instead of the one it was reading.
     if row.as_ref().is_some_and(|r| r.as_link().is_some()) {
         return;
     }
@@ -4713,21 +4919,28 @@ fn restore_context(app: &mut App, out: &mut Vec<ClientRequest>) {
 }
 
 /// After a worktree switch: select and re-attach the worktree's remembered
-/// session; with nothing to restore (or it's gone/archived), blank the pane
-/// rather than keep showing the previous context's session.
+/// session. With nothing remembered (a first visit), or a remembered row
+/// that is gone or archived, land on the top row instead — the most
+/// recently interacted session, or the first shell terminal when no agent
+/// is live — so a worktree with something to show never comes up blank.
+/// Only a worktree with no attachable row at all blanks the pane, rather
+/// than keep showing the previous context's session.
 fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.sel_session = 0;
     schedule_prewarm(app);
     schedule_pr_lookup(app);
+    let rows = app.visible_session_rows();
     let remembered = app
         .selected_worktree()
         .and_then(|w| app.last_session_for_worktree.get(&w.id).cloned());
-    let target = remembered.and_then(|sref| {
-        app.visible_session_rows()
-            .iter()
-            .position(|r| r.sref().as_ref() == Some(&sref) && !r.is_archived_agent())
-            .map(|i| (i, sref))
-    });
+    let attachable = |r: &SessionRow| r.sref().is_some() && !r.is_archived_agent();
+    let target = remembered
+        .and_then(|sref| {
+            rows.iter()
+                .position(|r| r.sref().as_ref() == Some(&sref) && attachable(r))
+        })
+        .or_else(|| rows.iter().position(attachable))
+        .and_then(|i| rows[i].sref().map(|sref| (i, sref)));
     match target {
         Some((index, sref)) => {
             app.sel_session = index;
@@ -5128,7 +5341,24 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
             app.tree.active_workspace_index().unwrap_or(0),
         ),
         Focus::Projects => (app.project_rows().len(), app.sel_project),
-        Focus::Worktrees => (app.worktree_row_count(), app.sel_worktree),
+        Focus::Worktrees => {
+            // Stepping down off the last row into a folded OPEN PRS group
+            // opens it and lands on its first pull request: the rows are
+            // where the cursor is headed, so there is no sense stopping
+            // at the header.
+            let checkouts = app.worktree_row_count();
+            if delta > 0
+                && app.open_prs_collapsed
+                && app.sel_worktree + 1 >= checkouts
+                && !app.all_open_prs().is_empty()
+            {
+                app.open_prs_collapsed = false;
+                app.dirty = true;
+                select_worktree_row(app, checkouts, out);
+                return;
+            }
+            (checkouts, app.sel_worktree)
+        }
         Focus::Sessions => (app.visible_session_rows().len(), app.sel_session),
         Focus::Terminal => return,
     };
@@ -5975,22 +6205,27 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         return;
     }
     // A left-click outside any modal dismisses it, exactly as Esc would, and
-    // is swallowed rather than landing on the panel underneath. One
+    // lands its focus — only its focus — on the panel underneath. One
     // hit-test covers all fifteen variants; what each has to unwind on the
-    // way out lives in `overlay_close`.
+    // way out lives in `overlay_close`, and where focus goes after in
+    // `land_click_focus`. Dismissing can put another modal up (a confirm
+    // backs out to the settings it came from); focus stays put under that.
     if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
         if let Some(overlay) = &app.overlay {
             if crate::overlay_close::click_is_outside(overlay, mouse_pos) {
                 crate::overlay_close::click_outside(app, out);
+                if app.overlay.is_none() {
+                    land_click_focus(app, mouse.column, mouse.row, out);
+                }
                 app.dirty = true;
                 return;
             }
         }
     }
     // An open context menu owns the rest of the mouse: a click on a row
-    // activates it, a right- or middle-click off the rows closes (the left
-    // button never gets here — the pre-check above took it), and everything
-    // is swallowed either way.
+    // activates it, a right- or middle-click off the rows closes and lands
+    // its focus like the left click above (the left button never gets here
+    // — the pre-check took it), and everything is swallowed either way.
     if let Some(Overlay::Menu(menu)) = &app.overlay {
         if let MouseEventKind::Down(_) = mouse.kind {
             let area = menu.area;
@@ -6009,7 +6244,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 }
                 // A click on the menu's own border or a blank row is inert.
                 None if inside => {}
-                None => crate::overlay_close::click_outside(app, out),
+                None => {
+                    crate::overlay_close::click_outside(app, out);
+                    if app.overlay.is_none() {
+                        land_click_focus(app, mouse.column, mouse.row, out);
+                    }
+                }
             }
             app.dirty = true;
         }
@@ -6502,6 +6742,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     app.focus = Focus::Sessions;
                     toggle_archived(app, out);
                 }
+                Some(HitTarget::OpenPrsHeader) => {
+                    app.focus = Focus::Worktrees;
+                    toggle_open_prs(app, out);
+                }
                 Some(HitTarget::PanelBg(focus)) => {
                     // Empty projects list: left click opens the obvious
                     // creation prompt. Other panels just take focus.
@@ -6586,7 +6830,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             let over_worktrees = !app.collapsed
                 && matches!(
                     over,
-                    Some(HitTarget::Worktree(_) | HitTarget::PanelBg(Focus::Worktrees))
+                    Some(
+                        HitTarget::Worktree(_)
+                            | HitTarget::OpenPrsHeader
+                            | HitTarget::PanelBg(Focus::Worktrees)
+                    )
                 );
             let in_term = matches!(over, Some(HitTarget::TerminalPane)) || app.collapsed;
             if over_worktrees {
@@ -6752,10 +7000,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         Focus::Worktrees => app
                             .selected_project()
                             .map(|p| {
-                                vec![MenuItem::new(
+                                let mut items = vec![MenuItem::new(
                                     "New worktree",
                                     MenuAction::NewWorktree(p.id.clone()),
-                                )]
+                                )];
+                                // Only once there is a group to fold.
+                                if !app.all_open_prs().is_empty() {
+                                    items.push(MenuItem::new(
+                                        "Show/hide open PRs",
+                                        MenuAction::ToggleOpenPrs,
+                                    ));
+                                }
+                                items
                             })
                             .unwrap_or_default(),
                         Focus::Sessions => app
@@ -7410,6 +7666,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 }),
             },
         );
@@ -7857,6 +8114,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 }),
             },
         );
@@ -9262,6 +9520,56 @@ mod tests {
         assert!(draft.is_open(), "a draft is an open pull request");
     }
 
+    /// The checkout's own PR ROW keeps a merged pull request, so GitHub's
+    /// answer about that one pull request — fetched for the pane — flips
+    /// the row's badge on the spot instead of retiring it, and the list
+    /// refresh's cache sweep leaves its body alone: the row is still on
+    /// screen, and re-fetching what it reads on every beat would spend an
+    /// API call a refresh.
+    #[test]
+    fn a_detail_that_says_merged_flips_the_branch_row_and_keeps_its_body() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_branch_pr(&mut app, 7, "Attach links");
+        let pid = app.selected_project().expect("a project").id.clone();
+        let wid = nebula_core::WorktreeId("w1".into());
+        let branch_pr = |app: &App| {
+            app.pull_requests
+                .get(&wid)
+                .cloned()
+                .flatten()
+                .expect("the branch's pull request")
+        };
+        assert_eq!(branch_pr(&app).badge(), "pr");
+
+        let mut merged = a_detail(7, "shipped", vec![]);
+        merged.state = "MERGED".into();
+        adopt_pr_state(&mut app, &merged);
+        assert_eq!(
+            branch_pr(&app).badge(),
+            "merged",
+            "the row wears the answer"
+        );
+        assert!(app.dirty, "and repaints for it");
+        assert_eq!(app.visible_links().len(), 1, "but the row is not retired");
+
+        app.pr_detail.insert(pr_url(7), merged);
+        // The project's open list no longer carries #7 — it is merged — and
+        // its refresh sweeps the detail cache.
+        note_open_prs_answer(&mut app, pid, Some(vec![]), &mut Vec::new());
+        assert!(
+            app.pr_detail.contains_key(&pr_url(7)),
+            "the body of a pull request still on a row is kept"
+        );
+
+        // A detail for some other pull request leaves the row alone.
+        let other = a_detail(9, "unrelated", vec![]);
+        app.dirty = false;
+        adopt_pr_state(&mut app, &other);
+        assert_eq!(branch_pr(&app).badge(), "merged");
+        assert!(!app.dirty);
+    }
+
     fn pr_url(number: u64) -> String {
         format!("https://github.com/o/r/pull/{number}")
     }
@@ -9421,6 +9729,7 @@ mod tests {
                 number,
                 url: format!("https://github.com/o/r/pull/{number}"),
                 title: title.into(),
+                state: crate::pull_request::STATE_OPEN.into(),
                 is_draft: false,
                 activity: Vec::new(),
             }),
@@ -9698,8 +10007,9 @@ diff --git a/src/b.rs b/src/b.rs
         );
     }
 
-    /// The pull-request row comes back from git on every lookup, so editing
-    /// or deleting it would be a lie. Both say so instead.
+    /// The pull-request row comes back from git on every lookup, so
+    /// deleting it would be a lie, and `d` says so; `r`, with no URL to
+    /// edit, re-asks GitHub for it instead (its own test below).
     #[test]
     fn the_pull_request_row_cannot_be_edited_or_deleted() {
         let mut app = App::new();
@@ -9710,6 +10020,7 @@ diff --git a/src/b.rs b/src/b.rs
                 number: 7,
                 url: "https://github.com/o/r/pull/7".into(),
                 title: "Attach links".into(),
+                state: crate::pull_request::STATE_OPEN.into(),
                 is_draft: false,
                 activity: Vec::new(),
             }),
@@ -9738,12 +10049,163 @@ diff --git a/src/b.rs b/src/b.rs
             app.flash.as_deref(),
             Some("the pull request comes from git and can't be edited")
         );
+        // Refreshing is its own key, not a meaning `r` takes on here.
+        press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.flash.as_deref(), Some("refreshing pull requests…"));
         // Enter still opens it — reading the PR is the whole point.
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert_eq!(app.flash.as_deref(), Some("opened github.com/o/r/pull/7"));
         assert!(!out
             .iter()
             .any(|r| matches!(r, ClientRequest::DeleteLink { .. })));
+    }
+
+    /// `Shift+R` in the Worktrees panel asks GitHub again at once: the
+    /// project's open list is due despite the `OPEN_PRS_MIN_AGE` floor a
+    /// seconds-old answer keeps for focus events, the worktree's own PR is
+    /// due despite its beat, the loop is flagged to fire both on its next
+    /// turn rather than the git tick, and the flash says so. No prompt
+    /// opens, and no daemon traffic: `gh` runs client-side. Plain `r` —
+    /// the rename key — does nothing here, where nothing is renameable.
+    #[test]
+    fn shift_r_on_the_worktrees_panel_refreshes_pull_requests_now() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let pid = app.selected_project().expect("a project").id.clone();
+        let wid = app.selected_worktree().expect("a worktree").id.clone();
+        note_open_prs_answer(&mut app, pid.clone(), Some(vec![]), &mut Vec::new());
+        app.focus = Focus::Worktrees;
+        schedule_pull_request_refresh(&mut app);
+        assert!(
+            !app.open_prs_lookup_due(&pid),
+            "seconds old: a focus event is held off by the floor"
+        );
+        // The worktree's own PR has no floor, so a focus event does re-ask
+        // it; settle it onto its beat so the key has a timer to skip.
+        note_pr_answer(&mut app, &wid, true);
+        assert!(!app.pr_lookup_due(&wid), "the beat hasn't come round");
+
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
+        assert!(
+            !app.open_prs_lookup_due(&pid) && !app.pr_refresh_requested,
+            "plain r is rename, and refreshes nothing"
+        );
+        assert!(app.overlay.is_none() && app.flash.is_none());
+
+        press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
+        assert!(app.open_prs_lookup_due(&pid), "the key skips the floor");
+        assert!(app.pr_lookup_due(&wid), "and the beat");
+        assert!(
+            app.pr_refresh_requested,
+            "fired on the loop's next turn, not the next git tick"
+        );
+        assert!(app.overlay.is_none(), "nothing to rename here");
+        assert_eq!(app.flash.as_deref(), Some("refreshing pull requests…"));
+        assert!(out.is_empty(), "no daemon traffic — gh runs client-side");
+
+        // The same from an open-PR row of the group, which the pane is
+        // reading: its conversation is asked for again too.
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        app.sel_worktree = app.visible_worktrees().len();
+        app.pr_detail.insert(pr_url(7), a_detail(7, "body", vec![]));
+        app.pr_refresh_requested = false;
+        press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
+        assert!(app.pr_refresh_requested);
+        assert_eq!(
+            app.pending_pr_detail.as_ref().map(|(p, _)| p.url.as_str()),
+            Some(pr_url(7).as_str()),
+            "the cached conversation is re-asked"
+        );
+        assert!(app.overlay.is_none());
+    }
+
+    /// `Shift+R` on the Sessions panel's PR ROW re-asks GitHub: the row's
+    /// own lookup, the project's list, and the conversation the pane is
+    /// reading, fetched again over the cached copy (a refused one is asked
+    /// again too) without rewinding the reader's scroll. It is not tied to
+    /// the row: from an agent row it refreshes just the same, while `r`
+    /// there keeps its rename.
+    #[test]
+    fn shift_r_on_the_pr_row_refreshes_pull_requests() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let url = pr_url(7);
+        let wid = app.selected_worktree().expect("a worktree").id.clone();
+        app.pull_requests.insert(
+            wid.clone(),
+            Some(crate::pull_request::PullRequest {
+                number: 7,
+                url: url.clone(),
+                title: "Attach links".into(),
+                state: crate::pull_request::STATE_OPEN.into(),
+                is_draft: false,
+                activity: Vec::new(),
+            }),
+        );
+        note_pr_answer(&mut app, &wid, true);
+        app.focus = Focus::Sessions;
+        app.sel_session = app
+            .visible_session_rows()
+            .iter()
+            .position(|r| r.as_link().is_some())
+            .expect("pull-request row");
+        // Read once, refused once since, and the reader is partway down.
+        app.pr_detail
+            .insert(url.clone(), a_detail(7, "body", vec![]));
+        app.pr_detail_failed.insert(url.clone());
+        app.pending_pr_detail = None;
+        app.pr_preview_scroll = 12;
+        assert!(!app.pr_lookup_due(&wid));
+
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
+        assert!(app.overlay.is_none(), "no prompt");
+        assert_eq!(app.flash.as_deref(), Some("refreshing pull requests…"));
+        assert!(app.pr_lookup_due(&wid), "the row's own lookup is due");
+        assert!(app.pr_refresh_requested);
+        let (pending, at) = app
+            .pending_pr_detail
+            .as_ref()
+            .expect("the conversation is fetched again");
+        assert_eq!(pending.url, url);
+        assert_eq!(pending.number, 7);
+        assert!(*at <= std::time::Instant::now(), "no hover debounce");
+        assert!(
+            app.pr_detail.contains_key(&url),
+            "the cached copy stays on screen until the new one lands"
+        );
+        assert!(
+            !app.pr_detail_failed.contains(&url),
+            "a refusal is not the last word"
+        );
+        assert_eq!(app.pr_preview_scroll, 12, "the reader is not rewound");
+
+        // One already in flight is left to land: nothing is stacked on it.
+        app.pending_pr_detail = None;
+        app.pr_detail_inflight.insert(url.clone());
+        press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
+        assert!(app.pending_pr_detail.is_none());
+
+        // From an agent row the key refreshes all the same…
+        app.sel_session = 0;
+        app.pr_refresh_requested = false;
+        app.flash = None;
+        press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
+        assert!(app.pr_refresh_requested && app.overlay.is_none());
+        assert_eq!(app.flash.as_deref(), Some("refreshing pull requests…"));
+
+        // …while `r` there still renames.
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
+        match &app.overlay {
+            Some(Overlay::Prompt(p)) => assert!(
+                matches!(p.kind, PromptKind::RenameAgent { .. }),
+                "got {:?}",
+                p.kind
+            ),
+            other => panic!("expected the rename prompt, got {other:?}"),
+        }
     }
 
     /// Shift+D wipes the panel's sessions; links are bookmarks and survive.
@@ -9920,6 +10382,7 @@ diff --git a/src/b.rs b/src/b.rs
                 number: 7,
                 url: "https://github.com/o/r/pull/7".into(),
                 title: "done".into(),
+                state: crate::pull_request::STATE_OPEN.into(),
                 is_draft: false,
                 activity: Vec::new(),
             }),
@@ -9948,6 +10411,7 @@ diff --git a/src/b.rs b/src/b.rs
                 number: 7,
                 url: url.into(),
                 title: "done".into(),
+                state: crate::pull_request::STATE_OPEN.into(),
                 is_draft: false,
                 activity: vec!["2024-04-25T19:55:42Z".into()],
             }),
@@ -9989,6 +10453,7 @@ diff --git a/src/b.rs b/src/b.rs
             number: 7,
             url: url.into(),
             title: "Attach links".into(),
+            state: crate::pull_request::STATE_OPEN.into(),
             is_draft: false,
             activity,
         };
@@ -10426,6 +10891,7 @@ diff --git a/src/b.rs b/src/b.rs
                         status_changed_at: 0,
                         alive: true,
                         cloud_mirroring: false,
+                        recent_prompts: Vec::new(),
                     }),
                 },
             );
@@ -10486,6 +10952,7 @@ diff --git a/src/b.rs b/src/b.rs
                     status_changed_at: changed_at,
                     alive: true,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 }),
             }
         };
@@ -10539,6 +11006,7 @@ diff --git a/src/b.rs b/src/b.rs
                 status_changed_at: at,
                 alive: true,
                 cloud_mirroring: false,
+                recent_prompts: Vec::new(),
             }),
         };
         // A long-running turn outranks a more recent finish, because a
@@ -10618,6 +11086,7 @@ diff --git a/src/b.rs b/src/b.rs
                     status_changed_at: crate::app::now_ms() - 23 * 60_000,
                     alive: true,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 }),
             },
         );
@@ -10682,6 +11151,7 @@ diff --git a/src/b.rs b/src/b.rs
                     status_changed_at: 0,
                     alive: true,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 }),
             },
         );
@@ -10748,6 +11218,7 @@ diff --git a/src/b.rs b/src/b.rs
                     status_changed_at: 0,
                     alive: true,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 }),
             },
         );
@@ -12230,6 +12701,7 @@ diff --git a/src/b.rs b/src/b.rs
                 number: 7,
                 url: "https://github.com/o/r/pull/7".into(),
                 title: "Attach links".into(),
+                state: crate::pull_request::STATE_OPEN.into(),
                 is_draft: false,
                 activity: Vec::new(),
             }),
@@ -12238,7 +12710,10 @@ diff --git a/src/b.rs b/src/b.rs
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("OPEN PRS"), "open-PR header:\n{text}");
+        assert!(
+            text.contains("PULL REQUESTS"),
+            "pull-request header:\n{text}"
+        );
         assert!(
             text.contains("#7 Attach links"),
             "pull request row:\n{text}"
@@ -12250,6 +12725,40 @@ diff --git a/src/b.rs b/src/b.rs
         // The panel's count is a session count; the two link rows don't
         // inflate it.
         assert!(text.contains("SESSIONS · 1"), "session count:\n{text}");
+    }
+
+    /// The branch's pull request outlives its merge on the row: the
+    /// checkout is still here, and its PR is what you check before archiving
+    /// or deleting it. The badge says what became of it, and the group's
+    /// header does not claim the row is open.
+    #[test]
+    fn a_merged_branch_pull_request_stays_on_its_row_badged() {
+        let mut app = App::new();
+        app.show_workspaces = false;
+        seed_tree(&mut app);
+        app.pull_requests.insert(
+            nebula_core::WorktreeId("w1".into()),
+            Some(crate::pull_request::PullRequest {
+                number: 7,
+                url: "https://github.com/o/r/pull/7".into(),
+                title: "Attach links".into(),
+                state: crate::pull_request::STATE_MERGED.into(),
+                is_draft: false,
+                activity: Vec::new(),
+            }),
+        );
+        assert_eq!(
+            app.visible_links().len(),
+            1,
+            "a merged pull request is still the checkout's row"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("PULL REQUESTS"), "header:\n{text}");
+        assert!(text.contains("#7 Attach links"), "the row:\n{text}");
+        assert!(text.contains(" merged"), "its badge:\n{text}");
     }
 
     #[test]
@@ -12661,6 +13170,7 @@ diff --git a/src/b.rs b/src/b.rs
                 status_changed_at: 0,
                 alive: true,
                 cloud_mirroring: false,
+                recent_prompts: Vec::new(),
             })
         };
         hse(
@@ -12748,6 +13258,7 @@ diff --git a/src/b.rs b/src/b.rs
                     status_changed_at: 0,
                     alive: false,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 }),
             },
         );
@@ -12797,6 +13308,7 @@ diff --git a/src/b.rs b/src/b.rs
             status_changed_at: 0,
             alive: false,
             cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         })
     }
 
@@ -12857,6 +13369,76 @@ diff --git a/src/b.rs b/src/b.rs
             Some("agent-1".into()),
             "cursor lands on a surviving row"
         );
+    }
+
+    /// The ARCHIVED collapse is one global switch, not a per-worktree one:
+    /// collapsing it under one worktree hides the archived rows of every
+    /// other worktree too, walking the cursor across worktrees never flips
+    /// it back, and it round-trips through the persisted UI state as a
+    /// single flag.
+    #[test]
+    fn archived_collapse_is_global_across_worktrees() {
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 / w1(main) / a1
+        for entity in [
+            wt_entity("w2", "p1", "feature", false),
+            agent_entity("a2", "w2", "agent-2", false),
+            archived_agent("old-1", "old-1", 100, 5), // on w1
+            agent_entity("old-2", "w2", "old-2", true),
+        ] {
+            hse(&mut app, ServerEvent::EntityUpserted { entity });
+        }
+        app.show_archived = true;
+        let mut out = Vec::new();
+        let w1 = WorktreeId("w1".into());
+        let w2 = WorktreeId("w2".into());
+        let archived_visible = |app: &App| app.visible_sessions().iter().any(|a| a.archived);
+        assert!(
+            archived_visible(&app),
+            "expanded: w1 lists its archived row"
+        );
+
+        // Collapse under w1.
+        app.focus = Focus::Sessions;
+        press(&mut app, KeyCode::Char('A'), KeyModifiers::SHIFT, &mut out);
+        assert!(!app.show_archived, "A collapses the group");
+        assert!(
+            !archived_visible(&app),
+            "collapsed: w1 hides its archived row"
+        );
+
+        // Walk to w2: still collapsed there, the header still counts the row.
+        app.focus = Focus::Worktrees;
+        move_selection(&mut app, 1, &mut out);
+        assert_eq!(app.selected_worktree().map(|w| w.id.clone()), Some(w2));
+        assert!(!app.show_archived, "a worktree switch never re-expands");
+        assert!(
+            !archived_visible(&app),
+            "collapsed: w2 hides its archived row too"
+        );
+        assert_eq!(
+            app.session_group_counts(),
+            (1, 1),
+            "the header still counts w2's archived row"
+        );
+
+        // Expand under w2, walk back to w1: expanded there as well.
+        app.focus = Focus::Sessions;
+        press(&mut app, KeyCode::Char('A'), KeyModifiers::SHIFT, &mut out);
+        assert!(archived_visible(&app), "expanded under w2");
+        app.focus = Focus::Worktrees;
+        move_selection(&mut app, -1, &mut out);
+        assert_eq!(app.selected_worktree().map(|w| w.id.clone()), Some(w1));
+        assert!(app.show_archived, "a worktree switch never re-collapses");
+        assert!(archived_visible(&app), "expanded under w1 again");
+
+        // One flag in the persisted blob, restored the same for every worktree.
+        let json = ui_state_json(&app);
+        assert!(json.contains(r#""show_archived":true"#), "{json}");
+        let mut restored = App::new();
+        seed_tree(&mut restored);
+        restore_ui_state(&mut restored, &json);
+        assert!(restored.show_archived);
     }
 
     /// An ARCHIVED group taller than the panel scrolls: the wheel moves the
@@ -12962,6 +13544,109 @@ diff --git a/src/b.rs b/src/b.rs
             &mut out,
         );
         assert!(!app.show_archived, "second click collapses");
+    }
+
+    /// Clicking the OPEN PRS header folds the group down to its count and
+    /// opens it back up. Folding away the row the cursor is on lands it on
+    /// the last checkout, whose session comes back into the pane.
+    #[test]
+    fn clicking_the_open_prs_header_folds_the_group() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Number lines")]);
+        let mut out = Vec::new();
+        app.sel_worktree = 2;
+        assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(9));
+
+        app.hits.push((
+            ratatui::layout::Rect::new(0, 5, 20, 1),
+            HitTarget::OpenPrsHeader,
+        ));
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 1, 5),
+            &mut out,
+        );
+        assert!(app.open_prs_collapsed, "click on the header folds");
+        assert_eq!(app.focus, Focus::Worktrees);
+        assert_eq!(app.worktree_row_count(), 1, "the rows are gone");
+        assert_eq!(app.sel_worktree, 0, "the cursor lands on the checkout");
+        assert!(app.selected_worktree_pr().is_none());
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == a1)),
+            "the checkout's session comes back: {out:?}"
+        );
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 1, 5),
+            &mut out,
+        );
+        assert!(!app.open_prs_collapsed, "second click opens it back up");
+        assert_eq!(app.worktree_row_count(), 3);
+        assert_eq!(app.sel_worktree, 0, "unfolding leaves the cursor be");
+    }
+
+    /// ↓ off the last checkout into a folded group opens it and lands on
+    /// its first pull request — the header is not a stop on the way. ↑ back
+    /// out leaves it open; only the header (or the menu) folds it again.
+    #[test]
+    fn stepping_down_into_a_folded_open_pr_group_unfolds_it() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Number lines")]);
+        app.focus = Focus::Worktrees;
+        app.open_prs_collapsed = true;
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert!(!app.open_prs_collapsed, "the step opens the group");
+        assert_eq!(app.sel_worktree, 1, "…and lands on its first row");
+        assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.sel_worktree, 0);
+        assert!(!app.open_prs_collapsed, "walking back out leaves it open");
+
+        // A folded group with nothing in it is not a stop either: ↓ on the
+        // last checkout stays put, as it always did.
+        app.open_prs.clear();
+        app.open_prs_collapsed = true;
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.sel_worktree, 0);
+        assert!(app.open_prs_collapsed);
+    }
+
+    /// Folded, the group is one dim line whose triangle and count say what
+    /// a click would open — the rows leave the column and the checkouts
+    /// have it to themselves. Open, the triangle turns down.
+    #[test]
+    fn a_folded_open_pr_group_is_just_its_header() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Number lines")]);
+        app.open_prs_collapsed = true;
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("▸ OPEN PRS · 2"), "folded header:\n{text}");
+        assert!(!text.contains("Attach links"), "no PR rows:\n{text}");
+        assert!(
+            app.hits.iter().any(|(_, h)| *h == HitTarget::OpenPrsHeader),
+            "the folded header is a click target"
+        );
+
+        app.open_prs_collapsed = false;
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("▾ OPEN PRS · 2"), "open header:\n{text}");
+        assert!(text.contains("#7 Attach links"), "PR rows back:\n{text}");
+        assert!(
+            app.hits.iter().any(|(_, h)| *h == HitTarget::OpenPrsHeader),
+            "the open header is a click target too"
+        );
     }
 
     #[test]
@@ -13667,6 +14352,28 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(legacy.panel_widths, crate::app::DEFAULT_PANEL_WIDTHS);
     }
 
+    /// The fold is remembered like the ARCHIVED toggle: it rides the
+    /// UI-state blob out and back, and a blob from before it existed leaves
+    /// the group open.
+    #[test]
+    fn ui_state_roundtrip_includes_the_open_prs_fold() {
+        let mut app = App::new();
+        app.open_prs_collapsed = true;
+        let json = ui_state_json(&app);
+        assert!(json.contains(r#""open_prs_collapsed":true"#), "{json}");
+
+        let mut restored = App::new();
+        restore_ui_state(&mut restored, &json);
+        assert!(restored.open_prs_collapsed);
+
+        let mut legacy = App::new();
+        restore_ui_state(
+            &mut legacy,
+            r#"{"project":null,"worktree":null,"session_agent":null,"show_archived":false,"collapsed":false}"#,
+        );
+        assert!(!legacy.open_prs_collapsed, "old blobs keep the group open");
+    }
+
     fn project(id: &str, name: &str, sort_order: i64) -> nebula_core::Entity {
         use nebula_core::{Entity, Project, ProjectId};
         Entity::Project(Project {
@@ -13718,6 +14425,7 @@ diff --git a/src/b.rs b/src/b.rs
             status_changed_at: 0,
             alive: true,
             cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         };
 
         // a1 is the selected session; its upsert lands under w2.
@@ -14013,6 +14721,7 @@ diff --git a/src/b.rs b/src/b.rs
             status_changed_at: at,
             alive: true,
             cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         })
     }
 
@@ -14402,6 +15111,97 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(branch.split('-').count(), 3, "not a random name: {branch}");
     }
 
+    /// A worktree with no remembered session — the first visit, or a
+    /// remembered row that has since vanished — comes up on its top row,
+    /// the most recently interacted session, not on a blank pane.
+    #[test]
+    fn a_worktree_with_nothing_remembered_shows_its_most_recent_session() {
+        use nebula_core::Entity;
+        let mut app = App::new();
+        seed_tree(&mut app); // p1/w1(main) + a1
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: wt_entity("w2", "p1", "other", false),
+            },
+        );
+        // Two idle sessions on w2, upserted oldest-interaction first so
+        // tree order and recency order disagree: the fallback must land on
+        // the row the list shows at the top, which is by recency.
+        let stamped = |id: &str, name: &str, stamp: i64| {
+            let Entity::Agent(mut a) = agent_entity(id, "w2", name, false) else {
+                unreachable!()
+            };
+            a.status = nebula_core::AgentStatus::Finished;
+            a.status_changed_at = stamp;
+            Entity::Agent(a)
+        };
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: stamped("a2", "older", 1_000),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: stamped("a3", "newer", 2_000),
+            },
+        );
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        let a3 = SessionRef::Agent(AgentId("a3".into()));
+        let w2 = WorktreeId("w2".into());
+        let mut out = Vec::new();
+        attach(&mut app, a1.clone(), &mut out);
+        out.clear();
+
+        // First visit: nothing is remembered for w2.
+        assert!(!app.last_session_for_worktree.contains_key(&w2));
+        select_worktree_row(&mut app, 1, &mut out);
+        assert_eq!(
+            app.selected_worktree().map(|w| w.branch.clone()),
+            Some("other".into())
+        );
+        fire_pending_attach(&mut app, &mut out);
+        assert_eq!(app.sel_session, 0, "cursor on the top row");
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(a3.clone()),
+            "the pane shows the most recently interacted session"
+        );
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == a3)),
+            "a3 is attached: {out:?}"
+        );
+
+        // A remembered session that no longer exists falls back the same
+        // way instead of blanking.
+        select_worktree_row(&mut app, 0, &mut out);
+        fire_pending_attach(&mut app, &mut out);
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(a1.clone()),
+            "back on w1, its remembered session"
+        );
+        app.last_session_for_worktree
+            .insert(w2.clone(), SessionRef::Agent(AgentId("gone".into())));
+        out.clear();
+        select_worktree_row(&mut app, 1, &mut out);
+        fire_pending_attach(&mut app, &mut out);
+        assert_eq!(app.sel_session, 0);
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(a3.clone()),
+            "a vanished memory lands on the top row"
+        );
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == a3)),
+            "a3 is re-attached: {out:?}"
+        );
+    }
+
     #[test]
     fn switching_contexts_restores_the_remembered_session() {
         use nebula_core::{Entity, Worktree, WorktreeId};
@@ -14532,6 +15332,7 @@ diff --git a/src/b.rs b/src/b.rs
                     status_changed_at: 0,
                     alive: true,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 }),
             },
         );
@@ -15492,6 +16293,7 @@ diff --git a/src/b.rs b/src/b.rs
                     status_changed_at: 0,
                     alive: true,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 }),
             },
         );
@@ -15515,6 +16317,7 @@ diff --git a/src/b.rs b/src/b.rs
                     status_changed_at: 0,
                     alive: false,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 }),
             },
         );
@@ -15745,6 +16548,7 @@ diff --git a/src/b.rs b/src/b.rs
             status_changed_at: 500,
             alive: true,
             cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         };
         for a in [
             agent("ask", "w2", AgentStatus::NeedsFeedback, false),
@@ -16036,7 +16840,7 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
-    fn palette_enter_on_worktree_navigates_without_attaching() {
+    fn palette_enter_on_worktree_previews_its_top_session_without_locking() {
         let mut app = App::new();
         seed_tree(&mut app);
         seed_second_project(&mut app);
@@ -16055,11 +16859,17 @@ diff --git a/src/b.rs b/src/b.rs
             Focus::Sessions,
             "a worktree pick lands in its Sessions panel, not the Worktrees column"
         );
+        // Nothing is remembered on the target worktree, so the switch lands
+        // on its top row and previews it, exactly like a manual switch —
+        // a preview, not Enter on the row, so the pane is not locked.
+        let a2 = SessionRef::Agent(AgentId("a2".into()));
+        assert_eq!(app.sel_session, 0);
+        assert_eq!(app.term.as_ref().map(|t| t.sref.clone()), Some(a2.clone()));
         assert!(!app.term_locked);
         assert!(
-            !out.iter()
-                .any(|r| matches!(r, ClientRequest::Attach { .. })),
-            "no remembered session on the target worktree, so nothing attaches: {out:?}"
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == a2)),
+            "the top session previews: {out:?}"
         );
     }
 
@@ -16203,6 +17013,7 @@ diff --git a/src/b.rs b/src/b.rs
                     status_changed_at: 0,
                     alive: true,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 }),
             },
         );
@@ -16474,6 +17285,100 @@ diff --git a/src/b.rs b/src/b.rs
         });
     }
 
+    /// The WORKTREE BASE BRANCH row is typed, not cycled: Enter opens a
+    /// prompt in the overlay's place, pre-filled with the stored value;
+    /// Enter there saves the name and lands back on the same row, Esc
+    /// keeps the old value and lands there too, and an empty Enter puts
+    /// `auto` back. ←/→ only explain themselves.
+    #[test]
+    fn settings_worktree_base_branch_is_typed_through_a_prompt() {
+        use crate::config::SettingKind::WorktreeBaseBranch;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        crate::config::with_config_path(path.clone(), || {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            let (tab, row) = crate::config::locate(WorktreeBaseBranch).unwrap();
+            open_settings_on(&mut app, tab, &mut out);
+            for _ in 0..row {
+                press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            }
+            let saved = |path: &std::path::Path| -> serde_json::Value {
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+            };
+
+            // ←/→: nothing to cycle, the overlay stays and explains.
+            press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
+            let view = settings_view(&app);
+            assert_eq!(view.selected, row);
+            assert!(
+                view.notice
+                    .as_ref()
+                    .is_some_and(|(t, _)| t.contains("Enter")),
+                "→ on a typed row says Enter types it: {:?}",
+                view.notice
+            );
+            assert_eq!(crate::config::Config::load().worktree_base_branch, "");
+
+            // Enter: a prompt in the overlay's place, empty like the value.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("expected the branch prompt, got {:?}", app.overlay);
+            };
+            assert_eq!(prompt.title, "Worktree base branch");
+            assert_eq!(prompt.input.as_str(), "");
+            assert!(
+                matches!(prompt.kind, PromptKind::SettingText { kind } if kind == WorktreeBaseBranch)
+            );
+
+            type_text(&mut app, "master", &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(out.is_empty(), "a setting is a file write, not a request");
+            assert_eq!(crate::config::Config::load().worktree_base_branch, "master");
+            assert_eq!(saved(&path)["worktree_base_branch"], "master");
+            let view = settings_view(&app);
+            assert_eq!((view.tab, view.selected, view.on_tabs), (tab, row, false));
+            assert!(
+                view.notice
+                    .as_ref()
+                    .is_some_and(|(t, _)| t.contains("master")),
+                "the notice shows the saved value: {:?}",
+                view.notice
+            );
+
+            // Reopened, the prompt carries the stored value; Esc keeps it.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("expected the branch prompt, got {:?}", app.overlay);
+            };
+            assert_eq!(prompt.input.as_str(), "master");
+            type_text(&mut app, "-typo", &mut out);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert_eq!(crate::config::Config::load().worktree_base_branch, "master");
+            let view = settings_view(&app);
+            assert_eq!((view.tab, view.selected), (tab, row));
+
+            // An empty Enter is the way back to auto — stored as "".
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            for _ in 0.."master".len() {
+                press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(out.is_empty());
+            assert_eq!(crate::config::Config::load().worktree_base_branch, "");
+            assert_eq!(saved(&path)["worktree_base_branch"], "");
+            let view = settings_view(&app);
+            assert_eq!(view.selected, row);
+            assert!(
+                view.notice
+                    .as_ref()
+                    .is_some_and(|(t, _)| t.contains("auto")),
+                "back to auto: {:?}",
+                view.notice
+            );
+        });
+    }
+
     #[test]
     fn settings_overlay_renders_labels() {
         let mut app = App::new();
@@ -16630,19 +17535,25 @@ diff --git a/src/b.rs b/src/b.rs
         crate::config::with_config_path(dir.path().join("config.json"), || {
             let mut app = App::new();
             let mut out = Vec::new();
-            open_settings_on(&mut app, 0, &mut out);
+            // The Editor row, found by name: the General tab's rows above
+            // it are free to change.
+            let (tab, editor_row) =
+                crate::config::locate(crate::config::SettingKind::Editor).unwrap();
+            assert_eq!(tab, 0);
+            open_settings_on(&mut app, tab, &mut out);
             assert!(!settings_view(&app).on_tabs);
             // In the list, → cycles the selected setting's value.
-            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            for _ in 0..editor_row {
+                press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            }
             press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
             assert_eq!(crate::config::Config::load().editor, "nvim");
             assert_eq!(settings_view(&app).tab, 0, "→ did not move the tab");
 
             // ↑ off the top row steps onto the strip; now → is the tab.
-            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+            for _ in 0..=editor_row {
+                press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+            }
             assert!(settings_view(&app).on_tabs, "↑ off the top row parks here");
             press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
             assert_eq!(settings_view(&app).tab, 1);
@@ -18217,6 +19128,7 @@ diff --git a/src/b.rs b/src/b.rs
                         status_changed_at: 0,
                         alive: true,
                         cloud_mirroring: false,
+                        recent_prompts: Vec::new(),
                     }),
                 },
             );
@@ -18288,6 +19200,7 @@ diff --git a/src/b.rs b/src/b.rs
             status_changed_at: 0,
             alive: true,
             cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         })
     }
 
@@ -18310,7 +19223,14 @@ diff --git a/src/b.rs b/src/b.rs
         app.term = Some(AttachedTerm::new(a1.clone(), 40, 10));
 
         let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+        // `a` reads `confirm_on_archive`; the default (off) archives at
+        // once, with no dialog in the way.
+        with_default_config(|| press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out));
+        assert!(
+            app.overlay.is_none(),
+            "no confirm by default: {:?}",
+            app.overlay
+        );
         assert!(
             out.iter()
                 .any(|r| matches!(r, ClientRequest::ArchiveAgent { .. })),
@@ -18343,6 +19263,89 @@ diff --git a/src/b.rs b/src/b.rs
             Some(a2),
             "the pane shows the newly highlighted session"
         );
+    }
+
+    /// With `confirm_on_archive` on, `a` asks first: nothing is sent until
+    /// the dialog is answered, Esc keeps the session, and Enter archives
+    /// it exactly as the bare key would have — pane released and all.
+    #[test]
+    fn confirm_on_archive_puts_a_dialog_in_front_of_a() {
+        with_config_json(r#"{"confirm_on_archive": true}"#, || {
+            let mut app = App::new();
+            seed_tree(&mut app); // p1 / w1(main) / a1
+            app.focus = Focus::Sessions;
+            app.sel_session = 0;
+            let a1 = SessionRef::Agent(AgentId("a1".into()));
+            app.term = Some(AttachedTerm::new(a1.clone(), 40, 10));
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Confirm(c))
+                        if c.action == PendingAction::ArchiveAgent(AgentId("a1".into()))
+                ),
+                "a opens the archive confirm: {:?}",
+                app.overlay
+            );
+            assert!(
+                !out.iter()
+                    .any(|r| matches!(r, ClientRequest::ArchiveAgent { .. })),
+                "nothing is archived before the answer: {out:?}"
+            );
+            assert!(
+                app.term.is_some(),
+                "the pane stays attached while the dialog is up"
+            );
+
+            // Esc backs out: the session stays, nothing was sent.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "Esc closes the confirm");
+            assert!(
+                !out.iter()
+                    .any(|r| matches!(r, ClientRequest::ArchiveAgent { .. })),
+                "backing out archives nothing: {out:?}"
+            );
+            assert!(app.term.is_some(), "backing out keeps the pane");
+
+            // Enter goes through, exactly as the bare key would have.
+            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "Enter closes the confirm");
+            assert!(
+                out.iter().any(|r| matches!(
+                    r,
+                    ClientRequest::ArchiveAgent { id, .. } if *id == AgentId("a1".into())
+                )),
+                "Enter archives the agent: {out:?}"
+            );
+            assert!(app.term.is_none(), "the archive releases the pane");
+        })
+    }
+
+    /// The row menu's Archive goes through the same gate as `a`.
+    #[test]
+    fn confirm_on_archive_gates_the_row_menu_too() {
+        with_config_json(r#"{"confirm_on_archive": true}"#, || {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let mut out = Vec::new();
+            run_menu_action(
+                &mut app,
+                MenuAction::ArchiveAgent(AgentId("a1".into())),
+                &mut out,
+            );
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Confirm(c)) if matches!(c.action, PendingAction::ArchiveAgent(_))
+                ),
+                "the menu's Archive asks too: {:?}",
+                app.overlay
+            );
+            assert!(out.is_empty(), "nothing sent before the answer: {out:?}");
+        })
     }
 
     /// Archiving a row ABOVE the cursor must not drag the highlight onto a
@@ -18717,6 +19720,7 @@ diff --git a/src/b.rs b/src/b.rs
                     status_changed_at: 0,
                     alive: true,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 }),
             },
         );
@@ -18912,6 +19916,7 @@ diff --git a/src/b.rs b/src/b.rs
                     status_changed_at: 0,
                     alive: true,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 }),
             },
         );
@@ -19011,6 +20016,7 @@ diff --git a/src/b.rs b/src/b.rs
                     status_changed_at: 0,
                     alive: true,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 }),
             },
         );
@@ -19041,6 +20047,7 @@ diff --git a/src/b.rs b/src/b.rs
                     status_changed_at: 0,
                     alive: true,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 }),
             },
         );
@@ -19116,6 +20123,7 @@ diff --git a/src/b.rs b/src/b.rs
                     status_changed_at: 0,
                     alive: true,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 }),
             },
         );
@@ -21279,6 +22287,7 @@ diff --git a/src/b.rs b/src/b.rs
                         status_changed_at: 0,
                         alive: true,
                         cloud_mirroring: false,
+                        recent_prompts: Vec::new(),
                     }),
                 },
             );
@@ -22248,6 +23257,139 @@ diff --git a/src/b.rs b/src/b.rs
         );
         click(&mut app, 0, 0, &mut out);
         assert!(app.overlay.is_none(), "outside click closes");
+    }
+
+    // ---- …and lands its focus on the panel it hit ----
+
+    /// The rect a panel row was drawn in on the last draw, and a check that
+    /// it sits beside the modal rather than under it — a click under the
+    /// modal is an inside click, and the test would be pressing the wrong
+    /// thing.
+    fn row_beside_modal(app: &App, modal: ratatui::layout::Rect, hit: HitTarget) -> (u16, u16) {
+        let rect = app
+            .hits
+            .iter()
+            .find(|(_, h)| *h == hit)
+            .map(|(rect, _)| *rect)
+            .unwrap_or_else(|| panic!("{hit:?} is not on screen"));
+        let at = ratatui::layout::Position::new(rect.x, rect.y);
+        assert!(
+            !modal.contains(at),
+            "{hit:?} at {rect:?} is under the modal {modal:?}"
+        );
+        (rect.x, rect.y)
+    }
+
+    /// The click that dismissed the modal was aimed at a panel: that panel
+    /// takes focus. Only focus — the row under the pointer is neither
+    /// selected nor previewed, so nothing goes to the daemon.
+    #[test]
+    fn click_outside_focuses_the_panel_beneath_without_acting_on_it() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE, &mut out);
+        let modal = drawn_modal_area(&mut app);
+        let (x, y) = row_beside_modal(&app, modal, HitTarget::Project(1));
+        out.clear();
+        click(&mut app, x, y, &mut out);
+        assert!(app.overlay.is_none(), "outside click closes");
+        assert_eq!(app.focus, Focus::Projects, "…and focuses the panel it hit");
+        assert_eq!(app.sel_project, 0, "the cursor did not move to the row");
+        assert!(out.is_empty(), "nothing selected or previewed: {out:?}");
+    }
+
+    /// Landing in the pane is the pane's own click: focus and the input
+    /// lock, so what the user types next reaches the agent.
+    #[test]
+    fn click_outside_into_the_pane_focuses_and_locks_it() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            40,
+            10,
+        ));
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE, &mut out);
+        let modal = drawn_modal_area(&mut app);
+        // The modal is centred over the pane; its bottom-right cell is not.
+        let pane = app.term_area;
+        let (x, y) = (pane.x + pane.width - 1, pane.y + pane.height - 1);
+        assert!(
+            !modal.contains(ratatui::layout::Position::new(x, y)),
+            "the pane's corner {x},{y} is beside the modal {modal:?}"
+        );
+        assert!(!app.term_locked);
+        click(&mut app, x, y, &mut out);
+        assert!(app.overlay.is_none(), "outside click closes");
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked, "a click into the pane locks input");
+    }
+
+    /// Dismissing can put another modal up — the settings-reset confirm
+    /// backs out to the settings overlay — and focus stays put under it:
+    /// the click never reached the panels.
+    #[test]
+    fn click_outside_that_backs_out_to_another_modal_moves_no_focus() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
+            assert!(
+                matches!(app.overlay, Some(Overlay::Confirm(_))),
+                "{:?}",
+                app.overlay
+            );
+            let before = app.focus;
+            let modal = drawn_modal_area(&mut app);
+            let (x, y) = row_beside_modal(&app, modal, HitTarget::Worktree(0));
+            click(&mut app, x, y, &mut out);
+            assert!(
+                matches!(app.overlay, Some(Overlay::Settings(_))),
+                "back to the overlay, not the panels: {:?}",
+                app.overlay
+            );
+            assert_eq!(
+                app.focus, before,
+                "focus stays under the modal that came back"
+            );
+        });
+    }
+
+    /// A right-click off a context menu's rows closes it the same way, and
+    /// lands its focus the same way.
+    #[test]
+    fn menu_right_click_off_the_rows_lands_focus_too() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Menu(_))),
+            "{:?}",
+            app.overlay
+        );
+        let modal = drawn_modal_area(&mut app);
+        let (x, y) = row_beside_modal(&app, modal, HitTarget::Project(0));
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Right), x, y),
+            &mut out,
+        );
+        assert!(app.overlay.is_none(), "the menu closes");
+        assert_eq!(
+            app.focus,
+            Focus::Projects,
+            "…and the panel under the pointer takes focus"
+        );
     }
 
     // ---- every modal has all three exits ----

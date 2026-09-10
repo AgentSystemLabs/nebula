@@ -197,6 +197,62 @@ pub async fn add_worktree_off_default(repo: &Path, branch: &str) -> Result<PathB
     add_worktree_inner(repo, branch, base.as_deref(), false).await
 }
 
+/// `add_worktree` for a base the caller named (`nebula worktree --base
+/// <ref>`). `origin` is fetched first, and a branch origin has — `main`,
+/// `release` — means origin's copy of it, `origin/main`, never the
+/// checkout's local branch of that name: that one is whatever this
+/// checkout last pulled, routinely commits behind. Cut with `--no-track`
+/// like a default-base worktree, for the same reason. A ref origin has no
+/// branch for — a tag, a SHA, a local-only branch, an explicit `origin/x`,
+/// or `HEAD` (always this checkout's) — is used as named and tracks as git
+/// decides. The rewrite does not wait on the fetch succeeding: offline,
+/// `origin/main` as last fetched is still never behind the local branch's
+/// last pull, and the daemon log says the fetch failed.
+pub async fn add_worktree_off_ref(repo: &Path, branch: &str, base: &str) -> Result<PathBuf> {
+    fetch_origin_if_any(repo).await;
+    match origin_branch(repo, base).await {
+        Some(remote) => add_worktree_inner(repo, branch, Some(&remote), false).await,
+        None => add_worktree_inner(repo, branch, Some(base), true).await,
+    }
+}
+
+/// `add_worktree` for a branch nobody named a base for when the
+/// `worktree_base_branch` SETTING names one (`master`, `develop`): the
+/// stand-in for `origin/HEAD` in repos whose default branch is not what
+/// origin says, or that have no origin at all. Resolved like `--base`:
+/// `origin` is fetched first, and origin's copy of the branch
+/// (`origin/master`) wins over the checkout's local one, which is whatever
+/// it last pulled — cut with `--no-track`, for the reason
+/// `add_worktree_off_default` gives. A branch origin lacks that the
+/// checkout has locally is used as named. The setting is one name for
+/// every project, so a repo with no branch of that name at all does not
+/// fail the `n`: it falls back to the fetched `origin/HEAD` exactly as if
+/// the setting were empty, and the daemon log says which repo ignored it.
+pub async fn add_worktree_off_configured(
+    repo: &Path,
+    branch: &str,
+    configured: &str,
+) -> Result<PathBuf> {
+    let fetched = fetch_origin_if_any(repo).await;
+    if let Some(remote) = origin_branch(repo, configured).await {
+        return add_worktree_inner(repo, branch, Some(&remote), false).await;
+    }
+    if local_branch(repo, configured).await {
+        return add_worktree_inner(repo, branch, Some(configured), true).await;
+    }
+    tracing::warn!(
+        repo = %repo.display(),
+        base = configured,
+        "configured worktree base branch is not in this repo; branching from origin's default"
+    );
+    let base = if fetched {
+        origin_head(repo).await
+    } else {
+        None
+    };
+    add_worktree_inner(repo, branch, base.as_deref(), false).await
+}
+
 async fn add_worktree_inner(
     repo: &Path,
     branch: &str,
@@ -244,18 +300,57 @@ const REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
 /// HEAD — when the repo has no `origin` or the fetch fails, which the
 /// daemon log says; a worktree cut offline is better than none.
 pub async fn default_base(repo: &Path) -> Option<String> {
-    if git(repo, &["remote", "get-url", "origin"]).await.is_err() {
-        return None;
-    }
-    if let Err(e) = fetch_origin(repo).await {
-        tracing::warn!(
-            repo = %repo.display(),
-            error = %e,
-            "fetch before worktree add failed; branching from local HEAD"
-        );
+    if !fetch_origin_if_any(repo).await {
         return None;
     }
     origin_head(repo).await
+}
+
+/// `git fetch origin` when the repo has an `origin`: true when origin's
+/// refs are what origin has right now. False — the reason in the daemon
+/// log — when there is no origin or the fetch fails (offline), and the
+/// caller makes do with what the checkout has.
+async fn fetch_origin_if_any(repo: &Path) -> bool {
+    if git(repo, &["remote", "get-url", "origin"]).await.is_err() {
+        return false;
+    }
+    match fetch_origin(repo).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                repo = %repo.display(),
+                error = %e,
+                "fetch before worktree add failed; branching from what the checkout has"
+            );
+            false
+        }
+    }
+}
+
+/// `origin/<name>` when origin has a branch called `name`. None for a
+/// name that is no origin branch — a tag, a SHA, a local-only branch, an
+/// already-qualified `origin/x` — and for `HEAD`, which always means this
+/// checkout's: `refs/remotes/origin/HEAD` exists too, and is not what
+/// anyone naming HEAD means.
+async fn origin_branch(repo: &Path, name: &str) -> Option<String> {
+    if name == "HEAD" {
+        return None;
+    }
+    let full = format!("refs/remotes/origin/{name}");
+    git(repo, &["rev-parse", "--verify", "--quiet", &full])
+        .await
+        .ok()?;
+    Some(format!("origin/{name}"))
+}
+
+/// Whether the checkout has a local branch called `name`
+/// (`refs/heads/<name>`). Only branches: the setting is a *branch* name,
+/// and a tag or SHA that happened to share it is not what anyone meant.
+async fn local_branch(repo: &Path, name: &str) -> bool {
+    let full = format!("refs/heads/{name}");
+    git(repo, &["rev-parse", "--verify", "--quiet", &full])
+        .await
+        .is_ok()
 }
 
 /// `git fetch origin`, killed and reported as an error past `REMOTE_TIMEOUT`.
@@ -553,6 +648,35 @@ mod tests {
     /// A bare `origin` beside `repo`, with `repo`'s `main` pushed and a
     /// `feat-x` branch that exists only there — the shape of a same-repo
     /// pull request whose branch nobody has fetched yet.
+    /// Someone else lands a commit on origin's `main` from their own
+    /// clone — nothing here fetches. The landed commit's sha.
+    async fn land_on_origin(tmp: &Path, origin: &Path) -> String {
+        let other = tmp.join("other");
+        git(
+            tmp,
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+        git(&other, &["config", "user.email", "t@t"]).await.unwrap();
+        git(&other, &["config", "user.name", "t"]).await.unwrap();
+        git(
+            &other,
+            &["commit", "--allow-empty", "-m", "landed elsewhere"],
+        )
+        .await
+        .unwrap();
+        git(&other, &["push", "-q", "origin", "main"])
+            .await
+            .unwrap();
+        git(&other, &["rev-parse", "HEAD"]).await.unwrap()
+    }
+
     async fn add_bare_origin(repo: &Path, tmp: &Path) -> PathBuf {
         let origin = tmp.join("origin.git");
         std::fs::create_dir(&origin).unwrap();
@@ -667,31 +791,7 @@ mod tests {
         std::fs::create_dir(&repo).unwrap();
         init_repo(&repo).await;
         let origin = add_bare_origin(&repo, tmp.path()).await;
-        // Someone else lands a commit on main; this checkout never fetches.
-        let other = tmp.path().join("other");
-        git(
-            tmp.path(),
-            &[
-                "clone",
-                "-q",
-                origin.to_str().unwrap(),
-                other.to_str().unwrap(),
-            ],
-        )
-        .await
-        .unwrap();
-        git(&other, &["config", "user.email", "t@t"]).await.unwrap();
-        git(&other, &["config", "user.name", "t"]).await.unwrap();
-        git(
-            &other,
-            &["commit", "--allow-empty", "-m", "landed elsewhere"],
-        )
-        .await
-        .unwrap();
-        git(&other, &["push", "-q", "origin", "main"])
-            .await
-            .unwrap();
-        let landed = git(&other, &["rev-parse", "HEAD"]).await.unwrap();
+        let landed = land_on_origin(tmp.path(), &origin).await;
         let local = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
         assert_ne!(landed, local, "the checkout is behind origin");
         // `git remote add` + a push leave no origin/HEAD symref behind;
@@ -712,6 +812,155 @@ mod tests {
                 .is_err(),
             "a new branch must not track origin/main"
         );
+    }
+
+    /// `--base main` with the checkout's `main` a commit behind origin's:
+    /// the branch starts at origin's main, never the local branch of that
+    /// name, and does not track it.
+    #[tokio::test]
+    async fn a_named_branch_base_means_origins_copy_not_the_local_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let origin = add_bare_origin(&repo, tmp.path()).await;
+        let landed = land_on_origin(tmp.path(), &origin).await;
+        let local_main = git(&repo, &["rev-parse", "main"]).await.unwrap();
+        assert_ne!(landed, local_main, "the local main is behind origin's");
+
+        let wt = add_worktree_off_ref(&repo, "feat", "main").await.unwrap();
+        let head = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(
+            head, landed,
+            "starts at origin's main, not the local branch"
+        );
+        assert!(
+            git(&wt, &["rev-parse", "--abbrev-ref", "feat@{upstream}"])
+                .await
+                .is_err(),
+            "a new branch must not track origin/main"
+        );
+        // The checkout's own main is untouched.
+        let after = git(&repo, &["rev-parse", "main"]).await.unwrap();
+        assert_eq!(after, local_main);
+    }
+
+    /// A base origin has no branch for is used as named: a tag here, and
+    /// `HEAD`, which means this checkout's HEAD even though the fetched
+    /// `origin/HEAD` exists.
+    #[tokio::test]
+    async fn a_named_base_origin_has_no_branch_for_is_used_as_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let origin = add_bare_origin(&repo, tmp.path()).await;
+        git(&repo, &["remote", "set-head", "origin", "--auto"])
+            .await
+            .unwrap();
+        let tagged = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        git(&repo, &["tag", "v1"]).await.unwrap();
+        // The checkout moves on locally; origin moves on separately.
+        git(&repo, &["commit", "--allow-empty", "-m", "local only"])
+            .await
+            .unwrap();
+        let local_head = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        let landed = land_on_origin(tmp.path(), &origin).await;
+
+        let wt = add_worktree_off_ref(&repo, "hotfix", "v1").await.unwrap();
+        let head = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(head, tagged, "a tag is used as named");
+
+        let wt = add_worktree_off_ref(&repo, "spike", "HEAD").await.unwrap();
+        let head = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(head, local_head, "HEAD is this checkout's, not origin's");
+        assert_ne!(head, landed);
+    }
+
+    /// The `worktree_base_branch` SETTING says `main` while the checkout's
+    /// `main` is a commit behind origin's: the branch starts at origin's
+    /// main, untracked — the same answer `--base main` gives.
+    #[tokio::test]
+    async fn a_configured_base_means_origins_copy_not_the_local_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let origin = add_bare_origin(&repo, tmp.path()).await;
+        let landed = land_on_origin(tmp.path(), &origin).await;
+        let local_main = git(&repo, &["rev-parse", "main"]).await.unwrap();
+        assert_ne!(landed, local_main, "the local main is behind origin's");
+
+        let wt = add_worktree_off_configured(&repo, "feat", "main")
+            .await
+            .unwrap();
+        let head = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(head, landed, "starts at origin's main");
+        assert!(
+            git(&wt, &["rev-parse", "--abbrev-ref", "feat@{upstream}"])
+                .await
+                .is_err(),
+            "a new branch must not track origin/main"
+        );
+    }
+
+    /// A configured branch origin lacks but the checkout has — a repo with
+    /// no origin at all, here — is used as named, from wherever the local
+    /// branch points, not from HEAD.
+    #[tokio::test]
+    async fn a_configured_base_origin_lacks_uses_the_local_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let master = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        git(&repo, &["branch", "master"]).await.unwrap();
+        // HEAD moves on along main; master stays where it was.
+        git(&repo, &["commit", "--allow-empty", "-m", "later on main"])
+            .await
+            .unwrap();
+        let head_now = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_ne!(master, head_now);
+
+        let wt = add_worktree_off_configured(&repo, "feat", "master")
+            .await
+            .unwrap();
+        let head = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(head, master, "starts at the local master, not HEAD");
+    }
+
+    /// A configured branch this repo has nowhere — the setting is global,
+    /// the repo uses `main` — falls back to the fetched `origin/HEAD`
+    /// rather than failing the worktree.
+    #[tokio::test]
+    async fn a_configured_base_the_repo_lacks_falls_back_to_origin_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let origin = add_bare_origin(&repo, tmp.path()).await;
+        let landed = land_on_origin(tmp.path(), &origin).await;
+        let local = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_ne!(landed, local, "the checkout is behind origin");
+
+        let wt = add_worktree_off_configured(&repo, "feat", "master")
+            .await
+            .unwrap();
+        let head = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(head, landed, "origin's default branch, freshly fetched");
+        assert!(
+            git(&wt, &["rev-parse", "--abbrev-ref", "feat@{upstream}"])
+                .await
+                .is_err(),
+            "the fallback is untracked like every default-base worktree"
+        );
+        // And a tag of that name is not a branch: still the fallback.
+        git(&repo, &["tag", "release"]).await.unwrap();
+        let wt = add_worktree_off_configured(&repo, "feat2", "release")
+            .await
+            .unwrap();
+        let head = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(head, landed, "a tag sharing the name is not the branch");
     }
 
     #[tokio::test]
