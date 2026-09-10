@@ -201,6 +201,28 @@ pub struct Agent {
     /// does not survive a daemon restart.
     #[serde(default)]
     pub cloud_mirroring: bool,
+    /// The last few prompts typed into this session, oldest first — what
+    /// the `UserPromptSubmit` hook carried, condensed to one line each
+    /// (RECENT PROMPTS). Capped at [`RECENT_PROMPTS_KEPT`] by the daemon;
+    /// the TUI shows however many its setting asks for, the newest at
+    /// the bottom. Empty for every row that predates the capture.
+    #[serde(default)]
+    pub recent_prompts: Vec<PromptEntry>,
+}
+
+/// How many prompts the daemon keeps per session: the most a TUI can be
+/// asked to show, with room to spare so a raised setting has history to
+/// draw from at once.
+pub const RECENT_PROMPTS_KEPT: usize = 10;
+
+/// One prompt in a session's RECENT PROMPTS history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptEntry {
+    /// The prompt as one line: whitespace runs collapsed, clipped with an
+    /// ellipsis past the daemon's cap. Never empty.
+    pub text: String,
+    /// Epoch ms when the prompt was submitted (the hook's arrival).
+    pub submitted_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

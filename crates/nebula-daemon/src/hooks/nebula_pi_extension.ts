@@ -68,11 +68,17 @@ export default function (pi: any) {
 
   // One user prompt starts one agent run. The response body is empty or the
   // auto-title instruction; a non-empty one rides this run's system prompt.
+  // The prompt itself goes along for the row's RECENT PROMPTS.
   pi.on(
     "before_agent_start",
-    async (event: { systemPrompt: string }, ctx: SessionContext) => {
+    async (
+      event: { prompt?: string; systemPrompt: string },
+      ctx: SessionContext,
+    ) => {
       running = true;
-      const context = injectedContext(await post("UserPromptSubmit", ctx));
+      const context = injectedContext(
+        await post("UserPromptSubmit", ctx, { prompt: event.prompt }),
+      );
       if (context) {
         return { systemPrompt: `${event.systemPrompt}\n\n${context}` };
       }

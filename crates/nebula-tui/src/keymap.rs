@@ -68,6 +68,9 @@ pub enum Action {
     New,
     GitDiff,
     OpenRepo,
+    /// `Shift+R`: ask GitHub for the pull requests again now, past every
+    /// timer — the open list, the worktree's PR, the one the pane is reading.
+    RefreshPullRequests,
     // sessions
     NewTerminal,
     Rename,
@@ -272,6 +275,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["shift+g"],
+    },
+    ActionSpec {
+        action: Action::RefreshPullRequests,
+        id: "refresh_pull_requests",
+        label: "Refresh pull requests",
+        hint: "Ask GitHub again now for the project's open PRs, the selected worktree's PR and the one the pane is reading",
+        group: "PROJECTS & WORKTREES",
+        scope: Scope::Global,
+        defaults: &["shift+r"],
     },
     // ---- SESSIONS ----
     ActionSpec {

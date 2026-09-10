@@ -6,6 +6,7 @@ pub mod lifecycle;
 pub mod metrics;
 pub mod open_files;
 pub mod pr_scope;
+pub mod prompt_history;
 pub mod pty;
 pub mod registry;
 pub mod server;
@@ -94,10 +95,17 @@ async fn serve() -> Result<()> {
                 session_id,
                 cwd,
                 transcript,
+                prompt,
             }) = hook_rx.recv().await
             {
                 let captures_session = event.captures_session();
                 daemon.apply_hook_event(&agent_id, event.clone(), session_id.clone());
+                // The prompt itself, for the row's RECENT PROMPTS. After
+                // the status step so the row it upserts already reads
+                // `running`.
+                if let Some(text) = prompt {
+                    daemon.record_prompt(&agent_id, text);
+                }
                 // Claude's own session name (`/rename`) rides no hook, but
                 // every payload says where it is persisted: remember that
                 // for the window-title path and read it now.

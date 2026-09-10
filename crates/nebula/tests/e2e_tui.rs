@@ -740,11 +740,11 @@ fn tui_manual_link_add_is_unavailable() {
     tui.wait_for_gone("attach a link");
 }
 
-/// The pull request nebula finds on the branch leads the OPEN PRS group. A
+/// The pull request nebula finds on the branch leads the PULL REQUESTS group. A
 /// stub `gh` on PATH stands in for GitHub: the real one is asked for exactly
 /// this JSON (`gh pr view --json number,url,title,state,isDraft`).
 #[test]
-fn tui_pull_request_row_leads_the_open_prs_group() {
+fn tui_pull_request_row_leads_the_pull_requests_group() {
     let stub_bin = tempfile::tempdir().unwrap();
     let gh = stub_bin.path().join("gh");
     std::fs::write(
@@ -766,7 +766,7 @@ fn tui_pull_request_row_leads_the_open_prs_group() {
     tui.wait_for_text("⌂ root");
 
     // The lookup rides the git poll, so the row shows up on its own.
-    tui.wait_for_text("OPEN PRS");
+    tui.wait_for_text("PULL REQUESTS");
     tui.wait_for_text("#7 Attach links");
 
     // It is not a stored row: d says so instead of opening a confirm.

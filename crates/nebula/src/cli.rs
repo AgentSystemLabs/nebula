@@ -134,7 +134,12 @@ pub(crate) enum Command {
         /// Branch name; several words are joined with hyphens, none at all
         /// gets a random `<adj>-<noun>-<verb>` one.
         name: Vec<String>,
-        /// Start point for a new branch (default: the checkout's HEAD).
+        /// Start point for a new branch (default: the `worktree_base_branch`
+        /// setting, else origin's default branch, fetched).
+        ///
+        /// A branch name origin has means origin's copy of it, fetched first:
+        /// `main` is `origin/main`, never this checkout's local branch. A tag,
+        /// a SHA or a branch origin lacks is used as named.
         #[arg(long, value_name = "REF")]
         base: Option<String>,
     },
@@ -308,7 +313,7 @@ Examples:
 
 const WORKTREE_EXAMPLES: &str = "\
 Examples:
-  nebula worktree fix-login-redirect  branch off HEAD and move there
+  nebula worktree fix-login-redirect  branch off the configured base and move there
   nebula worktree fix login redirect  the same; the words are slugified
   nebula worktree                     invent a random branch name
   nebula worktree hotfix --base v0.21.0

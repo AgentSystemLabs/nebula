@@ -31,8 +31,9 @@ pub(super) fn submit(
             // The rows first, so the panels never wait on git.
             let placeholder =
                 placeholder::stage(app, project.clone(), branch.clone(), &launch, out);
-            // `base: None` is the DAEMON's fetched `origin/HEAD`
-            // (`git::add_worktree_off_default`), never this checkout's HEAD.
+            // `base: None` is the DAEMON's `worktree_base_branch` SETTING,
+            // else its fetched `origin/HEAD` (`git::add_worktree_off_default`)
+            // — never this checkout's HEAD.
             send_with(
                 app,
                 out,

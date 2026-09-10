@@ -769,7 +769,11 @@ async fn hook_post_from_agent_pty_drives_status() {
         &mut c,
         &ClientRequest::Input {
             session: sref.clone(),
-            data: curl("UserPromptSubmit", r#"{"session_id":"sess-1"}"#).into_bytes(),
+            data: curl(
+                "UserPromptSubmit",
+                r#"{"session_id":"sess-1","prompt":"fix the  login\nredirect"}"#,
+            )
+            .into_bytes(),
         },
     )
     .await
@@ -778,6 +782,16 @@ async fn hook_post_from_agent_pty_drives_status() {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Running, .. }
                 if *agent == agent_id)
+        })
+    })
+    .await;
+    // …and the prompt itself lands on the row, condensed to one line, as
+    // the RECENT PROMPTS upsert that follows the status change.
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id
+                    && a.recent_prompts.iter().any(|p| p.text == "fix the login redirect"))
         })
     })
     .await;

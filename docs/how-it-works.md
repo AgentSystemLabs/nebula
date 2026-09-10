@@ -33,8 +33,12 @@
 - **Projects → worktrees → sessions.** All work happens in the main checkout or a git worktree.
   Worktrees are real (`git worktree add/remove`), created under
   `<repo>/../<repo-name>-worktrees/<branch>` and branched from the freshly fetched `origin/HEAD`
-  unless `nebula worktree --base` names another start (no `origin`, or a fetch that fails: the
-  checkout's HEAD).
+  unless `nebula worktree --base` names another start — a branch origin has means origin's fetched
+  copy, so `--base main` is `origin/main` and never the checkout's local `main` (no `origin`, or a
+  fetch that fails: the checkout's HEAD). The `worktree_base_branch` SETTING (Settings → General)
+  is a standing `--base` for every worktree nobody names one for — `master` for a repo whose
+  default branch is not what origin says, or that has no origin — resolved the same way, and
+  falling back to `origin/HEAD` in a repo that has no branch of that name.
 - **Worktrees made outside nebula show up anyway — WORKTREE SYNC.** Every 2 s the DAEMON mtime-probes
   the git files a worktree operation touches — the repo's shared `.git/HEAD`, the `.git/worktrees`
   directory, and each linked checkout's own `HEAD` — and only when the newest of those stamps has moved
@@ -128,6 +132,11 @@
   same `UserPromptSubmit` hook reply, as `hookSpecificOutput.sessionTitle`. Whichever side changed
   last wins; a name you set in nebula is never undone by re-reading Claude's older one. Claude only —
   Codex and Cursor have no session name of their own.
+- **Rows can list what they were last asked.** With **Recent prompts** on (Settings → Experimental),
+  the `prompt` field of the `UserPromptSubmit` payload — which every harness sends — is condensed to
+  one line in the hook receiver, kept on the AGENT row (the newest ten, in SQLite) and drawn under its
+  pill in the SESSIONS PANEL with an ago label, newest last. Pure capture: nothing is injected into the
+  model's context and no extra turn runs. See [Sessions](sessions.md#recent-prompts).
 - **Ask the agent for a worktree and it moves there.** Tell a Claude session "do this in a worktree" and
   it runs `nebula worktree <name>` instead of its own `EnterWorktree` tool (whose checkouts land under
   `<repo>/.claude/worktrees/` on a `worktree-*` branch). nebula creates the checkout in its usual
@@ -176,12 +185,14 @@
 
 ## Pull requests
 
-nebula finds the pull request open on each branch with `gh` and shows it in the Sessions panel's
-OPEN PRS group, including a count of comments that landed while you were away; once that pull request
-is merged or closed the row goes (a draft stays, dimmed and badged `draft`). Rest on that row and the
-pane reads the pull request — description, stats, conversation — exactly as it does for the project-wide
-OPEN PRS rows under the worktrees; `g` shows its diff. Manual link attachment is currently unavailable;
-previously saved links remain visible so the change does not discard data.
+nebula finds the pull request on each branch with `gh` and shows it in the Sessions panel's
+PULL REQUESTS group, including a count of comments that landed while you were away. The row outlives
+the pull request: once it is merged or closed the row stays, badged `merged` or `closed` (a draft is
+dimmed and badged `draft`), for as long as the checkout does — a worktree whose PR has shipped is the one
+you are about to archive or delete, and the PR is what you check first. Rest on that row and the pane
+reads the pull request — description, stats, conversation — exactly as it does for the project-wide
+OPEN PRS rows under the worktrees, which do retire on merge; `g` shows its diff. Manual link attachment
+is currently unavailable; previously saved links remain visible so the change does not discard data.
 
 This is the one part of nebula the TUI asks for itself rather than the DAEMON: every `gh pr view`,
 `gh pr list` and `gh pr diff` is spawned by the client, which is why the lookups stop the moment you
@@ -191,7 +202,8 @@ selected worktree's PR ROW and the selected project's PROJECT OPEN PRS GROUP, on
 stacked while one is in flight, each abandoned after 20 s. A repo that answers settles onto a steady
 15 s beat; an empty answer backs off by doubling — out to 3 min for a branch that never grows a PR,
 10 min for a project with none open — so a workspace of thirty repos does not cost thirty API calls a
-beat.
+beat. Focusing a sidebar panel or the terminal window pulls the next lookup forward, floored at a few
+seconds; `Shift+R` is the one gesture that asks straight away.
 
 Settings and hotkeys live in [Configuration](configuration.md). The process model, the IPC CODEC and
 the crate layout are covered in more depth in [ARCHITECTURE.md](../ARCHITECTURE.md).

@@ -7,7 +7,7 @@
 //! `App::bar_return` and the pane's input lock.
 
 use super::fire_pending_attach;
-use crate::app::{App, Focus};
+use crate::app::{App, Focus, HitTarget};
 use nebula_core::ClientRequest;
 use std::time::Duration;
 
@@ -92,6 +92,29 @@ pub(super) fn enter_workspaces_bar(app: &mut App) {
         panel => panel,
     };
     app.focus = Focus::Workspaces;
+}
+
+/// Where the click that dismissed a modal lands: on the focus of whatever
+/// the pointer was over, and nothing else. The user aimed that click at a
+/// panel, not at the modal's margin, so the panel takes focus as a click
+/// on it would — but the click itself was spent closing the modal: it
+/// moves no cursor, previews no session, switches no workspace and never
+/// opens a prompt, or dismissing a modal would be the one click in nebula
+/// that acts on a row the user could not see it land on. The pane is the
+/// exception that the walk already makes: entering it is a commitment to
+/// type at the agent, so it takes the input lock the way the click and Tab
+/// both do. A splitter is the seam between two panels and the footer's
+/// nameplate is a button: neither is somewhere focus lives.
+pub(super) fn land_click_focus(app: &mut App, column: u16, row: u16, out: &mut Vec<ClientRequest>) {
+    match app.hit_at(column, row) {
+        Some(HitTarget::Workspace(_)) => enter_workspaces_bar(app),
+        Some(HitTarget::Project(_)) => app.focus = app.first_sidebar_focus(),
+        Some(HitTarget::Worktree(_) | HitTarget::OpenPrsHeader) => app.focus = Focus::Worktrees,
+        Some(HitTarget::Session(_) | HitTarget::ArchivedHeader) => app.focus = Focus::Sessions,
+        Some(HitTarget::PanelBg(focus)) => app.focus = focus,
+        Some(HitTarget::TerminalPane) => enter_terminal_pane(app, out),
+        Some(HitTarget::Splitter(_) | HitTarget::FooterWorkspace) | None => {}
+    }
 }
 
 /// Where j,j out of the Workspaces bar lands: the panel focus came up from

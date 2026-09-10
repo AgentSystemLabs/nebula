@@ -27,6 +27,15 @@ pub struct Config {
     /// attach or prewarm (agents resume their conversation). Malformed
     /// values fall back to the 5m default.
     pub session_idle_timeout: String,
+    /// The branch every new WORKTREE nobody named a base for starts from
+    /// — `n` in the WORKTREES PANEL, a bare `nebula worktree`, the QUICK
+    /// PROMPT's auto-created one. Empty (the default) means origin's own
+    /// default branch, `origin/HEAD` as freshly fetched; a name (`master`,
+    /// `develop`) means origin's fetched copy of that branch when origin
+    /// has one, else the checkout's local ref of that name, else — a repo
+    /// with no such branch at all — the default again, with a warning in
+    /// the daemon log. Read through [`Config::worktree_base_branch`].
+    pub worktree_base_branch: String,
 }
 
 impl Default for Config {
@@ -36,6 +45,7 @@ impl Default for Config {
             prewarm_agents: true,
             prewarm_sessions: true,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT.into(),
+            worktree_base_branch: String::new(),
         }
     }
 }
@@ -59,6 +69,18 @@ impl Config {
     pub fn session_idle_timeout(&self) -> Option<std::time::Duration> {
         parse_timeout(&self.session_idle_timeout)
             .unwrap_or_else(|| parse_timeout(DEFAULT_SESSION_IDLE_TIMEOUT).expect("default parses"))
+    }
+
+    /// The configured WORKTREE BASE BRANCH, or None for the default
+    /// (origin's own default branch). Whitespace is trimmed and a leading
+    /// `origin/` dropped: `origin/master` means the same as `master` —
+    /// origin's fetched copy when it has one — and spelling it out must
+    /// not turn into a branch that tracks `origin/master` and aims its
+    /// first push there.
+    pub fn worktree_base_branch(&self) -> Option<&str> {
+        let name = self.worktree_base_branch.trim();
+        let name = name.strip_prefix("origin/").unwrap_or(name).trim();
+        (!name.is_empty()).then_some(name)
     }
 }
 
@@ -132,6 +154,28 @@ mod tests {
             Config::default().session_idle_timeout(),
             Some(Duration::from_secs(300))
         );
+    }
+
+    #[test]
+    fn worktree_base_branch_defaults_to_none_and_normalizes() {
+        assert_eq!(Config::default().worktree_base_branch(), None);
+        let base = |v: &str| {
+            let cfg: Config =
+                serde_json::from_str(&format!(r#"{{"worktree_base_branch": "{v}"}}"#)).unwrap();
+            cfg.worktree_base_branch().map(str::to_string)
+        };
+        assert_eq!(base(""), None);
+        assert_eq!(base("   "), None, "blank is unset, not a branch called ' '");
+        assert_eq!(base("master"), Some("master".into()));
+        assert_eq!(base("  develop "), Some("develop".into()));
+        assert_eq!(
+            base("origin/master"),
+            Some("master".into()),
+            "origin/x is x: origin's copy is what the name already means"
+        );
+        assert_eq!(base("origin/"), None);
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.worktree_base_branch(), None);
     }
 
     #[test]

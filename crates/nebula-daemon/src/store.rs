@@ -5,8 +5,9 @@
 use crate::session_title::TitleState;
 use anyhow::{Context, Result};
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, PrSeen, Project, ProjectId, TerminalId,
-    TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId, DEFAULT_WORKSPACE_ID,
+    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, PrSeen, Project, ProjectId, PromptEntry,
+    TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId, DEFAULT_WORKSPACE_ID,
+    RECENT_PROMPTS_KEPT,
 };
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
@@ -240,6 +241,14 @@ const MIGRATIONS: &[&str] = &[
     // the first sync, so every existing row simply starts unsynced.
     "
     ALTER TABLE agents ADD COLUMN claude_title TEXT;
+    ",
+    // 24: RECENT PROMPTS — the newest few prompts typed into the session,
+    // as a JSON array of `PromptEntry` (oldest first), for the SESSIONS
+    // PANEL's history lines. A bounded list on the row rather than a
+    // table: it is read with every row and pruned on every write.
+    // NULL (the empty history) for every row that predates the capture.
+    "
+    ALTER TABLE agents ADD COLUMN recent_prompts TEXT;
     ",
 ];
 
@@ -608,6 +617,31 @@ impl Store {
 
     /// The title last seen from (or pushed into) Claude for this session;
     /// `None` until the CLAUDE TITLE SYNC has run once.
+    /// Append one prompt to the row's RECENT PROMPTS, keeping only the
+    /// newest [`RECENT_PROMPTS_KEPT`]. Returns whether a row was there to
+    /// take it.
+    pub fn push_prompt(&self, id: &AgentId, entry: &PromptEntry) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT recent_prompts FROM agents WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id.as_str()])?;
+        let Some(row) = rows.next()? else {
+            return Ok(false);
+        };
+        let mut prompts = parse_prompts(row.get::<_, Option<String>>(0)?.as_deref());
+        drop(rows);
+        drop(stmt);
+        prompts.push(entry.clone());
+        if prompts.len() > RECENT_PROMPTS_KEPT {
+            prompts.drain(..prompts.len() - RECENT_PROMPTS_KEPT);
+        }
+        let json = serde_json::to_string(&prompts)?;
+        conn.execute(
+            "UPDATE agents SET recent_prompts = ?2 WHERE id = ?1",
+            params![id.as_str(), json],
+        )?;
+        Ok(true)
+    }
+
     pub fn agent_claude_title(&self, id: &AgentId) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT claude_title FROM agents WHERE id = ?1")?;
@@ -984,7 +1018,7 @@ const PROJECT_COLUMNS: &str = "id, name, repo_path, sort_order, workspace_id";
 const WORKTREE_COLUMNS: &str = "id, project_id, path, branch, is_main, sort_order";
 const AGENT_COLUMNS: &str = "id, worktree_id, name, status, archived, kind, \
                              claude_session_id, sort_order, status_changed_at, model, effort, \
-                             archived_at, unseen, cloud_session_id";
+                             archived_at, unseen, cloud_session_id, recent_prompts";
 const TERMINAL_COLUMNS: &str = "id, worktree_id, name, sort_order";
 const LINK_COLUMNS: &str = "id, worktree_id, url, sort_order";
 
@@ -1039,7 +1073,16 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<Agent> {
         cloud_session_id: r.get(13)?,
         alive: false,
         cloud_mirroring: false,
+        recent_prompts: parse_prompts(r.get::<_, Option<String>>(14)?.as_deref()),
     })
+}
+
+/// The `recent_prompts` column: NULL is the empty history, and a column
+/// that will not parse (a hand edit, a downgrade) reads as empty too
+/// rather than failing every row load.
+fn parse_prompts(json: Option<&str>) -> Vec<PromptEntry> {
+    json.and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default()
 }
 
 /// `alive` is daemon state, filled in by the registry like the agent's.
@@ -1103,6 +1146,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         };
         let pr_url = "https://github.com/AgentSystemLabs/nebula/pull/42";
         store
@@ -1125,6 +1169,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         };
         store.insert_agent(&codex_agent).unwrap();
         let cursor_agent = Agent {
@@ -1144,6 +1189,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         };
         store.insert_agent(&cursor_agent).unwrap();
 
@@ -1317,11 +1363,18 @@ mod tests {
 
         let store = Store::open(&path).unwrap();
         assert_eq!(store.agent_pr_url(&AgentId("a1".into())).unwrap(), None);
-        // …and the later columns arrive NULL too (23: claude_title).
+        // …and the later columns arrive NULL too (23: claude_title,
+        // 24: recent_prompts — read as the empty history).
         assert_eq!(
             store.agent_claude_title(&AgentId("a1".into())).unwrap(),
             None
         );
+        assert!(store
+            .get_agent(&AgentId("a1".into()))
+            .unwrap()
+            .unwrap()
+            .recent_prompts
+            .is_empty());
         let version: i64 = store
             .conn
             .lock()
@@ -1609,6 +1662,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         };
 
         // Default-named session: pending until the agent titles it, and the
@@ -1696,6 +1750,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 },
                 true,
             )
@@ -1824,6 +1879,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 })
                 .unwrap();
         }
@@ -1889,6 +1945,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: false,
                 cloud_mirroring: false,
+                recent_prompts: Vec::new(),
             };
             store.insert_agent(&agent).unwrap();
             agent.id
@@ -1943,5 +2000,86 @@ mod tests {
         assert!(flip(&c, AgentStatus::Finished));
         store.sweep_disconnected().unwrap();
         assert!(unseen(&c), "still waiting to be read after the restart");
+    }
+
+    /// RECENT PROMPTS: appended in order, pruned to the newest
+    /// `RECENT_PROMPTS_KEPT`, read back by both row paths, and nothing
+    /// for an id with no row.
+    #[test]
+    fn push_prompt_keeps_the_newest_bounded_history() {
+        let store = Store::open_in_memory().unwrap();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId("p1".into()),
+            name: "p".into(),
+            repo_path: "/tmp/p".into(),
+            sort_order: 0,
+        };
+        store.insert_project(&project).unwrap();
+        store
+            .insert_worktree(&Worktree {
+                id: WorktreeId("w1".into()),
+                project_id: project.id.clone(),
+                path: "/tmp/p".into(),
+                branch: "main".into(),
+                is_main: true,
+                sort_order: 0,
+            })
+            .unwrap();
+        let id = AgentId("a1".into());
+        store
+            .insert_agent(&Agent {
+                id: id.clone(),
+                worktree_id: WorktreeId("w1".into()),
+                name: "agent-1".into(),
+                status: AgentStatus::Fresh,
+                archived: false,
+                archived_at: 0,
+                unseen: false,
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                session_id: None,
+                cloud_session_id: None,
+                sort_order: 0,
+                status_changed_at: 0,
+                alive: false,
+                cloud_mirroring: false,
+                recent_prompts: Vec::new(),
+            })
+            .unwrap();
+        let entry = |n: usize| PromptEntry {
+            text: format!("prompt {n}"),
+            submitted_at: 1_000 + n as i64,
+        };
+        assert!(store
+            .get_agent(&id)
+            .unwrap()
+            .unwrap()
+            .recent_prompts
+            .is_empty());
+
+        assert!(store.push_prompt(&id, &entry(1)).unwrap());
+        assert!(store.push_prompt(&id, &entry(2)).unwrap());
+        let got = store.get_agent(&id).unwrap().unwrap().recent_prompts;
+        assert_eq!(got, vec![entry(1), entry(2)], "oldest first");
+
+        // Past the cap the oldest fall off the front.
+        for n in 3..=(RECENT_PROMPTS_KEPT + 2) {
+            assert!(store.push_prompt(&id, &entry(n)).unwrap());
+        }
+        let got = store.get_agent(&id).unwrap().unwrap().recent_prompts;
+        assert_eq!(got.len(), RECENT_PROMPTS_KEPT);
+        assert_eq!(got.first(), Some(&entry(3)));
+        assert_eq!(got.last(), Some(&entry(RECENT_PROMPTS_KEPT + 2)));
+
+        // `load_tree` reads the same column through the same mapper.
+        let (_, _, agents, _) = store.load_tree().unwrap();
+        assert_eq!(agents[0].recent_prompts, got);
+
+        // No row, nothing recorded — and no error.
+        assert!(!store
+            .push_prompt(&AgentId("ghost".into()), &entry(1))
+            .unwrap());
     }
 }

@@ -116,6 +116,9 @@ mod tests {
         assert!(src.contains("const ASK_TOOL = \"ask_question\";"));
         // The auto-title reply is read out of the shared envelope.
         assert!(src.contains("hookSpecificOutput?.additionalContext"));
+        // The prompt rides the UserPromptSubmit body under the key the
+        // receiver reads (RECENT PROMPTS).
+        assert!(src.contains("{ prompt: event.prompt }"));
     }
 
     #[test]

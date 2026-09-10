@@ -78,6 +78,7 @@ pub(super) fn stage(
         status_changed_at: now_ms(),
         alive: false,
         cloud_mirroring: false,
+        recent_prompts: Vec::new(),
     });
     // That stamp just moved the row to the top: re-seat the cursor on it.
     if let Some(i) = app
@@ -325,6 +326,7 @@ mod tests {
             status_changed_at: crate::app::now_ms(),
             alive: true,
             cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         }
     }
 

@@ -73,6 +73,26 @@ the agent is already working when the pane opens. The row it creates is an ordin
 itself on that first turn, resumes, and shows status like any other. Presets live in
 `agent_presets.json` beside `config.json`.
 
+## RECENT PROMPTS
+
+An experimental read on what each session was last asked to do. Turn on **Recent prompts** under
+Settings → Experimental (`recent_prompts` in CONFIG.JSON) and every session row in the SESSIONS PANEL
+grows a short list under its pill: the last few prompts typed into it, oldest first so the bottom line
+is the latest ask, each condensed to one line and clipped to the column, with a dim `30m ago` pinned
+to the right — the same label the rows themselves carry. **Recent prompts shown**
+(`recent_prompts_count`, `3` by default, `1` to `5` in the overlay) says how many; the DAEMON keeps the
+newest ten per session, so raising the number later has history to draw from at once.
+
+The text is the prompt as you typed it, not a paraphrase. The DAEMON reads it off the
+`UserPromptSubmit` hook payload every harness sends (Claude, Codex and Cursor name it `prompt`; Pi's
+managed extension posts the same field), collapses its whitespace and keeps the first 200 characters,
+so a pasted file shows as its opening line. It costs the agent nothing — no extra turn, no tool call,
+nothing added to its context — which is why it is the prompt and not a summary the model wrote.
+Prompts nebula composes itself, such as a PR SESSION's scope or the note a `nebula worktree`
+relocation reopens on, are left out, and so are blank ones. The lines belong to their row: a click on
+any of them lands on the session, archived rows list none, and a session created before the feature
+simply has nothing to show until its next prompt.
+
 ## The PROJECT OPEN PRS group
 
 Under the checkouts, an `OPEN PRS` group lists every pull request still open on the repo — drafts
@@ -80,7 +100,8 @@ included, sunk to the bottom of the group, dimmed and badged `draft` so they are
 ones asking for a reviewer — fetched with `gh` when you open the project, re-asked every 15 seconds once
 that PROJECT has answered with at least one open pull request, and again whenever the Worktrees or
 Sessions panel or the terminal window takes focus (one `gh pr list` per project, so a repo with a
-hundred open PRs still costs one API call). A PROJECT that answers empty — or one where `gh` is
+hundred open PRs still costs one API call) — or at once, past every timer, when you press `Shift+R`
+from any panel, which also re-reads the pull request the pane is showing. A PROJECT that answers empty — or one where `gh` is
 missing, unauthenticated, or too slow to answer at all — never settles onto that beat and backs off
 instead: 30 seconds to the next attempt, doubling every round to a 10-minute ceiling, so a repo with
 nothing open, or a machine with no `gh` on it, stops asking all day. A call that fails outright keeps
@@ -95,3 +116,12 @@ harness in the PROJECT's ROOT WORKTREE, through the same MODEL / EFFORT submenus
 PICKER, with a rule that limits all work to that PR and includes its URL: Claude gets it as an appended
 system prompt, Codex and Cursor as their first prompt. The URL is kept with the AGENT, so RESUME
 reapplies the same scope. Only the row you actually stop on is fetched.
+
+The group folds. Click its header — or pick **Show/hide open PRs** from the panel's right-click
+menu — and the list drops to the one line `▸ OPEN PRS · 12`, the triangle turned sideways and the
+count still honest, because `gh pr list` keeps its beat behind the fold; open, the header reads
+`▾ OPEN PRS · 12` over the rows. Folding away the row the cursor is on lands it on the last checkout
+and brings that checkout's session back into the pane, `↑/↓` then stop at the checkouts, and `/`
+still finds every pull request either way. Stepping `↓` off the last checkout into a folded group
+opens it onto its first pull request rather than stopping at the header. The fold is remembered
+across restarts, like the ARCHIVED toggle.

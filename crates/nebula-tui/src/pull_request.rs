@@ -1,10 +1,13 @@
-//! The pull request open on a worktree's branch, discovered with the
-//! GitHub CLI (`gh pr view`). The PR itself is never persisted — the row it
-//! feeds sits above the worktree's saved links and refreshes on its own, so
-//! a PR opened outside nebula shows up without anyone typing its URL. The
-//! one thing that outlives the process is how far the user has read into
-//! the conversation, which the daemon keeps (`pr_seen`) so the row can say
-//! how many comments landed while they were away.
+//! The pull request on a worktree's branch, discovered with the GitHub CLI
+//! (`gh pr view`). The PR itself is never persisted — the row it feeds sits
+//! above the worktree's saved links and refreshes on its own, so a PR
+//! opened outside nebula shows up without anyone typing its URL, and one
+//! that has since been merged or closed stays on the row, badged, for as
+//! long as the checkout does: the worktree outlives its pull request, and
+//! the PR is what you check before archiving or deleting it. The one thing
+//! that outlives the process is how far the user has read into the
+//! conversation, which the daemon keeps (`pr_seen`) so the row can say how
+//! many comments landed while they were away.
 //!
 //! The same `gh` also answers the wider question this module's other half
 //! asks — every pull request still open on the *project's* repo, for the
@@ -21,15 +24,54 @@ use std::path::Path;
 /// that never ends.
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// `gh`'s state string for a pull request that still accepts work — the
-/// one state a branch's PR ROW is kept for, and the one the preview and the
-/// detail-driven retirement key on.
+/// `gh`'s state strings. Only [`STATE_OPEN`] still accepts work: it is the
+/// one state the PROJECT OPEN PRS GROUP lists, and the one the preview and
+/// the detail-driven retirement key on. The other two are what a branch's
+/// PR ROW wears once the work is done.
 pub const STATE_OPEN: &str = "OPEN";
+pub const STATE_MERGED: &str = "MERGED";
+pub const STATE_CLOSED: &str = "CLOSED";
 
 /// Whether a `gh` state string is [`STATE_OPEN`]; drafts are open too, so
 /// this alone never says anything about `isDraft`.
 fn state_is_open(state: &str) -> bool {
     state == STATE_OPEN
+}
+
+/// Where a pull request stands, as a row paints it: the four looks a PR ROW
+/// can take, folded from `gh`'s state string and its draft flag. `Merged`
+/// and `Closed` win over the flag — a pull request closed while still a
+/// draft is closed, which is the more useful thing to say — and anything
+/// `gh` might add to its vocabulary later reads as open, the same trust
+/// [`state_at`] extends to a missing field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    Open,
+    Draft,
+    Merged,
+    Closed,
+}
+
+impl Standing {
+    pub fn of(state: &str, is_draft: bool) -> Self {
+        match state {
+            STATE_MERGED => Standing::Merged,
+            STATE_CLOSED => Standing::Closed,
+            _ if is_draft => Standing::Draft,
+            _ => Standing::Open,
+        }
+    }
+
+    /// Short word for a row's trailing badge — the same slot the agent rows
+    /// use for their CLI kind.
+    pub fn badge(self) -> &'static str {
+        match self {
+            Standing::Open => "pr",
+            Standing::Draft => "draft",
+            Standing::Merged => "merged",
+            Standing::Closed => "closed",
+        }
+    }
 }
 
 /// Run `gh` with `args` (in `dir` when given) under `timeout`, yielding
@@ -94,18 +136,24 @@ fn web_url(v: &serde_json::Value) -> Option<String> {
     (url.starts_with("https://") || url.starts_with("http://")).then_some(url)
 }
 
-/// The pull request still open on a checkout's branch.
+/// The pull request on a checkout's branch, whatever state it is in.
 ///
-/// Always open: `gh pr view` on a branch answers with that branch's most
-/// recent pull request whatever its state — a merged one keeps coming back
-/// for as long as the branch exists — and this row lives under an OPEN PRS
-/// header, so [`parse`] turns a MERGED or CLOSED answer into "no PR" and the
-/// row simply goes. A draft is open, just not finished, and stays.
+/// `gh pr view` on a branch answers with that branch's most recent pull
+/// request — preferring an open one, and a merged or closed one for as long
+/// as the branch exists once nothing on it accepts work any more — and the
+/// row keeps every answer. A checkout whose PR has shipped is exactly the
+/// one about to be archived or deleted, and the PR is what gets checked
+/// first, so the row stays put and its badge says `merged` or `closed`
+/// instead. The PROJECT OPEN PRS GROUP is where closed pull requests fall
+/// out; this row is per checkout, and the checkout is still here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequest {
     pub number: u64,
     pub url: String,
     pub title: String,
+    /// `gh`'s state string — [`STATE_OPEN`], [`STATE_MERGED`] or
+    /// [`STATE_CLOSED`].
+    pub state: String,
     pub is_draft: bool,
     /// When somebody *other than you* commented or submitted a review, as
     /// GitHub's RFC 3339 stamps, oldest first. Those sort lexicographically,
@@ -115,15 +163,20 @@ pub struct PullRequest {
 }
 
 impl PullRequest {
+    /// Whether this pull request still accepts work. A draft counts.
+    pub fn is_open(&self) -> bool {
+        state_is_open(&self.state)
+    }
+
+    /// The look the row takes: open, draft, merged or closed.
+    pub fn standing(&self) -> Standing {
+        Standing::of(&self.state, self.is_draft)
+    }
+
     /// Short word for the row's trailing badge — the same slot the agent
-    /// rows use for their CLI kind. Every row here is open by construction,
-    /// so the only thing left to say is whether it's still a draft.
+    /// rows use for their CLI kind: `pr`, `draft`, `merged` or `closed`.
     pub fn badge(&self) -> &'static str {
-        if self.is_draft {
-            "draft"
-        } else {
-            "pr"
-        }
+        self.standing().badge()
     }
 
     /// The mark to store when the user opens this PR: everything nebula
@@ -185,19 +238,19 @@ async fn viewer_login() -> Option<&'static str> {
 /// is your login when it's known; without it your own reviews count as
 /// activity, which is a wrong badge rather than a broken one.
 ///
-/// A pull request that is no longer open parses to `None`. `gh` prefers an
-/// open PR when the branch has several, so this only bites once nothing on
-/// the branch accepts work any more — exactly when the row should be gone.
+/// A merged or closed pull request parses like an open one, state and all.
+/// `gh` prefers an open PR when the branch has several, so a closed answer
+/// only arrives once nothing on the branch accepts work any more — and
+/// that is the pull request the checkout's row should keep showing, not
+/// hide, until the checkout itself goes.
 fn parse(json: &str, viewer: Option<&str>) -> Option<PullRequest> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let url = web_url(&v)?;
-    if !state_is_open(&state_at(&v)) {
-        return None;
-    }
     Some(PullRequest {
         number: v.get("number")?.as_u64()?,
         url,
         title: str_at(&v, "title"),
+        state: state_at(&v),
         is_draft: bool_at(&v, "isDraft"),
         activity: activity(&v, viewer),
     })
@@ -272,14 +325,16 @@ impl OpenPr {
         }
     }
 
-    /// Trailing badge — every row here is open by construction, so the only
-    /// thing left to say is whether it's still a draft.
+    /// Open or draft — every row here is open by construction (`list` asks
+    /// for nothing else), so the only thing left to say is whether it's
+    /// still a draft.
+    pub fn standing(&self) -> Standing {
+        Standing::of(STATE_OPEN, self.is_draft)
+    }
+
+    /// Trailing badge: `pr` or `draft`.
     pub fn badge(&self) -> &'static str {
-        if self.is_draft {
-            "draft"
-        } else {
-            "pr"
-        }
+        self.standing().badge()
     }
 }
 
@@ -605,6 +660,7 @@ mod tests {
             number: 1,
             url: "https://github.com/o/r/pull/1".into(),
             title: "t".into(),
+            state: STATE_OPEN.into(),
             is_draft: false,
             activity: stamps.iter().map(|s| s.to_string()).collect(),
         }
@@ -621,28 +677,45 @@ mod tests {
         assert_eq!(pr.url, "https://github.com/o/r/pull/42");
         assert_eq!(pr.title, "Attach links to worktrees");
         assert_eq!(pr.badge(), "pr");
+        assert!(pr.is_open());
     }
 
     /// `gh pr view` keeps answering with a branch's pull request after it
-    /// is merged or closed. The row it feeds sits under an OPEN PRS header,
-    /// so those answers are "no PR"; a draft is open and stays, badged.
+    /// is merged or closed, and the row keeps it: the checkout is still
+    /// here, and its pull request is what gets checked before the checkout
+    /// is archived or deleted. The badge says what became of it; a draft is
+    /// open and reads as one, unless it was closed as a draft, in which case
+    /// closed is the more useful word.
     #[test]
-    fn a_merged_or_closed_branch_pull_request_is_no_row() {
+    fn a_merged_or_closed_branch_pull_request_keeps_its_row_badged() {
         let payload = |state: &str, draft: bool| {
             format!(
                 r#"{{"number":1,"url":"https://x.dev/pull/1","title":"t","state":"{state}","isDraft":{draft}}}"#
             )
         };
-        assert!(parse(&payload("MERGED", false), None).is_none());
-        assert!(parse(&payload("CLOSED", false), None).is_none());
+        let merged = parse(&payload("MERGED", false), None).expect("a merged PR is still a row");
+        assert_eq!(merged.badge(), "merged");
+        assert_eq!(merged.standing(), Standing::Merged);
+        assert!(!merged.is_open());
+        let closed = parse(&payload("CLOSED", false), None).expect("a closed PR is still a row");
+        assert_eq!(closed.badge(), "closed");
+        assert!(!closed.is_open());
+        let closed_draft = parse(&payload("CLOSED", true), None).expect("closed");
+        assert_eq!(
+            closed_draft.standing(),
+            Standing::Closed,
+            "closed beats draft"
+        );
         let draft = parse(&payload("OPEN", true), None).expect("a draft is still open");
         assert_eq!(draft.badge(), "draft");
+        assert!(draft.is_open());
         let open = parse(&payload("OPEN", false), None).expect("open");
         assert_eq!(open.badge(), "pr");
         // An older `gh` that leaves `state` out is trusted to have listed
         // something open.
-        let bare = parse(r#"{"number":1,"url":"https://x.dev/pull/1"}"#, None);
-        assert!(bare.is_some(), "no state field means open");
+        let bare = parse(r#"{"number":1,"url":"https://x.dev/pull/1"}"#, None)
+            .expect("no state field means open");
+        assert_eq!(bare.standing(), Standing::Open);
     }
 
     /// Drafts sink below the finished pull requests and keep `gh`'s

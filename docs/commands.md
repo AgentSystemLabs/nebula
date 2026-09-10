@@ -55,7 +55,9 @@ nebula kill               # stop the daemon and all sessions cleanly
 nebula rename <title>     # title the current session (agents run this; --force to retitle)
 nebula worktree [name] [--base <ref>]  # move the current session into a worktree of its project,
                           # creating the branch if it's new (agents run this when you ask for a
-                          # worktree; no name invents one; --base picks a new branch's start point)
+                          # worktree; no name invents one; --base picks a new branch's start point,
+                          # a branch name meaning origin's fetched copy — main is origin/main;
+                          # without it the worktree_base_branch setting, else origin's default)
 nebula spawn <task> [--kind <claude|codex|cursor|pi>]  # start a new agent session beside the current
                           # one, in the same worktree, opening on <task> (agents run this when you
                           # ask for a new nebula session; --kind defaults to this session's harness)

@@ -107,7 +107,7 @@ struct PrewarmEntry {
 }
 
 /// Wall-clock epoch ms, matching the store's `status_changed_at` stamps.
-fn epoch_ms() -> i64 {
+pub(crate) fn epoch_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -805,13 +805,21 @@ impl Daemon {
             .store
             .get_project(project_id)?
             .context("project not found")?;
-        // A base the caller named (`nebula worktree --base`) is taken as
-        // is; every other new WORKTREE — `n` in the WORKTREES PANEL, a
-        // bare `nebula worktree`, the QUICK PROMPT's auto-created one —
-        // starts at the fetched `origin/HEAD`, never at this checkout's.
+        // A base the caller named (`nebula worktree --base`) is resolved
+        // against the fetched origin — `main` means `origin/main`, never
+        // this checkout's local branch; every other new WORKTREE — `n` in
+        // the WORKTREES PANEL, a bare `nebula worktree`, the QUICK PROMPT's
+        // auto-created one — starts at the `worktree_base_branch` SETTING
+        // when one is set (`master`, resolved the same way), else at the
+        // fetched `origin/HEAD`; never at this checkout's HEAD.
         let path = match base {
-            Some(base) => git::add_worktree(&project.repo_path, branch, Some(base)).await?,
-            None => git::add_worktree_off_default(&project.repo_path, branch).await?,
+            Some(base) => git::add_worktree_off_ref(&project.repo_path, branch, base).await?,
+            None => match crate::config::Config::load().worktree_base_branch() {
+                Some(configured) => {
+                    git::add_worktree_off_configured(&project.repo_path, branch, configured).await?
+                }
+                None => git::add_worktree_off_default(&project.repo_path, branch).await?,
+            },
         };
         let worktree = self.register_worktree(project_id, path, branch)?;
         // The row is out; the WORKTREE HOOK runs still under the lock, so
@@ -1116,6 +1124,7 @@ impl Daemon {
             status_changed_at: epoch_ms(),
             alive: false,
             cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         };
         self.store
             .insert_agent_with_launch_context(&agent, auto_title, pr_url.as_deref())?;
@@ -1220,6 +1229,7 @@ impl Daemon {
             status_changed_at: 0,
             alive: false,
             cloud_mirroring: false,
+            recent_prompts: Vec::new(),
         };
         self.spawn_agent_session(&agent, &worktree, DEFAULT_COLS, DEFAULT_ROWS)?;
         tracing::info!(agent = %agent.id, kind = kind.as_str(), worktree = %worktree.branch, "prewarmed agent session");
@@ -4161,6 +4171,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: false,
                 cloud_mirroring: false,
+                recent_prompts: Vec::new(),
             })
             .unwrap();
     }
@@ -4345,6 +4356,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     cloud_mirroring: false,
+                    recent_prompts: Vec::new(),
                 },
                 true,
             )
