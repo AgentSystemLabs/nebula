@@ -148,10 +148,12 @@
   no client is watching are killed after `session_idle_timeout` (5m by default) — working agents, ones
   waiting on you, and terminals with a command running are all spared, and a reaped agent
   revives on the next attach with its conversation resumed. Both halves of the PREWARM POOL are
-  switchable — `prewarm_agents` and `prewarm_sessions` in CONFIG.JSON, `true` by default and
-  hand-edit-only, since neither has a SETTINGS OVERLAY row (see [Configuration](configuration.md)) —
-  and a warm spare nobody claims inside 15 min is reaped on its own, because it holds real memory and
-  its context goes stale. The IDLE REAPER's check is a 15 s sweep (`NEBULA_IDLE_REAP_MS`), so the real
+  switchable — `prewarm_agents` and `prewarm_sessions`, `true` by default, on the SETTINGS OVERLAY's
+  Sessions tab or by hand in CONFIG.JSON (see [Configuration](configuration.md)); switching the pool
+  off drains its spares on the next sweep — and a warm spare nobody claims inside 15 min is reaped on
+  its own, because it holds real memory and its context goes stale. A spare is a bare CLI at its
+  prompt, so the CLI's own session list (Claude's `/list-agents`) shows it beside your sessions,
+  named after the directory. The IDLE REAPER's check is a 15 s sweep (`NEBULA_IDLE_REAP_MS`), so the real
   latency is the timeout plus up to 15 s more; `session_idle_timeout` also takes `"off"`, which
   switches reaping off entirely.
 

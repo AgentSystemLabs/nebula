@@ -196,6 +196,8 @@ pub enum SettingKind {
     CloseFinderOnOpen,
     SkipSessionNaming,
     SessionIdleTimeout,
+    PrewarmAgents,
+    PrewarmSessions,
     DoneSound,
     FeedbackSound,
     Theme,
@@ -266,6 +268,18 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::SessionIdleTimeout,
                 label: "Idle session timeout",
                 hint: "Kill idle sessions in unviewed worktrees (busy ones spared; off disables)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::PrewarmAgents,
+                label: "Warm spare agent",
+                hint: "Boot a spare CLI in the selected worktree for instant creates (a peer in /list-agents)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::PrewarmSessions,
+                label: "Prewarm dead sessions",
+                hint: "Boot a worktree's dead sessions while the cursor rests on it, so attaching is instant",
                 group: "",
             },
             SettingSpec {
@@ -592,6 +606,18 @@ pub struct Config {
     /// disables. Owned by the daemon (which does the parsing and reaping);
     /// the TUI writes it so the settings overlay can cycle it.
     pub session_idle_timeout: String,
+    /// PREWARM POOL: keep one booted agent CLI standing by in the selected
+    /// worktree, so creating a session there adopts it instead of waiting
+    /// on a cold start. Owned by the daemon (which spawns, adopts and reaps
+    /// the spare); the TUI writes it so the settings overlay can toggle it.
+    /// A spare is a real CLI process — Claude's own `/list-agents` lists
+    /// it beside the sessions you made, named after the directory — and
+    /// switching this off drains the pool on the daemon's next sweep.
+    pub prewarm_agents: bool,
+    /// SESSION PREWARM: boot a worktree's dead sessions while the selection
+    /// rests on it, so attaching lands on a booted screen. Daemon-owned and
+    /// TUI-written, same as above.
+    pub prewarm_sessions: bool,
     /// What rings when a turn reaches FINISHED: "off", "bell" (terminal
     /// BEL) or the name of a macOS system sound (`Glass` by default,
     /// `Ping`, …; see [`SOUNDS`]). Resolved by [`Config::done_sound`],
@@ -693,6 +719,8 @@ impl Default for Config {
             close_finder_on_open: true,
             skip_session_naming: false,
             session_idle_timeout: "5m".into(),
+            prewarm_agents: true,
+            prewarm_sessions: true,
             done_sound: "Glass".into(),
             feedback_sound: "Sosumi".into(),
             theme: "default".into(),
@@ -763,9 +791,9 @@ impl Config {
 
     /// Put every setting back to its default and return the result. The
     /// file is rewritten from scratch rather than patched like
-    /// [`Config::save`], so keys the overlay doesn't own — the daemon's
-    /// `prewarm_*`, anything hand-added — go too: a reset reads as if the
-    /// file had never been edited.
+    /// [`Config::save`], so keys the overlay doesn't own — anything
+    /// hand-added — go too: a reset reads as if the file had never been
+    /// edited.
     pub fn reset_to_defaults() -> std::io::Result<Self> {
         #[cfg(test)]
         assert!(
@@ -807,6 +835,14 @@ impl Config {
         obj.insert(
             "session_idle_timeout".into(),
             serde_json::json!(self.session_idle_timeout),
+        );
+        obj.insert(
+            "prewarm_agents".into(),
+            serde_json::json!(self.prewarm_agents),
+        );
+        obj.insert(
+            "prewarm_sessions".into(),
+            serde_json::json!(self.prewarm_sessions),
         );
         obj.insert("done_sound".into(), serde_json::json!(self.done_sound));
         obj.insert(
@@ -968,6 +1004,8 @@ impl Config {
             SettingKind::CloseFinderOnOpen => on_off(self.close_finder_on_open).into(),
             SettingKind::SkipSessionNaming => on_off(self.skip_session_naming).into(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
+            SettingKind::PrewarmAgents => on_off(self.prewarm_agents).into(),
+            SettingKind::PrewarmSessions => on_off(self.prewarm_sessions).into(),
             SettingKind::DoneSound => self.done_sound.clone(),
             SettingKind::FeedbackSound => self.feedback_sound.clone(),
             SettingKind::Theme => self.theme.clone(),
@@ -1026,6 +1064,12 @@ impl Config {
             SettingKind::SessionIdleTimeout => {
                 self.session_idle_timeout =
                     cycle_choice(&self.session_idle_timeout, SESSION_IDLE_TIMEOUTS, step).into();
+            }
+            SettingKind::PrewarmAgents => {
+                self.prewarm_agents = !self.prewarm_agents;
+            }
+            SettingKind::PrewarmSessions => {
+                self.prewarm_sessions = !self.prewarm_sessions;
             }
             SettingKind::DoneSound => {
                 self.done_sound = cycle_choice(&self.done_sound, SOUNDS, step).into();
@@ -1272,6 +1316,41 @@ mod tests {
         assert!(!load_from(&path).close_finder_on_open);
     }
 
+    /// The two prewarm keys are daemon-owned but overlay-toggled, like
+    /// `git_init_on_create`: on by default, a missing key reads as on, and
+    /// the Sessions-tab rows round-trip through the saved file.
+    #[test]
+    fn prewarm_toggles_default_on_and_round_trip() {
+        let cfg = Config::default();
+        assert!(cfg.prewarm_agents && cfg.prewarm_sessions);
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.prewarm_agents && cfg.prewarm_sessions);
+        let cfg: Config =
+            serde_json::from_str(r#"{"prewarm_agents": false, "prewarm_sessions": false}"#)
+                .unwrap();
+        assert!(!cfg.prewarm_agents && !cfg.prewarm_sessions);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut cfg = Config::default();
+        let (t, r) = locate(SettingKind::PrewarmAgents).unwrap();
+        assert_eq!(SETTINGS_TABS[t].title, "Sessions");
+        cfg.cycle(t, r, 0);
+        let (t, r) = locate(SettingKind::PrewarmSessions).unwrap();
+        assert_eq!(SETTINGS_TABS[t].title, "Sessions");
+        cfg.cycle(t, r, 0);
+        assert_eq!(cfg.value_label(SettingKind::PrewarmAgents), "off");
+        assert_eq!(cfg.value_label(SettingKind::PrewarmSessions), "off");
+        cfg.save_to(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Written under the daemon's own key names, since it is the reader.
+        assert_eq!(saved["prewarm_agents"], false);
+        assert_eq!(saved["prewarm_sessions"], false);
+        let loaded = load_from(&path);
+        assert!(!loaded.prewarm_agents && !loaded.prewarm_sessions);
+    }
+
     #[test]
     fn defaults_enter_attaches() {
         assert!(Config::default().palette_enter_attaches);
@@ -1296,12 +1375,12 @@ mod tests {
             // A key the overlay doesn't own survives an ordinary save…
             let mut root: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            root["prewarm_agents"] = serde_json::json!(false);
+            root["hand_added_key"] = serde_json::json!(false);
             std::fs::write(&path, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
             Config::load().save().unwrap();
             let raw = std::fs::read_to_string(&path).unwrap();
             assert!(
-                raw.contains("prewarm_agents"),
+                raw.contains("hand_added_key"),
                 "save() patches, keeping foreign keys:\n{raw}"
             );
 
@@ -1311,7 +1390,7 @@ mod tests {
             assert!(reset.keybindings.is_empty());
             let raw = std::fs::read_to_string(&path).unwrap();
             assert!(
-                !raw.contains("prewarm_agents"),
+                !raw.contains("hand_added_key"),
                 "foreign key survived:\n{raw}"
             );
             let loaded = Config::load();

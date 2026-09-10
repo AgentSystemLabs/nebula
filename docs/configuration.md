@@ -62,24 +62,30 @@ tree is worked; every row there is off by default.
 | `pi_model` | string | `"default"` | Agents | Default `--model` for new Pi sessions. Pi takes a fuzzy pattern across every provider it has credentials for, so the overlay lists families (`opus`, `sonnet`, `haiku`, `gpt-5.5`); a hand-edited `provider/id` such as `anthropic/claude-sonnet-5` passes through verbatim. |
 | `pi_effort` | string | `"default"` | Agents | Default `--thinking` level for new Pi sessions: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or the `"default"` sentinel. |
 | `keybindings` | object | `{}` | Hotkeys | KEYMAP overrides, keyed by action id, valued with a comma-separated chord list: `{"git_diff": "ctrl+g, g"}`. An empty string deliberately unbinds; unknown ids are ignored. Only rows that differ from the defaults are written. |
-| `prewarm_agents` | bool | `true` | — | PREWARM POOL: pre-spawn an agent CLI while you are still naming the session, so creation feels instant. **Costs one idle CLI process per warm slot** (150–300 MB each, up to 15 minutes). `false` opts out. |
-| `prewarm_sessions` | bool | `true` | — | SESSION PREWARM: pre-spawn a WORKTREE's dead sessions when your selection rests on it, so attaching shows an already-booted screen instead of a booting shell. **Costs idle shell/CLI processes for sessions you may never open.** `false` opts out. |
+| `prewarm_agents` | bool | `true` | Sessions | DAEMON-owned PREWARM POOL: keep one booted agent CLI standing by in the selected WORKTREE, so creating a session there adopts it and feels instant. **Costs one idle CLI process per warm slot** (150–300 MB each, up to 15 minutes), and that spare is a real session as far as the CLI is concerned — Claude's own `/list-agents` lists it beside the sessions you made, named after the directory (`my-repo-3f`), and the memory modal (`Shift+M`) groups it under **warm spares**. Off drains the pool on the DAEMON's next sweep (within 30 s). |
+| `prewarm_sessions` | bool | `true` | Sessions | DAEMON-owned SESSION PREWARM: boot a WORKTREE's dead sessions when your selection rests on it, so attaching shows an already-booted screen instead of a booting shell. **Costs idle shell/CLI processes for sessions you may never open.** Off stops booting them; sessions already up stay until the IDLE REAPER takes them. |
 
 `hide_projects` and `hide_worktrees` default to `false`. Set either to `true` to start with that panel
 hidden; the SESSIONS PANEL always remains visible.
 
-### Prewarming is hand-edit-only
+### Prewarming
 
-`prewarm_agents` and `prewarm_sessions` have no SETTINGS OVERLAY row at all — the only way to turn
-prewarming off is to write the key into CONFIG.JSON yourself:
+`prewarm_agents` and `prewarm_sessions` are the two settings that cost real processes you never
+asked for, so they are worth knowing about on a laptop or a small remote box — and worth knowing
+about if your sessions talk to each other. A warm spare is a bare `claude` sitting at its prompt in
+the selected worktree: Claude's `/list-agents` shows it as a peer named after the directory, the
+same way it names any session you have not titled yet, so a spare beside a fresh untitled session
+reads as two copies of one session (`my-repo-3f`, `my-repo-a1`), one of them forever idle. That is
+the spare, not a duplicate — `Shift+M` lists it under **warm spares** with its PID. Both rows live on
+the SETTINGS OVERLAY's Sessions tab (`Warm spare agent`, `Prewarm dead sessions`); the same keys in
+CONFIG.JSON work by hand:
 
 ```json
 { "prewarm_agents": false, "prewarm_sessions": false }
 ```
 
-They are the two settings that cost real processes you never asked for, so they are worth knowing
-about on a laptop or a small remote box. `session_idle_timeout` is what bounds their cost when they
-are left on.
+Turning the pool off takes the standing spares away on the DAEMON's next sweep. `session_idle_timeout`
+is what bounds the cost of both when they are left on.
 
 ### What `session_idle_timeout` accepts
 
@@ -98,7 +104,8 @@ on the next ATTACH or prewarm, and an agent RESUMES its conversation there.
   same file: color theme, animations, whether the Workspaces bar, PROJECTS PANEL,
   and WORKTREES PANEL are shown,
   editor, which agent CLIs the new-session menu offers (at least one stays on) and their default model
-  and reasoning effort, the idle timeout, the done sound (`done_sound`: a ding
+  and reasoning effort, the idle timeout, whether a warm spare and a worktree's dead sessions are
+  pre-booted (`prewarm_agents`, `prewarm_sessions`), the done sound (`done_sound`: a ding
   when a turn finishes — a macOS system sound such as `Glass`, the default; `bell` for the terminal
   bell, which Ghostty keeps silent unless its `bell-features` include `audio`; or `off`. Over
   `nebula ssh` and off macOS it is always the bell), the feedback sound (`feedback_sound`: the same
