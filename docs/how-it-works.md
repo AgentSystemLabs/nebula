@@ -119,9 +119,12 @@
   worktree, opening with a note saying where it now runs, so the conversation carries on there without
   you typing anything. Claude learns the rule from a short `--append-system-prompt` nebula passes at
   spawn, plus a `Bash(nebula worktree:*)` permission so the command never prompts; Pi gets the same
-  appended prompt and reopens on the same note. Codex and Cursor
-  sessions can run the same command; they resume silent and wait for your next prompt. The restart is
-  the only way there: an agent CLI can't `cd` out of the directory it was started in.
+  appended prompt and reopens on the same note. Codex and Cursor have no system-prompt flag to learn
+  the rule from, but run the same command when you ask. Codex then reopens on the same note —
+  `codex resume <id> --cd <worktree> "<note>"`, the `--cd` because Codex otherwise reopens a resumed
+  session in the directory its transcript recorded, the old checkout. Cursor resumes silent and waits
+  for your next prompt. The restart is the only way there: an agent CLI can't `cd` out of the
+  directory it was started in.
 - **Ask the agent for another session and it starts one.** Tell a Claude session "start a new nebula
   session that fixes the login redirect" and it runs `nebula spawn "<task>"`: the daemon starts a second
   agent beside it — same worktree, same harness, model and effort unless `--kind claude|codex|cursor|pi`
