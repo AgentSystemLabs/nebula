@@ -46,6 +46,13 @@ checkout", never "feat(tui): add tabs").
    `git revert` undoes and what it does not (a PROTOCOL VERSION bump, a migrated store, a pushed
    branch). "No risk" is never bare: a docs-only or prose-only PR says *why* nothing runs. The
    reviewer checks this read against the diff, so write it as the reviewer would, not as the seller.
+   When the change **adds a surface** — the DAEMON execs a program, opens a socket, a route or a
+   `ClientRequest`, reads a new config source, writes a file it did not before — the Risk section
+   opens with an `### 🎯 Attack surface` subsection above the verdict: one bullet per way in, saying
+   who or what reaches it, what holds it, and what does not. The 🔒 row then rates the residue, not
+   the whole list. One table cell is never enough for an exec surface (PR #42, 2026-09-09: the exec
+   of a git-config path shipped as one cell, and the maintainer asked where the attack vectors were).
+   The templates carry the block behind a guidance comment; a PR that adds no surface deletes it.
 7. **The footer.** Every PR body ends with the line the harness gives you (currently
    `🤖 Generated with [Claude Code](https://claude.com/claude-code)` plus the session link) — keep
    it verbatim, last, after a blank line.
