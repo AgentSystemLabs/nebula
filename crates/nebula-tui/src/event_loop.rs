@@ -125,8 +125,9 @@ const KEEPWARM_REFRESH: Duration = Duration::from_secs(4 * 60);
 /// it to the floor, so a PR an agent opens while the user watches lands on
 /// the row within seconds; resting on a checkout that will never have one
 /// backs off to a cadence that costs nothing. Each answer costs a `gh`
-/// process and a network round trip, so only the selected worktree is
-/// asked, and a worktree whose PR has been found is never asked again.
+/// process and a network round trip, so the selected worktree is the only
+/// one asked on every tick; the rest of the project's checkouts take turns
+/// (`sweep_pull_request`), one per tick, on the same backoff.
 const PR_RECHECK_MIN: Duration = Duration::from_secs(10);
 const PR_RECHECK_MAX: Duration = Duration::from_secs(3 * 60);
 /// How often the selected worktree's *known* pull request is re-asked. The
@@ -135,6 +136,18 @@ const PR_RECHECK_MAX: Duration = Duration::from_secs(3 * 60);
 /// for the one checkout the cursor is resting on. Same cadence and the same
 /// budget reasoning as `OPEN_PRS_REFRESH` below.
 const PR_REFRESH: Duration = Duration::from_secs(15);
+/// The same beat for every *other* checkout of the selected project: how
+/// often a known pull request on a worktree the cursor is not resting on
+/// is re-asked. Slow, because it multiplies by the number of checkouts —
+/// thirty worktrees with pull requests is thirty calls a sweep, so at five
+/// minutes that is 360 an hour — and because nothing on those rows needs
+/// to be fresher: what they show is whether the branch has *merged*, a
+/// change the project's open list catches within `OPEN_PRS_REFRESH`
+/// anyway (`note_open_prs_answer` pulls a checkout's lookup forward the
+/// moment its pull request leaves that list). The sweep is what lets a
+/// checkout turn purple without ever being focused, and what has every
+/// PR ROW badged when the cursor does arrive.
+const PR_SWEEP_REFRESH: Duration = Duration::from_secs(5 * 60);
 
 /// How often the selected *project's* open-pull-request list is re-asked
 /// once a repo has proved it has any, and how a repo that answers empty (or
@@ -146,7 +159,9 @@ const PR_REFRESH: Duration = Duration::from_secs(15);
 /// GraphQL API", checked 2026-08-28): 5,000 points an hour per user token,
 /// with a secondary cap of 2,000 points a minute. At fifteen seconds this
 /// list and the selected worktree's `PR_REFRESH` together spend 480 an hour
-/// — under a tenth of the quota — and a focus-driven re-ask (see
+/// — under a tenth of the quota — the sweep of the project's other
+/// checkouts (`PR_SWEEP_REFRESH`) adds twelve an hour per checkout with a
+/// pull request, and a focus-driven re-ask (see
 /// `schedule_pull_request_refresh`) adds at most one call per
 /// `OPEN_PRS_MIN_AGE`. The rest is left for the user's own `gh` and for the
 /// Claude sessions sharing the same token, which is why this isn't faster
@@ -301,16 +316,21 @@ async fn main_loop(
                 refresh_git_changes(&mut app);
                 // Rides the git tick rather than the repaint, so walking the
                 // worktree list with j/k can't spawn a `gh` per row passed —
-                // only whatever the selection is resting on when it fires.
+                // only whatever the selection is resting on when it fires,
+                // plus one of the project's other checkouts if its turn has
+                // come.
                 lookup_pull_request(&mut app, &pr_tx);
+                sweep_pull_request(&mut app, &pr_tx);
                 lookup_open_prs(&mut app, &prs_tx, &mut out);
                 next_git_poll = tokio::time::Instant::now() + GIT_POLL;
             }
-            // `r` asked for the pull requests now: the same two lookups the
-            // git tick runs, on this turn instead of up to `GIT_POLL` later.
+            // `Shift+R` asked for the pull requests now: the same lookups
+            // the git tick runs, on this turn instead of up to `GIT_POLL`
+            // later.
             _ = std::future::ready(()), if app.pr_refresh_requested => {
                 app.pr_refresh_requested = false;
                 lookup_pull_request(&mut app, &pr_tx);
+                sweep_pull_request(&mut app, &pr_tx);
                 lookup_open_prs(&mut app, &prs_tx, &mut out);
             }
             // Metrics poll: always on for the footer's memory/session
@@ -607,15 +627,72 @@ fn lookup_pull_request(
     });
 }
 
+/// Ask `gh` about one of the selected project's *other* checkouts, off the
+/// loop — the sweep that turns a worktree purple without the cursor ever
+/// visiting it. One process per tick at most, whatever the number of
+/// worktrees: the first unselected checkout in row order whose timer has
+/// expired gets this tick, the next one waits for the next tick, so a
+/// project of thirty checkouts fills in over a minute at startup and then
+/// idles on `PR_SWEEP_REFRESH`. The reply lands on `pr_tx` like any other.
+fn sweep_pull_request(
+    app: &mut App,
+    pr_tx: &tokio::sync::mpsc::UnboundedSender<(WorktreeId, Option<PullRequest>)>,
+) {
+    let Some((id, path)) = sweep_target(app) else {
+        return;
+    };
+    app.pr_inflight.insert(id.clone());
+    let pr_tx = pr_tx.clone();
+    tokio::spawn(async move {
+        let pr = crate::pull_request::lookup(&path).await;
+        let _ = pr_tx.send((id, pr));
+    });
+}
+
+/// The checkout the sweep should spend this tick on: the first of the
+/// selected project's unselected, non-root worktrees, in row order, that
+/// is due and on disk. The ROOT WORKTREE is skipped — nobody deletes it
+/// over a merged pull request, and its own turn comes when it is selected.
+/// A checkout that isn't on disk (deleted outside nebula) is noted as a
+/// miss on the way past, without spending a process or the tick, since
+/// its branch has nothing for `gh` to resolve; the backoff still runs, as
+/// a worktree can be restored underneath us.
+fn sweep_target(app: &mut App) -> Option<(WorktreeId, std::path::PathBuf)> {
+    let selected = app.selected_worktree().map(|w| w.id.clone());
+    let candidates: Vec<(WorktreeId, std::path::PathBuf)> = app
+        .visible_worktrees()
+        .iter()
+        .filter(|w| !w.is_main && Some(&w.id) != selected.as_ref())
+        .map(|w| (w.id.clone(), w.path.clone()))
+        .collect();
+    for (id, path) in candidates {
+        if !app.pr_lookup_due(&id) {
+            continue;
+        }
+        if !path.is_dir() {
+            note_pr_answer(app, &id, false);
+            app.dirty |= app.pull_requests.insert(id, None) != Some(None);
+            continue;
+        }
+        return Some((id, path));
+    }
+    None
+}
+
 /// Record what a lookup came back with, and arm the next one. A found PR
-/// settles onto the steady `PR_REFRESH` beat — it keeps being asked because
-/// its comment count has to keep up with GitHub — while an empty answer
-/// arms the next attempt one backoff step further out, so a checkout that
-/// never grows a PR settles at `PR_RECHECK_MAX` instead of asking every few
-/// seconds forever.
+/// settles onto a steady beat — it keeps being asked because its comment
+/// count and its state have to keep up with GitHub — `PR_REFRESH` for the
+/// checkout the cursor is resting on, the slower `PR_SWEEP_REFRESH` for
+/// any other, since a row nobody is reading only has to keep up with its
+/// merge. An empty answer arms the next attempt one backoff step further
+/// out, so a checkout that never grows a PR settles at `PR_RECHECK_MAX`
+/// instead of asking every few seconds forever.
 fn note_pr_answer(app: &mut App, worktree: &WorktreeId, found: bool) {
-    let step = if found {
+    let selected = app.selected_worktree().is_some_and(|w| &w.id == worktree);
+    let step = if found && selected {
         PR_REFRESH
+    } else if found {
+        PR_SWEEP_REFRESH
     } else {
         match app.pr_recheck.get(worktree) {
             Some((_, prev)) => (*prev * 2).min(PR_RECHECK_MAX),
@@ -692,12 +769,27 @@ fn note_open_prs_answer(
         }
     };
     let now = std::time::Instant::now();
+    // The pull requests that were open at the last answer and are not in
+    // this one: each has merged or closed since, and if a checkout of this
+    // project is on one of those branches its row is about to change
+    // colour. Only a real answer says so — a failed call keeps the old list
+    // and retires nothing.
+    let left: Vec<String> = match (previous, &list) {
+        (Some(open), Some(fresh)) => open
+            .list
+            .iter()
+            .filter(|was| !fresh.iter().any(|pr| pr.url == was.url))
+            .map(|was| was.url.clone())
+            .collect(),
+        _ => Vec::new(),
+    };
     let mut list = list.unwrap_or_else(|| previous.map(|o| o.list.clone()).unwrap_or_default());
     // Drafts sink to the bottom of the group here, on the one path every
     // answer lands through; the cursor reconcile below follows its PR by
     // URL, so the reorder never moves the selection off it.
     crate::pull_request::drafts_last(&mut list);
     app.dirty |= previous.map(|o| &o.list) != Some(&list);
+    reask_checkouts_whose_pr_left(app, &left);
     app.open_prs.insert(
         project,
         crate::app::OpenPrs {
@@ -709,6 +801,32 @@ fn note_open_prs_answer(
     );
     forget_retired_prs(app);
     reconcile_open_pr_cursor(app, cursor, out);
+}
+
+/// Pull the lookup of every checkout whose *open* pull request is among
+/// `left` — the URLs that just dropped out of the project's open list —
+/// forward to the next tick, past whatever `PR_SWEEP_REFRESH` timer the
+/// sweep had armed. The list is the fast signal that a branch has merged
+/// (it runs every `OPEN_PRS_REFRESH`, and a merged PR stops coming back);
+/// the checkout's own `gh pr view` is what says *merged* rather than
+/// *closed* and repaints the row purple, so the one is made to follow the
+/// other within seconds instead of minutes. A checkout whose PR is already
+/// known merged or closed has nothing left to learn and is left on its beat.
+fn reask_checkouts_whose_pr_left(app: &mut App, left: &[String]) {
+    if left.is_empty() {
+        return;
+    }
+    let due: Vec<WorktreeId> = app
+        .pull_requests
+        .iter()
+        .filter_map(|(wt, pr)| {
+            let pr = pr.as_ref()?;
+            (pr.is_open() && left.contains(&pr.url)).then(|| wt.clone())
+        })
+        .collect();
+    for wt in due {
+        app.pr_recheck.remove(&wt);
+    }
 }
 
 /// Follow the Worktrees cursor across a change to the open-pull-request
@@ -991,6 +1109,19 @@ fn schedule_pr_lookup(app: &mut App) {
     }
 }
 
+/// Arm every checkout of the selected project for a prompt lookup: drop
+/// the timers the sweep armed, so its next passes re-ask each row in turn.
+fn schedule_pr_sweep(app: &mut App) {
+    let ids: Vec<WorktreeId> = app
+        .visible_worktrees()
+        .iter()
+        .map(|w| w.id.clone())
+        .collect();
+    for id in ids {
+        app.pr_recheck.remove(&id);
+    }
+}
+
 /// Pull both pull-request lookups forward — the project's open list and
 /// the selected worktree's own PR — so the next `GIT_POLL` tick asks GitHub
 /// again. Run on the gestures that mean "I want fresh data now": the
@@ -1005,13 +1136,15 @@ fn schedule_pull_request_refresh(app: &mut App) {
 }
 
 /// `Shift+R`, from any panel: ask GitHub again *now* — the selected
-/// project's open list, the selected worktree's own PR, and the body and
-/// conversation of the pull request the pane is reading — past
+/// project's open list, every one of its checkouts' own PR, and the body
+/// and conversation of the pull request the pane is reading — past
 /// every timer and floor the beats keep. `schedule_pull_request_refresh`
 /// is what a focus event may do; this is what a deliberate keypress may
 /// do, so the list's `OPEN_PRS_MIN_AGE` floor does not apply and the two
 /// list lookups fire on the loop's next turn rather than the next git
-/// tick. The flash is the only immediate feedback: the rows repaint once
+/// tick. The other checkouts follow at the sweep's one-per-tick pace, so
+/// the key spends one process per row over the next seconds, never a
+/// burst. The flash is the only immediate feedback: the rows repaint once
 /// the answers land, and a machine with no `gh` never repaints at all.
 fn refresh_pull_requests(app: &mut App) {
     let Some(project) = app.selected_project().map(|p| p.id.clone()) else {
@@ -1021,6 +1154,7 @@ fn refresh_pull_requests(app: &mut App) {
         open.due = std::time::Instant::now();
     }
     schedule_pr_lookup(app);
+    schedule_pr_sweep(app);
     refetch_pr_detail(app);
     app.pr_refresh_requested = true;
     app.flash = Some("refreshing pull requests…".into());
@@ -10148,9 +10282,18 @@ diff --git a/src/b.rs b/src/b.rs
         );
         assert!(app.overlay.is_none() && app.flash.is_none());
 
+        // Another checkout of the project, resting on the sweep's beat.
+        let other = add_worktree(&mut app, "w2", "/tmp/demo-w2");
+        note_pr_answer(&mut app, &other, true);
+        assert!(!app.pr_lookup_due(&other), "swept minutes from now");
+
         press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
         assert!(app.open_prs_lookup_due(&pid), "the key skips the floor");
         assert!(app.pr_lookup_due(&wid), "and the beat");
+        assert!(
+            app.pr_lookup_due(&other),
+            "and every other checkout's sweep timer"
+        );
         assert!(
             app.pr_refresh_requested,
             "fired on the loop's next turn, not the next git tick"
@@ -10419,16 +10562,34 @@ diff --git a/src/b.rs b/src/b.rs
 
     /// Finding the PR settles the worktree onto a steady beat rather than
     /// retiring it: the PR won't change, but its conversation will, and the
-    /// unread-comment badge is only as fresh as the last poll.
+    /// unread-comment badge is only as fresh as the last poll. The beat
+    /// depends on where the cursor is: the selected checkout keeps up with
+    /// its conversation, any other only with its merge.
     #[test]
     fn a_found_pr_keeps_being_refreshed() {
         use nebula_core::WorktreeId;
         let mut app = App::new();
+        seed_tree(&mut app);
         let wt = WorktreeId("w1".into());
+        assert_eq!(
+            app.selected_worktree().map(|w| w.id.clone()),
+            Some(wt.clone())
+        );
         note_pr_answer(&mut app, &wt, false);
         note_pr_answer(&mut app, &wt, true);
         let (_, step) = *app.pr_recheck.get(&wt).expect("still scheduled");
         assert_eq!(step, PR_REFRESH, "the miss backoff gives way to the beat");
+
+        // A checkout the cursor is not on settles onto the sweep's slower
+        // beat instead: nobody is reading its badge.
+        let other = WorktreeId("w2".into());
+        note_pr_answer(&mut app, &other, true);
+        let (_, step) = *app.pr_recheck.get(&other).expect("scheduled");
+        assert_eq!(step, PR_SWEEP_REFRESH, "an unselected checkout is swept");
+        assert!(
+            PR_SWEEP_REFRESH > PR_RECHECK_MAX,
+            "slower than any miss backoff"
+        );
 
         app.pull_requests.insert(
             wt.clone(),
@@ -10592,6 +10753,170 @@ diff --git a/src/b.rs b/src/b.rs
             Some(w2.clone())
         );
         assert!(app.pr_lookup_due(&w2), "the switch re-arms the lookup");
+    }
+
+    /// Add a non-root checkout to the seeded project, as the daemon's
+    /// upsert would.
+    fn add_worktree(app: &mut App, id: &str, path: &str) -> nebula_core::WorktreeId {
+        use nebula_core::{Entity, ProjectId, Worktree, WorktreeId};
+        let wid = WorktreeId(id.into());
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: wid.clone(),
+                    project_id: ProjectId("p1".into()),
+                    path: path.into(),
+                    branch: id.into(),
+                    is_main: false,
+                    sort_order: 1,
+                }),
+            },
+        );
+        wid
+    }
+
+    /// The sweep hands out one checkout per tick: the first unselected,
+    /// non-root worktree in row order that is due and on disk. A checkout
+    /// with a lookup in flight or a timer still running is passed over;
+    /// one that isn't on disk is noted as a miss on the way past without
+    /// taking the tick; the ROOT WORKTREE and the selected checkout are
+    /// never the sweep's — the root has no merge worth a call, and the
+    /// selected one has its own lookup.
+    #[test]
+    fn the_sweep_takes_the_projects_other_checkouts_one_per_tick() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let root = app.selected_worktree().expect("the root").id.clone();
+        assert!(app.selected_worktree().unwrap().is_main);
+        let on_disk = tempfile::tempdir().unwrap();
+        let also_on_disk = tempfile::tempdir().unwrap();
+        let w2 = add_worktree(&mut app, "w2", on_disk.path().to_str().unwrap());
+        let w3 = add_worktree(&mut app, "w3", also_on_disk.path().to_str().unwrap());
+        let gone = add_worktree(&mut app, "w4", "/tmp/nebula-sweep-no-such-checkout");
+        let order: Vec<_> = app
+            .visible_worktrees()
+            .iter()
+            .map(|w| w.id.clone())
+            .collect();
+        assert_eq!(order[0], root, "root first");
+        let rest: Vec<_> = order[1..]
+            .iter()
+            .filter(|id| **id != gone)
+            .cloned()
+            .collect();
+
+        // First tick: the first on-disk checkout in row order.
+        let (first, path) = sweep_target(&mut app).expect("a checkout to sweep");
+        assert_eq!(first, rest[0]);
+        assert!(path.is_dir());
+        // Still the same one until its answer is in — the loop marks it in
+        // flight before spawning; here that is done by hand.
+        assert_eq!(
+            sweep_target(&mut app).map(|(id, _)| id),
+            Some(first.clone())
+        );
+        app.pr_inflight.insert(first.clone());
+        // Next tick: the other one. Then nothing until a timer expires.
+        let (second, _) = sweep_target(&mut app).expect("the other checkout");
+        assert_eq!(second, rest[1]);
+        assert_ne!(second, first);
+        app.pr_inflight.remove(&second);
+        note_pr_answer(&mut app, &second, true);
+        assert!(app.pr_lookup_due(&gone), "not yet reached");
+        assert_eq!(
+            sweep_target(&mut app),
+            None,
+            "everything is in flight or on its beat"
+        );
+        assert!(
+            !app.pr_lookup_due(&gone),
+            "the missing checkout was noted as a miss on the way past"
+        );
+        assert_eq!(app.pull_requests.get(&gone), Some(&None));
+
+        // With a non-root checkout selected, that one is left to its own
+        // lookup and the root is still not swept.
+        app.pr_inflight.clear();
+        app.pr_recheck.clear();
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = order.iter().position(|id| *id == w2).unwrap();
+        assert_eq!(
+            app.selected_worktree().map(|w| w.id.clone()),
+            Some(w2.clone())
+        );
+        assert_eq!(
+            sweep_target(&mut app).map(|(id, _)| id),
+            Some(w3.clone()),
+            "not the selected checkout, not the root"
+        );
+        app.pr_inflight.insert(w3);
+        assert_eq!(
+            sweep_target(&mut app),
+            None,
+            "the root is never the sweep's"
+        );
+    }
+
+    /// A pull request that drops out of the project's open list has merged
+    /// or closed; the checkout on that branch is re-asked on the next tick
+    /// rather than when its sweep timer comes round, so the row turns
+    /// purple within seconds of the merge. A failed list keeps its rows
+    /// and retires nothing; a checkout whose PR is already known merged
+    /// has nothing to learn.
+    #[test]
+    fn a_pull_request_that_leaves_the_open_list_re_asks_its_checkout() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let pid = app.selected_project().expect("a project").id.clone();
+        let wid = nebula_core::WorktreeId("w1".into());
+        seed_branch_pr(&mut app, 7, "Attach links");
+        seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Number lines")]);
+        let resting = || {
+            (
+                std::time::Instant::now() + PR_SWEEP_REFRESH,
+                PR_SWEEP_REFRESH,
+            )
+        };
+        app.pr_recheck.insert(wid.clone(), resting());
+        assert!(!app.pr_lookup_due(&wid), "on the sweep's beat");
+
+        // #9 is still open: nothing about #7's checkout changes.
+        let seven = app.open_prs[&pid].list[0].clone();
+        let nine = app.open_prs[&pid].list[1].clone();
+        assert_eq!((seven.number, nine.number), (7, 9));
+        note_open_prs_answer(
+            &mut app,
+            pid.clone(),
+            Some(vec![nine.clone(), seven]),
+            &mut Vec::new(),
+        );
+        assert!(!app.pr_lookup_due(&wid), "still listed: still on its beat");
+
+        // #7 leaves the list: its checkout is due now.
+        note_open_prs_answer(
+            &mut app,
+            pid.clone(),
+            Some(vec![nine.clone()]),
+            &mut Vec::new(),
+        );
+        assert!(
+            app.pr_lookup_due(&wid),
+            "its pull request just left the open list"
+        );
+
+        // A call that couldn't be made keeps the old rows and re-asks nothing.
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        app.pr_recheck.insert(wid.clone(), resting());
+        note_open_prs_answer(&mut app, pid.clone(), None, &mut Vec::new());
+        assert!(!app.pr_lookup_due(&wid), "no answer, no retirement");
+
+        // Known merged already: leaving the list says nothing new.
+        let mut merged = a_detail(7, "shipped", vec![]);
+        merged.state = "MERGED".into();
+        adopt_pr_state(&mut app, &merged);
+        note_open_prs_answer(&mut app, pid, Some(vec![]), &mut Vec::new());
+        assert!(!app.pr_lookup_due(&wid), "already wearing the merge");
     }
 
     /// The keep-warm tick re-sends the default-spec Claude prewarm for the

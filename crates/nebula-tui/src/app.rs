@@ -2126,10 +2126,13 @@ pub struct App {
     pub git_changes: Option<(WorktreeId, Option<usize>)>,
     /// What `gh pr view` last said about each worktree's branch: `Some(pr)`
     /// when one exists, `None` when the lookup came back empty (no PR, no
-    /// `gh`, no remote). A missing key means "not looked up yet". An empty
-    /// answer is re-asked on a backing-off timer (`pr_recheck`), since the
-    /// PR a session opens appears well after the first lookup; a found one
-    /// is final.
+    /// `gh`, no remote). A missing key means "not looked up yet" — briefly,
+    /// for the selected project: its selected checkout is asked on every
+    /// tick, and the others take turns on a sweep, so every row learns its
+    /// merge without being visited. An empty answer is re-asked on a
+    /// backing-off timer (`pr_recheck`), since the PR a session opens
+    /// appears well after the first lookup; a found one keeps being
+    /// re-asked on a beat, for its conversation and its state.
     pub pull_requests: HashMap<WorktreeId, Option<PullRequest>>,
     /// How far the user has read into each pull request's conversation,
     /// keyed by PR URL — the daemon's `pr_seen` rows, plus whatever this
@@ -2140,10 +2143,12 @@ pub struct App {
     /// `gh` process on the first.
     pub pr_inflight: std::collections::HashSet<WorktreeId>,
     /// When to ask `gh` about a worktree again, and the step that produced
-    /// that deadline: a steady beat once its pull request is known (so the
-    /// unread-comment count keeps up), a doubling backoff while it isn't.
-    /// Switching into a worktree drops its entry, so arriving somewhere
-    /// always asks again promptly.
+    /// that deadline: a steady beat once its pull request is known (a quick
+    /// one for the selected checkout, so the unread-comment count keeps up;
+    /// a slow one for the rest, which only have to keep up with a merge), a
+    /// doubling backoff while it isn't. Switching into a worktree drops its
+    /// entry, so arriving somewhere always asks again promptly; so does its
+    /// pull request leaving the project's open list.
     pub pr_recheck: HashMap<WorktreeId, (std::time::Instant, std::time::Duration)>,
     /// What `gh pr list` last said about each project's open pull requests
     /// — the group at the bottom of the Worktrees panel. A missing key

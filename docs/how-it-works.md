@@ -203,13 +203,18 @@ discard data.
 This is the one part of nebula the TUI asks for itself rather than the DAEMON: every `gh pr view`,
 `gh pr list` and `gh pr diff` is spawned by the client, which is why the lookups stop the moment you
 quit, and why a machine with no `gh` — or one that is unauthenticated, or pointed at a checkout with no
-remote — just shows no rows instead of an error. Only what you are looking at is ever asked about: the
-selected worktree's PR ROW and the selected project's PROJECT OPEN PRS GROUP, one process each, never
-stacked while one is in flight, each abandoned after 20 s. A repo that answers settles onto a steady
-15 s beat; an empty answer backs off by doubling — out to 3 min for a branch that never grows a PR,
-10 min for a project with none open — so a workspace of thirty repos does not cost thirty API calls a
-beat. Focusing a sidebar panel or the terminal window pulls the next lookup forward, floored at a few
-seconds; `Shift+R` is the one gesture that asks straight away.
+remote — just shows no rows instead of an error. Only the selected project is ever asked about: its
+selected worktree's PR ROW and its PROJECT OPEN PRS GROUP on every tick, one process each, and its other
+checkouts on a sweep that takes one of them per tick — so every worktree row learns whether its branch
+has merged without the cursor ever visiting it (the ROOT WORKTREE is left out; nobody deletes it over a
+merge). Nothing is stacked while a call is in flight, and each is abandoned after 20 s. The selected
+worktree and the open list settle onto a steady 15 s beat; the swept checkouts onto 5 min, since a
+merge reaches them sooner anyway — the moment a pull request drops out of the open list, the checkout on
+its branch is asked again on the next tick, and turns purple seconds after the merge. An empty answer
+backs off by doubling — out to 3 min for a branch that never grows a PR, 10 min for a project with none
+open — so a workspace of thirty repos does not cost thirty API calls a beat. Focusing a sidebar panel or
+the terminal window pulls the next lookup forward, floored at a few seconds; `Shift+R` is the one
+gesture that asks straight away, every checkout of the project included.
 
 Settings and hotkeys live in [Configuration](configuration.md). The process model, the IPC CODEC and
 the crate layout are covered in more depth in [ARCHITECTURE.md](../ARCHITECTURE.md).
