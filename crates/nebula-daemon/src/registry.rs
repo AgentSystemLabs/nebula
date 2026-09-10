@@ -1217,15 +1217,24 @@ impl Daemon {
         Some(entry)
     }
 
-    /// Drop warm sessions that died or sat unclaimed past the max age
-    /// (runs on the daemon's periodic tick).
+    /// Drop warm sessions that died or sat unclaimed past the max age —
+    /// and, once `prewarm_agents` is switched off, every one of them: a
+    /// spare is a real CLI process the user can see (Claude's `/list-agents`
+    /// names it beside their own sessions), so the toggle takes it away on
+    /// the next sweep rather than leaving it to age out over 15 minutes.
+    /// Runs on the daemon's periodic tick.
     pub fn reap_prewarmed(&self) {
+        self.reap_prewarmed_with(&crate::config::Config::load());
+    }
+
+    fn reap_prewarmed_with(&self, config: &crate::config::Config) {
         let doomed: Vec<AgentId> = {
             let mut pool = self.prewarmed.lock().unwrap();
             let expired: Vec<_> = pool
                 .iter()
                 .filter(|(_, e)| {
-                    e.spawned_at.elapsed() > PREWARM_MAX_AGE
+                    !config.prewarm_agents
+                        || e.spawned_at.elapsed() > PREWARM_MAX_AGE
                         || !self.is_alive(&SessionRef::Agent(e.agent_id.clone()))
                 })
                 .map(|(k, _)| k.clone())
@@ -4726,6 +4735,60 @@ mod tests {
         );
         daemon.reap_prewarmed();
         assert!(daemon.prewarmed.lock().unwrap().is_empty());
+    }
+
+    /// Switching `prewarm_agents` off drains the pool on the next sweep. A
+    /// spare is a real CLI process the user can see — Claude's own
+    /// `/list-agents` lists it beside their sessions, named after the
+    /// directory (issue #15) — so the toggle has to take it away now, not
+    /// when it ages out.
+    #[tokio::test]
+    async fn reap_prewarmed_drains_the_pool_once_prewarming_is_off() {
+        let daemon = test_daemon();
+        let key = (WorktreeId("w1".into()), AgentKind::Claude);
+        let id = AgentId("warm-1".into());
+        let sref = SessionRef::Agent(id.clone());
+        let session = PtySession::spawn(
+            sref.clone(),
+            SpawnSpec {
+                program: "sleep".into(),
+                args: vec!["30".into()],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: &[],
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .unwrap();
+        daemon.install_session(session);
+        daemon.prewarmed.lock().unwrap().insert(
+            key.clone(),
+            PrewarmEntry {
+                agent_id: id.clone(),
+                spawned_at: Instant::now(),
+                model: None,
+                effort: None,
+                buffered_hooks: Vec::new(),
+            },
+        );
+        let with_pool = |on: bool| crate::config::Config {
+            prewarm_agents: on,
+            ..crate::config::Config::default()
+        };
+
+        // Live, young and wanted: the ordinary sweep keeps it.
+        daemon.reap_prewarmed_with(&with_pool(true));
+        assert!(daemon.prewarmed.lock().unwrap().contains_key(&key));
+        assert!(daemon.is_alive(&sref), "a kept spare keeps its PTY");
+
+        // Off: the same sweep takes it, PTY and all.
+        daemon.reap_prewarmed_with(&with_pool(false));
+        assert!(daemon.prewarmed.lock().unwrap().is_empty());
+        assert!(
+            !daemon.is_alive(&sref),
+            "a drained spare's PTY goes with it"
+        );
     }
 
     #[test]
