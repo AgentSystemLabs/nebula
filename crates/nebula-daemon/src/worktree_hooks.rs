@@ -122,7 +122,14 @@ async fn run_program(
         worktree = %ctx.worktree.display(),
         "running worktree hook"
     );
-    let child = tokio::process::Command::new(program)
+    // Output lands in unlinked temp files, not pipes. A hook that starts a
+    // dev server in the background and exits 0 leaves that server holding
+    // its stdout; a pipe would keep the wait open until the timeout and
+    // then report a success as "timed out". A file is inherited harmlessly
+    // and the wait below is on the process alone.
+    let stdout = tempfile::tempfile().context("hook output file")?;
+    let stderr = tempfile::tempfile().context("hook output file")?;
+    let mut child = tokio::process::Command::new(program)
         .arg(ctx.repo)
         .arg(ctx.worktree)
         .env("NEBULA_HOOK", label)
@@ -130,31 +137,37 @@ async fn run_program(
         .env("NEBULA_WORKTREE_ID", ctx.id.as_str())
         .current_dir(ctx.repo)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Dropping the wait below on timeout is what kills it.
+        .stdout(Stdio::from(stdout.try_clone()?))
+        .stderr(Stdio::from(stderr.try_clone()?))
+        // Its own process group, so a timeout takes everything it started
+        // down with it, not just the script.
+        .process_group(0)
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("{label} hook `{program}` could not start"))?;
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(waited) => waited.with_context(|| format!("{label} hook `{program}`"))?,
-        Err(_) => bail!(
-            "{label} hook `{program}` timed out after {} and was killed",
-            describe(timeout)
-        ),
+        Err(_) => {
+            kill_group(&child);
+            let _ = child.wait().await;
+            bail!(
+                "{label} hook `{program}` timed out after {} and was killed with everything it started",
+                describe(timeout)
+            );
+        }
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = read_tail(stdout);
+    let stderr = read_tail(stderr);
     if !stdout.trim().is_empty() {
         tracing::info!(hook = label, "hook stdout:\n{}", stdout.trim_end());
     }
     if !stderr.trim().is_empty() {
         tracing::info!(hook = label, "hook stderr:\n{}", stderr.trim_end());
     }
-    if output.status.success() {
+    if status.success() {
         return Ok(());
     }
-    let status = match output.status.code() {
+    let status = match status.code() {
         Some(code) => format!("exited {code}"),
         None => "was killed by a signal".to_string(),
     };
@@ -175,6 +188,34 @@ async fn run_program(
             format!(": {detail}")
         }
     ))
+}
+
+/// SIGKILL the hook's whole process group — the script and whatever it
+/// spawned without `exec`. The group id is the hook's own pid
+/// (`process_group(0)` above).
+fn kill_group(child: &tokio::process::Child) {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+    if let Some(pid) = child.id() {
+        let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+    }
+}
+
+/// How much of a hook's output is kept: the tail, since the last line is
+/// what the warning quotes and a chatty script must not fill memory.
+const OUTPUT_TAIL: u64 = 64 * 1024;
+
+fn read_tail(mut file: std::fs::File) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut buf = Vec::new();
+    if file
+        .seek(SeekFrom::Start(len.saturating_sub(OUTPUT_TAIL)))
+        .is_ok()
+    {
+        let _ = file.by_ref().take(OUTPUT_TAIL).read_to_end(&mut buf);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 fn describe(d: Duration) -> String {
@@ -404,13 +445,46 @@ mod tests {
         );
     }
 
+    /// The pid a script wrote to `file`, waiting for it to appear: under a
+    /// loaded test runner a shell can take a while to start.
+    async fn pid_in(file: &Path) -> i32 {
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(file) {
+                if let Ok(pid) = s.trim().parse() {
+                    return pid;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{} was never written", file.display());
+    }
+
+    fn alive(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+    }
+
+    async fn wait_dead(pid: i32) -> bool {
+        for _ in 0..40 {
+            if !alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// A script that hangs on a child it did not `exec` — the shape of a
+    /// real hook — is killed with that child: the group goes, not just the
+    /// script, so "was killed" is the truth.
     #[tokio::test]
-    async fn hook_past_the_timeout_is_killed_and_reported() {
+    async fn hook_past_the_timeout_is_killed_with_what_it_started() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = repo_with_space(tmp.path());
-        // `exec` so the SIGKILL lands on the sleeper itself, not a shell
-        // whose orphan would outlive the test.
-        let hook = script(tmp.path(), "exec sleep 30");
+        let pidfile = tmp.path().join("sleeper.pid");
+        let hook = script(
+            tmp.path(),
+            &format!("sleep 30 &\necho $! > '{}'\nwait", pidfile.display()),
+        );
         let id = WorktreeId("w".into());
         let wt = tmp.path().join("gone");
 
@@ -419,15 +493,63 @@ mod tests {
             &hook.to_string_lossy(),
             WorktreeHook::Delete,
             &ctx(&repo, &wt, &id),
-            Duration::from_millis(200),
+            Duration::from_secs(1),
         )
         .await
         .unwrap_err()
         .to_string();
-        assert!(err.contains("timed out after 200ms"), "{err}");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            err.contains("timed out after 1s") && err.contains("everything it started"),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
             "the wait ended with the timeout, not the sleep"
+        );
+        let sleeper = pid_in(&pidfile).await;
+        assert!(
+            wait_dead(sleeper).await,
+            "the sleeper {sleeper} outlived the kill"
+        );
+    }
+
+    /// A hook that starts something long-lived — a dev server — and exits
+    /// 0 is a success the moment it exits, even though its child still
+    /// holds the output it inherited; and that child is left running.
+    #[tokio::test]
+    async fn backgrounded_child_neither_holds_the_hook_open_nor_dies_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = repo_with_space(tmp.path());
+        let pidfile = tmp.path().join("server.pid");
+        // No output redirection on purpose: the child keeps stdout/stderr.
+        let hook = script(
+            tmp.path(),
+            &format!(
+                "sleep 30 &\necho $! > '{}'\necho 'server up'\nexit 0",
+                pidfile.display()
+            ),
+        );
+        let id = WorktreeId("w".into());
+        let wt = tmp.path().join("gone");
+
+        let started = std::time::Instant::now();
+        run_program(
+            &hook.to_string_lossy(),
+            WorktreeHook::Create,
+            &ctx(&repo, &wt, &id),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the wait ended with the script's exit, not its child's"
+        );
+        let server = pid_in(&pidfile).await;
+        assert!(alive(server), "a successful hook's child is left running");
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(server),
+            nix::sys::signal::Signal::SIGKILL,
         );
     }
 

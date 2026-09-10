@@ -814,13 +814,15 @@ impl Daemon {
             None => git::add_worktree_off_default(&project.repo_path, branch).await?,
         };
         let worktree = self.register_worktree(project_id, path, branch)?;
-        // The row is out; the WORKTREE HOOK runs outside the lock so a
-        // slow script holds up neither the next create nor the sync probe.
-        // The Ack still waits for it, so whatever the hook provisions is
-        // in place before anything is launched in the checkout.
-        drop(ops);
+        // The row is out; the WORKTREE HOOK runs still under the lock, so
+        // it is ordered with the operation it belongs to — a delete of
+        // this path waits for it, two hooks never overlap — and the Ack
+        // waits for it, so whatever it provisions is in place before
+        // anything is launched in the checkout. The hook timeout bounds
+        // what that holds the lock for.
         self.run_worktree_hook(WorktreeHook::Create, &project.repo_path, &worktree)
             .await;
+        drop(ops);
         Ok(EntityId::Worktree(worktree.id))
     }
 
@@ -851,9 +853,9 @@ impl Daemon {
         }
         let path = git::add_pr_worktree(&project.repo_path, number, head).await?;
         let worktree = self.register_worktree(project_id, path, head)?;
-        drop(ops);
         self.run_worktree_hook(WorktreeHook::Create, &project.repo_path, &worktree)
             .await;
+        drop(ops);
         Ok(worktree)
     }
 
@@ -902,12 +904,15 @@ impl Daemon {
         });
         // The delete has happened as far as git and every client are
         // concerned; the WORKTREE HOOK only releases what the checkout
-        // owned elsewhere, so it runs after, outside the lock, and its
-        // failure is a warning — never an Error for this request, which
-        // would put the rows back in the TUI.
-        drop(ops);
+        // owned elsewhere, so it runs after, and its failure is a warning
+        // — never an Error for this request, which would put the rows
+        // back in the TUI. Still under the lock: a create of the same path
+        // waits until the hook has released what it is about to claim,
+        // and the hook's "still on disk" check sees the delete's result,
+        // not a recreate's.
         self.run_worktree_hook(WorktreeHook::Delete, &project.repo_path, &worktree)
             .await;
+        drop(ops);
         Ok(())
     }
 
@@ -4760,6 +4765,68 @@ mod tests {
                 && warnings[0].contains("exited 2: slot 7 was not ours"),
             "{}",
             warnings[0]
+        );
+    }
+
+    /// A create of the path a delete hook is still releasing waits for
+    /// that hook: the delete hook sees the checkout gone (no "still on
+    /// disk" skip), then the create hook runs, in that order.
+    #[tokio::test]
+    async fn recreating_a_path_waits_for_its_delete_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = init_repo(&root);
+        let wt = root.join("repo-worktrees").join("feat");
+        git_in(
+            &repo,
+            &["worktree", "add", &wt.to_string_lossy(), "-b", "feat"],
+        );
+        let log = root.join("hook.log");
+        let hook = hook_script(
+            &root,
+            &format!(
+                "[ \"$NEBULA_HOOK\" = worktree-delete ] && sleep 0.5\n\
+                 echo \"$NEBULA_HOOK $2\" >> '{}'",
+                log.display()
+            ),
+        );
+        for key in ["nebula.worktreeCreateHook", "nebula.worktreeDeleteHook"] {
+            git_in(&repo, &["config", key, &hook.to_string_lossy()]);
+        }
+        let daemon = test_daemon();
+        let project = project_at(&daemon, &repo);
+        seed_worktree(&daemon, "p", "feat", &wt.to_string_lossy(), false);
+        let mut events = daemon.events.subscribe();
+
+        let deleting = {
+            let daemon = daemon.clone();
+            tokio::spawn(async move {
+                daemon
+                    .delete_worktree(&WorktreeId("feat".into()), false)
+                    .await
+            })
+        };
+        // Let the delete get into its hook, then ask for the same path back.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        daemon
+            .create_worktree(&project.id, "feat", None)
+            .await
+            .unwrap();
+        deleting.await.unwrap().unwrap();
+
+        let got = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            got,
+            format!(
+                "worktree-delete {wt}\nworktree-create {wt}\n",
+                wt = wt.display()
+            ),
+            "delete hook first, create hook second"
+        );
+        assert!(wt.exists(), "the recreated checkout is there");
+        assert!(
+            drain_warnings(&mut events).is_empty(),
+            "neither hook was skipped or failed"
         );
     }
 

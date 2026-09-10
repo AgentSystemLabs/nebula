@@ -153,10 +153,17 @@ When they run, and what a failure means:
 - **Skipped while the directory is still there.** When git had already stopped tracking a checkout
   and nebula leaves the untracked directory alone, the delete hook does not run against live files;
   the warning says so.
-- **A hook only reports.** It exits non-zero, cannot start, or runs past the timeout (30 s; killed
-  after) — nebula shows a one-line warning naming the hook and the last line it wrote to stderr, and
-  logs the whole output in `daemon.log`. The worktree stays created or deleted, because it already
-  was. Nothing is retried.
+- **Hooks never overlap.** They run under the DAEMON's worktree lock, so a create of a path waits
+  for the delete hook still releasing it, and `Shift+D`'s batch runs its hooks one after another. A
+  stuck hook holds the next worktree operation for at most the timeout; keystrokes never wait on it.
+- **A hook only reports.** It exits non-zero, cannot start, or runs past the timeout (30 s; then it
+  and every process it started are killed) — nebula shows a one-line warning naming the hook and the
+  last line it wrote to stderr, and logs the tail of its output in `daemon.log`. The worktree stays
+  created or deleted, because it already was. Nothing is retried.
+- **It may start something that outlives it.** A hook that launches a dev server in the background
+  and exits 0 is a success the moment it exits — its output goes to a file, not a pipe, so a child
+  holding it open never stalls the wait — and the server is left running. Only a timeout takes down
+  what the hook started.
 - **The DAEMON's environment is not a login shell.** On macOS a launchd-started daemon has a thin
   `PATH`; a script that calls `caddy` or `docker` sets its own.
 
