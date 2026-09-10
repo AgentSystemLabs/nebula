@@ -2281,6 +2281,48 @@ fn status_color(status: Option<AgentStatus>, unseen: bool, th: Theme) -> Color {
     }
 }
 
+/// What a checkout row is colored on. Every other status-bearing row
+/// answers to its sessions alone; a checkout whose pull request has merged
+/// wears the merge instead (`App::worktree_wears_merge` decides — a live
+/// session still wins): purple dot, purple rail, and the branch name
+/// sweeping on the merged ramp the way a running row's sweeps yellow. The
+/// motion means what running's does — look here — but what it says is:
+/// this one landed, archive or delete it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowState {
+    /// The sessions' rolled-up status, `None` for a checkout with none.
+    Sessions(Option<AgentStatus>),
+    /// The checkout's pull request has merged.
+    Merged,
+}
+
+impl RowState {
+    /// The STATUS DOT: [`status_dot`], or a solid purple one.
+    fn dot(self, unseen: bool, th: Theme) -> Span<'static> {
+        match self {
+            RowState::Sessions(status) => status_dot(status, unseen, th),
+            RowState::Merged => Span::styled("● ", Style::default().fg(th.merged)),
+        }
+    }
+
+    /// The dot's color on its own, for the selection rail.
+    fn color(self, unseen: bool, th: Theme) -> Color {
+        match self {
+            RowState::Sessions(status) => status_color(status, unseen, th),
+            RowState::Merged => th.merged,
+        }
+    }
+
+    /// The sweep the name rides: [`sweep_ramp`]'s, or the merged ramp —
+    /// and nothing with animations off, same as every other sweep.
+    fn ramp(self, th: Theme, enabled: bool) -> Option<[Color; 3]> {
+        match self {
+            RowState::Sessions(status) => sweep_ramp(status, th, enabled),
+            RowState::Merged => enabled.then_some(th.merged_sweep),
+        }
+    }
+}
+
 /// The selection mark's color on a focused selection: the row's `mark`
 /// (its STATUS DOT color, or the accent for a row that has no dot),
 /// lifted from dim to muted the way a dim dot is lifted on the fill — a
@@ -2442,6 +2484,18 @@ const PILL_HALF: (char, char) = ('▄', '▀');
 /// into a black notch at each of the pill's left corners.
 const PILL_RAIL: &str = "█";
 
+/// The fill and rail of a selected pill, `(fill, rail)`: in the focused
+/// panel the raised `sel_bg` with the row's `mark` on the rail (see
+/// `selection_mark`); elsewhere the barely-raised `sel_bg_dim` under a
+/// dim rail, so an unfocused cursor reads as a place, not a signal.
+fn pill_bar(focused: bool, mark: Color, th: Theme) -> (Color, Color) {
+    if focused {
+        (th.sel_bg, selection_mark(mark, th))
+    } else {
+        (th.sel_bg_dim, th.dim)
+    }
+}
+
 /// Render one list entry into a 3-row cell starting at `top`: half-block
 /// pad, text, half-block pad. The name sits on the middle row so it
 /// stays vertically centered in the ~2-row pill. The pads run the full
@@ -2457,24 +2511,35 @@ fn render_pill(
     f: &mut Frame,
     inner: Rect,
     top: isize,
-    mut spans: Vec<Span>,
+    spans: Vec<Span>,
     selected: bool,
     focused: bool,
     th: Theme,
     mark: Color,
 ) {
-    let Some(text_area) = row_rect_at(inner, top + 1) else {
-        return;
-    };
-    let mark = selection_mark(mark, th);
+    render_pill_body(f, inner, top, spans, selected, focused, th, mark, 0);
+}
+
+/// [`render_pill`] for a pill with `body` rows of its own between its
+/// text row and its bottom pad — a session's RECENT PROMPTS lines. The
+/// pads wrap the whole: pad, text, body, pad, so a selected row and what
+/// hangs under its name are one rounded slab on one fill rather than a
+/// pill with rows beneath it. The body rows themselves are the caller's
+/// to draw (see `draw_prompt_lines`, which takes the same `pill_bar`).
+#[allow(clippy::too_many_arguments)]
+fn render_pill_body(
+    f: &mut Frame,
+    inner: Rect,
+    top: isize,
+    mut spans: Vec<Span>,
+    selected: bool,
+    focused: bool,
+    th: Theme,
+    mark: Color,
+    body: usize,
+) {
+    let (fill, rail) = pill_bar(focused, mark, th);
     if selected {
-        for s in &mut spans {
-            if s.style.fg == Some(th.dim) {
-                s.style.fg = Some(th.muted);
-            }
-        }
-        let fill = if focused { th.sel_bg } else { th.sel_bg_dim };
-        let rail = if focused { mark } else { th.dim };
         let mut pad = |glyph: char, row: isize| {
             if let Some(r) = row_rect_at(inner, row) {
                 f.render_widget(
@@ -2494,12 +2559,18 @@ fn render_pill(
             }
         };
         pad(PILL_HALF.0, top);
-        pad(PILL_HALF.1, top + 2);
+        pad(PILL_HALF.1, top + 2 + body as isize);
     }
-    let marker = if selected && focused {
-        Span::styled(PILL_RAIL, Style::default().fg(mark))
-    } else if selected {
-        Span::styled(PILL_RAIL, Style::default().fg(th.dim))
+    let Some(text_area) = row_rect_at(inner, top + 1) else {
+        return;
+    };
+    let marker = if selected {
+        for s in &mut spans {
+            if s.style.fg == Some(th.dim) {
+                s.style.fg = Some(th.muted);
+            }
+        }
+        Span::styled(PILL_RAIL, Style::default().fg(rail))
     } else {
         Span::raw(" ")
     };
@@ -2774,9 +2845,10 @@ type ProjectRowData = (String, Option<String>, Option<AgentStatus>, usize, i64);
 /// The same for the Worktrees panel: branch, is-root, rollup,
 /// unwatched-finish count, last-turn stamp.
 /// One WORKTREES PANEL row: branch, root-ness, status rollup, unseen
-/// count, recency stamp, and whether it is a QUICK PROMPT stand-in the
-/// DAEMON has not cut yet.
-type WorktreeRowData = (String, bool, Option<AgentStatus>, usize, i64, bool);
+/// count, recency stamp, whether it is a QUICK PROMPT stand-in the
+/// DAEMON has not cut yet, and whether it wears its merged pull request
+/// (`App::worktree_wears_merge`).
+type WorktreeRowData = (String, bool, Option<AgentStatus>, usize, i64, bool, bool);
 
 /// Columns between the `WORKSPACES` label and the first tab.
 const TAB_GAP: u16 = 2;
@@ -2946,6 +3018,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 app.worktree_unseen(&w.id),
                 app.worktree_recency(&w.id).stamped,
                 app.is_placeholder_worktree(&w.id),
+                app.worktree_wears_merge(&w.id),
             )
         })
         .collect();
@@ -3069,13 +3142,19 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
             WorktreeEntry::Row(i) if *i < worktrees.len() => {
-                let (branch, is_main, roll, unseen, stamped, pending) = &worktrees[*i];
+                let (branch, is_main, roll, unseen, stamped, pending, merged) = &worktrees[*i];
                 let (badges, badge_len) = row_badges(*unseen, th);
                 // A stand-in checkout (QUICK PROMPT, git still cutting
                 // it) reads as not-there-yet: hollow dot, no sweep, and
-                // the word where the ago label would sit.
-                let roll = if *pending { None } else { *roll };
-                let ramp = sweep_ramp(roll, th, app.animations);
+                // the word where the ago label would sit. A checkout
+                // whose pull request has merged wears that instead of
+                // its sessions' status (`RowState`).
+                let state = match (*pending, *merged) {
+                    (true, _) => RowState::Sessions(None),
+                    (false, true) => RowState::Merged,
+                    (false, false) => RowState::Sessions(*roll),
+                };
+                let ramp = state.ramp(th, app.animations);
                 // 3, not 2: the dot's two cells plus the pill marker
                 // `render_pill` prepends — bill them here or the trailing
                 // badge is what falls off the end of a twenty-cell column.
@@ -3108,7 +3187,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     None
                 };
                 let max = free - root.map_or(0, |r| r.chars().count());
-                let mut spans = vec![status_dot(roll, *unseen > 0, th)];
+                let mut spans = vec![state.dot(*unseen > 0, th)];
                 spans.extend(status_name_spans(
                     truncate(branch, max),
                     Style::default(),
@@ -3132,7 +3211,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     *i == app.sel_worktree,
                     focused,
                     th,
-                    status_color(roll, *unseen > 0, th),
+                    state.color(*unseen > 0, th),
                 );
                 if let Some(hit) = rows_rect_at(inner, y, hit_h) {
                     app.hits.push((hit, HitTarget::Worktree(*i)));
@@ -3192,7 +3271,7 @@ enum SessionEntry {
 impl SessionEntry {
     /// Rows the entry occupies: a header one, a pill its 3-row cell (they
     /// stack on a `PILL_H` stride, so neighboring pads overlap) plus any
-    /// prompt lines under it.
+    /// prompt lines inside it.
     fn height(&self) -> usize {
         match self {
             SessionEntry::Row { prompts, .. } => PILL_H as usize + 1 + prompts,
@@ -3215,45 +3294,61 @@ fn session_prompt_lines(app: &App, row: &SessionRow) -> usize {
     }
 }
 
-/// What a prompt line opens with: two columns to land under the name
-/// (past the pill's rail and the status dot), and a bullet so the lines
-/// read as a list hanging off the row rather than as more rows.
-const PROMPT_INDENT: &str = "  · ";
+/// What a prompt line opens with, after the pill's rail column: a column
+/// to land under the name (past the status dot), and a bullet so the
+/// lines read as a list hanging off the row rather than as more rows.
+const PROMPT_INDENT: &str = " · ";
 
-/// The RECENT PROMPTS under a session pill, from `first_row`: the newest
-/// `count` of `prompts`, oldest first so the bottom line is the latest
-/// thing asked, each clipped to fit with its ago label pinned right. Dim,
-/// with the newest lifted to muted so the eye lands on it — these are
-/// context for the row, not rows of their own, and they never take the
-/// selection fill.
+/// The RECENT PROMPTS under a session's name, from `first_row`: the
+/// newest `count` of `prompts`, oldest first so the bottom line is the
+/// latest thing asked, each clipped to fit with its ago label pinned
+/// right. Dim, with the newest lifted to muted so the eye lands on it —
+/// these are context for the row, not rows of their own.
+///
+/// On the selected row `bar` is the pill's `(fill, rail)` from
+/// `pill_bar`: the lines sit on that fill and carry the rail down their
+/// first column, so the pill and its history are one slab and the list
+/// reads as part of the session the cursor is on. Dim lifts to muted on
+/// the fill there, the way the pill's own dim spans do.
 fn draw_prompt_lines(
     f: &mut Frame,
     inner: Rect,
     first_row: isize,
     prompts: &[nebula_core::PromptEntry],
     count: usize,
+    bar: Option<(Color, Color)>,
     th: Theme,
 ) {
     let skip = prompts.len().saturating_sub(count);
-    let free = (inner.width as usize).saturating_sub(PROMPT_INDENT.chars().count());
+    let free = (inner.width as usize).saturating_sub(1 + PROMPT_INDENT.chars().count());
+    let lift = |color: Color| match bar {
+        Some(_) if color == th.dim => th.muted,
+        _ => color,
+    };
+    let base = bar.map_or_else(Style::default, |(fill, _)| Style::default().bg(fill));
+    let marker = match bar {
+        Some((_, rail)) => Span::styled(PILL_RAIL, Style::default().fg(rail)),
+        None => Span::raw(" "),
+    };
     for (i, entry) in prompts.iter().skip(skip).enumerate() {
         let Some(area) = row_rect_at(inner, first_row + i as isize) else {
             continue;
         };
         let newest = skip + i + 1 == prompts.len();
-        let text_color = if newest { th.muted } else { th.dim };
+        let text_color = lift(if newest { th.muted } else { th.dim });
         let (ago, text_max) = fit_ago(ago_badge(entry.submitted_at), free);
         let text = truncate(&entry.text, text_max);
         let mut spans = vec![
-            Span::styled(PROMPT_INDENT, Style::default().fg(th.dim)),
+            marker.clone(),
+            Span::styled(PROMPT_INDENT, Style::default().fg(lift(th.dim))),
             Span::styled(text.clone(), Style::default().fg(text_color)),
         ];
         if !ago.is_empty() {
             let gap = text_max.saturating_sub(text.chars().count());
             spans.push(Span::raw(" ".repeat(gap)));
-            spans.push(Span::styled(ago, Style::default().fg(th.dim)));
+            spans.push(Span::styled(ago, Style::default().fg(lift(th.dim))));
         }
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        f.render_widget(Paragraph::new(Line::from(spans)).style(base), area);
     }
 }
 
@@ -3305,8 +3400,8 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
                 let prompts = session_prompt_lines(app, row);
                 layout.push((*vrow, SessionEntry::Row { index: i, prompts }));
                 // Pills stack on a `PILL_H` stride, sharing their pads;
-                // one with prompt lines under it keeps its bottom pad
-                // and the next pill starts below the lines.
+                // one with prompt lines inside it grows by them and keeps
+                // its bottom pad, so the next pill starts below that.
                 *vrow += PILL_H as usize;
                 if prompts > 0 {
                     *vrow += 1 + prompts;
@@ -3584,22 +3679,17 @@ fn draw_session_row(
             (spans, look.rail)
         }
     };
-    render_pill(
-        f,
-        inner,
-        top,
-        spans,
-        index == app.sel_session,
-        focused,
-        th,
-        mark,
-    );
+    let selected = index == app.sel_session;
+    render_pill_body(f, inner, top, spans, selected, focused, th, mark, prompts);
     if prompts > 0 {
         if let SessionRow::Agent(a) = row {
-            // Under the pill's bottom pad, so a selected row keeps its
-            // rounded lower edge above its history.
-            let first_row = top + PILL_H as isize + 1;
-            draw_prompt_lines(f, inner, first_row, &a.recent_prompts, prompts, th);
+            // Inside the pill, straight under the name: its bottom pad
+            // closes under the last line, so a selected row's history
+            // sits on the row's own fill and reads as part of the session
+            // the cursor is on, not as rows of its own beneath it.
+            let bar = selected.then(|| pill_bar(focused, mark, th));
+            let first_row = top + PILL_H as isize;
+            draw_prompt_lines(f, inner, first_row, &a.recent_prompts, prompts, bar, th);
         }
     }
     if let Some(hit) = rows_rect_at(inner, top, hit_h) {
@@ -4681,9 +4771,10 @@ fn pill_hit_height(top: usize, next_top: Option<usize>) -> u16 {
     row_hit_height(top, next_top, 0)
 }
 
-/// [`pill_hit_height`] for a pill with `extra` rows of its own under its
-/// bottom pad — a session's RECENT PROMPTS lines — which the target runs
-/// over too, so a click on a prompt line lands on its session.
+/// [`pill_hit_height`] for a pill with `extra` rows of its own between
+/// its text row and its bottom pad — a session's RECENT PROMPTS lines —
+/// which the target runs over too, so a click on a prompt line lands on
+/// its session.
 fn row_hit_height(top: usize, next_top: Option<usize>, extra: usize) -> u16 {
     let cell = PILL_H as usize + 1 + extra;
     next_top.map_or(cell, |n| n.saturating_sub(top).min(cell)) as u16
@@ -4925,6 +5016,121 @@ mod tests {
             sweep_ramp(Some(AgentStatus::NeedsFeedback), th, false),
             None
         );
+    }
+
+    /// A checkout wearing its merged pull request animates like a running
+    /// one — on the purple ramp — and the animations setting stills it the
+    /// same way. Its dot and rail are the merged purple; a checkout on its
+    /// sessions is exactly what `status_dot` / `status_color` /
+    /// `sweep_ramp` already say.
+    #[test]
+    fn merged_row_state_sweeps_purple_and_obeys_the_setting() {
+        let th = Theme::default();
+        let merged = RowState::Merged;
+        assert_eq!(merged.ramp(th, true), Some(th.merged_sweep));
+        assert_eq!(merged.ramp(th, false), None);
+        assert_eq!(merged.color(false, th), th.merged);
+        assert_eq!(
+            merged.color(true, th),
+            th.merged,
+            "unseen is a sessions thing"
+        );
+        let dot = merged.dot(false, th);
+        assert_eq!(dot.content, "● ", "solid: the checkout is very much there");
+        assert_eq!(dot.style.fg, Some(th.merged));
+
+        let running = RowState::Sessions(Some(AgentStatus::Running));
+        assert_eq!(running.ramp(th, true), Some(th.warn_sweep));
+        assert_eq!(running.color(false, th), th.warn);
+        let done = RowState::Sessions(Some(AgentStatus::Finished));
+        assert_eq!(done.ramp(th, true), None);
+        assert_eq!(done.color(true, th), th.done);
+        assert_eq!(done.color(false, th), th.ok);
+        assert_eq!(RowState::Sessions(None).dot(false, th).content, "○ ");
+    }
+
+    /// The WORKTREES row of a checkout whose pull request has merged is
+    /// purple end to end — dot, selection rail, and the branch name on the
+    /// merged sweep — so the checkout to delete stands out. Animations off,
+    /// the name holds still in plain text and the purple stays. A session
+    /// still running there takes the row back: yellow, as a checkout not
+    /// to pull out from under it.
+    #[test]
+    fn worktree_row_wears_its_merged_pull_request() {
+        use nebula_core::{AgentStatus, WorktreeId};
+        let mut app = hit_test_app(&["main", "feat"], &["agent"], &[]);
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 1;
+        app.pull_requests.insert(
+            WorktreeId("w1".into()),
+            Some(crate::pull_request::PullRequest {
+                number: 7,
+                url: "https://github.com/o/r/pull/7".into(),
+                title: "Attach links".into(),
+                state: crate::pull_request::STATE_MERGED.into(),
+                is_draft: false,
+                activity: Vec::new(),
+            }),
+        );
+        let th = app.theme;
+        let area = Rect::new(0, 0, 30, 12);
+        // The feat row's text line, as (rail color, dot color, name colors).
+        let row = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 12)).unwrap();
+            terminal.draw(|f| draw_worktrees(f, app, area)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            // Cell-wise, not by byte offset: the rail and dot glyphs
+            // ahead of the name are multi-byte.
+            let cells = |y: u16| -> Vec<String> {
+                (0..30)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect()
+            };
+            let name_at = |y: u16| {
+                cells(y)
+                    .windows(4)
+                    .position(|w| w.concat() == "feat")
+                    .map(|x| x as u16)
+            };
+            let (y, name_x) = (0..12)
+                .find_map(|y| name_at(y).map(|x| (y, x)))
+                .expect("the feat row");
+            let rail = buf.cell((0, y)).unwrap().clone();
+            assert_eq!(rail.symbol(), PILL_RAIL, "the cursor is on the row");
+            let dot = buf.cell((1, y)).unwrap().clone();
+            assert_eq!(dot.symbol(), "●", "solid dot");
+            let name: Vec<Color> = (name_x..name_x + 4)
+                .map(|x| buf.cell((x, y)).unwrap().fg)
+                .collect();
+            (rail.fg, dot.fg, name)
+        };
+
+        let (rail, dot, name) = row(&mut app);
+        assert_eq!(rail, th.merged, "the rail is the merge's purple");
+        assert_eq!(dot, th.merged, "so is the dot");
+        assert!(
+            name.iter().all(|c| th.merged_sweep.contains(c)),
+            "the name rides the merged sweep: {name:?}"
+        );
+
+        app.animations = false;
+        let (rail, dot, name) = row(&mut app);
+        assert_eq!((rail, dot), (th.merged, th.merged), "still purple");
+        assert_eq!(name, vec![Color::Reset; 4], "the name holds still");
+
+        // A running session in the checkout: not one to delete yet.
+        app.animations = true;
+        app.tree.agents[0].worktree_id = WorktreeId("w1".into());
+        app.tree.agents[0].status = AgentStatus::Running;
+        let (rail, dot, name) = row(&mut app);
+        assert_eq!((rail, dot), (th.warn, th.warn), "running wins");
+        assert!(name.iter().all(|c| th.warn_sweep.contains(c)), "{name:?}");
+
+        // Finished, though, and the merge is the story again.
+        app.tree.agents[0].status = AgentStatus::Finished;
+        let (rail, dot, _) = row(&mut app);
+        assert_eq!((rail, dot), (th.merged, th.merged));
     }
 
     /// The tint fills every untouched cell of the panel rect — and only
@@ -5228,12 +5434,12 @@ mod tests {
         assert_eq!(at(11), Some(HitTarget::PanelBg(Focus::Worktrees)));
     }
 
-    /// RECENT PROMPTS under a session pill. Off (the default), the list is
-    /// as it was; on, the newest N follow the pill oldest-first, each
-    /// with its ago label, the next group moves down by that much, a
-    /// click over the lines lands on their session, and a session with
-    /// fewer prompts than asked lists only what it has. Archived rows and
-    /// terminals list none.
+    /// RECENT PROMPTS under a session's name. Off (the default), the list
+    /// is as it was; on, the newest N follow the name oldest-first inside
+    /// the pill, each with its ago label, the next group moves down by
+    /// that much, a click over the lines lands on their session, and a
+    /// session with fewer prompts than asked lists only what it has.
+    /// Archived rows and terminals list none.
     #[test]
     fn recent_prompts_hang_under_the_session_pill_newest_last() {
         use nebula_core::PromptEntry;
@@ -5262,14 +5468,15 @@ mod tests {
         assert!(!all.contains("prompt"), "off draws no history");
         assert!(row_text(&terminal, 6).contains("TERMINALS"));
 
-        // On, three of four: the newest three, oldest first, under the
-        // pill's bottom pad — rows 6..=8 — pushing the header (and the
-        // blank every header keeps above it) down to 10.
+        // On, three of four: the newest three, oldest first, straight
+        // under the name — rows 5..=7, the pill's bottom pad at 8 —
+        // pushing the header (and the blank every header keeps above it)
+        // down to 10.
         app.recent_prompts = 3;
         app.hits.clear();
         terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
         assert!(row_text(&terminal, 4).contains("agent"));
-        for (y, n, ago) in [(6, 2, "30m ago"), (7, 3, "20m ago"), (8, 4, "10m ago")] {
+        for (y, n, ago) in [(5, 2, "30m ago"), (6, 3, "20m ago"), (7, 4, "10m ago")] {
             let line = row_text(&terminal, y);
             assert!(line.contains(&format!("prompt {n}")), "y={y}: {line:?}");
             // Pinned to the column's right edge, just inside its border.
@@ -5295,8 +5502,8 @@ mod tests {
         app.recent_prompts = 5;
         app.hits.clear();
         terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
-        assert!(row_text(&terminal, 6).contains("prompt 1"));
-        assert!(row_text(&terminal, 9).contains("prompt 4"));
+        assert!(row_text(&terminal, 5).contains("prompt 1"));
+        assert!(row_text(&terminal, 8).contains("prompt 4"));
         assert!(row_text(&terminal, 11).contains("TERMINALS"));
 
         // Archived: the history is over and the row is back to a pill.
@@ -5306,6 +5513,108 @@ mod tests {
         terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
         let all: String = (0..24).map(|y| row_text(&terminal, y)).collect();
         assert!(!all.contains("prompt"), "archived rows list none: {all}");
+    }
+
+    /// With the cursor on a row, its RECENT PROMPTS lines sit on the pill's
+    /// fill with the rail running down their first column and the bottom
+    /// pad closing under the last line: one slab, so the history reads as
+    /// part of the session under the cursor. Unfocused, the same shape on
+    /// the quiet fill under a dim rail; a row the cursor is not on keeps
+    /// its lines on bare background, dim as ever.
+    #[test]
+    fn selected_session_prompt_lines_sit_on_the_pill_fill() {
+        use nebula_core::{AgentStatus, PromptEntry};
+        let mut app = hit_test_app(&["main"], &["agent", "other"], &[]);
+        let now = crate::app::now_ms();
+        for a in &mut app.tree.agents {
+            a.status = AgentStatus::Running;
+            a.recent_prompts = (1..=2)
+                .map(|n| PromptEntry {
+                    text: format!("ask {n}"),
+                    submitted_at: now - (3 - n) * 60_000,
+                })
+                .collect();
+        }
+        app.recent_prompts = 2;
+        app.focus = Focus::Sessions;
+        let th = app.theme;
+        let area = Rect::new(0, 0, 30, 16);
+        let draw = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 16)).unwrap();
+            terminal.draw(|f| draw_sessions(f, app, area)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let text_x = |buf: &ratatui::buffer::Buffer, y: u16, needle: &str| {
+            let line: String = (0..30)
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect();
+            line.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} on row {y}: {line:?}")) as u16
+        };
+
+        // Focused: the agent's pill is pad 3, name 4, lines 5..=6, pad 7 —
+        // one fill end to end, the rail in the RUNNING yellow all the way
+        // down, the pad's cap included.
+        let buf = draw(&mut app);
+        let cell =
+            |buf: &ratatui::buffer::Buffer, x: u16, y: u16| buf.cell((x, y)).unwrap().clone();
+        assert_eq!(cell(&buf, 0, 3).symbol(), PILL_HALF.0.to_string());
+        for y in 4..=6 {
+            let rail = cell(&buf, 0, y);
+            assert_eq!(rail.symbol(), PILL_RAIL, "y={y}");
+            assert_eq!(rail.fg, th.warn, "y={y}: the rail keeps the status color");
+            // The row's 28 cells: the column keeps a pad column and its
+            // rule past them, which no row paints.
+            for x in 0..28 {
+                assert_eq!(cell(&buf, x, y).bg, th.sel_bg, "({x},{y}) is on the fill");
+            }
+        }
+        let pad = cell(&buf, 0, 7);
+        assert_eq!(
+            pad.symbol(),
+            PILL_HALF.1.to_string(),
+            "the pad closes under the lines"
+        );
+        assert_eq!(pad.fg, th.warn);
+        assert_eq!(
+            cell(&buf, 5, 7).fg,
+            th.sel_bg,
+            "the pad row is the fill's half-block"
+        );
+        assert_eq!(
+            cell(&buf, text_x(&buf, 5, "ask 1"), 5).fg,
+            th.muted,
+            "an older line is lifted off dim on the fill"
+        );
+        assert_eq!(cell(&buf, text_x(&buf, 6, "ask 2"), 6).fg, th.muted);
+        // The other row — pad 8, name 9, lines 10..=11 — draws its lines
+        // on bare background with a plain gutter, older one dim.
+        for y in 10..=11 {
+            assert_eq!(
+                cell(&buf, 0, y).symbol(),
+                " ",
+                "y={y}: no rail off the cursor"
+            );
+            assert_eq!(
+                cell(&buf, 5, y).bg,
+                Color::Reset,
+                "y={y}: no fill off the cursor"
+            );
+        }
+        assert_eq!(cell(&buf, text_x(&buf, 10, "ask 1"), 10).fg, th.dim);
+        assert_eq!(cell(&buf, text_x(&buf, 11, "ask 2"), 11).fg, th.muted);
+
+        // Unfocused: the quiet fill, the dim rail, the same shape.
+        app.focus = Focus::Worktrees;
+        let buf = draw(&mut app);
+        for y in 4..=6 {
+            assert_eq!(cell(&buf, 0, y).symbol(), PILL_RAIL, "y={y}");
+            assert_eq!(cell(&buf, 0, y).fg, th.dim, "y={y}");
+            assert_eq!(cell(&buf, 5, y).bg, th.sel_bg_dim, "y={y}");
+        }
+        assert_eq!(cell(&buf, 0, 7).fg, th.dim, "the pad cap follows the rail");
+        assert_eq!(cell(&buf, 5, 7).fg, th.sel_bg_dim);
     }
 
     /// The same rule in the Sessions panel: the last pill of a group has

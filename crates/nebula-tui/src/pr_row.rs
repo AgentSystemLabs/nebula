@@ -26,12 +26,13 @@ pub struct Look {
 /// `draft` badge is even read. Selecting a draft row lifts it like any
 /// other (`render_pill` brightens `dim` to `muted`), so it stays legible.
 ///
-/// A merged pull request wears the PR PREVIEW's `merged` color on its arrow,
-/// rail and badge, with the title left readable: the work landed, and the
-/// checkout under it is the one about to be archived. A closed one keeps
-/// only the arrow and badge in the preview's `closed` color and dims the
-/// rest, so it reads as done-with rather than as a session needing someone
-/// — the rail is the surface the STATUS DOT colors own on the rows above.
+/// A merged pull request wears the theme's `merged` purple — the color the
+/// PR PREVIEW paints that state in — on its arrow, rail and badge, with the
+/// title left readable: the work landed, and the checkout under it is the
+/// one about to be archived. A closed one keeps only the arrow and badge in
+/// the preview's `closed` color and dims the rest, so it reads as done-with
+/// rather than as a session needing someone — the rail is the surface the
+/// STATUS DOT colors own on the rows above.
 pub fn look(standing: Standing, th: Theme) -> Look {
     match standing {
         Standing::Open => Look {
@@ -47,10 +48,10 @@ pub fn look(standing: Standing, th: Theme) -> Look {
             badge: th.dim,
         },
         Standing::Merged => Look {
-            glyph: th.special,
+            glyph: th.merged,
             label: th.muted,
-            rail: th.special,
-            badge: th.special,
+            rail: th.merged,
+            badge: th.merged,
         },
         Standing::Closed => Look {
             glyph: th.err,
@@ -129,9 +130,9 @@ mod tests {
         for name in crate::theme::THEMES {
             let th = Theme::by_name(name);
             let merged = look(Standing::Merged, th);
-            assert_eq!(merged.glyph, th.special, "{name}");
-            assert_eq!(merged.badge, th.special, "{name}");
-            assert_eq!(merged.rail, th.special, "{name}");
+            assert_eq!(merged.glyph, th.merged, "{name}");
+            assert_eq!(merged.badge, th.merged, "{name}");
+            assert_eq!(merged.rail, th.merged, "{name}");
             assert_eq!(merged.label, th.muted, "{name}: the title stays readable");
             let closed = look(Standing::Closed, th);
             assert_eq!(closed.glyph, th.err, "{name}");

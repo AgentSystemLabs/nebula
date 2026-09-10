@@ -8269,6 +8269,60 @@ mod tests {
         assert!(!app.status_anim_active());
     }
 
+    /// A checkout wearing its merged pull request sweeps purple, so it
+    /// keeps the sweep clock running too — while its row is on screen.
+    /// Another project's merged checkout has no row to animate.
+    #[test]
+    fn a_merged_checkout_on_screen_keeps_the_sweep_ticking() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        assert!(
+            !app.status_anim_active(),
+            "fresh agent, open PR: nothing sweeps"
+        );
+        seed_branch_pr(&mut app, 7, "Attach links");
+        assert!(!app.status_anim_active());
+
+        let mut merged = a_detail(7, "shipped", vec![]);
+        merged.state = "MERGED".into();
+        adopt_pr_state(&mut app, &merged);
+        assert!(app.status_anim_active(), "the merged row sweeps");
+        app.animations = false;
+        assert!(!app.status_anim_active(), "unless animations are off");
+        app.animations = true;
+
+        // Another project selected: the merged checkout is not a row.
+        use nebula_core::{Entity, Project, ProjectId};
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(Project {
+                    workspace_id: Default::default(),
+                    id: ProjectId("p2".into()),
+                    name: "other".into(),
+                    repo_path: "/tmp/other".into(),
+                    sort_order: 1,
+                }),
+            },
+        );
+        let p2 = app
+            .tree
+            .projects
+            .iter()
+            .position(|p| p.id == ProjectId("p2".into()))
+            .expect("the other project");
+        app.sel_project = app
+            .project_rows()
+            .iter()
+            .position(|i| *i == p2)
+            .expect("its row");
+        assert_eq!(
+            app.selected_project().map(|p| p.name.as_str()),
+            Some("other")
+        );
+        assert!(!app.status_anim_active(), "no merged row on screen");
+    }
+
     /// N summons the splash as a preview over a populated tree — full-body
     /// nebula with the "any key" hint instead of panel columns — and the
     /// next keypress (even q) only dismisses it.

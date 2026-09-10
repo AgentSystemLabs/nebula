@@ -126,7 +126,7 @@ pub fn lines(detail: &PrDetail, width: usize, th: Theme) -> Vec<Line<'static>> {
     let state = match (detail.state.as_str(), detail.is_draft) {
         (STATE_OPEN, true) => ("draft", th.dim),
         (STATE_OPEN, false) => ("open", th.ok),
-        ("MERGED", _) => ("merged", th.special),
+        ("MERGED", _) => ("merged", th.merged),
         ("CLOSED", _) => ("closed", th.err),
         _ => (detail.state.as_str(), th.dim),
     };

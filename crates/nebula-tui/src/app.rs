@@ -2378,18 +2378,24 @@ impl App {
     }
 
     /// Some sidebar row is showing a running (yellow) or needs-feedback
-    /// (red) status, so its text sweep should be ticking. Any live agent in
+    /// (red) status, or a checkout row wears its merged pull request
+    /// (purple), so its text sweep should be ticking. Any live agent in
     /// one of those states surfaces somewhere — its own row, or a worktree /
     /// project rollup — unless the panels are hidden (collapsed, editor
-    /// modal, splash) or animations are switched off.
+    /// modal, splash) or animations are switched off. A merged checkout
+    /// only shows while its project is selected, so only those keep the
+    /// clock running.
     pub fn status_anim_active(&self) -> bool {
         self.animations
             && !self.collapsed
             && self.vim.is_none()
             && !self.splash_active()
-            && self.tree.agents.iter().any(|a| {
+            && (self.tree.agents.iter().any(|a| {
                 !a.archived && matches!(a.status, AgentStatus::Running | AgentStatus::NeedsFeedback)
-            })
+            }) || self
+                .visible_worktrees()
+                .iter()
+                .any(|w| self.worktree_wears_merge(&w.id)))
     }
 
     /// Frame counter for the status-sweep text animation — a pure function
@@ -2949,6 +2955,26 @@ impl App {
 
     pub fn project_rollup(&self, project_id: &ProjectId) -> Option<AgentStatus> {
         project_rollup(&self.tree, project_id)
+    }
+
+    /// Whether the checkout's row wears its pull request's merge instead of
+    /// its sessions' status. The PR ROW keeps a merged pull request
+    /// (`pull_requests` holds it, state and all), and a checkout whose
+    /// branch has landed is the one to archive or delete — so its row says
+    /// so in purple, from across the room. A live session still wins: a
+    /// running or asking agent is exactly the thing not to delete a
+    /// checkout out from under, and its yellow or red is the warning.
+    pub fn worktree_wears_merge(&self, worktree_id: &WorktreeId) -> bool {
+        let merged = self
+            .pull_requests
+            .get(worktree_id)
+            .and_then(Option::as_ref)
+            .is_some_and(|pr| pr.standing() == crate::pull_request::Standing::Merged);
+        merged
+            && !matches!(
+                self.worktree_rollup(worktree_id),
+                Some(AgentStatus::Running | AgentStatus::NeedsFeedback)
+            )
     }
 
     /// When the worktree last saw a turn — what its row sorts and labels on.

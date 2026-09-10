@@ -189,10 +189,14 @@ nebula finds the pull request on each branch with `gh` and shows it in the Sessi
 PULL REQUESTS group, including a count of comments that landed while you were away. The row outlives
 the pull request: once it is merged or closed the row stays, badged `merged` or `closed` (a draft is
 dimmed and badged `draft`), for as long as the checkout does — a worktree whose PR has shipped is the one
-you are about to archive or delete, and the PR is what you check first. Rest on that row and the pane
-reads the pull request — description, stats, conversation — exactly as it does for the project-wide
-OPEN PRS rows under the worktrees, which do retire on merge; `g` shows its diff. Manual link attachment
-is currently unavailable; previously saved links remain visible so the change does not discard data.
+you are about to archive or delete, and the PR is what you check first. A merged one also takes over the
+checkout's row in the Worktrees panel: purple dot, purple rail, and the branch name sweeping the way a
+running row's does, so the checkout to delete stands out from across the room (a session still running
+or asking there keeps its yellow or red — that is not a checkout to pull out from under it). Rest on that
+row and the pane reads the pull request — description, stats, conversation — exactly as it does for the
+project-wide OPEN PRS rows under the worktrees, which do retire on merge; `g` shows its diff. Manual link
+attachment is currently unavailable; previously saved links remain visible so the change does not
+discard data.
 
 This is the one part of nebula the TUI asks for itself rather than the DAEMON: every `gh pr view`,
 `gh pr list` and `gh pr diff` is spawned by the client, which is why the lookups stop the moment you

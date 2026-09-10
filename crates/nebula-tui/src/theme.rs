@@ -46,6 +46,13 @@ pub struct Theme {
     pub err: Color,
     /// Terminated sessions and the session kind badge.
     pub special: Color,
+    /// A merged pull request: its row's arrow, rail and badge, and the
+    /// state word in the PR PREVIEW. Purple in every preset — the color
+    /// GitHub paints a merge in, so the row says "landed" before the badge
+    /// is read — and its own role rather than `special`, so a merged PR
+    /// never wears the same color as a terminated session, whatever the
+    /// preset makes of that one.
+    pub merged: Color,
     /// Selected-row fill in the focused panel (a subtle raised surface,
     /// not a reverse-video slab).
     pub sel_bg: Color,
@@ -61,6 +68,9 @@ pub struct Theme {
     /// Needs-feedback counterpart of `warn_sweep`. Red family, paired
     /// with `err`.
     pub err_sweep: [Color; 3],
+    /// Merged counterpart of `warn_sweep`, for the checkout row whose pull
+    /// request has landed. Purple family, paired with `merged`.
+    pub merged_sweep: [Color; 3],
     /// Focused-panel background: a dark neutral-gray floor with a faint
     /// lean toward the accent, filling the whole focused panel (and the
     /// rounded corners of a selected PILL ROW's pad rows) so it reads as
@@ -83,11 +93,17 @@ impl Default for Theme {
             warn: Color::Yellow,
             err: Color::Red,
             special: Color::Magenta,
+            merged: Color::Indexed(135), // purple — GitHub's merged, a shade deeper than done's violet
             sel_bg: Color::Indexed(237),
             sel_bg_dim: Color::Indexed(235),
             edge: Color::Indexed(238),
             warn_sweep: [Color::Yellow, Color::Indexed(220), Color::Indexed(230)],
             err_sweep: [Color::Red, Color::Indexed(203), Color::Indexed(217)],
+            merged_sweep: [
+                Color::Indexed(135),
+                Color::Indexed(141),
+                Color::Indexed(183),
+            ],
             focus_tint: Color::Rgb(22, 33, 34),
         }
     }
@@ -156,6 +172,39 @@ mod tests {
             assert_ne!(th.done, th.err, "{name}: done reads as needs-feedback");
             assert_ne!(th.done, th.special, "{name}: done reads as terminated");
             assert_ne!(th.done, th.dim, "{name}: done reads as fresh");
+        }
+    }
+
+    /// A merged pull request is purple in every preset, and that purple is
+    /// nobody else's: not the terminated `special`, not the unread `done`
+    /// violet a preset may move around, and not a status that would make a
+    /// landed pull request look like it needs someone.
+    #[test]
+    fn merged_is_purple_and_its_own_color_in_every_preset() {
+        for name in THEMES {
+            let th = Theme::by_name(name);
+            assert_eq!(th.merged, Color::Indexed(135), "{name}: merged is purple");
+            assert_ne!(th.merged, th.special, "{name}: merged reads as terminated");
+            assert_ne!(th.merged, th.done, "{name}: merged reads as unread done");
+            assert_ne!(th.merged, th.ok, "{name}: merged reads as plain success");
+            assert_ne!(th.merged, th.warn, "{name}: merged reads as running");
+            assert_ne!(th.merged, th.err, "{name}: merged reads as needs-feedback");
+            assert_ne!(th.merged, th.accent, "{name}: merged reads as open");
+            assert_ne!(th.merged, th.dim, "{name}: merged reads as a draft");
+            // The sweep a merged checkout's branch name rides rests on that
+            // same purple, and is nobody else's sweep.
+            assert_eq!(
+                th.merged_sweep[0], th.merged,
+                "{name}: the sweep rests on merged"
+            );
+            assert_ne!(
+                th.merged_sweep, th.warn_sweep,
+                "{name}: the sweep reads as running"
+            );
+            assert_ne!(
+                th.merged_sweep, th.err_sweep,
+                "{name}: the sweep reads as needs-feedback"
+            );
         }
     }
 

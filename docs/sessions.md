@@ -89,9 +89,11 @@ managed extension posts the same field), collapses its whitespace and keeps the 
 so a pasted file shows as its opening line. It costs the agent nothing — no extra turn, no tool call,
 nothing added to its context — which is why it is the prompt and not a summary the model wrote.
 Prompts nebula composes itself, such as a PR SESSION's scope or the note a `nebula worktree`
-relocation reopens on, are left out, and so are blank ones. The lines belong to their row: a click on
-any of them lands on the session, archived rows list none, and a session created before the feature
-simply has nothing to show until its next prompt.
+relocation reopens on, are left out, and so are blank ones. The lines belong to their row: they sit
+inside its pill, and on the row the cursor is on they take the pill's fill with the rail running down
+beside them, so the list reads as part of the selected session rather than as rows beneath it. A
+click on any of them lands on the session, archived rows list none, and a session created before the
+feature simply has nothing to show until its next prompt.
 
 ## The PROJECT OPEN PRS group
 
