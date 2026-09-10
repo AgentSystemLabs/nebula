@@ -10,6 +10,7 @@ use nebula_core::SessionRef;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use progress::ProgressScanner;
 use ring::ScrollbackRing;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,6 +48,57 @@ fn pty_size(cols: u16, rows: u16) -> PtySize {
         pixel_width: 0,
         pixel_height: 0,
     }
+}
+
+/// Every process group with a member in `root`'s subtree, `root`'s own
+/// first (it leads its PTY session, so that group is its pid, and it is
+/// named even when the `ps` sweep fails). An interactive shell running the
+/// agent as a job puts it in a group of its own; SIGKILLing the leader's
+/// group alone would miss it. Taken while the tree is intact — see `kill`.
+fn process_groups_under(root: u32) -> Vec<u32> {
+    let table = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,pgid="])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    process_groups_in_table(&table, root)
+}
+
+/// Pure core of [`process_groups_under`]: `table` is `ps -axo
+/// pid=,ppid=,pgid=` output, one process per line.
+fn process_groups_in_table(table: &str, root: u32) -> Vec<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut group_of: HashMap<u32, u32> = HashMap::new();
+    for line in table.lines() {
+        let mut cols = line.split_whitespace();
+        let (Some(pid), Some(ppid), Some(pgid)) = (
+            cols.next().and_then(|s| s.parse::<u32>().ok()),
+            cols.next().and_then(|s| s.parse::<u32>().ok()),
+            cols.next().and_then(|s| s.parse::<u32>().ok()),
+        ) else {
+            continue;
+        };
+        children.entry(ppid).or_default().push(pid);
+        group_of.insert(pid, pgid);
+    }
+    let mut groups = vec![root];
+    let mut stack = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if let Some(&pgid) = group_of.get(&pid) {
+            if !groups.contains(&pgid) {
+                groups.push(pgid);
+            }
+        }
+        if let Some(kids) = children.get(&pid) {
+            stack.extend(kids);
+        }
+    }
+    groups
 }
 
 /// Broadcast to attached clients (and, later, the status machine).
@@ -96,8 +148,9 @@ pub struct PtySession {
     master: Mutex<Box<dyn MasterPty + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     /// Child pid: drives the SIGHUP → SIGKILL escalation (the child is its
-    /// PTY session's leader — portable-pty does setsid — so pgid == pid)
-    /// and the metrics modal's process-tree sums.
+    /// PTY session's leader — portable-pty does setsid — so pgid == pid,
+    /// though an agent run as a job under a login shell sits in a group of
+    /// its own below it) and the metrics modal's process-tree sums.
     pub child_pid: Option<u32>,
     pub ring: Mutex<ScrollbackRing>,
     pub events: broadcast::Sender<PtyEvent>,
@@ -225,13 +278,19 @@ impl PtySession {
         }
     }
 
-    /// SIGHUP the child, then SIGKILL its whole process group if it hasn't
-    /// exited within [`KILL_GRACE`]. The group kill also reaps grandchildren
+    /// SIGHUP the child, then SIGKILL every process group under it if it
+    /// hasn't exited within [`KILL_GRACE`]. The sweep also reaps grandchildren
     /// that would otherwise hold the slave fd open (no EOF → reader thread,
-    /// pump task, and the 1MB ring all pinned forever).
+    /// pump task, and the 1MB ring all pinned forever) — including an agent
+    /// the login shell forked into a job group of its own, which a kill of
+    /// the leader's group alone would leave running with its pane gone.
     pub fn kill(&self) {
         // Subscribe before signalling so an immediate exit can't be missed.
         let mut rx = self.events.subscribe();
+        // Sweep before the polite signal: a shell that dies of it leaves the
+        // job it was running to init, where no walk from `pid` would find
+        // it afterwards. ~10ms, and a kill is rare.
+        let mut groups = self.child_pid.map(process_groups_under).unwrap_or_default();
         let _ = self.killer.lock().unwrap().kill();
         let Some(pid) = self.child_pid else { return };
         let sref = self.sref.clone();
@@ -240,28 +299,73 @@ impl PtySession {
         // called from.
         std::thread::Builder::new()
             .name("pty-kill-watchdog".into())
-            .stack_size(64 * 1024)
+            .stack_size(256 * 1024)
             .spawn(move || {
+                use nix::sys::signal::{killpg, Signal};
+                use nix::unistd::Pid;
                 let deadline = std::time::Instant::now() + KILL_GRACE;
-                let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+                let nix_pid = Pid::from_raw(pid as i32);
+                let mut child_gone = false;
                 while std::time::Instant::now() < deadline {
                     loop {
                         use tokio::sync::broadcast::error::TryRecvError;
                         match rx.try_recv() {
-                            Ok(PtyEvent::Exited { .. }) | Err(TryRecvError::Closed) => return,
+                            Ok(PtyEvent::Exited { .. }) | Err(TryRecvError::Closed) => {
+                                child_gone = true;
+                                break;
+                            }
                             Ok(_) | Err(TryRecvError::Lagged(_)) => continue,
                             Err(TryRecvError::Empty) => break,
                         }
                     }
                     // Reaped (ESRCH) strictly precedes the Exited broadcast,
                     // so this also covers an Exited lost to channel lag.
-                    if nix::sys::signal::kill(nix_pid, None).is_err() {
-                        return;
+                    if child_gone || nix::sys::signal::kill(nix_pid, None).is_err() {
+                        child_gone = true;
+                        break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-                tracing::warn!(session = ?sref, pid, "child ignored SIGHUP — SIGKILLing its process group");
-                let _ = nix::sys::signal::killpg(nix_pid, nix::sys::signal::Signal::SIGKILL);
+                if child_gone {
+                    // A shell that exited on its own hung up its jobs first;
+                    // one the signal took outright left them to init (and on
+                    // macOS the leader's death revokes the slave, so the
+                    // session reads as exited with the job still running).
+                    // Any group of the sweep still standing is the latter:
+                    // it gets the hangup the shell owed it, and its own
+                    // grace period.
+                    let orphans: Vec<Pid> = groups
+                        .iter()
+                        .filter(|&&g| g != pid)
+                        .map(|&g| Pid::from_raw(g as i32))
+                        .filter(|&g| killpg(g, None).is_ok())
+                        .collect();
+                    if orphans.is_empty() {
+                        return;
+                    }
+                    for g in &orphans {
+                        let _ = killpg(*g, Signal::SIGHUP);
+                    }
+                    let deadline = std::time::Instant::now() + KILL_GRACE;
+                    while std::time::Instant::now() < deadline
+                        && orphans.iter().any(|&g| killpg(g, None).is_ok())
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    if orphans.iter().all(|&g| killpg(g, None).is_err()) {
+                        return;
+                    }
+                }
+                // Whatever appeared since the first sweep, then the lot.
+                for pgid in process_groups_under(pid) {
+                    if !groups.contains(&pgid) {
+                        groups.push(pgid);
+                    }
+                }
+                tracing::warn!(session = ?sref, pid, ?groups, "still running after SIGHUP — SIGKILLing its process groups");
+                for pgid in groups {
+                    let _ = killpg(Pid::from_raw(pgid as i32), Signal::SIGKILL);
+                }
             })
             .expect("spawn pty kill watchdog");
     }
@@ -555,5 +659,23 @@ mod tests {
             out.contains("env=xterm-256color|truecolor|unset|unset"),
             "child saw: {out:?}"
         );
+    }
+
+    /// The kill escalation must reach an agent the login shell forked into
+    /// a job group of its own, not just the PTY leader's group.
+    #[test]
+    fn process_groups_cover_a_job_the_shell_forked_into_its_own_group() {
+        // shell 20 leads its session (group 20); the agent 21 is a job in
+        // group 21 with a worker 22; 30 is another session, 99 unrelated.
+        let table = "\
+ 20    10    20
+ 21    20    21
+ 22    21    21
+ 30    10    30
+ 99     1    99
+";
+        assert_eq!(process_groups_in_table(table, 20), vec![20, 21]);
+        // A failed sweep still names the leader's own group.
+        assert_eq!(process_groups_in_table("", 20), vec![20]);
     }
 }

@@ -2542,7 +2542,9 @@ impl Daemon {
         };
         // Run the agent through the user's login+interactive shell so it sees
         // the same env as a Terminal.app tab (~/.zprofile, ~/.zshrc,
-        // path_helper) instead of the daemon's inherited-at-boot env.
+        // path_helper) instead of the daemon's inherited-at-boot env, and
+        // resolves the CLI the way a typed command would — an alias or
+        // function in those files wins over the binary on PATH.
         // Overrides (tests) stay verbatim.
         let (program, args) = if cmd_override.is_some() {
             (program, args)
@@ -3211,33 +3213,46 @@ fn cli_missing_message(kind: AgentKind) -> String {
 }
 
 /// Wrap `program args…` in a login + interactive shell (`$SHELL -l -i -c
-/// 'exec env … prog args'`) so the child gets the user's real environment —
-/// ~/.zprofile and ~/.zshrc on zsh — rather than the daemon's. `exec` keeps
-/// the child as the PTY's direct process (exit codes and signals pass
-/// through); `env` execs straight into it, so nothing sits in between.
+/// 'unset …; export …; prog args'`) so the child gets the user's real
+/// environment — ~/.zprofile and ~/.zshrc on zsh — rather than the daemon's.
 ///
-/// The `env` restates what the pane is *after* those files have run: `TERM`
-/// and `COLORTERM` name nebula's own grid — 24-bit colour whatever the host
-/// terminal — and `NO_COLOR` / `FORCE_COLOR` are dropped. A login-only
-/// profile that exports `NO_COLOR` reaches a session here and nowhere else
-/// (foot and Ghostty on Linux start non-login shells), and Claude Code takes
-/// it as "no colour": its whole UI in the default foreground while the TUI
-/// around it stays coloured (#37). The spawn sets the same three against the
-/// daemon's inherited environment; this covers the profile's.
+/// The command word goes in bare, so the shell resolves it the way a typed
+/// command line would: an alias or function from the rc files wins over the
+/// binary on PATH. That is where a work setup reroutes `claude` through a
+/// wrapper (another backend, another login), and the earlier `exec env …
+/// 'claude'` form skipped it — `env` looks the name up on PATH, and neither
+/// zsh nor bash expands the word after an `exec` either — so every session
+/// landed on the raw CLI. Without an `exec` the shell stays in charge of the
+/// launch: zsh execs a plain last command itself, so the agent is still the
+/// PTY's direct child there; bash, and any command that resolves to a
+/// function, run it as a job under the shell instead, in a process group of
+/// its own — which is why `PtySession::kill` sweeps the whole tree rather
+/// than one group.
+///
+/// The prelude restates what the pane is *after* those files have run:
+/// `TERM` and `COLORTERM` name nebula's own grid — 24-bit colour whatever
+/// the host terminal — and `NO_COLOR` / `FORCE_COLOR` are dropped. A
+/// login-only profile that exports `NO_COLOR` reaches a session here and
+/// nowhere else (foot and Ghostty on Linux start non-login shells), and
+/// Claude Code takes it as "no colour": its whole UI in the default
+/// foreground while the TUI around it stays coloured (#37). The spawn sets
+/// the same three against the daemon's inherited environment; this covers
+/// the profile's.
 fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec<String>) {
-    let mut cmdline = String::from("exec env");
+    let mut cmdline = String::from("unset");
     for name in env::PANE_COLOR_OVERRIDES {
-        cmdline.push_str(" -u ");
+        cmdline.push(' ');
         cmdline.push_str(name);
     }
-    cmdline.push_str(" TERM=");
+    cmdline.push_str("; export TERM=");
     cmdline.push_str(env::PANE_TERM);
     cmdline.push_str(" COLORTERM=");
     cmdline.push_str(env::PANE_COLORTERM);
-    for part in std::iter::once(program).chain(args.iter().map(String::as_str)) {
-        cmdline.push_str(" '");
-        cmdline.push_str(&part.replace('\'', "'\\''"));
-        cmdline.push('\'');
+    cmdline.push_str("; ");
+    cmdline.push_str(&command_word(program));
+    for arg in args {
+        cmdline.push(' ');
+        cmdline.push_str(&shell_quote(arg));
     }
     let args = LOGIN_SHELL_ARGS
         .iter()
@@ -3245,6 +3260,26 @@ fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec
         .chain([cmdline])
         .collect();
     (shell.to_string(), args)
+}
+
+/// `program` as the command word of a shell line: bare when it is a plain
+/// name (letters, digits, `-`, `_`, `.`, `/`), since a quoted word is exempt
+/// from alias expansion in every shell; single-quoted otherwise.
+fn command_word(program: &str) -> String {
+    let plain = !program.is_empty()
+        && program
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b));
+    if plain {
+        program.to_string()
+    } else {
+        shell_quote(program)
+    }
+}
+
+/// Single-quote `arg` for a POSIX shell; the only escape needed is `'`.
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -3790,12 +3825,13 @@ mod tests {
         assert!(err.contains("message"), "{err}");
     }
 
-    /// What every agent launch execs once the login shell's files have run.
+    /// What every agent launch runs once the login shell's files have run,
+    /// ahead of the command itself.
     const PANE_ENV: &str =
-        "exec env -u NO_COLOR -u FORCE_COLOR TERM=xterm-256color COLORTERM=truecolor";
+        "unset NO_COLOR FORCE_COLOR; export TERM=xterm-256color COLORTERM=truecolor;";
 
     #[test]
-    fn login_shell_wrap_quotes_and_execs() {
+    fn login_shell_wrap_quotes_args_and_leaves_the_command_word_bare() {
         let (program, args) = login_shell_wrap(
             "/bin/zsh",
             "claude",
@@ -3808,12 +3844,85 @@ mod tests {
                 "-l",
                 "-i",
                 "-c",
-                &format!("{PANE_ENV} 'claude' '--resume' 'sid-1'")
+                &format!("{PANE_ENV} claude '--resume' 'sid-1'")
             ]
         );
         // Single quotes in an arg survive the wrapping.
         let (_, args) = login_shell_wrap("/bin/zsh", "echo", &["it's".to_string()]);
-        assert_eq!(args[3], format!(r"{PANE_ENV} 'echo' 'it'\''s'"));
+        assert_eq!(args[3], format!(r"{PANE_ENV} echo 'it'\''s'"));
+        // A command word that isn't a plain name is quoted like an argument.
+        let (_, args) = login_shell_wrap("/bin/zsh", "my tool", &[]);
+        assert_eq!(args[3], format!("{PANE_ENV} 'my tool'"));
+    }
+
+    /// The command word resolves through the shell, so an alias or function
+    /// from the rc files takes precedence over the binary on PATH — the
+    /// reason a launch goes through the login shell at all. A function
+    /// stands in for the alias: every POSIX sh honours one in a `-c` string,
+    /// and the old `exec env` form bypassed both alike.
+    #[test]
+    fn login_shell_wrap_lets_the_shell_resolve_the_command() {
+        let (_, args) = login_shell_wrap(
+            "/bin/sh",
+            "claude",
+            &["--resume".to_string(), "sid-1".to_string()],
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "claude() {{ printf 'routed %s' \"$*\"; }}; {}",
+                args[3]
+            ))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "routed --resume sid-1",
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The shape of the report itself: zsh, `-l -i -c`, and an alias in
+    /// `.zshrc` that reroutes `claude`. Skipped where there is no zsh.
+    #[test]
+    fn login_shell_wrap_honours_a_zshrc_alias() {
+        use std::os::unix::process::CommandExt;
+        if std::process::Command::new("zsh")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".zshrc"), "alias claude='echo routed'\n").unwrap();
+        let (program, args) = login_shell_wrap(
+            "zsh",
+            "claude",
+            &["--resume".to_string(), "sid-1".to_string()],
+        );
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(&args)
+            .env("ZDOTDIR", home.path())
+            .stdin(std::process::Stdio::null());
+        // Own session, as the daemon's CLI probe does: an interactive zsh
+        // must not make itself the foreground of the terminal running the
+        // tests.
+        unsafe {
+            cmd.pre_exec(|| match nix::unistd::setsid() {
+                Ok(_) => Ok(()),
+                Err(errno) => Err(std::io::Error::from_raw_os_error(errno as i32)),
+            });
+        }
+        let out = cmd.output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim_end(),
+            "routed --resume sid-1",
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// The command line's `env` really does undo a profile's colour

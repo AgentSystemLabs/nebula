@@ -2778,6 +2778,83 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
     wait_for_exit(&mut daemon);
 }
 
+/// The launch resolves the CLI through the login shell the way a typed
+/// command would, so a `claude` the rc files reroute — an alias, a function
+/// — is what runs, not the binary on PATH behind it. That shell then keeps
+/// the agent as a job in a process group of its own, so archiving has to
+/// reach past the shell: the polite SIGHUP takes the shell alone (a
+/// non-interactive one forwards nothing) and reparents the job to init, and
+/// only a sweep taken before the signal still knows which group to hang up
+/// — and, for one that shrugs that off too, to SIGKILL.
+#[tokio::test]
+async fn create_agent_runs_the_shells_own_claude_and_archive_clears_its_job() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let dir = env.tmp.path().to_path_buf();
+    // The rc file: job control on, and a `claude` function that records its
+    // argv and parks an HUP-immune job in a group of its own.
+    let rc = dir.join("rc.sh");
+    std::fs::write(
+        &rc,
+        format!(
+            concat!(
+                "set -m\n",
+                "claude() {{\n",
+                "  echo \"routed $*\" > '{d}/routed'\n",
+                "  sh -c 'trap \"\" HUP; echo $$ > \"{d}/job.pid\"; sleep 600' &\n",
+                "  wait\n",
+                "}}\n",
+            ),
+            d = dir.display()
+        ),
+    )
+    .unwrap();
+    // A `$SHELL` that sources it ahead of the `-c` string, as `-l -i` would
+    // source ~/.zshrc.
+    let shell = dir.join("routing-shell.sh");
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nPATH=/usr/bin:/bin\nexport PATH\nexec /bin/bash -c \". '{}'; $4\"\n",
+            rc.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&shell);
+    let mut daemon = env.spawn_daemon_with_shell(&shell);
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let agent_id = create_agent_get_id(&mut c, &worktree.id, "routed", 2).await;
+
+    // The function ran, with the CLI's argv, in place of any binary.
+    let job_pid = read_pidfile(&dir.join("job.pid")).await;
+    let routed = std::fs::read_to_string(dir.join("routed")).unwrap();
+    assert!(
+        routed.starts_with("routed --append-system-prompt "),
+        "{routed:?}"
+    );
+    assert!(pid_alive(job_pid), "the agent's job should be up");
+
+    write_frame(
+        &mut c,
+        &ClientRequest::ArchiveAgent {
+            req_id: 3,
+            id: agent_id,
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 3).is_some()).await;
+    // SIGHUP ends the shell and orphans the job; the watchdog's sweep must
+    // still clear it once the grace period is up.
+    wait_pid_dead(job_pid, SLOW_TIMEOUT, "agent job the shell left behind").await;
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// One PrewarmWorktreeSessions must revive every dead session under the
 /// worktree — no Attach involved — so the TUI can boot a worktree's
 /// sessions the moment the user's selection rests on it. Archived agents
