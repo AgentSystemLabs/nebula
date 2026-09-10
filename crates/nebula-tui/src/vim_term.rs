@@ -93,7 +93,10 @@ impl VimTerm {
         let mut cmd = CommandBuilder::new(program);
         cmd.args(args);
         cmd.cwd(cwd);
-        cmd.env("TERM", "xterm-256color");
+        // The modal is drawn on nebula's grid, the same truecolor terminal
+        // every session pane is (see `nebula_core::env::PANE_TERM`).
+        cmd.env("TERM", nebula_core::env::PANE_TERM);
+        cmd.env("COLORTERM", nebula_core::env::PANE_COLORTERM);
 
         let mut child = pair
             .slave
