@@ -1508,10 +1508,11 @@ impl Daemon {
     /// The turn an agent ran `nebula worktree` in has ended: make the
     /// process match its row. Kill it and respawn it resumed in the target,
     /// with a prompt naming the checkout it now runs in so the conversation
-    /// carries straight on (Claude and pi take that prompt as an argument;
-    /// codex and cursor resume silent and wait for the user). Gated on the
-    /// turn-end hooks — Stop, and the idle notification a Stop-less end
-    /// still fires — so a Bash hook from the same turn never triggers it.
+    /// carries straight on (Claude, codex and pi take that prompt as an
+    /// argument; cursor resumes silent and waits for the user — see
+    /// `relocation_prompt`). Gated on the turn-end hooks — Stop, and the
+    /// idle notification a Stop-less end still fires — so a Bash hook from
+    /// the same turn never triggers it.
     pub fn complete_pending_move(self: &Arc<Self>, id: &AgentId, event: &HookEvent) {
         let turn_over = match event {
             HookEvent::Stop => true,
@@ -1541,17 +1542,15 @@ impl Daemon {
         tracing::info!(agent = %id, to = %target.branch, "relocating session into its worktree");
         self.kill_session(&sref);
         self.last_cwd.lock().unwrap().remove(id);
-        // Claude and pi: `claude --resume <sid> "<prompt>"` and
-        // `pi --session-id <sid> "<prompt>"` are verified to open on the
-        // prompt; whether `codex resume` / `cursor-agent --resume` take a
-        // trailing prompt is not, so their relocated sessions keep waiting
-        // for the user.
-        let prompt = relocation_prompt(&target);
-        let prompt =
-            matches!(agent.kind, AgentKind::Claude | AgentKind::Pi).then_some(prompt.as_str());
-        if let Err(e) =
-            self.spawn_agent_session_with(&agent, &target, DEFAULT_COLS, DEFAULT_ROWS, None, prompt)
-        {
+        let prompt = relocation_prompt(agent.kind, &target);
+        if let Err(e) = self.spawn_agent_session_with(
+            &agent,
+            &target,
+            DEFAULT_COLS,
+            DEFAULT_ROWS,
+            None,
+            prompt.as_deref(),
+        ) {
             tracing::warn!(agent = %id, error = %e, "respawn after worktree relocation failed");
         }
         self.try_broadcast_agent(id);
@@ -2463,6 +2462,7 @@ impl Daemon {
             None => agent_spawn_command_with(
                 agent.kind,
                 agent.session_id.as_deref(),
+                Some(&worktree.path),
                 agent.model.as_deref(),
                 agent.effort.as_deref(),
                 cmd_override.as_deref(),
@@ -2722,12 +2722,17 @@ impl Daemon {
 /// Program + args for an agent PTY. An override (tests) is used verbatim —
 /// no resume args. Otherwise the kind picks the CLI and its resume shape:
 /// `claude --resume <sid>` and `cursor-agent --resume <sid>` (flag) vs
-/// `codex resume <sid>` (subcommand, so resume args must lead); pi takes
-/// `pi --session-id <sid>`, which resumes the id where it exists and
-/// creates it where it doesn't (a relocated session's new cwd). Codex and
-/// cursor always get their skip-permissions flag (`--yolo` / `--force`),
-/// appended after the resume args — same convention as Mission Control;
-/// pi has no permission gate to skip.
+/// `codex resume <sid> --cd <cwd>` (subcommand, so resume args must lead;
+/// the `--cd` because codex reopens a resumed session in the directory its
+/// transcript recorded — or asks which to use — unless told one, and a
+/// relocated session must land in its new worktree, not the old checkout);
+/// pi takes `pi --session-id <sid>`, which resumes the id where it exists
+/// and creates it where it doesn't (a relocated session's new cwd). `cwd`
+/// is the checkout every local spawn boots in, and None for a Cloud launch,
+/// which has no local one. Codex and cursor always get their
+/// skip-permissions flag (`--yolo` / `--force`), appended after the resume
+/// args — same convention as Mission Control; pi has no permission gate to
+/// skip.
 /// Model/effort choices follow: `claude --model m --effort e`,
 /// `codex -m m -c model_reasoning_effort=e`, `pi --model m --thinking e`,
 /// and for cursor one flat id
@@ -2742,8 +2747,9 @@ impl Daemon {
 /// (`claude [prompt]`, `codex [PROMPT]`, `cursor-agent [prompt...]`,
 /// `pi [messages...]`).
 ///
-/// The plain shape, as every restart/resume spawns it: no initial prompt,
-/// guidance on. Tests assert against this; the daemon calls the full form.
+/// The plain shape, as every restart/resume spawns it: booted in
+/// `TEST_CWD`, no initial prompt, guidance on. Tests assert against this;
+/// the daemon calls the full form.
 #[cfg(test)]
 fn agent_spawn_command(
     kind: AgentKind,
@@ -2755,6 +2761,7 @@ fn agent_spawn_command(
     agent_spawn_command_with(
         kind,
         session_id,
+        Some(Path::new(TEST_CWD)),
         model,
         effort,
         cmd_override,
@@ -2784,24 +2791,38 @@ tell the user in one line that the session is moving into the worktree, and make
 calls or edits — you will be resumed inside the worktree with a prompt to carry on there. If the \
 command fails, report the error and carry on in the current checkout.";
 
-/// The prompt a relocated Claude session is resumed with: it names the
-/// checkout the process now runs in and asks for the work to pick back up
-/// there, so the user never has to type "continue".
-fn relocation_prompt(worktree: &Worktree) -> String {
-    format!(
-        "[nebula] This session now runs inside the worktree `{}` at {} — your working \
-         directory is that checkout. Continue the user's most recent request there.",
-        worktree.branch,
-        worktree.path.display()
-    )
+/// The prompt a relocated session is resumed with: it names the checkout
+/// the process now runs in and asks for the work to pick back up there, so
+/// the user never has to type "continue". Only for the CLIs verified to
+/// open a resumed session on a trailing prompt — `claude --resume <sid>
+/// "<prompt>"`, `codex resume <sid> [PROMPT]` (the positional its `--help`
+/// documents; submitted as the next turn, verified live on codex 0.153.4)
+/// and `pi --session-id <sid> "<prompt>"`. Whether `cursor-agent --resume
+/// <id> [prompt...]` submits one is not, so a relocated cursor session
+/// resumes silent and waits for the user.
+fn relocation_prompt(kind: AgentKind, worktree: &Worktree) -> Option<String> {
+    match kind {
+        AgentKind::Claude | AgentKind::Codex | AgentKind::Pi => Some(format!(
+            "[nebula] This session now runs inside the worktree `{}` at {} — your working \
+             directory is that checkout. Continue the user's most recent request there.",
+            worktree.branch,
+            worktree.path.display()
+        )),
+        AgentKind::Cursor => None,
+    }
 }
 
-// Eight positional knobs is one over clippy's line; the callers are the two
+/// The checkout the test wrapper boots every spawn in.
+#[cfg(test)]
+const TEST_CWD: &str = "/nebula-test/p-feat";
+
+// Nine positional knobs are two over clippy's line; the callers are the two
 // thin wrappers above and the tests, so a builder would only add ceremony.
 #[allow(clippy::too_many_arguments)]
 fn agent_spawn_command_with(
     kind: AgentKind,
     session_id: Option<&str>,
+    cwd: Option<&Path>,
     model: Option<&str>,
     effort: Option<&str>,
     cmd_override: Option<&str>,
@@ -2820,7 +2841,13 @@ fn agent_spawn_command_with(
     let program = kind.cli_program().to_string();
     let (mut args, resumed) = match (kind, session_id) {
         (AgentKind::Claude, Some(sid)) => (vec!["--resume".to_string(), sid.to_string()], true),
-        (AgentKind::Codex, Some(sid)) => (vec!["resume".to_string(), sid.to_string()], true),
+        (AgentKind::Codex, Some(sid)) => {
+            let mut args = vec!["resume".to_string(), sid.to_string()];
+            if let Some(cwd) = cwd {
+                args.extend(["--cd".to_string(), cwd.to_string_lossy().into_owned()]);
+            }
+            (args, true)
+        }
         (AgentKind::Cursor, Some(sid)) => (vec!["--resume".to_string(), sid.to_string()], true),
         (AgentKind::Pi, Some(sid)) => (vec!["--session-id".to_string(), sid.to_string()], true),
         (_, None) => (Vec::new(), false),
@@ -3001,6 +3028,7 @@ fn claude_cloud_spawn_command(
 ) -> (String, Vec<String>, bool) {
     let (program, mut args, resumed) = agent_spawn_command_with(
         AgentKind::Claude,
+        None,
         None,
         model,
         effort,
@@ -3187,7 +3215,10 @@ mod tests {
             agent_spawn_command(AgentKind::Claude, Some("sid-1"), None, None, None),
             ("claude".into(), guided(&["--resume", "sid-1"]), true)
         );
-        // Skip-permissions flags trail the resume args.
+        // Skip-permissions flags trail the resume args. A codex resume is
+        // told its checkout (`--cd`): without it codex reopens the session
+        // in the directory its transcript recorded, which for a relocated
+        // session is the old one.
         assert_eq!(
             agent_spawn_command(AgentKind::Codex, Some("sid-2"), None, None, None),
             (
@@ -3195,6 +3226,8 @@ mod tests {
                 vec![
                     "resume".to_string(),
                     "sid-2".to_string(),
+                    "--cd".to_string(),
+                    TEST_CWD.to_string(),
                     "--yolo".to_string()
                 ],
                 true
@@ -3335,6 +3368,7 @@ mod tests {
         let (_, args, resumed) = agent_spawn_command_with(
             AgentKind::Claude,
             Some("sid"),
+            Some(Path::new(TEST_CWD)),
             Some("opus"),
             None,
             None,
@@ -3351,6 +3385,7 @@ mod tests {
             agent_spawn_command_with(
                 AgentKind::Codex,
                 Some("sid"),
+                Some(Path::new(TEST_CWD)),
                 None,
                 None,
                 None,
@@ -3359,12 +3394,13 @@ mod tests {
                 true
             )
             .1,
-            vec!["resume", "sid", "--yolo", "carry on"]
+            vec!["resume", "sid", "--cd", TEST_CWD, "--yolo", "carry on"]
         );
         assert_eq!(
             agent_spawn_command_with(
                 AgentKind::Cursor,
                 Some("sid"),
+                Some(Path::new(TEST_CWD)),
                 None,
                 None,
                 None,
@@ -3383,6 +3419,7 @@ mod tests {
             agent_spawn_command_with(
                 AgentKind::Claude,
                 None,
+                Some(Path::new(TEST_CWD)),
                 Some("opus"),
                 Some("high"),
                 None,
@@ -3397,6 +3434,7 @@ mod tests {
             agent_spawn_command_with(
                 AgentKind::Codex,
                 None,
+                Some(Path::new(TEST_CWD)),
                 Some("gpt-5.5"),
                 Some("high"),
                 None,
@@ -3418,6 +3456,7 @@ mod tests {
             agent_spawn_command_with(
                 AgentKind::Cursor,
                 None,
+                Some(Path::new(TEST_CWD)),
                 None,
                 None,
                 None,
@@ -3436,6 +3475,7 @@ mod tests {
             agent_spawn_command_with(
                 AgentKind::Pi,
                 Some("sid"),
+                Some(Path::new(TEST_CWD)),
                 None,
                 None,
                 None,
@@ -3451,6 +3491,7 @@ mod tests {
             agent_spawn_command_with(
                 AgentKind::Claude,
                 None,
+                Some(Path::new(TEST_CWD)),
                 None,
                 None,
                 Some("/bin/sh -i"),
@@ -3459,6 +3500,58 @@ mod tests {
                 true
             ),
             ("/bin/sh".into(), vec!["-i".to_string()], false)
+        );
+    }
+
+    /// The relocation notice reaches the CLIs whose resume submits a
+    /// trailing prompt — Claude, codex and pi — and names the checkout;
+    /// cursor's is unverified, so its relocated session reopens silent.
+    /// (Codex was gated out until #39: `codex resume <id> --yolo` sat at
+    /// Ready in the worktree until the user typed "continue".)
+    #[test]
+    fn relocation_prompt_reaches_every_kind_but_cursor() {
+        let feat = Worktree {
+            id: WorktreeId("feat".into()),
+            project_id: ProjectId("p".into()),
+            path: "/nebula-test/p-feat".into(),
+            branch: "feat".into(),
+            is_main: false,
+            sort_order: 0,
+        };
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Pi] {
+            let prompt = relocation_prompt(kind, &feat).unwrap_or_else(|| panic!("{kind:?}"));
+            assert!(prompt.contains("`feat`"), "{kind:?}: {prompt}");
+            assert!(prompt.contains("/nebula-test/p-feat"), "{kind:?}: {prompt}");
+            assert!(prompt.contains("Continue the user's most recent request"));
+        }
+        assert_eq!(relocation_prompt(AgentKind::Cursor, &feat), None);
+
+        // And the codex respawn it feeds: resumed, re-rooted in the
+        // worktree, and opening on the notice.
+        let notice = relocation_prompt(AgentKind::Codex, &feat).unwrap();
+        let (program, args, resumed) = agent_spawn_command_with(
+            AgentKind::Codex,
+            Some("sid"),
+            Some(&feat.path),
+            None,
+            None,
+            None,
+            Some(&notice),
+            None,
+            true,
+        );
+        assert_eq!(program, "codex");
+        assert!(resumed);
+        assert_eq!(
+            args,
+            vec![
+                "resume",
+                "sid",
+                "--cd",
+                "/nebula-test/p-feat",
+                "--yolo",
+                notice.as_str()
+            ]
         );
     }
 
@@ -3474,6 +3567,7 @@ mod tests {
         let (_, args, resumed) = agent_spawn_command_with(
             AgentKind::Claude,
             Some("sid"),
+            Some(Path::new(TEST_CWD)),
             None,
             None,
             None,
