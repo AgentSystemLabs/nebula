@@ -143,7 +143,15 @@ impl PtySession {
         let mut cmd = CommandBuilder::new(&spec.program);
         cmd.args(&spec.args);
         cmd.cwd(&spec.cwd);
-        cmd.env("TERM", "xterm-256color");
+        // The child paints nebula's grid, not the terminal the daemon was
+        // started from: name that grid and drop the colour overrides the
+        // daemon inherited. Agent launches restate all three after the
+        // login shell's profile too (`login_shell_wrap`).
+        cmd.env("TERM", nebula_core::env::PANE_TERM);
+        cmd.env("COLORTERM", nebula_core::env::PANE_COLORTERM);
+        for name in nebula_core::env::PANE_COLOR_OVERRIDES {
+            cmd.env_remove(name);
+        }
         for name in spec.scrub_env {
             cmd.env_remove(name);
         }
@@ -488,5 +496,64 @@ mod tests {
         assert_eq!(title, "✳ Fix Login");
         assert_eq!(session.window_title().as_deref(), Some("✳ Fix Login"));
         session.kill();
+    }
+
+    /// The pane is nebula's grid, not the terminal the daemon was started
+    /// from: every child hears `TERM`/`COLORTERM` for that grid, and a
+    /// `NO_COLOR` or `FORCE_COLOR` the daemon inherited never reaches it.
+    #[tokio::test]
+    async fn child_is_told_the_pane_is_a_truecolor_terminal() {
+        // The daemon's own environment is the base the child is built from,
+        // so the overrides have to sit there for the scrub to be exercised.
+        // Only this test sets them, and only until the spawn has read them;
+        // whatever was there before is put back.
+        let before: Vec<(&str, Option<std::ffi::OsString>)> = ["NO_COLOR", "FORCE_COLOR", "TERM"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect();
+        std::env::set_var("NO_COLOR", "1");
+        std::env::set_var("FORCE_COLOR", "0");
+        std::env::set_var("TERM", "foot");
+        let session = PtySession::spawn(
+            SessionRef::Agent(AgentId::generate()),
+            SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    r#"printf 'env=%s|%s|%s|%s' "$TERM" "$COLORTERM" "${NO_COLOR-unset}" "${FORCE_COLOR-unset}""#
+                        .into(),
+                ],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: &[],
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+            },
+        )
+        .unwrap();
+        for (name, value) in before {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        let mut rx = session.events.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match rx.recv().await {
+                    Ok(PtyEvent::Exited { .. }) => break,
+                    Ok(_) => continue,
+                    Err(e) => panic!("event stream ended: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("child exits within 10s");
+        let (_, bytes) = session.snapshot(None);
+        let out = String::from_utf8_lossy(&bytes);
+        assert!(
+            out.contains("env=xterm-256color|truecolor|unset|unset"),
+            "child saw: {out:?}"
+        );
     }
 }

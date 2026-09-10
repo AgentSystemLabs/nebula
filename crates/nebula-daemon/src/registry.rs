@@ -3201,11 +3201,29 @@ fn cli_missing_message(kind: AgentKind) -> String {
 }
 
 /// Wrap `program args…` in a login + interactive shell (`$SHELL -l -i -c
-/// 'exec …'`) so the child gets the user's real environment — ~/.zprofile
-/// and ~/.zshrc on zsh — rather than the daemon's. `exec` keeps the child
-/// as the PTY's direct process (exit codes and signals pass through).
+/// 'exec env … prog args'`) so the child gets the user's real environment —
+/// ~/.zprofile and ~/.zshrc on zsh — rather than the daemon's. `exec` keeps
+/// the child as the PTY's direct process (exit codes and signals pass
+/// through); `env` execs straight into it, so nothing sits in between.
+///
+/// The `env` restates what the pane is *after* those files have run: `TERM`
+/// and `COLORTERM` name nebula's own grid — 24-bit colour whatever the host
+/// terminal — and `NO_COLOR` / `FORCE_COLOR` are dropped. A login-only
+/// profile that exports `NO_COLOR` reaches a session here and nowhere else
+/// (foot and Ghostty on Linux start non-login shells), and Claude Code takes
+/// it as "no colour": its whole UI in the default foreground while the TUI
+/// around it stays coloured (#37). The spawn sets the same three against the
+/// daemon's inherited environment; this covers the profile's.
 fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec<String>) {
-    let mut cmdline = String::from("exec");
+    let mut cmdline = String::from("exec env");
+    for name in env::PANE_COLOR_OVERRIDES {
+        cmdline.push_str(" -u ");
+        cmdline.push_str(name);
+    }
+    cmdline.push_str(" TERM=");
+    cmdline.push_str(env::PANE_TERM);
+    cmdline.push_str(" COLORTERM=");
+    cmdline.push_str(env::PANE_COLORTERM);
     for part in std::iter::once(program).chain(args.iter().map(String::as_str)) {
         cmdline.push_str(" '");
         cmdline.push_str(&part.replace('\'', "'\\''"));
@@ -3762,6 +3780,10 @@ mod tests {
         assert!(err.contains("message"), "{err}");
     }
 
+    /// What every agent launch execs once the login shell's files have run.
+    const PANE_ENV: &str =
+        "exec env -u NO_COLOR -u FORCE_COLOR TERM=xterm-256color COLORTERM=truecolor";
+
     #[test]
     fn login_shell_wrap_quotes_and_execs() {
         let (program, args) = login_shell_wrap(
@@ -3772,11 +3794,47 @@ mod tests {
         assert_eq!(program, "/bin/zsh");
         assert_eq!(
             args,
-            vec!["-l", "-i", "-c", "exec 'claude' '--resume' 'sid-1'"]
+            vec![
+                "-l",
+                "-i",
+                "-c",
+                &format!("{PANE_ENV} 'claude' '--resume' 'sid-1'")
+            ]
         );
         // Single quotes in an arg survive the wrapping.
         let (_, args) = login_shell_wrap("/bin/zsh", "echo", &["it's".to_string()]);
-        assert_eq!(args[3], r"exec 'echo' 'it'\''s'");
+        assert_eq!(args[3], format!(r"{PANE_ENV} 'echo' 'it'\''s'"));
+    }
+
+    /// The command line's `env` really does undo a profile's colour
+    /// overrides and restate the pane: run it through a plain `sh -c` with
+    /// `NO_COLOR` and a foreign `TERM` already exported, as a `.profile`
+    /// would leave them, and read back what the program sees.
+    #[test]
+    fn login_shell_wrap_restates_the_pane_after_the_profile() {
+        let (_, args) = login_shell_wrap(
+            "/bin/sh",
+            "sh",
+            &[
+                "-c".to_string(),
+                r#"printf '%s|%s|%s|%s' "$TERM" "$COLORTERM" "${NO_COLOR-unset}" "${FORCE_COLOR-unset}""#
+                    .to_string(),
+            ],
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&args[3])
+            .env("NO_COLOR", "1")
+            .env("FORCE_COLOR", "0")
+            .env("TERM", "foot")
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "xterm-256color|truecolor|unset|unset",
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn test_daemon() -> Arc<Daemon> {

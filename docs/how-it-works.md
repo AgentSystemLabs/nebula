@@ -8,6 +8,14 @@
   with scrollback replayed. When the daemon swaps the process under a session you are looking at — a
   restart, or the `nebula worktree` relocation at the end of a turn — the pane is rebound to the new
   one on its own.
+- **Every pane is the same truecolor terminal.** A session paints nebula's own grid, not the terminal
+  nebula runs in, so the daemon tells each child `TERM=xterm-256color` and `COLORTERM=truecolor` and
+  drops any `NO_COLOR` / `FORCE_COLOR` it inherited. An agent launch runs through your login shell
+  (`$SHELL -l -i -c 'exec env … claude …'`) so it sees your real PATH, and restates all three after your
+  profile has run. Claude Code takes a stray `NO_COLOR` — exported by the agent shell the daemon was
+  first started from, or by a login-only profile no interactive terminal sources — as "no colour" and
+  paints its whole UI in the default foreground while the TUI around it stays coloured; the TUI still
+  honours its own `NO_COLOR` on the way out, so a user who wants none keeps none.
 - **Client and DAEMON must agree on the PROTOCOL VERSION.** IPC frames are positional msgpack, so any
   change to the shared types bumps `PROTOCOL_VERSION` (`crates/nebula-core/src/protocol.rs`) and the
   handshake refuses a mismatched pair — the DAEMON answers `Incompatible`, the TUI bails, and the
