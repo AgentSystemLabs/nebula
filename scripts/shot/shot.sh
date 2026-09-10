@@ -39,6 +39,9 @@ git -C "$DEMO" init -q -b main
 git -C "$DEMO" -c user.name=shot -c user.email=shot@example.invalid commit -q --allow-empty -m "demo"
 git -C "$DEMO" worktree add -q -b feature-x "$WORK/demo-worktrees/feature-x" main
 git -C "$DEMO" worktree add -q -b wheel-one-line "$WORK/demo-worktrees/wheel-one-line" main
+# A scene that needs more than the stock demo — a git config key, a file in a checkout — ships a
+# scenes/<scene>.setup.sh beside its .keys, sourced here with DEMO, WORK and RUNTIME in scope.
+if [ -f "$HERE/scenes/$SCENE.setup.sh" ]; then DEMO="$DEMO" WORK="$WORK" RUNTIME="$RUNTIME" . "$HERE/scenes/$SCENE.setup.sh"; fi
 
 export NEBULA_RUNTIME_DIR="$RUNTIME" NEBULA_DATA_DIR="$WORK/data" NEBULA_AGENT_CMD=/bin/cat \
        NEBULA_UPDATE_CHECK_SECS=0 NEBULA_GH_FIXTURES="${NEBULA_GH_FIXTURES:-$HERE/fixtures}" \
