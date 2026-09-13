@@ -6394,6 +6394,66 @@ fn pane_cell(area: ratatui::layout::Rect, col: u16, row: u16) -> (u16, u16) {
     )
 }
 
+/// The modifier bits of an xterm mouse report: ⇧ 4, ⌥ 8, ^ 16.
+fn mouse_modifier_bits(modifiers: KeyModifiers) -> u16 {
+    let mut bits = 0;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        bits |= 4;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        bits |= 8;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        bits |= 16;
+    }
+    bits
+}
+
+/// One xterm mouse report in the encoding the program asked for: SGR
+/// (`CSI < button ; x ; y M`, a lowercase `m` for a release) or the legacy
+/// X10 bytes (`CSI M` and three offset bytes, coordinates capped at that
+/// encoding's 223 limit, a release folded into button 3). `col` and `row`
+/// are pane-relative cells; the report is 1-based.
+fn mouse_report(sgr: bool, button: u16, release: bool, col: u16, row: u16) -> Vec<u8> {
+    if sgr {
+        let last = if release { 'm' } else { 'M' };
+        format!("\x1b[<{button};{};{}{last}", col + 1, row + 1).into_bytes()
+    } else {
+        let button = if release {
+            (button & !0b11) | 3
+        } else {
+            button
+        };
+        vec![
+            0x1b,
+            b'[',
+            b'M',
+            32 + button as u8,
+            32 + (col + 1).min(223) as u8,
+            32 + (row + 1).min(223) as u8,
+        ]
+    }
+}
+
+/// Hand the program in the pane one report of `button` at the pointer,
+/// clamped to the pane the way a drag-selection's head is.
+fn forward_mouse(
+    app: &App,
+    out: &mut Vec<ClientRequest>,
+    sgr: bool,
+    button: u16,
+    release: bool,
+    mouse: &MouseEvent,
+) {
+    if let Some(term) = &app.term {
+        let (col, row) = pane_cell(app.term_area, mouse.column, mouse.row);
+        out.push(ClientRequest::Input {
+            session: term.sref.clone(),
+            data: mouse_report(sgr, button, release, col, row),
+        });
+    }
+}
+
 /// Text under the current selection, from the screen's visible view
 /// (respects scrollback offset and wrapped rows).
 fn selection_text(app: &App) -> Option<String> {
@@ -7154,8 +7214,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 }
             }
             // Any fresh click clears a stale selection highlight; a click on
-            // the terminal pane below re-arms one.
+            // the terminal pane below re-arms one. A button the program was
+            // still holding (its release never arrived) is let go the same
+            // way.
             app.term_selection = None;
+            app.term_mouse_grab = None;
             match app.hit_at(mouse.column, mouse.row) {
                 Some(HitTarget::Splitter(i)) => {
                     // Arm a resize drag; focus and selections stay put.
@@ -7246,7 +7309,21 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                             app.term_locked = true;
                         }
                         let cell = pane_cell(app.term_area, mouse.column, mouse.row);
-                        if is_double_click(&mut app.last_term_click, cell) {
+                        let (mode, sgr) = app.child_mouse_mode();
+                        if mode != vt100::MouseProtocolMode::None {
+                            // The program asked for the mouse (claude's
+                            // fullscreen renderer, vim `mouse=a`, htop): the
+                            // press is its, and so are the drag and release
+                            // to come. Its own selection knows its layout —
+                            // claude's diff panel sits beside the
+                            // conversation, and a screen-row copy of ours
+                            // took both (#52). ⇧drag still selects through
+                            // the terminal.
+                            let sref = t.sref.clone();
+                            let button = mouse_modifier_bits(mouse.modifiers);
+                            forward_mouse(app, out, sgr, button, false, &mouse);
+                            app.term_mouse_grab = Some(sref);
+                        } else if is_double_click(&mut app.last_term_click, cell) {
                             // Double-click: select (and copy) the word under
                             // the cursor.
                             select_word_at(app, cell);
@@ -7274,6 +7351,22 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     app.body_area.width,
                 );
                 app.dirty = true;
+            } else if let Some(sref) = &app.term_mouse_grab {
+                // The program holding the button gets the motion — if it
+                // asked for motion at all (`?1002h` / `?1003h`); press-only
+                // and press/release tracking hear nothing until the release.
+                let (mode, sgr) = app.child_mouse_mode();
+                let held = app.term.as_ref().is_some_and(|t| &t.sref == sref);
+                if held
+                    && matches!(
+                        mode,
+                        vt100::MouseProtocolMode::ButtonMotion
+                            | vt100::MouseProtocolMode::AnyMotion
+                    )
+                {
+                    let button = 32 | mouse_modifier_bits(mouse.modifiers);
+                    forward_mouse(app, out, sgr, button, false, &mouse);
+                }
             } else if let Some(sel) = &mut app.term_selection {
                 if sel.dragging {
                     sel.head = pane_cell(app.term_area, mouse.column, mouse.row);
@@ -7289,6 +7382,20 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         MouseEventKind::Up(MouseButton::Left) => {
             if app.splitter_drag.take().is_some() {
                 app.dirty = true;
+            } else if let Some(sref) = app.term_mouse_grab.take() {
+                // The release closes the program's button — except under
+                // press-only tracking (`?9h`), which has no release report.
+                let (mode, sgr) = app.child_mouse_mode();
+                let held = app.term.as_ref().is_some_and(|t| t.sref == sref);
+                if held
+                    && !matches!(
+                        mode,
+                        vt100::MouseProtocolMode::None | vt100::MouseProtocolMode::Press
+                    )
+                {
+                    let button = mouse_modifier_bits(mouse.modifiers);
+                    forward_mouse(app, out, sgr, button, true, &mouse);
+                }
             } else if app.term_selection.is_some_and(|s| s.dragging) {
                 finish_selection(app);
             }
@@ -7349,20 +7456,14 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 app.dirty = true;
             } else if in_term {
                 // A stand-in pane has no PTY to forward the wheel to; its
-                // grid is empty, so there is nothing to scroll either.
-                let stand_in = app.pane_shows_placeholder();
+                // grid is empty, so there is nothing to scroll either
+                // (`child_mouse_mode` calls it mouseless).
+                let (mouse_mode, sgr) = app.child_mouse_mode();
                 if let Some(term) = &mut app.term {
                     // Scrolling shifts the content under a (screen-anchored)
                     // selection highlight — drop it.
                     app.term_selection = None;
-                    let screen = term.parser.screen();
-                    let mouse_mode = if stand_in {
-                        vt100::MouseProtocolMode::None
-                    } else {
-                        screen.mouse_protocol_mode()
-                    };
-                    let sgr = screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr;
-                    let alternate = screen.alternate_screen();
+                    let alternate = term.parser.screen().alternate_screen();
                     if mouse_mode != vt100::MouseProtocolMode::None {
                         // The child asked for the mouse (claude's alt-screen
                         // UI, vim `mouse=a`, htop): forward the wheel event
@@ -7371,23 +7472,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         // "Scroll wheel is sending arrow keys" warning.
                         let (col, row) = pane_cell(app.term_area, mouse.column, mouse.row);
                         let button: u16 = if up { 64 } else { 65 };
-                        let data = if sgr {
-                            format!("\x1b[<{button};{};{}M", col + 1, row + 1).into_bytes()
-                        } else {
-                            // Legacy X10 bytes: 32 + button/coord, 1-based
-                            // coords capped at the encoding's 223 limit.
-                            vec![
-                                0x1b,
-                                b'[',
-                                b'M',
-                                32 + button as u8,
-                                32 + (col + 1).min(223) as u8,
-                                32 + (row + 1).min(223) as u8,
-                            ]
-                        };
                         out.push(ClientRequest::Input {
                             session: term.sref.clone(),
-                            data,
+                            data: mouse_report(sgr, button, false, col, row),
                         });
                     } else if alternate {
                         // Full-screen apps that ignore the mouse (plain vim,
@@ -7579,6 +7666,11 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     if term.apply_scrollback(base_seq, &data) {
                         app.term_selection = None;
                     }
+                    // A replay is history: a clipboard write in it went out
+                    // when it happened (or never reached this client), and
+                    // redoing it now would clobber whatever the user has
+                    // copied since.
+                    term.take_clipboard();
                     app.dirty = true;
                 }
             }
@@ -7587,6 +7679,16 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             if let Some(term) = &mut app.term {
                 if term.sref == session {
                     term.apply_output(seq, &data);
+                    // The program wrote "the clipboard" with OSC 52 —
+                    // claude's fullscreen renderer over ssh, vim, tmux —
+                    // and that landed here, in the emulation, not on any
+                    // clipboard. Pass it on to the terminal the user is
+                    // sitting at, the route nebula's own copy takes on a
+                    // remote host.
+                    if let Some(payload) = term.take_clipboard() {
+                        app.pending_clipboard = Some(payload);
+                        app.flash = Some("copied (via terminal)".into());
+                    }
                     app.dirty = true;
                 }
             }
@@ -15617,6 +15719,238 @@ diff --git a/src/c.rs b/src/c.rs
             [ClientRequest::Input { data, .. }] => assert_eq!(data, b"\x1b[A"),
             other => panic!("expected one Input request, got {other:?}"),
         }
+    }
+
+    /// A term whose program asked for the mouse with `modes` (the DECSET
+    /// numbers), on a pane sitting right of the sidebars so reports have to
+    /// be pane-relative.
+    fn mouse_owning_pane(app: &mut App, modes: &[u16]) {
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        let mut term = AttachedTerm::new(sref, 80, 24);
+        term.parser.process(b"\x1b[?1049h");
+        for mode in modes {
+            term.parser.process(format!("\x1b[?{mode}h").as_bytes());
+        }
+        app.term = Some(term);
+        app.term_area = ratatui::layout::Rect::new(10, 2, 80, 24);
+        app.hits.push((app.term_area, HitTarget::TerminalPane));
+    }
+
+    fn only_input(out: &[ClientRequest]) -> &[u8] {
+        match out {
+            [ClientRequest::Input { data, .. }] => data,
+            other => panic!("expected one Input request, got {other:?}"),
+        }
+    }
+
+    /// A program that asked for the mouse — claude's fullscreen renderer,
+    /// vim `mouse=a` — gets the left button: press, drag and release, in its
+    /// encoding and pane-relative, and nebula arms no selection of its own.
+    /// (#52: claude's diff panel sits beside the conversation, and a
+    /// screen-row copy of ours took both; claude's selection knows better.)
+    #[test]
+    fn the_left_button_goes_to_a_program_that_asked_for_the_mouse() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        mouse_owning_pane(&mut app, &[1002, 1006]);
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 15, 5),
+            &mut out,
+        );
+        assert_eq!(only_input(&out), b"\x1b[<0;6;4M");
+        assert!(app.term_selection.is_none(), "no selection of nebula's");
+        assert!(app.term_locked, "a click into the pane still locks input");
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(
+            app.term_mouse_grab.is_some(),
+            "the program holds the button"
+        );
+
+        out.clear();
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 20, 6),
+            &mut out,
+        );
+        assert_eq!(only_input(&out), b"\x1b[<32;11;5M");
+        assert!(app.term_selection.is_none());
+
+        // Wandering off the pane clamps to its edge, as our own drag does.
+        out.clear();
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 200, 50),
+            &mut out,
+        );
+        assert_eq!(only_input(&out), b"\x1b[<32;80;24M");
+
+        out.clear();
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Up(MouseButton::Left), 20, 6),
+            &mut out,
+        );
+        assert_eq!(only_input(&out), b"\x1b[<0;11;5m");
+        assert!(app.term_mouse_grab.is_none(), "the release lets go");
+        assert!(app.flash.is_none(), "nebula copied nothing");
+        assert!(app.term_selection.is_none());
+    }
+
+    /// Press-only tracking (`?9h`) has no drag or release reports, and a
+    /// program that never asked for SGR gets the legacy X10 bytes.
+    #[test]
+    fn press_only_tracking_gets_the_press_alone_in_x10_bytes() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        mouse_owning_pane(&mut app, &[9]);
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 15, 5),
+            &mut out,
+        );
+        assert_eq!(only_input(&out), &[0x1b, b'[', b'M', 32, 32 + 6, 32 + 4]);
+
+        out.clear();
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 20, 6),
+            &mut out,
+        );
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Up(MouseButton::Left), 20, 6),
+            &mut out,
+        );
+        assert!(out.is_empty(), "nothing after the press: {out:?}");
+        assert!(app.term_mouse_grab.is_none());
+    }
+
+    /// Press/release tracking (`?1000h`) hears the press and the release but
+    /// never the motion between them.
+    #[test]
+    fn press_release_tracking_hears_no_drag() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        mouse_owning_pane(&mut app, &[1000]);
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 10, 2),
+            &mut out,
+        );
+        assert_eq!(only_input(&out), &[0x1b, b'[', b'M', 32, 33, 33]);
+
+        out.clear();
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 13, 2),
+            &mut out,
+        );
+        assert!(out.is_empty(), "no motion report: {out:?}");
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Up(MouseButton::Left), 13, 2),
+            &mut out,
+        );
+        assert_eq!(only_input(&out), &[0x1b, b'[', b'M', 35, 36, 33]);
+    }
+
+    /// ⇧, ⌥ and ^ ride along in the report's modifier bits. (A ⌥click on a
+    /// link never gets this far — nebula opens the link itself.)
+    #[test]
+    fn modifiers_ride_along_in_the_report() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        mouse_owning_pane(&mut app, &[1002, 1006]);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 10,
+                row: 2,
+                modifiers: KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+            },
+            &mut out,
+        );
+        assert_eq!(only_input(&out), b"\x1b[<20;1;1M");
+    }
+
+    /// A program that took the mouse and then exited: its last screen is
+    /// still ours to select from, so the click arms nebula's selection.
+    #[test]
+    fn an_exited_programs_screen_is_still_ours_to_select() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        mouse_owning_pane(&mut app, &[1002, 1006]);
+        let term = app.term.as_mut().unwrap();
+        term.parser.process(b"hello world");
+        term.exited = true;
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 10, 2),
+            &mut out,
+        );
+        assert!(out.is_empty(), "nothing to forward to: {out:?}");
+        assert!(app.term_selection.is_some_and(|s| s.dragging && !s.active));
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 20, 2),
+            &mut out,
+        );
+        assert_eq!(selection_text(&app).as_deref(), Some("hello world"));
+    }
+
+    /// A program's OSC 52 copy — claude's fullscreen renderer over ssh, vim,
+    /// tmux — is passed on to the terminal the user is sitting at; a ring
+    /// replay carrying an old one is not.
+    #[test]
+    fn a_programs_clipboard_write_is_relayed_to_the_terminal() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        app.term = Some(AttachedTerm::new(sref.clone(), 80, 24));
+
+        handle_server_event(
+            &mut app,
+            ServerEvent::Output {
+                session: sref.clone(),
+                seq: 0,
+                data: b"\x1b]52;c;aGVsbG8=\x07".to_vec(),
+            },
+            &mut out,
+        );
+        assert_eq!(app.pending_clipboard.as_deref(), Some("aGVsbG8="));
+        assert!(
+            app.flash
+                .as_deref()
+                .is_some_and(|f| f.contains("via terminal")),
+            "flash names the route: {:?}",
+            app.flash
+        );
+
+        app.pending_clipboard = None;
+        app.flash = None;
+        handle_server_event(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: sref,
+                base_seq: 0,
+                data: b"\x1b]52;c;aGVsbG8=\x07".to_vec(),
+            },
+            &mut out,
+        );
+        assert!(
+            app.pending_clipboard.is_none(),
+            "a replay is history, not a fresh copy"
+        );
+        assert!(app.flash.is_none());
     }
 
     #[test]

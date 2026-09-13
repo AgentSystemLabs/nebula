@@ -54,12 +54,17 @@ export NEBULA_RUNTIME_DIR="$RUNTIME" NEBULA_DATA_DIR="$WORK/data" NEBULA_AGENT_C
 $TMUX new-session -d -x "$COLS" -y "$ROWS" "$BIN"
 sleep "${SHOT_BOOT_SECS:-4}"                                 # first paint + the first GIT POLL answers
 # A keys line is a tmux key name or literal text; `click <col> <row>` / `rclick <col> <row>` (1-based
-# cells) are an SGR mouse press and release typed straight into the pane, for the targets no key reaches.
+# cells) are an SGR mouse press and release typed straight into the pane, for the targets no key reaches,
+# and `drag <col> <row> <col2> <row2>` a left press, two motion reports and the release at the far end.
 send() {
   case "$1" in
     click\ *|rclick\ *)
       set -- $1; b=0; [ "$1" = rclick ] && b=2
       $TMUX send-keys -l "$(printf '\033[<%d;%d;%dM\033[<%d;%d;%dm' "$b" "$2" "$3" "$b" "$2" "$3")";;
+    drag\ *)
+      set -- $1; mc=$(( ($2 + $4) / 2 )); mr=$(( ($3 + $5) / 2 ))
+      $TMUX send-keys -l "$(printf '\033[<0;%d;%dM\033[<32;%d;%dM\033[<32;%d;%dM\033[<0;%d;%dm' \
+        "$2" "$3" "$mc" "$mr" "$4" "$5" "$4" "$5")";;
     *) $TMUX send-keys "$1";;
   esac
   sleep "${SHOT_KEY_SECS:-0.6}"
