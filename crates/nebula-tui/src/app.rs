@@ -7,7 +7,7 @@ use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Project, ProjectId, SessionRef,
     TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
 };
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -2076,6 +2076,17 @@ pub struct App {
     pub hits: Vec<(Rect, HitTarget)>,
     /// Inner rect of the terminal pane from the last draw.
     pub term_area: Rect,
+    /// Where the host terminal's own cursor is parked once a frame is
+    /// flushed: the cell under the cursor of the PTY the keyboard is
+    /// headed for — the editor modal's, else the attached session's — or
+    /// None to leave it wherever the frame's last diff run ended. The host
+    /// cursor stays hidden either way (the pane paints its own), but a
+    /// CJK input method anchors its composition — the preedit text and
+    /// the candidate window — to the hardware cursor's cell, hidden or
+    /// not, so an unparked cursor put Japanese preedit at the edge of the
+    /// window instead of at the prompt (#53). Set by `ui::draw`, applied
+    /// by the event loop after the frame.
+    pub host_cursor: Option<Position>,
     pub dirty: bool,
     pub should_quit: bool,
     /// Set with `should_quit` when the hosts picker chose a destination:
@@ -2406,6 +2417,7 @@ impl App {
             conn: ConnState::Disconnected,
             hits: Vec::new(),
             term_area: Rect::default(),
+            host_cursor: None,
             dirty: true,
             should_quit: false,
             pending_ssh: None,
