@@ -2052,6 +2052,10 @@ pub struct App {
     pub worktrees_scroll: usize,
     /// `(sel_project, sel_worktree)` as of the last draw.
     pub worktrees_anchor: Option<(usize, usize)>,
+    /// How many pill rows the Worktrees column had room for as of the
+    /// last draw — the page Ctrl+d / Ctrl+u jump by half of. Zero before
+    /// the first frame, when a half page is a single row.
+    pub worktrees_view_rows: usize,
     pub term: Option<AttachedTerm>,
     /// Screens of the sessions the pane showed most recently, most recent
     /// first — at most [`TERM_CACHE_MAX`], each under [`TERM_CACHE_CELLS`].
@@ -2361,6 +2365,12 @@ pub struct App {
     /// and the splash's motion (off = fewer repaints). Mirrors the config,
     /// refreshed at startup and when the settings overlay applies a change.
     pub animations: bool,
+    /// The `focus_tint` setting: paints the focused panel's background
+    /// with a faint accent wash. On by default; off leaves the terminal's
+    /// own background (transparency included) showing through. Mirrors
+    /// the config, refreshed at startup and when the settings overlay
+    /// applies a change.
+    pub focus_tint: bool,
 }
 
 impl Default for App {
@@ -2381,6 +2391,7 @@ impl App {
             sessions_anchor: None,
             worktrees_scroll: 0,
             worktrees_anchor: None,
+            worktrees_view_rows: 0,
             term: None,
             term_cache: Vec::new(),
             term_locked: false,
@@ -2468,6 +2479,7 @@ impl App {
             splash_epoch: std::time::Instant::now(),
             splash_preview: false,
             animations: true,
+            focus_tint: true,
         }
     }
 
@@ -2995,6 +3007,14 @@ impl App {
     /// the truth about it.
     pub fn worktree_row_count(&self) -> usize {
         self.visible_worktrees().len() + self.visible_open_prs().len()
+    }
+
+    /// Rows a half-page jump (Ctrl+d / Ctrl+u) moves the Worktrees
+    /// cursor: half of what the column showed room for on the last
+    /// frame, never less than one so the keys still move before the
+    /// first draw or in a column squeezed down to a row or two.
+    pub fn worktrees_half_page(&self) -> usize {
+        (self.worktrees_view_rows / 2).max(1)
     }
 
     /// The open pull request under the Worktrees cursor, when it's on one.

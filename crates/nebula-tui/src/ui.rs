@@ -144,7 +144,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     if app.collapsed {
         draw_terminal(f, app, body);
-        if app.focus == Focus::Terminal {
+        if app.focus_tint && app.focus == Focus::Terminal {
             draw_focus_tint(f.buffer_mut(), body, app.theme);
         }
         draw_footer(f, app, footer);
@@ -220,20 +220,24 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     );
     draw_terminal(f, app, term_a);
     draw_splitter_grips(f.buffer_mut(), app, panels_a);
-    // Focus cue (always on): the focused panel's whole background picks
-    // up a faint accent tint. The sidebar columns stop one cell short of
+    // Focus cue (`focus_tint` setting, on by default): the focused
+    // panel's whole background picks up a faint accent tint. Off leaves
+    // the terminal's own background — a configured transparency included
+    // — showing through. The sidebar columns stop one cell short of
     // their right rule so the tint stays inside the panel.
-    let tinted = match app.focus {
-        // The bar's last row is its rule, which belongs to the boundary
-        // rather than to the bar — leave it untinted.
-        Focus::Workspaces => Some(shrink_b(workspaces_a)),
-        Focus::Projects => panel_areas[0].map(shrink_r),
-        Focus::Worktrees => panel_areas[1].map(shrink_r),
-        Focus::Sessions => panel_areas[2].map(shrink_r),
-        Focus::Terminal => Some(term_a),
-    };
-    if let Some(tinted) = tinted {
-        draw_focus_tint(f.buffer_mut(), tinted, app.theme);
+    if app.focus_tint {
+        let tinted = match app.focus {
+            // The bar's last row is its rule, which belongs to the
+            // boundary rather than to the bar — leave it untinted.
+            Focus::Workspaces => Some(shrink_b(workspaces_a)),
+            Focus::Projects => panel_areas[0].map(shrink_r),
+            Focus::Worktrees => panel_areas[1].map(shrink_r),
+            Focus::Sessions => panel_areas[2].map(shrink_r),
+            Focus::Terminal => Some(term_a),
+        };
+        if let Some(tinted) = tinted {
+            draw_focus_tint(f.buffer_mut(), tinted, app.theme);
+        }
     }
     draw_footer(f, app, footer);
     draw_overlay(f, app);
@@ -687,6 +691,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "WORKTREES",
                     &[
                         (Act(&[New]), "new worktree (PR row: Claude)"),
+                        (Act(&[HalfPageDown, HalfPageUp]), "half a panel down / up"),
                         (Act(&[GitDiff]), "git diff (^r: mark reviewed ✓)"),
                         (Act(&[OpenRepo]), "open the repo on GitHub"),
                         (Act(&[RefreshPullRequests]), "refresh pull requests now"),
@@ -1449,9 +1454,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     PaletteTarget::Project(_) => ("▪ ", "▫ "),
                     PaletteTarget::Worktree(_) => ("▸ ", "▹ "),
                     PaletteTarget::Session(_) => ("● ", "○ "),
-                    // The panels' "leaves nebula" arrow: a pull request row
-                    // opens a browser, it doesn't move a cursor.
-                    PaletteTarget::PullRequest(_) => ("↗ ", "↗ "),
+                    // The arrow its Worktrees-panel row wears (`pr_row`),
+                    // since that row is where picking it lands.
+                    PaletteTarget::PullRequest { .. } => ("↗ ", "↗ "),
                 };
                 // Archived rows stay quiet even if their last status was
                 // live — the Sessions panel's `⊘` rule.
@@ -2108,11 +2113,6 @@ fn shrink_b(area: Rect) -> Rect {
     }
 }
 
-/// Subtle focus cue: fill the whole focused panel with the theme's
-/// `focus_tint` — the accent at ~10% opacity, so the panel reads as a
-/// faintly lit surface. Painted after content, and only onto cells whose
-/// background is still untouched, so selection fills and PTY-drawn
-/// colors sit on top of the tint instead of under it.
 /// Drag affordance for the panel splitters: a short thick grip centered on
 /// each column rule, one step brighter than the rule so the boundary reads
 /// as grabbable without turning the chrome back up. Accent while that
@@ -2138,6 +2138,12 @@ fn draw_splitter_grips(buf: &mut ratatui::buffer::Buffer, app: &App, body: Rect)
     }
 }
 
+/// Subtle focus cue: fill the whole focused panel with the theme's
+/// `focus_tint` — the accent at ~10% opacity, so the panel reads as a
+/// faintly lit surface. Painted after content, and only onto cells whose
+/// background is still untouched, so selection fills and PTY-drawn
+/// colors sit on top of the tint instead of under it. The `focus_tint`
+/// setting decides whether the callers paint it at all.
 fn draw_focus_tint(buf: &mut ratatui::buffer::Buffer, area: Rect, th: Theme) {
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
@@ -3101,6 +3107,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let wt_count = app.visible_worktrees().len();
     let count = Some(wt_count).filter(|n| *n > 0);
     let inner = draw_column(f, area, "WORKTREES", count, focused, th);
+    // The page Ctrl+d / Ctrl+u jump by half of: how many pills the column
+    // has room for this frame (group headers and quiet rows not billed —
+    // "about half a panel" is the promise, not an exact line count).
+    app.worktrees_view_rows = (inner.height / PILL_H) as usize;
 
     let worktrees: Vec<WorktreeRowData> = app
         .visible_worktrees()
@@ -5532,6 +5542,37 @@ mod tests {
             "last pill keeps its bottom pad"
         );
         assert_eq!(at(11), Some(HitTarget::PanelBg(Focus::Worktrees)));
+    }
+
+    /// Every draw of the Worktrees column writes back how many pills it
+    /// had room for — the page Ctrl+d / Ctrl+u halve — so the key handler
+    /// sizes its jump to the column as it is on screen, not to a guess.
+    /// `draw_column` keeps three rows for the title, and a pill is two
+    /// rows tall, so a 20-row area fits eight pills and a half page is
+    /// four; a shorter window shrinks both, never below one row.
+    #[test]
+    fn drawing_the_worktrees_column_records_its_page_size() {
+        let mut app = hit_test_app(&["main", "feature", "other"], &[], &[]);
+        assert_eq!(app.worktrees_view_rows, 0, "nothing drawn yet");
+        assert_eq!(app.worktrees_half_page(), 1);
+
+        let area = Rect::new(0, 0, 30, 20);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 20)).unwrap();
+        terminal
+            .draw(|f| draw_worktrees(f, &mut app, area))
+            .unwrap();
+        assert_eq!(app.worktrees_view_rows, 8);
+        assert_eq!(app.worktrees_half_page(), 4);
+
+        let area = Rect::new(0, 0, 30, 6);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 6)).unwrap();
+        terminal
+            .draw(|f| draw_worktrees(f, &mut app, area))
+            .unwrap();
+        assert_eq!(app.worktrees_view_rows, 1, "three title rows, one pill");
+        assert_eq!(app.worktrees_half_page(), 1, "never less than a row");
     }
 
     /// RECENT PROMPTS under a session's name. Off (the default), the list
