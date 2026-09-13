@@ -338,6 +338,13 @@ async fn main_loop(
 
         let focus_before = app.focus;
         let preview_before = app.previewed_pr().map(|pr| pr.url);
+        // When the KEY COMBO DISPLAY's last press comes down (its arm below).
+        let key_combo_deadline = app
+            .key_combo
+            .as_ref()
+            .map_or_else(tokio::time::Instant::now, |combo| {
+                tokio::time::Instant::from_std(combo.deadline())
+            });
         tokio::select! {
             // Pending redraw: wake at the frame boundary even if no new
             // events arrive.
@@ -407,6 +414,13 @@ async fn main_loop(
                     app.dirty = true;
                 }
                 next_ago_refresh = tokio::time::Instant::now() + AGO_REFRESH;
+            }
+            // The KEY COMBO DISPLAY clears itself a moment after the press
+            // (`key_combo::LINGER`) — nothing else repaints an idle app, so
+            // the deadline takes a wake of its own.
+            _ = tokio::time::sleep_until(key_combo_deadline), if app.key_combo.is_some() => {
+                app.key_combo = None;
+                app.dirty = true;
             }
             // A host that reset itself (iTerm2's ⌘R) drops mouse reporting
             // without a word, and a dead mouse can't report that it is
@@ -1878,9 +1892,16 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     // needs a mouse; Ctrl+Q is the one press that always lands back on the
     // panels, the same promise it makes inside a LOCKED PANE.
     if app.overlay.is_some() {
-        if crate::keymap::KeyChord::from_event(&key) == HARDWIRED_UNLOCK {
+        let chord = crate::keymap::KeyChord::from_event(&key);
+        if chord == HARDWIRED_UNLOCK {
+            crate::key_combo::note(app, &[chord], Some("Force close"));
             crate::overlay_close::force_close(app, out);
             return;
+        }
+        // The KEY COMBO DISPLAY shows a modal's navigation keys bare and
+        // never what is typed into its text field (see key_combo.rs).
+        if !crate::key_combo::is_text_key(&chord) {
+            crate::key_combo::note(app, &[chord], None);
         }
         handle_overlay_key(app, key, out);
         return;
@@ -1912,6 +1933,14 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             || app.keymap.lookup(crate::keymap::Scope::Terminal, &chord)
                 == Some(crate::keymap::Action::UnlockTerminal);
         if is_hatch {
+            // The one key in a LOCKED PANE the KEY COMBO DISPLAY shows:
+            // everything else typed here is the agent's, passwords
+            // included, and never lands on the screen.
+            crate::key_combo::note(
+                app,
+                &[chord],
+                crate::keymap::spec_of(crate::keymap::Action::UnlockTerminal).map(|s| s.label),
+            );
             leave_terminal_lock(app);
             return;
         }
@@ -1945,6 +1974,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // keys. Esc/Enter/q go back to the session list; everything else
         // falls through to panel navigation.
         if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+            crate::key_combo::note(app, &[chord], Some("Back to sessions"));
             leave_terminal_lock(app);
             return;
         }
@@ -1953,6 +1983,11 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     // Splash preview up: the next key just dismisses it, back to the
     // panels — even q, which asks to quit on the press after.
     if app.splash_preview {
+        crate::key_combo::note(
+            app,
+            &[crate::keymap::KeyChord::from_event(&key)],
+            Some("Back to panels"),
+        );
         app.splash_preview = false;
         return;
     }
@@ -1972,6 +2007,11 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             _ => None,
         };
         if let Some(to) = scrolled {
+            crate::key_combo::note(
+                app,
+                &[crate::keymap::KeyChord::from_event(&key)],
+                Some("Scroll the pull request"),
+            );
             app.dirty |= app.pr_preview_scroll != to;
             app.pr_preview_scroll = to;
             return;
@@ -1986,7 +2026,17 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     // in between — bound or not — breaks it, so the arm is taken here and
     // only the edge arms below put one back.
     let armed = app.edge_tap.take();
-    let Some(action) = app.keymap.lookup(crate::keymap::Scope::Global, &chord) else {
+    let action = app.keymap.lookup(crate::keymap::Scope::Global, &chord);
+    // The KEY COMBO DISPLAY: the key and the label of what it fired — an
+    // unbound key shows bare, so a watcher sees it did nothing. Noted
+    // before the dispatch so a double tap's second press can restate the
+    // pair as one combo (focus_walk::double_tapped).
+    crate::key_combo::note(
+        app,
+        &[chord],
+        action.and_then(crate::keymap::spec_of).map(|s| s.label),
+    );
+    let Some(action) = action else {
         return;
     };
     use crate::keymap::Action;
@@ -4625,6 +4675,12 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     set_hide_root_worktree(app, cfg.hide_root_worktree);
     set_hide_draft_prs(app, cfg.hide_draft_prs);
     app.recent_prompts = cfg.recent_prompts_shown();
+    app.show_key_combos = cfg.show_key_combos;
+    if !app.show_key_combos {
+        // Switched off: whatever the display was showing comes down now
+        // rather than lingering out.
+        app.key_combo = None;
+    }
 }
 
 /// `R` in the settings overlay, confirmed: rewrite config.json from the
@@ -27358,5 +27414,195 @@ diff --git a/src/c.rs b/src/c.rs
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(!app.should_quit, "Enter on an empty list is a no-op");
         });
+    }
+
+    // ---- KEY COMBO DISPLAY (Settings → Experimental) ----
+
+    fn combo_text(app: &App) -> Option<String> {
+        app.key_combo.as_ref().map(|c| c.text())
+    }
+
+    /// With the display on, a panel key shows as `key - label` and an
+    /// unbound one bare; off (the default) nothing is recorded at all.
+    /// Inside a modal only the keys that cannot be text show, bare.
+    #[test]
+    fn key_combo_display_spells_each_press_with_what_it_did() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        assert!(app.key_combo.is_none(), "off by default");
+
+        app.show_key_combos = true;
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        assert_eq!(combo_text(&app).as_deref(), Some("j - Move down"));
+        press(
+            &mut app,
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        assert_eq!(combo_text(&app).as_deref(), Some("^d - Half page down"));
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            combo_text(&app).as_deref(),
+            Some("x"),
+            "an unbound key shows bare: it did nothing, and the watcher sees that"
+        );
+
+        // The palette is a modal with a text field: what is typed into it
+        // never shows, its navigation keys show bare.
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        assert_eq!(combo_text(&app).as_deref(), Some("/ - Fuzzy jump"));
+        assert!(matches!(app.overlay, Some(Overlay::Palette(_))));
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('B'), KeyModifiers::SHIFT, &mut out);
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            combo_text(&app).as_deref(),
+            Some("/ - Fuzzy jump"),
+            "typed text leaves the last combo standing"
+        );
+        press(
+            &mut app,
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        assert_eq!(combo_text(&app).as_deref(), Some("^u"));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert_eq!(combo_text(&app).as_deref(), Some("Esc"));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none());
+
+        // The hardwired hatch out of any modal names itself.
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE, &mut out);
+        assert_eq!(combo_text(&app).as_deref(), Some("? - Help"));
+        press(
+            &mut app,
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        assert_eq!(combo_text(&app).as_deref(), Some("^q - Force close"));
+        assert!(app.overlay.is_none());
+    }
+
+    /// A double tap is one gesture, so its second press restates the pair
+    /// as one combo with what the pair did, in place of the single key.
+    #[test]
+    fn key_combo_display_shows_a_double_tap_as_one_combo() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.show_key_combos = true;
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            combo_text(&app).as_deref(),
+            Some("l - Focus right"),
+            "the first press is its own key"
+        );
+        assert_eq!(app.focus, Focus::Sessions, "and stays put, armed");
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
+        assert_eq!(combo_text(&app).as_deref(), Some("l l - Enter pane"));
+        assert_eq!(app.focus, Focus::Terminal);
+    }
+
+    /// Keys typed into a LOCKED PANE are the agent's — a password at a
+    /// prompt in there must never land on the screen — so the display
+    /// ignores them all and names only the hatch out.
+    #[test]
+    fn key_combo_display_never_echoes_what_is_typed_into_a_locked_pane() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.show_key_combos = true;
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        app.term = Some(AttachedTerm::new(sref, 80, 24));
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        let mut out = Vec::new();
+        for code in [
+            KeyCode::Char('h'),
+            KeyCode::Char('u'),
+            KeyCode::Char('n'),
+            KeyCode::Enter,
+            KeyCode::Char('j'),
+        ] {
+            press(&mut app, code, KeyModifiers::NONE, &mut out);
+        }
+        assert!(
+            app.key_combo.is_none(),
+            "typed keys are the agent's, not the display's"
+        );
+        assert!(app.term_locked, "and none of them was taken for a hotkey");
+        press(
+            &mut app,
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        assert_eq!(
+            combo_text(&app).as_deref(),
+            Some("^q - Unlock terminal input")
+        );
+        assert!(!app.term_locked);
+    }
+
+    /// The setting is live: switching it off in the overlay takes down
+    /// whatever the display was showing rather than letting it linger out.
+    #[test]
+    fn switching_the_key_combo_display_off_takes_the_last_combo_down() {
+        let mut app = App::new();
+        let mut cfg = crate::config::Config {
+            show_key_combos: true,
+            ..Default::default()
+        };
+        apply_config(&mut app, &cfg);
+        assert!(app.show_key_combos);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        assert!(app.key_combo.is_some());
+        cfg.show_key_combos = false;
+        apply_config(&mut app, &cfg);
+        assert!(!app.show_key_combos);
+        assert!(app.key_combo.is_none(), "nothing lingers once it is off");
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        assert!(app.key_combo.is_none());
+    }
+
+    /// Where it draws: the footer's padding row, far left — the one blank
+    /// row on screen — with the key in a keycap and the bar under it
+    /// untouched; nothing on the row once the combo is gone.
+    #[test]
+    fn key_combo_display_sits_on_the_footers_padding_row_at_the_left() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.show_key_combos = true;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut terminal, &mut app).unwrap();
+        let text = buffer_text(&terminal);
+        let rows: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            rows[28].trim_end(),
+            "  j  - Move down",
+            "the row above the bar, at the far left"
+        );
+        assert!(rows[29].contains("nebula v"), "the bar itself is untouched");
+        let cell = &terminal.backend().buffer()[(2, 28)];
+        assert_eq!(cell.symbol(), "j");
+        assert_eq!(cell.bg, app.theme.sel_bg, "the key sits in a keycap");
+        assert_eq!(cell.fg, app.theme.accent);
+
+        app.key_combo = None;
+        draw_frame(&mut terminal, &mut app).unwrap();
+        let text = buffer_text(&terminal);
+        assert_eq!(
+            text.lines().nth(28).unwrap().trim(),
+            "",
+            "gone: the row is breathing space again"
+        );
     }
 }

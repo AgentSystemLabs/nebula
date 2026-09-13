@@ -45,6 +45,9 @@ pub(super) fn double_tapped(
 ) -> bool {
     let now = std::time::Instant::now();
     if armed.is_some_and(|(a, at)| a == action && now.duration_since(at) <= DOUBLE_TAP) {
+        // Both presses as one combo on the KEY COMBO DISPLAY, over the
+        // single key `handle_key` noted a moment ago.
+        crate::key_combo::note_double_tap(app, chord, does);
         return true;
     }
     app.edge_tap = Some((action, now));

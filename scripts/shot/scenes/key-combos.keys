@@ -1,0 +1,4 @@
+# KEY COMBO DISPLAY on (see the .setup.sh): Tab onto Worktrees, then j moves the cursor and the
+# footer's blank row spells the press — `j - Move down` — bottom left.
+Tab
+j
