@@ -214,6 +214,7 @@ pub enum SettingKind {
     FeedbackSound,
     Theme,
     Animations,
+    FocusTint,
     ShowWorkspaces,
     HideProjects,
     HideWorktrees,
@@ -346,6 +347,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::Animations,
                 label: "Animations",
                 hint: "Status text sweep and splash motion (off = fewer repaints)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::FocusTint,
+                label: "Focused panel tint",
+                hint: "Faint accent wash behind the focused panel (off shows the terminal's background)",
                 group: "",
             },
             SettingSpec {
@@ -719,6 +726,12 @@ pub struct Config {
     /// status-text sweep and the splash's motion). Off trades them for
     /// fewer repaints on constrained machines.
     pub animations: bool,
+    /// Faint accent-tinted background fill on the focused panel. On by
+    /// default — it is the one cue that says which panel keys land in.
+    /// Off leaves every cell on the terminal's own background, so a
+    /// transparency or image configured in the terminal shows through
+    /// the whole frame instead of stopping at the focused panel.
+    pub focus_tint: bool,
     /// Whether the Workspaces bar is drawn across the top. This is the
     /// bar's only home: `Shift+W` writes it here as it toggles, so a hidden
     /// bar stays hidden across restarts, and a crash or a
@@ -829,6 +842,7 @@ impl Default for Config {
             feedback_sound: "Sosumi".into(),
             theme: "default".into(),
             animations: true,
+            focus_tint: true,
             show_workspaces: true,
             hide_projects: false,
             hide_worktrees: false,
@@ -966,6 +980,7 @@ impl Config {
         );
         obj.insert("theme".into(), serde_json::json!(self.theme));
         obj.insert("animations".into(), serde_json::json!(self.animations));
+        obj.insert("focus_tint".into(), serde_json::json!(self.focus_tint));
         obj.insert(
             "show_workspaces".into(),
             serde_json::json!(self.show_workspaces),
@@ -1154,6 +1169,7 @@ impl Config {
             SettingKind::FeedbackSound => self.feedback_sound.clone(),
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
+            SettingKind::FocusTint => on_off(self.focus_tint).into(),
             SettingKind::ShowWorkspaces => on_off(self.show_workspaces).into(),
             SettingKind::HideProjects => shown_hidden(self.hide_projects).into(),
             SettingKind::HideWorktrees => shown_hidden(self.hide_worktrees).into(),
@@ -1237,6 +1253,9 @@ impl Config {
             }
             SettingKind::Animations => {
                 self.animations = !self.animations;
+            }
+            SettingKind::FocusTint => {
+                self.focus_tint = !self.focus_tint;
             }
             SettingKind::ShowWorkspaces => {
                 self.show_workspaces = !self.show_workspaces;
@@ -1989,18 +2008,35 @@ mod tests {
         assert!(!legacy.hide_draft_prs);
     }
 
-    /// The FOCUS TINT is always on since 2026-08-29: a `focus_tint` key
-    /// left behind in an older config.json is ignored, never an error.
+    /// The FOCUS TINT: on out of the box, toggled from its Appearance row,
+    /// persisted under `focus_tint`. A config.json written while the key
+    /// was ignored (2026-08-29 to v0.26) is honoured again: `false` in
+    /// it switches the tint off on the next launch (issue #51), and a
+    /// file predating the key keeps the default.
     #[test]
-    fn stale_focus_tint_key_is_ignored() {
-        let cfg: Config = serde_json::from_str(r#"{"focus_tint": true}"#).unwrap();
-        assert!(cfg.animations);
+    fn focus_tint_default_on_toggle_and_persist() {
+        let mut cfg = Config::default();
+        assert!(cfg.focus_tint);
+        let (tab, row) = locate(SettingKind::FocusTint).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        cfg.cycle(tab, row, 0);
+        assert!(!cfg.focus_tint);
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         cfg.save_to(&path).unwrap();
+        assert!(!load_from(&path).focus_tint);
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(raw.get("focus_tint").is_none());
+        assert_eq!(raw.get("focus_tint"), Some(&serde_json::json!(false)));
+
+        let legacy: Config = serde_json::from_str(r#"{"focus_tint": false}"#).unwrap();
+        assert!(!legacy.focus_tint, "a hand-edited key is honoured");
+        let older: Config = serde_json::from_str("{}").unwrap();
+        assert!(
+            older.focus_tint,
+            "a config predating the key keeps the tint"
+        );
     }
 
     /// The QUICK PROMPT's focus toggle: off unless the user turns it on,

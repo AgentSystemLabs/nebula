@@ -9,6 +9,7 @@ use crate::app::{
     window_start, workspace_recency, workspace_rollup, workspace_unseen, worktree_recency,
     worktree_rollup, worktree_unseen, OpenPrs, Tree,
 };
+use crate::pull_request::Standing;
 use crate::text_input::TextInput;
 use nebula_core::{Agent, AgentId, AgentStatus, Project, ProjectId, WorkspaceId, WorktreeId};
 use ratatui::layout::Rect;
@@ -23,10 +24,15 @@ pub enum PaletteTarget {
     Project(ProjectId),
     Worktree(WorktreeId),
     Session(AgentId),
-    /// An open pull request on some project's repo, addressed by URL — the
+    /// An open pull request on `project`'s repo, addressed by URL — the
     /// only identity it has, since nothing about a PR is stored. Picking it
-    /// opens a browser instead of moving any panel cursor.
-    PullRequest(String),
+    /// lands the Worktrees cursor on its row in that project's OPEN PRS
+    /// group, so the pane reads it; the project is what says which
+    /// workspace to switch to and which group to unfold on the way.
+    PullRequest {
+        project: ProjectId,
+        url: String,
+    },
 }
 
 /// Where a `/` row sits before the query has said anything — the tiers of
@@ -75,6 +81,15 @@ pub struct PaletteItem {
     /// workspace, project or worktree, `archived_at` for an archived row,
     /// nothing for a pull request. 0 sorts last within its tier.
     pub interacted: i64,
+    /// Where a pull request row's PR stands — `Draft`, or `Open` for one
+    /// that is ready for review; every row here is open, so those are the
+    /// two it can be — and `None` for every other kind of row. The row
+    /// spells it out after the title and takes its colors from it, so a
+    /// draft is told from a finished pull request before it is picked, by
+    /// the word and not only by the dim. Re-read by [`Palette::rebuild`]
+    /// as list answers land, so a draft marked ready flips on the next
+    /// refresh.
+    pub standing: Option<Standing>,
 }
 
 /// One visible palette row: an index into `items` plus the char positions of
@@ -285,6 +300,7 @@ fn build_palette_items(
                 unseen: workspace_unseen(tree, &ws.id) > 0,
                 tier: PaletteTier::Rest,
                 interacted: workspace_recency(tree, &ws.id, now).interacted,
+                standing: None,
             });
         }
         let at = match workspace {
@@ -307,6 +323,7 @@ fn build_palette_items(
                 unseen: project_unseen(tree, &p.id) > 0,
                 tier: PaletteTier::Rest,
                 interacted: project_recency(tree, &p.id, now).interacted,
+                standing: None,
             });
         }
         for p in &projects {
@@ -319,6 +336,7 @@ fn build_palette_items(
                     unseen: worktree_unseen(tree, &w.id) > 0,
                     tier: PaletteTier::Rest,
                     interacted: worktree_recency(tree, &w.id, now).interacted,
+                    standing: None,
                 });
             }
         }
@@ -342,6 +360,7 @@ fn build_palette_items(
                         } else {
                             last_interaction_ms(a, now)
                         },
+                        standing: None,
                     });
                 }
             }
@@ -359,13 +378,17 @@ fn build_palette_items(
                     continue;
                 }
                 items.push(PaletteItem {
-                    target: PaletteTarget::PullRequest(pr.url.clone()),
+                    target: PaletteTarget::PullRequest {
+                        project: p.id.clone(),
+                        url: pr.url.clone(),
+                    },
                     text: format!("{at}{}/{}", p.name, pr.label()),
                     archived: false,
                     status: None,
                     unseen: false,
                     tier: PaletteTier::Rest,
                     interacted: 0,
+                    standing: Some(pr.standing()),
                 });
             }
         }
@@ -625,6 +648,61 @@ mod tests {
         assert!(
             hidden.iter().any(|t| t == "default/demo/main/ask"),
             "sessions are untouched: {hidden:?}"
+        );
+    }
+
+    /// A pull request row knows whether its PR is a draft or ready for
+    /// review — the one thing the row can say about it beyond the title —
+    /// and no other kind of row carries a standing at all. The list's
+    /// order (drafts sunk last) is the panel's, applied where the answer
+    /// lands, so here the rows come in the order the list holds them.
+    #[test]
+    fn pull_request_rows_carry_their_standing_and_nothing_else_does() {
+        use crate::app::OpenPrs;
+        use crate::pull_request::OpenPr;
+        let tree = tree();
+        let pr = |number: u64, title: &str, is_draft: bool| OpenPr {
+            number,
+            title: title.into(),
+            url: format!("https://github.com/o/r/pull/{number}"),
+            is_draft,
+            head: format!("pr-{number}"),
+        };
+        let now = std::time::Instant::now();
+        let mut open_prs = HashMap::new();
+        open_prs.insert(
+            ProjectId("p1".into()),
+            OpenPrs {
+                list: vec![
+                    pr(7, "Attach links", false),
+                    pr(9, "Number the lines", true),
+                ],
+                at: now,
+                due: now,
+                step: std::time::Duration::from_secs(1),
+            },
+        );
+        let palette = Palette::new(&tree, false, false, &open_prs, false);
+        let standings: Vec<(&str, Option<Standing>)> = palette
+            .items
+            .iter()
+            .filter(|i| matches!(i.target, PaletteTarget::PullRequest { .. }))
+            .map(|i| (i.text.as_str(), i.standing))
+            .collect();
+        assert_eq!(
+            standings,
+            [
+                ("default/demo/#7 Attach links", Some(Standing::Open)),
+                ("default/demo/#9 Number the lines", Some(Standing::Draft)),
+            ]
+        );
+        assert!(
+            palette
+                .items
+                .iter()
+                .filter(|i| !matches!(i.target, PaletteTarget::PullRequest { .. }))
+                .all(|i| i.standing.is_none()),
+            "only a pull request has a standing"
         );
     }
 
