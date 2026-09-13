@@ -329,7 +329,7 @@ async fn main_loop(
             if app.git_changes_stale() {
                 request_git_changes(&mut app, &git_tx);
             }
-            terminal.draw(|f| ui::draw(f, &mut app))?;
+            draw_frame(terminal, &mut app)?;
             app.dirty = false;
             next_draw = tokio::time::Instant::now() + FRAME_INTERVAL;
             sync_pty_size(&mut app, &mut out);
@@ -1723,6 +1723,24 @@ fn close_vim(app: &mut App) {
         Some(Overlay::FileTabs(view)) => view.editor_closed(),
         _ => {}
     }
+}
+
+/// One frame: paint it, then park the host's cursor on the cell of the
+/// PTY cursor the keyboard is headed for (`App::host_cursor`), so a CJK
+/// input method's composition lands where the typing goes rather than
+/// wherever the frame's last diff run left the cursor (#53). Ratatui's
+/// `Frame::set_cursor_position` would show the cursor as well, and the
+/// pane paints its own; so the move is made after the frame, on the
+/// terminal, with the cursor still hidden — one `CUP` on the wire.
+fn draw_frame<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+) -> Result<(), B::Error> {
+    terminal.draw(|f| ui::draw(f, app))?;
+    if let Some(cell) = app.host_cursor {
+        terminal.set_cursor_position(cell)?;
+    }
+    Ok(())
 }
 
 fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientRequest>) {
@@ -8758,6 +8776,105 @@ mod tests {
     pub(super) fn hse(app: &mut App, ev: ServerEvent) {
         let mut out = Vec::new();
         handle_server_event(app, ev, &mut out);
+    }
+
+    /// The pane paints its own cursor and the host's stays hidden — but
+    /// where the hidden one sits still matters: a CJK input method anchors
+    /// its composition, the preedit text and the candidate window, to the
+    /// hardware cursor's cell, drawn or not. Left where the frame's last
+    /// diff run ended, Japanese preedit came up at the edge of the window
+    /// (#53). A frame parks it on the attached PTY's cursor instead — the
+    /// row and column the PTY reports, a wide character counting for two.
+    #[test]
+    fn a_frame_parks_the_host_cursor_on_the_attached_ptys_cursor() {
+        use crate::app::{AttachedTerm, Focus};
+        use ratatui::layout::Position;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut term = AttachedTerm::new(SessionRef::Agent(AgentId("a1".into())), 40, 10);
+        // `$ cat`, then one wide character: row 1, two cells in.
+        term.parser.process("$ cat\r\n亜".as_bytes());
+        app.term = Some(term);
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut terminal, &mut app).unwrap();
+        let want = Position::new(app.term_area.x + 2, app.term_area.y + 1);
+        assert_eq!(app.host_cursor, Some(want), "the frame named the cell");
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            want,
+            "and the host cursor was moved onto it"
+        );
+        assert!(
+            !terminal.backend().cursor_visible(),
+            "still hidden: the pane paints its own"
+        );
+    }
+
+    /// Scrolled back far enough that the PTY's cursor is below the pane,
+    /// there is no cell to park on: the host cursor is left where it was
+    /// rather than pinned to some row that isn't the cursor's.
+    #[test]
+    fn a_pane_scrolled_past_its_cursor_leaves_the_host_cursor_alone() {
+        use crate::app::{AttachedTerm, Focus};
+        use ratatui::layout::Position;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut term = AttachedTerm::new(SessionRef::Agent(AgentId("a1".into())), 40, 10);
+        for i in 0..40 {
+            term.parser.process(format!("line {i}\r\n").as_bytes());
+        }
+        // Twenty rows of scrollback above a ten-row grid: the cursor's row
+        // is well below the pane.
+        term.set_scroll(20);
+        app.term = Some(term);
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let parked = Position::new(7, 7);
+        terminal.set_cursor_position(parked).unwrap();
+        draw_frame(&mut terminal, &mut app).unwrap();
+        assert_eq!(app.host_cursor, None, "no cell to name");
+        assert_eq!(terminal.backend().cursor_position(), parked, "so no move");
+    }
+
+    /// With the editor modal up every key goes to it, so the host cursor
+    /// follows the editor's PTY cursor, not the attached pane's underneath.
+    #[test]
+    fn the_editor_modal_takes_the_host_cursor_over_the_pane() {
+        use crate::app::{AttachedTerm, Focus};
+        use ratatui::layout::Position;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut term = AttachedTerm::new(SessionRef::Agent(AgentId("a1".into())), 40, 10);
+        term.parser.process(b"$ cat\r\nabc");
+        app.term = Some(term);
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let mut vim = crate::vim_term::VimTerm::spawn_cmd(
+            "/bin/sh",
+            &["-c".into(), "sleep 30".into()],
+            dir.path(),
+            "a.txt:1".into(),
+            80,
+            24,
+            1,
+            tx,
+        )
+        .unwrap();
+        vim.kill();
+        // Row 2, column 4 of the editor's grid.
+        vim.process(b"\x1b[3;5H");
+        app.vim = Some(vim);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut terminal, &mut app).unwrap();
+        let modal = app.vim.as_ref().unwrap().area;
+        let want = Position::new(modal.x + 4, modal.y + 2);
+        assert_eq!(app.host_cursor, Some(want), "the editor is where keys go");
+        assert_eq!(terminal.backend().cursor_position(), want);
     }
 
     pub(super) fn buffer_text(terminal: &Terminal<TestBackend>) -> String {

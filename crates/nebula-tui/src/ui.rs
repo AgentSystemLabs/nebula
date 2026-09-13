@@ -7,7 +7,7 @@ use crate::keymap::Action;
 use crate::text_input::TextInput;
 use crate::theme::Theme;
 use nebula_core::{AgentStatus, SessionRef};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
@@ -136,6 +136,7 @@ const MIN_PREVIEW_TEXT_W: usize = 16;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits.clear();
+    app.host_cursor = None;
 
     // The bar gets a blank row above it so it breathes off the panel
     // borders, matching the terminal's own padding below the last row.
@@ -266,6 +267,9 @@ fn draw_vim(f: &mut Frame, app: &mut App) {
                 tui_term::widget::PseudoTerminal::new(vim.parser.screen()),
                 inner,
             );
+            // Every key goes to the editor while it is up, so the host
+            // cursor follows it rather than the pane underneath.
+            app.host_cursor = pty_cursor_cell(vim.parser.screen(), inner);
             // Write-back: the post-draw sync resizes the PTY to the pane.
             if let Some(vim) = &mut app.vim {
                 vim.area = inner;
@@ -298,6 +302,7 @@ fn draw_vim(f: &mut Frame, app: &mut App) {
         tui_term::widget::PseudoTerminal::new(vim.parser.screen()),
         inner,
     );
+    app.host_cursor = pty_cursor_cell(vim.parser.screen(), inner);
     // Write-back: the post-draw sync resizes the PTY to the drawn rect.
     if let Some(vim) = &mut app.vim {
         vim.area = inner;
@@ -3964,6 +3969,24 @@ fn titled_frame(
     }
 }
 
+/// The buffer cell under a PTY's cursor when its screen is drawn at
+/// `area`, by the same arithmetic `PseudoTerminal` paints it with: the
+/// row shifted down by however far the pane is scrolled back, and None
+/// once that puts it below the pane. A cursor resting past the last
+/// column (a line filled to the edge) clamps onto it. Whether the PTY
+/// has hidden its cursor is not asked: the host cursor is never shown
+/// from here, only placed — a real terminal anchors IME composition to
+/// the cursor's cell whether or not it is drawn (see `App::host_cursor`).
+fn pty_cursor_cell(screen: &vt100::Screen, area: Rect) -> Option<Position> {
+    if area.width == 0 {
+        return None;
+    }
+    let (row, col) = screen.cursor_position();
+    let scrollback = u16::try_from(screen.scrollback()).unwrap_or(u16::MAX);
+    let row = row.saturating_add(scrollback);
+    (row < area.height).then(|| Position::new(area.x + col.min(area.width - 1), area.y + row))
+}
+
 fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Terminal;
@@ -4043,6 +4066,7 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
             let screen = term.parser.screen();
             let widget = tui_term::widget::PseudoTerminal::new(screen);
             f.render_widget(widget, inner);
+            app.host_cursor = pty_cursor_cell(screen, inner);
             // Selection highlight: overlay REVERSED on the selected cells
             // (stream selection — full rows between the endpoints).
             if let Some(sel) = app.term_selection.filter(|s| s.active) {
