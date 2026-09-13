@@ -4547,6 +4547,7 @@ fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i32) {
 fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.theme = cfg.theme();
     app.animations = cfg.animations;
+    app.focus_tint = cfg.focus_tint;
     set_show_workspaces(app, cfg.show_workspaces);
     set_hide_projects(app, cfg.hide_projects);
     set_hide_worktrees(app, cfg.hide_worktrees);
@@ -8788,6 +8789,61 @@ mod tests {
         assert!(app.status_anim_active());
         app.animations = false;
         assert!(!app.status_anim_active());
+    }
+
+    /// The focused-panel tint honours its setting. On (the default) the
+    /// focused panel's untouched cells wear the theme's `focus_tint`; off,
+    /// no cell in the frame does — the terminal's own background, a
+    /// configured transparency included, shows through the whole window.
+    /// The collapsed layout takes the same switch, and applying a config
+    /// carries the value into the app like the other Appearance rows.
+    #[test]
+    fn focus_tint_setting_switches_the_panel_wash_off() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let th = app.theme;
+        let tinted = |terminal: &Terminal<TestBackend>| {
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .filter(|c| c.bg == th.focus_tint)
+                .count()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        assert!(app.focus_tint, "on out of the box");
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(tinted(&terminal) > 0, "the focused panel is washed");
+
+        apply_config(
+            &mut app,
+            &crate::config::Config {
+                focus_tint: false,
+                ..Default::default()
+            },
+        );
+        assert!(!app.focus_tint, "apply_config carries the setting");
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert_eq!(
+            tinted(&terminal),
+            0,
+            "off: every background is the terminal's own"
+        );
+
+        app.collapsed = true;
+        app.focus = Focus::Terminal;
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert_eq!(tinted(&terminal), 0, "collapsed, still off");
+
+        apply_config(&mut app, &crate::config::Config::default());
+        assert!(app.focus_tint);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            tinted(&terminal) > 0,
+            "collapsed, back on: the pane is washed"
+        );
     }
 
     /// A checkout wearing its merged pull request sweeps purple, so it

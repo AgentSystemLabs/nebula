@@ -144,7 +144,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     if app.collapsed {
         draw_terminal(f, app, body);
-        if app.focus == Focus::Terminal {
+        if app.focus_tint && app.focus == Focus::Terminal {
             draw_focus_tint(f.buffer_mut(), body, app.theme);
         }
         draw_footer(f, app, footer);
@@ -220,20 +220,24 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     );
     draw_terminal(f, app, term_a);
     draw_splitter_grips(f.buffer_mut(), app, panels_a);
-    // Focus cue (always on): the focused panel's whole background picks
-    // up a faint accent tint. The sidebar columns stop one cell short of
+    // Focus cue (`focus_tint` setting, on by default): the focused
+    // panel's whole background picks up a faint accent tint. Off leaves
+    // the terminal's own background — a configured transparency included
+    // — showing through. The sidebar columns stop one cell short of
     // their right rule so the tint stays inside the panel.
-    let tinted = match app.focus {
-        // The bar's last row is its rule, which belongs to the boundary
-        // rather than to the bar — leave it untinted.
-        Focus::Workspaces => Some(shrink_b(workspaces_a)),
-        Focus::Projects => panel_areas[0].map(shrink_r),
-        Focus::Worktrees => panel_areas[1].map(shrink_r),
-        Focus::Sessions => panel_areas[2].map(shrink_r),
-        Focus::Terminal => Some(term_a),
-    };
-    if let Some(tinted) = tinted {
-        draw_focus_tint(f.buffer_mut(), tinted, app.theme);
+    if app.focus_tint {
+        let tinted = match app.focus {
+            // The bar's last row is its rule, which belongs to the
+            // boundary rather than to the bar — leave it untinted.
+            Focus::Workspaces => Some(shrink_b(workspaces_a)),
+            Focus::Projects => panel_areas[0].map(shrink_r),
+            Focus::Worktrees => panel_areas[1].map(shrink_r),
+            Focus::Sessions => panel_areas[2].map(shrink_r),
+            Focus::Terminal => Some(term_a),
+        };
+        if let Some(tinted) = tinted {
+            draw_focus_tint(f.buffer_mut(), tinted, app.theme);
+        }
     }
     draw_footer(f, app, footer);
     draw_overlay(f, app);
@@ -2088,11 +2092,6 @@ fn shrink_b(area: Rect) -> Rect {
     }
 }
 
-/// Subtle focus cue: fill the whole focused panel with the theme's
-/// `focus_tint` — the accent at ~10% opacity, so the panel reads as a
-/// faintly lit surface. Painted after content, and only onto cells whose
-/// background is still untouched, so selection fills and PTY-drawn
-/// colors sit on top of the tint instead of under it.
 /// Drag affordance for the panel splitters: a short thick grip centered on
 /// each column rule, one step brighter than the rule so the boundary reads
 /// as grabbable without turning the chrome back up. Accent while that
@@ -2118,6 +2117,12 @@ fn draw_splitter_grips(buf: &mut ratatui::buffer::Buffer, app: &App, body: Rect)
     }
 }
 
+/// Subtle focus cue: fill the whole focused panel with the theme's
+/// `focus_tint` — the accent at ~10% opacity, so the panel reads as a
+/// faintly lit surface. Painted after content, and only onto cells whose
+/// background is still untouched, so selection fills and PTY-drawn
+/// colors sit on top of the tint instead of under it. The `focus_tint`
+/// setting decides whether the callers paint it at all.
 fn draw_focus_tint(buf: &mut ratatui::buffer::Buffer, area: Rect, th: Theme) {
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {

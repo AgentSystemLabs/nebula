@@ -46,6 +46,7 @@ how the tree is worked; every switch there is off by default.
 | `feedback_sound` | string | `"Sosumi"` | Sessions | The FEEDBACK SOUND rung when a turn stops at NEEDS FEEDBACK — a permission prompt or a question — with the same values and fallbacks as `done_sound`, and a different default so red and green sound different from the next room. It never rings for the session whose pane you are locked into typing at while the terminal window has focus: that prompt is already under your hands. The one switch for the DESKTOP NOTIFICATION too: while the terminal window is in the background (from the focus reports nebula asks the terminal for — tmux needs `focus-events on`), each session that goes red is also named in a desktop notification (`osascript` on macOS, `notify-send` on Linux; never over `nebula ssh`, where the desktop is the wrong machine's; a notifier that is missing or fails is a debug line, not an error). `off` silences the sound and the notification together. |
 | `theme` | string | `"default"` | Appearance | The THEME: `default`, `ocean`, `forest`, `rose`, `amber`. An unknown name falls back to `default`. |
 | `animations` | bool | `true` | Appearance | Master switch for the STATUS SWEEP and the SPLASH's motion. Off trades them for fewer repaints on a constrained machine. |
+| `focus_tint` | bool | `true` | Appearance | The FOCUSED PANEL TINT: a faint accent wash behind whichever panel keys land in. Off leaves every cell on the terminal's own background, so a transparency or image configured in the terminal shows through the whole window instead of stopping at the focused panel. |
 | `show_workspaces` | bool | `true` | Appearance | Whether the WORKSPACES BAR is drawn across the top. `Shift+W` writes the key as it toggles, so a hidden bar stays hidden across restarts. |
 | `hide_projects` | bool | `false` | Appearance | Hide the PROJECTS PANEL and give its width to the TERMINAL PANE (`Shift+P`). |
 | `hide_worktrees` | bool | `false` | Appearance | Hide the WORKTREES PANEL (`Shift+B`), independently of `hide_projects`. |
@@ -107,8 +108,8 @@ on the next ATTACH or prewarm, and an agent RESUMES its conversation there.
 
 - **Settings live in one JSON file** (`config.json`, beside the database), read fresh on each use by both
   the daemon and the TUI, so hand edits apply without a restart. `s` opens the settings overlay over the
-  same file: color theme, animations, whether the Workspaces bar, PROJECTS PANEL,
-  and WORKTREES PANEL are shown,
+  same file: color theme, animations, the FOCUSED PANEL TINT, whether the Workspaces bar,
+  PROJECTS PANEL, and WORKTREES PANEL are shown,
   editor, the branch new worktrees start from (`worktree_base_branch`: `auto` for origin's default
   branch, or a name such as `master`, typed into a prompt that `Enter` opens on the row), which
   agent CLIs the new-session menu offers (at least one stays on) and their default model
