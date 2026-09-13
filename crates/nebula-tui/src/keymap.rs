@@ -73,6 +73,9 @@ pub enum Action {
     /// `Shift+R`: ask GitHub for the pull requests again now, past every
     /// timer — the open list, the worktree's PR, the one the pane is reading.
     RefreshPullRequests,
+    /// `i`: the ISSUES MODAL — the project's open GitHub issues, read in
+    /// place, with a QUICK PROMPT or an AGENT PRESET launched on one.
+    Issues,
     // sessions
     NewTerminal,
     Rename,
@@ -304,6 +307,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["shift+r"],
+    },
+    ActionSpec {
+        action: Action::Issues,
+        id: "issues",
+        label: "GitHub issues",
+        hint: "List the project's open issues; Enter prompts an agent on one, e launches a preset on it",
+        group: "PROJECTS & WORKTREES",
+        scope: Scope::Global,
+        defaults: &["i"],
     },
     // ---- SESSIONS ----
     ActionSpec {

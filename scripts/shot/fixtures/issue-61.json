@@ -1,0 +1,19 @@
+{
+ "url": "https://github.com/AgentSystemLabs/demo/issues/61",
+ "comments": [
+  {
+   "author": {
+    "login": "webdevcody"
+   },
+   "createdAt": "2026-09-11T10:30:00Z",
+   "body": "Reproduced on main. The picker's return trip rebuilds the box from `QuickReturn`, so the text should survive \u2014 I suspect the git tick's redraw is clobbering `app.overlay` between the two frames."
+  },
+  {
+   "author": {
+    "login": "takeyamakenta"
+   },
+   "createdAt": "2026-09-11T14:02:00Z",
+   "body": "Happens with `Tab` too, same one-in-five feel."
+  }
+ ]
+}

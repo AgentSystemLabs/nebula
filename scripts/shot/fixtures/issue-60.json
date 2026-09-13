@@ -1,0 +1,12 @@
+{
+ "url": "https://github.com/AgentSystemLabs/demo/issues/60",
+ "comments": [
+  {
+   "author": {
+    "login": "webdevcody"
+   },
+   "createdAt": "2026-09-11T09:15:00Z",
+   "body": "Thanks \u2014 this is the host terminal drawing the preedit at its own cursor, which nebula parks at the pane's bottom-right between frames. We should move the real cursor to the PTY's cursor cell."
+  }
+ ]
+}

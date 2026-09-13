@@ -250,6 +250,13 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE agents ADD COLUMN recent_prompts TEXT;
     ",
+    // 25: the GitHub issue an ISSUE SESSION was launched for (the ISSUES
+    // MODAL's prompt and preset launches). Nullable and request-driven
+    // like `pr_url`: every existing AGENT remains an ordinary session, and
+    // an issue-created one rebuilds its issue context on every spawn.
+    "
+    ALTER TABLE agents ADD COLUMN issue_url TEXT;
+    ",
 ];
 
 pub struct Store {
@@ -516,28 +523,30 @@ impl Store {
     // ---- agents ----
 
     pub fn insert_agent(&self, a: &Agent) -> Result<()> {
-        self.insert_agent_with_launch_context(a, false, None)
+        self.insert_agent_with_launch_context(a, false, None, None)
     }
 
     /// `auto_title` marks the row as awaiting one agent-driven title
     /// (`nebula rename` from inside the CLI). The flag is store-internal:
     /// clients never see it, they only observe the eventual rename.
     pub fn insert_agent_with_auto_title(&self, a: &Agent, auto_title: bool) -> Result<()> {
-        self.insert_agent_with_launch_context(a, auto_title, None)
+        self.insert_agent_with_launch_context(a, auto_title, None, None)
     }
 
     /// Persist an AGENT plus the launch-only context that must be rebuilt
-    /// on every process spawn. `pr_url` is intentionally not part of the
-    /// shared Agent entity: it constrains Claude's launch, not row display.
+    /// on every process spawn. `pr_url` and `issue_url` are intentionally
+    /// not part of the shared Agent entity: they constrain the CLI's
+    /// launch, not row display.
     pub fn insert_agent_with_launch_context(
         &self,
         a: &Agent,
         auto_title: bool,
         pr_url: Option<&str>,
+        issue_url: Option<&str>,
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id, pr_url)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id, pr_url, issue_url)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 a.id.as_str(),
                 a.worktree_id.as_str(),
@@ -556,6 +565,7 @@ impl Store {
                 a.unseen as i64,
                 a.cloud_session_id,
                 pr_url,
+                issue_url,
             ],
         )?;
         Ok(())
@@ -565,8 +575,17 @@ impl Store {
     /// row. A missing row also returns None; the spawn path has already
     /// resolved the Agent itself before asking for this adjunct.
     pub fn agent_pr_url(&self, id: &AgentId) -> Result<Option<String>> {
+        self.agent_text_column(id, "pr_url")
+    }
+
+    /// Issue launch context for an AGENT (an ISSUE SESSION), or None.
+    pub fn agent_issue_url(&self, id: &AgentId) -> Result<Option<String>> {
+        self.agent_text_column(id, "issue_url")
+    }
+
+    fn agent_text_column(&self, id: &AgentId, column: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT pr_url FROM agents WHERE id = ?1")?;
+        let mut stmt = conn.prepare(&format!("SELECT {column} FROM agents WHERE id = ?1"))?;
         let mut rows = stmt.query(params![id.as_str()])?;
         match rows.next()? {
             Some(row) => Ok(row.get(0)?),
@@ -1150,7 +1169,7 @@ mod tests {
         };
         let pr_url = "https://github.com/AgentSystemLabs/nebula/pull/42";
         store
-            .insert_agent_with_launch_context(&agent, false, Some(pr_url))
+            .insert_agent_with_launch_context(&agent, false, Some(pr_url), None)
             .unwrap();
         let codex_agent = Agent {
             id: AgentId::generate(),
@@ -1192,11 +1211,34 @@ mod tests {
             recent_prompts: Vec::new(),
         };
         store.insert_agent(&cursor_agent).unwrap();
+        let issue_url = "https://github.com/AgentSystemLabs/nebula/issues/15";
+        let issue_agent = Agent {
+            id: AgentId::generate(),
+            worktree_id: worktree.id.clone(),
+            name: "agent-4".into(),
+            status: AgentStatus::Fresh,
+            archived: false,
+            archived_at: 0,
+            unseen: false,
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            session_id: None,
+            cloud_session_id: None,
+            sort_order: 3,
+            status_changed_at: 0,
+            alive: false,
+            cloud_mirroring: false,
+            recent_prompts: Vec::new(),
+        };
+        store
+            .insert_agent_with_launch_context(&issue_agent, true, None, Some(issue_url))
+            .unwrap();
 
         let (projects, worktrees, agents, _terms) = store.load_tree().unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(worktrees.len(), 1);
-        assert_eq!(agents.len(), 3);
+        assert_eq!(agents.len(), 4);
         assert_eq!(agents[0].status, AgentStatus::Running);
         assert_eq!(agents[0].kind, AgentKind::Claude);
         assert_eq!(agents[0].session_id.as_deref(), Some("sess-123"));
@@ -1210,6 +1252,14 @@ mod tests {
         assert_eq!(agents[1].kind, AgentKind::Codex);
         assert_eq!(agents[1].model, None);
         assert_eq!(agents[2].kind, AgentKind::Cursor);
+        // The issue context is its own column: a PR SESSION carries none,
+        // an ISSUE SESSION carries no PR.
+        assert_eq!(store.agent_issue_url(&agents[0].id).unwrap(), None);
+        assert_eq!(
+            store.agent_issue_url(&agents[3].id).unwrap().as_deref(),
+            Some(issue_url)
+        );
+        assert_eq!(store.agent_pr_url(&agents[3].id).unwrap(), None);
     }
 
     /// Read marks are keyed by PR URL and outlive the worktree they were

@@ -17,7 +17,7 @@ use ratatui::Frame;
 /// Shared with the event loop's pre-draw PTY size guess.
 pub const VIM_MODAL_PCT: (u16, u16) = (94, 92);
 /// Outer size of the two split modals (diff, tree), percent of the frame.
-const SPLIT_MODAL_PCT: (u16, u16) = (92, 90);
+pub(crate) const SPLIT_MODAL_PCT: (u16, u16) = (92, 90);
 /// Outer size of the find-in-files modal, percent of the frame.
 const GREP_MODAL_PCT: (u16, u16) = (88, 76);
 /// Fixed (width, height) of the jump palette.
@@ -126,7 +126,7 @@ const HOSTS_W: u16 = 64;
 /// `MIN_DIFF_PANE_W`: the file list is clamped to keep that minimum first,
 /// so on a tiny screen this lets the layout squeeze the diff/preview pane
 /// rather than the list.
-const SPLIT_PANE_LAYOUT_MIN: u16 = 20;
+pub(crate) const SPLIT_PANE_LAYOUT_MIN: u16 = 20;
 /// What every filtered list says when nothing survives the filter.
 const NO_MATCHES: &str = "no matches";
 
@@ -700,6 +700,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[GitDiff]), "git diff (^r: mark reviewed ✓)"),
                         (Act(&[OpenRepo]), "open the repo on GitHub"),
                         (Act(&[RefreshPullRequests]), "refresh pull requests now"),
+                        (Act(&[Issues]), "github issues: prompt / preset on one"),
                         (Act(&[Delete, DeleteAll]), "delete one / delete all"),
                     ],
                 ),
@@ -1726,6 +1727,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
         Overlay::AgentPresetEditor(editor) => {
             crate::preset_overlays::draw_editor(f, app, &editor, th)
         }
+        Overlay::Issues(view) => crate::issues::draw(f, app, &view, th),
         Overlay::FileTabs(view) => {
             // The TREE BROWSER's footprint: the editor Enter opens wants the
             // room, and the preview is a whole file.
@@ -2074,7 +2076,7 @@ pub(crate) fn centered_rect(frame: Rect, width: u16, height: u16) -> Rect {
 }
 
 /// A centered rect sized as a percentage of the frame.
-fn centered_rect_pct(frame: Rect, pct_w: u16, pct_h: u16) -> Rect {
+pub(crate) fn centered_rect_pct(frame: Rect, pct_w: u16, pct_h: u16) -> Rect {
     centered_rect(frame, frame.width * pct_w / 100, frame.height * pct_h / 100)
 }
 
@@ -2220,7 +2222,7 @@ fn hint_line(pairs: &[(&str, &str)], th: Theme) -> Line<'static> {
 /// look. Focus has to be unmissable, so the focused panel gets an accent
 /// border plus a solid accent-background title chip, versus a thin dim
 /// border and plain muted title.
-fn panel_block(title: &str, focused: bool, th: Theme) -> Block<'_> {
+pub(crate) fn panel_block(title: &str, focused: bool, th: Theme) -> Block<'_> {
     if focused {
         Block::default()
             .borders(Borders::ALL)
@@ -4322,6 +4324,11 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             "Tab/↑↓: next field  ←/→: cycle  Shift+Enter/^J: newline  Enter: save  Esc: back to list",
             Style::default().fg(th.dim),
         )
+    } else if matches!(&app.overlay, Some(Overlay::Issues(_))) {
+        Span::styled(
+            "↑/↓: issue  PgUp/PgDn ^d/^u: read  Enter/p: prompt an agent  e: preset  o: browser  r: refresh  Esc: close",
+            Style::default().fg(th.dim),
+        )
     } else if matches!(&app.overlay, Some(Overlay::Menu(m)) if m.is_workspace_picker()) {
         Span::styled(
             "Enter: open  n: new  r: rename  d: delete  Esc: close",
@@ -5070,6 +5077,7 @@ mod tests {
             model: None,
             effort: None,
             preset: None,
+            issue: None,
         });
         let cloud = PromptKind::CloudMessage {
             id: nebula_core::AgentId::from("a".to_string()),

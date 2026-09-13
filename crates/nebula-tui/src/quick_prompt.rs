@@ -49,6 +49,13 @@ pub struct QuickLaunch {
     /// the typed text into the STARTING PROMPT, and it pins the harness.
     /// `Tab` picking a harness clears it — a launch spec has one source.
     pub preset: Option<AgentPreset>,
+    /// The GitHub issue this launch is for, when the box was opened from
+    /// the ISSUES MODAL: named in the title, sent to the DAEMON as the
+    /// session's persisted context (`CreateAgent::issue_url`), the name
+    /// of the worktree `Ctrl+N` cuts, and the task when the box is sent
+    /// empty. Kept across the box's pickers — the harness and the preset
+    /// change what runs, not what it is for.
+    pub issue: Option<crate::issues::IssueRef>,
 }
 
 /// What a picker opened *from* the box carries, so the trip loses nothing:
@@ -98,7 +105,23 @@ impl QuickLaunch {
             model,
             effort,
             preset: None,
+            issue: None,
         }
+    }
+
+    /// The same launch, for `issue` (or for nothing, with `None`). What
+    /// every picker's return trip does to the launch it rebuilt, so the
+    /// issue survives a `Tab` or `Shift+Tab` pick.
+    pub fn with_issue(mut self, issue: Option<crate::issues::IssueRef>) -> Self {
+        self.issue = issue;
+        self
+    }
+
+    /// The task Enter sends when the box is empty: an ISSUE SESSION's box
+    /// may be sent as it is, the issue being the task. `None` for every
+    /// other launch, where an empty box is a change of mind.
+    pub fn default_task(&self) -> Option<String> {
+        self.issue.as_ref().map(|issue| issue.default_task())
     }
 
     /// The launch an AGENT PRESET describes: its harness, its pinned
@@ -126,17 +149,22 @@ impl QuickLaunch {
         }
     }
 
-    /// The dialog's title: the preset (when one is applied), the worktree
-    /// Enter will cut first (when it is a new one) and the flags it will
-    /// actually launch with, so Enter is never a surprise —
+    /// The dialog's title: the issue (when the box is for one), the preset
+    /// (when one is applied), the worktree Enter will cut first (when it
+    /// is a new one) and the flags it will actually launch with, so Enter
+    /// is never a surprise —
     /// `Quick prompt · reviewer (claude · opus · high)`,
-    /// `Quick prompt · new worktree yellow-fox-jumps (claude)`.
+    /// `Quick prompt · new worktree yellow-fox-jumps (claude)`,
+    /// `Quick prompt · issue #15 · reviewer (claude · opus)`.
     pub fn title(&self) -> String {
         let opts: Vec<&str> = std::iter::once(self.kind.as_str())
             .chain(self.model.as_deref())
             .chain(self.effort.as_deref())
             .collect();
         let mut head = vec!["Quick prompt".to_string()];
+        if let Some(issue) = &self.issue {
+            head.push(format!("issue #{}", issue.number));
+        }
         if let Some(preset) = &self.preset {
             head.push(preset.name.clone());
         }
@@ -148,12 +176,16 @@ impl QuickLaunch {
 
     /// The line under the title: what Enter will send.
     pub fn label(&self) -> String {
-        match &self.preset {
-            Some(preset) if preset.has_wrapping() => {
+        match (&self.preset, &self.issue) {
+            (Some(preset), _) if preset.has_wrapping() => {
                 format!("{} — prefix + your task + postfix", preset.name)
             }
-            Some(preset) => format!("{} — sent as the first prompt", preset.name),
-            None => "what should the agent do?".into(),
+            (Some(preset), _) => format!("{} — sent as the first prompt", preset.name),
+            (None, Some(issue)) => format!(
+                "what should the agent do about #{}? (empty = fix the issue)",
+                issue.number
+            ),
+            (None, None) => "what should the agent do?".into(),
         }
     }
 
@@ -239,7 +271,8 @@ pub(crate) fn reopen(app: &mut App, launch: QuickLaunch, text: &str) {
 /// WORKTREE and a fresh one, from whichever panel `p` was pressed in —
 /// the WORKTREES PANEL's "cut a worktree first" without walking over to
 /// it, and the way back into the checkout under the cursor from there.
-/// Flipping on mints the same random branch `n` would offer; flipping off
+/// Flipping on mints the same random branch `n` would offer — or, for an
+/// ISSUE SESSION, one named after the issue (`issue-15-fix-login`); flipping off
 /// needs a real checkout under the cursor (not an OPEN PRS row, not a
 /// stand-in git is still cutting) and says so while keeping the fresh one
 /// otherwise. The box is rebuilt so its title and frame follow the
@@ -262,7 +295,13 @@ pub(crate) fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: Tex
         {
             None => Err("quick prompt: worktree no longer exists"),
             Some(project) => {
-                let branch = crate::branch_name::random_name(&app.project_branches(&project));
+                let taken = app.project_branches(&project);
+                let branch = match &launch.issue {
+                    Some(issue) => {
+                        crate::branch_name::issue_name(issue.number, &issue.title, &taken)
+                    }
+                    None => crate::branch_name::random_name(&taken),
+                };
                 Ok(QuickTarget::NewWorktree { project, branch })
             }
         },
@@ -481,6 +520,43 @@ mod tests {
 
         let bare = QuickLaunch::of_preset(worktree(), preset("scratch", AgentKind::Cursor), &cfg);
         assert_eq!(bare.label(), "scratch — sent as the first prompt");
+    }
+
+    /// An ISSUE SESSION's box names the issue first, offers the issue as
+    /// the task when sent empty, and keeps the issue through a preset.
+    #[test]
+    fn an_issue_launch_names_the_issue_and_has_a_default_task() {
+        let cfg = Config::default();
+        let issue = crate::issues::IssueRef {
+            url: "https://github.com/o/r/issues/15".into(),
+            number: 15,
+            title: "Fix login redirect".into(),
+        };
+        let plain = QuickLaunch::of_kind(worktree(), AgentKind::Claude, None, None, &cfg)
+            .with_issue(Some(issue.clone()));
+        assert_eq!(plain.title(), "Quick prompt · issue #15 (claude)");
+        assert_eq!(
+            plain.label(),
+            "what should the agent do about #15? (empty = fix the issue)"
+        );
+        assert_eq!(
+            plain.default_task().as_deref(),
+            Some("Fix GitHub issue #15: Fix login redirect (https://github.com/o/r/issues/15)")
+        );
+        let wrapped = QuickLaunch::of_preset(
+            new_worktree("issue-15-fix-login-redirect"),
+            preset("reviewer", AgentKind::Cursor),
+            &cfg,
+        )
+        .with_issue(Some(issue));
+        assert_eq!(
+            wrapped.title(),
+            "Quick prompt · issue #15 · reviewer · new worktree issue-15-fix-login-redirect (cursor)"
+        );
+        assert_eq!(wrapped.label(), "reviewer — sent as the first prompt");
+        assert!(wrapped.default_task().is_some());
+        let none = QuickLaunch::of_kind(worktree(), AgentKind::Claude, None, None, &cfg);
+        assert_eq!(none.default_task(), None, "an empty ordinary box cancels");
     }
 
     /// A launch into a worktree that does not exist yet says so — and

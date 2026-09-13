@@ -14,6 +14,13 @@
 //! system-prompt flag, so on their cold spawn it becomes the positional
 //! first prompt — their transcripts keep it, so a resume of either needs
 //! nothing added.
+//!
+//! The ISSUE SESSION — an AGENT launched from the ISSUES MODAL — rides the
+//! same plumbing with a different rule ([`issue_rule`]): the GitHub issue
+//! the work is for, named so the harness knows what it is fixing, in
+//! whichever checkout the launch picked (the selected worktree, or a fresh
+//! one cut for the issue). Its URL is persisted beside the PR URL and
+//! folded into the same launch prompts on every spawn.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -64,14 +71,64 @@ pub(crate) fn rule(scope: &PrScope<'_>) -> String {
     )
 }
 
+/// Everything the issue rule says: the issue, and the checkout the ISSUE
+/// SESSION works in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IssueScope<'a> {
+    pub url: &'a str,
+    /// The worktree the session runs in.
+    pub worktree: &'a Path,
+    /// That worktree's branch.
+    pub branch: &'a str,
+}
+
+/// The context attached to an AGENT created from the ISSUES MODAL: which
+/// GitHub issue the session exists for, so the harness reads it before
+/// acting and keeps its work — and the pull request it ends in — tied to
+/// it. Unlike the PR rule this scopes nothing else: the issue has no
+/// branch of its own yet, and the checkout is whatever the launch picked.
+pub(crate) fn issue_rule(scope: &IssueScope<'_>) -> String {
+    let IssueScope {
+        url,
+        worktree,
+        branch,
+    } = scope;
+    let number = issue_number(url)
+        .map(|n| format!("#{n}"))
+        .unwrap_or_default();
+    format!(
+        "[nebula] This session was created for the GitHub issue {url}. The user wants that issue \
+         {number} investigated and fixed: read it first (`gh issue view {url} --comments`), then \
+         keep the work in this session to what resolves it. The session runs in the worktree at \
+         {wt} on branch `{branch}`: do every edit, test and commit there. Reference the issue in \
+         commit messages, and close it from the pull request (`Closes {number}`).",
+        wt = worktree.display(),
+    )
+}
+
 /// The rule as the first prompt of a CLI with no system-prompt flag: the
 /// same text, plus a line that keeps the agent from treating it as a task.
-fn rule_as_first_prompt(scope: &PrScope<'_>) -> String {
+fn rule_as_first_prompt(rule: &str) -> String {
     format!(
-        "{}\n\nThis message is context, not a task: acknowledge it in one line and wait for the \
-         user's request.",
-        rule(scope)
+        "{rule}\n\nThis message is context, not a task: acknowledge it in one line and wait for the \
+         user's request."
     )
+}
+
+/// The one rule a spawn carries: the PR rule, the issue rule, or both
+/// joined (a row can only ever hold one today, but the store has a column
+/// for each and a spawn must never drop either). `None` for an ordinary
+/// session.
+pub(crate) fn combined_rule(
+    pr: Option<&PrScope<'_>>,
+    issue: Option<&IssueScope<'_>>,
+) -> Option<String> {
+    let parts: Vec<String> = pr
+        .map(rule)
+        .into_iter()
+        .chain(issue.map(issue_rule))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 /// What the argv builder gets once the PR rule is folded in: the text to
@@ -83,19 +140,19 @@ pub(crate) struct LaunchPrompts {
     pub initial: Option<String>,
 }
 
-/// Fold the PR rule (when the AGENT carries a scope) into a spawn's
-/// prompts. `initial` is the first prompt the spawn already had — a
-/// RELOCATION PROMPT or an AGENT PRESET's composed task — and stays where
-/// it was; `resumed` tells a Codex / Cursor resume (which needs no rule)
-/// from a cold spawn (which opens with it).
+/// Fold a launch rule (the PR rule, the issue rule — see [`combined_rule`])
+/// into a spawn's prompts. `initial` is the first prompt the spawn already
+/// had — a RELOCATION PROMPT or an AGENT PRESET's composed task — and stays
+/// where it was; `resumed` tells a Codex / Cursor resume (which needs no
+/// rule) from a cold spawn (which opens with it).
 pub(crate) fn launch_prompts(
     kind: AgentKind,
     resumed: bool,
-    scope: Option<&PrScope<'_>>,
+    rule: Option<&str>,
     initial: Option<&str>,
 ) -> LaunchPrompts {
     let initial_owned = initial.map(str::to_string);
-    let Some(scope) = scope else {
+    let Some(rule) = rule else {
         return LaunchPrompts {
             system: None,
             initial: initial_owned,
@@ -103,7 +160,7 @@ pub(crate) fn launch_prompts(
     };
     match kind {
         AgentKind::Claude | AgentKind::Pi => LaunchPrompts {
-            system: Some(rule(scope)),
+            system: Some(rule.to_string()),
             initial: initial_owned,
         },
         // Every other CLI has no system-prompt flag: the rule opens a cold
@@ -116,8 +173,8 @@ pub(crate) fn launch_prompts(
         _ => LaunchPrompts {
             system: None,
             initial: Some(match initial {
-                Some(task) => format!("{}\n\n{task}", rule(scope)),
-                None => rule_as_first_prompt(scope),
+                Some(task) => format!("{rule}\n\n{task}"),
+                None => rule_as_first_prompt(rule),
             }),
         },
     }
@@ -141,13 +198,38 @@ pub(crate) fn validate_pr_url(raw: &str) -> Result<String> {
 /// The pull request's number, read off its validated URL (`…/pull/42`,
 /// with or without a trailing path).
 pub(crate) fn pr_number(url: &str) -> Result<u64> {
-    let (_, tail) = url.split_once("/pull/").context("not a pull request URL")?;
+    number_after(url, "/pull/").with_context(|| format!("no pull request number in {url}"))
+}
+
+/// Validate an ISSUE SESSION's URL the way [`validate_pr_url`] validates a
+/// PR SESSION's: HTTP(S), bounded, and an issue path — the TUI only ever
+/// sends what `gh issue list` returned, but the DAEMON rechecks at the IPC
+/// boundary before the text reaches a CLI's argv on every spawn.
+pub(crate) fn validate_issue_url(raw: &str) -> Result<String> {
+    const MAX_ISSUE_URL_BYTES: usize = 4 * 1024;
+    let url = crate::registry::normalize_url(raw)?;
+    if url.len() > MAX_ISSUE_URL_BYTES {
+        bail!("issue URL is too long (max 4 KiB)");
+    }
+    if !url.contains("/issues/") {
+        bail!("not an issue URL: {url}");
+    }
+    issue_number(&url).with_context(|| format!("no issue number in {url}"))?;
+    Ok(url)
+}
+
+/// The issue's number, read off its URL (`…/issues/15`, with or without a
+/// trailing path).
+pub(crate) fn issue_number(url: &str) -> Option<u64> {
+    number_after(url, "/issues/")
+}
+
+/// The positive number that follows `marker` in `url`, up to the next path
+/// or query separator.
+fn number_after(url: &str, marker: &str) -> Option<u64> {
+    let (_, tail) = url.split_once(marker)?;
     let digits = tail.split(['/', '?', '#']).next().unwrap_or_default();
-    digits
-        .parse::<u64>()
-        .ok()
-        .filter(|n| *n > 0)
-        .with_context(|| format!("no pull request number in {url}"))
+    digits.parse::<u64>().ok().filter(|n| *n > 0)
 }
 
 /// The PR's head branch as `gh` reports it, checked before it becomes a
@@ -217,6 +299,7 @@ impl Daemon {
             cloud_prompt: None,
             starting_prompt: None,
             pr_url: Some(pr_url),
+            issue_url: None,
         })
         .await
     }
@@ -260,9 +343,10 @@ mod tests {
     #[test]
     fn claude_and_pi_take_the_rule_as_a_system_prompt_and_keep_their_first_prompt() {
         let scope = scope(None);
+        let text = rule(&scope);
         for kind in [AgentKind::Claude, AgentKind::Pi] {
             for resumed in [false, true] {
-                let prompts = launch_prompts(kind, resumed, Some(&scope), Some("relocated"));
+                let prompts = launch_prompts(kind, resumed, Some(&text), Some("relocated"));
                 assert_eq!(
                     prompts.system.as_deref(),
                     Some(rule(&scope).as_str()),
@@ -276,20 +360,21 @@ mod tests {
     #[test]
     fn codex_and_cursor_open_a_cold_spawn_with_the_rule_and_resume_without_it() {
         let scope = scope(None);
+        let text = rule(&scope);
         for kind in [AgentKind::Codex, AgentKind::Cursor] {
-            let cold = launch_prompts(kind, false, Some(&scope), None);
+            let cold = launch_prompts(kind, false, Some(&text), None);
             assert_eq!(cold.system, None, "{kind:?} has no system-prompt flag");
             let first = cold.initial.expect("the rule is the first prompt");
             assert!(first.starts_with(&rule(&scope)), "{first}");
             assert!(first.contains("wait for the user's request"), "{first}");
 
-            let with_task = launch_prompts(kind, false, Some(&scope), Some("fix the tests"));
+            let with_task = launch_prompts(kind, false, Some(&text), Some("fix the tests"));
             assert_eq!(
                 with_task.initial.as_deref(),
                 Some(format!("{}\n\nfix the tests", rule(&scope)).as_str())
             );
 
-            let resumed = launch_prompts(kind, true, Some(&scope), None);
+            let resumed = launch_prompts(kind, true, Some(&text), None);
             assert_eq!(
                 resumed,
                 LaunchPrompts::default(),
@@ -320,6 +405,82 @@ mod tests {
         );
         assert!(validate_pr_url("https://github.com/o/r/issues/7").is_err());
         assert!(validate_pr_url("javascript:alert(1)").is_err());
+    }
+
+    const ISSUE_URL: &str = "https://github.com/AgentSystemLabs/nebula/issues/15";
+
+    /// The issue rule names the issue (URL and number), where the session
+    /// works, and how to tie the work back — and nothing about a checkout
+    /// to avoid, since an issue has no branch of its own.
+    #[test]
+    fn the_issue_rule_names_the_issue_and_the_worktree() {
+        let scope = IssueScope {
+            url: ISSUE_URL,
+            worktree: Path::new("/w/nebula-worktrees/issue-15-fix-login"),
+            branch: "issue-15-fix-login",
+        };
+        let text = issue_rule(&scope);
+        assert!(text.contains(ISSUE_URL), "{text}");
+        assert!(text.contains("#15"), "{text}");
+        assert!(
+            text.contains("/w/nebula-worktrees/issue-15-fix-login"),
+            "{text}"
+        );
+        assert!(text.contains("`issue-15-fix-login`"), "{text}");
+        assert!(text.contains("gh issue view"), "{text}");
+        assert!(text.contains("Closes #15"), "{text}");
+        assert!(!text.contains("main checkout"), "{text}");
+    }
+
+    /// A spawn carries whichever rules the row holds: one, the other, both
+    /// (PR first), or none.
+    #[test]
+    fn combined_rule_joins_whatever_the_row_carries() {
+        let pr = scope(None);
+        let issue = IssueScope {
+            url: ISSUE_URL,
+            worktree: Path::new("/w/nebula-worktrees/fix-login"),
+            branch: "fix-login",
+        };
+        assert_eq!(combined_rule(None, None), None);
+        assert_eq!(
+            combined_rule(Some(&pr), None).as_deref(),
+            Some(rule(&pr).as_str())
+        );
+        assert_eq!(
+            combined_rule(None, Some(&issue)).as_deref(),
+            Some(issue_rule(&issue).as_str())
+        );
+        let both = combined_rule(Some(&pr), Some(&issue)).unwrap();
+        assert_eq!(both, format!("{}\n\n{}", rule(&pr), issue_rule(&issue)));
+    }
+
+    #[test]
+    fn validate_issue_url_normalizes_and_refuses_non_issue_urls() {
+        assert_eq!(
+            validate_issue_url("github.com/o/r/issues/15").unwrap(),
+            "https://github.com/o/r/issues/15"
+        );
+        assert_eq!(
+            validate_issue_url("https://github.com/o/r/issues/15#issuecomment-1").unwrap(),
+            "https://github.com/o/r/issues/15#issuecomment-1"
+        );
+        assert!(validate_issue_url("https://github.com/o/r/pull/7").is_err());
+        assert!(validate_issue_url("https://github.com/o/r/issues/").is_err());
+        assert!(validate_issue_url("https://github.com/o/r/issues/abc").is_err());
+        assert!(validate_issue_url("javascript:alert(1)").is_err());
+        assert!(validate_issue_url(&format!("https://x.dev/issues/{}", "9".repeat(5000))).is_err());
+    }
+
+    #[test]
+    fn issue_number_reads_the_url_tail() {
+        assert_eq!(issue_number("https://github.com/o/r/issues/15"), Some(15));
+        assert_eq!(
+            issue_number("https://github.com/o/r/issues/15?x=1"),
+            Some(15)
+        );
+        assert_eq!(issue_number("https://github.com/o/r/issues/0"), None);
+        assert_eq!(issue_number("https://github.com/o/r/pull/7"), None);
     }
 
     #[test]

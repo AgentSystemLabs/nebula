@@ -21,6 +21,54 @@ pub fn slugify(input: &str) -> String {
         .to_string()
 }
 
+/// A branch for an ISSUE SESSION cut into a fresh worktree:
+/// `issue-15-fix-login-redirect` — the number first so the checkout sorts
+/// and reads by issue, then the title lowercased and reduced to
+/// hyphenated words, capped so a long title stays a usable ref. A name
+/// already in `taken` gets a `-2`, `-3`, … suffix.
+pub fn issue_name(number: u64, title: &str, taken: &[String]) -> String {
+    const MAX_SLUG: usize = 40;
+    // Whole words only up to the cap: a slug cut mid-word
+    // (`…-when-the-pre`) reads worse than a shorter one.
+    let mut slug = String::new();
+    for word in title
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+    {
+        let word = word.to_ascii_lowercase();
+        let need = if slug.is_empty() {
+            word.len()
+        } else {
+            word.len() + 1
+        };
+        if slug.len() + need > MAX_SLUG {
+            // A first word longer than the whole cap is clipped rather
+            // than dropped, so the slug is never empty for a real title.
+            if slug.is_empty() {
+                slug.push_str(&word[..MAX_SLUG]);
+            }
+            break;
+        }
+        if !slug.is_empty() {
+            slug.push('-');
+        }
+        slug.push_str(&word);
+    }
+    let slug = slug.as_str();
+    let base = if slug.is_empty() {
+        format!("issue-{number}")
+    } else {
+        format!("issue-{number}-{slug}")
+    };
+    if !taken.iter().any(|t| t == &base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|candidate| !taken.iter().any(|t| t == candidate))
+        .expect("an unbounded range always finds a free suffix")
+}
+
 const ADJECTIVES: &[&str] = &[
     "amber",
     "brave",
@@ -118,6 +166,49 @@ fn splitmix64(seed: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_branches_carry_the_number_and_a_bounded_slug() {
+        assert_eq!(
+            issue_name(15, "Fix login redirect", &[]),
+            "issue-15-fix-login-redirect"
+        );
+        assert_eq!(
+            issue_name(7, "  Crash: `nebula open` on a PDF!  ", &[]),
+            "issue-7-crash-nebula-open-on-a-pdf"
+        );
+        assert_eq!(issue_name(3, "", &[]), "issue-3");
+        assert_eq!(issue_name(3, "!!!", &[]), "issue-3");
+        let long = issue_name(9, &"word ".repeat(30), &[]);
+        assert!(long.len() <= "issue-9-".len() + 40, "{long}");
+        assert!(!long.ends_with('-'), "{long}");
+        // The cap falls between words, never inside one.
+        assert_eq!(
+            issue_name(
+                61,
+                "Quick prompt loses its text when the preset picker is cancelled",
+                &[]
+            ),
+            "issue-61-quick-prompt-loses-its-text-when-the"
+        );
+        assert_eq!(
+            issue_name(2, &"x".repeat(60), &[]),
+            format!("issue-2-{}", "x".repeat(40)),
+            "a single overlong word is clipped, not dropped"
+        );
+        assert_eq!(
+            issue_name(15, "Fix login", &["issue-15-fix-login".into()]),
+            "issue-15-fix-login-2"
+        );
+        assert_eq!(
+            issue_name(
+                15,
+                "Fix login",
+                &["issue-15-fix-login".into(), "issue-15-fix-login-2".into()]
+            ),
+            "issue-15-fix-login-3"
+        );
+    }
 
     #[test]
     fn spaces_become_hyphens() {

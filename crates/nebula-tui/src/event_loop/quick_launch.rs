@@ -103,6 +103,8 @@ fn draft(
         cloud_prompt: None,
         // Sized in `submit_prompt`, with the task — composing cannot fail.
         starting_prompt: Some(launch.compose(&text)),
+        // An ISSUE SESSION's context, persisted by the DAEMON with the row.
+        issue_url: launch.issue.as_ref().map(|issue| issue.url.clone()),
         reopen_on_error: Some((PromptKind::QuickPrompt(launch), text)),
         pr: None,
         // The QUICK PROMPT is the one launch that stays out of the way by

@@ -76,6 +76,7 @@ impl Daemon {
             cloud_prompt: None,
             starting_prompt: Some(starting_prompt.to_string()),
             pr_url: None,
+            issue_url: None,
         })
     }
 
@@ -192,7 +193,7 @@ mod tests {
             spec.starting_prompt.as_deref(),
             Some("Fix the login redirect")
         );
-        assert!(spec.cloud_prompt.is_none() && spec.pr_url.is_none());
+        assert!(spec.cloud_prompt.is_none() && spec.pr_url.is_none() && spec.issue_url.is_none());
     }
 
     #[test]

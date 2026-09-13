@@ -87,6 +87,9 @@ pub(crate) struct CreateAgentSpec {
     /// The CLI's positional first prompt (an AGENT PRESET launch). Request-only.
     pub starting_prompt: Option<String>,
     pub pr_url: Option<String>,
+    /// The GitHub issue an ISSUE SESSION was launched for (see
+    /// `pr_scope::issue_rule`). Persisted like `pr_url`.
+    pub issue_url: Option<String>,
 }
 
 /// A pre-spawned agent CLI waiting to be adopted by the next CreateAgent for
@@ -1057,6 +1060,7 @@ impl Daemon {
             cloud_prompt,
             starting_prompt,
             pr_url,
+            issue_url,
         } = spec;
         let cloud_prompt = match cloud_prompt {
             Some(_) if kind != AgentKind::Claude => {
@@ -1082,6 +1086,13 @@ impl Daemon {
             Some(url) => Some(crate::pr_scope::validate_pr_url(&url)?),
             None => None,
         };
+        let issue_url = match issue_url {
+            Some(_) if cloud_prompt.is_some() => {
+                bail!("issue launch context is not supported for Claude Cloud")
+            }
+            Some(url) => Some(crate::pr_scope::validate_issue_url(&url)?),
+            None => None,
+        };
         let worktree = self
             .store
             .get_worktree(&worktree_id)?
@@ -1089,10 +1100,14 @@ impl Daemon {
         // A warm session for this (worktree, kind) hands over its PTY and
         // its pre-generated id — the CLI booted while the user typed the
         // name, so the create feels instant. A starting prompt rides the
-        // CLI's argv, and a spare already booted bare cannot be handed one.
-        let adopted = (cloud_prompt.is_none() && pr_url.is_none() && starting_prompt.is_none())
-            .then(|| self.take_prewarmed(&worktree_id, kind, model.as_deref(), effort.as_deref()))
-            .flatten();
+        // CLI's argv, and a spare already booted bare cannot be handed one;
+        // neither can it be handed a PR or issue rule.
+        let adopted = (cloud_prompt.is_none()
+            && pr_url.is_none()
+            && issue_url.is_none()
+            && starting_prompt.is_none())
+        .then(|| self.take_prewarmed(&worktree_id, kind, model.as_deref(), effort.as_deref()))
+        .flatten();
         // Only the cold path needs asking: an adopted warm session is proof
         // the CLI runs. Without this, a missing CLI still "succeeds" — the
         // login shell prints `command not found` into a PTY that dies at
@@ -1126,8 +1141,12 @@ impl Daemon {
             cloud_mirroring: false,
             recent_prompts: Vec::new(),
         };
-        self.store
-            .insert_agent_with_launch_context(&agent, auto_title, pr_url.as_deref())?;
+        self.store.insert_agent_with_launch_context(
+            &agent,
+            auto_title,
+            pr_url.as_deref(),
+            issue_url.as_deref(),
+        )?;
         if adopted.is_none() {
             // Cold path: boot the CLI right away.
             let spawned = self.spawn_agent_session_with(
@@ -2493,14 +2512,18 @@ impl Daemon {
 
         // NEBULA_AGENT_CMD overrides for tests; default is the kind's CLI.
         let cmd_override = std::env::var(env::AGENT_CMD).ok();
-        // A PR SESSION's rule rides Claude's system prompt, or opens a
-        // Codex / Cursor cold spawn as its first prompt (see `pr_scope`).
-        // Rebuilt from the row's *current* worktree on every spawn, so a
-        // relocated PR SESSION is told where it now works.
-        let pr_url = if cloud.is_none() {
-            self.store.agent_pr_url(&agent.id)?
+        // A PR SESSION's rule — or an ISSUE SESSION's — rides Claude's
+        // system prompt, or opens a Codex / Cursor cold spawn as its first
+        // prompt (see `pr_scope`). Rebuilt from the row's *current*
+        // worktree on every spawn, so a relocated session is told where it
+        // now works.
+        let (pr_url, issue_url) = if cloud.is_none() {
+            (
+                self.store.agent_pr_url(&agent.id)?,
+                self.store.agent_issue_url(&agent.id)?,
+            )
         } else {
-            None
+            (None, None)
         };
         let root = match &pr_url {
             Some(_) if !worktree.is_main => self
@@ -2515,10 +2538,16 @@ impl Daemon {
             branch: &worktree.branch,
             root: root.as_deref(),
         });
+        let issue_scope = issue_url.as_deref().map(|url| crate::pr_scope::IssueScope {
+            url,
+            worktree: &worktree.path,
+            branch: &worktree.branch,
+        });
+        let rule = crate::pr_scope::combined_rule(scope.as_ref(), issue_scope.as_ref());
         let prompts = crate::pr_scope::launch_prompts(
             agent.kind,
             agent.session_id.is_some(),
-            scope.as_ref(),
+            rule.as_deref(),
             initial_prompt,
         );
         let (program, args, resumed) = match cloud {
@@ -3983,6 +4012,7 @@ mod tests {
                 cloud_prompt: Some(" \n ".into()),
                 starting_prompt: None,
                 pr_url: None,
+                issue_url: None,
             })
             .await
             .unwrap_err();
@@ -3999,6 +4029,7 @@ mod tests {
                 cloud_prompt: Some("fix\0auth".into()),
                 starting_prompt: None,
                 pr_url: None,
+                issue_url: None,
             })
             .await
             .unwrap_err();
@@ -4015,6 +4046,7 @@ mod tests {
                 cloud_prompt: Some("x".repeat(MAX_CLOUD_PROMPT_BYTES + 1)),
                 starting_prompt: None,
                 pr_url: None,
+                issue_url: None,
             })
             .await
             .unwrap_err();
@@ -4031,6 +4063,7 @@ mod tests {
                 cloud_prompt: Some("Fix auth".into()),
                 starting_prompt: None,
                 pr_url: None,
+                issue_url: None,
             })
             .await
             .unwrap_err();
@@ -4050,6 +4083,7 @@ mod tests {
             cloud_prompt: cloud.map(String::from),
             starting_prompt: None,
             pr_url: Some("https://github.com/o/r/pull/7".into()),
+            issue_url: None,
         };
         for kind in AgentKind::ALL {
             // Validation passes for every harness; the missing worktree is
@@ -4150,6 +4184,47 @@ mod tests {
         assert!(err.to_string().contains("not a branch name"), "{err}");
     }
 
+    /// The ISSUE SESSION's URL is checked at the boundary like the PR
+    /// SESSION's: every harness may carry one, a PR URL is not an issue,
+    /// and Claude Cloud takes no launch context at all.
+    #[tokio::test]
+    async fn issue_launch_context_is_accepted_for_every_kind_but_never_with_cloud() {
+        let daemon = test_daemon();
+        let spec = |kind: AgentKind, cloud: Option<&str>| CreateAgentSpec {
+            worktree: WorktreeId("unused".into()),
+            name: "issue".into(),
+            kind,
+            model: None,
+            effort: None,
+            auto_title: true,
+            cloud_prompt: cloud.map(String::from),
+            starting_prompt: Some("Fix it".into()),
+            pr_url: None,
+            issue_url: Some("https://github.com/o/r/issues/15".into()),
+        };
+        for kind in AgentKind::ALL {
+            let err = daemon.create_agent(spec(kind, None)).await.unwrap_err();
+            assert!(
+                err.to_string().contains("worktree not found"),
+                "{kind:?}: {err}"
+            );
+        }
+        let cloud = daemon
+            .create_agent(CreateAgentSpec {
+                starting_prompt: None,
+                ..spec(AgentKind::Claude, Some("Fix auth"))
+            })
+            .await
+            .unwrap_err();
+        assert!(cloud.to_string().contains("not supported for Claude Cloud"));
+        let not_an_issue = CreateAgentSpec {
+            issue_url: Some("https://github.com/o/r/pull/7".into()),
+            ..spec(AgentKind::Codex, None)
+        };
+        let err = daemon.create_agent(not_an_issue).await.unwrap_err();
+        assert!(err.to_string().contains("not an issue URL"), "{err}");
+    }
+
     #[tokio::test]
     async fn starting_prompt_is_validated_and_never_adopts_a_warm_cli() {
         let daemon = test_daemon();
@@ -4163,6 +4238,7 @@ mod tests {
             cloud_prompt: cloud.map(String::from),
             starting_prompt: starting.map(String::from),
             pr_url: None,
+            issue_url: None,
         };
         // Validation runs before the worktree lookup, so an unknown
         // worktree is fine here and every failure is the prompt's own.

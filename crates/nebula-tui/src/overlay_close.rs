@@ -4,7 +4,7 @@
 //! UNLOCK. The Esc arms stay beside the rest of each overlay's keys, because
 //! several of them are deliberately two-stage — the first press peels a
 //! typed filter or an open submenu and only the second closes. The other two
-//! exits live here: both need the same two facts about all fifteen
+//! exits live here: both need the same two facts about all sixteen
 //! variants, the box the overlay was last drawn in and what has to be put
 //! back when it goes, and spelling either of those out per variant is how
 //! the list drifts.
@@ -38,6 +38,7 @@ pub(crate) fn overlay_area(overlay: &Overlay) -> Rect {
         Overlay::Hosts(v) => v.area,
         Overlay::AgentPresets(v) => v.area,
         Overlay::AgentPresetEditor(v) => v.area,
+        Overlay::Issues(v) => v.area,
     }
 }
 
@@ -77,7 +78,8 @@ pub(crate) fn click_outside(app: &mut App, out: &mut Vec<ClientRequest>) {
             | Overlay::Tree(_)
             | Overlay::FileTabs(_)
             | Overlay::Metrics(_)
-            | Overlay::Hosts(_),
+            | Overlay::Hosts(_)
+            | Overlay::Issues(_),
         ) => app.overlay = None,
         // Confirm, Prompt, the AGENT PRESETS list and the PRESET EDITOR each
         // have a side effect on the way out that their own Esc already

@@ -71,7 +71,10 @@
   when the old one is gone) / `pi --session-id <session-id>` (which creates a missing id instead of
   dying). An AGENT created from a PROJECT OPEN PRS row also receives the PR URL and a PR-only
   work rule — Claude and Pi through `--append-system-prompt` on every spawn, Codex and Cursor as the first prompt of
-  their cold spawn (their transcripts carry it through a resume); nebula persists that URL.
+  their cold spawn (their transcripts carry it through a resume); nebula persists that URL. An AGENT
+  launched from the ISSUES MODAL (`i`) carries the GitHub issue's URL the same way — persisted with
+  the row, rebuilt into an issue-context rule on every spawn and resume — so the harness knows which
+  issue the session is for (see [Sessions](sessions.md#the-issues-modal-and-issue-sessions)).
 - **Status via agent-CLI hooks, not MCP.** At agent spawn, nebula merges managed hooks into the
   worktree's `.claude/settings.local.json` (Claude Code) or `.cursor/hooks.json` (Cursor CLI), and into
   `~/.codex/hooks.json` (Codex — codex records hook approvals against the hook file's path, so a
@@ -223,7 +226,7 @@ attachment is currently unavailable; previously saved links remain visible so th
 discard data.
 
 This is the one part of nebula the TUI asks for itself rather than the DAEMON: every `gh pr view`,
-`gh pr list` and `gh pr diff` is spawned by the client, which is why the lookups stop the moment you
+`gh pr list` and `gh pr diff` — and the ISSUES MODAL's `gh issue list` and `gh issue view` — is spawned by the client, which is why the lookups stop the moment you
 quit, and why a machine with no `gh` — or one that is unauthenticated, or pointed at a checkout with no
 remote — just shows no rows instead of an error. Only the selected project is ever asked about: its
 selected worktree's PR ROW and its PROJECT OPEN PRS GROUP on every tick, one process each, and its other
