@@ -2093,6 +2093,11 @@ pub struct App {
     /// last draw — the page Ctrl+d / Ctrl+u jump by half of. Zero before
     /// the first frame, when a half page is a single row.
     pub worktrees_view_rows: usize,
+    /// The same for the Sessions column: pill rows it had room for as of
+    /// the last draw, the page its Ctrl+d / Ctrl+u halve. A worktree
+    /// with a long ARCHIVED group outgrows the column the way a project
+    /// with many open pull requests outgrows Worktrees.
+    pub sessions_view_rows: usize,
     pub term: Option<AttachedTerm>,
     /// Screens of the sessions the pane showed most recently, most recent
     /// first — at most [`TERM_CACHE_MAX`], each under [`TERM_CACHE_CELLS`].
@@ -2472,6 +2477,7 @@ impl App {
             worktrees_scroll: 0,
             worktrees_anchor: None,
             worktrees_view_rows: 0,
+            sessions_view_rows: 0,
             term: None,
             term_cache: Vec::new(),
             term_locked: false,
@@ -3153,6 +3159,12 @@ impl App {
     /// first draw or in a column squeezed down to a row or two.
     pub fn worktrees_half_page(&self) -> usize {
         (self.worktrees_view_rows / 2).max(1)
+    }
+
+    /// Rows a half-page jump moves the Sessions cursor: the same rule as
+    /// [`App::worktrees_half_page`], on the Sessions column's last frame.
+    pub fn sessions_half_page(&self) -> usize {
+        (self.sessions_view_rows / 2).max(1)
     }
 
     /// The open pull request under the Worktrees cursor, when it's on one.
