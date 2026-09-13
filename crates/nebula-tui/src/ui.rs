@@ -1449,16 +1449,16 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     PaletteTarget::Project(_) => ("▪ ", "▫ "),
                     PaletteTarget::Worktree(_) => ("▸ ", "▹ "),
                     PaletteTarget::Session(_) => ("● ", "○ "),
-                    // The panels' "leaves nebula" arrow: a pull request row
-                    // opens a browser, it doesn't move a cursor.
-                    PaletteTarget::PullRequest(_) => ("↗ ", "↗ "),
+                    // The arrow its Worktrees-panel row wears (`pr_row`),
+                    // since that row is where picking it lands.
+                    PaletteTarget::PullRequest { .. } => ("↗ ", "↗ "),
                 };
                 // Archived rows stay quiet even if their last status was
                 // live — the Sessions panel's `⊘` rule.
                 let status = if item.archived { None } else { item.status };
                 let (glyph, glyph_color) = if item.archived {
                     ("⊘ ", th.dim)
-                } else if matches!(item.target, PaletteTarget::PullRequest(_)) {
+                } else if matches!(item.target, PaletteTarget::PullRequest { .. }) {
                     // No status to carry: an open pull request wears the
                     // same accent its Worktrees-panel row does.
                     (solid, th.accent)

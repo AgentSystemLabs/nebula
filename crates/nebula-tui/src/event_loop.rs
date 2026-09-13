@@ -84,6 +84,8 @@ const SELECT_CONTEXT_FIRST: &str = "select a project or worktree first";
 
 /// Flash for a session pick that lost a race with its removal.
 const SESSION_GONE: &str = "session no longer exists";
+/// Flash for a `/` pull-request pick whose row a refresh retired meanwhile.
+const PR_GONE: &str = "pull request is no longer open";
 /// `]` / `[` with no session anywhere to land on.
 const NO_SESSIONS_TO_JUMP: &str = "no sessions to jump to";
 
@@ -4043,10 +4045,11 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 KeyCode::Char('n') if ctrl => palette.select(palette.selected as i64 + 1),
                 KeyCode::Char('p') if ctrl => palette.select(palette.selected as i64 - 1),
                 // Enter picks per the config setting; Ctrl+O always opens
-                // (attach + terminal focus), Ctrl+F only focuses the row.
+                // (attach + terminal focus; the browser, for a pull
+                // request), Ctrl+F only focuses the row.
                 KeyCode::Enter => {
-                    let landing = Landing::for_enter(palette.enter_attaches);
                     if let Some(target) = palette.selected_target().cloned() {
+                        let landing = Landing::for_enter_on(&target, palette.enter_attaches);
                         app.overlay = None;
                         jump_to_target(app, target, landing, out);
                     }
@@ -5518,9 +5521,9 @@ fn select_project_row_by_id(app: &mut App, id: &nebula_core::ProjectId) -> bool 
 }
 
 /// The workspace a palette pick lives in, when that isn't the open one.
-/// A pull request has no workspace of its own — it is opened in a browser
-/// and moves no cursor — and a target whose row has vanished resolves to
-/// None, leaving the jump's own re-validation to flash.
+/// A pull request lives where its project does — its row is in that
+/// project's OPEN PRS group — and a target whose row has vanished resolves
+/// to None, leaving the jump's own re-validation to flash.
 fn target_workspace(app: &App, target: &PaletteTarget) -> Option<WorkspaceId> {
     let project = |id: &ProjectId| {
         app.tree
@@ -5546,7 +5549,7 @@ fn target_workspace(app: &App, target: &PaletteTarget) -> Option<WorkspaceId> {
             .iter()
             .find(|a| &a.id == id)
             .and_then(|a| worktree(&a.worktree_id)),
-        PaletteTarget::PullRequest(_) => None,
+        PaletteTarget::PullRequest { project: id, .. } => project(id),
     };
     found.filter(|id| id != &app.tree.active_workspace)
 }
@@ -5683,11 +5686,49 @@ fn jump_to_target_inner(
                 }
             }
         }
-        // A pull request isn't in any panel — picking it hands the URL to
-        // the browser and leaves every cursor where it was. Enter opens it
-        // whether or not the "Enter attaches" setting is on: there is no
-        // second, quieter thing for it to do.
-        PaletteTarget::PullRequest(url) => open_link(app, &url, out),
+        // A pull request is a row of its project's OPEN PRS group, under
+        // the checkouts: the jump selects that project (restoring its
+        // context like a manual switch), unfolds the group if it was
+        // folded — a folded group has no rows to land on — and puts the
+        // Worktrees cursor on the row, so the pane reads the pull request
+        // exactly as ↓ onto it would (`App::previewed_pr`). Nothing else
+        // is needed for a PR with no checkout or session of its own. The
+        // browser stays an explicit ask: `Attach` is "what Enter on its
+        // row does", and on this row that is the browser.
+        PaletteTarget::PullRequest { project, url } => {
+            let changed = switched
+                || app
+                    .selected_project()
+                    .map(|p| p.id != project)
+                    .unwrap_or(true);
+            if !select_project_row_by_id(app, &project) {
+                app.flash = Some("project no longer exists".into());
+                return;
+            }
+            if changed {
+                restore_context(app, out);
+            }
+            if app.open_prs_collapsed {
+                app.open_prs_collapsed = false;
+                app.dirty = true;
+            }
+            let checkouts = app.visible_worktrees().len();
+            let Some(index) = app.visible_open_prs().iter().position(|pr| pr.url == url) else {
+                app.flash = Some(PR_GONE.into());
+                return;
+            };
+            // Re-picking the row the cursor is already on keeps the
+            // reader's scroll; a move re-arms the detail fetch as any
+            // cursor move onto the row does.
+            let row = checkouts + index;
+            if app.sel_worktree != row {
+                select_worktree_row(app, row, out);
+            }
+            app.focus = Focus::Worktrees;
+            if landing == Landing::Attach {
+                open_link(app, &url, out);
+            }
+        }
     }
 }
 
@@ -5759,6 +5800,18 @@ impl Landing {
             Landing::Attach
         } else {
             Landing::FocusOnly
+        }
+    }
+
+    /// The palette's Enter on `target`: a session attaches when the setting
+    /// says so; a pull request only ever lands on its row with the pane
+    /// reading it — the setting is about attaching, and a pull request has
+    /// nothing to attach — so `Ctrl+O` stays the one palette key that also
+    /// hands it to the browser.
+    fn for_enter_on(target: &PaletteTarget, attaches: bool) -> Self {
+        match target {
+            PaletteTarget::PullRequest { .. } => Landing::FocusOnly,
+            _ => Landing::for_enter(attaches),
         }
     }
 }
@@ -6837,8 +6890,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     let index = start + (mouse.row - list.y) as usize;
                     if index < palette.matches.len() {
                         palette.select(index as i64);
-                        let landing = Landing::for_enter(palette.enter_attaches);
                         if let Some(target) = palette.selected_target().cloned() {
+                            let landing = Landing::for_enter_on(&target, palette.enter_attaches);
                             app.overlay = None;
                             jump_to_target(app, target, landing, out);
                         }
@@ -9898,34 +9951,127 @@ mod tests {
     }
 
     /// `/` searches pull requests by title alongside everything else, and
-    /// Enter on one opens the browser instead of moving any panel cursor.
+    /// Enter on one lands the Worktrees cursor on its OPEN PRS row so the
+    /// pane reads it — inside nebula, not in a browser.
     #[test]
-    fn the_palette_finds_open_prs_by_title_and_opens_them() {
+    fn the_palette_finds_open_prs_by_title_and_reads_them_in_the_pane() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(
+            &mut app,
+            &[(7, "Attach links to worktrees"), (9, "Number the lines")],
+        );
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        for c in "number".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        {
+            let p = palette(&app);
+            assert_eq!(
+                p.items[p.matches[0].item].text, "demo/#9 Number the lines",
+                "the project prefixes it, like every other row"
+            );
+        }
+        // Enter lands on the row whether or not "Enter attaches" is on: the
+        // setting is about attaching sessions, and a pull request has
+        // nothing to attach — the browser is never the quiet default.
+        set_enter_attaches(&mut app, true);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "the palette closes");
+        assert_eq!(app.flash, None, "no browser opened: {:?}", app.flash);
+        assert_eq!(app.focus, Focus::Worktrees);
+        assert_eq!(app.sel_worktree, 2, "the row after the one checkout and #7");
+        assert_eq!(
+            app.selected_worktree_pr().map(|pr| pr.number),
+            Some(9),
+            "the Worktrees cursor is on the pull request"
+        );
+        assert_eq!(
+            app.previewed_pr().map(|pr| pr.url),
+            Some("https://github.com/o/r/pull/9".into()),
+            "the pane is reading it"
+        );
+        assert_eq!(
+            app.pending_pr_detail.as_ref().map(|(p, _)| p.url.as_str()),
+            Some("https://github.com/o/r/pull/9"),
+            "its description is asked for, as any move onto the row would"
+        );
+    }
+
+    /// A folded OPEN PRS group has no rows to land on, so the jump unfolds
+    /// it first — the row is where the pick is headed, the way ↓ off the
+    /// last checkout opens the group rather than stopping at its header.
+    #[test]
+    fn a_palette_pr_pick_unfolds_the_open_prs_group() {
         let mut app = App::new();
         seed_tree(&mut app);
         seed_open_prs(&mut app, &[(7, "Attach links to worktrees")]);
-        app.focus = Focus::Worktrees;
+        app.open_prs_collapsed = true;
+        assert_eq!(app.worktree_row_count(), 1, "folded: only the checkout");
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        for c in "#7".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(!app.open_prs_collapsed, "the group is open");
+        assert_eq!(app.selected_worktree_pr().map(|pr| pr.number), Some(7));
+        assert_eq!(app.focus, Focus::Worktrees);
+    }
+
+    /// `Ctrl+O` is the palette's "open the hit", and on a pull request that
+    /// is the browser — the explicit way out, the same as Enter on the row
+    /// once landed. It still lands the cursor there first, so the pane is
+    /// reading the pull request when the browser is dismissed.
+    #[test]
+    fn palette_ctrl_o_on_a_pr_lands_on_it_and_opens_the_browser() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links to worktrees")]);
         let mut out = Vec::new();
 
         press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
         for c in "attach".chars() {
             press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
         }
-        {
-            let p = palette(&app);
-            assert_eq!(
-                p.items[p.matches[0].item].text, "demo/#7 Attach links to worktrees",
-                "the project prefixes it, like every other row"
-            );
-        }
-        // Enter opens it whether or not "Enter attaches" is on — there is no
-        // second, quieter thing a pull request can do.
-        set_enter_attaches(&mut app, false);
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        press(
+            &mut app,
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
         assert!(app.overlay.is_none(), "the palette closes");
         assert_eq!(app.flash.as_deref(), Some("opened github.com/o/r/pull/7"));
-        assert_eq!(app.sel_worktree, 0, "no panel cursor moved");
+        assert_eq!(app.selected_worktree_pr().map(|pr| pr.number), Some(7));
         assert_eq!(app.focus, Focus::Worktrees);
+    }
+
+    /// A pull request that merged between the palette listing it and the
+    /// pick has no row left to land on: the project is selected, and the
+    /// footer says why the cursor went no further.
+    #[test]
+    fn a_palette_pr_pick_that_lost_its_row_flashes() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links to worktrees")]);
+        let mut out = Vec::new();
+
+        jump_to_target(
+            &mut app,
+            PaletteTarget::PullRequest {
+                project: nebula_core::ProjectId("p1".into()),
+                url: "https://github.com/o/r/pull/8".into(),
+            },
+            Landing::FocusOnly,
+            &mut out,
+        );
+        assert_eq!(app.flash.as_deref(), Some(PR_GONE));
+        assert!(app.selected_worktree_pr().is_none());
+        assert_eq!(app.sel_worktree, 0, "the cursor stays on the checkout");
     }
 
     /// A space in the query is an AND between terms, not a char to match: the
@@ -21195,6 +21341,63 @@ diff --git a/src/c.rs b/src/c.rs
             Some("main".into())
         );
         assert_eq!(app.focus, Focus::Sessions);
+        assert!(app.flash.is_none(), "flash: {:?}", app.flash);
+    }
+
+    /// A pull request in another workspace's project is a jump there too:
+    /// the switch happens first, its project is selected, and the cursor
+    /// lands on the row under that project's checkouts — nothing about the
+    /// pull request needs a worktree or session of its own.
+    #[test]
+    fn jumping_to_another_workspaces_pr_switches_workspace_first() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_default_workspace(&mut app);
+        seed_other_workspace(&mut app);
+        let now = std::time::Instant::now();
+        app.open_prs.insert(
+            nebula_core::ProjectId("p9".into()),
+            crate::app::OpenPrs {
+                list: vec![crate::pull_request::OpenPr {
+                    number: 3,
+                    title: "Hush the logs".into(),
+                    url: "https://github.com/o/secret/pull/3".into(),
+                    is_draft: false,
+                    head: "hush".into(),
+                }],
+                at: now,
+                due: now + OPEN_PRS_REFRESH,
+                step: OPEN_PRS_REFRESH,
+            },
+        );
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        for c in "hush".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        {
+            let p = palette(&app);
+            assert_eq!(
+                p.items[p.matches[0].item].text, "client/secret/#3 Hush the logs",
+                "pathed under its workspace like every other row"
+            );
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            app.tree.active_workspace,
+            nebula_core::WorkspaceId("ws2".into())
+        );
+        assert_eq!(
+            app.selected_project().map(|p| p.name.clone()),
+            Some("secret".into())
+        );
+        assert_eq!(app.selected_worktree_pr().map(|pr| pr.number), Some(3));
+        assert_eq!(
+            app.previewed_pr().map(|pr| pr.url),
+            Some("https://github.com/o/secret/pull/3".into())
+        );
+        assert_eq!(app.focus, Focus::Worktrees);
         assert!(app.flash.is_none(), "flash: {:?}", app.flash);
     }
 
