@@ -2122,22 +2122,30 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             }
         }
         Action::MoveUp => move_selection(app, -1, out),
-        // Ctrl+d / Ctrl+u jump the Worktrees cursor half a panel at a time
-        // — the one column that routinely outgrows its height once the
-        // OPEN PRS group is open — through checkouts and pull requests
-        // alike, stopping at either end; the draw then scrolls the list
-        // after the cursor exactly as it does for a single step, so the
-        // row landed on is always in view. That panel only: a locked pane
-        // never gets here (the chords are the shell's EOF and
-        // kill-to-start), every line editor keeps ^u for itself, and the
-        // other panels are short enough that the keys stay unclaimed there.
-        Action::HalfPageDown if app.focus == Focus::Worktrees => {
-            move_selection(app, app.worktrees_half_page() as i64, out)
+        // Ctrl+d / Ctrl+u jump the cursor half a panel at a time in the
+        // two columns that routinely outgrow their height — Worktrees once
+        // the OPEN PRS group is open, Sessions once the ARCHIVED group is
+        // — through every row kind alike, stopping at either end; the
+        // draw then scrolls the list after the cursor exactly as it does
+        // for a single step, so the row landed on is always in view.
+        // Those panels only: a locked pane never gets here (the chords
+        // are the shell's EOF and kill-to-start), every line editor keeps
+        // ^u for itself, and Projects is short enough that the keys stay
+        // unclaimed there.
+        Action::HalfPageDown | Action::HalfPageUp => {
+            let page = match app.focus {
+                Focus::Worktrees => app.worktrees_half_page() as i64,
+                Focus::Sessions => app.sessions_half_page() as i64,
+                _ => 0,
+            };
+            if page > 0 {
+                let delta = match action {
+                    Action::HalfPageDown => page,
+                    _ => -page,
+                };
+                move_selection(app, delta, out);
+            }
         }
-        Action::HalfPageUp if app.focus == Focus::Worktrees => {
-            move_selection(app, -(app.worktrees_half_page() as i64), out)
-        }
-        Action::HalfPageDown | Action::HalfPageUp => {}
         Action::Activate => match app.focus {
             // The cursor already IS the open workspace; Enter steps into it.
             Focus::Workspaces => app.focus = app.first_sidebar_focus(),
@@ -10015,31 +10023,135 @@ mod tests {
         assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
     }
 
-    /// The half-page chords belong to the Worktrees column alone. Every
-    /// other panel leaves them unclaimed as before, and a locked pane
+    /// Ctrl+d / Ctrl+u walk the Sessions column the same way: half the
+    /// pill rows its last draw had room for, across the live rows and the
+    /// ARCHIVED group as one list, clamped at both ends rather than
+    /// wrapping. The long list this is for is a worktree's archive — a
+    /// dozen archived sessions under one live one are a `j`-marathon
+    /// otherwise — and like `↓`, the jump stays inside what the panel
+    /// lists: a folded archive is not unfolded by it. The pane follows
+    /// the cursor onto a live row the way it does for a single step, and
+    /// is left alone over the archived ones.
+    #[test]
+    fn ctrl_d_and_ctrl_u_jump_the_sessions_cursor_half_a_panel() {
+        use nebula_core::{Agent, AgentStatus, Entity, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 / w1(main) / a1
+        for n in 1..=10i64 {
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(Agent {
+                        id: AgentId(format!("old{n}")),
+                        worktree_id: WorktreeId("w1".into()),
+                        name: format!("archived-{n}"),
+                        status: AgentStatus::Fresh,
+                        archived: true,
+                        // Newest archive first: archived-1 is row 1.
+                        archived_at: 100 - n,
+                        unseen: false,
+                        kind: nebula_core::AgentKind::Claude,
+                        model: None,
+                        effort: None,
+                        session_id: None,
+                        cloud_session_id: None,
+                        sort_order: n,
+                        status_changed_at: 0,
+                        alive: false,
+                        cloud_mirroring: false,
+                        recent_prompts: Vec::new(),
+                    }),
+                },
+            );
+        }
+        let name_at = |app: &App| {
+            app.visible_session_rows()
+                .get(app.sel_session)
+                .map(|r| r.name().to_string())
+        };
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        app.focus = Focus::Sessions;
+        // A column with room for six pills: half a page is three rows.
+        app.sessions_view_rows = 6;
+        assert_eq!(app.sessions_half_page(), 3);
+        let mut out = Vec::new();
+
+        // Archive folded: the live row is the whole list, and the jump
+        // stays on it rather than opening the group.
+        assert_eq!(app.visible_session_rows().len(), 1, "one live row");
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(app.sel_session, 0, "nowhere to go");
+        assert!(!app.show_archived, "the fold is not undone");
+
+        app.show_archived = true;
+        assert_eq!(
+            app.visible_session_rows().len(),
+            11,
+            "one live + ten archived"
+        );
+        out.clear();
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(app.sel_session, 3, "half a panel down");
+        assert_eq!(name_at(&app).as_deref(), Some("archived-3"));
+        assert!(app.term.is_none(), "an archived row is not previewed");
+        ctrl(&mut app, 'd', &mut out);
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(app.sel_session, 9);
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(app.sel_session, 10, "stops at the last row");
+        assert_eq!(name_at(&app).as_deref(), Some("archived-10"));
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(app.sel_session, 10, "and stays there — no wrap");
+
+        ctrl(&mut app, 'u', &mut out);
+        assert_eq!(app.sel_session, 7, "half a panel up");
+        ctrl(&mut app, 'u', &mut out);
+        ctrl(&mut app, 'u', &mut out);
+        assert_eq!(app.sel_session, 1);
+        out.clear();
+        ctrl(&mut app, 'u', &mut out);
+        assert_eq!(app.sel_session, 0, "stops at the first row");
+        assert_eq!(name_at(&app).as_deref(), Some("agent-1"));
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(a1),
+            "landing on the live row brings it up in the pane"
+        );
+        ctrl(&mut app, 'u', &mut out);
+        assert_eq!(app.sel_session, 0);
+
+        // Before the column has been drawn there is no page to halve, and
+        // the keys still move: one row, like `j`/`k`.
+        app.sessions_view_rows = 0;
+        assert_eq!(app.sessions_half_page(), 1);
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(app.sel_session, 1, "one row");
+    }
+
+    /// The half-page chords belong to the Worktrees and Sessions columns.
+    /// Projects leaves them unclaimed as before, and a locked pane
     /// forwards them to the PTY as the control bytes they are — Ctrl+d is
     /// the shell's EOF and Ctrl+u its kill-to-start, and an agent running
     /// in there is owed both.
     #[test]
-    fn half_page_chords_stay_out_of_the_other_panels_and_the_locked_pane() {
+    fn half_page_chords_stay_out_of_the_projects_panel_and_the_locked_pane() {
         let mut app = App::new();
         seed_tree(&mut app);
         seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Number the lines")]);
         app.worktrees_view_rows = 6;
+        app.sessions_view_rows = 6;
         let mut out = Vec::new();
 
-        for focus in [Focus::Projects, Focus::Sessions] {
-            app.focus = focus;
-            let before = (app.sel_project, app.sel_worktree, app.sel_session);
-            ctrl(&mut app, 'd', &mut out);
-            ctrl(&mut app, 'u', &mut out);
-            assert_eq!(
-                (app.sel_project, app.sel_worktree, app.sel_session),
-                before,
-                "{focus:?}: no cursor moved"
-            );
-            assert!(app.overlay.is_none(), "{focus:?}: nothing opened");
-        }
+        app.focus = Focus::Projects;
+        let before = (app.sel_project, app.sel_worktree, app.sel_session);
+        ctrl(&mut app, 'd', &mut out);
+        ctrl(&mut app, 'u', &mut out);
+        assert_eq!(
+            (app.sel_project, app.sel_worktree, app.sel_session),
+            before,
+            "Projects: no cursor moved"
+        );
+        assert!(app.overlay.is_none(), "Projects: nothing opened");
 
         app.focus = Focus::Terminal;
         app.term_locked = true;

@@ -722,6 +722,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[AgentPresets]), "agent presets: launch with a task"),
                         (Act(&[NewTerminal]), "new shell terminal"),
                         (Act(&[Activate]), "attach session / open link"),
+                        (Act(&[HalfPageDown, HalfPageUp]), "half a panel down / up"),
                         (Act(&[Rename]), "rename agent / edit link URL"),
                         (
                             Act(&[Archive, Unarchive, ToggleArchived]),
@@ -3488,6 +3489,12 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         .count();
     let count = Some(visible).filter(|n| *n > 0);
     let inner = draw_column(f, area, "SESSIONS", count, focused, th);
+    // The page Ctrl+d / Ctrl+u jump by half of: how many pills the column
+    // has room for this frame. Group headers and RECENT PROMPTS lines are
+    // not billed, as the Worktrees column's headers aren't — "about half
+    // a panel" is the promise, and the long lists this is for are the
+    // archived rows, which carry no prompt lines.
+    app.sessions_view_rows = (inner.height / PILL_H) as usize;
 
     let rows = app.visible_session_rows();
     if rows.is_empty() && app.selected_worktree().is_some() {
@@ -5624,6 +5631,30 @@ mod tests {
             .unwrap();
         assert_eq!(app.worktrees_view_rows, 1, "three title rows, one pill");
         assert_eq!(app.worktrees_half_page(), 1, "never less than a row");
+    }
+
+    /// The Sessions column writes its page size back the same way, on
+    /// the same arithmetic: a 20-row area fits eight pills, a 6-row one
+    /// a single pill, and a half page is never less than a row.
+    #[test]
+    fn drawing_the_sessions_column_records_its_page_size() {
+        let mut app = hit_test_app(&["main"], &["a", "b", "c"], &[]);
+        assert_eq!(app.sessions_view_rows, 0, "nothing drawn yet");
+        assert_eq!(app.sessions_half_page(), 1);
+
+        let area = Rect::new(0, 0, 30, 20);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 20)).unwrap();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        assert_eq!(app.sessions_view_rows, 8);
+        assert_eq!(app.sessions_half_page(), 4);
+
+        let area = Rect::new(0, 0, 30, 6);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 6)).unwrap();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        assert_eq!(app.sessions_view_rows, 1, "three title rows, one pill");
+        assert_eq!(app.sessions_half_page(), 1, "never less than a row");
     }
 
     /// RECENT PROMPTS under a session's name. Off (the default), the list
