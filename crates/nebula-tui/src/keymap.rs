@@ -565,6 +565,12 @@ pub fn index_of(action: Action) -> Option<usize> {
     ACTIONS.iter().position(|s| s.action == action)
 }
 
+/// The row for an action: its label and hint, for anything that names
+/// what a key did (the KEY COMBO DISPLAY, for one).
+pub fn spec_of(action: Action) -> Option<&'static ActionSpec> {
+    index_of(action).and_then(spec_at)
+}
+
 // ---- chords ----
 
 /// A single key press: one key plus the modifiers held with it, in the one

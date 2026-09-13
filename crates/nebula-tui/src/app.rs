@@ -2178,6 +2178,13 @@ pub struct App {
     /// `recent_prompts` switch and `recent_prompts_count` (Settings →
     /// Experimental), resolved through `Config::recent_prompts_shown`.
     pub recent_prompts: usize,
+    /// The KEY COMBO DISPLAY is on; mirrors CONFIG.JSON's `show_key_combos`
+    /// (Settings → Experimental). `key_combo` is what it is showing.
+    pub show_key_combos: bool,
+    /// The last key press, spelled for the bottom-left of the screen with
+    /// what it did, while the display is on and the press is fresh; the
+    /// loop clears it after `key_combo::LINGER`. See `key_combo.rs`.
+    pub key_combo: Option<crate::key_combo::KeyCombo>,
     pub next_req_id: u64,
     pub pending: HashMap<u64, PendingIntent>,
     /// `nebula --workspace <name>`: the workspace this instance was asked
@@ -2502,6 +2509,8 @@ impl App {
             hide_draft_prs: false,
             hide_root_worktree: false,
             recent_prompts: 0,
+            show_key_combos: false,
+            key_combo: None,
             next_req_id: 1,
             pending: HashMap::new(),
             startup_workspace: None,
