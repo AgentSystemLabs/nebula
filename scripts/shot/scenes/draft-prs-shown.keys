@@ -1,0 +1,3 @@
+# The default: Settings › Appearance › Draft pull requests is `shown`, so the PROJECT OPEN PRS GROUP
+# lists the draft (#39) dimmed and last, and the header counts all three. No keys — the first screen
+# is the scene; the `draft-prs-hidden` scene is the same screen with the setting flipped.

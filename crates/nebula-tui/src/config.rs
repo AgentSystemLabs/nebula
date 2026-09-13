@@ -369,7 +369,7 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             SettingSpec {
                 kind: SettingKind::HideDraftPrs,
                 label: "Draft pull requests",
-                hint: "Show or hide drafts in the OPEN PRS group and / search (worktrees and sessions stay)",
+                hint: "Show or hide drafts in the OPEN PRS group and / search; checkouts always stay",
                 group: "",
             },
         ]),
