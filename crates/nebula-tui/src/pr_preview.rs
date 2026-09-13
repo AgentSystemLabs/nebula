@@ -14,7 +14,7 @@
 //! one concession is that hard line breaks are honored, because a PR
 //! description written as a list reads as a list.
 
-use crate::pull_request::{PrComment, PrDetail, STATE_OPEN};
+use crate::pull_request::{PrComment, PrDetail, Standing, STATE_OPEN};
 use crate::theme::Theme;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -123,11 +123,15 @@ pub fn lines(detail: &PrDetail, width: usize, th: Theme) -> Vec<Line<'static>> {
         ],
         width,
     ));
+    // The state word is the one the rows wear (`Standing::label`), spelled
+    // out in full: `ready for review` here as in the `/` PALETTE, where the
+    // sidebar's badge cuts it to `ready`. A state `gh` might add later is
+    // shown as it came, dim, rather than guessed at.
     let state = match (detail.state.as_str(), detail.is_draft) {
-        (STATE_OPEN, true) => ("draft", th.dim),
-        (STATE_OPEN, false) => ("open", th.ok),
-        ("MERGED", _) => ("merged", th.merged),
-        ("CLOSED", _) => ("closed", th.err),
+        (STATE_OPEN, true) => (Standing::Draft.label(), th.dim),
+        (STATE_OPEN, false) => (Standing::Open.label(), th.ok),
+        ("MERGED", _) => (Standing::Merged.label(), th.merged),
+        ("CLOSED", _) => (Standing::Closed.label(), th.err),
         _ => (detail.state.as_str(), th.dim),
     };
     let mut meta = vec![
@@ -323,8 +327,8 @@ mod tests {
         let out = text(&lines(&d, 60, Theme::default()));
         assert!(out.starts_with(" #42 Attach links"), "{out}");
         assert!(
-            out.contains("open · webdevcody · main ← feat/links"),
-            "{out}"
+            out.contains("ready for review · webdevcody · main ← feat/links"),
+            "the state word is the palette's: {out}"
         );
         assert!(out.contains("+106 -4 · 2 files"), "{out}");
         assert!(out.contains("Makes the row."), "{out}");

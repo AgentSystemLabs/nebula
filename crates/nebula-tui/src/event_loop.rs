@@ -945,6 +945,12 @@ fn note_open_prs_answer(
     );
     forget_retired_prs(app);
     reconcile_open_pr_cursor(app, cursor, out);
+    // An open `/` palette lists these rows too: a pull request marked
+    // ready for review (or turned back into a draft) since the last answer
+    // must change its word there as well, and one merged since must leave.
+    if changed {
+        refresh_palette(app);
+    }
 }
 
 /// Pull the lookup of every checkout whose *open* pull request is among
@@ -1045,7 +1051,7 @@ fn forget_retired_prs(app: &mut App) {
 /// Carry the state GitHub just gave for one pull request over to the
 /// checkout row that shows the same one, ahead of that row's own
 /// `PR_REFRESH` beat. The PR ROW keeps a merged or closed pull request
-/// rather than retiring it, so what changes here is its badge — `pr` to
+/// rather than retiring it, so what changes here is its badge — `ready` to
 /// `merged` the moment the pane learns it, not up to fifteen seconds later
 /// — and, on the Sessions panel, its look.
 fn adopt_pr_state(app: &mut App, detail: &crate::pull_request::PrDetail) {
@@ -10255,6 +10261,117 @@ mod tests {
         assert_eq!(app.focus, Focus::Worktrees);
     }
 
+    /// A pull request row in `/` says where it stands, in words, before it
+    /// is picked: one ready for review is badged `ready for review` and
+    /// wears the accent its Worktrees-panel row does; a draft is badged
+    /// `draft` and dimmed end to end, like that row. The words are the
+    /// sidebar's — `draft` there too, `ready` cut to fit its column — so
+    /// the two lists never disagree about a state. And the list refresh
+    /// that learns a draft was marked ready flips the row under an open
+    /// palette, without moving the cursor off it.
+    #[test]
+    fn palette_pull_request_rows_say_draft_or_ready_for_review_and_follow_the_refresh() {
+        let th = crate::theme::Theme::default();
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let pid = app.selected_project().expect("a project").id.clone();
+        let answer = |app: &mut App, prs: Vec<(u64, &str, bool)>| {
+            let list = prs
+                .into_iter()
+                .map(|(number, title, is_draft)| crate::pull_request::OpenPr {
+                    number,
+                    title: title.into(),
+                    url: pr_url(number),
+                    is_draft,
+                    head: format!("pr-{number}-head"),
+                })
+                .collect();
+            note_open_prs_answer(app, pid.clone(), Some(list), &mut Vec::new());
+        };
+        answer(
+            &mut app,
+            vec![(7, "Attach links", false), (9, "Number the lines", true)],
+        );
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("↗ demo/#7 Attach links ready for review"),
+            "a finished pull request says so after its title:\n{text}"
+        );
+        assert!(
+            text.contains("↗ demo/#9 Number the lines draft"),
+            "a draft says so after its title:\n{text}"
+        );
+        // The colors are the sidebar's: accent arrow and plain title for
+        // the ready one, dim arrow and dim title for the draft — the same
+        // `pr_row::look` both panels paint from.
+        let buffer = terminal.backend().buffer();
+        let (x, y) = find_cell(&terminal, "↗ demo/#7");
+        assert_eq!(buffer[(x, y)].fg, th.accent, "ready: the accent arrow");
+        let title_x = x + "↗ demo/".chars().count() as u16;
+        assert_eq!(buffer[(title_x, y)].fg, th.text, "ready: the title reads");
+        let (x, y) = find_cell(&terminal, "↗ demo/#9");
+        assert_eq!(buffer[(x, y)].fg, th.dim, "draft: the dim arrow");
+        assert_eq!(buffer[(title_x, y)].fg, th.dim, "draft: dimmed end to end");
+        let badge_x = x + "↗ demo/#9 Number the lines ".chars().count() as u16;
+        assert_eq!(buffer[(badge_x, y)].fg, th.dim, "draft: the badge is dim");
+
+        // Park the cursor on the draft, then let a refresh say it was
+        // marked ready for review: the word flips, the cursor stays.
+        if let Some(Overlay::Palette(p)) = &mut app.overlay {
+            let row = p
+                .matches
+                .iter()
+                .position(|m| {
+                    p.items[m.item].target
+                        == PaletteTarget::PullRequest {
+                            project: pid.clone(),
+                            url: pr_url(9),
+                        }
+                })
+                .expect("the draft's row");
+            p.select(row as i64);
+        }
+        answer(
+            &mut app,
+            vec![(7, "Attach links", false), (9, "Number the lines", false)],
+        );
+        assert_eq!(
+            palette(&app).selected_target(),
+            Some(&PaletteTarget::PullRequest {
+                project: pid.clone(),
+                url: pr_url(9),
+            }),
+            "the rebuild keeps the cursor on its pull request"
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("↗ demo/#9 Number the lines ready for review"),
+            "the refresh flips the word:\n{text}"
+        );
+        assert!(
+            !text.contains(" draft"),
+            "no draft is left on screen:\n{text}"
+        );
+
+        // And back: a pull request turned into a draft again reads so.
+        answer(
+            &mut app,
+            vec![(7, "Attach links", false), (9, "Number the lines", true)],
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("↗ demo/#9 Number the lines draft"),
+            "back to a draft:\n{text}"
+        );
+    }
+
     /// A pull request that merged between the palette listing it and the
     /// pick has no row left to land on: the project is selected, and the
     /// footer says why the cursor went no further.
@@ -10466,7 +10583,7 @@ mod tests {
                 .flatten()
                 .expect("the branch's pull request")
         };
-        assert_eq!(branch_pr(&app).badge(), "pr");
+        assert_eq!(branch_pr(&app).badge(), "ready");
 
         let mut merged = a_detail(7, "shipped", vec![]);
         merged.state = "MERGED".into();

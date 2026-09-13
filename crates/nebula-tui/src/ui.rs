@@ -1461,12 +1461,20 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 // Archived rows stay quiet even if their last status was
                 // live — the Sessions panel's `⊘` rule.
                 let status = if item.archived { None } else { item.status };
+                // A pull request carries no status; its colors are its
+                // standing's, the look its Worktrees-panel row wears — the
+                // accent for one ready for review, the dim end to end for
+                // a draft — and a trailing badge spells that state out in
+                // full (`draft`, `ready for review`), the sidebar's words
+                // at this modal's width, so the two are told apart before
+                // either is picked, by the word and not only by the color.
+                let pr = item
+                    .standing
+                    .map(|standing| (standing, crate::pr_row::look(standing, th)));
                 let (glyph, glyph_color) = if item.archived {
                     ("⊘ ", th.dim)
-                } else if matches!(item.target, PaletteTarget::PullRequest { .. }) {
-                    // No status to carry: an open pull request wears the
-                    // same accent its Worktrees-panel row does.
-                    (solid, th.accent)
+                } else if let Some((_, look)) = pr {
+                    (solid, look.glyph)
                 } else {
                     match status {
                         Some(AgentStatus::Running) => (solid, th.warn),
@@ -1478,18 +1486,30 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         Some(AgentStatus::Disconnected) | None => (hollow, th.dim),
                     }
                 };
-                let budget = (list_inner.width as usize).saturating_sub(4);
+                let badge =
+                    pr.map(|(standing, look)| (format!(" {}", standing.label()), look.badge));
+                // The badge is billed before the text, as `pr_row::spans`
+                // does, so a long title shortens and the state never clips.
+                let badge_len = badge.as_ref().map_or(0, |(b, _)| b.chars().count());
+                let budget = (list_inner.width as usize)
+                    .saturating_sub(4)
+                    .saturating_sub(badge_len);
                 let shown = truncate(&item.text, budget);
                 let positions = visible_positions(&m.positions, &shown, &item.text);
+                let quiet = item.archived
+                    || matches!(item.standing, Some(crate::pull_request::Standing::Draft));
                 let mut spans = vec![Span::styled(glyph, Style::default().fg(glyph_color))];
                 spans.extend(path_highlight_spans(
                     &shown,
                     positions,
-                    item.archived,
+                    quiet,
                     sweep_ramp(status, th, app.animations),
                     app.sweep_phase(),
                     th,
                 ));
+                if let Some((badge, color)) = badge {
+                    spans.push(Span::styled(badge, Style::default().fg(color)));
+                }
                 render_row(f, row_area, spans, i == palette.selected, true, th);
             }
 
@@ -4577,15 +4597,16 @@ fn token_style(kind: crate::syntax::TokenKind, th: Theme) -> Style {
 }
 
 /// Palette row text: dim `parent/path/` prefix, normal leaf segment, with
-/// fuzzy-match chars lit accent-bold on top. Archived rows stay dim all
-/// the way through. With a `ramp`, the leaf segment — the entity's own
-/// name, the very text that sweeps in its panel row — rides the same
+/// fuzzy-match chars lit accent-bold on top. A `quiet` row — archived, or
+/// a draft pull request, dimmed end to end like its panel row — stays dim
+/// all the way through. With a `ramp`, the leaf segment — the entity's
+/// own name, the very text that sweeps in its panel row — rides the same
 /// left-to-right band; matched chars keep the accent highlight so the
 /// sweep never buries what the query hit.
 fn path_highlight_spans(
     shown: &str,
     positions: &[usize],
-    archived: bool,
+    quiet: bool,
     ramp: Option<[Color; 3]>,
     phase: usize,
     th: Theme,
@@ -4602,7 +4623,7 @@ fn path_highlight_spans(
     for (i, c) in shown.chars().enumerate() {
         let style = if positions.binary_search(&i).is_ok() {
             hl
-        } else if archived || i < boundary {
+        } else if quiet || i < boundary {
             Style::default().fg(th.dim)
         } else if let Some(ramp) = ramp {
             sweep_style(Style::default(), ramp, phase, i - boundary, leaf_len)
