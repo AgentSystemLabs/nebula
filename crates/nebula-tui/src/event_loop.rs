@@ -2080,6 +2080,22 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             }
         }
         Action::MoveUp => move_selection(app, -1, out),
+        // Ctrl+d / Ctrl+u jump the Worktrees cursor half a panel at a time
+        // — the one column that routinely outgrows its height once the
+        // OPEN PRS group is open — through checkouts and pull requests
+        // alike, stopping at either end; the draw then scrolls the list
+        // after the cursor exactly as it does for a single step, so the
+        // row landed on is always in view. That panel only: a locked pane
+        // never gets here (the chords are the shell's EOF and
+        // kill-to-start), every line editor keeps ^u for itself, and the
+        // other panels are short enough that the keys stay unclaimed there.
+        Action::HalfPageDown if app.focus == Focus::Worktrees => {
+            move_selection(app, app.worktrees_half_page() as i64, out)
+        }
+        Action::HalfPageUp if app.focus == Focus::Worktrees => {
+            move_selection(app, -(app.worktrees_half_page() as i64), out)
+        }
+        Action::HalfPageDown | Action::HalfPageUp => {}
         Action::Activate => match app.focus {
             // The cursor already IS the open workspace; Enter steps into it.
             Focus::Workspaces => app.focus = app.first_sidebar_focus(),
@@ -9512,6 +9528,11 @@ mod tests {
         );
     }
 
+    /// A control chord pressed wherever the cursor is: `ctrl(app, 'd', out)`.
+    fn ctrl(app: &mut App, c: char, out: &mut Vec<ClientRequest>) {
+        press(app, KeyCode::Char(c), KeyModifiers::CONTROL, out);
+    }
+
     /// The open pull requests take the rows *after* the checkouts, which is
     /// what lets every "index into visible_worktrees()" in the app stay
     /// correct: a cursor on a PR row simply has no selected worktree.
@@ -9563,6 +9584,134 @@ mod tests {
         press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert_eq!(app.focus, Focus::Sessions);
+    }
+
+    /// Ctrl+d / Ctrl+u walk the Worktrees column half a panel at a time:
+    /// half the pill rows the last draw had room for, across the checkouts
+    /// and the OPEN PRS rows as one list, clamped at both ends rather than
+    /// wrapping. The draw re-anchors the scroll on the cursor, so the row
+    /// landed on is what the column shows.
+    #[test]
+    fn ctrl_d_and_ctrl_u_jump_the_worktrees_cursor_half_a_panel() {
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 / w1(main) / a1
+        let prs: Vec<(u64, String)> = (1..=10).map(|n| (n, format!("PR {n}"))).collect();
+        let prs: Vec<(u64, &str)> = prs.iter().map(|(n, t)| (*n, t.as_str())).collect();
+        seed_open_prs(&mut app, &prs);
+        assert_eq!(app.worktree_row_count(), 11, "one checkout + ten PRs");
+        app.focus = Focus::Worktrees;
+        // A column with room for six pills: half a page is three rows.
+        app.worktrees_view_rows = 6;
+        app.worktrees_anchor = Some((app.sel_project, app.sel_worktree));
+        let mut out = Vec::new();
+
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(app.sel_worktree, 3, "half a panel down");
+        assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(3));
+        ctrl(&mut app, 'd', &mut out);
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(app.sel_worktree, 9);
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(app.sel_worktree, 10, "stops at the last row");
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(app.sel_worktree, 10, "and stays there — no wrap");
+
+        ctrl(&mut app, 'u', &mut out);
+        assert_eq!(app.sel_worktree, 7, "half a panel up");
+        ctrl(&mut app, 'u', &mut out);
+        ctrl(&mut app, 'u', &mut out);
+        assert_eq!(app.sel_worktree, 1);
+        ctrl(&mut app, 'u', &mut out);
+        assert_eq!(app.sel_worktree, 0, "stops at the first row");
+        assert!(app.selected_worktree().is_some(), "row 0 is the checkout");
+        ctrl(&mut app, 'u', &mut out);
+        assert_eq!(app.sel_worktree, 0);
+
+        // Walking into the PR rows never touched the pane: a pull request
+        // has no sessions of its own, so nothing was detached.
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::Detach { .. })),
+            "the pane is left alone: {out:?}"
+        );
+    }
+
+    /// Before the column has been drawn — or squeezed to a row or two —
+    /// there is no page to halve, and the keys still move: one row, like
+    /// `j`/`k`. And like `↓`, a jump off the last checkout into a folded
+    /// OPEN PRS group opens it onto its first pull request.
+    #[test]
+    fn a_half_page_is_never_less_than_a_row_and_opens_a_folded_pr_group() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Number the lines")]);
+        app.focus = Focus::Worktrees;
+        assert_eq!(app.worktrees_view_rows, 0, "nothing drawn yet");
+        assert_eq!(app.worktrees_half_page(), 1);
+        let mut out = Vec::new();
+
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(app.sel_worktree, 1, "one row, the group being open");
+        ctrl(&mut app, 'u', &mut out);
+        assert_eq!(app.sel_worktree, 0);
+
+        app.open_prs_collapsed = true;
+        assert_eq!(app.worktree_row_count(), 1, "folded: the checkout alone");
+        ctrl(&mut app, 'd', &mut out);
+        assert!(
+            !app.open_prs_collapsed,
+            "Ctrl+d off the last checkout unfolds"
+        );
+        assert_eq!(app.sel_worktree, 1, "onto the first pull request");
+        assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+    }
+
+    /// The half-page chords belong to the Worktrees column alone. Every
+    /// other panel leaves them unclaimed as before, and a locked pane
+    /// forwards them to the PTY as the control bytes they are — Ctrl+d is
+    /// the shell's EOF and Ctrl+u its kill-to-start, and an agent running
+    /// in there is owed both.
+    #[test]
+    fn half_page_chords_stay_out_of_the_other_panels_and_the_locked_pane() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Number the lines")]);
+        app.worktrees_view_rows = 6;
+        let mut out = Vec::new();
+
+        for focus in [Focus::Projects, Focus::Sessions] {
+            app.focus = focus;
+            let before = (app.sel_project, app.sel_worktree, app.sel_session);
+            ctrl(&mut app, 'd', &mut out);
+            ctrl(&mut app, 'u', &mut out);
+            assert_eq!(
+                (app.sel_project, app.sel_worktree, app.sel_session),
+                before,
+                "{focus:?}: no cursor moved"
+            );
+            assert!(app.overlay.is_none(), "{focus:?}: nothing opened");
+        }
+
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            80,
+            24,
+        ));
+        out.clear();
+        ctrl(&mut app, 'd', &mut out);
+        assert!(
+            matches!(out.last(), Some(ClientRequest::Input { data, .. }) if data == b"\x04"),
+            "^d reaches the PTY as EOF: {out:?}"
+        );
+        ctrl(&mut app, 'u', &mut out);
+        assert!(
+            matches!(out.last(), Some(ClientRequest::Input { data, .. }) if data == b"\x15"),
+            "^u reaches the PTY as kill-to-start: {out:?}"
+        );
+        assert_eq!(app.sel_worktree, 0, "the Worktrees cursor never moved");
+        assert!(app.term_locked, "and the lock held");
     }
 
     /// A second click on a pull request opens it; one click only selects —

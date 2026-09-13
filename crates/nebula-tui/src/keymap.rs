@@ -57,6 +57,8 @@ pub enum Action {
     FocusTerminal,
     MoveDown,
     MoveUp,
+    HalfPageDown,
+    HalfPageUp,
     Activate,
     Palette,
     /// `]`: the next session in the PALETTE's attention order, no modal.
@@ -202,6 +204,24 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["k", "up"],
+    },
+    ActionSpec {
+        action: Action::HalfPageDown,
+        id: "half_page_down",
+        label: "Half page down",
+        hint: "In the Worktrees panel, jump the selection down by half the rows the column shows — checkouts and open pull requests alike — stopping at the end",
+        group: "NAVIGATE",
+        scope: Scope::Global,
+        defaults: &["ctrl+d"],
+    },
+    ActionSpec {
+        action: Action::HalfPageUp,
+        id: "half_page_up",
+        label: "Half page up",
+        hint: "In the Worktrees panel, jump the selection up by half the rows the column shows, stopping at the first row",
+        group: "NAVIGATE",
+        scope: Scope::Global,
+        defaults: &["ctrl+u"],
     },
     ActionSpec {
         action: Action::Activate,
@@ -1180,6 +1200,26 @@ mod tests {
             map.lookup(Scope::Global, &KeyChord::parse("q").unwrap()),
             Some(Action::Quit)
         );
+    }
+
+    /// ^d / ^u are panel chords only: a locked pane must keep forwarding
+    /// them as the shell's EOF and kill-to-start, so the Terminal scope
+    /// never answers to them.
+    #[test]
+    fn half_page_chords_are_bound_in_the_panels_and_not_the_locked_pane() {
+        let map = Keymap::default();
+        let ctrl_d = KeyChord::parse("ctrl+d").unwrap();
+        let ctrl_u = KeyChord::parse("ctrl+u").unwrap();
+        assert_eq!(
+            map.lookup(Scope::Global, &ctrl_d),
+            Some(Action::HalfPageDown)
+        );
+        assert_eq!(map.lookup(Scope::Global, &ctrl_u), Some(Action::HalfPageUp));
+        assert_eq!(map.lookup(Scope::Terminal, &ctrl_d), None);
+        assert_eq!(map.lookup(Scope::Terminal, &ctrl_u), None);
+        // Plain, kitty-free control bytes: every emulator delivers them.
+        assert!(host_warning(&ctrl_d).0.is_fine());
+        assert!(host_warning(&ctrl_u).0.is_fine());
     }
 
     #[test]

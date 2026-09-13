@@ -1,0 +1,5 @@
+# Two Ctrl+d from the top of the WORKTREES PANEL: each jumps half the column's rows, the list
+# scrolling after the cursor into the OPEN PRS group.
+Tab
+C-d
+C-d
