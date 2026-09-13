@@ -279,6 +279,7 @@ mod tests {
                     model: None,
                     effort: None,
                     preset: None,
+                    issue: None,
                 },
                 text: "typed so far".into(),
             };

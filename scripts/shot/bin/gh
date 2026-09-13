@@ -8,6 +8,8 @@ real repository. Anything else is "couldn't ask" (exit 1) — exactly what nebul
   gh pr view <n> --json …                 → fixtures/pr-<n>.json, else exit 1
   gh pr diff <n>                          → fixtures/pr-<n>.diff, else exit 1
   gh api user --jq .login                 → fixtures/user (a login on one line), else "shot-user"
+  gh issue list --state open … --json …   → fixtures/issue-list.json
+  gh issue view <n> --json …              → fixtures/issue-<n>.json, else exit 1
 """
 import os
 import sys
@@ -35,6 +37,11 @@ def main(argv):
     if argv[:2] == ["pr", "diff"]:
         number = next((a for a in argv[2:] if a.isdigit()), None)
         return emit("pr-%s.diff" % number) if number else 1
+    if argv[:2] == ["issue", "list"]:
+        return emit("issue-list.json")
+    if argv[:2] == ["issue", "view"]:
+        number = next((a for a in argv[2:] if a.isdigit()), None)
+        return emit("issue-%s.json" % number) if number else 1
     if argv[:2] == ["api", "user"]:
         path = os.path.join(FIX, "user")
         print(open(path).read().strip() if os.path.isfile(path) else "shot-user")

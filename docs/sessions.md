@@ -130,3 +130,35 @@ and brings that checkout's session back into the pane, `↑/↓` then stop at th
 still finds every pull request either way. Stepping `↓` off the last checkout into a folded group
 opens it onto its first pull request rather than stopping at the header. The fold is remembered
 across restarts, like the ARCHIVED toggle.
+
+## The ISSUES MODAL and ISSUE SESSIONS
+
+`i` from any panel lists the selected PROJECT's open GitHub issues — `gh issue list`, newest first,
+pull requests left out — down the left of a modal, and reads the one under the cursor on the right:
+number and title, who opened it and when, its labels, the description as plain wrapped text, and,
+once the cursor has rested on the row for a moment, its comments (`gh issue view`, one call per issue
+you actually stop on, remembered for the session). `o` opens the issue in the browser and `r` asks
+GitHub again; a machine with no `gh`, or one that is not logged in, gets a line saying so in the pane
+rather than an empty modal. The rows are kept for the session, so reopening the modal paints at
+once while the fresh list lands underneath — and the cursor stays on the issue it was on, by URL,
+when a refresh retires a row above it.
+
+Two keys put an agent on the issue. `Enter` (or `p`) opens the QUICK PROMPT for it — the same box
+`p` opens anywhere, titled `Quick prompt · issue #15 (claude · opus)`, launching the `Agent` row's
+harness from Settings → Agents into the selected worktree (or the PROJECT's ROOT WORKTREE when the
+cursor is not on one of its checkouts). `e` opens the AGENT PRESETS list as a picker instead, and
+`Enter` on a preset hands the same box back with that preset's harness, model, effort and
+prefix/postfix applied. Inside the box `Tab` and `Shift+Tab` still switch the harness or the preset
+and `Ctrl+N` still flips to a fresh worktree — named `issue-15-fix-login-redirect` here, the number
+first and the title slugified, rather than a random name — and the issue survives every one of those
+round trips. Send the box empty and the task is `Fix GitHub issue #15: <title> (<url>)`.
+
+Either way the launch is an ISSUE SESSION. The create carries the issue's URL
+(`CreateAgent::issue_url`); the DAEMON validates it, keeps it with the AGENT row beside a PR
+SESSION's URL, refuses to hand the launch to a PREWARM POOL spare (which booted without it), and on
+every cold spawn and RESUME composes an issue-context rule naming the URL, the checkout and its
+branch — Claude and Pi receive it through `--append-system-prompt`, Codex and Cursor as the opening
+of their first prompt, exactly as the PR rule travels. The harness therefore knows which issue the
+session exists for before it reads your task, is told to read the issue with `gh issue view` first,
+and to reference it in commits and close it from the pull request. The row it creates is an
+ordinary agent from then on: auto-title, hooks, status, resume.

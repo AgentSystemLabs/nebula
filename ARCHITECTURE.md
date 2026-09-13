@@ -31,6 +31,8 @@ Worktrees can still carry a persisted **link list** from earlier versions: URLs 
 
 The WORKTREES PANEL's PROJECT OPEN PRS GROUP has a separate creation path: `n`, `m`, or right-click can create a local Claude SESSION for the selected PR. Because that row has no checkout of its own, the AGENT starts in the PROJECT's ROOT WORKTREE. The TUI sends `CreatePrAgent` with the PR URL; the daemon validates and stores it, refuses to adopt a PREWARM POOL process that started without the constraint, and composes the URL plus the PR-only work rule into Claude's existing `--append-system-prompt`. Every later cold spawn or RESUME rebuilds the same system prompt from SQLite.
 
+The ISSUES MODAL (`i`) is the same idea for GitHub issues: the TUI lists the selected project's open issues with `gh issue list`, reads one with `gh issue view`, and launches a QUICK PROMPT or an AGENT PRESET on it. That create is an ordinary `CreateAgent` carrying `issue_url`; the daemon validates it, stores it in its own column beside `pr_url`, skips PREWARM POOL adoption, and folds an issue-context rule (URL, checkout, branch) into the same launch prompts the PR rule uses — Claude and Pi's appended system prompt, a Codex / Cursor cold spawn's first prompt — on every spawn and RESUME.
+
 ## How the pieces talk
 
 ```

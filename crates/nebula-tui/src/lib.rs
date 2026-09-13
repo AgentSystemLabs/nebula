@@ -13,6 +13,7 @@ pub mod git_diff;
 pub mod grep_search;
 pub mod hosts;
 pub mod ipc;
+pub mod issues;
 pub mod keymap;
 pub mod keys;
 pub mod links;

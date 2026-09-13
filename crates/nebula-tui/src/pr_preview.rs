@@ -82,7 +82,7 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
 /// Every line this module emits goes through here or through [`wrap`];
 /// ratatui silently clips an overwide line, taking the rest of the row with
 /// it, so "it'll probably fit" is not good enough.
-fn fit(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+pub(crate) fn fit(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
     let mut kept: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
     for span in spans {

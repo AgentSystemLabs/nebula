@@ -1,0 +1,87 @@
+[
+ {
+  "number": 61,
+  "url": "https://github.com/AgentSystemLabs/demo/issues/61",
+  "title": "Quick prompt loses its text when the preset picker is cancelled",
+  "author": {
+   "login": "takeyamakenta"
+  },
+  "createdAt": "2026-09-11T08:12:00Z",
+  "updatedAt": "2026-09-11T14:02:00Z",
+  "labels": [
+   {
+    "name": "bug"
+   },
+   {
+    "name": "quick-prompt"
+   }
+  ],
+  "body": "Open `p`, type a task, press `Shift+Tab`, then `Esc`.\n\nExpected: the box comes back with the text.\nActual: the box comes back empty about one time in five \u2014 it looks like a race with the git poll repainting the overlay.\n\n### Steps to reproduce\n1. `p`\n2. type `fix the login redirect`\n3. `Shift+Tab`, `Esc`\n\nnebula 0.26.0, Ghostty 1.2, macOS 15."
+ },
+ {
+  "number": 60,
+  "url": "https://github.com/AgentSystemLabs/demo/issues/60",
+  "title": "Japanese IME composition renders at the terminal edge inside the embedded PTY",
+  "author": {
+   "login": "mkoba"
+  },
+  "createdAt": "2026-09-10T22:40:00Z",
+  "updatedAt": "2026-09-11T09:15:00Z",
+  "labels": [
+   {
+    "name": "bug"
+   },
+   {
+    "name": "terminal"
+   }
+  ],
+  "body": "While text is still being composed by the IME, the preedit string is drawn near the edge of the host terminal instead of at the cursor inside the pane. Committed CJK text renders fine.\n\nReproducible with a plain `cat`, so it is not specific to any agent CLI."
+ },
+ {
+  "number": 58,
+  "url": "https://github.com/AgentSystemLabs/demo/issues/58",
+  "title": "Hide draft pull requests from the OPEN PRS group",
+  "author": {
+   "login": "webdevcody"
+  },
+  "createdAt": "2026-09-09T17:05:00Z",
+  "updatedAt": "2026-09-10T11:00:00Z",
+  "labels": [
+   {
+    "name": "enhancement"
+   }
+  ],
+  "body": "A setting to leave drafts out of the group entirely \u2014 some repos have dozens of WIP drafts and the rows asking for a reviewer get buried."
+ },
+ {
+  "number": 55,
+  "url": "https://github.com/AgentSystemLabs/demo/issues/55",
+  "title": "`nebula upgrade` should print the release notes it is about to install",
+  "author": {
+   "login": "jsato"
+  },
+  "createdAt": "2026-09-07T13:30:00Z",
+  "updatedAt": "2026-09-07T13:30:00Z",
+  "labels": [],
+  "body": ""
+ },
+ {
+  "number": 52,
+  "url": "https://github.com/AgentSystemLabs/demo/issues/52",
+  "title": "Memory modal: sort rows by RSS",
+  "author": {
+   "login": "webdevcody"
+  },
+  "createdAt": "2026-09-05T09:00:00Z",
+  "updatedAt": "2026-09-06T10:10:00Z",
+  "labels": [
+   {
+    "name": "enhancement"
+   },
+   {
+    "name": "good first issue"
+   }
+  ],
+  "body": "Right now the rows follow the sidebar order. When something is leaking, the biggest process tree should be at the top."
+ }
+]

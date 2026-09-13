@@ -49,6 +49,7 @@ dot on a collapsed PROJECT tells you exactly where to look without opening anyth
 | **Real git WORKTREES, one keystroke** | `n` in the WORKTREES PANEL branches off into an actual `git worktree`. Two agents in two directories never collide. A WORKTREE HOOK in git config lets a project claim a port or a route when a checkout is created and release it when it is deleted. |
 | **Agents that drive nebula back** | Tell a Claude SESSION *"do this in a worktree"* and it runs `nebula worktree`, then restarts itself resumed inside the new checkout. Say *"show me the file"* and `nebula open` puts it in front of you in a tabbed modal. Say *"start a new nebula session that…"* and `nebula spawn` has a second agent working beside it before you look. |
 | **Every open pull request, in place** | nebula asks `gh` what's still open on the repo. Rest on a PR ROW and the PR PREVIEW reads it to you — description, stats, the whole conversation. `g` for its diff, `Enter` for the browser, `n` for a SESSION on any harness, scoped to that PR. |
+| **Every open issue, one key from an agent** | `i` lists the project's open GitHub issues, newest first, and reads the one under the cursor — description, labels, comments. `Enter` opens a QUICK PROMPT for it, `e` launches one of your AGENT PRESETS on it; the issue's URL travels with the session as context on every spawn, so the harness knows what it is fixing. |
 | **Diff, find, grep, browse** | `g` opens the DIFF VIEWER with REVIEWED MARKS, `f` the FILE FINDER, `F` a `git grep`, `b` the TREE BROWSER — all scoped to the selected WORKTREE, all one key from anywhere. |
 | **`/` finds anything, anywhere** | The PALETTE spans every WORKSPACE, not just the open one. Before you type it sorts by attention: NEEDS FEEDBACK first, then RUNNING, then UNSEEN — so `/` `Enter` is the fastest way back to whatever needs you, and `]` / `[` cycle that same attention order with no modal at all, one session per press, workspaces included. |
 | **It follows you to other machines** | `nebula ssh <host>` opens nebula there, installing it if missing. `nebula tunnel <host>` puts that machine's TUI in a browser tab over a single ssh tunnel. |
@@ -165,7 +166,7 @@ is open.
 |---|---|
 | [**Keys**](docs/keys.md) | Every default binding, the WORKTREE views (`g` `f` `F` `b`), and the mouse. All of it rebindable. |
 | [**Commands**](docs/commands.md) | The `nebula` CLI: `add`, `rename`, `worktree`, `spawn`, `workspace`, `ssh`, `tunnel`, `browser`, `daemon`, `kill`, `upgrade`. |
-| [**Sessions**](docs/sessions.md) | The NEW SESSION PICKER, MODEL / EFFORT, Claude Cloud and the CLOUD MIRROR, AGENT PRESETS, the PROJECT OPEN PRS group. |
+| [**Sessions**](docs/sessions.md) | The NEW SESSION PICKER, MODEL / EFFORT, Claude Cloud and the CLOUD MIRROR, AGENT PRESETS, the PROJECT OPEN PRS group, the ISSUES MODAL. |
 | [**Configuration**](docs/configuration.md) | `config.json`, the SETTINGS OVERLAY, the HOTKEYS TAB, logs and environment overrides. |
 | [**How it works**](docs/how-it-works.md) | The DAEMON, the hook dialects, AUTO-TITLE, WORKTREE RELOCATION, prewarm and reaping, persistence. |
 | [**Architecture**](ARCHITECTURE.md) | Process model, the IPC CODEC and the crate layout. |

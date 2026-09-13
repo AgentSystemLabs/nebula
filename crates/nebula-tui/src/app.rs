@@ -1234,6 +1234,8 @@ pub enum Overlay {
     AgentPresets(crate::preset_overlays::AgentPresetsView),
     /// The PRESET EDITOR form behind the list's `a` / `e`.
     AgentPresetEditor(crate::preset_overlays::AgentPresetEditor),
+    /// `i`: the ISSUES MODAL — the project's open GitHub issues.
+    Issues(crate::issues::IssuesView),
 }
 
 /// Rows optimistically removed for an in-flight DeleteWorktree, kept so an
@@ -2342,6 +2344,27 @@ pub struct App {
     /// fetches a fresh copy over the top, as it would fetch a missing one,
     /// and the answer takes the URL out of here.
     pub pr_detail_stale: std::collections::HashSet<String>,
+    /// What `gh issue list` last said about each project's open issues —
+    /// the ISSUES MODAL's rows, kept for the session so reopening paints
+    /// at once while the fresh answer lands. Asked only when the modal
+    /// opens (and on its `r`), never on a beat.
+    pub issues: HashMap<ProjectId, crate::issues::IssueList>,
+    /// Projects with a list lookup in flight, and ones whose first ask
+    /// `gh` couldn't answer (the modal says so rather than spinning).
+    pub issues_inflight: std::collections::HashSet<ProjectId>,
+    pub issues_failed: std::collections::HashSet<ProjectId>,
+    /// The conversations of the issues the cursor has rested on, keyed by
+    /// URL; in flight and failed like the pull requests'.
+    pub issue_detail: HashMap<String, crate::issues::IssueDetail>,
+    pub issue_detail_inflight: std::collections::HashSet<String>,
+    pub issue_detail_failed: std::collections::HashSet<String>,
+    /// Debounced comments fetch: the issue under the cursor and when its
+    /// lookup is due, re-armed on every move.
+    pub pending_issue_detail: Option<(crate::issues::PendingIssueDetail, std::time::Instant)>,
+    /// Where a finished `gh issue …` is sent back to the loop; installed at
+    /// startup like `pr_diff_tx`, so the modal's own handlers can start a
+    /// fetch. `None` in the unit tests, which then never spawn one.
+    pub issues_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::issues::IssuesAnswer>>,
     /// Latest daemon metrics reading (daemon + per-session process trees),
     /// for the footer's memory/session readout. Refreshed on a slow poll;
     /// the metrics modal shares the same replies at a faster cadence.
@@ -2463,6 +2486,14 @@ impl App {
             pr_cache: None,
             pr_cache_dirty: false,
             pr_detail_stale: std::collections::HashSet::new(),
+            issues: HashMap::new(),
+            issues_inflight: std::collections::HashSet::new(),
+            issues_failed: std::collections::HashSet::new(),
+            issue_detail: HashMap::new(),
+            issue_detail_inflight: std::collections::HashSet::new(),
+            issue_detail_failed: std::collections::HashSet::new(),
+            pending_issue_detail: None,
+            issues_tx: None,
             last_metrics: None,
             client_rss_bytes: 0,
             splash_epoch: std::time::Instant::now(),
@@ -3150,6 +3181,12 @@ impl App {
     /// the cursor isn't resting on a pull request that still needs one.
     pub fn pr_detail_delay(&self) -> Option<std::time::Duration> {
         let (_, at) = self.pending_pr_detail.as_ref()?;
+        Some(at.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// The same for the ISSUES MODAL's debounced comments fetch.
+    pub fn issue_detail_delay(&self) -> Option<std::time::Duration> {
+        let (_, at) = self.pending_issue_detail.as_ref()?;
         Some(at.saturating_duration_since(std::time::Instant::now()))
     }
 

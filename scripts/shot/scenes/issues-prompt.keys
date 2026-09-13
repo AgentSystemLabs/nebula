@@ -1,0 +1,4 @@
+# Enter on an issue opens the QUICK PROMPT for it; Ctrl+N flips it into a fresh worktree named after the issue.
+i
+Enter
+C-n

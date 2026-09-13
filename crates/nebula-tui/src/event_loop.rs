@@ -295,6 +295,12 @@ async fn main_loop(
     // refreshes the one already open on the cached copy.
     let (prdiff_tx, mut prdiff_rx) = tokio::sync::mpsc::unbounded_channel::<PrDiffAnswer>();
     app.pr_diff_tx = Some(prdiff_tx);
+    // The ISSUES MODAL's `gh issue list` / `gh issue view` answers, on the
+    // same footing: the modal's own handlers start the fetch, the loop
+    // lands it.
+    let (issues_tx, mut issues_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::issues::IssuesAnswer>();
+    app.issues_tx = Some(issues_tx);
     // A newer nebula published on GitHub, probed off the loop at start and
     // then on a slow beat (`update_check::interval`; the e2e tests turn it
     // off). Only a newer version ever arrives, so the footer's indicator,
@@ -507,6 +513,17 @@ async fn main_loop(
             answer = prdiff_rx.recv() => {
                 if let Some(answer) = answer {
                     land_pr_diff(&mut app, answer);
+                }
+            }
+            // The ISSUES MODAL's hover debounce: the cursor has rested on
+            // an issue long enough to fetch its comments.
+            _ = tokio::time::sleep(app.issue_detail_delay().unwrap_or(Duration::MAX)),
+                if app.issue_detail_delay().is_some() => {
+                crate::issues::lookup_detail(&mut app);
+            }
+            answer = issues_rx.recv() => {
+                if let Some(answer) = answer {
+                    crate::issues::land_answer(&mut app, answer);
                 }
             }
         }
@@ -2017,6 +2034,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::Hosts => open_hosts_picker(app),
         Action::AgentPresets => crate::preset_overlays::open_agent_presets(app),
         Action::QuickPrompt => crate::quick_prompt::open_quick_prompt(app),
+        Action::Issues => crate::issues::open_issues(app),
         // Ctrl+→ still reaches the terminal pane (the counterpart of the
         // Ctrl+← escape hatch).
         Action::FocusTerminal => {
@@ -3737,6 +3755,7 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
         }
         Overlay::AgentPresets(_) => crate::preset_overlays::handle_list_key(app, key),
         Overlay::AgentPresetEditor(_) => crate::preset_overlays::handle_editor_key(app, key),
+        Overlay::Issues(_) => crate::issues::handle_key(app, key),
         Overlay::Menu(menu) => match key.code {
             // Type-ahead in the MODEL / EFFORT submenus: letters narrow the
             // rows (so ↑/↓ move there, not j/k), Backspace widens, and Esc
@@ -4668,6 +4687,13 @@ fn save_panel_visibility(app: &mut App) {
 
 fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientRequest>) {
     let value = prompt.input.trim().to_string();
+    // An ISSUE SESSION's box may be sent empty: the issue is the task.
+    let value = match &prompt.kind {
+        PromptKind::QuickPrompt(launch) if value.is_empty() => {
+            launch.default_task().unwrap_or(value)
+        }
+        _ => value,
+    };
     // A cloud session cannot start without its task. Keep the multiline
     // dialog open on validation so the user can correct it in place (the
     // QUICK PROMPT opts out of the empty half of that — see below).
@@ -4828,6 +4854,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                         starting_prompt: None,
                         reopen_on_error: None,
                         pr,
+                        issue_url: None,
                         focus_pane: true,
                         placeholder: None,
                     },
@@ -4852,6 +4879,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 starting_prompt: None,
                 reopen_on_error: None,
                 pr: None,
+                issue_url: None,
                 focus_pane: true,
                 placeholder: None,
             },
@@ -4885,6 +4913,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                         value,
                     )),
                     pr: None,
+                    issue_url: None,
                     focus_pane: true,
                     placeholder: None,
                 },
@@ -5149,7 +5178,8 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     model.filter(|m| m != "default"),
                     effort.filter(|e| e != "default"),
                     &crate::config::Config::load(),
-                );
+                )
+                .with_issue(back.launch.issue.clone());
                 crate::quick_prompt::reopen(app, launch, &back.text);
                 return;
             }
@@ -5199,6 +5229,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                             starting_prompt: None,
                             reopen_on_error: None,
                             pr,
+                            issue_url: None,
                             focus_pane: true,
                             placeholder: None,
                         },
@@ -6202,6 +6233,10 @@ struct AgentLaunchDraft {
     /// OPEN PRS launch context: this launch is a PR SESSION, scoped to that
     /// pull request and run in a checkout of its head branch.
     pr: Option<crate::pull_request::PrLaunch>,
+    /// ISSUES MODAL launch context: this launch is an ISSUE SESSION, and
+    /// the DAEMON persists the URL as the row's context (see
+    /// `ClientRequest::CreateAgent::issue_url`).
+    issue_url: Option<String>,
     /// Enter and lock the TERMINAL PANE once the create is acked. True for
     /// every launch the user walked a picker to reach; the QUICK PROMPT
     /// passes the `quick_prompt_focus` SETTING, which is off by default.
@@ -6237,6 +6272,7 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
         starting_prompt,
         reopen_on_error,
         pr,
+        issue_url,
         focus_pane,
         placeholder,
     } = draft;
@@ -6319,6 +6355,7 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
             auto_title,
             cloud_prompt,
             starting_prompt,
+            issue_url,
         },
     });
     // The create consumes (or, off-spec, discards) the worktree's warm
@@ -6581,7 +6618,7 @@ fn copy_to_clipboard(text: &str) -> bool {
 /// Open a URL in the default browser via open(1) (this tool targets macOS).
 /// The scheme allowlist is defense in depth — the link scanner only ever
 /// produces http(s) URLs, but the text originates from untrusted PTY output.
-fn open_url(url: &str) -> bool {
+pub(crate) fn open_url(url: &str) -> bool {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return false;
     }
@@ -6959,6 +6996,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     }
     if matches!(&app.overlay, Some(Overlay::AgentPresets(_))) {
         crate::preset_overlays::handle_list_mouse(app, mouse, mouse_pos);
+        return;
+    }
+    if matches!(&app.overlay, Some(Overlay::Issues(_))) {
+        crate::issues::handle_mouse(app, mouse, mouse_pos);
         return;
     }
     // Hosts picker: the wheel moves the selection, a click on a row connects
@@ -25340,6 +25381,14 @@ diff --git a/src/c.rs b/src/c.rs
                 None,
             ),
             (
+                "Issues",
+                |app| {
+                    seed_tree(app);
+                    press(app, KeyCode::Char('i'), KeyModifiers::NONE, &mut Vec::new());
+                },
+                None,
+            ),
+            (
                 "Hosts",
                 |app| {
                     app.overlay = Some(Overlay::Hosts(crate::app::HostsView::new(vec![
@@ -25509,6 +25558,7 @@ diff --git a/src/c.rs b/src/c.rs
             Overlay::Hosts(_) => "Hosts",
             Overlay::AgentPresets(_) => "AgentPresets",
             Overlay::AgentPresetEditor(_) => "AgentPresetEditor",
+            Overlay::Issues(_) => "Issues",
         }
     }
 
@@ -25537,7 +25587,7 @@ diff --git a/src/c.rs b/src/c.rs
             let mut unique = seen.clone();
             unique.dedup();
             assert_eq!(unique, seen, "two rows for the same variant");
-            assert_eq!(seen.len(), 15, "a variant came or went: {seen:?}");
+            assert_eq!(seen.len(), 16, "a variant came or went: {seen:?}");
         });
     }
 
