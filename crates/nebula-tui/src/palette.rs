@@ -23,10 +23,15 @@ pub enum PaletteTarget {
     Project(ProjectId),
     Worktree(WorktreeId),
     Session(AgentId),
-    /// An open pull request on some project's repo, addressed by URL — the
+    /// An open pull request on `project`'s repo, addressed by URL — the
     /// only identity it has, since nothing about a PR is stored. Picking it
-    /// opens a browser instead of moving any panel cursor.
-    PullRequest(String),
+    /// lands the Worktrees cursor on its row in that project's OPEN PRS
+    /// group, so the pane reads it; the project is what says which
+    /// workspace to switch to and which group to unfold on the way.
+    PullRequest {
+        project: ProjectId,
+        url: String,
+    },
 }
 
 /// Where a `/` row sits before the query has said anything — the tiers of
@@ -350,7 +355,10 @@ fn build_palette_items(
             };
             for pr in &open.list {
                 items.push(PaletteItem {
-                    target: PaletteTarget::PullRequest(pr.url.clone()),
+                    target: PaletteTarget::PullRequest {
+                        project: p.id.clone(),
+                        url: pr.url.clone(),
+                    },
                     text: format!("{at}{}/{}", p.name, pr.label()),
                     archived: false,
                     status: None,
