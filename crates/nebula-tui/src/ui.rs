@@ -737,6 +737,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[Activate, Zoom]), "lock input (2nd: full-screen)"),
                         (Act(&[UnlockTerminal]), "unlock, back to panels"),
                         (Lit("drag"), "select + copy (2×click: word)"),
+                        (Lit("click / drag"), "an app that took the mouse gets it"),
                         (Lit("⌥click"), "open URL / file under cursor"),
                         (Lit("⇧drag"), "select via your terminal"),
                         (Lit("drag border"), "resize panels"),
@@ -4368,11 +4369,18 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 "session exited — Esc: back to sessions".to_string()
             }
             Focus::Terminal if app.term_locked => format!(
-                "{}: panels  drag: select+copy  ⌥click: open link",
+                "{}: panels  {}  ⌥click: open link",
                 app.keymap
                     .first(Action::UnlockTerminal)
                     .map(|c| c.display())
                     .unwrap_or_else(|| "^q".into()),
+                // A program that asked for the mouse gets the drag (its
+                // own selection copies); promising nebula's would lie.
+                if app.child_mouse_mode().0 != vt100::MouseProtocolMode::None {
+                    "drag: to the app (⇧drag: terminal)"
+                } else {
+                    "drag: select+copy"
+                },
             ),
             Focus::Terminal if app.term.is_some() => format!(
                 "{}: type into terminal  {}: sessions",

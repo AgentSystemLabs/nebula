@@ -116,6 +116,16 @@ lists without touching the selection, and the PR PREVIEW scrolls three lines a n
 is resting on a pull request. Text selection: hold `Shift` while dragging (mouse capture bypass —
 same as tmux).
 
+A program that asked for the mouse itself — Claude Code's fullscreen renderer, vim with `mouse=a`,
+htop, tmux with its mouse on — gets the left button the way a plain terminal hands it over: the
+press, the drag and the release all reach it, and its own selection does the copying. Claude Code's
+knows that its `/diff` panel sits beside the conversation; a screen-row copy of nebula's took the
+panel along with the reply. nebula's own drag-select is for everything that never asked — a shell,
+Claude Code's classic renderer — and `Shift`-drag selects through the terminal either way. A copy
+the program sends its terminal as an OSC 52 write (Claude Code over `nebula ssh`, vim's OSC 52
+clipboard, tmux with `set-clipboard` on) is passed on to the terminal you are sitting at, the route
+nebula's own copy takes on a remote host.
+
 A host terminal can forget that it was asked for the mouse — iTerm2's Session ▸ Reset (`⌘R`) does,
 and so does a stray full reset — after which every click goes to the terminal and the wheel scrolls
 its own scrollback instead of the pane. nebula asks for the mouse (and bracketed paste, focus reports

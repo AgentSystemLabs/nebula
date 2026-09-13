@@ -1,0 +1,10 @@
+# A quick prompt on the root checkout launches the stand-in agent (see the .setup.sh), which asks for
+# the mouse. A click and then a drag typed into the pane reach it as SGR reports instead of arming
+# nebula's own drag-selection.
+Tab
+Tab
+p
+Copy a reply beside the diff panel
+Enter
+click 120 20
+drag 100 24 140 30

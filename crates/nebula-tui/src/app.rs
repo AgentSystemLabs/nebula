@@ -1745,9 +1745,30 @@ impl Tree {
     }
 }
 
+/// What the pane's terminal emulation reports back beyond the screen
+/// itself. One thing today: an OSC 52 clipboard write from the program in
+/// the pane — Claude Code's fullscreen renderer copying its own selection
+/// over ssh, vim's OSC 52 clipboard, tmux with `set-clipboard` on. In a
+/// plain terminal that write lands on the clipboard; here it lands in the
+/// emulation, so the parser parks it and the event loop passes it on to
+/// the terminal the user is sitting at (`App::pending_clipboard`, the route
+/// nebula's own copy takes on a remote host).
+#[derive(Debug, Default)]
+pub struct TermCallbacks {
+    /// Base64 payload of the latest OSC 52 write, until drained.
+    pub clipboard: Option<String>,
+}
+
+impl vt100::Callbacks for TermCallbacks {
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _ty: &[u8], data: &[u8]) {
+        // vt100 only gets here with a base64-clean payload.
+        self.clipboard = Some(String::from_utf8_lossy(data).into_owned());
+    }
+}
+
 pub struct AttachedTerm {
     pub sref: SessionRef,
-    pub parser: vt100::Parser,
+    pub parser: vt100::Parser<TermCallbacks>,
     pub exited: bool,
     /// Size the parser (and daemon PTY) currently uses.
     pub cols: u16,
@@ -1782,7 +1803,7 @@ impl AttachedTerm {
     pub fn new(sref: SessionRef, cols: u16, rows: u16) -> Self {
         Self {
             sref,
-            parser: vt100::Parser::new(rows, cols, 10_000),
+            parser: vt100::Parser::new_with_callbacks(rows, cols, 10_000, TermCallbacks::default()),
             exited: false,
             cols,
             rows,
@@ -1796,7 +1817,12 @@ impl AttachedTerm {
 
     /// Reset the parser (fresh replay is about to arrive).
     pub fn reset(&mut self) {
-        self.parser = vt100::Parser::new(self.rows, self.cols, 10_000);
+        self.parser = vt100::Parser::new_with_callbacks(
+            self.rows,
+            self.cols,
+            10_000,
+            TermCallbacks::default(),
+        );
         self.exited = false;
         self.scroll = 0;
         self.painted = false;
@@ -1869,6 +1895,12 @@ impl AttachedTerm {
     pub fn set_scroll(&mut self, scroll: usize) {
         self.scroll = scroll;
         self.parser.screen_mut().set_scrollback(scroll);
+    }
+
+    /// The program's latest OSC 52 clipboard write, if one arrived since the
+    /// last call (see `TermCallbacks`).
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.parser.callbacks_mut().clipboard.take()
     }
 }
 
@@ -2185,6 +2217,12 @@ pub struct App {
     pub next_keepwarm: Option<std::time::Instant>,
     /// Mouse drag-selection over the terminal pane, if any.
     pub term_selection: Option<TermSelection>,
+    /// The session whose program holds the left button: it asked for the
+    /// mouse (Claude Code's fullscreen renderer, vim `mouse=a`, htop), the
+    /// press on the pane went to it, and the drag and release that follow
+    /// go to it too — wherever the pointer has wandered by then. Cleared by
+    /// the release; a press on anything else starts over.
+    pub term_mouse_grab: Option<SessionRef>,
     /// Last left-click on the terminal pane (time + pane-relative cell), for
     /// double-click detection.
     pub last_term_click: Option<(std::time::Instant, (u16, u16))>,
@@ -2472,6 +2510,7 @@ impl App {
             attached_sref: None,
             next_keepwarm: None,
             term_selection: None,
+            term_mouse_grab: None,
             last_term_click: None,
             last_session_click: None,
             term_links: Vec::new(),
@@ -2758,6 +2797,26 @@ impl App {
         self.term
             .as_ref()
             .is_some_and(|t| self.is_placeholder_session(&t.sref))
+    }
+
+    /// The mouse protocol the program in the pane has asked for, and
+    /// whether it wants SGR coordinates. `None` when nothing there can take
+    /// a report: no session, one whose process has exited (its last screen
+    /// is still worth selecting from), a stand-in pane with no PTY behind
+    /// it, or a pull request showing in the pane instead of a terminal.
+    pub fn child_mouse_mode(&self) -> (vt100::MouseProtocolMode, bool) {
+        let mouseless = (vt100::MouseProtocolMode::None, false);
+        let Some(term) = &self.term else {
+            return mouseless;
+        };
+        if term.exited || self.pane_shows_placeholder() || self.previewed_pr().is_some() {
+            return mouseless;
+        }
+        let screen = term.parser.screen();
+        (
+            screen.mouse_protocol_mode(),
+            screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr,
+        )
     }
 
     /// Projects panel rows in display order, each an index into the FULL
