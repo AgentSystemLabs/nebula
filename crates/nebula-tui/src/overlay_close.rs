@@ -105,7 +105,7 @@ pub(crate) fn click_outside(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// of files an agent put in front of the user is not lost to the press
 /// that leaves one of them. Nothing can trap the user in it: the strip's
 /// Ctrl+Q is unconditional.
-pub(crate) fn force_close(app: &mut App, out: &mut Vec<ClientRequest>) -> bool {
+pub(crate) fn force_close(app: &mut App) -> bool {
     if let Some(Overlay::FileTabs(view)) = &mut app.overlay {
         if !view.on_tabs {
             view.on_tabs = true;
@@ -117,14 +117,6 @@ pub(crate) fn force_close(app: &mut App, out: &mut Vec<ClientRequest>) -> bool {
     };
     match overlay {
         Overlay::Settings(_) => crate::event_loop::close_settings(app),
-        // Abandoning a Claude name prompt can leave the warm slot holding
-        // the submenu's off-default spec (its prewarm fired on kind-pick);
-        // put the standing default spec back, as its Esc does.
-        Overlay::Prompt(prompt) => {
-            let restore = crate::event_loop::abandoned_prompt_prewarm(&prompt.kind);
-            app.overlay = None;
-            out.extend(restore);
-        }
         _ => app.overlay = None,
     }
     true

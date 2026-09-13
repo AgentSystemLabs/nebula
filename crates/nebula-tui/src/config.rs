@@ -292,8 +292,8 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
         body: TabBody::Values(&[
             SettingSpec {
                 kind: SettingKind::SkipSessionNaming,
-                label: "Skip session naming",
-                hint: "New agents skip the name prompt and take the auto-title the agent sets",
+                label: "Skip starting prompt",
+                hint: "New agents launch straight from the picker; type the first prompt in the CLI",
                 group: "",
             },
             SettingSpec {
@@ -678,10 +678,11 @@ pub struct Config {
     /// preview pane, or ⌥click, which has no overlay to close.
     pub close_finder_on_open: bool,
     /// Create new agent sessions straight from the kind picker, with no
-    /// name prompt: the session takes the generated default name and is
-    /// opted into agent-driven auto-titling, exactly as accepting an empty
-    /// prompt does. Off by default — naming a session is the deliberate
-    /// choice, and skipping it is opting out of that.
+    /// task box: the session takes the generated default name and
+    /// agent-driven auto-titling, and the first prompt is typed in the
+    /// CLI. Off by default — the box is the point of the picker. The key
+    /// predates the box: it once skipped a name prompt, which the box
+    /// replaced.
     pub skip_session_naming: bool,
     /// Put a CONFIRM DIALOG in front of archiving a session — the `a` key
     /// and the row menu's Archive alike. Off by default: archive is cheap

@@ -23,8 +23,6 @@ pub const AGENT_CMD: &str = "NEBULA_AGENT_CMD";
 pub const IDLE_REAP_MS: &str = "NEBULA_IDLE_REAP_MS";
 /// External-worktree sync probe period in ms; tests shorten it.
 pub const WORKTREE_SYNC_MS: &str = "NEBULA_WORKTREE_SYNC_MS";
-/// Cloud-mirror refresh cadence in seconds; `0` turns it off.
-pub const CLOUD_MIRROR_SECS: &str = "NEBULA_CLOUD_MIRROR_SECS";
 /// How long a WORKTREE HOOK may run before the daemon kills it, in ms
 /// (default 30s); tests shorten it.
 pub const HOOK_TIMEOUT_MS: &str = "NEBULA_HOOK_TIMEOUT_MS";

@@ -1879,7 +1879,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     // panels, the same promise it makes inside a LOCKED PANE.
     if app.overlay.is_some() {
         if crate::keymap::KeyChord::from_event(&key) == HARDWIRED_UNLOCK {
-            crate::overlay_close::force_close(app, out);
+            crate::overlay_close::force_close(app);
             return;
         }
         handle_overlay_key(app, key, out);
@@ -2157,8 +2157,12 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 None => app.focus = Focus::Sessions,
             },
             Focus::Sessions => attach_selected(app, out),
-            // Lock input into an already-focused live pane.
-            Focus::Terminal => enter_terminal_pane(app, out),
+            // Lock input into an already-focused live pane — or, with the
+            // CLOUD SESSION PANEL up, open the session it points at.
+            Focus::Terminal => match app.previewed_cloud() {
+                Some(cloud) => open_link(app, &cloud.url, out),
+                None => enter_terminal_pane(app, out),
+            },
         },
         // First run (or an empty workspace): with no visible projects every
         // panel is empty and the splash is up — New creates a project no
@@ -2359,7 +2363,7 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
             format!("branch name (empty = {suggestion})").into(),
             String::new(),
         ),
-        PromptKind::NewAgent { model, effort, .. } => {
+        PromptKind::NewPrAgent { model, effort, .. } => {
             // Surface the resolved launch options so Enter-with-defaults is
             // visibly what it is; plain "New agent" means CLI defaults.
             let opts: Vec<&str> = model
@@ -3211,7 +3215,22 @@ fn menu_items_for_link(row: &LinkRow) -> Vec<MenuItem> {
 }
 
 fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
-    let mut items = if a.archived {
+    // A Cloud row has no terminal to attach or restart: the agent runs in
+    // the cloud sandbox, so its verbs are the browser and the message
+    // queue, ahead of the row-keeping ones every session has.
+    if let Some(url) = a.cloud_session_url().filter(|_| !a.archived) {
+        return vec![
+            MenuItem::new("Open in browser", MenuAction::OpenLink(url)),
+            MenuItem::new(
+                "Send to cloud session",
+                MenuAction::SendCloudMessage(a.id.clone()),
+            ),
+            MenuItem::new("Rename", MenuAction::RenameAgent(a.id.clone())),
+            MenuItem::new("Archive", MenuAction::ArchiveAgent(a.id.clone())),
+            MenuItem::destructive("Delete", MenuAction::DeleteAgent(a.id.clone())),
+        ];
+    }
+    if a.archived {
         vec![
             MenuItem::new("Unarchive", MenuAction::UnarchiveAgent(a.id.clone())),
             MenuItem::destructive("Delete", MenuAction::DeleteAgent(a.id.clone())),
@@ -3227,31 +3246,7 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
             MenuItem::new("Archive", MenuAction::ArchiveAgent(a.id.clone())),
             MenuItem::destructive("Delete", MenuAction::DeleteAgent(a.id.clone())),
         ]
-    };
-    // A Cloud row can always be re-entered explicitly — even after a
-    // teleport made it a local session that Restart now resumes, a fresh
-    // attach/teleport picks up whatever the cloud side did since.
-    if !a.archived && a.cloud_session_id.is_some() {
-        let after_restart = items
-            .iter()
-            .position(|i| matches!(i.action, MenuAction::RestartAgent(_)))
-            .map_or(items.len(), |i| i + 1);
-        items.insert(
-            after_restart,
-            MenuItem::new(
-                "Attach cloud session",
-                MenuAction::AttachCloudAgent(a.id.clone()),
-            ),
-        );
-        items.insert(
-            after_restart + 1,
-            MenuItem::new(
-                "Send to cloud session",
-                MenuAction::SendCloudMessage(a.id.clone()),
-            ),
-        );
     }
-    items
 }
 
 fn menu_items_for_terminal(t: &nebula_core::TerminalTab) -> Vec<MenuItem> {
@@ -3281,8 +3276,9 @@ fn open_menu(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
 }
 
 /// Step 1 of new-session creation: pick which CLI the session runs. The
-/// kind chains into the name prompt via `MenuAction::NewAgentOfKind` —
-/// unless `skip_session_naming` is on, which creates it right there.
+/// kind chains into the NEW SESSION box (the QUICK PROMPT's, asking for
+/// the first prompt) via `MenuAction::NewAgentOfKind` — unless
+/// `skip_session_naming` is on, which creates it right there.
 /// Claude/Codex rows expand (→) into model and effort submenus; Enter
 /// anywhere takes the configured defaults for whatever wasn't drilled into.
 /// A plain TERMINAL SESSION is not offered here: NEW TERMINAL (`t`) and the
@@ -3885,7 +3881,6 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
         },
         Overlay::Prompt(prompt) => match key.code {
             KeyCode::Esc => {
-                let restore = abandoned_prompt_prewarm(&prompt.kind);
                 // Abandoning a preset's task goes back to the list it came
                 // from, on the same row, rather than to the panels.
                 let back_to_presets = match &prompt.kind {
@@ -3898,7 +3893,6 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 // keeps the old value and puts the overlay back on its row.
                 let back_to_settings = matches!(prompt.kind, PromptKind::SettingText { .. });
                 app.overlay = None;
-                out.extend(restore);
                 if back_to_settings {
                     reopen_settings(app);
                 } else if let Some((worktree, name)) = back_to_presets {
@@ -4861,18 +4855,19 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
     // An empty agent name falls back to the next free default (agent-1, …),
     // an empty worktree name to the random branch the prompt offered, an
     // empty project name undoes the rename — the row goes back to the
-    // folder's own name, which is the only way back from a rename — and an
+    // folder's own name, which is the only way back from a rename — an
     // empty typed setting is that row's default (`auto`), which is the only
-    // way back to it. For every other prompt an empty field is a cancel.
-    if value.is_empty()
-        && !matches!(
-            prompt.kind,
-            PromptKind::NewAgent { .. }
-                | PromptKind::NewWorktree { .. }
-                | PromptKind::RenameProject { .. }
-                | PromptKind::SettingText { .. }
-        )
-    {
+    // way back to it, and the NEW SESSION PICKER's empty box launches with
+    // no STARTING PROMPT. For every other prompt an empty field is a cancel.
+    let empty_is_a_default = match &prompt.kind {
+        PromptKind::NewPrAgent { .. }
+        | PromptKind::NewWorktree { .. }
+        | PromptKind::RenameProject { .. }
+        | PromptKind::SettingText { .. } => true,
+        PromptKind::QuickPrompt(launch) => launch.launches_empty(),
+        _ => false,
+    };
+    if value.is_empty() && !empty_is_a_default {
         app.flash = Some("cancelled: empty input".into());
         return;
     }
@@ -4939,45 +4934,30 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 },
             );
         }
-        PromptKind::NewAgent {
+        PromptKind::NewPrAgent {
             worktree,
             kind,
             model,
             effort,
-            cloud,
             pr,
-        } => {
-            if cloud {
-                open_prompt(
-                    app,
-                    PromptKind::ClaudeCloudTask {
-                        worktree,
-                        name: value,
-                        model,
-                        effort,
-                    },
-                );
-            } else {
-                create_agent(
-                    app,
-                    AgentLaunchDraft {
-                        worktree,
-                        kind,
-                        model,
-                        effort,
-                        name: value,
-                        cloud_prompt: None,
-                        starting_prompt: None,
-                        reopen_on_error: None,
-                        pr,
-                        issue_url: None,
-                        focus_pane: true,
-                        placeholder: None,
-                    },
-                    out,
-                );
-            }
-        }
+        } => create_agent(
+            app,
+            AgentLaunchDraft {
+                worktree,
+                kind,
+                model,
+                effort,
+                name: value,
+                cloud_prompt: None,
+                starting_prompt: None,
+                reopen_on_error: None,
+                pr: Some(pr),
+                issue_url: None,
+                focus_pane: true,
+                placeholder: None,
+            },
+            out,
+        ),
         PromptKind::ClaudeCloudTask {
             worktree,
             name,
@@ -5041,7 +5021,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             let intent = PendingIntent::ReopenPromptOnError {
                 kind: PromptKind::CloudMessage { id: id.clone() },
                 text: value.clone(),
-                note: "Sent to the cloud session — pulling the transcript".into(),
+                note: "Sent to the cloud session — the reply lands on its page".into(),
             };
             send_with(app, out, intent, |req_id| ClientRequest::SendCloudMessage {
                 req_id,
@@ -5241,12 +5221,6 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 id,
             });
         }
-        MenuAction::AttachCloudAgent(id) => {
-            send(app, out, |req_id| ClientRequest::AttachCloudAgent {
-                req_id,
-                id,
-            });
-        }
         MenuAction::SendCloudMessage(id) => open_prompt(app, PromptKind::CloudMessage { id }),
         MenuAction::RenameAgent(id) => open_prompt(app, PromptKind::RenameAgent { id }),
         MenuAction::ArchiveAgent(id) => {
@@ -5295,7 +5269,8 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     effort.filter(|e| e != "default"),
                     &crate::config::Config::load(),
                 )
-                .with_issue(back.launch.issue.clone());
+                .with_issue(back.launch.issue.clone())
+                .with_origin(back.launch.origin);
                 crate::quick_prompt::reopen(app, launch, &back.text);
                 return;
             }
@@ -5317,65 +5292,68 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 model.as_deref(),
                 resolve(effort, cfg.default_effort(kind)),
             );
-            // No name prompt means no typing window to warm through, so
-            // create straight from the picker: the standing default-spec
-            // warm slot gets adopted where it matches, and the refill
-            // behind the create re-warms it either way.
-            if cfg.skip_session_naming {
-                if cloud {
-                    open_prompt(
-                        app,
-                        PromptKind::ClaudeCloudTask {
-                            worktree,
-                            name: String::new(),
-                            model,
-                            effort,
-                        },
-                    );
-                } else {
-                    create_agent(
-                        app,
-                        AgentLaunchDraft {
-                            worktree,
-                            kind,
-                            model,
-                            effort,
-                            name: String::new(),
-                            cloud_prompt: None,
-                            starting_prompt: None,
-                            reopen_on_error: None,
-                            pr,
-                            issue_url: None,
-                            focus_pane: true,
-                            placeholder: None,
-                        },
-                        out,
-                    );
-                }
+            // A Claude Cloud launch has its own task box, and nothing to
+            // name first.
+            if cloud {
+                open_prompt(
+                    app,
+                    PromptKind::ClaudeCloudTask {
+                        worktree,
+                        name: String::new(),
+                        model,
+                        effort,
+                    },
+                );
                 return;
             }
-            // Warm the CLI while the user types the name: the daemon
-            // pre-spawns the session so CreateAgent adopts an already-booted
-            // PTY. Fail-soft — a missing CLI just means a cold spawn later.
-            if !cloud && pr.is_none() {
-                out.push(ClientRequest::PrewarmAgent {
-                    worktree: worktree.clone(),
-                    kind,
-                    model: model.clone(),
-                    effort: effort.clone(),
-                });
+            // No box means no typing at all: create straight from the
+            // picker. The standing default-spec warm slot gets adopted
+            // where it matches, and the refill behind the create re-warms
+            // it either way.
+            if cfg.skip_session_naming {
+                create_agent(
+                    app,
+                    AgentLaunchDraft {
+                        worktree,
+                        kind,
+                        model,
+                        effort,
+                        name: String::new(),
+                        cloud_prompt: None,
+                        starting_prompt: None,
+                        reopen_on_error: None,
+                        pr,
+                        issue_url: None,
+                        focus_pane: true,
+                        placeholder: None,
+                    },
+                    out,
+                );
+                return;
             }
-            open_prompt(
-                app,
-                PromptKind::NewAgent {
-                    worktree,
-                    kind,
-                    model,
-                    effort,
-                    cloud,
-                    pr,
-                },
-            )
+            // A PR SESSION still asks for a name: `CreatePrAgent` carries
+            // no STARTING PROMPT, so there is no box to put in its place.
+            // Nothing is warmed for it either — an unscoped warm CLI
+            // cannot be adopted for a PR launch.
+            if let Some(pr) = pr {
+                open_prompt(
+                    app,
+                    PromptKind::NewPrAgent {
+                        worktree,
+                        kind,
+                        model,
+                        effort,
+                        pr,
+                    },
+                );
+                return;
+            }
+            // The box, where the name prompt used to be: what is typed is
+            // the session's STARTING PROMPT, and an empty Enter starts it
+            // with none. Nothing is warmed while the user types — a launch
+            // carrying a STARTING PROMPT can adopt no WARM SPARE, and one
+            // sent empty adopts the standing default-spec slot as it is.
+            crate::quick_prompt::open_for_new_session(app, worktree, kind, model, effort, &cfg);
         }
         MenuAction::NewWorktree(project) => open_new_worktree_prompt(app, project),
         MenuAction::OpenLink(url) => open_link(app, &url, out),
@@ -6118,9 +6096,27 @@ fn attach_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
         }
         return;
     };
+    // A Cloud row leads out of nebula too: there is no PTY to lock into,
+    // only the session's page.
+    if let Some(url) = cloud_session_url_of(app, &sref) {
+        open_link(app, &url, out);
+        return;
+    }
     attach_now(app, sref, out);
     app.focus = Focus::Terminal;
     app.term_locked = true;
+}
+
+/// The claude.ai page behind `sref`, when it is a Claude Cloud row.
+fn cloud_session_url_of(app: &App, sref: &SessionRef) -> Option<String> {
+    let SessionRef::Agent(id) = sref else {
+        return None;
+    };
+    app.tree
+        .agents
+        .iter()
+        .find(|a| &a.id == id)
+        .and_then(|a| a.cloud_session_url())
 }
 
 /// Leave a locked pane for the Sessions panel. Also expands collapsed
@@ -6208,6 +6204,15 @@ fn attach_inner(app: &mut App, sref: SessionRef, delay: Duration, out: &mut Vec<
     // screen during the debounce just the same.
     if let SessionRef::Agent(id) = &sref {
         mark_agent_seen(app, id, out);
+    }
+    // A Cloud row has nothing to attach: its create PTY is gone seconds
+    // after printing the session id, and the daemon refuses to boot a
+    // local CLI in its name. The pane shows the CLOUD SESSION PANEL from
+    // the row itself (`App::previewed_cloud`), so let go of whatever was
+    // held and leave the pane empty underneath it.
+    if cloud_session_url_of(app, &sref).is_some() {
+        detach_pane(app, out);
+        return;
     }
     let showing = app
         .term
@@ -6381,9 +6386,10 @@ fn fire_pending_prewarm(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// Ask the daemon for a new agent session and attach it once the Ack lands.
 /// An empty `name` takes the generated default (agent-1, …) and opts the
 /// session into agent-driven auto-titling (`nebula rename` on the first
-/// prompt) — that's what accepting an empty name prompt means, and what
-/// the `skip_session_naming` setting does without asking. A typed name is
-/// the user's choice and stays.
+/// prompt) — what every launch from the NEW SESSION box and the QUICK
+/// PROMPT does, and what the `skip_session_naming` setting does without
+/// asking. A typed name (a PR SESSION's prompt) is the user's choice and
+/// stays.
 struct AgentLaunchDraft {
     worktree: WorktreeId,
     kind: AgentKind,
@@ -6531,23 +6537,6 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
     // QUICK PROMPT), never touches the slot, so there is nothing to refill.
     if kind == AgentKind::Claude && !cloud && !with_first_prompt {
         out.extend(default_claude_prewarm(worktree));
-    }
-}
-
-/// The prewarm to re-issue when a PROMPT DIALOG is abandoned, whichever exit
-/// abandoned it. A Claude name prompt can leave the warm slot holding the
-/// submenu's off-default spec — its prewarm fired the moment the kind was
-/// picked — so the standing default spec goes back; the same spec is a
-/// daemon-side no-op.
-pub(crate) fn abandoned_prompt_prewarm(kind: &PromptKind) -> Option<ClientRequest> {
-    match kind {
-        PromptKind::NewAgent {
-            worktree,
-            kind: AgentKind::Claude,
-            cloud: false,
-            ..
-        } => default_claude_prewarm(worktree.clone()),
-        _ => None,
     }
 }
 
@@ -7509,6 +7498,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         open_prompt(app, PromptKind::AddProject);
                     }
                 }
+                Some(HitTarget::CloudSessionLink) => {
+                    if let Some(cloud) = app.previewed_cloud() {
+                        open_link(app, &cloud.url, out);
+                    }
+                }
                 Some(HitTarget::TerminalPane) => {
                     // A click into the pane is deliberate — lock input too.
                     if let Some(t) = &app.term {
@@ -8051,7 +8045,34 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         }
         ServerEvent::EntityUpserted { entity } => {
             let before = selection_snapshot(app);
+            // The `claude --cloud <task>` create runs in an ordinary pane
+            // until the id it prints makes the row a Cloud row. That is the
+            // cue to let the create PTY go and give the keyboard back: the
+            // pane is the CLOUD SESSION PANEL from here, and Enter means
+            // "open in the browser", not a keystroke into a process that
+            // has already exited.
+            let became_cloud = match &entity {
+                nebula_core::Entity::Agent(a) if a.cloud_session_id.is_some() => {
+                    let shown = app
+                        .term
+                        .as_ref()
+                        .is_some_and(|t| t.sref == SessionRef::Agent(a.id.clone()));
+                    let was_cloud = app
+                        .tree
+                        .agents
+                        .iter()
+                        .any(|x| x.id == a.id && x.cloud_session_id.is_some());
+                    shown && !was_cloud
+                }
+                _ => false,
+            };
             apply_upsert(app, entity);
+            if became_cloud {
+                detach_pane(app, out);
+                if app.focus == Focus::Terminal {
+                    leave_terminal_lock(app);
+                }
+            }
             // Cursors follow the row they were on across re-sorts and
             // re-homes; a row that left its list (archived away,
             // moved elsewhere) hands the cursor — and the terminal pane —
@@ -8514,7 +8535,6 @@ mod tests {
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -9061,23 +9081,25 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 }),
             },
         );
     }
 
-    /// Turn the seeded row into a Claude Cloud row, mirroring or not.
-    fn make_cloud_row(app: &mut App, mirroring: bool) {
+    const CLOUD_ID: &str = "session_01SQugK2HDyk33coSrfqFJk4";
+
+    /// Turn the seeded row into a Claude Cloud row — the upsert the daemon
+    /// sends once the create has printed its session id.
+    fn make_cloud_row(app: &mut App, out: &mut Vec<ClientRequest>) {
         let mut agent = app.tree.agents[0].clone();
-        agent.cloud_session_id = Some("session_01SQugK2HDyk33coSrfqFJk4".into());
-        agent.cloud_mirroring = mirroring;
-        hse(
+        agent.cloud_session_id = Some(CLOUD_ID.into());
+        handle_server_event(
             app,
             ServerEvent::EntityUpserted {
                 entity: nebula_core::Entity::Agent(agent),
             },
+            out,
         );
     }
 
@@ -9088,9 +9110,9 @@ mod tests {
     fn cloud_row_can_send_a_message_to_its_session() {
         let mut app = App::new();
         seed_tree(&mut app);
-        make_cloud_row(&mut app, true);
-        app.focus = Focus::Sessions;
         let mut out = Vec::new();
+        make_cloud_row(&mut app, &mut out);
+        app.focus = Focus::Sessions;
 
         press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE, &mut out);
         let Some(Overlay::Menu(menu)) = &app.overlay else {
@@ -9098,8 +9120,12 @@ mod tests {
         };
         let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
         assert!(
-            labels.contains(&"Attach cloud session") && labels.contains(&"Send to cloud session"),
+            labels.contains(&"Open in browser") && labels.contains(&"Send to cloud session"),
             "cloud rows get both cloud verbs: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"Attach") && !labels.contains(&"Restart"),
+            "nothing local to attach or restart: {labels:?}"
         );
 
         let idx = menu
@@ -9150,29 +9176,128 @@ mod tests {
         assert_eq!(prompt.input.as_str(), "also update the README");
     }
 
-    /// The badge says whether the pane is being kept current. A row that
-    /// changes on its own with no explanation reads as a glitch.
+    /// A Cloud row has no terminal: the agent runs in the cloud sandbox,
+    /// so the pane is a panel pointing at the session's page rather than
+    /// a PTY nebula would have to teleport, and re-teleport, to keep
+    /// fresh. Landing on the row attaches nothing; Enter and a click on
+    /// the link hand the URL to the browser and stay put.
     #[test]
-    fn cloud_badge_says_when_the_row_is_following() {
+    fn cloud_row_pane_links_to_the_session_instead_of_attaching() {
         let mut app = App::new();
         seed_tree(&mut app);
-        make_cloud_row(&mut app, true);
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        assert!(
-            buffer_text(&terminal).contains("cloud ↻"),
-            "a following row says so: {}",
-            buffer_text(&terminal)
-        );
+        let mut out = Vec::new();
+        make_cloud_row(&mut app, &mut out);
+        app.focus = Focus::Sessions;
+        app.sel_session = 0;
+        out.clear();
 
-        make_cloud_row(&mut app, false);
+        preview_selected_now(&mut app, &mut out);
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { .. })),
+            "a cloud row is never attached: {out:?}"
+        );
+        assert!(app.term.is_none(), "no PTY stands behind the panel");
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("cloud"), "still a cloud row: {text}");
+        assert!(text.contains("CLAUDE CLOUD"), "{text}");
         assert!(
-            !text.contains("cloud ↻"),
-            "the follow ended; stop promising refreshes: {text}"
+            text.contains(&format!("https://claude.ai/code/{CLOUD_ID}")),
+            "the link is on the panel: {text}"
         );
+        assert!(text.contains(" cloud"), "the row keeps its badge: {text}");
+        assert_eq!(
+            app.hits
+                .iter()
+                .filter(|(_, t)| *t == HitTarget::CloudSessionLink)
+                .count(),
+            1,
+            "a wide pane shows the link on one row"
+        );
+
+        // A pane too narrow for the URL folds it rather than clipping it —
+        // every row of the fold is clickable.
+        let mut narrow = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        narrow.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&narrow);
+        let rows: Vec<ratatui::layout::Rect> = app
+            .hits
+            .iter()
+            .filter(|(_, t)| *t == HitTarget::CloudSessionLink)
+            .map(|(r, _)| *r)
+            .collect();
+        assert!(rows.len() > 1, "the link folds: {text}");
+        let folded: String = text
+            .lines()
+            .map(|l| l.trim_end().rsplit("  ").next().unwrap_or("").trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .concat();
+        assert!(
+            folded.contains(&format!("https://claude.ai/code/{CLOUD_ID}")),
+            "the whole URL is on the panel: {text}"
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+
+        // Enter opens the page and stays on the panel — nothing to lock into.
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            app.flash.as_deref(),
+            Some(&*format!("opened claude.ai/code/{CLOUD_ID}"))
+        );
+        assert_eq!(app.focus, Focus::Sessions);
+        assert!(!app.term_locked);
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { .. })),
+            "{out:?}"
+        );
+
+        // So does a click on the link itself.
+        app.flash = None;
+        let (link, _) = app
+            .hits
+            .iter()
+            .find(|(_, t)| *t == HitTarget::CloudSessionLink)
+            .cloned()
+            .expect("the link is a hit target");
+        click(&mut app, link.x + 1, link.y, &mut out);
+        assert_eq!(
+            app.flash.as_deref(),
+            Some(&*format!("opened claude.ai/code/{CLOUD_ID}"))
+        );
+    }
+
+    /// The `claude --cloud <task>` create runs in an ordinary pane — the
+    /// row is attached and locked like any fresh session — until the id it
+    /// prints turns the row into a Cloud row. That upsert lets the dead
+    /// create PTY go and gives the keyboard back: from here the pane is the
+    /// link panel, and Enter opens the browser instead of feeding a process
+    /// that has already exited.
+    #[test]
+    fn a_row_that_gains_its_cloud_session_lets_go_of_the_create_pane() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        attach_now(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        assert!(app.attached_sref.is_some());
+        out.clear();
+
+        make_cloud_row(&mut app, &mut out);
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Detach { .. })),
+            "the create pane is released: {out:?}"
+        );
+        assert!(app.term.is_none());
+        assert!(!app.term_locked);
+        assert_eq!(app.focus, Focus::Sessions);
+        assert!(app.previewed_cloud().is_some());
     }
 
     /// An empty tree replaces the panel columns with the animated splash
@@ -10058,7 +10183,6 @@ mod tests {
                         sort_order: n,
                         status_changed_at: 0,
                         alive: false,
-                        cloud_mirroring: false,
                         recent_prompts: Vec::new(),
                     }),
                 },
@@ -10293,10 +10417,9 @@ mod tests {
                     &app.overlay,
                     Some(Overlay::Prompt(p)) if matches!(
                         &p.kind,
-                        PromptKind::NewAgent {
+                        PromptKind::NewPrAgent {
                             kind: AgentKind::Codex,
-                            pr: Some(pr),
-                            cloud: false,
+                            pr,
                             ..
                         } if pr.url == "https://github.com/o/r/pull/7"
                     )
@@ -12961,39 +13084,28 @@ diff --git a/src/c.rs b/src/c.rs
         })
     }
 
-    /// Esc on a Claude name prompt restores the standing default-spec warm
-    /// session — the submenu's off-default pick had already replaced it the
-    /// moment the kind was chosen.
+    /// Esc on the NEW SESSION PICKER's box sends nothing: nothing was
+    /// warmed for it (a launch carrying a STARTING PROMPT can adopt no
+    /// WARM SPARE), so there is no default spec to put back either.
     #[test]
-    fn esc_on_claude_name_prompt_restores_default_prewarm() {
+    fn esc_on_the_new_session_box_sends_nothing() {
         with_default_config(|| {
             let mut app = App::new();
             seed_tree(&mut app);
-            app.overlay = Some(Overlay::Prompt(PromptDialog::new(
-                "New agent (opus · high)",
-                "name",
-                "",
-                PromptKind::NewAgent {
-                    worktree: nebula_core::WorktreeId("w1".into()),
-                    kind: AgentKind::Claude,
-                    model: Some("opus".into()),
-                    effort: Some("high".into()),
-                    cloud: false,
-                    pr: None,
-                },
-            )));
+            app.focus = Focus::Sessions;
             let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(matches!(
+                &app.overlay,
+                Some(Overlay::Prompt(p)) if matches!(p.kind, PromptKind::QuickPrompt(_))
+            ));
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
             assert!(app.overlay.is_none());
-            assert!(matches!(
-                out.as_slice(),
-                [ClientRequest::PrewarmAgent {
-                    worktree,
-                    kind: AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                }] if worktree == &nebula_core::WorktreeId("w1".into())
-            ));
+            assert!(
+                out.is_empty(),
+                "nothing to create, nothing to warm: {out:?}"
+            );
         })
     }
 
@@ -13280,7 +13392,6 @@ diff --git a/src/c.rs b/src/c.rs
                         sort_order: i,
                         status_changed_at: 0,
                         alive: true,
-                        cloud_mirroring: false,
                         recent_prompts: Vec::new(),
                     }),
                 },
@@ -13341,7 +13452,6 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: sort,
                     status_changed_at: changed_at,
                     alive: true,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 }),
             }
@@ -13395,7 +13505,6 @@ diff --git a/src/c.rs b/src/c.rs
                 sort_order: sort,
                 status_changed_at: at,
                 alive: true,
-                cloud_mirroring: false,
                 recent_prompts: Vec::new(),
             }),
         };
@@ -13475,7 +13584,6 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 1,
                     status_changed_at: crate::app::now_ms() - 23 * 60_000,
                     alive: true,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -13540,7 +13648,6 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -13607,7 +13714,6 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -13982,43 +14088,48 @@ diff --git a/src/c.rs b/src/c.rs
             assert_eq!(menu.items[2].label, "Cursor");
             assert_eq!(menu.hover, 0, "Claude is the default");
 
-            // Enter on the default chains into the name prompt with
-            // kind=Claude, and fires the prewarm so the CLI boots while the
-            // user types. Nothing configured → no model/effort flags.
+            // Enter on the default chains into the box where the name
+            // prompt used to be, with kind=Claude. Nothing is warmed for
+            // it: a launch carrying a STARTING PROMPT can adopt no WARM
+            // SPARE. Nothing configured → no model/effort flags.
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(matches!(
-                out.last(),
-                Some(ClientRequest::PrewarmAgent {
-                    kind: AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    ..
-                })
-            ));
+            assert!(out.is_empty(), "opening the box sends nothing: {out:?}");
             let Some(Overlay::Prompt(p)) = &app.overlay else {
-                panic!("expected name prompt, got {:?}", app.overlay);
+                panic!("expected the new-session box, got {:?}", app.overlay);
             };
-            assert_eq!(p.title, "New agent");
-            assert_eq!(p.input, "", "name starts blank; the default is only a hint");
-            assert_eq!(p.label, "name (empty = agent-2)");
+            assert_eq!(p.title, "New session (claude)");
+            assert_eq!(p.input, "", "the box starts blank");
+            assert_eq!(
+                p.label,
+                "what should the agent do? (empty = start with no prompt)"
+            );
+            assert!(p.is_multiline(), "a task box, not a one-line name");
             assert!(matches!(
                 &p.kind,
-                PromptKind::NewAgent {
-                    kind: AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    ..
-                }
+                PromptKind::QuickPrompt(launch)
+                    if launch.kind == AgentKind::Claude
+                        && launch.model.is_none()
+                        && launch.effort.is_none()
+                        && launch.origin == crate::quick_prompt::QuickOrigin::NewSession
             ));
 
-            // Accepting the empty prompt falls back to the next free default
-            // name, and the consumed warm slot is refilled right behind the
-            // create so the next one adopts a booted CLI too.
+            // Enter on the empty box still launches — no STARTING PROMPT,
+            // the next free default name and AUTO-TITLE, as accepting the
+            // empty name prompt did — and the default-spec warm slot the
+            // create adopts is refilled right behind it.
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(app.overlay.is_none());
             assert!(matches!(
                 &out[out.len() - 2],
-                ClientRequest::CreateAgent { name, kind: AgentKind::Claude, model: None, effort: None, .. } if name == "agent-2"
+                ClientRequest::CreateAgent {
+                    name,
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    auto_title: true,
+                    starting_prompt: None,
+                    ..
+                } if name == "agent-2"
             ));
             assert!(matches!(
                 out.last(),
@@ -14029,6 +14140,79 @@ diff --git a/src/c.rs b/src/c.rs
                     ..
                 })
             ));
+        })
+    }
+
+    /// What is typed into the NEW SESSION PICKER's box is the session's
+    /// STARTING PROMPT — and, unlike the `p` box, the launch takes the
+    /// TERMINAL PANE, as every picker-walked launch does.
+    #[test]
+    fn the_new_session_box_launches_on_the_typed_prompt_and_takes_the_pane() {
+        use nebula_core::{Agent, AgentStatus, Entity, WorktreeId};
+
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let worktree = app.selected_worktree().unwrap().id.clone();
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(paste_into_overlay(&mut app, "Fix auth"));
+            press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
+            assert!(paste_into_overlay(&mut app, "then ship it"));
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "launching closes the box");
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [ClientRequest::CreateAgent {
+                        worktree: w,
+                        kind: AgentKind::Claude,
+                        model: None,
+                        effort: None,
+                        auto_title: true,
+                        cloud_prompt: None,
+                        starting_prompt: Some(text),
+                        ..
+                    }] if *w == worktree && text == "Fix auth\nthen ship it"
+                ),
+                "one create carrying the typed prompt and no prewarm — a \
+                 launch with a first prompt neither adopts nor refills the \
+                 warm slot: {out:?}"
+            );
+
+            // The daemon broadcasts the new row before it acks the create;
+            // the Ack enters and locks its pane.
+            let req_id = match &out[0] {
+                ClientRequest::CreateAgent { req_id, .. } => *req_id,
+                other => panic!("expected create request, got {other:?}"),
+            };
+            let template = app.tree.agents[0].clone();
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(Agent {
+                        id: AgentId("a2".into()),
+                        worktree_id: WorktreeId("w1".into()),
+                        name: "agent-2".into(),
+                        status: AgentStatus::Fresh,
+                        kind: AgentKind::Claude,
+                        sort_order: 1,
+                        ..template
+                    }),
+                },
+            );
+            hse(
+                &mut app,
+                ServerEvent::Ack {
+                    req_id,
+                    created: Some(EntityId::Agent(AgentId("a2".into()))),
+                },
+            );
+            assert_eq!(app.focus, Focus::Terminal, "straight into the pane");
+            assert!(app.term_locked, "typing goes to the new agent");
         })
     }
 
@@ -14057,23 +14241,10 @@ diff --git a/src/c.rs b/src/c.rs
 
             // Cloud creation is cold on purpose: a bare-Claude warm PTY
             // cannot be adopted because it never received --cloud + task.
+            // No name step either: the multiline task prompt opens straight
+            // from the picker.
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(out.is_empty(), "cloud name entry must not prewarm: {out:?}");
-            assert!(matches!(
-                &app.overlay,
-                Some(Overlay::Prompt(p)) if matches!(
-                    &p.kind,
-                    PromptKind::NewAgent {
-                        kind: AgentKind::Claude,
-                        cloud: true,
-                        ..
-                    }
-                )
-            ));
-
-            // The usual name prompt stays in the flow. Accepting its empty
-            // default opens one additional, multiline task prompt.
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(out.is_empty(), "cloud task entry must not prewarm: {out:?}");
             let Some(Overlay::Prompt(prompt)) = &app.overlay else {
                 panic!("expected Claude Cloud task prompt");
             };
@@ -14228,8 +14399,8 @@ diff --git a/src/c.rs b/src/c.rs
     }
 
     /// With `skip_session_naming` on, picking the kind is the whole flow:
-    /// no name prompt, the generated default name, and the same auto-title
-    /// opt-in that accepting an empty prompt gives.
+    /// no box, the generated default name, and the same auto-title opt-in
+    /// that sending the box empty gives.
     #[test]
     fn skip_session_naming_creates_straight_from_the_picker() {
         let dir = tempfile::tempdir().unwrap();
@@ -14250,7 +14421,7 @@ diff --git a/src/c.rs b/src/c.rs
             assert!(out.is_empty(), "opening the picker sends nothing: {out:?}");
 
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(app.overlay.is_none(), "no name prompt: {:?}", app.overlay);
+            assert!(app.overlay.is_none(), "no box: {:?}", app.overlay);
             assert!(matches!(
                 &out[0],
                 ClientRequest::CreateAgent {
@@ -14312,7 +14483,7 @@ diff --git a/src/c.rs b/src/c.rs
                 press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
             }
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(app.overlay.is_none(), "no name prompt: {:?}", app.overlay);
+            assert!(app.overlay.is_none(), "no box: {:?}", app.overlay);
             assert!(matches!(
                 &out[0],
                 ClientRequest::CreateAgent {
@@ -14427,19 +14598,11 @@ diff --git a/src/c.rs b/src/c.rs
             press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
 
-            assert!(matches!(
-                out.last(),
-                Some(ClientRequest::PrewarmAgent {
-                    kind: AgentKind::Codex,
-                    model: Some(m),
-                    effort: Some(e),
-                    ..
-                }) if m == "gpt-5.6-luna" && e == "minimal"
-            ));
+            assert!(out.is_empty(), "the box warms nothing: {out:?}");
             let Some(Overlay::Prompt(p)) = &app.overlay else {
-                panic!("expected name prompt, got {:?}", app.overlay);
+                panic!("expected the new-session box, got {:?}", app.overlay);
             };
-            assert_eq!(p.title, "New agent (gpt-5.6-luna · minimal)");
+            assert_eq!(p.title, "New session (codex · gpt-5.6-luna · minimal)");
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(matches!(
                 out.last(),
@@ -14471,19 +14634,11 @@ diff --git a/src/c.rs b/src/c.rs
             // Enter straight on the Claude row: both settings apply.
             press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(matches!(
-                out.last(),
-                Some(ClientRequest::PrewarmAgent {
-                    kind: AgentKind::Claude,
-                    model: Some(m),
-                    effort: Some(e),
-                    ..
-                }) if m == "sonnet" && e == "max"
-            ));
+            assert!(out.is_empty(), "the box warms nothing: {out:?}");
             let Some(Overlay::Prompt(p)) = &app.overlay else {
-                panic!("expected name prompt");
+                panic!("expected the new-session box");
             };
-            assert_eq!(p.title, "New agent (sonnet · max)");
+            assert_eq!(p.title, "New session (claude · sonnet · max)");
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
 
             // The model submenu highlights and checks the configured model,
@@ -14500,12 +14655,13 @@ diff --git a/src/c.rs b/src/c.rs
             press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(matches!(
-                out.last(),
-                Some(ClientRequest::PrewarmAgent {
-                    model: Some(m),
-                    effort: Some(e),
-                    ..
-                }) if m == "sonnet" && e == "max"
+                &app.overlay,
+                Some(Overlay::Prompt(p)) if matches!(
+                    &p.kind,
+                    PromptKind::QuickPrompt(launch)
+                        if launch.model.as_deref() == Some("sonnet")
+                            && launch.effort.as_deref() == Some("max")
+                )
             ));
         })
     }
@@ -14525,7 +14681,7 @@ diff --git a/src/c.rs b/src/c.rs
             }
             assert!(matches!(
                 &app.overlay,
-                Some(Overlay::Prompt(p)) if matches!(&p.kind, PromptKind::NewAgent { kind: AgentKind::Codex, .. })
+                Some(Overlay::Prompt(p)) if matches!(&p.kind, PromptKind::QuickPrompt(launch) if launch.kind == AgentKind::Codex)
             ));
             handle_key(
                 &mut app,
@@ -14560,7 +14716,7 @@ diff --git a/src/c.rs b/src/c.rs
             }
             assert!(matches!(
                 &app.overlay,
-                Some(Overlay::Prompt(p)) if matches!(&p.kind, PromptKind::NewAgent { kind: AgentKind::Cursor, .. })
+                Some(Overlay::Prompt(p)) if matches!(&p.kind, PromptKind::QuickPrompt(launch) if launch.kind == AgentKind::Cursor)
             ));
             handle_key(
                 &mut app,
@@ -14603,7 +14759,7 @@ diff --git a/src/c.rs b/src/c.rs
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(matches!(
                 &app.overlay,
-                Some(Overlay::Prompt(p)) if matches!(&p.kind, PromptKind::NewAgent { kind: AgentKind::Cursor, .. })
+                Some(Overlay::Prompt(p)) if matches!(&p.kind, PromptKind::QuickPrompt(launch) if launch.kind == AgentKind::Cursor)
             ));
         });
     }
@@ -15559,7 +15715,6 @@ diff --git a/src/c.rs b/src/c.rs
                 sort_order: sort,
                 status_changed_at: 0,
                 alive: true,
-                cloud_mirroring: false,
                 recent_prompts: Vec::new(),
             })
         };
@@ -15647,7 +15802,6 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: false,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -16005,7 +16159,6 @@ diff --git a/src/c.rs b/src/c.rs
             sort_order: sort,
             status_changed_at: 0,
             alive: false,
-            cloud_mirroring: false,
             recent_prompts: Vec::new(),
         })
     }
@@ -17354,7 +17507,6 @@ diff --git a/src/c.rs b/src/c.rs
             sort_order: 0,
             status_changed_at: 0,
             alive: true,
-            cloud_mirroring: false,
             recent_prompts: Vec::new(),
         };
 
@@ -17650,7 +17802,6 @@ diff --git a/src/c.rs b/src/c.rs
             sort_order: 0,
             status_changed_at: at,
             alive: true,
-            cloud_mirroring: false,
             recent_prompts: Vec::new(),
         })
     }
@@ -18262,7 +18413,6 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -19250,7 +19400,6 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -19274,7 +19423,6 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: false,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -19505,7 +19653,6 @@ diff --git a/src/c.rs b/src/c.rs
             sort_order: 5,
             status_changed_at: 500,
             alive: true,
-            cloud_mirroring: false,
             recent_prompts: Vec::new(),
         };
         for a in [
@@ -19970,7 +20117,6 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -22085,7 +22231,6 @@ diff --git a/src/c.rs b/src/c.rs
                         sort_order: 1,
                         status_changed_at: 0,
                         alive: true,
-                        cloud_mirroring: false,
                         recent_prompts: Vec::new(),
                     }),
                 },
@@ -22157,7 +22302,6 @@ diff --git a/src/c.rs b/src/c.rs
             sort_order: 1,
             status_changed_at: 0,
             alive: true,
-            cloud_mirroring: false,
             recent_prompts: Vec::new(),
         })
     }
@@ -22734,7 +22878,6 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -22931,7 +23074,6 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -23026,7 +23168,6 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -23057,7 +23198,6 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -23134,7 +23274,6 @@ diff --git a/src/c.rs b/src/c.rs
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 }),
             },
@@ -24951,7 +25090,7 @@ diff --git a/src/c.rs b/src/c.rs
 
     /// The QUICK PROMPT: `p` anywhere in the panels, a multi-row box, and
     /// Enter starts an agent of the configured harness on what was typed —
-    /// no picker and no name prompt on the way.
+    /// no picker on the way.
     #[test]
     fn p_opens_the_quick_prompt_and_launches_on_what_was_typed() {
         with_config_json(
@@ -25348,7 +25487,6 @@ diff --git a/src/c.rs b/src/c.rs
                         sort_order: 1,
                         status_changed_at: 0,
                         alive: true,
-                        cloud_mirroring: false,
                         recent_prompts: Vec::new(),
                     }),
                 },

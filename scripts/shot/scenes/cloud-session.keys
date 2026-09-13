@@ -1,0 +1,11 @@
+# A Claude Cloud launch on the root checkout: `n` opens the NEW SESSION PICKER, `Tab` flips the Claude
+# row to cloud, `Enter` takes it and the default name, the task goes into the wrapped editor and `Enter`
+# dispatches. The stand-in agent (see the .setup.sh) prints the session URL and exits, so the row's pane
+# is the CLOUD SESSION PANEL rather than a terminal.
+Tab
+Tab
+n
+Tab
+Enter
+Fix the login redirect loop when the session cookie has expired
+Enter

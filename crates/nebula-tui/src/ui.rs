@@ -3711,16 +3711,10 @@ fn draw_session_row(
                 )
             } else if a.unseen && !a.archived {
                 (" done".to_string(), Style::default().fg(th.done))
-            } else if a.cloud_mirroring && !a.archived {
-                // Following the cloud session: the pane is re-pulled on a
-                // timer, so what it shows is the cloud agent's own work.
-                // Worth saying loudly — otherwise a pane that changes on
-                // its own looks like a glitch.
-                (" cloud ↻".to_string(), Style::default().fg(th.accent))
             } else if a.cloud_session_id.is_some() {
                 // A Claude Cloud row: the harness that matters is the cloud
                 // sandbox, and the badge is how the user tells this row
-                // re-enters that session rather than booting a local CLI.
+                // opens the session's page rather than a local CLI.
                 (" cloud".to_string(), Style::default().fg(th.dim))
             } else {
                 (format!(" {}", a.kind.as_str()), Style::default().fg(th.dim))
@@ -3914,6 +3908,98 @@ fn draw_pr_preview(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     f.render_widget(Paragraph::new(shown), inner);
 }
 
+/// The CLOUD SESSION PANEL: what the pane shows for a Claude Cloud row.
+/// The agent works in a cloud sandbox nebula has no terminal into — the
+/// `claude --cloud <task>` create prints the session id and exits — so
+/// rather than a dead pane ending in "Resume with: …" the row gets a
+/// short explanation and the session's link, underlined and clickable,
+/// with the keys that open it. Nothing here is a PTY: no cursor, no
+/// scrollback, nothing to lock the keyboard into.
+fn draw_cloud_session(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
+    let th = app.theme;
+    let Some(cloud) = app.previewed_cloud() else {
+        return;
+    };
+    let left = vec![
+        Span::styled(" · ".to_string(), Style::default().fg(th.dim)),
+        Span::styled(cloud.name.clone(), Style::default().fg(th.muted)),
+    ];
+    let inner = titled_frame(f, area, "CLAUDE CLOUD", left, None, focused, th);
+    let inner = Rect {
+        x: inner.x + 1,
+        width: inner.width.saturating_sub(1),
+        ..inner
+    };
+    app.term_area = inner;
+    // Nothing in this pane is a PTY, so the link/file scanners have nothing
+    // to find — clear them or ⌥click would still hit last frame's hits.
+    app.term_links = Vec::new();
+    app.term_file_links = Vec::new();
+
+    let w = (inner.width as usize).saturating_sub(2).max(20);
+    let prose = |text: &str, style: Style| -> Vec<Line<'static>> {
+        crate::pr_preview::wrap(text, w)
+            .into_iter()
+            .map(|t| Line::from(Span::styled(format!(" {t}"), style)))
+            .collect()
+    };
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" ◆ ", Style::default().fg(th.accent)),
+            Span::styled(
+                "This session runs in Claude Cloud",
+                Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+    ];
+    lines.extend(prose(
+        "The agent works in a cloud sandbox, not in a terminal here. Its turns, its questions and its diff are on the session's page:",
+        Style::default().fg(th.muted),
+    ));
+    lines.push(Line::from(""));
+    // The link: folded at the pane edge rather than clipped — a link with
+    // its tail cut off is a link that cannot be trusted — every row of it
+    // a hit target, registered ahead of the pane so a click on it wins.
+    let link_style = Style::default()
+        .fg(th.accent)
+        .add_modifier(Modifier::UNDERLINED);
+    let fold = (inner.width as usize).saturating_sub(1).max(1);
+    let url_chars: Vec<char> = cloud.url.chars().collect();
+    for chunk in url_chars.chunks(fold) {
+        let row = lines.len() as u16;
+        let text: String = chunk.iter().collect();
+        if row < inner.height {
+            let width = (chunk.len() as u16 + 1).min(inner.width);
+            let link = Rect::new(inner.x, inner.y + row, width, 1);
+            app.hits.push((link, HitTarget::CloudSessionLink));
+        }
+        lines.push(Line::from(Span::styled(format!(" {text}"), link_style)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" {}", key_hint(app, Action::Activate)),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" or click: open in browser", Style::default().fg(th.dim)),
+        Span::styled("   ·   ", Style::default().fg(th.dim)),
+        Span::styled(
+            key_hint(app, Action::ContextMenu),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(": send a message", Style::default().fg(th.dim)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!(" {}", cloud.cloud_session_id),
+        Style::default().fg(th.dim),
+    )));
+    app.hits.push((inner, HitTarget::TerminalPane));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 /// Borderless terminal frame: a header row (`TERMINAL · session` plus a
 /// right-aligned state tag), a thin rule, then the content area. The
 /// header carries the focus signal like the sidebar columns do.
@@ -4005,6 +4091,13 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     // detach/attach.
     if app.previewed_pr().is_some() {
         draw_pr_preview(f, app, area, focused);
+        return;
+    }
+    // A Claude Cloud row: the agent runs in the cloud sandbox, so the pane
+    // says where and links there instead of showing a PTY nebula would
+    // have to keep teleporting to stay current.
+    if app.previewed_cloud().is_some() {
+        draw_cloud_session(f, app, area, focused);
         return;
     }
 
@@ -4372,6 +4465,13 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
         // lying.
         let k = |a| key_hint(app, a);
         let text = match app.focus {
+            // The pane is the CLOUD SESSION PANEL: there is no terminal to
+            // type into, and Enter hands the session to the browser.
+            Focus::Terminal if app.previewed_cloud().is_some() => format!(
+                "{}: open in browser  {}: sessions",
+                k(Action::Activate),
+                k(Action::FocusLeft)
+            ),
             Focus::Terminal if app.term.as_ref().is_some_and(|t| t.exited) => {
                 "session exited — Esc: back to sessions".to_string()
             }
@@ -4460,6 +4560,17 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 "{}: open in browser  {}: edit URL  {}: delete  {}: menu  {}: help",
                 k(Action::Activate),
                 k(Action::Rename),
+                k(Action::Delete),
+                k(Action::ContextMenu),
+                k(Action::Help)
+            ),
+            // A Cloud row leads out of nebula like a link row does; the
+            // menu holds the one verb that reaches the session from here.
+            Focus::Sessions if app.previewed_cloud().is_some() => format!(
+                "{}: open in browser  {}: rename  {}: archive  {}: del  {}: menu  {}: help",
+                k(Action::Activate),
+                k(Action::Rename),
+                k(Action::Archive),
                 k(Action::Delete),
                 k(Action::ContextMenu),
                 k(Action::Help)
@@ -5093,6 +5204,7 @@ mod tests {
             effort: None,
             preset: None,
             issue: None,
+            origin: crate::quick_prompt::QuickOrigin::Hotkey,
         });
         let cloud = PromptKind::CloudMessage {
             id: nebula_core::AgentId::from("a".to_string()),
@@ -5548,7 +5660,6 @@ mod tests {
                 cloud_session_id: None,
                 sort_order: i as i64,
                 alive: false,
-                cloud_mirroring: false,
                 recent_prompts: Vec::new(),
             });
         }

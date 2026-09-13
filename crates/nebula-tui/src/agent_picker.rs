@@ -58,13 +58,14 @@ impl KindPicker {
         }
     }
 
-    /// The QUICK PROMPT's `Tab` picker: every row hands the box back, and
-    /// the cursor starts on the harness the box is already set to.
+    /// The QUICK PROMPT's `Tab` picker (the NEW SESSION PICKER's own box
+    /// included — the title says which): every row hands the box back,
+    /// and the cursor starts on the harness the box is already set to.
     /// `worktree` is the checkout the menu is built against, not where
     /// the launch lands — that stays the box's own `QuickLaunch::target`.
     pub fn quick_prompt(worktree: WorktreeId, back: QuickReturn) -> Self {
         Self {
-            title: "Quick prompt agent".into(),
+            title: back.launch.picker_title(),
             worktree,
             pr: None,
             hover: Some(back.launch.kind),
@@ -280,6 +281,7 @@ mod tests {
                     effort: None,
                     preset: None,
                     issue: None,
+                    origin: crate::quick_prompt::QuickOrigin::Hotkey,
                 },
                 text: "typed so far".into(),
             };

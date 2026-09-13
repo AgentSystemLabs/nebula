@@ -99,7 +99,8 @@ in the WORKTREES PANEL to branch off into a real `git worktree`. That's the whol
 two agents in two WORKTREES edit two directories and never collide.
 
 **4. Start the agent.** `n` in the SESSIONS PANEL opens the NEW SESSION PICKER — **Claude**, **Codex**,
-**Cursor** or **Pi**, `→` for MODEL and EFFORT, `Enter` for your defaults. Or skip the picker entirely: `p` from any
+**Cursor** or **Pi**, `→` for MODEL and EFFORT, `Enter` for your defaults — then type the agent's first prompt
+in the box that follows (or `Enter` on it empty to start in the CLI). Or skip the picker entirely: `p` from any
 PANEL opens the QUICK PROMPT, you type the task, and an agent starts working on it in the selected
 WORKTREE — or, from the WORKTREES PANEL or with `Ctrl+N` inside the box, in a fresh worktree cut for the
 job, the box turning green to say so. Save a framing you keep retyping as an AGENT PRESET (`e`) and it
@@ -110,8 +111,8 @@ reading *Leave the TUI? Sessions keep running in the daemon.* that `Enter` accep
 walks straight through. The DAEMON still owns every PTY — come back with `nebula` an hour later and each
 SESSION is exactly where you left it, scrollback replayed.
 
-Leave a new SESSION on its default name and AUTO-TITLE renames it from your first prompt — `Fix Login
-Redirect`, not `agent-3`. Type a name yourself and nebula never touches it. A Claude SESSION's own name
+A new SESSION starts on a default name and AUTO-TITLE renames it from your first prompt — `Fix Login
+Redirect`, not `agent-3`; `r` renames it whenever you like. A Claude SESSION's own name
 is the same name: `/rename` inside Claude Code retitles the row, and a name set in nebula reaches
 Claude's prompt box and `/resume` picker on your next prompt.
 
@@ -166,7 +167,7 @@ is open.
 |---|---|
 | [**Keys**](docs/keys.md) | Every default binding, the WORKTREE views (`g` `f` `F` `b`), and the mouse. All of it rebindable. |
 | [**Commands**](docs/commands.md) | The `nebula` CLI: `add`, `rename`, `worktree`, `spawn`, `workspace`, `ssh`, `tunnel`, `browser`, `daemon`, `kill`, `upgrade`. |
-| [**Sessions**](docs/sessions.md) | The NEW SESSION PICKER, MODEL / EFFORT, Claude Cloud and the CLOUD MIRROR, AGENT PRESETS, the PROJECT OPEN PRS group, the ISSUES MODAL. |
+| [**Sessions**](docs/sessions.md) | The NEW SESSION PICKER, MODEL / EFFORT, Claude Cloud and the CLOUD SESSION PANEL, AGENT PRESETS, the PROJECT OPEN PRS group, the ISSUES MODAL. |
 | [**Configuration**](docs/configuration.md) | `config.json`, the SETTINGS OVERLAY, the HOTKEYS TAB, logs and environment overrides. |
 | [**How it works**](docs/how-it-works.md) | The DAEMON, the hook dialects, AUTO-TITLE, WORKTREE RELOCATION, prewarm and reaping, persistence. |
 | [**Architecture**](ARCHITECTURE.md) | Process model, the IPC CODEC and the crate layout. |

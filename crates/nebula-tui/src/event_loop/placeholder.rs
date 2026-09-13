@@ -104,7 +104,6 @@ pub(super) fn stage(
         // the row does not jump when the real one replaces it.
         status_changed_at: now_ms(),
         alive: false,
-        cloud_mirroring: false,
         recent_prompts: Vec::new(),
     });
     // That stamp just moved the row to the top: re-seat the cursor on it.
@@ -363,7 +362,6 @@ mod tests {
             sort_order: 0,
             status_changed_at: crate::app::now_ms(),
             alive: true,
-            cloud_mirroring: false,
             recent_prompts: Vec::new(),
         }
     }

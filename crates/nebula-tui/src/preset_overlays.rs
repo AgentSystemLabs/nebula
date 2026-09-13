@@ -534,7 +534,8 @@ fn apply_preset_to_quick_prompt(
         return;
     }
     let launch = crate::quick_prompt::QuickLaunch::of_preset(back.launch.target, preset, &cfg)
-        .with_issue(back.launch.issue);
+        .with_issue(back.launch.issue)
+        .with_origin(back.launch.origin);
     crate::quick_prompt::reopen(app, launch, &back.text);
 }
 

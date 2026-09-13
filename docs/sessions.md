@@ -17,27 +17,25 @@ Pi's model is a fuzzy `--model` pattern — `opus`, `sonnet`, or a `provider/id`
 and its effort is the `--thinking` level, `off` through `max`).
 In those submenus you type to filter — `opus` narrows the rows to the Opus families, `↑`/`↓` move, `Backspace` widens, `Esc` clears — and the preset editor's Harness / Model / Effort rows take the same type-ahead.
 `Enter` anywhere takes your configured defaults. On the
-Claude row, `Tab` toggles Cloud mode: after the optional name, enter the task in the wrapped editor
+Claude row, `Tab` toggles Cloud mode: enter the task in the wrapped editor
 (`Shift+Enter` or `Ctrl+J` adds a line) and nebula launches `claude --cloud=<task>` — the value binds
-with `=` and never a space, because `--cloud` and `--teleport` each take an *optional* value, so a
-separate argv item starting with `--` would be read as another Claude flag instead. On accounts without
-Claude's live-attach rollout the CLI prints the session URL and exits — so nebula reads the session id off
-that output and re-enters the session for you, without being asked. The row becomes a **mirror** of the
-cloud session: nebula runs `claude --cloud=<id>`, falling back to `claude --teleport=<id>` (the transcript
-and branch pulled into a local session) when the account can't attach, and then re-teleports every 45s so
-turns the cloud agent takes keep landing in the pane. The badge reads `cloud ↻` while it is following,
-and drops the `↻` for a plain `cloud` on a cloud row that is not currently mirroring.
-Since either CLI switches the checkout to the cloud branch, a row still in the main checkout is first
-re-homed into a `cloud-<id>` worktree of its own.
-
-A teleport is a snapshot, not a live link, which is why the mirror re-pulls — and why **the first key you
-type into the pane ends it**: from then on the session is yours, an ordinary local Claude that started from
-a cloud transcript, and nebula stops respawning it under you. `NEBULA_CLOUD_MIRROR_SECS` changes the
-cadence; `0` turns the follow off, leaving **Attach cloud session** (the row's `m` menu) as the manual
-refresh. To steer the cloud agent without a browser, pick **Send to cloud session** — the same wrapped
-editor — and nebula runs `claude -p <message> --cloud=<id>` and pulls the transcript straight after. The
-reply shows up on a later refresh; the CLI never returns one. Otherwise, name the session or accept the
-default and nebula spawns the CLI in that worktree and drops you straight into it.
+with `=` and never a space, because `--cloud` takes an *optional* value, so a separate argv item starting
+with `--` would be read as another Claude flag instead. The CLI creates the session, prints its URL and
+exits — nebula reads the session id off that output, and that is where the local side ends. The agent
+runs in Claude's cloud sandbox, not in a terminal here, so the row wears a `cloud` badge and its pane is
+the **CLOUD SESSION PANEL** instead of a terminal: a line saying so, and the session's
+`https://claude.ai/code/session_…` link, underlined. `Enter` on the row — or a click on the link — opens
+the page in the browser. Nothing is attached, teleported or re-homed on your behalf, the checkout never
+switches branch, and **Attach** and **Restart** are not offered: there is no local session behind the
+row, and the daemon refuses to boot a bare `claude` in its name. To steer the cloud agent without a
+browser, pick **Send to cloud session** from the row's `m` menu — the same wrapped editor — and nebula
+runs `claude -p <message> --cloud=<id>`; the reply lands on the session's page, the CLI never returns
+one. Otherwise the picker ends in the same task
+box `p` opens (the QUICK PROMPT — see [Keys](keys.md)): type the agent's first prompt and `Enter`, or
+`Enter` on the empty box to start with none and type it in the CLI, and nebula spawns the CLI in that
+worktree with it and drops you straight into it. The session titles itself from that first prompt
+(AUTO-TITLE); `r` renames it whenever you like. **Skip starting prompt** (Settings → Sessions) launches
+straight from the picker instead.
 
 The rows do not run under the same permissions, and the picker is where you decide that. Claude
 is spawned with no permission flag at all and keeps its normal prompts — it stops and asks before the

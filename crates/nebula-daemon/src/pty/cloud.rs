@@ -1,9 +1,8 @@
-//! Claude Cloud scanner — the two things a `claude --cloud` child says on
-//! its output that nebula must act on, read straight off the PTY stream.
+//! Claude Cloud scanner — the one thing a `claude --cloud <task>` child
+//! says on its output that nebula must act on, read straight off the PTY
+//! stream.
 //!
-//! On an account without the live-attach rollout (Claude's
-//! `tengu_remote_backend` flag, 2.1.247), `claude --cloud <task>` creates
-//! the session, prints where it lives, and exits:
+//! The dispatch creates the session, prints where it lives, and exits:
 //!
 //! ```text
 //! Created cloud session: Hello world
@@ -14,24 +13,12 @@
 //! That id is the only handle nebula ever gets on the session, and the
 //! process is gone milliseconds after printing it, so it is captured here
 //! rather than asked for. Both lines carry it; the first sighting wins.
-//!
-//! The same accounts have `claude --cloud <id>` refuse with
-//! `Error: Attaching to an existing cloud session is not enabled for your
-//! account.` and exit 1. Seeing that line is what tells the daemon to fall
-//! back to a teleport — a deliberate kill of an attach that *did* work looks
-//! identical from the exit code alone, so the refusal has to be read, not
-//! inferred.
+//! The agent then runs in the cloud sandbox: nebula never attaches to or
+//! teleports the session, it shows the row's pane as a panel linking to
+//! the session's page.
 
 /// Byte sequences that immediately precede a session id.
 const ID_MARKERS: [&[u8]; 2] = [b"claude.ai/code/session_", b"--teleport session_"];
-
-/// Fragments of the CLI's attach-refusal messages. The account-gate wording
-/// is the one observed; the other is the generic attach failure that
-/// precedes any reason text.
-const REJECT_MARKERS: [&[u8]; 2] = [
-    b"cloud session is not enabled for your account",
-    b"Couldn't attach to cloud session",
-];
 
 /// An id longer than this is accepted as-is rather than waiting for its
 /// terminator; real ids are ~28 characters.
@@ -41,8 +28,6 @@ const MAX_ID_LEN: usize = 64;
 pub enum CloudSighting {
     /// The session id the child printed, `session_` prefix included.
     SessionId(String),
-    /// The child refused to attach; it exits right after.
-    AttachRejected,
 }
 
 /// Where an id search left off within the retained tail.
@@ -56,14 +41,13 @@ enum IdScan {
     None,
 }
 
-/// Tracks sightings across chunk boundaries. Each sighting is reported once.
+/// Tracks the sighting across chunk boundaries. It is reported once.
 #[derive(Debug)]
 pub struct CloudScanner {
     /// Unconsumed tail of prior chunks: enough to complete a marker that
     /// straddles chunks, or a marker plus an id still being printed.
     tail: Vec<u8>,
     id_found: bool,
-    rejected: bool,
 }
 
 impl Default for CloudScanner {
@@ -77,49 +61,36 @@ impl CloudScanner {
         Self {
             tail: Vec::new(),
             id_found: false,
-            rejected: false,
         }
     }
 
     /// Scan a chunk of child output. Markers split across chunks are fine —
     /// the retained tail bridges them. Returns the sightings this chunk
-    /// completed, in the order they were completed.
+    /// completed (at most one, ever: the id).
     pub fn feed(&mut self, data: &[u8]) -> Vec<CloudSighting> {
         let mut out = Vec::new();
-        if self.id_found && self.rejected {
+        if self.id_found {
             return out;
         }
         self.tail.extend_from_slice(data);
 
-        if !self.rejected && REJECT_MARKERS.iter().any(|m| find(&self.tail, m).is_some()) {
-            self.rejected = true;
-            out.push(CloudSighting::AttachRejected);
-        }
-
         let mut keep_from = None;
-        if !self.id_found {
-            match self.scan_id() {
-                IdScan::Found(id) => {
-                    self.id_found = true;
-                    out.push(CloudSighting::SessionId(id));
-                }
-                IdScan::Pending { start } => keep_from = Some(start),
-                IdScan::None => {}
+        match self.scan_id() {
+            IdScan::Found(id) => {
+                self.id_found = true;
+                out.push(CloudSighting::SessionId(id));
             }
+            IdScan::Pending { start } => keep_from = Some(start),
+            IdScan::None => {}
         }
 
-        if self.id_found && self.rejected {
+        if self.id_found {
             self.tail.clear();
         } else {
             // Keep a pending id whole; otherwise only what a marker that
             // straddles the boundary could need.
             let keep = keep_from.unwrap_or_else(|| {
-                let longest = ID_MARKERS
-                    .iter()
-                    .chain(REJECT_MARKERS.iter())
-                    .map(|m| m.len())
-                    .max()
-                    .unwrap_or(0);
+                let longest = ID_MARKERS.iter().map(|m| m.len()).max().unwrap_or(0);
                 self.tail.len().saturating_sub(longest - 1)
             });
             self.tail.drain(..keep);
@@ -172,7 +143,6 @@ impl From<CloudSighting> for super::PtyEvent {
     fn from(sighting: CloudSighting) -> Self {
         match sighting {
             CloudSighting::SessionId(id) => super::PtyEvent::CloudSession { id },
-            CloudSighting::AttachRejected => super::PtyEvent::CloudAttachRejected,
         }
     }
 }
@@ -260,19 +230,6 @@ Resume with: claude --teleport session_016SiQW5Lem2LbnUf1A3undt\r\n";
             s.feed(line.as_bytes()),
             vec![CloudSighting::SessionId(format!("session_{long}"))]
         );
-    }
-
-    #[test]
-    fn attach_refusal_is_reported_once_and_split_safe() {
-        let msg =
-            b"Error: Attaching to an existing cloud session is not enabled for your account.\r\n";
-        for cut in 1..msg.len() {
-            let mut s = CloudScanner::new();
-            let mut got = s.feed(&msg[..cut]);
-            got.extend(s.feed(&msg[cut..]));
-            assert_eq!(got, vec![CloudSighting::AttachRejected], "cut at {cut}");
-            assert!(s.feed(msg).is_empty());
-        }
     }
 
     #[test]

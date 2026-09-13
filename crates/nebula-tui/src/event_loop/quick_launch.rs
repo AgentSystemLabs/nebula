@@ -12,10 +12,11 @@ use super::{
     create_agent, placeholder, schedule_prewarm, select_worktree_by_id, send_with, AgentLaunchDraft,
 };
 use crate::app::{App, PendingIntent, PlaceholderRows, PromptKind};
-use crate::quick_prompt::{QuickLaunch, QuickTarget};
+use crate::quick_prompt::{QuickLaunch, QuickOrigin, QuickTarget};
 use nebula_core::{AgentId, ClientRequest, WorktreeId};
 
-/// Enter in the box, with `text` already sized and non-empty.
+/// Enter in the box, with `text` already sized — and non-empty, unless
+/// the box `launches_empty` (the NEW SESSION PICKER's, sent as it is).
 pub(super) fn submit(
     app: &mut App,
     launch: QuickLaunch,
@@ -94,6 +95,13 @@ fn draft(
     text: String,
     placeholder: Option<AgentId>,
 ) -> AgentLaunchDraft {
+    // The hotkey's box is the one launch that stays out of the way by
+    // default: `p`, type, Enter, keep working. The NEW SESSION PICKER's
+    // takes the pane, as every picker-walked launch does.
+    let focus_pane = match launch.origin {
+        QuickOrigin::Hotkey => crate::config::Config::load().quick_prompt_focus,
+        QuickOrigin::NewSession => true,
+    };
     AgentLaunchDraft {
         worktree,
         kind: launch.kind,
@@ -102,14 +110,14 @@ fn draft(
         name: String::new(),
         cloud_prompt: None,
         // Sized in `submit_prompt`, with the task — composing cannot fail.
-        starting_prompt: Some(launch.compose(&text)),
+        // Empty only from the NEW SESSION PICKER's box (`launches_empty`):
+        // no first prompt, the CLI's own input is it.
+        starting_prompt: (!text.is_empty()).then(|| launch.compose(&text)),
         // An ISSUE SESSION's context, persisted by the DAEMON with the row.
         issue_url: launch.issue.as_ref().map(|issue| issue.url.clone()),
         reopen_on_error: Some((PromptKind::QuickPrompt(launch), text)),
         pr: None,
-        // The QUICK PROMPT is the one launch that stays out of the way by
-        // default: `p`, type, Enter, keep working.
-        focus_pane: crate::config::Config::load().quick_prompt_focus,
+        focus_pane,
         placeholder,
     }
 }

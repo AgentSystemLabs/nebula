@@ -39,7 +39,7 @@ how the tree is worked; every switch there is off by default.
 | `worktree_base_branch` | string | `""` | General | DAEMON-owned WORKTREE BASE BRANCH: where every new WORKTREE nobody named a base for starts — `n` in the WORKTREES PANEL, a bare `nebula worktree`, the QUICK PROMPT's auto-created one (`nebula worktree --base` always wins). Empty, shown as `auto` in the overlay, is origin's own default branch: `origin/HEAD` freshly fetched, normally `origin/main`. A name — `master`, `develop` — is resolved the way `--base` resolves one: origin is fetched and origin's copy of that branch (`origin/master`) is the start point, untracked, never the checkout's local branch of that name, which is only as new as its last pull; a branch origin lacks that the checkout has locally is used as named. The setting is one name for every project, so a repo with no branch of that name at all does not fail the `n`: it falls back to `origin/HEAD` as if the key were empty, and `daemon.log` says which repo ignored it. A leading `origin/` is dropped (`origin/master` means `master`); a tag or SHA is not a branch and falls back too — name those with `--base`. Typed, not cycled: `Enter` on the row opens a prompt, an empty answer puts `auto` back. |
 | `editor` | string | `"vim"` | General | The EDITOR the FILE FINDER (`f`), TREE BROWSER (`b`), find-in-files (`Shift+F`) and ⌥click launch, invoked as `<editor> +<line> <file>`. The overlay cycles `vim`, `nvim`, `nano`, `emacs`, `hx`; any command passes through verbatim, so a hand edit can name one the picker doesn't. `NEBULA_EDITOR` overrides it for the process. |
 | `close_finder_on_open` | bool | `true` | General | Opening a file closes the FILE FINDER behind the editor modal, so quitting the editor is one Esc instead of two. Off leaves the results underneath. Never touches the TREE BROWSER (its editor is its own preview pane) or ⌥click. |
-| `skip_session_naming` | bool | `false` | Sessions | New AGENTS launch straight from the NEW SESSION PICKER with no name prompt, taking the generated name and opting into AUTO-TITLE — exactly as accepting an empty prompt does. |
+| `skip_session_naming` | bool | `false` | Sessions | New AGENTS launch straight from the NEW SESSION PICKER with no task box, taking the generated name and AUTO-TITLE; the first prompt is typed in the CLI instead. The key predates the box, which stands where a name prompt used to. |
 | `confirm_on_archive` | bool | `false` | Sessions | Put a CONFIRM DIALOG in front of archiving a session — `a` and the row menu's **Archive** alike — for when typing aimed at an agent keeps landing on the SESSIONS PANEL and archiving the session under the cursor. Off, archive is the one verb on that panel that skips the dialog `d` goes behind: it is cheap to undo with `u`, and the dialog says so. |
 | `session_idle_timeout` | string | `"5m"` | Sessions | DAEMON-owned IDLE TIMEOUT: how long a session in a WORKTREE no client is viewing goes unwatched before the IDLE REAPER kills its PTY. See the values below. |
 | `done_sound` | string | `"Glass"` | Sessions | The DONE SOUND rung when a turn reaches FINISHED: `off`, `bell` (the terminal BEL — silent in Ghostty unless its `bell-features` include `audio`), or a macOS system sound from `/System/Library/Sounds` played with `afplay` (`Glass`, `Ping`, `Pop`, `Hero`, …). Over `nebula ssh` and off macOS it is always the bell. |
@@ -121,8 +121,8 @@ on the next ATTACH or prewarm, and an agent RESUMES its conversation there.
   `nebula ssh` and off macOS it is always the bell), the feedback sound (`feedback_sound`: the same
   choices, `Sosumi` by default, rung when a turn stops to ask you — and, while the terminal window
   is in the background, a desktop notification naming the session and its worktree; `off` silences
-  both), whether new sessions stop to ask for a
-  name, and whether `a` asks before archiving one (`confirm_on_archive`, off unless you turn it
+  both), whether new sessions stop to ask for a first
+  prompt (`skip_session_naming`), and whether `a` asks before archiving one (`confirm_on_archive`, off unless you turn it
   on). `R` inside the overlay puts every setting — hotkeys included — back to its default, after a
   confirmation.
 - **Every panel key is rebindable.** The overlay's Hotkeys tab lists every action and what it answers to,
@@ -218,7 +218,6 @@ Knobs worth reaching for by hand:
 |---|---|---|
 | `NEBULA_LOG` | — | `RUST_LOG`-style tracing filter for both the DAEMON and the TUI. |
 | `NEBULA_EDITOR` | — | Editor command the file modals open, ahead of the `editor` setting. |
-| `NEBULA_CLOUD_MIRROR_SECS` | `45` | CLOUD MIRROR cadence in seconds, floored at 2; `0` turns the follow off and leaves **Attach cloud session** as the manual refresh. See [Sessions](sessions.md). |
 
 Overrides for tests and parallel instances — real, but not things a normal install needs:
 

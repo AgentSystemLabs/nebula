@@ -367,7 +367,6 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: false,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 },
                 true,

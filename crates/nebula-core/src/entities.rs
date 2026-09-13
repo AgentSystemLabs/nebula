@@ -185,22 +185,17 @@ pub struct Agent {
     /// CLI session id used for resume (claude, codex, or cursor, per `kind`).
     pub session_id: Option<String>,
     /// The Claude Cloud session this row launched (`claude --cloud <task>`
-    /// prints the id as it creates one). Only cloud rows have it. Restarting
-    /// such a row while it has no local `session_id` re-enters the cloud
-    /// session — `claude --cloud <id>`, or `claude --teleport <id>` when the
-    /// account cannot attach — instead of booting a bare local CLI.
+    /// prints the id as it creates one). Only cloud rows have it. The
+    /// agent runs in the cloud sandbox, never in a local PTY: the row's
+    /// pane is an information panel linking to the session in the browser
+    /// (see [`Agent::cloud_session_url`]), and the daemon refuses to boot a
+    /// local CLI for it — a restart or an attach would only start a bare
+    /// `claude` with no link to the work.
     #[serde(default)]
     pub cloud_session_id: Option<String>,
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this agent.
     pub alive: bool,
-    /// True while the daemon is following this row's Claude Cloud session —
-    /// re-teleporting the pane on a timer so turns taken in the cloud show
-    /// up here. Runtime state like `alive`, never persisted: it ends the
-    /// moment the pane is typed into (the session is then the user's) and
-    /// does not survive a daemon restart.
-    #[serde(default)]
-    pub cloud_mirroring: bool,
     /// The last few prompts typed into this session, oldest first — what
     /// the `UserPromptSubmit` hook carried, condensed to one line each
     /// (RECENT PROMPTS). Capped at [`RECENT_PROMPTS_KEPT`] by the daemon;
@@ -208,6 +203,20 @@ pub struct Agent {
     /// the bottom. Empty for every row that predates the capture.
     #[serde(default)]
     pub recent_prompts: Vec<PromptEntry>,
+}
+
+impl Agent {
+    /// Where this row's Claude Cloud session lives in the browser, when it
+    /// has one — the page the CLI printed as `View:` on creation, without
+    /// its tracking query.
+    pub fn cloud_session_url(&self) -> Option<String> {
+        self.cloud_session_id.as_deref().map(cloud_session_url)
+    }
+}
+
+/// The claude.ai page of a Claude Cloud session, from its `session_…` id.
+pub fn cloud_session_url(cloud_session_id: &str) -> String {
+    format!("https://claude.ai/code/{cloud_session_id}")
 }
 
 /// How many prompts the daemon keeps per session: the most a TUI can be

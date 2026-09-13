@@ -1072,8 +1072,8 @@ fn row_to_worktree(r: &rusqlite::Row) -> rusqlite::Result<Worktree> {
     })
 }
 
-/// `alive` and `cloud_mirroring` are daemon state, not columns: the
-/// registry fills them in from its session table after the read.
+/// `alive` is daemon state, not a column: the registry fills it in from
+/// its session table after the read.
 fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<Agent> {
     Ok(Agent {
         id: AgentId(r.get(0)?),
@@ -1091,7 +1091,6 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<Agent> {
         unseen: r.get::<_, i64>(12)? != 0,
         cloud_session_id: r.get(13)?,
         alive: false,
-        cloud_mirroring: false,
         recent_prompts: parse_prompts(r.get::<_, Option<String>>(14)?.as_deref()),
     })
 }
@@ -1164,7 +1163,6 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
-            cloud_mirroring: false,
             recent_prompts: Vec::new(),
         };
         let pr_url = "https://github.com/AgentSystemLabs/nebula/pull/42";
@@ -1187,7 +1185,6 @@ mod tests {
             sort_order: 1,
             status_changed_at: 0,
             alive: false,
-            cloud_mirroring: false,
             recent_prompts: Vec::new(),
         };
         store.insert_agent(&codex_agent).unwrap();
@@ -1207,7 +1204,6 @@ mod tests {
             sort_order: 2,
             status_changed_at: 0,
             alive: false,
-            cloud_mirroring: false,
             recent_prompts: Vec::new(),
         };
         store.insert_agent(&cursor_agent).unwrap();
@@ -1228,7 +1224,6 @@ mod tests {
             sort_order: 3,
             status_changed_at: 0,
             alive: false,
-            cloud_mirroring: false,
             recent_prompts: Vec::new(),
         };
         store
@@ -1711,7 +1706,6 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
-            cloud_mirroring: false,
             recent_prompts: Vec::new(),
         };
 
@@ -1799,7 +1793,6 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: false,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 },
                 true,
@@ -1928,7 +1921,6 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: false,
-                    cloud_mirroring: false,
                     recent_prompts: Vec::new(),
                 })
                 .unwrap();
@@ -1994,7 +1986,6 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: false,
-                cloud_mirroring: false,
                 recent_prompts: Vec::new(),
             };
             store.insert_agent(&agent).unwrap();
@@ -2094,7 +2085,6 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: false,
-                cloud_mirroring: false,
                 recent_prompts: Vec::new(),
             })
             .unwrap();

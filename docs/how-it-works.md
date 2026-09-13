@@ -66,7 +66,10 @@
 - **Agents boot `claude`, `codex`, `cursor-agent`, or `pi`.** Creating an agent (`n`) first asks which CLI to
   run, then spawns it in the worktree. Claude's picker can also dispatch a one-shot Cloud task as
   `claude --cloud <task>`; because Claude accepts that description as a process argument, don't put
-  secrets in the Cloud task. Restored agents resume with `claude --resume <session-id>` /
+  secrets in the Cloud task. That CLI prints the new session's id and exits, and the DAEMON reads the
+  id off its output — the agent then runs in Claude's cloud, so the row's pane is the CLOUD SESSION
+  PANEL linking to it, and nothing is ever attached, teleported or restarted locally in its name.
+  Restored agents resume with `claude --resume <session-id>` /
   `codex resume <session-id>` / `cursor-agent --resume <session-id>` (falling back to a fresh session
   when the old one is gone) / `pi --session-id <session-id>` (which creates a missing id instead of
   dying). An AGENT created from a PROJECT OPEN PRS row also receives the PR URL and a PR-only
@@ -193,8 +196,8 @@
 - **Everything persists in SQLite** (`~/.local/share/nebula/nebula.db` or the platform equivalent):
   projects, worktrees, agents (with kind + CLI session ids), links, workspaces, and your
   last selection.
-- **Sessions warm up, then get reaped.** The daemon can pre-spawn an agent CLI while you're still naming
-  the session, and pre-boot a worktree's dead sessions while your selection rests on it, so attaching
+- **Sessions warm up, then get reaped.** The daemon can pre-spawn an agent CLI in the selected worktree
+  before you ask for one, and pre-boot a worktree's dead sessions while your selection rests on it, so attaching
   lands on a booted screen instead of a booting shell. To bound what that costs, idle PTYs in worktrees
   no client is watching are killed after `session_idle_timeout` (5m by default) — working agents, ones
   waiting on you, and terminals with a command running are all spared, and a reaped agent

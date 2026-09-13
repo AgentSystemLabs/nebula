@@ -1,6 +1,8 @@
 //! The QUICK PROMPT: the hotkey that opens a task box anywhere in the TUI
 //! and launches an AGENT on what you type, without walking the NEW SESSION
-//! PICKER first.
+//! PICKER first. The same box is that picker's own last step — `n`, a
+//! harness, then this, where a name prompt used to stand
+//! ([`QuickOrigin::NewSession`]).
 //!
 //! What lives here is the launch spec — [`QuickLaunch`]: which AGENT KIND
 //! and MODEL / EFFORT the `quick_prompt_kind` SETTING resolves to, which
@@ -34,6 +36,22 @@ pub enum QuickTarget {
     NewWorktree { project: ProjectId, branch: String },
 }
 
+/// Which surface put the box up. Both launch the same way; they differ in
+/// what an empty box means and where FOCUS lands after Enter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickOrigin {
+    /// The `p` hotkey, and the ISSUES MODAL's box: Enter on an empty box
+    /// is a change of mind (an ISSUE SESSION aside), and the launch reads
+    /// the `quick_prompt_focus` SETTING.
+    Hotkey,
+    /// The NEW SESSION PICKER's last step (`n`, then a harness), standing
+    /// where the name prompt used to. Enter on an empty box still
+    /// launches — with no STARTING PROMPT, the CLI's own input being the
+    /// first prompt, as accepting the empty name prompt was — and the
+    /// launch takes the TERMINAL PANE like every other picker-walked one.
+    NewSession,
+}
+
 /// Everything one QUICK PROMPT will launch with. Resolved from the config
 /// when the box opens and rewritten in place by the box's own pickers —
 /// `Tab` (harness, then MODEL / EFFORT) and `Shift+Tab` (an AGENT PRESET).
@@ -56,6 +74,9 @@ pub struct QuickLaunch {
     /// empty. Kept across the box's pickers — the harness and the preset
     /// change what runs, not what it is for.
     pub issue: Option<crate::issues::IssueRef>,
+    /// Which surface opened the box — see [`QuickOrigin`]. Kept across the
+    /// box's pickers and its `Ctrl+N`, as the issue is.
+    pub origin: QuickOrigin,
 }
 
 /// What a picker opened *from* the box carries, so the trip loses nothing:
@@ -106,6 +127,7 @@ impl QuickLaunch {
             effort,
             preset: None,
             issue: None,
+            origin: QuickOrigin::Hotkey,
         }
     }
 
@@ -117,11 +139,28 @@ impl QuickLaunch {
         self
     }
 
+    /// The same launch, from `origin`. The NEW SESSION PICKER sets it on
+    /// the box it opens, and every picker's return trip keeps it, as
+    /// `with_issue` keeps the issue.
+    pub fn with_origin(mut self, origin: QuickOrigin) -> Self {
+        self.origin = origin;
+        self
+    }
+
     /// The task Enter sends when the box is empty: an ISSUE SESSION's box
     /// may be sent as it is, the issue being the task. `None` for every
     /// other launch, where an empty box is a change of mind.
     pub fn default_task(&self) -> Option<String> {
         self.issue.as_ref().map(|issue| issue.default_task())
+    }
+
+    /// Does Enter on an empty box launch, with no STARTING PROMPT? Only
+    /// the NEW SESSION PICKER's box, and only with no AGENT PRESET on it —
+    /// a preset's prefix and postfix wrap a task, so an empty box is a
+    /// change of mind there as it is after `p`. (An ISSUE SESSION's empty
+    /// box is `default_task`'s: the issue is the task.)
+    pub fn launches_empty(&self) -> bool {
+        self.origin == QuickOrigin::NewSession && self.preset.is_none()
     }
 
     /// The launch an AGENT PRESET describes: its harness, its pinned
@@ -155,13 +194,14 @@ impl QuickLaunch {
     /// is never a surprise —
     /// `Quick prompt · reviewer (claude · opus · high)`,
     /// `Quick prompt · new worktree yellow-fox-jumps (claude)`,
-    /// `Quick prompt · issue #15 · reviewer (claude · opus)`.
+    /// `Quick prompt · issue #15 · reviewer (claude · opus)` — and, for
+    /// the NEW SESSION PICKER's box, `New session (claude · opus · high)`.
     pub fn title(&self) -> String {
         let opts: Vec<&str> = std::iter::once(self.kind.as_str())
             .chain(self.model.as_deref())
             .chain(self.effort.as_deref())
             .collect();
-        let mut head = vec!["Quick prompt".to_string()];
+        let mut head = vec![self.head().to_string()];
         if let Some(issue) = &self.issue {
             head.push(format!("issue #{}", issue.number));
         }
@@ -185,8 +225,27 @@ impl QuickLaunch {
                 "what should the agent do about #{}? (empty = fix the issue)",
                 issue.number
             ),
-            (None, None) => "what should the agent do?".into(),
+            (None, None) => match self.origin {
+                QuickOrigin::Hotkey => "what should the agent do?".into(),
+                QuickOrigin::NewSession => {
+                    "what should the agent do? (empty = start with no prompt)".into()
+                }
+            },
         }
+    }
+
+    /// The title's first words: which surface the box is.
+    fn head(&self) -> &'static str {
+        match self.origin {
+            QuickOrigin::Hotkey => "Quick prompt",
+            QuickOrigin::NewSession => "New session",
+        }
+    }
+
+    /// The title of the box's `Tab` picker: `Quick prompt agent`, or
+    /// `New session agent` over the NEW SESSION PICKER's own box.
+    pub fn picker_title(&self) -> String {
+        format!("{} agent", self.head())
     }
 
     /// Does Enter cut a fresh worktree before it launches? The box's frame
@@ -236,6 +295,25 @@ pub(crate) fn open_quick_prompt(app: &mut App) {
 /// the title can name what Enter is about to start.
 pub(crate) fn open_for(app: &mut App, target: QuickTarget) {
     let launch = QuickLaunch::from_config(target, &Config::load());
+    crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch));
+}
+
+/// The NEW SESSION PICKER's last step: the box for the harness (and the
+/// MODEL / EFFORT) just picked, launching into the picker's worktree. It
+/// stands where the name prompt used to — the session titles itself from
+/// the prompt instead — and `Tab`, `Shift+Tab` and `Ctrl+N` work in it as
+/// they do after `p`. `model` / `effort` are the picker's resolved choice;
+/// `of_kind` only fills in what is still None.
+pub(crate) fn open_for_new_session(
+    app: &mut App,
+    worktree: WorktreeId,
+    kind: AgentKind,
+    model: Option<String>,
+    effort: Option<String>,
+    cfg: &Config,
+) {
+    let launch = QuickLaunch::of_kind(QuickTarget::Worktree(worktree), kind, model, effort, cfg)
+        .with_origin(QuickOrigin::NewSession);
     crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch));
 }
 
@@ -586,5 +664,60 @@ mod tests {
             wrapped.title(),
             "Quick prompt · reviewer · new worktree yellow-fox-jumps (cursor)"
         );
+    }
+
+    /// The NEW SESSION PICKER's box: titled for the picker, launching on
+    /// an empty Enter — unless an AGENT PRESET is on it — and keeping its
+    /// origin through the rebuilds its pickers and `Ctrl+N` do.
+    #[test]
+    fn the_new_session_box_is_titled_for_the_picker_and_launches_empty() {
+        let cfg = Config::default();
+        let hotkey = QuickLaunch::of_kind(worktree(), AgentKind::Claude, None, None, &cfg);
+        assert_eq!(hotkey.origin, QuickOrigin::Hotkey);
+        assert_eq!(hotkey.title(), "Quick prompt (claude)");
+        assert_eq!(hotkey.label(), "what should the agent do?");
+        assert_eq!(hotkey.picker_title(), "Quick prompt agent");
+        assert!(
+            !hotkey.launches_empty(),
+            "an empty hotkey box is a change of mind"
+        );
+
+        let picked = QuickLaunch::of_kind(
+            worktree(),
+            AgentKind::Claude,
+            Some("opus".into()),
+            Some("high".into()),
+            &cfg,
+        )
+        .with_origin(QuickOrigin::NewSession);
+        assert_eq!(picked.title(), "New session (claude · opus · high)");
+        assert_eq!(
+            picked.label(),
+            "what should the agent do? (empty = start with no prompt)"
+        );
+        assert_eq!(picked.picker_title(), "New session agent");
+        assert!(picked.launches_empty());
+
+        // A preset wraps a task, so an empty box is a change of mind again.
+        let mut wrapped = picked.clone();
+        wrapped.preset = Some(preset("reviewer", AgentKind::Claude));
+        assert!(!wrapped.launches_empty());
+        assert_eq!(
+            wrapped.title(),
+            "New session · reviewer (claude · opus · high)"
+        );
+
+        // `Ctrl+N` rebuilds the launch around a new target; the origin
+        // rides along.
+        let flipped = QuickLaunch {
+            target: new_worktree("fix-login"),
+            ..picked
+        };
+        assert_eq!(flipped.origin, QuickOrigin::NewSession);
+        assert_eq!(
+            flipped.title(),
+            "New session · new worktree fix-login (claude · opus · high)"
+        );
+        assert!(flipped.launches_empty());
     }
 }

@@ -112,7 +112,9 @@ pub(super) fn land_click_focus(app: &mut App, column: u16, row: u16, out: &mut V
         Some(HitTarget::Worktree(_) | HitTarget::OpenPrsHeader) => app.focus = Focus::Worktrees,
         Some(HitTarget::Session(_) | HitTarget::ArchivedHeader) => app.focus = Focus::Sessions,
         Some(HitTarget::PanelBg(focus)) => app.focus = focus,
-        Some(HitTarget::TerminalPane) => enter_terminal_pane(app, out),
+        Some(HitTarget::TerminalPane | HitTarget::CloudSessionLink) => {
+            enter_terminal_pane(app, out)
+        }
         Some(HitTarget::Splitter(_) | HitTarget::FooterWorkspace) | None => {}
     }
 }

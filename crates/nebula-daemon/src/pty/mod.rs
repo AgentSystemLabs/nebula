@@ -12,7 +12,6 @@ use progress::ProgressScanner;
 use ring::ScrollbackRing;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
 
@@ -127,14 +126,11 @@ pub enum PtyEvent {
     Title {
         title: String,
     },
-    /// The child printed the id of the Claude Cloud session it created or
-    /// attached to. Only scanned for on `--cloud` launches (`arm_cloud_scan`).
+    /// The child printed the id of the Claude Cloud session it created.
+    /// Only scanned for on `--cloud` launches (`arm_cloud_scan`).
     CloudSession {
         id: String,
     },
-    /// The child refused to attach to a cloud session ("not enabled for
-    /// your account"); it exits right after. Likewise `--cloud` launches only.
-    CloudAttachRejected,
 }
 
 enum ReaderMsg {
@@ -162,14 +158,9 @@ pub struct PtySession {
     progress: Mutex<ProgressScanner>,
     /// OSC 0/2 window-title tracking, likewise fed from live output.
     title: Mutex<title::TitleScanner>,
-    /// Claude Cloud session id / attach-refusal scanner; `None` until a
-    /// `--cloud` launch arms it, so ordinary sessions pay nothing.
+    /// Claude Cloud session id scanner; `None` until a `--cloud` launch
+    /// arms it, so ordinary sessions pay nothing.
     cloud: Mutex<Option<CloudScanner>>,
-    /// Set by the first `write_input`. A Cloud mirror stops re-teleporting
-    /// once its pane has been typed into: the moment the user talks to the
-    /// local session, replacing it under them would eat their turn.
-    /// Resizes and attaches deliberately do not count.
-    input_seen: AtomicBool,
 }
 
 pub struct SpawnSpec {
@@ -237,7 +228,6 @@ impl PtySession {
             progress: Mutex::new(ProgressScanner::new()),
             title: Mutex::new(title::TitleScanner::new()),
             cloud: Mutex::new(None),
-            input_seen: AtomicBool::new(false),
         });
 
         let (tx, rx) = mpsc::channel::<ReaderMsg>(READER_CHANNEL_BOUND);
@@ -247,9 +237,6 @@ impl PtySession {
     }
 
     pub fn write_input(&self, data: &[u8]) -> Result<()> {
-        if !data.is_empty() {
-            self.input_seen.store(true, Ordering::Relaxed);
-        }
         let mut w = self.writer.lock().unwrap();
         w.write_all(data)?;
         w.flush()?;
@@ -386,22 +373,16 @@ impl PtySession {
         self.progress.lock().unwrap().busy()
     }
 
-    /// Start watching this child's output for the Claude Cloud session id
-    /// it prints on creation and for an attach refusal (see `pty::cloud`).
-    /// Output that already landed in the ring is scanned first, so arming
-    /// a moment after spawn cannot miss a fast-printing child; sightings
-    /// then arrive as `PtyEvent::CloudSession` / `CloudAttachRejected`.
-    /// Whether anything has been typed into this session. Drives the
-    /// Cloud mirror's "stop refreshing once it's yours" rule.
-    pub fn input_seen(&self) -> bool {
-        self.input_seen.load(Ordering::Relaxed)
-    }
-
     /// The child's current window title, or `None` if it never set one.
     pub fn window_title(&self) -> Option<String> {
         self.title.lock().unwrap().title().map(str::to_string)
     }
 
+    /// Start watching this child's output for the Claude Cloud session id
+    /// it prints on creation (see `pty::cloud`). Output that already landed
+    /// in the ring is scanned first, so arming a moment after spawn cannot
+    /// miss a fast-printing child; the sighting then arrives as
+    /// `PtyEvent::CloudSession`.
     pub fn arm_cloud_scan(&self) {
         let mut scanner = CloudScanner::new();
         let (_, replay) = self.snapshot(None);
@@ -545,23 +526,6 @@ mod tests {
             },
         )
         .unwrap()
-    }
-
-    /// The Cloud mirror stops refreshing a pane once its user has typed
-    /// into it, so `input_seen` must track keystrokes only — an attach's
-    /// resize jiggle happens without anyone touching the keyboard.
-    #[tokio::test]
-    async fn input_seen_tracks_keystrokes_not_resizes() {
-        let session = echo_session();
-        assert!(!session.input_seen());
-        session.resize_with_jiggle(100, 30).unwrap();
-        session.resize(80, 24).unwrap();
-        assert!(!session.input_seen(), "a resize is not input");
-        session.write_input(b"").unwrap();
-        assert!(!session.input_seen(), "an empty write is not input");
-        session.write_input(b"x").unwrap();
-        assert!(session.input_seen());
-        session.kill();
     }
 
     /// A window title set by the child reaches subscribers as its own

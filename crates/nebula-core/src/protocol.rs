@@ -282,21 +282,11 @@ pub enum ClientRequest {
         req_id: u64,
         id: AgentId,
     },
-    /// Re-enter the Claude Cloud session a row launched: `claude --cloud
-    /// <id>` for a live attach, which the daemon downgrades to `claude
-    /// --teleport <id>` when the account cannot attach. A row still sitting
-    /// in the main checkout is first re-homed into a worktree of its own,
-    /// because either CLI switches the checkout to the cloud branch.
-    /// Rejected for rows without a `cloud_session_id`.
-    AttachCloudAgent {
-        req_id: u64,
-        id: AgentId,
-    },
     /// Queue a message on the Claude Cloud session a row launched
-    /// (`claude -p <message> --cloud <id>`), then pull the transcript so the
-    /// send is visible. Fire-and-forget by nature: the CLI acknowledges the
-    /// send and returns, and the reply only ever appears in a later pull.
-    /// Rejected for rows without a `cloud_session_id`, and bounded by
+    /// (`claude -p <message> --cloud <id>`). Fire-and-forget by nature: the
+    /// CLI acknowledges the send and returns, and the reply only ever
+    /// appears in the session's page in the browser. Rejected for rows
+    /// without a `cloud_session_id`, and bounded by
     /// [`MAX_CLOUD_PROMPT_BYTES`] like the launch task.
     SendCloudMessage {
         req_id: u64,
