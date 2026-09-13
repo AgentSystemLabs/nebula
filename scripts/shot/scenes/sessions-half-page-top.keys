@@ -1,0 +1,124 @@
+# Focus the SESSIONS PANEL over the root checkout, launch thirty quick prompts and archive the newest
+# twenty-eight, then `A` shows the ARCHIVED group: the cursor on the top live row, the archive
+# running off the bottom of the column.
+Tab
+Tab
+p
+Fix the login redirect loop when the session cookie has expired
+Enter
+p
+Sort the changelog entries by date, newest first
+Enter
+p
+Profile the daemon's startup and find what takes 400ms
+Enter
+p
+Make the mouse wheel step one line a notch in the pane
+Enter
+p
+Ring the done sound once per finish, not once per hook
+Enter
+p
+Let the palette search every workspace, not just the open one
+Enter
+p
+Have the quick prompt cut a fresh worktree when asked
+Enter
+p
+Add a Hotkeys tab to settings that rebinds the panel walk
+Enter
+p
+Let the root badge yield to the branch name when the column is narrow
+Enter
+p
+Colour a merged checkout purple in the Worktrees column
+Enter
+p
+Add a confirm-on-archive setting, off by default
+Enter
+p
+Preview a file on Enter in the tree browser instead of opening the editor
+Enter
+p
+Hang the last three prompts under each session pill
+Enter
+p
+Fade the splash in on first run
+Enter
+p
+Forget a stale host in the hosts picker after three failed connects
+Enter
+p
+Make Ctrl+q leave the locked pane from any nesting depth
+Enter
+p
+Fold the OPEN PRS group down to a header on click
+Enter
+p
+Let the diff viewer mark a file reviewed with Ctrl+r
+Enter
+p
+Count unread finishes on the workspaces bar
+Enter
+p
+Show the branch's pull request as a row in the Sessions panel
+Enter
+p
+Wrap the task in prefix and postfix text from an agent preset
+Enter
+p
+Show a placeholder row while git cuts the worktree
+Enter
+p
+Name the double tap in the footer flash
+Enter
+p
+Poll the daemon for memory in the metrics overlay
+Enter
+p
+Run the update check off the tick, not at every draw
+Enter
+p
+Open grep results at the matched line
+Enter
+p
+Add a GitHub issues modal with prompt and preset on one
+Enter
+p
+Report the IME cursor position while typing in the prompt
+Enter
+p
+Forward wheel and clicks to an app that took the mouse
+Enter
+p
+Hide draft pull requests behind a setting
+Enter
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+a
+A
