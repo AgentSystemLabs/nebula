@@ -213,6 +213,9 @@ pub enum MenuAction {
     ToggleArchived,
     /// Fold / unfold the PROJECT OPEN PRS GROUP (Worktrees panel menu).
     ToggleOpenPrs,
+    /// Flip the `hide_draft_prs` SETTING from the Worktrees panel menu:
+    /// drafts out of the group and `/`, or back in.
+    ToggleDraftPrs,
 }
 
 /// Which submenu → (right arrow) opens from a menu row.
@@ -2112,6 +2115,11 @@ pub struct App {
     pub hide_projects: bool,
     /// Worktrees panel hidden; mirrors CONFIG.JSON's `hide_worktrees`.
     pub hide_worktrees: bool,
+    /// Draft pull requests left out of the PROJECT OPEN PRS GROUP and the
+    /// `/` PALETTE; mirrors CONFIG.JSON's `hide_draft_prs` (Settings →
+    /// Appearance, or the Worktrees panel menu). Read on every look at
+    /// the list (`listed_open_prs`), never applied to what is stored.
+    pub hide_draft_prs: bool,
     /// The ROOT WORKTREE row left out of the Worktrees panel; mirrors
     /// CONFIG.JSON's `hide_root_worktree` (Settings → Experimental).
     pub hide_root_worktree: bool,
@@ -2412,6 +2420,7 @@ impl App {
             show_workspaces: true,
             hide_projects: false,
             hide_worktrees: false,
+            hide_draft_prs: false,
             hide_root_worktree: false,
             recent_prompts: 0,
             next_req_id: 1,
@@ -2977,10 +2986,12 @@ impl App {
             .collect()
     }
 
-    /// The selected project's open pull requests, whether or not the group
-    /// under the checkouts is showing them: what its header counts while
-    /// it is folded. Empty until the first `gh pr list` answers (or when
-    /// the repo genuinely has none).
+    /// The selected project's open pull requests, every one `gh pr list`
+    /// answered with — drafts included whatever `hide_draft_prs` says, and
+    /// whether or not the group under the checkouts is showing them. The
+    /// list the fetch cap (`pull_request::LIST_LIMIT`) is measured
+    /// against. Empty until the first answer (or when the repo genuinely
+    /// has none).
     pub fn all_open_prs(&self) -> &[OpenPr] {
         self.selected_project()
             .and_then(|p| self.open_prs.get(&p.id))
@@ -2988,15 +2999,40 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// The open pull requests with rows under the checkouts: the whole
-    /// list, or none while the group is folded — a folded group has no
+    /// The open pull requests the PROJECT OPEN PRS GROUP lists once it is
+    /// open: the whole answer, or — with `hide_draft_prs` on — only the
+    /// rows asking for a reviewer. What its header counts while it is
+    /// folded. A view over [`App::all_open_prs`], filtered on every read
+    /// rather than once on arrival, so switching the setting off shows
+    /// every draft at once with no refetch, and a draft marked ready on
+    /// GitHub joins the rows on the refresh that says so.
+    pub fn listed_open_prs(&self) -> Vec<&OpenPr> {
+        self.all_open_prs()
+            .iter()
+            .filter(|pr| !(self.hide_draft_prs && pr.is_draft))
+            .collect()
+    }
+
+    /// How many drafts `hide_draft_prs` is keeping out of the group right
+    /// now — what its header owns up to (`9/12`), so a pull request that
+    /// is not where it was reads as a setting, not a loss. Zero while
+    /// drafts show.
+    pub fn hidden_draft_prs(&self) -> usize {
+        if !self.hide_draft_prs {
+            return 0;
+        }
+        self.all_open_prs().iter().filter(|pr| pr.is_draft).count()
+    }
+
+    /// The open pull requests with rows under the checkouts: the listed
+    /// ones, or none while the group is folded — a folded group has no
     /// rows for the cursor to walk into, the way a collapsed ARCHIVED
     /// group has none.
-    pub fn visible_open_prs(&self) -> &[OpenPr] {
+    pub fn visible_open_prs(&self) -> Vec<&OpenPr> {
         if self.open_prs_collapsed {
-            return &[];
+            return Vec::new();
         }
-        self.all_open_prs()
+        self.listed_open_prs()
     }
 
     /// How many rows the Worktrees panel has: the project's checkouts, then
@@ -3024,7 +3060,7 @@ impl App {
         let i = self
             .sel_worktree
             .checked_sub(self.visible_worktrees().len())?;
-        self.visible_open_prs().get(i)
+        self.visible_open_prs().get(i).copied()
     }
 
     /// The pull request the pane should be reading: the PROJECT OPEN PRS

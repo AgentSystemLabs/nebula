@@ -217,7 +217,8 @@ checkout's row in the Worktrees panel: purple dot, purple rail, and the branch n
 running row's does, so the checkout to delete stands out from across the room (a session still running
 or asking there keeps its yellow or red — that is not a checkout to pull out from under it). Rest on that
 row and the pane reads the pull request — description, stats, conversation — exactly as it does for the
-project-wide OPEN PRS rows under the worktrees, which do retire on merge; `g` shows its diff. Manual link
+project-wide OPEN PRS rows under the worktrees, which do retire on merge (and which the `hide_draft_prs`
+setting can thin to the non-drafts — this row is never thinned, it is the checkout's own); `g` shows its diff. Manual link
 attachment is currently unavailable; previously saved links remain visible so the change does not
 discard data.
 
