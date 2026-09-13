@@ -115,9 +115,10 @@ impl Palette {
         show_archived: bool,
         enter_attaches: bool,
         open_prs: &HashMap<ProjectId, OpenPrs>,
+        hide_draft_prs: bool,
     ) -> Self {
         let mut palette = Self {
-            items: build_palette_items(tree, show_archived, open_prs),
+            items: build_palette_items(tree, show_archived, open_prs, hide_draft_prs),
             query: TextInput::new(),
             matches: Vec::new(),
             selected: 0,
@@ -139,9 +140,10 @@ impl Palette {
         tree: &Tree,
         show_archived: bool,
         open_prs: &HashMap<ProjectId, OpenPrs>,
+        hide_draft_prs: bool,
     ) {
         let keep = self.selected_target().cloned();
-        self.items = build_palette_items(tree, show_archived, open_prs);
+        self.items = build_palette_items(tree, show_archived, open_prs, hide_draft_prs);
         self.apply_filter();
         if let Some(target) = keep {
             if let Some(row) = self
@@ -214,7 +216,7 @@ fn attention_rank(items: &[PaletteItem]) -> Vec<usize> {
 /// archived sessions are left out whatever the SESSIONS PANEL's toggle
 /// says: a released PTY has nothing left to ask of anyone.
 pub fn attention_sessions(tree: &Tree) -> Vec<AgentId> {
-    let items = build_palette_items(tree, false, &HashMap::new());
+    let items = build_palette_items(tree, false, &HashMap::new(), false);
     let rank = attention_rank(&items);
     let mut order: Vec<usize> = (0..items.len()).collect();
     order.sort_by_key(|&i| rank[i]);
@@ -246,7 +248,10 @@ fn session_tier(a: &Agent) -> PaletteTier {
 /// themselves, then each one's projects in tree order, then their
 /// worktrees, then their sessions, then the open pull requests nebula has
 /// fetched. Archived sessions appear only when the archived toggle is on
-/// (the Sessions panel rule).
+/// (the Sessions panel rule); draft pull requests only while
+/// `hide_draft_prs` is off (the PROJECT OPEN PRS GROUP's rule — the two
+/// surfaces show the same rows). Worktrees and sessions are never held
+/// back by either.
 ///
 /// This is the build order — what `matches` falls back to among rows with
 /// the same tier and stamp; the open workspace comes first so never-run
@@ -259,6 +264,7 @@ fn build_palette_items(
     tree: &Tree,
     show_archived: bool,
     open_prs: &HashMap<ProjectId, OpenPrs>,
+    hide_draft_prs: bool,
 ) -> Vec<PaletteItem> {
     let now = now_ms();
     let mut items = Vec::new();
@@ -349,6 +355,9 @@ fn build_palette_items(
                 continue;
             };
             for pr in &open.list {
+                if hide_draft_prs && pr.is_draft {
+                    continue;
+                }
                 items.push(PaletteItem {
                     target: PaletteTarget::PullRequest(pr.url.clone()),
                     text: format!("{at}{}/{}", p.name, pr.label()),
@@ -469,7 +478,7 @@ mod tests {
     }
 
     fn rows(tree: &Tree, show_archived: bool, query: &str) -> Vec<String> {
-        let mut palette = Palette::new(tree, show_archived, false, &HashMap::new());
+        let mut palette = Palette::new(tree, show_archived, false, &HashMap::new(), false);
         palette.query = TextInput::from(query);
         palette.apply_filter();
         palette
@@ -560,6 +569,63 @@ mod tests {
             .map(|id| id.0)
             .collect();
         assert_eq!(ring, ["ask", "run", "unread", "read", "fresh"]);
+    }
+
+    /// `hide_draft_prs` keeps drafts out of `/` exactly as it keeps them
+    /// out of the PROJECT OPEN PRS GROUP: the finished pull request is
+    /// still a row, the draft is not, and nothing else on the project is
+    /// touched — its worktrees and sessions are what the toggle promises
+    /// to leave alone.
+    #[test]
+    fn hidden_drafts_leave_the_palette_and_nothing_else_does() {
+        let tree = tree();
+        let pr = |number: u64, title: &str, is_draft: bool| crate::pull_request::OpenPr {
+            number,
+            title: title.into(),
+            url: format!("https://github.com/o/r/pull/{number}"),
+            is_draft,
+            head: format!("pr-{number}"),
+        };
+        let now = std::time::Instant::now();
+        let mut open_prs = HashMap::new();
+        open_prs.insert(
+            ProjectId("p1".into()),
+            OpenPrs {
+                list: vec![pr(7, "Attach links", false), pr(9, "Still cooking", true)],
+                at: now,
+                due: now,
+                step: std::time::Duration::from_secs(1),
+            },
+        );
+        let texts = |hide: bool| -> Vec<String> {
+            Palette::new(&tree, false, false, &open_prs, hide)
+                .items
+                .iter()
+                .map(|i| i.text.clone())
+                .collect()
+        };
+
+        let shown = texts(false);
+        assert!(
+            shown.iter().any(|t| t == "default/demo/#7 Attach links"),
+            "{shown:?}"
+        );
+        assert!(
+            shown.iter().any(|t| t == "default/demo/#9 Still cooking"),
+            "{shown:?}"
+        );
+
+        let hidden = texts(true);
+        assert!(
+            hidden.iter().any(|t| t == "default/demo/#7 Attach links"),
+            "{hidden:?}"
+        );
+        assert!(!hidden.iter().any(|t| t.contains("#9")), "{hidden:?}");
+        assert_eq!(hidden.len(), shown.len() - 1, "only the draft row went");
+        assert!(
+            hidden.iter().any(|t| t == "default/demo/main/ask"),
+            "sessions are untouched: {hidden:?}"
+        );
     }
 
     #[test]

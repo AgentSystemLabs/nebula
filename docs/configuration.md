@@ -24,7 +24,7 @@ convenience stores: missing or malformed reads as empty.
 
 ## Every setting
 
-Thirty-six keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
+Thirty-seven keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
 exists only in the file, so it is hand-edit-only. Most rows toggle or cycle on `Enter` / `←` / `→`; a
 *typed* row (`worktree_base_branch`) opens a one-line prompt on `Enter` instead, pre-filled with the
 stored value, and an empty answer puts its default back. The Agents tab groups its rows under **Quick
@@ -49,6 +49,7 @@ how the tree is worked; every switch there is off by default.
 | `show_workspaces` | bool | `true` | Appearance | Whether the WORKSPACES BAR is drawn across the top. `Shift+W` writes the key as it toggles, so a hidden bar stays hidden across restarts. |
 | `hide_projects` | bool | `false` | Appearance | Hide the PROJECTS PANEL and give its width to the TERMINAL PANE (`Shift+P`). |
 | `hide_worktrees` | bool | `false` | Appearance | Hide the WORKTREES PANEL (`Shift+B`), independently of `hide_projects`. |
+| `hide_draft_prs` | bool | `false` | Appearance | Leave draft pull requests out of the PROJECT OPEN PRS GROUP and the PALETTE's (`/`) pull-request rows, so browsing what's open shows only the rows asking for a reviewer; the group's header then counts `9/12` — listed over open. A view filter, not a fetch filter: `gh pr list` still fetches the drafts and the PR CACHE still holds them, so `shown` brings them back at once and a draft marked ready joins the rows on the refresh that says so. Worktrees, their sessions and a checkout's own PR ROW in the SESSIONS PANEL are never hidden. The Worktrees panel's right-click menu flips it too (**Hide draft PRs** / **Show draft PRs**). |
 | `hide_root_worktree` | bool | `false` | Experimental | Leave the ROOT WORKTREE row out of the WORKTREES PANEL, so nothing launched from that panel lands in the shared checkout. The root's sessions keep running and stay reachable from the PALETTE (`/`). Not what makes `p` on that panel cut a fresh WORKTREE — a random `<adj>-<noun>-<verb>` branch off the freshly fetched `origin/HEAD`, or the `worktree_base_branch` above, the agent started in it and the cursor moved onto the new row — that is the panel's own behaviour, on or off. |
 | `recent_prompts` | bool | `false` | Experimental | RECENT PROMPTS: list the last few prompts typed into each session under its row in the SESSIONS PANEL — the text the `UserPromptSubmit` hook carried, condensed to one line — oldest first so the bottom line is the latest ask, each with a dim `30m ago` pinned right; a click on any line lands on its session. Every harness reports its prompt (Claude, Codex and Cursor in the hook payload, Pi through its managed extension). Prompts nebula composes itself — a PR SESSION's scope, the note a `nebula worktree` relocation reopens on — are left out, and archived rows list none. Off, the rows are the single pills they always were. See [Sessions](sessions.md#recent-prompts). |
 | `recent_prompts_count` | integer | `3` | Experimental | How many of those prompts to list while `recent_prompts` is on. The overlay cycles `1` to `5`; a hand edit is clamped to the ten the DAEMON keeps per session (`0` reads as `1`, `50` as `10`). |

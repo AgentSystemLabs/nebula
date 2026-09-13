@@ -2192,6 +2192,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     app.show_archived,
                     crate::config::Config::load().palette_enter_attaches,
                     &app.open_prs,
+                    app.hide_draft_prs,
                 )));
             }
         }
@@ -4551,6 +4552,7 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     set_hide_projects(app, cfg.hide_projects);
     set_hide_worktrees(app, cfg.hide_worktrees);
     set_hide_root_worktree(app, cfg.hide_root_worktree);
+    set_hide_draft_prs(app, cfg.hide_draft_prs);
     app.recent_prompts = cfg.recent_prompts_shown();
 }
 
@@ -4655,6 +4657,68 @@ fn set_hide_root_worktree(app: &mut App, hidden: bool) {
     };
     let last = app.worktree_row_count().saturating_sub(1);
     app.sel_worktree = index.unwrap_or(app.sel_worktree).min(last);
+}
+
+/// Show or hide the drafts in the PROJECT OPEN PRS GROUP and `/` (Settings
+/// → Appearance, or the panel menu's **Hide draft PRs**). Nothing stored
+/// changes — `listed_open_prs` reads the flag — but the rows under the
+/// cursor do, so it follows its pull request by URL, as
+/// `reconcile_open_pr_cursor` does after a refresh. A cursor on a draft
+/// that just went has nothing to follow: it lands on the nearest row left
+/// and the pane is told to read whatever that is. True when that landing
+/// was a checkout, so a caller with a request buffer can bring its session
+/// up (`toggle_hide_draft_prs`); `apply_config` has none, and there the
+/// pane catches up on the next move, as it does after the ROOT WORKTREE
+/// toggle.
+fn set_hide_draft_prs(app: &mut App, hidden: bool) -> bool {
+    if app.hide_draft_prs == hidden {
+        return false;
+    }
+    let was = app.selected_worktree_pr().cloned();
+    app.hide_draft_prs = hidden;
+    app.dirty = true;
+    refresh_palette(app);
+    let Some(was) = was else {
+        return false;
+    };
+    let checkouts = app.visible_worktrees().len();
+    if let Some(i) = app
+        .visible_open_prs()
+        .iter()
+        .position(|pr| pr.url == was.url)
+    {
+        app.sel_worktree = checkouts + i;
+        return false;
+    }
+    let last = app.worktree_row_count().saturating_sub(1);
+    app.sel_worktree = app.sel_worktree.min(last);
+    schedule_pr_detail(app);
+    app.selected_worktree().is_some()
+}
+
+/// **Hide draft PRs** / **Show draft PRs** on the Worktrees panel menu:
+/// flip the `hide_draft_prs` SETTING where the group is and write it to
+/// CONFIG.JSON, the way `Shift+P` writes the panel it hides — the file is
+/// where the choice persists, the app field is the live copy. A cursor
+/// that was on a draft and landed on a checkout gets that checkout's
+/// session brought up, as a fold does (`toggle_open_prs`): the PTY
+/// underneath was deliberately left attached while the cursor was in the
+/// group, and it may belong to another worktree.
+fn toggle_hide_draft_prs(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let mut cfg = crate::config::Config::load();
+    cfg.hide_draft_prs = !app.hide_draft_prs;
+    if !save_config(app, &cfg) {
+        return;
+    }
+    if set_hide_draft_prs(app, cfg.hide_draft_prs) {
+        restore_session(app, out);
+        fire_pending_attach(app, out);
+    }
+    app.flash = Some(if cfg.hide_draft_prs {
+        "draft pull requests hidden (Settings → Appearance)".into()
+    } else {
+        "draft pull requests shown".into()
+    });
 }
 
 fn save_panel_visibility(app: &mut App) {
@@ -5270,6 +5334,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         }
         MenuAction::ToggleArchived => toggle_archived(app, out),
         MenuAction::ToggleOpenPrs => toggle_open_prs(app, out),
+        MenuAction::ToggleDraftPrs => toggle_hide_draft_prs(app, out),
     }
 }
 
@@ -5812,7 +5877,7 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
             if delta > 0
                 && app.open_prs_collapsed
                 && app.sel_worktree + 1 >= checkouts
-                && !app.all_open_prs().is_empty()
+                && !app.listed_open_prs().is_empty()
             {
                 app.open_prs_collapsed = false;
                 app.dirty = true;
@@ -7489,11 +7554,24 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                                     MenuAction::NewWorktree(p.id.clone()),
                                 )];
                                 // Only once there is a group to fold.
-                                if !app.all_open_prs().is_empty() {
+                                if !app.listed_open_prs().is_empty() {
                                     items.push(MenuItem::new(
                                         "Show/hide open PRs",
                                         MenuAction::ToggleOpenPrs,
                                     ));
+                                }
+                                // And drafts to hide — or, once hidden,
+                                // a way back that doesn't need the list
+                                // to still hold one.
+                                if app.hide_draft_prs
+                                    || app.all_open_prs().iter().any(|pr| pr.is_draft)
+                                {
+                                    let label = if app.hide_draft_prs {
+                                        "Show draft PRs"
+                                    } else {
+                                        "Hide draft PRs"
+                                    };
+                                    items.push(MenuItem::new(label, MenuAction::ToggleDraftPrs));
                                 }
                                 items
                             })
@@ -8043,7 +8121,12 @@ fn restore_worktree_rows(app: &mut App, rollback: WorktreeRollback) {
 /// new entities) so its rows never go stale under the user's cursor.
 fn refresh_palette(app: &mut App) {
     if let Some(Overlay::Palette(palette)) = &mut app.overlay {
-        palette.rebuild(&app.tree, app.show_archived, &app.open_prs);
+        palette.rebuild(
+            &app.tree,
+            app.show_archived,
+            &app.open_prs,
+            app.hide_draft_prs,
+        );
     }
 }
 
@@ -9897,6 +9980,286 @@ mod tests {
         );
     }
 
+    /// Settings → Appearance → Draft pull requests: `hidden` keeps the
+    /// drafts out of the PROJECT OPEN PRS GROUP and out of `/`, the header
+    /// counts what is listed over what is open (`1/2`) so the missing row
+    /// reads as a setting, the stored list keeps the draft — a view
+    /// filter, not a fetch filter — and `shown` brings it back at once
+    /// with no refetch. The checkout and its session are never touched.
+    #[test]
+    fn hidden_drafts_leave_the_group_and_the_palette_until_shown_again() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let pid = app.selected_project().expect("a project").id.clone();
+            note_open_prs_answer(
+                &mut app,
+                pid.clone(),
+                Some(vec![
+                    a_pr(9, "Still cooking", true),
+                    a_pr(7, "Attach links", false),
+                ]),
+                &mut Vec::new(),
+            );
+            assert_eq!(open_pr_numbers(&app), vec![7, 9]);
+            let mut out = Vec::new();
+            let palette_texts = |app: &mut App, out: &mut Vec<ClientRequest>| -> Vec<String> {
+                app.focus = Focus::Worktrees;
+                press(app, KeyCode::Char('/'), KeyModifiers::NONE, out);
+                let texts = palette(app).items.iter().map(|i| i.text.clone()).collect();
+                press(app, KeyCode::Esc, KeyModifiers::NONE, out);
+                texts
+            };
+
+            let mut cfg = crate::config::Config {
+                hide_draft_prs: true,
+                ..Default::default()
+            };
+            apply_config(&mut app, &cfg);
+            assert!(app.hide_draft_prs);
+            assert_eq!(open_pr_numbers(&app), vec![7], "the draft is off the panel");
+            assert_eq!(app.hidden_draft_prs(), 1);
+            assert_eq!(
+                app.open_prs[&pid].list.len(),
+                2,
+                "but still in the list — hidden, not forgotten"
+            );
+            assert_eq!(app.tree.worktrees.len(), 1, "no checkout went anywhere");
+            assert_eq!(app.tree.agents.len(), 1, "nor its session");
+
+            let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("OPEN PRS · 1/2"), "listed over open:\n{text}");
+            assert!(text.contains("#7"), "{text}");
+            assert!(!text.contains("#9"), "no draft row:\n{text}");
+
+            let texts = palette_texts(&mut app, &mut out);
+            assert!(
+                texts.iter().any(|t| t == "demo/#7 Attach links"),
+                "{texts:?}"
+            );
+            assert!(
+                !texts.iter().any(|t| t.contains("#9")),
+                "/ agrees with the panel: {texts:?}"
+            );
+            assert!(
+                texts.iter().any(|t| t == "demo/main/agent-1"),
+                "the session is still a row: {texts:?}"
+            );
+
+            cfg.hide_draft_prs = false;
+            apply_config(&mut app, &cfg);
+            assert_eq!(open_pr_numbers(&app), vec![7, 9], "back, without a refetch");
+            assert_eq!(app.hidden_draft_prs(), 0);
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("OPEN PRS · 2"), "{text}");
+            assert!(
+                !text.contains("OPEN PRS · 2/"),
+                "nothing hidden, nothing to own up to:\n{text}"
+            );
+            let texts = palette_texts(&mut app, &mut out);
+            assert!(texts.iter().any(|t| t.contains("#9")), "{texts:?}");
+        });
+    }
+
+    /// **Hide draft PRs** from the Worktrees panel menu writes the setting
+    /// to CONFIG.JSON and applies it in place. A cursor resting on the
+    /// draft has no row to follow: it lands on the nearest row left — the
+    /// last finished pull request when there is one, else the last
+    /// checkout, whose session is brought back into the pane as a fold
+    /// does. Showing them again puts the draft back without moving a
+    /// cursor that was on something else.
+    #[test]
+    fn hiding_the_draft_under_the_cursor_lands_it_on_the_nearest_row_left() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let pid = app.selected_project().expect("a project").id.clone();
+            note_open_prs_answer(
+                &mut app,
+                pid.clone(),
+                Some(vec![
+                    a_pr(9, "Still cooking", true),
+                    a_pr(7, "Attach links", false),
+                ]),
+                &mut Vec::new(),
+            );
+            app.focus = Focus::Worktrees;
+            let checkouts = app.visible_worktrees().len();
+            let mut out = Vec::new();
+
+            // The panel menu offers the verb once the list holds a draft.
+            app.hits.push((
+                ratatui::layout::Rect::new(0, 0, 20, 2),
+                HitTarget::PanelBg(Focus::Worktrees),
+            ));
+            handle_mouse(
+                &mut app,
+                mev(MouseEventKind::Down(MouseButton::Right), 1, 0),
+                &mut out,
+            );
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the panel menu, got {:?}", app.overlay);
+            };
+            let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(
+                labels,
+                ["New worktree", "Show/hide open PRs", "Hide draft PRs"]
+            );
+            app.overlay = None;
+
+            app.sel_worktree = checkouts + 1;
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(9));
+            toggle_hide_draft_prs(&mut app, &mut out);
+            assert!(app.hide_draft_prs);
+            assert!(
+                crate::config::Config::load().hide_draft_prs,
+                "the menu writes the setting where it persists"
+            );
+            assert_eq!(
+                app.selected_worktree_pr().map(|p| p.number),
+                Some(7),
+                "the nearest row left is the finished pull request"
+            );
+            assert!(
+                out.is_empty(),
+                "no checkout was landed on, so nothing attaches"
+            );
+            assert_eq!(
+                app.flash.as_deref(),
+                Some("draft pull requests hidden (Settings → Appearance)")
+            );
+
+            // Back on: the draft returns below #7 and the cursor stays put.
+            toggle_hide_draft_prs(&mut app, &mut out);
+            assert!(!app.hide_draft_prs);
+            assert!(!crate::config::Config::load().hide_draft_prs);
+            assert_eq!(open_pr_numbers(&app), vec![7, 9]);
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+
+            // Only drafts open, the cursor on one: hiding them empties the
+            // group, so the cursor lands on the last checkout and that
+            // checkout's session comes back into the pane.
+            note_open_prs_answer(
+                &mut app,
+                pid.clone(),
+                Some(vec![a_pr(9, "Still cooking", true)]),
+                &mut out,
+            );
+            app.sel_worktree = checkouts;
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(9));
+            out.clear();
+            toggle_hide_draft_prs(&mut app, &mut out);
+            assert!(app.selected_worktree_pr().is_none());
+            assert_eq!(
+                app.selected_worktree().map(|w| w.branch.clone()).as_deref(),
+                Some("main")
+            );
+            assert!(
+                out.iter()
+                    .any(|r| matches!(r, ClientRequest::Attach { .. })),
+                "the checkout's session is brought up, as a fold does: {out:?}"
+            );
+            let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("OPEN PRS · 0/1"),
+                "the header still says a draft is being kept out:\n{text}"
+            );
+
+            // The menu now offers the way back, even though nothing is listed.
+            // (The draw above re-registered every real hit; start clean so
+            // the pushed rect is the one the click finds.)
+            app.hits.clear();
+            app.hits.push((
+                ratatui::layout::Rect::new(0, 0, 20, 2),
+                HitTarget::PanelBg(Focus::Worktrees),
+            ));
+            handle_mouse(
+                &mut app,
+                mev(MouseEventKind::Down(MouseButton::Right), 1, 0),
+                &mut out,
+            );
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the panel menu, got {:?}", app.overlay);
+            };
+            let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(labels, ["New worktree", "Show draft PRs"]);
+        });
+    }
+
+    /// The filter reads each pull request's draft flag as GitHub last gave
+    /// it, so a draft marked ready joins the rows on the refresh that says
+    /// so and one turned back into a draft leaves on the next — no toggle
+    /// involved. And a folded group with nothing listed is not something
+    /// `↓` steps into.
+    #[test]
+    fn a_refresh_that_changes_draft_status_moves_the_row_in_or_out() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let pid = app.selected_project().expect("a project").id.clone();
+            apply_config(
+                &mut app,
+                &crate::config::Config {
+                    hide_draft_prs: true,
+                    ..Default::default()
+                },
+            );
+            let answer = |app: &mut App, list: Vec<crate::pull_request::OpenPr>| {
+                note_open_prs_answer(app, pid.clone(), Some(list), &mut Vec::new());
+            };
+
+            answer(
+                &mut app,
+                vec![
+                    a_pr(9, "Still cooking", true),
+                    a_pr(7, "Attach links", false),
+                ],
+            );
+            assert_eq!(open_pr_numbers(&app), vec![7]);
+            // #9 marked ready for review.
+            answer(
+                &mut app,
+                vec![
+                    a_pr(9, "Still cooking", false),
+                    a_pr(7, "Attach links", false),
+                ],
+            );
+            assert_eq!(open_pr_numbers(&app), vec![9, 7], "in, in gh's order");
+            // #7 converted back to a draft.
+            answer(
+                &mut app,
+                vec![
+                    a_pr(9, "Still cooking", false),
+                    a_pr(7, "Attach links", true),
+                ],
+            );
+            assert_eq!(open_pr_numbers(&app), vec![9], "and out again");
+
+            // Nothing listed once both are drafts: ↓ off the last checkout
+            // has no row to open the folded group onto, so it stays put.
+            answer(
+                &mut app,
+                vec![
+                    a_pr(9, "Still cooking", true),
+                    a_pr(7, "Attach links", true),
+                ],
+            );
+            assert!(open_pr_numbers(&app).is_empty());
+            app.focus = Focus::Worktrees;
+            app.open_prs_collapsed = true;
+            app.sel_worktree = app.visible_worktrees().len() - 1;
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            assert!(app.open_prs_collapsed, "nothing to step into");
+            assert!(app.selected_worktree().is_some());
+        });
+    }
+
     /// `/` searches pull requests by title alongside everything else, and
     /// Enter on one opens the browser instead of moving any panel cursor.
     #[test]
@@ -10147,6 +10510,17 @@ mod tests {
 
     fn pr_url(number: u64) -> String {
         format!("https://github.com/o/r/pull/{number}")
+    }
+
+    /// One `gh pr list` row, as `parse_list` would build it.
+    fn a_pr(number: u64, title: &str, is_draft: bool) -> crate::pull_request::OpenPr {
+        crate::pull_request::OpenPr {
+            number,
+            title: title.into(),
+            url: pr_url(number),
+            is_draft,
+            head: format!("pr-{number}-head"),
+        }
     }
 
     fn open_pr_numbers(app: &App) -> Vec<u64> {
@@ -21144,7 +21518,7 @@ diff --git a/src/c.rs b/src/c.rs
         assert_eq!(app.project_rows().len(), 1, "only demo has a row");
         assert_eq!(app.tree.visible_project_count(), 1);
 
-        let palette = Palette::new(&app.tree, true, false, &app.open_prs);
+        let palette = Palette::new(&app.tree, true, false, &app.open_prs, false);
         let texts: Vec<&str> = palette.items.iter().map(|i| i.text.as_str()).collect();
         assert_eq!(
             texts,
@@ -21328,6 +21702,7 @@ diff --git a/src/c.rs b/src/c.rs
             false,
             false,
             &app.open_prs,
+            false,
         )));
         let mut out = Vec::new();
         switch_workspace(&mut app, nebula_core::WorkspaceId("ws2".into()), &mut out);

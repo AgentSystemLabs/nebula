@@ -217,6 +217,7 @@ pub enum SettingKind {
     ShowWorkspaces,
     HideProjects,
     HideWorktrees,
+    HideDraftPrs,
     QuickPromptKind,
     QuickPromptFocus,
     HideRootWorktree,
@@ -363,6 +364,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::HideWorktrees,
                 label: "Worktrees panel",
                 hint: "Show or hide the Worktrees panel (Shift+B toggles)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::HideDraftPrs,
+                label: "Draft pull requests",
+                hint: "Show or hide drafts in the OPEN PRS group and / search (worktrees and sessions stay)",
                 group: "",
             },
         ]),
@@ -725,6 +732,16 @@ pub struct Config {
     /// Hide the Worktrees panel and give its width to the terminal pane.
     /// Independent from `hide_projects`; Sessions always remains visible.
     pub hide_worktrees: bool,
+    /// Leave draft pull requests out of the PROJECT OPEN PRS GROUP and the
+    /// `/` PALETTE's pull-request rows, so browsing what's open shows only
+    /// the rows asking for a reviewer. A view filter, not a fetch filter:
+    /// `gh pr list` still returns the drafts and the cache still holds
+    /// them, so switching this off shows them again at once, and a draft
+    /// marked ready on GitHub joins the rows on the next refresh. Never
+    /// touches a checkout, its sessions, or the checkout's own PR ROW in
+    /// the SESSIONS PANEL — those describe work you have, not work you are
+    /// browsing. Off by default: a config predating the key hides nothing.
+    pub hide_draft_prs: bool,
     /// Experimental: leave the ROOT WORKTREE row out of the WORKTREES
     /// PANEL, so nothing launched there lands in the shared checkout. (A
     /// `p` on that panel cuts a fresh worktree with this on or off — that
@@ -815,6 +832,7 @@ impl Default for Config {
             show_workspaces: true,
             hide_projects: false,
             hide_worktrees: false,
+            hide_draft_prs: false,
             hide_root_worktree: false,
             recent_prompts: false,
             recent_prompts_count: DEFAULT_RECENT_PROMPTS_COUNT,
@@ -959,6 +977,10 @@ impl Config {
         obj.insert(
             "hide_worktrees".into(),
             serde_json::json!(self.hide_worktrees),
+        );
+        obj.insert(
+            "hide_draft_prs".into(),
+            serde_json::json!(self.hide_draft_prs),
         );
         obj.insert(
             "hide_root_worktree".into(),
@@ -1135,6 +1157,7 @@ impl Config {
             SettingKind::ShowWorkspaces => on_off(self.show_workspaces).into(),
             SettingKind::HideProjects => shown_hidden(self.hide_projects).into(),
             SettingKind::HideWorktrees => shown_hidden(self.hide_worktrees).into(),
+            SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
             SettingKind::HideRootWorktree => on_off(self.hide_root_worktree).into(),
             SettingKind::RecentPrompts => on_off(self.recent_prompts).into(),
             SettingKind::RecentPromptsCount => self
@@ -1223,6 +1246,9 @@ impl Config {
             }
             SettingKind::HideWorktrees => {
                 self.hide_worktrees = !self.hide_worktrees;
+            }
+            SettingKind::HideDraftPrs => {
+                self.hide_draft_prs = !self.hide_draft_prs;
             }
             SettingKind::HideRootWorktree => {
                 self.hide_root_worktree = !self.hide_root_worktree;
@@ -1931,6 +1957,36 @@ mod tests {
         let legacy: Config = serde_json::from_str("{}").unwrap();
         assert!(!legacy.hide_projects);
         assert!(!legacy.hide_worktrees);
+    }
+
+    /// DRAFT PULL REQUESTS: an Appearance row that reads `shown` / `hidden`
+    /// like the panel rows beside it, shown by default so a config that
+    /// predates the key keeps every draft on screen, and persisted under
+    /// `hide_draft_prs`.
+    #[test]
+    fn draft_pull_requests_default_shown_toggle_on_the_appearance_tab_and_persist() {
+        let mut cfg = Config::default();
+        assert!(!cfg.hide_draft_prs, "drafts stay on screen until asked");
+        assert_eq!(cfg.value_label(SettingKind::HideDraftPrs), "shown");
+
+        let (tab, row) = locate(SettingKind::HideDraftPrs).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.hide_draft_prs);
+        assert_eq!(cfg.value_label(SettingKind::HideDraftPrs), "hidden");
+        cfg.cycle(tab, row, 1);
+        assert!(!cfg.hide_draft_prs, "←/→ toggle a bool like Enter does");
+        cfg.cycle(tab, row, 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(r#""hide_draft_prs": true"#), "{raw}");
+        assert!(load_from(&path).hide_draft_prs);
+
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.hide_draft_prs);
     }
 
     /// The FOCUS TINT is always on since 2026-08-29: a `focus_tint` key

@@ -3097,11 +3097,16 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             )
         })
         .collect();
-    let prs = app.visible_open_prs().to_vec();
-    // The header counts the whole list even while the group is folded and
-    // `prs` — the rows actually on screen — is empty.
-    let pr_total = app.all_open_prs().len();
-    if worktrees.is_empty() && pr_total == 0 {
+    let prs: Vec<crate::pull_request::OpenPr> =
+        app.visible_open_prs().into_iter().cloned().collect();
+    // The header counts what the group lists — the whole answer, or the
+    // rows left once `hide_draft_prs` has kept the drafts out — even while
+    // the group is folded and `prs`, the rows actually on screen, is
+    // empty. The drafts kept out are owned up to beside it, so a pull
+    // request that is not where it was reads as a setting, not a loss.
+    let pr_total = app.listed_open_prs().len();
+    let drafts_hidden = app.hidden_draft_prs();
+    if worktrees.is_empty() && pr_total == 0 && drafts_hidden == 0 {
         if app.tree.has_visible_projects() {
             f.render_widget(
                 Paragraph::new(hint_line(&[("n", " starts a worktree")], th)),
@@ -3137,23 +3142,29 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             vrow += 1;
         }
     }
-    if pr_total > 0 {
+    if pr_total > 0 || drafts_hidden > 0 {
         // A list cut off at the fetch cap says so rather than passing
-        // itself off as the whole set.
-        let more = if pr_total >= crate::pull_request::LIST_LIMIT {
+        // itself off as the whole set. The cap is on the answer, drafts
+        // and all, so it is measured there.
+        let open_total = app.all_open_prs().len();
+        let more = if open_total >= crate::pull_request::LIST_LIMIT {
             "+"
         } else {
             ""
+        };
+        // With drafts hidden the count reads `9/12`: nine rows listed of
+        // twelve open. Short enough for a twenty-cell column, and honest
+        // about the three that are not on screen.
+        let count = if drafts_hidden > 0 {
+            format!("{pr_total}/{open_total}{more}")
+        } else {
+            format!("{pr_total}{more}")
         };
         // The disclosure triangle is the state: ▾ over the rows, ▸ when a
         // click (or ↓ off the last checkout) would open them. Folded, the
         // header is the whole group and its count says what it hides.
         let fold = if app.open_prs_collapsed { "▸" } else { "▾" };
-        header(
-            &mut layout,
-            &mut vrow,
-            format!("{fold} OPEN PRS · {pr_total}{more}"),
-        );
+        header(&mut layout, &mut vrow, format!("{fold} OPEN PRS · {count}"));
         for i in 0..prs.len() {
             layout.push((vrow, WorktreeEntry::Row(worktrees.len() + i)));
             vrow += PILL_H as usize;
