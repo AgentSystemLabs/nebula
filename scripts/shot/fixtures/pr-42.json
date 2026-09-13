@@ -1,0 +1,6 @@
+{"number": 42, "url": "https://github.com/AgentSystemLabs/nebula/pull/42", "title": "Attach links to worktrees", "state": "OPEN", "isDraft": false,
+ "author": {"login": "shot-user"}, "baseRefName": "main", "headRefName": "attach-links", "additions": 188, "deletions": 23, "changedFiles": 5,
+ "body": "A worktree can now carry saved links — the pull request it opened, a staging URL, a ticket — as rows of the SESSIONS PANEL's PULL REQUESTS group.\n\nEnter on a row hands the URL to the browser; the detected pull request is found by `gh pr view` on the branch and needs no saving at all.\n\nA saved link that *is* the pull request is shown once, as the pull-request row, so the same destination never appears twice.",
+ "comments": [{"author": {"login": "reviewer"}, "createdAt": "2026-09-03T14:12:00Z", "body": "Tried it on a branch with no PR yet — the group stays empty until one opens, which is what I'd expect."},
+              {"author": {"login": "shot-user"}, "createdAt": "2026-09-03T15:40:00Z", "body": "Right — and the first GIT POLL after `gh pr create` picks it up without a restart."}],
+ "reviews": [{"author": {"login": "reviewer"}, "submittedAt": "2026-09-04T09:05:00Z", "state": "APPROVED", "body": "Reads well; one nit on the dedupe inline."}]}

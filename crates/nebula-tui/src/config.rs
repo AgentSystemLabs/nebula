@@ -214,9 +214,11 @@ pub enum SettingKind {
     FeedbackSound,
     Theme,
     Animations,
+    FocusTint,
     ShowWorkspaces,
     HideProjects,
     HideWorktrees,
+    HideDraftPrs,
     QuickPromptKind,
     QuickPromptFocus,
     HideRootWorktree,
@@ -348,6 +350,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 group: "",
             },
             SettingSpec {
+                kind: SettingKind::FocusTint,
+                label: "Focused panel tint",
+                hint: "Faint accent wash behind the focused panel (off shows the terminal's background)",
+                group: "",
+            },
+            SettingSpec {
                 kind: SettingKind::ShowWorkspaces,
                 label: "Workspaces bar",
                 hint: "Show the Workspaces tab bar across the top (Shift+W toggles)",
@@ -363,6 +371,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::HideWorktrees,
                 label: "Worktrees panel",
                 hint: "Show or hide the Worktrees panel (Shift+B toggles)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::HideDraftPrs,
+                label: "Draft pull requests",
+                hint: "Show or hide drafts in the OPEN PRS group and / search; checkouts always stay",
                 group: "",
             },
         ]),
@@ -712,6 +726,12 @@ pub struct Config {
     /// status-text sweep and the splash's motion). Off trades them for
     /// fewer repaints on constrained machines.
     pub animations: bool,
+    /// Faint accent-tinted background fill on the focused panel. On by
+    /// default — it is the one cue that says which panel keys land in.
+    /// Off leaves every cell on the terminal's own background, so a
+    /// transparency or image configured in the terminal shows through
+    /// the whole frame instead of stopping at the focused panel.
+    pub focus_tint: bool,
     /// Whether the Workspaces bar is drawn across the top. This is the
     /// bar's only home: `Shift+W` writes it here as it toggles, so a hidden
     /// bar stays hidden across restarts, and a crash or a
@@ -725,6 +745,16 @@ pub struct Config {
     /// Hide the Worktrees panel and give its width to the terminal pane.
     /// Independent from `hide_projects`; Sessions always remains visible.
     pub hide_worktrees: bool,
+    /// Leave draft pull requests out of the PROJECT OPEN PRS GROUP and the
+    /// `/` PALETTE's pull-request rows, so browsing what's open shows only
+    /// the rows asking for a reviewer. A view filter, not a fetch filter:
+    /// `gh pr list` still returns the drafts and the cache still holds
+    /// them, so switching this off shows them again at once, and a draft
+    /// marked ready on GitHub joins the rows on the next refresh. Never
+    /// touches a checkout, its sessions, or the checkout's own PR ROW in
+    /// the SESSIONS PANEL — those describe work you have, not work you are
+    /// browsing. Off by default: a config predating the key hides nothing.
+    pub hide_draft_prs: bool,
     /// Experimental: leave the ROOT WORKTREE row out of the WORKTREES
     /// PANEL, so nothing launched there lands in the shared checkout. (A
     /// `p` on that panel cuts a fresh worktree with this on or off — that
@@ -812,9 +842,11 @@ impl Default for Config {
             feedback_sound: "Sosumi".into(),
             theme: "default".into(),
             animations: true,
+            focus_tint: true,
             show_workspaces: true,
             hide_projects: false,
             hide_worktrees: false,
+            hide_draft_prs: false,
             hide_root_worktree: false,
             recent_prompts: false,
             recent_prompts_count: DEFAULT_RECENT_PROMPTS_COUNT,
@@ -948,6 +980,7 @@ impl Config {
         );
         obj.insert("theme".into(), serde_json::json!(self.theme));
         obj.insert("animations".into(), serde_json::json!(self.animations));
+        obj.insert("focus_tint".into(), serde_json::json!(self.focus_tint));
         obj.insert(
             "show_workspaces".into(),
             serde_json::json!(self.show_workspaces),
@@ -959,6 +992,10 @@ impl Config {
         obj.insert(
             "hide_worktrees".into(),
             serde_json::json!(self.hide_worktrees),
+        );
+        obj.insert(
+            "hide_draft_prs".into(),
+            serde_json::json!(self.hide_draft_prs),
         );
         obj.insert(
             "hide_root_worktree".into(),
@@ -1132,9 +1169,11 @@ impl Config {
             SettingKind::FeedbackSound => self.feedback_sound.clone(),
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
+            SettingKind::FocusTint => on_off(self.focus_tint).into(),
             SettingKind::ShowWorkspaces => on_off(self.show_workspaces).into(),
             SettingKind::HideProjects => shown_hidden(self.hide_projects).into(),
             SettingKind::HideWorktrees => shown_hidden(self.hide_worktrees).into(),
+            SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
             SettingKind::HideRootWorktree => on_off(self.hide_root_worktree).into(),
             SettingKind::RecentPrompts => on_off(self.recent_prompts).into(),
             SettingKind::RecentPromptsCount => self
@@ -1215,6 +1254,9 @@ impl Config {
             SettingKind::Animations => {
                 self.animations = !self.animations;
             }
+            SettingKind::FocusTint => {
+                self.focus_tint = !self.focus_tint;
+            }
             SettingKind::ShowWorkspaces => {
                 self.show_workspaces = !self.show_workspaces;
             }
@@ -1223,6 +1265,9 @@ impl Config {
             }
             SettingKind::HideWorktrees => {
                 self.hide_worktrees = !self.hide_worktrees;
+            }
+            SettingKind::HideDraftPrs => {
+                self.hide_draft_prs = !self.hide_draft_prs;
             }
             SettingKind::HideRootWorktree => {
                 self.hide_root_worktree = !self.hide_root_worktree;
@@ -1933,18 +1978,65 @@ mod tests {
         assert!(!legacy.hide_worktrees);
     }
 
-    /// The FOCUS TINT is always on since 2026-08-29: a `focus_tint` key
-    /// left behind in an older config.json is ignored, never an error.
+    /// DRAFT PULL REQUESTS: an Appearance row that reads `shown` / `hidden`
+    /// like the panel rows beside it, shown by default so a config that
+    /// predates the key keeps every draft on screen, and persisted under
+    /// `hide_draft_prs`.
     #[test]
-    fn stale_focus_tint_key_is_ignored() {
-        let cfg: Config = serde_json::from_str(r#"{"focus_tint": true}"#).unwrap();
-        assert!(cfg.animations);
+    fn draft_pull_requests_default_shown_toggle_on_the_appearance_tab_and_persist() {
+        let mut cfg = Config::default();
+        assert!(!cfg.hide_draft_prs, "drafts stay on screen until asked");
+        assert_eq!(cfg.value_label(SettingKind::HideDraftPrs), "shown");
+
+        let (tab, row) = locate(SettingKind::HideDraftPrs).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.hide_draft_prs);
+        assert_eq!(cfg.value_label(SettingKind::HideDraftPrs), "hidden");
+        cfg.cycle(tab, row, 1);
+        assert!(!cfg.hide_draft_prs, "←/→ toggle a bool like Enter does");
+        cfg.cycle(tab, row, 0);
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         cfg.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(r#""hide_draft_prs": true"#), "{raw}");
+        assert!(load_from(&path).hide_draft_prs);
+
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.hide_draft_prs);
+    }
+
+    /// The FOCUS TINT: on out of the box, toggled from its Appearance row,
+    /// persisted under `focus_tint`. A config.json written while the key
+    /// was ignored (2026-08-29 to v0.26) is honoured again: `false` in
+    /// it switches the tint off on the next launch (issue #51), and a
+    /// file predating the key keeps the default.
+    #[test]
+    fn focus_tint_default_on_toggle_and_persist() {
+        let mut cfg = Config::default();
+        assert!(cfg.focus_tint);
+        let (tab, row) = locate(SettingKind::FocusTint).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Appearance");
+        cfg.cycle(tab, row, 0);
+        assert!(!cfg.focus_tint);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(!load_from(&path).focus_tint);
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(raw.get("focus_tint").is_none());
+        assert_eq!(raw.get("focus_tint"), Some(&serde_json::json!(false)));
+
+        let legacy: Config = serde_json::from_str(r#"{"focus_tint": false}"#).unwrap();
+        assert!(!legacy.focus_tint, "a hand-edited key is honoured");
+        let older: Config = serde_json::from_str("{}").unwrap();
+        assert!(
+            older.focus_tint,
+            "a config predating the key keeps the tint"
+        );
     }
 
     /// The QUICK PROMPT's focus toggle: off unless the user turns it on,

@@ -102,7 +102,8 @@ feature simply has nothing to show until its next prompt.
 
 Under the checkouts, an `OPEN PRS` group lists every pull request still open on the repo — drafts
 included, sunk to the bottom of the group, dimmed and badged `draft` so they are told apart from the
-ones asking for a reviewer — fetched with `gh` when you open the project, re-asked every 15 seconds once
+ones asking for a reviewer (the `/` PALETTE lists the same rows and spells both states out, `draft` and
+`ready for review`) — fetched with `gh` when you open the project, re-asked every 15 seconds once
 that PROJECT has answered with at least one open pull request, and again whenever the Worktrees or
 Sessions panel or the terminal window takes focus (one `gh pr list` per project, so a repo with a
 hundred open PRs still costs one API call) — or at once, past every timer, when you press `Shift+R`
@@ -130,6 +131,17 @@ and brings that checkout's session back into the pane, `↑/↓` then stop at th
 still finds every pull request either way. Stepping `↓` off the last checkout into a folded group
 opens it onto its first pull request rather than stopping at the header. The fold is remembered
 across restarts, like the ARCHIVED toggle.
+
+Drafts can be kept out altogether. **Draft pull requests** under Settings → Appearance
+(`hide_draft_prs` in CONFIG.JSON, `shown` by default) — or **Hide draft PRs** from the panel's
+right-click menu, offered whenever the list holds one — drops them from the group and from `/` alike,
+and the header counts `9/12`: nine rows listed of twelve open, so the rows that are not there read as
+a setting rather than a loss. It is a view, not a fetch: the list still holds every draft, so **Show
+draft PRs** brings them back without a round trip, and a draft marked ready on GitHub joins the rows
+on the refresh that says so (one converted back to a draft leaves on the next). A checkout on a
+draft's branch keeps its row, its sessions and its own PR ROW in the SESSIONS PANEL — the toggle is
+for browsing what is open, not for hiding work you have. Hiding the row the cursor is on lands it on
+the nearest row left, as a fold does. The choice is remembered across restarts.
 
 ## The ISSUES MODAL and ISSUE SESSIONS
 

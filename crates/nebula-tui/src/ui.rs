@@ -144,7 +144,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     if app.collapsed {
         draw_terminal(f, app, body);
-        if app.focus == Focus::Terminal {
+        if app.focus_tint && app.focus == Focus::Terminal {
             draw_focus_tint(f.buffer_mut(), body, app.theme);
         }
         draw_footer(f, app, footer);
@@ -220,20 +220,24 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     );
     draw_terminal(f, app, term_a);
     draw_splitter_grips(f.buffer_mut(), app, panels_a);
-    // Focus cue (always on): the focused panel's whole background picks
-    // up a faint accent tint. The sidebar columns stop one cell short of
+    // Focus cue (`focus_tint` setting, on by default): the focused
+    // panel's whole background picks up a faint accent tint. Off leaves
+    // the terminal's own background — a configured transparency included
+    // — showing through. The sidebar columns stop one cell short of
     // their right rule so the tint stays inside the panel.
-    let tinted = match app.focus {
-        // The bar's last row is its rule, which belongs to the boundary
-        // rather than to the bar — leave it untinted.
-        Focus::Workspaces => Some(shrink_b(workspaces_a)),
-        Focus::Projects => panel_areas[0].map(shrink_r),
-        Focus::Worktrees => panel_areas[1].map(shrink_r),
-        Focus::Sessions => panel_areas[2].map(shrink_r),
-        Focus::Terminal => Some(term_a),
-    };
-    if let Some(tinted) = tinted {
-        draw_focus_tint(f.buffer_mut(), tinted, app.theme);
+    if app.focus_tint {
+        let tinted = match app.focus {
+            // The bar's last row is its rule, which belongs to the
+            // boundary rather than to the bar — leave it untinted.
+            Focus::Workspaces => Some(shrink_b(workspaces_a)),
+            Focus::Projects => panel_areas[0].map(shrink_r),
+            Focus::Worktrees => panel_areas[1].map(shrink_r),
+            Focus::Sessions => panel_areas[2].map(shrink_r),
+            Focus::Terminal => Some(term_a),
+        };
+        if let Some(tinted) = tinted {
+            draw_focus_tint(f.buffer_mut(), tinted, app.theme);
+        }
     }
     draw_footer(f, app, footer);
     draw_overlay(f, app);
@@ -687,6 +691,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "WORKTREES",
                     &[
                         (Act(&[New]), "new worktree (PR row: Claude)"),
+                        (Act(&[HalfPageDown, HalfPageUp]), "half a panel down / up"),
                         (Act(&[GitDiff]), "git diff (^r: mark reviewed ✓)"),
                         (Act(&[OpenRepo]), "open the repo on GitHub"),
                         (Act(&[RefreshPullRequests]), "refresh pull requests now"),
@@ -1450,19 +1455,27 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     PaletteTarget::Project(_) => ("▪ ", "▫ "),
                     PaletteTarget::Worktree(_) => ("▸ ", "▹ "),
                     PaletteTarget::Session(_) => ("● ", "○ "),
-                    // The panels' "leaves nebula" arrow: a pull request row
-                    // opens a browser, it doesn't move a cursor.
-                    PaletteTarget::PullRequest(_) => ("↗ ", "↗ "),
+                    // The arrow its Worktrees-panel row wears (`pr_row`),
+                    // since that row is where picking it lands.
+                    PaletteTarget::PullRequest { .. } => ("↗ ", "↗ "),
                 };
                 // Archived rows stay quiet even if their last status was
                 // live — the Sessions panel's `⊘` rule.
                 let status = if item.archived { None } else { item.status };
+                // A pull request carries no status; its colors are its
+                // standing's, the look its Worktrees-panel row wears — the
+                // accent for one ready for review, the dim end to end for
+                // a draft — and a trailing badge spells that state out in
+                // full (`draft`, `ready for review`), the sidebar's words
+                // at this modal's width, so the two are told apart before
+                // either is picked, by the word and not only by the color.
+                let pr = item
+                    .standing
+                    .map(|standing| (standing, crate::pr_row::look(standing, th)));
                 let (glyph, glyph_color) = if item.archived {
                     ("⊘ ", th.dim)
-                } else if matches!(item.target, PaletteTarget::PullRequest(_)) {
-                    // No status to carry: an open pull request wears the
-                    // same accent its Worktrees-panel row does.
-                    (solid, th.accent)
+                } else if let Some((_, look)) = pr {
+                    (solid, look.glyph)
                 } else {
                     match status {
                         Some(AgentStatus::Running) => (solid, th.warn),
@@ -1474,18 +1487,30 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         Some(AgentStatus::Disconnected) | None => (hollow, th.dim),
                     }
                 };
-                let budget = (list_inner.width as usize).saturating_sub(4);
+                let badge =
+                    pr.map(|(standing, look)| (format!(" {}", standing.label()), look.badge));
+                // The badge is billed before the text, as `pr_row::spans`
+                // does, so a long title shortens and the state never clips.
+                let badge_len = badge.as_ref().map_or(0, |(b, _)| b.chars().count());
+                let budget = (list_inner.width as usize)
+                    .saturating_sub(4)
+                    .saturating_sub(badge_len);
                 let shown = truncate(&item.text, budget);
                 let positions = visible_positions(&m.positions, &shown, &item.text);
+                let quiet = item.archived
+                    || matches!(item.standing, Some(crate::pull_request::Standing::Draft));
                 let mut spans = vec![Span::styled(glyph, Style::default().fg(glyph_color))];
                 spans.extend(path_highlight_spans(
                     &shown,
                     positions,
-                    item.archived,
+                    quiet,
                     sweep_ramp(status, th, app.animations),
                     app.sweep_phase(),
                     th,
                 ));
+                if let Some((badge, color)) = badge {
+                    spans.push(Span::styled(badge, Style::default().fg(color)));
+                }
                 render_row(f, row_area, spans, i == palette.selected, true, th);
             }
 
@@ -2090,11 +2115,6 @@ fn shrink_b(area: Rect) -> Rect {
     }
 }
 
-/// Subtle focus cue: fill the whole focused panel with the theme's
-/// `focus_tint` — the accent at ~10% opacity, so the panel reads as a
-/// faintly lit surface. Painted after content, and only onto cells whose
-/// background is still untouched, so selection fills and PTY-drawn
-/// colors sit on top of the tint instead of under it.
 /// Drag affordance for the panel splitters: a short thick grip centered on
 /// each column rule, one step brighter than the rule so the boundary reads
 /// as grabbable without turning the chrome back up. Accent while that
@@ -2120,6 +2140,12 @@ fn draw_splitter_grips(buf: &mut ratatui::buffer::Buffer, app: &App, body: Rect)
     }
 }
 
+/// Subtle focus cue: fill the whole focused panel with the theme's
+/// `focus_tint` — the accent at ~10% opacity, so the panel reads as a
+/// faintly lit surface. Painted after content, and only onto cells whose
+/// background is still untouched, so selection fills and PTY-drawn
+/// colors sit on top of the tint instead of under it. The `focus_tint`
+/// setting decides whether the callers paint it at all.
 fn draw_focus_tint(buf: &mut ratatui::buffer::Buffer, area: Rect, th: Theme) {
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
@@ -3083,6 +3109,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let wt_count = app.visible_worktrees().len();
     let count = Some(wt_count).filter(|n| *n > 0);
     let inner = draw_column(f, area, "WORKTREES", count, focused, th);
+    // The page Ctrl+d / Ctrl+u jump by half of: how many pills the column
+    // has room for this frame (group headers and quiet rows not billed —
+    // "about half a panel" is the promise, not an exact line count).
+    app.worktrees_view_rows = (inner.height / PILL_H) as usize;
 
     let worktrees: Vec<WorktreeRowData> = app
         .visible_worktrees()
@@ -3099,11 +3129,16 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             )
         })
         .collect();
-    let prs = app.visible_open_prs().to_vec();
-    // The header counts the whole list even while the group is folded and
-    // `prs` — the rows actually on screen — is empty.
-    let pr_total = app.all_open_prs().len();
-    if worktrees.is_empty() && pr_total == 0 {
+    let prs: Vec<crate::pull_request::OpenPr> =
+        app.visible_open_prs().into_iter().cloned().collect();
+    // The header counts what the group lists — the whole answer, or the
+    // rows left once `hide_draft_prs` has kept the drafts out — even while
+    // the group is folded and `prs`, the rows actually on screen, is
+    // empty. The drafts kept out are owned up to beside it, so a pull
+    // request that is not where it was reads as a setting, not a loss.
+    let pr_total = app.listed_open_prs().len();
+    let drafts_hidden = app.hidden_draft_prs();
+    if worktrees.is_empty() && pr_total == 0 && drafts_hidden == 0 {
         if app.tree.has_visible_projects() {
             f.render_widget(
                 Paragraph::new(hint_line(&[("n", " starts a worktree")], th)),
@@ -3139,23 +3174,29 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             vrow += 1;
         }
     }
-    if pr_total > 0 {
+    if pr_total > 0 || drafts_hidden > 0 {
         // A list cut off at the fetch cap says so rather than passing
-        // itself off as the whole set.
-        let more = if pr_total >= crate::pull_request::LIST_LIMIT {
+        // itself off as the whole set. The cap is on the answer, drafts
+        // and all, so it is measured there.
+        let open_total = app.all_open_prs().len();
+        let more = if open_total >= crate::pull_request::LIST_LIMIT {
             "+"
         } else {
             ""
+        };
+        // With drafts hidden the count reads `9/12`: nine rows listed of
+        // twelve open. Short enough for a twenty-cell column, and honest
+        // about the three that are not on screen.
+        let count = if drafts_hidden > 0 {
+            format!("{pr_total}/{open_total}{more}")
+        } else {
+            format!("{pr_total}{more}")
         };
         // The disclosure triangle is the state: ▾ over the rows, ▸ when a
         // click (or ↓ off the last checkout) would open them. Folded, the
         // header is the whole group and its count says what it hides.
         let fold = if app.open_prs_collapsed { "▸" } else { "▾" };
-        header(
-            &mut layout,
-            &mut vrow,
-            format!("{fold} OPEN PRS · {pr_total}{more}"),
-        );
+        header(&mut layout, &mut vrow, format!("{fold} OPEN PRS · {count}"));
         for i in 0..prs.len() {
             layout.push((vrow, WorktreeEntry::Row(worktrees.len() + i)));
             vrow += PILL_H as usize;
@@ -4574,15 +4615,16 @@ fn token_style(kind: crate::syntax::TokenKind, th: Theme) -> Style {
 }
 
 /// Palette row text: dim `parent/path/` prefix, normal leaf segment, with
-/// fuzzy-match chars lit accent-bold on top. Archived rows stay dim all
-/// the way through. With a `ramp`, the leaf segment — the entity's own
-/// name, the very text that sweeps in its panel row — rides the same
+/// fuzzy-match chars lit accent-bold on top. A `quiet` row — archived, or
+/// a draft pull request, dimmed end to end like its panel row — stays dim
+/// all the way through. With a `ramp`, the leaf segment — the entity's
+/// own name, the very text that sweeps in its panel row — rides the same
 /// left-to-right band; matched chars keep the accent highlight so the
 /// sweep never buries what the query hit.
 fn path_highlight_spans(
     shown: &str,
     positions: &[usize],
-    archived: bool,
+    quiet: bool,
     ramp: Option<[Color; 3]>,
     phase: usize,
     th: Theme,
@@ -4599,7 +4641,7 @@ fn path_highlight_spans(
     for (i, c) in shown.chars().enumerate() {
         let style = if positions.binary_search(&i).is_ok() {
             hl
-        } else if archived || i < boundary {
+        } else if quiet || i < boundary {
             Style::default().fg(th.dim)
         } else if let Some(ramp) = ramp {
             sweep_style(Style::default(), ramp, phase, i - boundary, leaf_len)
@@ -5519,6 +5561,37 @@ mod tests {
             "last pill keeps its bottom pad"
         );
         assert_eq!(at(11), Some(HitTarget::PanelBg(Focus::Worktrees)));
+    }
+
+    /// Every draw of the Worktrees column writes back how many pills it
+    /// had room for — the page Ctrl+d / Ctrl+u halve — so the key handler
+    /// sizes its jump to the column as it is on screen, not to a guess.
+    /// `draw_column` keeps three rows for the title, and a pill is two
+    /// rows tall, so a 20-row area fits eight pills and a half page is
+    /// four; a shorter window shrinks both, never below one row.
+    #[test]
+    fn drawing_the_worktrees_column_records_its_page_size() {
+        let mut app = hit_test_app(&["main", "feature", "other"], &[], &[]);
+        assert_eq!(app.worktrees_view_rows, 0, "nothing drawn yet");
+        assert_eq!(app.worktrees_half_page(), 1);
+
+        let area = Rect::new(0, 0, 30, 20);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 20)).unwrap();
+        terminal
+            .draw(|f| draw_worktrees(f, &mut app, area))
+            .unwrap();
+        assert_eq!(app.worktrees_view_rows, 8);
+        assert_eq!(app.worktrees_half_page(), 4);
+
+        let area = Rect::new(0, 0, 30, 6);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 6)).unwrap();
+        terminal
+            .draw(|f| draw_worktrees(f, &mut app, area))
+            .unwrap();
+        assert_eq!(app.worktrees_view_rows, 1, "three title rows, one pill");
+        assert_eq!(app.worktrees_half_page(), 1, "never less than a row");
     }
 
     /// RECENT PROMPTS under a session's name. Off (the default), the list

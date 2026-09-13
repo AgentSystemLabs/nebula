@@ -84,6 +84,8 @@ const SELECT_CONTEXT_FIRST: &str = "select a project or worktree first";
 
 /// Flash for a session pick that lost a race with its removal.
 const SESSION_GONE: &str = "session no longer exists";
+/// Flash for a `/` pull-request pick whose row a refresh retired meanwhile.
+const PR_GONE: &str = "pull request is no longer open";
 /// `]` / `[` with no session anywhere to land on.
 const NO_SESSIONS_TO_JUMP: &str = "no sessions to jump to";
 
@@ -960,6 +962,12 @@ fn note_open_prs_answer(
     );
     forget_retired_prs(app);
     reconcile_open_pr_cursor(app, cursor, out);
+    // An open `/` palette lists these rows too: a pull request marked
+    // ready for review (or turned back into a draft) since the last answer
+    // must change its word there as well, and one merged since must leave.
+    if changed {
+        refresh_palette(app);
+    }
 }
 
 /// Pull the lookup of every checkout whose *open* pull request is among
@@ -1060,7 +1068,7 @@ fn forget_retired_prs(app: &mut App) {
 /// Carry the state GitHub just gave for one pull request over to the
 /// checkout row that shows the same one, ahead of that row's own
 /// `PR_REFRESH` beat. The PR ROW keeps a merged or closed pull request
-/// rather than retiring it, so what changes here is its badge — `pr` to
+/// rather than retiring it, so what changes here is its badge — `ready` to
 /// `merged` the moment the pane learns it, not up to fifteen seconds later
 /// — and, on the Sessions panel, its look.
 fn adopt_pr_state(app: &mut App, detail: &crate::pull_request::PrDetail) {
@@ -2096,6 +2104,22 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             }
         }
         Action::MoveUp => move_selection(app, -1, out),
+        // Ctrl+d / Ctrl+u jump the Worktrees cursor half a panel at a time
+        // — the one column that routinely outgrows its height once the
+        // OPEN PRS group is open — through checkouts and pull requests
+        // alike, stopping at either end; the draw then scrolls the list
+        // after the cursor exactly as it does for a single step, so the
+        // row landed on is always in view. That panel only: a locked pane
+        // never gets here (the chords are the shell's EOF and
+        // kill-to-start), every line editor keeps ^u for itself, and the
+        // other panels are short enough that the keys stay unclaimed there.
+        Action::HalfPageDown if app.focus == Focus::Worktrees => {
+            move_selection(app, app.worktrees_half_page() as i64, out)
+        }
+        Action::HalfPageUp if app.focus == Focus::Worktrees => {
+            move_selection(app, -(app.worktrees_half_page() as i64), out)
+        }
+        Action::HalfPageDown | Action::HalfPageUp => {}
         Action::Activate => match app.focus {
             // The cursor already IS the open workspace; Enter steps into it.
             Focus::Workspaces => app.focus = app.first_sidebar_focus(),
@@ -2210,6 +2234,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     app.show_archived,
                     crate::config::Config::load().palette_enter_attaches,
                     &app.open_prs,
+                    app.hide_draft_prs,
                 )));
             }
         }
@@ -4062,10 +4087,11 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 KeyCode::Char('n') if ctrl => palette.select(palette.selected as i64 + 1),
                 KeyCode::Char('p') if ctrl => palette.select(palette.selected as i64 - 1),
                 // Enter picks per the config setting; Ctrl+O always opens
-                // (attach + terminal focus), Ctrl+F only focuses the row.
+                // (attach + terminal focus; the browser, for a pull
+                // request), Ctrl+F only focuses the row.
                 KeyCode::Enter => {
-                    let landing = Landing::for_enter(palette.enter_attaches);
                     if let Some(target) = palette.selected_target().cloned() {
+                        let landing = Landing::for_enter_on(&target, palette.enter_attaches);
                         app.overlay = None;
                         jump_to_target(app, target, landing, out);
                     }
@@ -4566,10 +4592,12 @@ fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i32) {
 fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     app.theme = cfg.theme();
     app.animations = cfg.animations;
+    app.focus_tint = cfg.focus_tint;
     set_show_workspaces(app, cfg.show_workspaces);
     set_hide_projects(app, cfg.hide_projects);
     set_hide_worktrees(app, cfg.hide_worktrees);
     set_hide_root_worktree(app, cfg.hide_root_worktree);
+    set_hide_draft_prs(app, cfg.hide_draft_prs);
     app.recent_prompts = cfg.recent_prompts_shown();
 }
 
@@ -4674,6 +4702,68 @@ fn set_hide_root_worktree(app: &mut App, hidden: bool) {
     };
     let last = app.worktree_row_count().saturating_sub(1);
     app.sel_worktree = index.unwrap_or(app.sel_worktree).min(last);
+}
+
+/// Show or hide the drafts in the PROJECT OPEN PRS GROUP and `/` (Settings
+/// → Appearance, or the panel menu's **Hide draft PRs**). Nothing stored
+/// changes — `listed_open_prs` reads the flag — but the rows under the
+/// cursor do, so it follows its pull request by URL, as
+/// `reconcile_open_pr_cursor` does after a refresh. A cursor on a draft
+/// that just went has nothing to follow: it lands on the nearest row left
+/// and the pane is told to read whatever that is. True when that landing
+/// was a checkout, so a caller with a request buffer can bring its session
+/// up (`toggle_hide_draft_prs`); `apply_config` has none, and there the
+/// pane catches up on the next move, as it does after the ROOT WORKTREE
+/// toggle.
+fn set_hide_draft_prs(app: &mut App, hidden: bool) -> bool {
+    if app.hide_draft_prs == hidden {
+        return false;
+    }
+    let was = app.selected_worktree_pr().cloned();
+    app.hide_draft_prs = hidden;
+    app.dirty = true;
+    refresh_palette(app);
+    let Some(was) = was else {
+        return false;
+    };
+    let checkouts = app.visible_worktrees().len();
+    if let Some(i) = app
+        .visible_open_prs()
+        .iter()
+        .position(|pr| pr.url == was.url)
+    {
+        app.sel_worktree = checkouts + i;
+        return false;
+    }
+    let last = app.worktree_row_count().saturating_sub(1);
+    app.sel_worktree = app.sel_worktree.min(last);
+    schedule_pr_detail(app);
+    app.selected_worktree().is_some()
+}
+
+/// **Hide draft PRs** / **Show draft PRs** on the Worktrees panel menu:
+/// flip the `hide_draft_prs` SETTING where the group is and write it to
+/// CONFIG.JSON, the way `Shift+P` writes the panel it hides — the file is
+/// where the choice persists, the app field is the live copy. A cursor
+/// that was on a draft and landed on a checkout gets that checkout's
+/// session brought up, as a fold does (`toggle_open_prs`): the PTY
+/// underneath was deliberately left attached while the cursor was in the
+/// group, and it may belong to another worktree.
+fn toggle_hide_draft_prs(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let mut cfg = crate::config::Config::load();
+    cfg.hide_draft_prs = !app.hide_draft_prs;
+    if !save_config(app, &cfg) {
+        return;
+    }
+    if set_hide_draft_prs(app, cfg.hide_draft_prs) {
+        restore_session(app, out);
+        fire_pending_attach(app, out);
+    }
+    app.flash = Some(if cfg.hide_draft_prs {
+        "draft pull requests hidden (Settings → Appearance)".into()
+    } else {
+        "draft pull requests shown".into()
+    });
 }
 
 fn save_panel_visibility(app: &mut App) {
@@ -5301,6 +5391,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         }
         MenuAction::ToggleArchived => toggle_archived(app, out),
         MenuAction::ToggleOpenPrs => toggle_open_prs(app, out),
+        MenuAction::ToggleDraftPrs => toggle_hide_draft_prs(app, out),
     }
 }
 
@@ -5549,9 +5640,9 @@ fn select_project_row_by_id(app: &mut App, id: &nebula_core::ProjectId) -> bool 
 }
 
 /// The workspace a palette pick lives in, when that isn't the open one.
-/// A pull request has no workspace of its own — it is opened in a browser
-/// and moves no cursor — and a target whose row has vanished resolves to
-/// None, leaving the jump's own re-validation to flash.
+/// A pull request lives where its project does — its row is in that
+/// project's OPEN PRS group — and a target whose row has vanished resolves
+/// to None, leaving the jump's own re-validation to flash.
 fn target_workspace(app: &App, target: &PaletteTarget) -> Option<WorkspaceId> {
     let project = |id: &ProjectId| {
         app.tree
@@ -5577,7 +5668,7 @@ fn target_workspace(app: &App, target: &PaletteTarget) -> Option<WorkspaceId> {
             .iter()
             .find(|a| &a.id == id)
             .and_then(|a| worktree(&a.worktree_id)),
-        PaletteTarget::PullRequest(_) => None,
+        PaletteTarget::PullRequest { project: id, .. } => project(id),
     };
     found.filter(|id| id != &app.tree.active_workspace)
 }
@@ -5714,11 +5805,49 @@ fn jump_to_target_inner(
                 }
             }
         }
-        // A pull request isn't in any panel — picking it hands the URL to
-        // the browser and leaves every cursor where it was. Enter opens it
-        // whether or not the "Enter attaches" setting is on: there is no
-        // second, quieter thing for it to do.
-        PaletteTarget::PullRequest(url) => open_link(app, &url, out),
+        // A pull request is a row of its project's OPEN PRS group, under
+        // the checkouts: the jump selects that project (restoring its
+        // context like a manual switch), unfolds the group if it was
+        // folded — a folded group has no rows to land on — and puts the
+        // Worktrees cursor on the row, so the pane reads the pull request
+        // exactly as ↓ onto it would (`App::previewed_pr`). Nothing else
+        // is needed for a PR with no checkout or session of its own. The
+        // browser stays an explicit ask: `Attach` is "what Enter on its
+        // row does", and on this row that is the browser.
+        PaletteTarget::PullRequest { project, url } => {
+            let changed = switched
+                || app
+                    .selected_project()
+                    .map(|p| p.id != project)
+                    .unwrap_or(true);
+            if !select_project_row_by_id(app, &project) {
+                app.flash = Some("project no longer exists".into());
+                return;
+            }
+            if changed {
+                restore_context(app, out);
+            }
+            if app.open_prs_collapsed {
+                app.open_prs_collapsed = false;
+                app.dirty = true;
+            }
+            let checkouts = app.visible_worktrees().len();
+            let Some(index) = app.visible_open_prs().iter().position(|pr| pr.url == url) else {
+                app.flash = Some(PR_GONE.into());
+                return;
+            };
+            // Re-picking the row the cursor is already on keeps the
+            // reader's scroll; a move re-arms the detail fetch as any
+            // cursor move onto the row does.
+            let row = checkouts + index;
+            if app.sel_worktree != row {
+                select_worktree_row(app, row, out);
+            }
+            app.focus = Focus::Worktrees;
+            if landing == Landing::Attach {
+                open_link(app, &url, out);
+            }
+        }
     }
 }
 
@@ -5792,6 +5921,18 @@ impl Landing {
             Landing::FocusOnly
         }
     }
+
+    /// The palette's Enter on `target`: a session attaches when the setting
+    /// says so; a pull request only ever lands on its row with the pane
+    /// reading it — the setting is about attaching, and a pull request has
+    /// nothing to attach — so `Ctrl+O` stays the one palette key that also
+    /// hands it to the browser.
+    fn for_enter_on(target: &PaletteTarget, attaches: bool) -> Self {
+        match target {
+            PaletteTarget::PullRequest { .. } => Landing::FocusOnly,
+            _ => Landing::for_enter(attaches),
+        }
+    }
 }
 
 /// `]` / `[`: land on the next (`step` 1) or previous (`step` -1) session
@@ -5843,7 +5984,7 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
             if delta > 0
                 && app.open_prs_collapsed
                 && app.sel_worktree + 1 >= checkouts
-                && !app.all_open_prs().is_empty()
+                && !app.listed_open_prs().is_empty()
             {
                 app.open_prs_collapsed = false;
                 app.dirty = true;
@@ -6874,8 +7015,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     let index = start + (mouse.row - list.y) as usize;
                     if index < palette.matches.len() {
                         palette.select(index as i64);
-                        let landing = Landing::for_enter(palette.enter_attaches);
                         if let Some(target) = palette.selected_target().cloned() {
+                            let landing = Landing::for_enter_on(&target, palette.enter_attaches);
                             app.overlay = None;
                             jump_to_target(app, target, landing, out);
                         }
@@ -7530,11 +7671,24 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                                     MenuAction::NewWorktree(p.id.clone()),
                                 )];
                                 // Only once there is a group to fold.
-                                if !app.all_open_prs().is_empty() {
+                                if !app.listed_open_prs().is_empty() {
                                     items.push(MenuItem::new(
                                         "Show/hide open PRs",
                                         MenuAction::ToggleOpenPrs,
                                     ));
+                                }
+                                // And drafts to hide — or, once hidden,
+                                // a way back that doesn't need the list
+                                // to still hold one.
+                                if app.hide_draft_prs
+                                    || app.all_open_prs().iter().any(|pr| pr.is_draft)
+                                {
+                                    let label = if app.hide_draft_prs {
+                                        "Show draft PRs"
+                                    } else {
+                                        "Hide draft PRs"
+                                    };
+                                    items.push(MenuItem::new(label, MenuAction::ToggleDraftPrs));
                                 }
                                 items
                             })
@@ -8084,7 +8238,12 @@ fn restore_worktree_rows(app: &mut App, rollback: WorktreeRollback) {
 /// new entities) so its rows never go stale under the user's cursor.
 fn refresh_palette(app: &mut App) {
     if let Some(Overlay::Palette(palette)) = &mut app.overlay {
-        palette.rebuild(&app.tree, app.show_archived, &app.open_prs);
+        palette.rebuild(
+            &app.tree,
+            app.show_archived,
+            &app.open_prs,
+            app.hide_draft_prs,
+        );
     }
 }
 
@@ -8831,6 +8990,61 @@ mod tests {
         assert!(!app.status_anim_active());
     }
 
+    /// The focused-panel tint honours its setting. On (the default) the
+    /// focused panel's untouched cells wear the theme's `focus_tint`; off,
+    /// no cell in the frame does — the terminal's own background, a
+    /// configured transparency included, shows through the whole window.
+    /// The collapsed layout takes the same switch, and applying a config
+    /// carries the value into the app like the other Appearance rows.
+    #[test]
+    fn focus_tint_setting_switches_the_panel_wash_off() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let th = app.theme;
+        let tinted = |terminal: &Terminal<TestBackend>| {
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .filter(|c| c.bg == th.focus_tint)
+                .count()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        assert!(app.focus_tint, "on out of the box");
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(tinted(&terminal) > 0, "the focused panel is washed");
+
+        apply_config(
+            &mut app,
+            &crate::config::Config {
+                focus_tint: false,
+                ..Default::default()
+            },
+        );
+        assert!(!app.focus_tint, "apply_config carries the setting");
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert_eq!(
+            tinted(&terminal),
+            0,
+            "off: every background is the terminal's own"
+        );
+
+        app.collapsed = true;
+        app.focus = Focus::Terminal;
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert_eq!(tinted(&terminal), 0, "collapsed, still off");
+
+        apply_config(&mut app, &crate::config::Config::default());
+        assert!(app.focus_tint);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            tinted(&terminal) > 0,
+            "collapsed, back on: the pane is washed"
+        );
+    }
+
     /// A checkout wearing its merged pull request sweeps purple, so it
     /// keeps the sweep clock running too — while its row is on screen.
     /// Another project's merged checkout has no row to animate.
@@ -9444,6 +9658,11 @@ mod tests {
         );
     }
 
+    /// A control chord pressed wherever the cursor is: `ctrl(app, 'd', out)`.
+    fn ctrl(app: &mut App, c: char, out: &mut Vec<ClientRequest>) {
+        press(app, KeyCode::Char(c), KeyModifiers::CONTROL, out);
+    }
+
     /// The open pull requests take the rows *after* the checkouts, which is
     /// what lets every "index into visible_worktrees()" in the app stay
     /// correct: a cursor on a PR row simply has no selected worktree.
@@ -9495,6 +9714,134 @@ mod tests {
         press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert_eq!(app.focus, Focus::Sessions);
+    }
+
+    /// Ctrl+d / Ctrl+u walk the Worktrees column half a panel at a time:
+    /// half the pill rows the last draw had room for, across the checkouts
+    /// and the OPEN PRS rows as one list, clamped at both ends rather than
+    /// wrapping. The draw re-anchors the scroll on the cursor, so the row
+    /// landed on is what the column shows.
+    #[test]
+    fn ctrl_d_and_ctrl_u_jump_the_worktrees_cursor_half_a_panel() {
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 / w1(main) / a1
+        let prs: Vec<(u64, String)> = (1..=10).map(|n| (n, format!("PR {n}"))).collect();
+        let prs: Vec<(u64, &str)> = prs.iter().map(|(n, t)| (*n, t.as_str())).collect();
+        seed_open_prs(&mut app, &prs);
+        assert_eq!(app.worktree_row_count(), 11, "one checkout + ten PRs");
+        app.focus = Focus::Worktrees;
+        // A column with room for six pills: half a page is three rows.
+        app.worktrees_view_rows = 6;
+        app.worktrees_anchor = Some((app.sel_project, app.sel_worktree));
+        let mut out = Vec::new();
+
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(app.sel_worktree, 3, "half a panel down");
+        assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(3));
+        ctrl(&mut app, 'd', &mut out);
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(app.sel_worktree, 9);
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(app.sel_worktree, 10, "stops at the last row");
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(app.sel_worktree, 10, "and stays there — no wrap");
+
+        ctrl(&mut app, 'u', &mut out);
+        assert_eq!(app.sel_worktree, 7, "half a panel up");
+        ctrl(&mut app, 'u', &mut out);
+        ctrl(&mut app, 'u', &mut out);
+        assert_eq!(app.sel_worktree, 1);
+        ctrl(&mut app, 'u', &mut out);
+        assert_eq!(app.sel_worktree, 0, "stops at the first row");
+        assert!(app.selected_worktree().is_some(), "row 0 is the checkout");
+        ctrl(&mut app, 'u', &mut out);
+        assert_eq!(app.sel_worktree, 0);
+
+        // Walking into the PR rows never touched the pane: a pull request
+        // has no sessions of its own, so nothing was detached.
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::Detach { .. })),
+            "the pane is left alone: {out:?}"
+        );
+    }
+
+    /// Before the column has been drawn — or squeezed to a row or two —
+    /// there is no page to halve, and the keys still move: one row, like
+    /// `j`/`k`. And like `↓`, a jump off the last checkout into a folded
+    /// OPEN PRS group opens it onto its first pull request.
+    #[test]
+    fn a_half_page_is_never_less_than_a_row_and_opens_a_folded_pr_group() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Number the lines")]);
+        app.focus = Focus::Worktrees;
+        assert_eq!(app.worktrees_view_rows, 0, "nothing drawn yet");
+        assert_eq!(app.worktrees_half_page(), 1);
+        let mut out = Vec::new();
+
+        ctrl(&mut app, 'd', &mut out);
+        assert_eq!(app.sel_worktree, 1, "one row, the group being open");
+        ctrl(&mut app, 'u', &mut out);
+        assert_eq!(app.sel_worktree, 0);
+
+        app.open_prs_collapsed = true;
+        assert_eq!(app.worktree_row_count(), 1, "folded: the checkout alone");
+        ctrl(&mut app, 'd', &mut out);
+        assert!(
+            !app.open_prs_collapsed,
+            "Ctrl+d off the last checkout unfolds"
+        );
+        assert_eq!(app.sel_worktree, 1, "onto the first pull request");
+        assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+    }
+
+    /// The half-page chords belong to the Worktrees column alone. Every
+    /// other panel leaves them unclaimed as before, and a locked pane
+    /// forwards them to the PTY as the control bytes they are — Ctrl+d is
+    /// the shell's EOF and Ctrl+u its kill-to-start, and an agent running
+    /// in there is owed both.
+    #[test]
+    fn half_page_chords_stay_out_of_the_other_panels_and_the_locked_pane() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Number the lines")]);
+        app.worktrees_view_rows = 6;
+        let mut out = Vec::new();
+
+        for focus in [Focus::Projects, Focus::Sessions] {
+            app.focus = focus;
+            let before = (app.sel_project, app.sel_worktree, app.sel_session);
+            ctrl(&mut app, 'd', &mut out);
+            ctrl(&mut app, 'u', &mut out);
+            assert_eq!(
+                (app.sel_project, app.sel_worktree, app.sel_session),
+                before,
+                "{focus:?}: no cursor moved"
+            );
+            assert!(app.overlay.is_none(), "{focus:?}: nothing opened");
+        }
+
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            80,
+            24,
+        ));
+        out.clear();
+        ctrl(&mut app, 'd', &mut out);
+        assert!(
+            matches!(out.last(), Some(ClientRequest::Input { data, .. }) if data == b"\x04"),
+            "^d reaches the PTY as EOF: {out:?}"
+        );
+        ctrl(&mut app, 'u', &mut out);
+        assert!(
+            matches!(out.last(), Some(ClientRequest::Input { data, .. }) if data == b"\x15"),
+            "^u reaches the PTY as kill-to-start: {out:?}"
+        );
+        assert_eq!(app.sel_worktree, 0, "the Worktrees cursor never moved");
+        assert!(app.term_locked, "and the lock held");
     }
 
     /// A second click on a pull request opens it; one click only selects —
@@ -9938,35 +10285,519 @@ mod tests {
         );
     }
 
-    /// `/` searches pull requests by title alongside everything else, and
-    /// Enter on one opens the browser instead of moving any panel cursor.
+    /// Settings → Appearance → Draft pull requests: `hidden` keeps the
+    /// drafts out of the PROJECT OPEN PRS GROUP and out of `/`, the header
+    /// counts what is listed over what is open (`1/2`) so the missing row
+    /// reads as a setting, the stored list keeps the draft — a view
+    /// filter, not a fetch filter — and `shown` brings it back at once
+    /// with no refetch. The checkout and its session are never touched.
     #[test]
-    fn the_palette_finds_open_prs_by_title_and_opens_them() {
+    fn hidden_drafts_leave_the_group_and_the_palette_until_shown_again() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let pid = app.selected_project().expect("a project").id.clone();
+            note_open_prs_answer(
+                &mut app,
+                pid.clone(),
+                Some(vec![
+                    a_pr(9, "Still cooking", true),
+                    a_pr(7, "Attach links", false),
+                ]),
+                &mut Vec::new(),
+            );
+            assert_eq!(open_pr_numbers(&app), vec![7, 9]);
+            let mut out = Vec::new();
+            let palette_texts = |app: &mut App, out: &mut Vec<ClientRequest>| -> Vec<String> {
+                app.focus = Focus::Worktrees;
+                press(app, KeyCode::Char('/'), KeyModifiers::NONE, out);
+                let texts = palette(app).items.iter().map(|i| i.text.clone()).collect();
+                press(app, KeyCode::Esc, KeyModifiers::NONE, out);
+                texts
+            };
+
+            let mut cfg = crate::config::Config {
+                hide_draft_prs: true,
+                ..Default::default()
+            };
+            apply_config(&mut app, &cfg);
+            assert!(app.hide_draft_prs);
+            assert_eq!(open_pr_numbers(&app), vec![7], "the draft is off the panel");
+            assert_eq!(app.hidden_draft_prs(), 1);
+            assert_eq!(
+                app.open_prs[&pid].list.len(),
+                2,
+                "but still in the list — hidden, not forgotten"
+            );
+            assert_eq!(app.tree.worktrees.len(), 1, "no checkout went anywhere");
+            assert_eq!(app.tree.agents.len(), 1, "nor its session");
+
+            let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("OPEN PRS · 1/2"), "listed over open:\n{text}");
+            assert!(text.contains("#7"), "{text}");
+            assert!(!text.contains("#9"), "no draft row:\n{text}");
+
+            let texts = palette_texts(&mut app, &mut out);
+            assert!(
+                texts.iter().any(|t| t == "demo/#7 Attach links"),
+                "{texts:?}"
+            );
+            assert!(
+                !texts.iter().any(|t| t.contains("#9")),
+                "/ agrees with the panel: {texts:?}"
+            );
+            assert!(
+                texts.iter().any(|t| t == "demo/main/agent-1"),
+                "the session is still a row: {texts:?}"
+            );
+
+            cfg.hide_draft_prs = false;
+            apply_config(&mut app, &cfg);
+            assert_eq!(open_pr_numbers(&app), vec![7, 9], "back, without a refetch");
+            assert_eq!(app.hidden_draft_prs(), 0);
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("OPEN PRS · 2"), "{text}");
+            assert!(
+                !text.contains("OPEN PRS · 2/"),
+                "nothing hidden, nothing to own up to:\n{text}"
+            );
+            let texts = palette_texts(&mut app, &mut out);
+            assert!(texts.iter().any(|t| t.contains("#9")), "{texts:?}");
+        });
+    }
+
+    /// **Hide draft PRs** from the Worktrees panel menu writes the setting
+    /// to CONFIG.JSON and applies it in place. A cursor resting on the
+    /// draft has no row to follow: it lands on the nearest row left — the
+    /// last finished pull request when there is one, else the last
+    /// checkout, whose session is brought back into the pane as a fold
+    /// does. Showing them again puts the draft back without moving a
+    /// cursor that was on something else.
+    #[test]
+    fn hiding_the_draft_under_the_cursor_lands_it_on_the_nearest_row_left() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let pid = app.selected_project().expect("a project").id.clone();
+            note_open_prs_answer(
+                &mut app,
+                pid.clone(),
+                Some(vec![
+                    a_pr(9, "Still cooking", true),
+                    a_pr(7, "Attach links", false),
+                ]),
+                &mut Vec::new(),
+            );
+            app.focus = Focus::Worktrees;
+            let checkouts = app.visible_worktrees().len();
+            let mut out = Vec::new();
+
+            // The panel menu offers the verb once the list holds a draft.
+            app.hits.push((
+                ratatui::layout::Rect::new(0, 0, 20, 2),
+                HitTarget::PanelBg(Focus::Worktrees),
+            ));
+            handle_mouse(
+                &mut app,
+                mev(MouseEventKind::Down(MouseButton::Right), 1, 0),
+                &mut out,
+            );
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the panel menu, got {:?}", app.overlay);
+            };
+            let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(
+                labels,
+                ["New worktree", "Show/hide open PRs", "Hide draft PRs"]
+            );
+            app.overlay = None;
+
+            app.sel_worktree = checkouts + 1;
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(9));
+            toggle_hide_draft_prs(&mut app, &mut out);
+            assert!(app.hide_draft_prs);
+            assert!(
+                crate::config::Config::load().hide_draft_prs,
+                "the menu writes the setting where it persists"
+            );
+            assert_eq!(
+                app.selected_worktree_pr().map(|p| p.number),
+                Some(7),
+                "the nearest row left is the finished pull request"
+            );
+            assert!(
+                out.is_empty(),
+                "no checkout was landed on, so nothing attaches"
+            );
+            assert_eq!(
+                app.flash.as_deref(),
+                Some("draft pull requests hidden (Settings → Appearance)")
+            );
+
+            // Back on: the draft returns below #7 and the cursor stays put.
+            toggle_hide_draft_prs(&mut app, &mut out);
+            assert!(!app.hide_draft_prs);
+            assert!(!crate::config::Config::load().hide_draft_prs);
+            assert_eq!(open_pr_numbers(&app), vec![7, 9]);
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+
+            // Only drafts open, the cursor on one: hiding them empties the
+            // group, so the cursor lands on the last checkout and that
+            // checkout's session comes back into the pane.
+            note_open_prs_answer(
+                &mut app,
+                pid.clone(),
+                Some(vec![a_pr(9, "Still cooking", true)]),
+                &mut out,
+            );
+            app.sel_worktree = checkouts;
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(9));
+            out.clear();
+            toggle_hide_draft_prs(&mut app, &mut out);
+            assert!(app.selected_worktree_pr().is_none());
+            assert_eq!(
+                app.selected_worktree().map(|w| w.branch.clone()).as_deref(),
+                Some("main")
+            );
+            assert!(
+                out.iter()
+                    .any(|r| matches!(r, ClientRequest::Attach { .. })),
+                "the checkout's session is brought up, as a fold does: {out:?}"
+            );
+            let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("OPEN PRS · 0/1"),
+                "the header still says a draft is being kept out:\n{text}"
+            );
+
+            // The menu now offers the way back, even though nothing is listed.
+            // (The draw above re-registered every real hit; start clean so
+            // the pushed rect is the one the click finds.)
+            app.hits.clear();
+            app.hits.push((
+                ratatui::layout::Rect::new(0, 0, 20, 2),
+                HitTarget::PanelBg(Focus::Worktrees),
+            ));
+            handle_mouse(
+                &mut app,
+                mev(MouseEventKind::Down(MouseButton::Right), 1, 0),
+                &mut out,
+            );
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the panel menu, got {:?}", app.overlay);
+            };
+            let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(labels, ["New worktree", "Show draft PRs"]);
+        });
+    }
+
+    /// The filter reads each pull request's draft flag as GitHub last gave
+    /// it, so a draft marked ready joins the rows on the refresh that says
+    /// so and one turned back into a draft leaves on the next — no toggle
+    /// involved. And a folded group with nothing listed is not something
+    /// `↓` steps into.
+    #[test]
+    fn a_refresh_that_changes_draft_status_moves_the_row_in_or_out() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let pid = app.selected_project().expect("a project").id.clone();
+            apply_config(
+                &mut app,
+                &crate::config::Config {
+                    hide_draft_prs: true,
+                    ..Default::default()
+                },
+            );
+            let answer = |app: &mut App, list: Vec<crate::pull_request::OpenPr>| {
+                note_open_prs_answer(app, pid.clone(), Some(list), &mut Vec::new());
+            };
+
+            answer(
+                &mut app,
+                vec![
+                    a_pr(9, "Still cooking", true),
+                    a_pr(7, "Attach links", false),
+                ],
+            );
+            assert_eq!(open_pr_numbers(&app), vec![7]);
+            // #9 marked ready for review.
+            answer(
+                &mut app,
+                vec![
+                    a_pr(9, "Still cooking", false),
+                    a_pr(7, "Attach links", false),
+                ],
+            );
+            assert_eq!(open_pr_numbers(&app), vec![9, 7], "in, in gh's order");
+            // #7 converted back to a draft.
+            answer(
+                &mut app,
+                vec![
+                    a_pr(9, "Still cooking", false),
+                    a_pr(7, "Attach links", true),
+                ],
+            );
+            assert_eq!(open_pr_numbers(&app), vec![9], "and out again");
+
+            // Nothing listed once both are drafts: ↓ off the last checkout
+            // has no row to open the folded group onto, so it stays put.
+            answer(
+                &mut app,
+                vec![
+                    a_pr(9, "Still cooking", true),
+                    a_pr(7, "Attach links", true),
+                ],
+            );
+            assert!(open_pr_numbers(&app).is_empty());
+            app.focus = Focus::Worktrees;
+            app.open_prs_collapsed = true;
+            app.sel_worktree = app.visible_worktrees().len() - 1;
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            assert!(app.open_prs_collapsed, "nothing to step into");
+            assert!(app.selected_worktree().is_some());
+        });
+    }
+
+    /// `/` searches pull requests by title alongside everything else, and
+    /// Enter on one lands the Worktrees cursor on its OPEN PRS row so the
+    /// pane reads it — inside nebula, not in a browser.
+    #[test]
+    fn the_palette_finds_open_prs_by_title_and_reads_them_in_the_pane() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(
+            &mut app,
+            &[(7, "Attach links to worktrees"), (9, "Number the lines")],
+        );
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        for c in "number".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        {
+            let p = palette(&app);
+            assert_eq!(
+                p.items[p.matches[0].item].text, "demo/#9 Number the lines",
+                "the project prefixes it, like every other row"
+            );
+        }
+        // Enter lands on the row whether or not "Enter attaches" is on: the
+        // setting is about attaching sessions, and a pull request has
+        // nothing to attach — the browser is never the quiet default.
+        set_enter_attaches(&mut app, true);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "the palette closes");
+        assert_eq!(app.flash, None, "no browser opened: {:?}", app.flash);
+        assert_eq!(app.focus, Focus::Worktrees);
+        assert_eq!(app.sel_worktree, 2, "the row after the one checkout and #7");
+        assert_eq!(
+            app.selected_worktree_pr().map(|pr| pr.number),
+            Some(9),
+            "the Worktrees cursor is on the pull request"
+        );
+        assert_eq!(
+            app.previewed_pr().map(|pr| pr.url),
+            Some("https://github.com/o/r/pull/9".into()),
+            "the pane is reading it"
+        );
+        assert_eq!(
+            app.pending_pr_detail.as_ref().map(|(p, _)| p.url.as_str()),
+            Some("https://github.com/o/r/pull/9"),
+            "its description is asked for, as any move onto the row would"
+        );
+    }
+
+    /// A folded OPEN PRS group has no rows to land on, so the jump unfolds
+    /// it first — the row is where the pick is headed, the way ↓ off the
+    /// last checkout opens the group rather than stopping at its header.
+    #[test]
+    fn a_palette_pr_pick_unfolds_the_open_prs_group() {
         let mut app = App::new();
         seed_tree(&mut app);
         seed_open_prs(&mut app, &[(7, "Attach links to worktrees")]);
-        app.focus = Focus::Worktrees;
+        app.open_prs_collapsed = true;
+        assert_eq!(app.worktree_row_count(), 1, "folded: only the checkout");
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        for c in "#7".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(!app.open_prs_collapsed, "the group is open");
+        assert_eq!(app.selected_worktree_pr().map(|pr| pr.number), Some(7));
+        assert_eq!(app.focus, Focus::Worktrees);
+    }
+
+    /// `Ctrl+O` is the palette's "open the hit", and on a pull request that
+    /// is the browser — the explicit way out, the same as Enter on the row
+    /// once landed. It still lands the cursor there first, so the pane is
+    /// reading the pull request when the browser is dismissed.
+    #[test]
+    fn palette_ctrl_o_on_a_pr_lands_on_it_and_opens_the_browser() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links to worktrees")]);
         let mut out = Vec::new();
 
         press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
         for c in "attach".chars() {
             press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
         }
-        {
-            let p = palette(&app);
-            assert_eq!(
-                p.items[p.matches[0].item].text, "demo/#7 Attach links to worktrees",
-                "the project prefixes it, like every other row"
-            );
-        }
-        // Enter opens it whether or not "Enter attaches" is on — there is no
-        // second, quieter thing a pull request can do.
-        set_enter_attaches(&mut app, false);
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        press(
+            &mut app,
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
         assert!(app.overlay.is_none(), "the palette closes");
         assert_eq!(app.flash.as_deref(), Some("opened github.com/o/r/pull/7"));
-        assert_eq!(app.sel_worktree, 0, "no panel cursor moved");
+        assert_eq!(app.selected_worktree_pr().map(|pr| pr.number), Some(7));
         assert_eq!(app.focus, Focus::Worktrees);
+    }
+
+    /// A pull request row in `/` says where it stands, in words, before it
+    /// is picked: one ready for review is badged `ready for review` and
+    /// wears the accent its Worktrees-panel row does; a draft is badged
+    /// `draft` and dimmed end to end, like that row. The words are the
+    /// sidebar's — `draft` there too, `ready` cut to fit its column — so
+    /// the two lists never disagree about a state. And the list refresh
+    /// that learns a draft was marked ready flips the row under an open
+    /// palette, without moving the cursor off it.
+    #[test]
+    fn palette_pull_request_rows_say_draft_or_ready_for_review_and_follow_the_refresh() {
+        let th = crate::theme::Theme::default();
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let pid = app.selected_project().expect("a project").id.clone();
+        let answer = |app: &mut App, prs: Vec<(u64, &str, bool)>| {
+            let list = prs
+                .into_iter()
+                .map(|(number, title, is_draft)| crate::pull_request::OpenPr {
+                    number,
+                    title: title.into(),
+                    url: pr_url(number),
+                    is_draft,
+                    head: format!("pr-{number}-head"),
+                })
+                .collect();
+            note_open_prs_answer(app, pid.clone(), Some(list), &mut Vec::new());
+        };
+        answer(
+            &mut app,
+            vec![(7, "Attach links", false), (9, "Number the lines", true)],
+        );
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("↗ demo/#7 Attach links ready for review"),
+            "a finished pull request says so after its title:\n{text}"
+        );
+        assert!(
+            text.contains("↗ demo/#9 Number the lines draft"),
+            "a draft says so after its title:\n{text}"
+        );
+        // The colors are the sidebar's: accent arrow and plain title for
+        // the ready one, dim arrow and dim title for the draft — the same
+        // `pr_row::look` both panels paint from.
+        let buffer = terminal.backend().buffer();
+        let (x, y) = find_cell(&terminal, "↗ demo/#7");
+        assert_eq!(buffer[(x, y)].fg, th.accent, "ready: the accent arrow");
+        let title_x = x + "↗ demo/".chars().count() as u16;
+        assert_eq!(buffer[(title_x, y)].fg, th.text, "ready: the title reads");
+        let (x, y) = find_cell(&terminal, "↗ demo/#9");
+        assert_eq!(buffer[(x, y)].fg, th.dim, "draft: the dim arrow");
+        assert_eq!(buffer[(title_x, y)].fg, th.dim, "draft: dimmed end to end");
+        let badge_x = x + "↗ demo/#9 Number the lines ".chars().count() as u16;
+        assert_eq!(buffer[(badge_x, y)].fg, th.dim, "draft: the badge is dim");
+
+        // Park the cursor on the draft, then let a refresh say it was
+        // marked ready for review: the word flips, the cursor stays.
+        if let Some(Overlay::Palette(p)) = &mut app.overlay {
+            let row = p
+                .matches
+                .iter()
+                .position(|m| {
+                    p.items[m.item].target
+                        == PaletteTarget::PullRequest {
+                            project: pid.clone(),
+                            url: pr_url(9),
+                        }
+                })
+                .expect("the draft's row");
+            p.select(row as i64);
+        }
+        answer(
+            &mut app,
+            vec![(7, "Attach links", false), (9, "Number the lines", false)],
+        );
+        assert_eq!(
+            palette(&app).selected_target(),
+            Some(&PaletteTarget::PullRequest {
+                project: pid.clone(),
+                url: pr_url(9),
+            }),
+            "the rebuild keeps the cursor on its pull request"
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("↗ demo/#9 Number the lines ready for review"),
+            "the refresh flips the word:\n{text}"
+        );
+        assert!(
+            !text.contains(" draft"),
+            "no draft is left on screen:\n{text}"
+        );
+
+        // And back: a pull request turned into a draft again reads so.
+        answer(
+            &mut app,
+            vec![(7, "Attach links", false), (9, "Number the lines", true)],
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("↗ demo/#9 Number the lines draft"),
+            "back to a draft:\n{text}"
+        );
+    }
+
+    /// A pull request that merged between the palette listing it and the
+    /// pick has no row left to land on: the project is selected, and the
+    /// footer says why the cursor went no further.
+    #[test]
+    fn a_palette_pr_pick_that_lost_its_row_flashes() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links to worktrees")]);
+        let mut out = Vec::new();
+
+        jump_to_target(
+            &mut app,
+            PaletteTarget::PullRequest {
+                project: nebula_core::ProjectId("p1".into()),
+                url: "https://github.com/o/r/pull/8".into(),
+            },
+            Landing::FocusOnly,
+            &mut out,
+        );
+        assert_eq!(app.flash.as_deref(), Some(PR_GONE));
+        assert!(app.selected_worktree_pr().is_none());
+        assert_eq!(app.sel_worktree, 0, "the cursor stays on the checkout");
     }
 
     /// A space in the query is an AND between terms, not a char to match: the
@@ -10156,7 +10987,7 @@ mod tests {
                 .flatten()
                 .expect("the branch's pull request")
         };
-        assert_eq!(branch_pr(&app).badge(), "pr");
+        assert_eq!(branch_pr(&app).badge(), "ready");
 
         let mut merged = a_detail(7, "shipped", vec![]);
         merged.state = "MERGED".into();
@@ -10188,6 +11019,17 @@ mod tests {
 
     fn pr_url(number: u64) -> String {
         format!("https://github.com/o/r/pull/{number}")
+    }
+
+    /// One `gh pr list` row, as `parse_list` would build it.
+    fn a_pr(number: u64, title: &str, is_draft: bool) -> crate::pull_request::OpenPr {
+        crate::pull_request::OpenPr {
+            number,
+            title: title.into(),
+            url: pr_url(number),
+            is_draft,
+            head: format!("pr-{number}-head"),
+        }
     }
 
     fn open_pr_numbers(app: &App) -> Vec<u64> {
@@ -21185,7 +22027,7 @@ diff --git a/src/c.rs b/src/c.rs
         assert_eq!(app.project_rows().len(), 1, "only demo has a row");
         assert_eq!(app.tree.visible_project_count(), 1);
 
-        let palette = Palette::new(&app.tree, true, false, &app.open_prs);
+        let palette = Palette::new(&app.tree, true, false, &app.open_prs, false);
         let texts: Vec<&str> = palette.items.iter().map(|i| i.text.as_str()).collect();
         assert_eq!(
             texts,
@@ -21236,6 +22078,63 @@ diff --git a/src/c.rs b/src/c.rs
             Some("main".into())
         );
         assert_eq!(app.focus, Focus::Sessions);
+        assert!(app.flash.is_none(), "flash: {:?}", app.flash);
+    }
+
+    /// A pull request in another workspace's project is a jump there too:
+    /// the switch happens first, its project is selected, and the cursor
+    /// lands on the row under that project's checkouts — nothing about the
+    /// pull request needs a worktree or session of its own.
+    #[test]
+    fn jumping_to_another_workspaces_pr_switches_workspace_first() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_default_workspace(&mut app);
+        seed_other_workspace(&mut app);
+        let now = std::time::Instant::now();
+        app.open_prs.insert(
+            nebula_core::ProjectId("p9".into()),
+            crate::app::OpenPrs {
+                list: vec![crate::pull_request::OpenPr {
+                    number: 3,
+                    title: "Hush the logs".into(),
+                    url: "https://github.com/o/secret/pull/3".into(),
+                    is_draft: false,
+                    head: "hush".into(),
+                }],
+                at: now,
+                due: now + OPEN_PRS_REFRESH,
+                step: OPEN_PRS_REFRESH,
+            },
+        );
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        for c in "hush".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        {
+            let p = palette(&app);
+            assert_eq!(
+                p.items[p.matches[0].item].text, "client/secret/#3 Hush the logs",
+                "pathed under its workspace like every other row"
+            );
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            app.tree.active_workspace,
+            nebula_core::WorkspaceId("ws2".into())
+        );
+        assert_eq!(
+            app.selected_project().map(|p| p.name.clone()),
+            Some("secret".into())
+        );
+        assert_eq!(app.selected_worktree_pr().map(|pr| pr.number), Some(3));
+        assert_eq!(
+            app.previewed_pr().map(|pr| pr.url),
+            Some("https://github.com/o/secret/pull/3".into())
+        );
+        assert_eq!(app.focus, Focus::Worktrees);
         assert!(app.flash.is_none(), "flash: {:?}", app.flash);
     }
 
@@ -21369,6 +22268,7 @@ diff --git a/src/c.rs b/src/c.rs
             false,
             false,
             &app.open_prs,
+            false,
         )));
         let mut out = Vec::new();
         switch_workspace(&mut app, nebula_core::WorkspaceId("ws2".into()), &mut out);
