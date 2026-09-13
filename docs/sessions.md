@@ -102,7 +102,8 @@ feature simply has nothing to show until its next prompt.
 
 Under the checkouts, an `OPEN PRS` group lists every pull request still open on the repo — drafts
 included, sunk to the bottom of the group, dimmed and badged `draft` so they are told apart from the
-ones asking for a reviewer — fetched with `gh` when you open the project, re-asked every 15 seconds once
+ones asking for a reviewer (the `/` PALETTE lists the same rows and spells both states out, `draft` and
+`ready for review`) — fetched with `gh` when you open the project, re-asked every 15 seconds once
 that PROJECT has answered with at least one open pull request, and again whenever the Worktrees or
 Sessions panel or the terminal window takes focus (one `gh pr list` per project, so a repo with a
 hundred open PRs still costs one API call) — or at once, past every timer, when you press `Shift+R`

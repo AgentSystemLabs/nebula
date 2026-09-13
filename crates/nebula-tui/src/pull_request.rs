@@ -66,11 +66,29 @@ impl Standing {
         }
     }
 
+    /// The state's name in full, for a surface with the width to spell it
+    /// out: the `/` PALETTE's pull request rows. `ready for review` is the
+    /// open pull request that is not a draft — GitHub's own phrase for the
+    /// step out of draft — and says nothing about approvals, checks or
+    /// mergeability; [`badge`](Self::badge) is the same word cut to fit a
+    /// sidebar column, so the two surfaces never disagree about a state.
+    pub fn label(self) -> &'static str {
+        match self {
+            Standing::Open => "ready for review",
+            Standing::Draft => "draft",
+            Standing::Merged => "merged",
+            Standing::Closed => "closed",
+        }
+    }
+
     /// Short word for a row's trailing badge — the same slot the agent rows
-    /// use for their CLI kind.
+    /// use for their CLI kind. `ready` is [`label`](Self::label)'s `ready
+    /// for review` at sidebar width: the SESSIONS PANEL's PR ROW keeps a
+    /// title beside it in a 32-column default, which the full phrase would
+    /// leave ten cells for.
     pub fn badge(self) -> &'static str {
         match self {
-            Standing::Open => "pr",
+            Standing::Open => "ready",
             Standing::Draft => "draft",
             Standing::Merged => "merged",
             Standing::Closed => "closed",
@@ -190,7 +208,7 @@ impl PullRequest {
     }
 
     /// Short word for the row's trailing badge — the same slot the agent
-    /// rows use for their CLI kind: `pr`, `draft`, `merged` or `closed`.
+    /// rows use for their CLI kind: `ready`, `draft`, `merged` or `closed`.
     pub fn badge(&self) -> &'static str {
         self.standing().badge()
     }
@@ -384,7 +402,7 @@ impl OpenPr {
         Standing::of(STATE_OPEN, self.is_draft)
     }
 
-    /// Trailing badge: `pr` or `draft`.
+    /// Trailing badge: `ready` or `draft`.
     pub fn badge(&self) -> &'static str {
         self.standing().badge()
     }
@@ -728,7 +746,7 @@ mod tests {
         assert_eq!(pr.number, 42);
         assert_eq!(pr.url, "https://github.com/o/r/pull/42");
         assert_eq!(pr.title, "Attach links to worktrees");
-        assert_eq!(pr.badge(), "pr");
+        assert_eq!(pr.badge(), "ready");
         assert!(pr.is_open());
     }
 
@@ -762,7 +780,7 @@ mod tests {
         assert_eq!(draft.badge(), "draft");
         assert!(draft.is_open());
         let open = parse(&payload("OPEN", false), None).expect("open");
-        assert_eq!(open.badge(), "pr");
+        assert_eq!(open.badge(), "ready");
         // An older `gh` that leaves `state` out is trusted to have listed
         // something open.
         let bare = parse(r#"{"number":1,"url":"https://x.dev/pull/1"}"#, None)
@@ -785,6 +803,31 @@ mod tests {
         drafts_last(&mut list);
         let numbers: Vec<u64> = list.iter().map(|p| p.number).collect();
         assert_eq!(numbers, [40, 30, 42, 31]);
+    }
+
+    /// One vocabulary for a pull request's state, in two lengths: the
+    /// PALETTE spells `ready for review` out, the sidebar badge is the same
+    /// word cut to `ready`, and every other state is the same word at both
+    /// lengths — so a draft reads `draft` wherever it is, and nothing
+    /// anywhere says `open` or `pr` for a state another surface names
+    /// differently.
+    #[test]
+    fn the_palette_label_and_the_sidebar_badge_name_the_same_state() {
+        assert_eq!(Standing::Open.label(), "ready for review");
+        assert_eq!(Standing::Open.badge(), "ready");
+        assert!(
+            Standing::Open.label().starts_with(Standing::Open.badge()),
+            "the badge is the label's first word"
+        );
+        for standing in [Standing::Draft, Standing::Merged, Standing::Closed] {
+            assert_eq!(standing.label(), standing.badge(), "{standing:?}");
+        }
+        assert_eq!(Standing::Draft.label(), "draft");
+        assert_ne!(
+            Standing::Open.label(),
+            Standing::Draft.label(),
+            "a draft and a ready pull request are told apart by the word"
+        );
     }
 
     #[test]
@@ -874,7 +917,7 @@ mod tests {
         .expect("parsed");
         assert_eq!(prs.len(), 2);
         assert_eq!(prs[0].label(), "#42 Attach links");
-        assert_eq!(prs[0].badge(), "pr");
+        assert_eq!(prs[0].badge(), "ready");
         assert_eq!(prs[1].badge(), "draft");
         assert_eq!(
             prs[0].head, "attach-links",
