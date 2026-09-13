@@ -1,0 +1,5 @@
+# `/`, part of a pull request's title, Enter: the pick selects its project, unfolds the OPEN PRS
+# group and lands the WORKTREES cursor on the row, so the PR PREVIEW reads it in the pane.
+/
+attach links
+Enter
