@@ -94,6 +94,7 @@ The FOOTER carries the rest, left to right:
 | `+3 files` after the breadcrumb | the selected worktree's dirty-file count, in the warning color. It rides the breadcrumb because it is context about that checkout, not chrome, and it is absent at zero |
 | `✗ disconnected` | this client has lost the DAEMON. It is the client-to-daemon link and nothing else — a session's own health is its `●` STATUS DOT, and a hollow `○` is an agent the daemon restarted out from under. A healthy connection says nothing at all: the bar reports the link only when something is wrong |
 | `2 agents · 1 term · 3 warm · 412 MB` at the right edge | live counts and nebula's whole memory footprint — this TUI, the DAEMON and every session's process subtree summed — re-read every 5 seconds while no modal is up. Prewarm spares are counted apart as `warm` so the agent figure matches the sidebar, and the whole readout is blank until the first reading lands |
+| `j - Move down` on the blank row above the bar, far left | the KEY COMBO DISPLAY (Settings → Experimental, `show_key_combos`), off by default: the key you just pressed in a keycap and what it did, for anyone watching a screen share — vim's `showcmd`. A double tap reads as one combo (`l l - Enter pane`), an unbound key bare, and it clears itself three seconds after the press. Keys typed into a LOCKED PANE never show (only the hatch out does), nor does anything typed into a modal's text field — in a modal only `Esc`, `Enter`, `Tab`, the arrows and `^`/`⌥` chords show, bare |
 
 ## Mouse
 

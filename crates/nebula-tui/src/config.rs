@@ -224,6 +224,7 @@ pub enum SettingKind {
     HideRootWorktree,
     RecentPrompts,
     RecentPromptsCount,
+    ShowKeyCombos,
     ClaudeEnabled,
     ClaudeModel,
     ClaudeEffort,
@@ -495,6 +496,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::RecentPromptsCount,
                 label: "Recent prompts shown",
                 hint: "How many of a session's recent prompts the Sessions panel lists",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::ShowKeyCombos,
+                label: "Key combo display",
+                hint: "Spell each key you press bottom-left with what it did, for anyone watching",
                 group: "",
             },
         ]),
@@ -773,6 +780,13 @@ pub struct Config {
     /// to what the daemon keeps. Read through
     /// [`Config::recent_prompts_shown`].
     pub recent_prompts_count: usize,
+    /// Experimental: the KEY COMBO DISPLAY — each key pressed in the
+    /// panels spelled at the bottom left of the screen with what it did
+    /// (`j - Move down`), vim's `showcmd` for people watching a screen
+    /// share learn the shortcuts. Keys typed into a LOCKED PANE or an
+    /// overlay's text field never show. Off by default: it is a teaching
+    /// aid, and a row of chrome nobody asked for otherwise.
+    pub show_key_combos: bool,
     /// Default model/effort for new Claude / Codex / Cursor sessions.
     /// "default" means "don't pass the flag" (the CLI picks); any other
     /// value is passed through verbatim, so hand-edited configs can name
@@ -851,6 +865,7 @@ impl Default for Config {
             hide_root_worktree: false,
             recent_prompts: false,
             recent_prompts_count: DEFAULT_RECENT_PROMPTS_COUNT,
+            show_key_combos: false,
             claude_model: DEFAULT_CHOICE.into(),
             claude_models: Vec::new(),
             claude_effort: DEFAULT_CHOICE.into(),
@@ -1009,6 +1024,10 @@ impl Config {
         obj.insert(
             "recent_prompts_count".into(),
             serde_json::json!(self.recent_prompts_count),
+        );
+        obj.insert(
+            "show_key_combos".into(),
+            serde_json::json!(self.show_key_combos),
         );
         obj.insert("claude_model".into(), serde_json::json!(self.claude_model));
         obj.insert(
@@ -1177,6 +1196,7 @@ impl Config {
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
             SettingKind::HideRootWorktree => on_off(self.hide_root_worktree).into(),
             SettingKind::RecentPrompts => on_off(self.recent_prompts).into(),
+            SettingKind::ShowKeyCombos => on_off(self.show_key_combos).into(),
             SettingKind::RecentPromptsCount => self
                 .recent_prompts_count
                 .clamp(1, nebula_core::RECENT_PROMPTS_KEPT)
@@ -1282,6 +1302,9 @@ impl Config {
                 self.recent_prompts_count = cycle_choice(&current, RECENT_PROMPT_COUNTS, step)
                     .parse()
                     .unwrap_or(DEFAULT_RECENT_PROMPTS_COUNT);
+            }
+            SettingKind::ShowKeyCombos => {
+                self.show_key_combos = !self.show_key_combos;
             }
             SettingKind::ClaudeModel => {
                 self.claude_model =
@@ -2093,6 +2116,35 @@ mod tests {
 
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(!cfg.hide_root_worktree);
+    }
+
+    /// The KEY COMBO DISPLAY: an Experimental switch, off by default, a
+    /// plain toggle persisted under `show_key_combos`, unknown to a config
+    /// written before it (which reads as off).
+    #[test]
+    fn key_combo_display_is_off_by_default_on_the_experimental_tab_and_persists() {
+        let mut cfg = Config::default();
+        assert!(!cfg.show_key_combos, "a teaching aid nobody asked for yet");
+        assert_eq!(cfg.value_label(SettingKind::ShowKeyCombos), "off");
+
+        let (tab, row) = locate(SettingKind::ShowKeyCombos).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Experimental");
+        assert_eq!(tab + 1, hotkeys_tab(), "Hotkeys stays last");
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.show_key_combos);
+        assert_eq!(cfg.value_label(SettingKind::ShowKeyCombos), "on");
+        cfg.cycle(tab, row, 1);
+        assert!(!cfg.show_key_combos, "either arrow toggles it back");
+        cfg.cycle(tab, row, -1);
+        assert!(cfg.show_key_combos);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).show_key_combos);
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.show_key_combos);
     }
 
     /// RECENT PROMPTS: an Experimental switch that is off by default and

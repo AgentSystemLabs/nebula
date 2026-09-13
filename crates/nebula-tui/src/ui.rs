@@ -4332,6 +4332,46 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some(rect) = draw_footer_bar(f, app, area) {
         app.hits.push((rect, HitTarget::FooterWorkspace));
     }
+    draw_key_combo(f, app, area);
+}
+
+/// The KEY COMBO DISPLAY (Settings → Experimental): the last key press
+/// and what it did — `j - Move down` — on the footer's padding row at the
+/// far left, the one blank row on screen and right where vim keeps
+/// `showcmd`. Each key sits in a keycap (the selected-row fill) so it
+/// reads across a screen share; the label is plain text. Nothing is drawn
+/// once the press has aged out (`key_combo::LINGER`; the loop clears it)
+/// or while the setting is off, so the row stays the breathing space it
+/// was.
+fn draw_key_combo(f: &mut Frame, app: &App, area: Rect) {
+    let Some(combo) = &app.key_combo else {
+        return;
+    };
+    if area.height < 2 || area.width == 0 {
+        return;
+    }
+    let row = Rect {
+        y: area.y,
+        height: 1,
+        ..area
+    };
+    let th = app.theme;
+    let cap = Style::default()
+        .fg(th.accent)
+        .bg(th.sel_bg)
+        .add_modifier(Modifier::BOLD);
+    let mut spans = vec![Span::raw(" ")];
+    for (i, key) in combo.keys.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(format!(" {} ", key.display()), cap));
+    }
+    if let Some(does) = &combo.does {
+        spans.push(Span::styled(" - ", Style::default().fg(th.dim)));
+        spans.push(Span::styled(does.as_str(), Style::default().fg(th.text)));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), row);
 }
 
 /// Draw the bar; returns the screen rect of the workspace nameplate when
