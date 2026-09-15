@@ -68,7 +68,9 @@ It downloads the prebuilt binary for your platform from the latest GitHub releas
 Afterwards, `nebula upgrade` runs that same script for you; it refuses to clobber a local `cargo build`
 (pass `--force` if you mean it). Upgrading with a DAEMON running is safe: an idle one — nothing live in
 it — is shut down for you, so the next launch comes up on the new binary. A DAEMON with live SESSIONS is
-left alone and they keep running the old binary until you `nebula kill` and relaunch. `nebula --version`
+left alone and they keep running the old binary until you `nebula kill` and relaunch — unless the new
+build speaks a different protocol, in which case it can't attach until that restart, and `nebula upgrade`
+says so and offers to do it for you. `nebula --version`
 (`-V`) says which binary you are on.
 
 > **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, or `pi`.
@@ -169,7 +171,7 @@ is open.
 | [**Keys**](docs/keys.md) | Every default binding, the WORKTREE views (`g` `f` `F` `b`), and the mouse. All of it rebindable. |
 | [**Commands**](docs/commands.md) | The `nebula` CLI: `add`, `rename`, `worktree`, `spawn`, `workspace`, `ssh`, `tunnel`, `browser`, `daemon`, `kill`, `upgrade`. |
 | [**Sessions**](docs/sessions.md) | The NEW SESSION PICKER, MODEL / EFFORT, Claude Cloud and the CLOUD SESSION PANEL, AGENT PRESETS, the PROJECT OPEN PRS group, the ISSUES MODAL. |
-| [**Configuration**](docs/configuration.md) | `config.json`, the SETTINGS OVERLAY, the HOTKEYS TAB, logs and environment overrides. |
+| [**Configuration**](docs/configuration.md) | `config.json`, the SETTINGS OVERLAY, the HOTKEYS TAB, the `.nebula.json` PROJECT FILE (`r` runs a worktree, `Shift+Enter` opens it), logs and environment overrides. |
 | [**How it works**](docs/how-it-works.md) | The DAEMON, the hook dialects, AUTO-TITLE, WORKTREE RELOCATION, prewarm and reaping, persistence. |
 | [**Architecture**](ARCHITECTURE.md) | Process model, the IPC CODEC and the crate layout. |
 

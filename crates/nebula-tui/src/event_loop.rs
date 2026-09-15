@@ -2275,11 +2275,26 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 let id = app.tree.active_workspace.clone();
                 open_prompt(app, PromptKind::RenameWorkspace { id });
             }
-            Focus::Worktrees | Focus::Terminal => {}
+            // Nothing on the Worktrees panel is renamed, so `r` is RUN
+            // there: the checkout's `.nebula.json` RUN COMMAND, started or
+            // stopped. The KEY COMBO DISPLAY says which, not "Rename".
+            Focus::Worktrees => {
+                let running = app
+                    .selected_worktree()
+                    .is_some_and(|w| app.worktree_running(&w.id));
+                let does = if running {
+                    "Stop the run"
+                } else {
+                    "Run worktree"
+                };
+                crate::key_combo::note(app, &[chord], Some(does));
+                toggle_run(app, out);
+            }
+            Focus::Terminal => {}
         },
-        // Its own key rather than a meaning `r` takes on where nothing can
-        // be renamed: the selection it acts on is the selected project and
-        // worktree, which every panel has, so it is not scoped to a row.
+        // Its own key rather than another meaning for `r`: the selection it
+        // acts on is the selected project and worktree, which every panel
+        // has, so it is not scoped to a row.
         Action::RefreshPullRequests => refresh_pull_requests(app),
         Action::Archive => {
             if app.focus == Focus::Sessions {
@@ -2358,6 +2373,13 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::GitDiff if app.previewed_pr().is_some() => request_pr_diff(app),
         Action::GitDiff => open_diff_view(app),
         Action::OpenRepo => open_repo_in_browser(app),
+        // Shift+Enter: the checkout's OPEN COMMAND. Worktrees panel only —
+        // on every other panel the shifted Enter has nothing to open.
+        Action::OpenWorktree => {
+            if app.focus == Focus::Worktrees {
+                open_selected_worktree(app);
+            }
+        }
         // AddProject adds a project from ANY panel — unlike New it never
         // changes meaning with focus, matching the "open a repo" instinct.
         Action::AddProject => open_prompt(app, PromptKind::AddProject),
@@ -2570,6 +2592,120 @@ fn open_repo_in_browser(app: &mut App) {
         Ok(url) => app.flash = Some(format!("couldn't open {url}")),
         Err(msg) => app.flash = Some(msg),
     }
+}
+
+/// `r` on the Worktrees panel: start the selected checkout's RUN COMMAND,
+/// or stop it when it is already up.
+fn toggle_run(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if app.selected_worktree_pr().is_some() {
+        app.flash = Some("a pull request has no checkout to run — pick a worktree".into());
+        return;
+    }
+    let Some(w) = app.selected_worktree().cloned() else {
+        app.flash = Some(SELECT_CONTEXT_FIRST.into());
+        return;
+    };
+    toggle_run_in(app, &w, out);
+}
+
+/// Ask the DAEMON to start `worktree`'s run, or to stop it while it runs.
+fn toggle_run_in(app: &mut App, worktree: &nebula_core::Worktree, out: &mut Vec<ClientRequest>) {
+    if app.is_placeholder_worktree(&worktree.id) {
+        app.flash = Some(WORKTREE_STILL_CREATING.into());
+        return;
+    }
+    let start = !app.worktree_running(&worktree.id);
+    let intent = PendingIntent::RunToggled {
+        branch: worktree.branch.clone(),
+        started: start,
+    };
+    let id = worktree.id.clone();
+    send_with(app, out, intent, |req_id| {
+        if start {
+            ClientRequest::StartRun {
+                req_id,
+                worktree: id,
+            }
+        } else {
+            ClientRequest::StopRun {
+                req_id,
+                worktree: id,
+            }
+        }
+    });
+}
+
+/// `Shift+Enter` on the Worktrees panel: fire the selected checkout's OPEN
+/// COMMAND.
+fn open_selected_worktree(app: &mut App) {
+    if app.selected_worktree_pr().is_some() {
+        app.flash = Some("a pull request has no checkout to open — pick a worktree".into());
+        return;
+    }
+    let Some(w) = app.selected_worktree().cloned() else {
+        app.flash = Some(SELECT_CONTEXT_FIRST.into());
+        return;
+    };
+    open_worktree(app, &w);
+}
+
+/// Run `worktree`'s `.nebula.json` OPEN COMMAND once and say so. The TUI
+/// runs it, not the DAEMON: it opens a browser or an editor on the machine
+/// the user is sitting at.
+fn open_worktree(app: &mut App, worktree: &nebula_core::Worktree) {
+    let main = app
+        .tree
+        .projects
+        .iter()
+        .find(|p| p.id == worktree.project_id)
+        .map_or_else(|| worktree.path.clone(), |p| p.repo_path.clone());
+    let command = match nebula_core::project_file::command(
+        &worktree.path,
+        &main,
+        nebula_core::project_file::ProjectCommand::Open,
+    ) {
+        Ok(command) => command,
+        Err(msg) => {
+            app.flash = Some(msg);
+            return;
+        }
+    };
+    app.flash = Some(match spawn_open_command(&command, &worktree.path) {
+        Ok(()) => format!("↗ {command}"),
+        Err(e) => format!("couldn't run {command}: {e}"),
+    });
+}
+
+/// Start an OPEN COMMAND through `$SHELL -c` in `cwd`, kept off the TUI's
+/// screen: no stdin, output discarded (a stray byte on the TUI's terminal
+/// tears the frame), a process group of its own, reaped on a thread. A
+/// failure to start is the caller's to show; a non-zero exit only logs,
+/// since by then `open` has handed the URL over or said why not.
+fn spawn_open_command(command: &str, cwd: &std::path::Path) -> std::io::Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let mut child = Command::new(shell)
+        .arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    let command = command.to_string();
+    std::thread::spawn(move || match child.wait() {
+        Ok(status) if !status.success() => {
+            tracing::warn!(%command, %status, "open command failed");
+        }
+        Err(err) => tracing::warn!(%command, %err, "open command not reaped"),
+        Ok(_) => {}
+    });
+    Ok(())
 }
 
 /// The selected worktree's checkout — path and branch — for the modals that
@@ -3718,6 +3854,36 @@ fn refresh_workspace_picker(app: &mut App) {
     reopen_workspace_picker(app, hover);
 }
 
+/// A checkout row's context menu in the Worktrees panel — the same rows
+/// from `m` as from a right-click.
+fn worktree_menu_items(app: &App, w: &nebula_core::Worktree) -> Vec<MenuItem> {
+    let run = if app.worktree_running(&w.id) {
+        "Stop run"
+    } else {
+        "Run"
+    };
+    let mut items = vec![
+        MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
+        MenuItem::new("New terminal", MenuAction::NewTerminal(w.id.clone())),
+        MenuItem::new(run, MenuAction::ToggleRun(w.id.clone())),
+        MenuItem::new("Open", MenuAction::OpenWorktree(w.id.clone())),
+    ];
+    // The ROOT WORKTREE moves between branches; a linked worktree, named
+    // for its branch, is deleted instead.
+    if w.is_main {
+        items.push(MenuItem::new(
+            "Switch branch…",
+            MenuAction::SwitchBranch(w.id.clone()),
+        ));
+    } else {
+        items.push(MenuItem::destructive(
+            "Delete worktree",
+            MenuAction::DeleteWorktree(w.id.clone()),
+        ));
+    }
+    items
+}
+
 fn open_context_menu_for_selection(app: &mut App) {
     let at = KEYBOARD_MENU_ANCHOR;
     match app.focus {
@@ -3747,22 +3913,8 @@ fn open_context_menu_for_selection(app: &mut App) {
             if let Some(pr) = app.selected_worktree_pr().cloned() {
                 let items = pr_row_menu_items(app, &pr);
                 open_menu(app, items, at);
-            } else if let Some(w) = app.selected_worktree() {
-                let mut items = vec![
-                    MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
-                    MenuItem::new("New terminal", MenuAction::NewTerminal(w.id.clone())),
-                ];
-                if w.is_main {
-                    items.push(MenuItem::new(
-                        "Switch branch…",
-                        MenuAction::SwitchBranch(w.id.clone()),
-                    ));
-                } else {
-                    items.push(MenuItem::destructive(
-                        "Delete worktree",
-                        MenuAction::DeleteWorktree(w.id.clone()),
-                    ));
-                }
+            } else if let Some(w) = app.selected_worktree().cloned() {
+                let items = worktree_menu_items(app, &w);
                 open_menu(app, items, at);
             }
         }
@@ -5445,6 +5597,16 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 .find(|l| l.id() == Some(&id))
             {
                 delete_link(app, &row);
+            }
+        }
+        MenuAction::ToggleRun(id) => {
+            if let Some(w) = app.tree.worktrees.iter().find(|w| w.id == id).cloned() {
+                toggle_run_in(app, &w, out);
+            }
+        }
+        MenuAction::OpenWorktree(id) => {
+            if let Some(w) = app.tree.worktrees.iter().find(|w| w.id == id).cloned() {
+                open_worktree(app, &w);
             }
         }
         MenuAction::DeleteWorktree(id) => {
@@ -7817,22 +7979,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     if let Some(pr) = app.selected_worktree_pr().cloned() {
                         let items = pr_row_menu_items(app, &pr);
                         open_menu(app, items, at);
-                    } else if let Some(w) = app.selected_worktree() {
-                        let mut items = vec![
-                            MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
-                            MenuItem::new("New terminal", MenuAction::NewTerminal(w.id.clone())),
-                        ];
-                        if w.is_main {
-                            items.push(MenuItem::new(
-                                "Switch branch…",
-                                MenuAction::SwitchBranch(w.id.clone()),
-                            ));
-                        } else {
-                            items.push(MenuItem::destructive(
-                                "Delete worktree",
-                                MenuAction::DeleteWorktree(w.id.clone()),
-                            ));
-                        }
+                    } else if let Some(w) = app.selected_worktree().cloned() {
+                        let items = worktree_menu_items(app, &w);
                         open_menu(app, items, at);
                     }
                 }
@@ -8082,6 +8230,38 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 ) => attach_created(app, id, focus, placeholder, out),
                 (Some(PendingIntent::ReopenPromptOnError { note, .. }), _) => {
                     app.flash = Some(note);
+                }
+                (
+                    Some(PendingIntent::RunToggled {
+                        branch,
+                        started: true,
+                    }),
+                    created,
+                ) => {
+                    // The reply usually beats the broadcast upsert, so the
+                    // row naming the command may not be in the tree yet:
+                    // then the flash names it when the row lands.
+                    match created {
+                        Some(EntityId::Terminal(id)) => match run_command_of(app, &id) {
+                            Some(command) => {
+                                app.flash = Some(format!("▶ running {command} in {branch}"));
+                            }
+                            None => {
+                                app.flash = Some(format!("▶ running in {branch}"));
+                                app.run_flash_when_seen = Some((id, branch));
+                            }
+                        },
+                        _ => app.flash = Some(format!("▶ running in {branch}")),
+                    }
+                }
+                (
+                    Some(PendingIntent::RunToggled {
+                        branch,
+                        started: false,
+                    }),
+                    _,
+                ) => {
+                    app.flash = Some(format!("■ stopped the run in {branch}"));
                 }
                 (Some(PendingIntent::SelectCreatedProject), Some(EntityId::Project(id))) => {
                     // Its upsert usually lands just before this Ack; if not,
@@ -8368,9 +8548,33 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
                 app.select_when_seen = Some(SessionRef::Agent(id));
             }
         }
-        Entity::Terminal(t) => upsert_by(&mut app.tree.terminals, t, |x, y| x.id == y.id),
+        Entity::Terminal(t) => {
+            let id = t.id.clone();
+            upsert_by(&mut app.tree.terminals, t, |x, y| x.id == y.id);
+            if app
+                .run_flash_when_seen
+                .as_ref()
+                .is_some_and(|(want, _)| *want == id)
+            {
+                if let (Some(command), Some((_, branch))) =
+                    (run_command_of(app, &id), app.run_flash_when_seen.take())
+                {
+                    app.flash = Some(format!("▶ running {command} in {branch}"));
+                }
+            }
+        }
         Entity::Link(l) => upsert_by(&mut app.tree.links, l, |x, y| x.id == y.id),
     }
+}
+
+/// The command a RUN TERMINAL in the tree runs; None for a plain shell or
+/// a row not seen yet.
+fn run_command_of(app: &App, id: &TerminalId) -> Option<String> {
+    app.tree
+        .terminals
+        .iter()
+        .find(|t| &t.id == id)
+        .and_then(|t| t.run_command.clone())
 }
 
 /// Replace the first entry of `list` that `same` pairs with `item`, or
@@ -12501,9 +12705,15 @@ diff --git a/src/c.rs b/src/c.rs
         press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
         assert!(
             !app.open_prs_lookup_due(&pid) && !app.pr_refresh_requested,
-            "plain r is rename, and refreshes nothing"
+            "plain r runs the checkout, and refreshes nothing"
+        );
+        assert!(
+            out.iter()
+                .all(|r| matches!(r, ClientRequest::StartRun { .. })),
+            "{out:?}"
         );
         assert!(app.overlay.is_none() && app.flash.is_none());
+        out.clear();
 
         // Another checkout of the project, resting on the sweep's beat.
         let other = add_worktree(&mut app, "w2", "/tmp/demo-w2");
@@ -15110,9 +15320,136 @@ diff --git a/src/c.rs b/src/c.rs
                     name: name.into(),
                     sort_order: 0,
                     alive: true,
+                    run_command: None,
                 }),
             },
         );
+    }
+
+    /// `r` on the Worktrees panel runs the checkout — nothing is renamed
+    /// there — the Ack names what is running, and `r` again stops it.
+    #[test]
+    fn r_on_a_worktree_starts_its_run_and_again_stops_it() {
+        use nebula_core::{Entity, TerminalId, TerminalTab, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
+        let req_id = out
+            .iter()
+            .find_map(|r| match r {
+                ClientRequest::StartRun { req_id, worktree } if worktree.0 == "w1" => Some(*req_id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("r sends StartRun: {out:?}"));
+        assert!(app.overlay.is_none(), "no rename prompt on a worktree");
+        assert!(!app.worktree_running(&WorktreeId("w1".into())));
+
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Terminal(TerminalTab {
+                    id: TerminalId("run1".into()),
+                    worktree_id: WorktreeId("w1".into()),
+                    name: "run".into(),
+                    sort_order: 0,
+                    alive: true,
+                    run_command: Some("npm run dev".into()),
+                }),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(EntityId::Terminal(TerminalId("run1".into()))),
+            },
+        );
+        assert_eq!(app.flash.as_deref(), Some("▶ running npm run dev in main"));
+        assert!(app.worktree_running(&WorktreeId("w1".into())));
+        assert_eq!(app.run_flash_when_seen, None);
+
+        out.clear();
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
+        assert!(
+            out.iter().any(
+                |r| matches!(r, ClientRequest::StopRun { worktree, .. } if worktree.0 == "w1")
+            ),
+            "r on a running worktree stops it: {out:?}"
+        );
+    }
+
+    /// The DAEMON's reply to `StartRun` usually reaches the TUI before the
+    /// broadcast upsert of the terminal it started: the flash names the
+    /// branch at once and the command when the row lands.
+    #[test]
+    fn a_run_ack_ahead_of_its_terminal_names_the_command_when_it_lands() {
+        use nebula_core::{Entity, TerminalTab, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
+        let req_id = out
+            .iter()
+            .find_map(|r| match r {
+                ClientRequest::StartRun { req_id, .. } => Some(*req_id),
+                _ => None,
+            })
+            .expect("r sends StartRun");
+        hse(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(EntityId::Terminal(TerminalId("run1".into()))),
+            },
+        );
+        assert_eq!(app.flash.as_deref(), Some("▶ running in main"));
+
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Terminal(TerminalTab {
+                    id: TerminalId("run1".into()),
+                    worktree_id: WorktreeId("w1".into()),
+                    name: "run".into(),
+                    sort_order: 0,
+                    alive: true,
+                    run_command: Some("bun dev".into()),
+                }),
+            },
+        );
+        assert_eq!(app.flash.as_deref(), Some("▶ running bun dev in main"));
+        assert_eq!(app.run_flash_when_seen, None, "spent");
+    }
+
+    /// `Shift+Enter` on a worktree fires `.nebula.json`'s `open` — and says
+    /// what to add when there is none, without Enter's drill-in.
+    #[test]
+    fn shift_enter_on_a_worktree_fires_its_open_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, dir.path());
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
+        assert!(
+            app.flash
+                .as_deref()
+                .is_some_and(|f| f.contains("no .nebula.json")),
+            "{:?}",
+            app.flash
+        );
+        assert_eq!(app.focus, Focus::Worktrees, "not Enter's drill-in");
+
+        std::fs::write(
+            dir.path().join(".nebula.json"),
+            r#"{"open": "open http://localhost:3000"}"#,
+        )
+        .unwrap();
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
+        assert_eq!(app.flash.as_deref(), Some("↗ open http://localhost:3000"));
     }
 
     #[test]

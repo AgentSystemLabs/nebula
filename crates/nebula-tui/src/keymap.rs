@@ -79,6 +79,10 @@ pub enum Action {
     /// `c`: the BRANCH SWITCHER — move the project's ROOT WORKTREE onto
     /// another branch, asking what to do with uncommitted changes.
     SwitchBranch,
+    /// `Shift+Enter` on a worktree: fire its `.nebula.json` OPEN COMMAND
+    /// (`open http://localhost:3000`, say). Its RUN COMMAND is `r`, which
+    /// takes that meaning on the Worktrees panel, where nothing is renamed.
+    OpenWorktree,
     // sessions
     NewTerminal,
     Rename,
@@ -329,6 +333,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         scope: Scope::Global,
         defaults: &["c"],
     },
+    ActionSpec {
+        action: Action::OpenWorktree,
+        id: "open_worktree",
+        label: "Open worktree",
+        hint: "On a worktree, run the \"open\" command from its .nebula.json — e.g. open http://localhost:3000 (⇧Enter needs the kitty protocol; ⇧O arrives everywhere)",
+        group: "PROJECTS & WORKTREES",
+        scope: Scope::Global,
+        defaults: &["shift+enter", "shift+o"],
+    },
     // ---- SESSIONS ----
     ActionSpec {
         action: Action::NewTerminal,
@@ -343,7 +356,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::Rename,
         id: "rename",
         label: "Rename",
-        hint: "Rename the selected session, or edit a link's URL",
+        hint: "Rename the selected session, or edit a link's URL; on a worktree, start or stop the \"run\" command from its .nebula.json",
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["r"],
@@ -870,6 +883,14 @@ pub fn host_warning(chord: &KeyChord) -> (Reach, Option<&'static str>) {
             Some("macOS Mission Control takes ^← / ^→ unless you turn its Spaces shortcuts off"),
         );
     }
+    // Legacy encoding has no shifted Enter: without the kitty protocol the
+    // terminal sends the same \r a bare Enter does.
+    if shift && !ctrl && !alt && chord.code == KeyCode::Enter {
+        return (
+            Reach::Risky,
+            Some("⇧Enter needs the kitty keyboard protocol — Ghostty/kitty send it, Terminal.app sends a plain Enter"),
+        );
+    }
     if ctrl && shift {
         return (
             Reach::Risky,
@@ -1191,6 +1212,27 @@ mod tests {
             ev(KeyCode::Char('?'), KeyModifiers::NONE)
         );
         assert_eq!(KeyChord::parse("?").unwrap().spec(), "?");
+    }
+
+    #[test]
+    fn shift_enter_is_its_own_chord_and_flagged_as_kitty_only() {
+        let map = Keymap::default();
+        let shift_enter = ev(KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(
+            map.lookup(Scope::Global, &shift_enter),
+            Some(Action::OpenWorktree)
+        );
+        assert_eq!(
+            map.lookup(Scope::Global, &ev(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::Activate)
+        );
+        assert_eq!(shift_enter.spec(), "shift+enter");
+        assert_eq!(host_warning(&shift_enter).0, Reach::Risky);
+        // …so a stock terminal gets a letter for it too.
+        assert_eq!(
+            map.lookup(Scope::Global, &ev(KeyCode::Char('O'), KeyModifiers::SHIFT)),
+            Some(Action::OpenWorktree)
+        );
     }
 
     #[test]

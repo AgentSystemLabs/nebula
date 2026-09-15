@@ -111,5 +111,7 @@ nebula upgrade            # install the latest release (--force on a dev build).
                           # binary doesn't touch a running daemon, so afterwards it shuts an idle
                           # one (no live sessions) down for you and the next launch starts on the
                           # new binary. With sessions live it leaves the daemon up — they'd die
-                          # with it — and says to run `nebula kill` when you're ready to restart
+                          # with it — and says to run `nebula kill` when you're ready to restart.
+                          # When the new build speaks another protocol, and so can't attach to
+                          # that daemon, it says that too and offers the restart then and there
 ```

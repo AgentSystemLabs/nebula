@@ -199,6 +199,10 @@ pub enum MenuAction {
     DeleteWorktree(WorktreeId),
     /// The ROOT WORKTREE row's menu: open the BRANCH SWITCHER on it.
     SwitchBranch(WorktreeId),
+    /// Start the worktree's RUN COMMAND, or stop it while it runs (`r`).
+    ToggleRun(WorktreeId),
+    /// Fire the worktree's OPEN COMMAND (`Shift+Enter`).
+    OpenWorktree(WorktreeId),
     AddProject,
     RemoveProject(ProjectId),
     /// Retitle a project's row. Display only — the folder keeps its name and
@@ -1304,6 +1308,12 @@ pub enum PendingIntent {
         text: String,
         note: String,
     },
+    /// `r` on a worktree (`StartRun` / `StopRun`): once the DAEMON has done
+    /// it, flash what happened in `branch`.
+    RunToggled {
+        branch: String,
+        started: bool,
+    },
     /// Select the added project and step into its Worktrees panel.
     SelectCreatedProject,
     /// The NEW WORKTREE modal's create. The stand-in row `placeholder`
@@ -2219,6 +2229,10 @@ pub struct App {
     pub select_project_when_seen: Option<ProjectId>,
     /// Worktree created by us, awaiting its upsert to fix the selection.
     pub select_worktree_when_seen: Option<WorktreeId>,
+    /// A RUN TERMINAL `r` started whose upsert had not landed when its Ack
+    /// did, and the branch it runs in: the flash names the command once
+    /// the row arrives.
+    pub run_flash_when_seen: Option<(TerminalId, String)>,
     /// Last selected worktree per project — switching back to a project
     /// returns to the worktree the user left it on.
     pub last_worktree_for_project: HashMap<ProjectId, WorktreeId>,
@@ -2542,6 +2556,7 @@ impl App {
             select_when_seen: None,
             select_project_when_seen: None,
             select_worktree_when_seen: None,
+            run_flash_when_seen: None,
             last_worktree_for_project: HashMap::new(),
             last_session_for_worktree: HashMap::new(),
             last_project_for_workspace: HashMap::new(),
@@ -3452,6 +3467,21 @@ impl App {
             )
     }
 
+    /// The worktree's RUN TERMINAL — the terminal `r` started there, still
+    /// running or exited on its own — when it has one.
+    pub fn run_terminal(&self, worktree_id: &WorktreeId) -> Option<&TerminalTab> {
+        self.tree
+            .terminals
+            .iter()
+            .find(|t| &t.worktree_id == worktree_id && t.run_command.is_some())
+    }
+
+    /// Whether the worktree's RUN COMMAND is up right now: the RUNNING
+    /// badge its row wears, and what `r` stops.
+    pub fn worktree_running(&self, worktree_id: &WorktreeId) -> bool {
+        self.run_terminal(worktree_id).is_some_and(|t| t.alive)
+    }
+
     /// When the worktree last saw a turn — what its row sorts and labels on.
     pub fn worktree_recency(&self, worktree_id: &WorktreeId) -> Recency {
         worktree_recency(&self.tree, worktree_id, now_ms())
@@ -3782,6 +3812,7 @@ mod tests {
             name: "shell".into(),
             sort_order: 0,
             alive: true,
+            run_command: None,
         });
         app.tree
             .links

@@ -27,7 +27,11 @@
   handshake refuses a mismatched pair — the DAEMON answers `Incompatible`, the TUI bails, and the
   VERSION SKEW message names both binaries. Which side is stale decides the fix, and getting it
   backwards costs an afternoon: when the DAEMON is the *older* build, `nebula kill` and relaunch is the
-  whole remedy (it stops every live session on the way). When the DAEMON is *ahead* of the `nebula` you
+  whole remedy (it stops every live session on the way). A DAEMON that can't take the `Shutdown`
+  request gets SIGTERM instead, at the pid the kernel reports on the other end of the socket or, when
+  it can't say, at the pid in its pidfile — which can't come first, because macOS's tmp cleaner deletes
+  regular files in `/tmp` after three idle days but spares sockets, so the DAEMON touches its pidfile
+  hourly and puts it back if it vanishes. When the DAEMON is *ahead* of the `nebula` you
   just ran, `nebula kill` does nothing for you — a live instance respawns its DAEMON from its own
   binary, so the skew survives every restart, and the fix is to install the DAEMON's build over yours
   (`make install` from that checkout) instead. The usual shape in a checkout is a `make dev` DAEMON out
@@ -71,6 +75,14 @@
   releasing it — and under a 30 s timeout that kills the hook and everything it started; a failure is
   a warning in every client, never a rolled-back create or delete. Per repo in git config rather than in CONFIG.JSON, and never a file inside the
   checkout. See [Configuration](configuration.md#worktree-hooks).
+- **A worktree runs its own project — the PROJECT FILE.** A committed `.nebula.json` names a `run` and
+  an `open` command. `r` on a worktree has the DAEMON start `run` in a RUN TERMINAL — a terminal row
+  that carries its command and spawns `$SHELL -l -i -c '<run>'` instead of an interactive shell — so the
+  PTY's life is the worktree's RUNNING state, broadcast as that terminal's `alive` and drawn as the
+  row's `▶ running`; `r` again kills the process tree and drops the row. The idle reaper and the prewarm
+  sweep leave that terminal alone, and a run that exits on its own keeps its PTY, so an attach replays
+  the ending instead of respawning — a command starts only on the keypress. `Shift+Enter` (or `Shift+O`) runs `open`
+  once, from the TUI. See [Configuration](configuration.md#the-project-file-nebulajson).
 - **Agents boot `claude`, `codex`, `cursor-agent`, or `pi`.** Creating an agent (`n`) first asks which CLI to
   run, then spawns it in the worktree. Claude's picker can also dispatch a one-shot Cloud task as
   `claude --cloud <task>`; because Claude accepts that description as a process argument, don't put

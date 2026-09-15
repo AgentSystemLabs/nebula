@@ -5,6 +5,8 @@
 //! from remembering the curl one-liner.
 
 use anyhow::{bail, Context, Result};
+use nebula_core::PROTOCOL_VERSION;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -38,6 +40,11 @@ pub fn run_upgrade(force: bool) -> Result<()> {
 /// the next launch spawns the new binary; live sessions would die with the
 /// daemon, so that restart stays the user's call. Never fails the upgrade:
 /// the install already succeeded.
+///
+/// This process is still the old binary, so it speaks the daemon's protocol
+/// whatever the new one does. That makes now the moment to say when the new
+/// build can't attach — afterwards the only binary that could reach the
+/// daemon is gone (#68).
 fn finish_daemon_handoff() {
     use nebula_tui::ipc::IdleShutdown;
     match nebula_tui::shutdown_daemon_if_idle() {
@@ -51,13 +58,88 @@ fn finish_daemon_handoff() {
         Ok(IdleShutdown::SessionsLive { count }) => {
             let plural = if count == 1 { "" } else { "s" };
             println!("note: the old daemon is still running with {count} live session{plural}.");
-            println!("{KILL_HINT}");
+            let installed = std::env::var_os("PATH").and_then(|path| {
+                protocol_version_on_path(&path, &nebula_core::paths::runtime_dir())
+            });
+            match installed.filter(|v| *v != PROTOCOL_VERSION) {
+                Some(new) => {
+                    println!("{}", protocol_change_note(new));
+                    if !offer_restart(count) {
+                        println!("{KILL_HINT}");
+                    }
+                }
+                None => println!("{KILL_HINT}"),
+            }
         }
         Ok(IdleShutdown::Skewed) | Err(_) => {
             println!("note: a daemon from a previous version may still be running.");
             println!("{KILL_HINT}");
         }
     }
+}
+
+/// Why the restart can't wait, when the new build speaks another protocol.
+fn protocol_change_note(installed: u32) -> String {
+    format!(
+        "      the new build speaks protocol v{installed} and the daemon v{PROTOCOL_VERSION}, \
+         so `nebula` won't open until the daemon restarts."
+    )
+}
+
+/// Offer that restart when someone is at the terminal to answer. No is still
+/// the default — a restart takes every session with it. True once the daemon
+/// is down.
+fn offer_restart(count: usize) -> bool {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        return false;
+    }
+    let plural = if count == 1 { "" } else { "s" };
+    print!("restart it now? that stops the {count} live session{plural} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().lock().read_line(&mut answer).is_err() || !is_yes(&answer) {
+        return false;
+    }
+    match nebula_tui::run_kill() {
+        Ok(()) => {
+            println!("the new binary starts on the next launch");
+            true
+        }
+        Err(err) => {
+            println!("could not stop the daemon: {err:#}");
+            false
+        }
+    }
+}
+
+fn is_yes(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// The protocol version of the first `nebula` on `path` — the one the user
+/// runs next, which is where install.sh just put the new build (it warns when
+/// that dir isn't on PATH). None when there is none, or it predates
+/// `_protocol-version`: such a build reads the word as `nebula <dir>`, so it
+/// runs from `cwd` — the runtime dir, where no directory by that name will
+/// ever sit to be registered as a project.
+fn protocol_version_on_path(path: &OsStr, cwd: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let exe = std::env::split_paths(path)
+        .map(|dir| dir.join("nebula"))
+        .find(|p| {
+            p.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })?;
+    let out = Command::new(exe)
+        .arg("_protocol-version")
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 fn upgrade_with(url: &str, staging_dir: &Path, force: bool) -> Result<()> {
@@ -219,6 +301,89 @@ mod tests {
             "{err}"
         );
         assert!(staged_files(tmp.path()).is_empty());
+    }
+
+    fn fake_nebula(dir: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = dir.join("nebula");
+        std::fs::write(&exe, body).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn reads_the_protocol_of_the_first_nebula_on_path() {
+        let empty = tempfile::tempdir().unwrap();
+        let newer = tempfile::tempdir().unwrap();
+        let shadowed = tempfile::tempdir().unwrap();
+        fake_nebula(
+            newer.path(),
+            "#!/bin/sh\n[ \"$1\" = _protocol-version ] && echo 44\n",
+        );
+        fake_nebula(shadowed.path(), "#!/bin/sh\necho 12\n");
+        let path = std::env::join_paths([empty.path(), newer.path(), shadowed.path()]).unwrap();
+
+        assert_eq!(protocol_version_on_path(&path, empty.path()), Some(44));
+    }
+
+    // Every build released before `_protocol-version` reads the word as
+    // `nebula <dir>`: an error when no such directory exists, a registered
+    // project when one does. Either way it must come back "unknown", and the
+    // probe must run where the caller says, not wherever `upgrade` was run.
+    #[test]
+    fn a_nebula_without_the_hook_has_no_known_protocol() {
+        let old = tempfile::tempdir().unwrap();
+        let added = old.path().join("added");
+        fake_nebula(
+            old.path(),
+            &format!(
+                "#!/bin/sh\nif [ -d \"$1\" ]; then : > '{}'; echo \"added project $1\"; \
+                 else echo \"Error: $1 does not exist\" >&2; exit 1; fi\n",
+                added.display()
+            ),
+        );
+        let clean = tempfile::tempdir().unwrap();
+        assert_eq!(
+            protocol_version_on_path(old.path().as_os_str(), clean.path()),
+            None
+        );
+        assert!(!added.exists());
+
+        let trap = tempfile::tempdir().unwrap();
+        std::fs::create_dir(trap.path().join("_protocol-version")).unwrap();
+        assert_eq!(
+            protocol_version_on_path(old.path().as_os_str(), trap.path()),
+            None
+        );
+        assert!(added.exists(), "the probe ran in the cwd it was given");
+
+        let none = tempfile::tempdir().unwrap();
+        assert_eq!(
+            protocol_version_on_path(none.path().as_os_str(), clean.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn the_protocol_note_names_both_versions() {
+        let note = protocol_change_note(PROTOCOL_VERSION + 1);
+        assert!(
+            note.contains(&format!("v{}", PROTOCOL_VERSION + 1)),
+            "{note}"
+        );
+        assert!(
+            note.contains(&format!("daemon v{PROTOCOL_VERSION}")),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_yes_restarts() {
+        for yes in ["y\n", "Y\n", " yes \n"] {
+            assert!(is_yes(yes), "{yes:?}");
+        }
+        for no in ["\n", "n\n", "no\n", "sure\n", ""] {
+            assert!(!is_yes(no), "{no:?}");
+        }
     }
 
     #[test]
