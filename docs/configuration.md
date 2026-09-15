@@ -133,6 +133,47 @@ on the next ATTACH or prewarm, and an agent RESUMES its conversation there.
   `^←` on stock macOS. `Ctrl+q` is the one exception to all of it: it unlocks a terminal no matter what
   you bind, since unbinding your way out would trap you in the session.
 
+## The project file (`.nebula.json`)
+
+The PROJECT FILE tells nebula how a repository is run. Commit it at the repo root, beside
+`package.json` or `Cargo.toml`, and every checkout of the project carries it:
+
+```json
+{
+  "run": "npm run dev",
+  "open": "open http://localhost:3000"
+}
+```
+
+Both keys are optional shell command lines, and both run in the selected worktree's checkout:
+
+- **`run`** — the RUN COMMAND. `r` on a checkout row in the WORKTREES PANEL starts it; `r` again stops
+  it. The DAEMON runs it in a RUN TERMINAL: your login shell (`$SHELL -l -i -c`, the wrapper an agent
+  launch uses, so `npm`, `bun` or `mise` resolve the way they do typed) running that line and nothing
+  else. Its process is the worktree's RUNNING state — while it lives the worktree row wears a green
+  `▶ running`, and the output is the `▶ run` row in the Sessions panel. Like every session it outlives
+  the TUI and every client sees it, and the idle reaper never takes it. Stopping kills the whole process
+  tree and removes the row. A command that exits on its own leaves its row behind, dimmed; attaching it
+  replays how the run ended, and nothing but `r` runs it again — not an attach, not the prewarm sweep.
+  There is one run per worktree: a second client's `r` on a worktree already running never starts
+  another.
+- **`open`** — the OPEN COMMAND. `Shift+Enter` on a checkout row fires it once, from the TUI rather than
+  the DAEMON, since what it opens — a browser tab, an editor — belongs on the machine you are sitting
+  at. It runs through `$SHELL -c` with its output discarded, and nebula does not wait for it.
+  `Shift+Enter` needs the KITTY PROTOCOL (Ghostty, kitty); Terminal.app sends it as a plain `Enter`, so
+  `Shift+O` is bound beside it, and the row's context menu has **Open**.
+
+The file is read fresh at every press, so an edit applies on the next `r` or `Shift+Enter`. Nebula looks
+in the worktree's own checkout first, so a branch can carry commands of its own, and falls back to the
+project's main checkout, so a worktree cut before the file was committed still runs. The first file found
+is the whole answer: a worktree's file with no `open` does not borrow the main checkout's. A missing
+file, a missing key, or JSON that doesn't parse is a one-line footer message saying what to fix; unknown
+keys are ignored.
+
+Unlike the WORKTREE HOOKS below, which nebula runs on its own and so never takes from a checkout,
+nothing in the PROJECT FILE runs until you press its key on that worktree — the same trust as typing the
+command into a shell there.
+
 ## Worktree hooks
 
 A checkout often owns things outside its own directory — a dev-server port, a Caddy or nginx route, a

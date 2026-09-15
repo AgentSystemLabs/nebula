@@ -6,6 +6,7 @@ pub mod host;
 pub mod ids;
 pub mod mem;
 pub mod paths;
+pub mod project_file;
 pub mod protocol;
 
 pub use entities::*;

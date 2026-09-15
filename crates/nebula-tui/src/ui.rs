@@ -696,6 +696,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "WORKTREES",
                     &[
                         (Act(&[New]), "new worktree (PR row: Claude)"),
+                        (Act(&[Rename]), "run / stop .nebula.json \"run\""),
+                        (Act(&[OpenWorktree]), "fire .nebula.json \"open\""),
                         (Act(&[HalfPageDown, HalfPageUp]), "half a panel down / up"),
                         (Act(&[GitDiff]), "git diff (^r: mark reviewed ✓)"),
                         (Act(&[OpenRepo]), "open the repo on GitHub"),
@@ -2957,8 +2959,18 @@ type ProjectRowData = (String, Option<String>, Option<AgentStatus>, usize, i64);
 /// One WORKTREES PANEL row: branch, root-ness, status rollup, unseen
 /// count, recency stamp, whether it is a QUICK PROMPT stand-in the
 /// DAEMON has not cut yet, and whether it wears its merged pull request
-/// (`App::worktree_wears_merge`).
-type WorktreeRowData = (String, bool, Option<AgentStatus>, usize, i64, bool, bool);
+/// (`App::worktree_wears_merge`), and whether its RUN COMMAND is up
+/// (`App::worktree_running`).
+type WorktreeRowData = (
+    String,
+    bool,
+    Option<AgentStatus>,
+    usize,
+    i64,
+    bool,
+    bool,
+    bool,
+);
 
 /// Columns between the `WORKSPACES` label and the first tab.
 const TAB_GAP: u16 = 2;
@@ -3133,6 +3145,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 app.worktree_recency(&w.id).stamped,
                 app.is_placeholder_worktree(&w.id),
                 app.worktree_wears_merge(&w.id),
+                app.worktree_running(&w.id),
             )
         })
         .collect();
@@ -3251,6 +3264,12 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     // default column width `main ⌂ 23m ago` is what fits.
     const ROOT_BADGE: &str = " ⌂ root";
     const ROOT_GLYPH: &str = " ⌂";
+    // A checkout whose RUN COMMAND is up says so in green, straight after
+    // its branch: ` ▶ running`, or the bare ` ▶` where the word would cut
+    // the branch. The glyph never yields — it is the one thing on the row
+    // that says a process is serving from this checkout.
+    const RUN_BADGE: &str = " ▶ running";
+    const RUN_GLYPH: &str = " ▶";
     for (pos, (top, entry)) in layout.iter().enumerate() {
         let y = *top as isize - scroll;
         if y >= view_h as isize {
@@ -3267,7 +3286,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
             WorktreeEntry::Row(i) if *i < worktrees.len() => {
-                let (branch, is_main, roll, unseen, stamped, pending, merged) = &worktrees[*i];
+                let (branch, is_main, roll, unseen, stamped, pending, merged, running) =
+                    &worktrees[*i];
                 let (badges, badge_len) = row_badges(*unseen, th);
                 // A stand-in checkout (QUICK PROMPT, git still cutting
                 // it) reads as not-there-yet: hollow dot, no sweep, and
@@ -3284,6 +3304,15 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 // `render_pill` prepends — bill them here or the trailing
                 // badge is what falls off the end of a twenty-cell column.
                 let free = (inner.width as usize).saturating_sub(3 + badge_len);
+                let run = running.then(|| {
+                    let wide = branch.chars().count() + RUN_BADGE.chars().count();
+                    if wide <= free {
+                        RUN_BADGE
+                    } else {
+                        RUN_GLYPH
+                    }
+                });
+                let free = free.saturating_sub(run.map_or(0, |r| r.chars().count()));
                 // How long since a session in this checkout last did
                 // something — the stamp the group is sorted on, so the
                 // label is what makes the order legible. It yields to the
@@ -3319,6 +3348,12 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     ramp,
                     app.sweep_phase(),
                 ));
+                if let Some(run) = run {
+                    spans.push(Span::styled(
+                        run,
+                        Style::default().fg(th.ok).add_modifier(Modifier::BOLD),
+                    ));
+                }
                 if let Some(root) = root {
                     spans.push(Span::styled(root, Style::default().fg(th.dim)));
                 }
@@ -3760,15 +3795,28 @@ fn draw_session_row(
         }
         SessionRow::Terminal(t) => {
             // Shell prompt glyph instead of a status dot; dim once the
-            // shell has exited (re-attach respawns it).
+            // shell has exited (re-attach respawns it). A RUN TERMINAL wears
+            // the play glyph of its worktree's RUNNING badge and names its
+            // command, dim, after the row name; exited, re-attaching it
+            // replays how the run ended instead of respawning anything.
             let glyph_color = if t.alive { th.ok } else { th.dim };
-            let spans = vec![
-                Span::styled("❯ ", Style::default().fg(glyph_color)),
-                Span::styled(
-                    truncate(&t.name, width.saturating_sub(3) as usize),
-                    Style::default().fg(th.muted),
-                ),
+            let glyph = if t.run_command.is_some() {
+                "▶ "
+            } else {
+                "❯ "
+            };
+            let name = truncate(&t.name, width.saturating_sub(3) as usize);
+            let room = (width as usize).saturating_sub(4 + name.chars().count());
+            let mut spans = vec![
+                Span::styled(glyph, Style::default().fg(glyph_color)),
+                Span::styled(name, Style::default().fg(th.muted)),
             ];
+            if let Some(command) = t.run_command.as_deref().filter(|_| room > 1) {
+                spans.push(Span::styled(
+                    format!(" {}", truncate(command, room)),
+                    Style::default().fg(th.dim),
+                ));
+            }
             (spans, th.accent)
         }
         SessionRow::Link(l) => {
@@ -4569,8 +4617,18 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::Help)
             ),
             Focus::Worktrees => format!(
-                "{}: new worktree  {}: terminal  {}: delete  {}: refresh PRs  {}: search  {}: menu  {}: help",
+                "{}: new worktree  {}: {}  {}: open  {}: terminal  {}: delete  {}: refresh PRs  {}: search  {}: menu  {}: help",
                 k(Action::New),
+                k(Action::Rename),
+                if app
+                    .selected_worktree()
+                    .is_some_and(|w| app.worktree_running(&w.id))
+                {
+                    "stop"
+                } else {
+                    "run"
+                },
+                k(Action::OpenWorktree),
                 k(Action::NewTerminal),
                 k(Action::Delete),
                 k(Action::RefreshPullRequests),
@@ -5375,6 +5433,74 @@ mod tests {
     /// the name holds still in plain text and the purple stays. A session
     /// still running there takes the row back: yellow, as a checkout not
     /// to pull out from under it.
+    /// A checkout whose RUN COMMAND is up wears a green `▶ running` after
+    /// its branch — the bare glyph where the word would cut the branch —
+    /// and a run that has exited wears nothing.
+    #[test]
+    fn worktree_row_wears_its_running_badge() {
+        use nebula_core::{TerminalId, TerminalTab, WorktreeId};
+        let mut app = hit_test_app(&["main", "feat"], &[], &[]);
+        app.focus = Focus::Worktrees;
+        app.tree.terminals.push(TerminalTab {
+            id: TerminalId("run".into()),
+            worktree_id: WorktreeId("w1".into()),
+            name: "run".into(),
+            sort_order: 0,
+            alive: true,
+            run_command: Some("npm run dev".into()),
+        });
+        let render = |app: &mut App, width: u16| -> Vec<(String, Vec<Color>)> {
+            let area = Rect::new(0, 0, width, 12);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 12)).unwrap();
+            terminal.draw(|f| draw_worktrees(f, app, area)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..12)
+                .map(|y| {
+                    let cells: Vec<_> = (0..width)
+                        .map(|x| buf.cell((x, y)).unwrap().clone())
+                        .collect();
+                    (
+                        cells.iter().map(|c| c.symbol().to_string()).collect(),
+                        cells.iter().map(|c| c.fg).collect(),
+                    )
+                })
+                .collect()
+        };
+        let th = app.theme;
+
+        let lines = render(&mut app, 30);
+        let (feat, colors) = lines
+            .iter()
+            .find(|(l, _)| l.contains("feat"))
+            .expect("the feat row");
+        assert!(feat.contains("feat ▶ running"), "{feat:?}");
+        let glyph = feat.chars().position(|c| c == '▶').unwrap();
+        assert_eq!(colors[glyph], th.ok, "green");
+        let (main, _) = lines
+            .iter()
+            .find(|(l, _)| l.contains("main"))
+            .expect("the main row");
+        assert!(!main.contains('▶'), "only the running checkout: {main:?}");
+
+        let narrow = render(&mut app, 14);
+        let (feat, _) = narrow
+            .iter()
+            .find(|(l, _)| l.contains("feat"))
+            .expect("the feat row, narrow");
+        assert!(
+            feat.contains("feat ▶") && !feat.contains("running"),
+            "{feat:?}"
+        );
+
+        app.tree.terminals[0].alive = false;
+        let lines = render(&mut app, 30);
+        assert!(
+            lines.iter().all(|(l, _)| !l.contains('▶')),
+            "an exited run is not running"
+        );
+    }
+
     #[test]
     fn worktree_row_wears_its_merged_pull_request() {
         use nebula_core::{AgentStatus, WorktreeId};
@@ -5710,6 +5836,7 @@ mod tests {
                 name: (*name).into(),
                 sort_order: i as i64,
                 alive: false,
+                run_command: None,
             });
         }
         app
