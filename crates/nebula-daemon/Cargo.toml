@@ -24,5 +24,6 @@ tokio-util = "0.7"
 rand = "0.10"
 subtle = "2"
 tempfile = "3"
+vt100 = "0.16"
 
 [dev-dependencies]

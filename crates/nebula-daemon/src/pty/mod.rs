@@ -1,4 +1,5 @@
 pub mod cloud;
+pub mod cursor;
 pub mod kitty;
 pub mod progress;
 pub mod ring;
@@ -6,6 +7,7 @@ pub mod title;
 
 use anyhow::{Context, Result};
 use cloud::CloudScanner;
+use cursor::CursorTracker;
 use nebula_core::SessionRef;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use progress::ProgressScanner;
@@ -161,6 +163,9 @@ pub struct PtySession {
     /// Claude Cloud session id scanner; `None` until a `--cloud` launch
     /// arms it, so ordinary sessions pay nothing.
     cloud: Mutex<Option<CloudScanner>>,
+    /// Screen for answering cursor position reports; `None` until the child
+    /// first asks, so sessions that never do parse nothing.
+    cursor: Mutex<Option<CursorTracker>>,
 }
 
 pub struct SpawnSpec {
@@ -228,6 +233,7 @@ impl PtySession {
             progress: Mutex::new(ProgressScanner::new()),
             title: Mutex::new(title::TitleScanner::new()),
             cloud: Mutex::new(None),
+            cursor: Mutex::new(None),
         });
 
         let (tx, rx) = mpsc::channel::<ReaderMsg>(READER_CHANNEL_BOUND);
@@ -247,6 +253,9 @@ impl PtySession {
         let master = self.master.lock().unwrap();
         master.resize(pty_size(cols, rows))?;
         *self.last_size.lock().unwrap() = (cols, rows);
+        if let Some(cursor) = self.cursor.lock().unwrap().as_mut() {
+            cursor.resize(cols, rows);
+        }
         Ok(())
     }
 
@@ -392,6 +401,36 @@ impl PtySession {
             let _ = self.events.send(sighting.into());
         }
     }
+
+    /// The bytes owed to the child for one chunk's queries, in query order.
+    /// A cursor report reads the screen as it stood just past its query, so
+    /// the tracker takes `chunk` up to each one in turn, then the rest: once
+    /// built — from the ring, which does not hold `chunk` yet, at the PTY's
+    /// size — it follows every byte.
+    fn query_replies(&self, replies: Vec<kitty::Reply>, chunk: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut cursor = self.cursor.lock().unwrap();
+        let mut fed = 0;
+        for reply in replies {
+            match reply {
+                kitty::Reply::Bytes(bytes) => out.extend_from_slice(&bytes),
+                kitty::Reply::CursorPosition { at } => {
+                    let tracker = cursor.get_or_insert_with(|| {
+                        let (cols, rows) = *self.last_size.lock().unwrap();
+                        let (_, history) = self.snapshot(None);
+                        CursorTracker::new(cols, rows, &history)
+                    });
+                    tracker.feed(&chunk[fed..at]);
+                    fed = at;
+                    out.extend_from_slice(&tracker.report());
+                }
+            }
+        }
+        if let Some(tracker) = cursor.as_mut() {
+            tracker.feed(&chunk[fed..]);
+        }
+        out
+    }
 }
 
 /// PTY reads are blocking → dedicated thread per session. After EOF it reaps
@@ -434,12 +473,13 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
         if pending.is_empty() {
             return;
         }
-        // Kitty keyboard negotiation rides in the output stream; nothing else
-        // would ever answer the child's queries (tmux does the same).
+        // Terminal queries (kitty keyboard, DA1, DSR) ride in the output
+        // stream; nothing else would ever answer them (tmux does the same).
         let actions = session.kitty.lock().unwrap().feed(pending);
-        if !actions.reply.is_empty() {
-            if let Err(e) = session.write_input(&actions.reply) {
-                tracing::warn!(error = %e, "kitty/DA reply write failed");
+        let reply = session.query_replies(actions.replies, pending);
+        if !reply.is_empty() {
+            if let Err(e) = session.write_input(&reply) {
+                tracing::warn!(error = %e, "terminal query reply write failed");
             }
         }
         let busy_edge = session.progress.lock().unwrap().feed(pending);
@@ -623,6 +663,48 @@ mod tests {
             out.contains("env=xterm-256color|truecolor|unset|unset"),
             "child saw: {out:?}"
         );
+    }
+
+    /// A child asking where its cursor is — crossterm's `cursor::position()`,
+    /// which timed out inside nebula before (#66) — is answered from the
+    /// screen as it stood at the query, not after the rest of the chunk.
+    #[tokio::test]
+    async fn cursor_position_query_is_answered_from_the_screen() {
+        let session = PtySession::spawn(
+            SessionRef::Agent(AgentId::generate()),
+            SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    // `min 6`: the read waits for the whole six-byte reply.
+                    "stty -icanon -echo min 6 time 50; \
+                     printf 'hi\\033[3;7H\\033[6nbye'; \
+                     printf 'REPLY:'; dd bs=6 count=1 2>/dev/null | tr '\\033' E"
+                        .into(),
+                ],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: &[],
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+            },
+        )
+        .unwrap();
+        let mut rx = session.events.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match rx.recv().await {
+                    Ok(PtyEvent::Exited { .. }) => break,
+                    Ok(_) => continue,
+                    Err(e) => panic!("event stream ended: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("child reads its reply and exits within 10s");
+        let (_, bytes) = session.snapshot(None);
+        let out = String::from_utf8_lossy(&bytes);
+        assert!(out.contains("REPLY:E[3;7R"), "child saw: {out:?}");
     }
 
     /// The kill escalation must reach an agent the login shell forked into

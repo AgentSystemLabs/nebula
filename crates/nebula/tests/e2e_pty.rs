@@ -683,6 +683,79 @@ async fn kitty_keyboard_negotiation_passthrough() {
     wait_for_exit(&mut daemon);
 }
 
+/// A child asking where its cursor is (`CSI 6 n`) is answered from the
+/// daemon's own screen for the session, at the size the PTY has now. That
+/// is the query crossterm's `cursor::position()` makes, and it timed out
+/// after two seconds inside a nebula terminal (#66).
+#[tokio::test]
+async fn cursor_position_query_is_answered_at_the_pty_size() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateTerminal {
+            req_id: 2,
+            worktree: worktree.id.clone(),
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Terminal(term_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateTerminal failed: {events:#?}");
+    };
+    let sref = SessionRef::Terminal(term_id.clone());
+
+    // Park the cursor past the bottom-right corner (it clamps there), ask,
+    // and read the reply back off stdin; `tr` makes it greppable.
+    let probe = "stty -icanon -echo min 0 time 20; printf '\\033[999;999H\\033[6n'; sleep 1; \
+                 printf 'REPLY:'; dd bs=64 count=1 2>/dev/null | tr '\\033' 'E'; echo; stty sane\n";
+    // The first query builds the screen from the shell's output so far; the
+    // re-attach at a new size must reach it.
+    for (cols, rows) in [(100, 30), (120, 40)] {
+        write_frame(
+            &mut c,
+            &ClientRequest::Attach {
+                session: sref.clone(),
+                from_seq: None,
+                cols,
+                rows,
+            },
+        )
+        .await
+        .unwrap();
+        // The daemon applies the attach's resize before it reads the next
+        // frame, so the probe cannot outrun it.
+        write_frame(
+            &mut c,
+            &ClientRequest::Input {
+                session: sref.clone(),
+                data: probe.into(),
+            },
+        )
+        .await
+        .unwrap();
+        let want = format!("REPLY:E[{rows};{cols}R");
+        read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+            String::from_utf8_lossy(&collected_output(evs)).contains(&want)
+        })
+        .await;
+    }
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// True end-to-end status detection: the agent PTY (a /bin/sh stand-in for
 /// claude) uses its *injected* NEBULA_* env to curl the daemon's hook
 /// endpoint, exactly like the installed claude hooks would — and the
