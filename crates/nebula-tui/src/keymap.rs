@@ -70,6 +70,9 @@ pub enum Action {
     New,
     GitDiff,
     OpenRepo,
+    /// `Shift+O`: a new Ghostty tab in the selected worktree's directory —
+    /// a silent no-op on a machine without Ghostty.
+    OpenGhosttyTab,
     /// `Shift+R`: ask GitHub for the pull requests again now, past every
     /// timer — the open list, the worktree's PR, the one the pane is reading.
     RefreshPullRequests,
@@ -298,6 +301,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["shift+g"],
+    },
+    ActionSpec {
+        action: Action::OpenGhosttyTab,
+        id: "open_ghostty_tab",
+        label: "Open in Ghostty tab",
+        hint: "Open a new Ghostty tab in the selected worktree's directory; does nothing without Ghostty.app",
+        group: "PROJECTS & WORKTREES",
+        scope: Scope::Global,
+        defaults: &["shift+o"],
     },
     ActionSpec {
         action: Action::RefreshPullRequests,
