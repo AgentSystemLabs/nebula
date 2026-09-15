@@ -1152,6 +1152,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_bytes",
+ "serde_json",
  "tokio",
  "ulid",
 ]

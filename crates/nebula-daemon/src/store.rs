@@ -257,6 +257,12 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE agents ADD COLUMN issue_url TEXT;
     ",
+    // 26: the command a RUN TERMINAL runs (`r` on a worktree starts
+    // `.nebula.json`'s `run`). Nullable: every existing terminal stays a
+    // plain shell tab.
+    "
+    ALTER TABLE terminals ADD COLUMN run_command TEXT;
+    ",
 ];
 
 pub struct Store {
@@ -820,8 +826,8 @@ impl Store {
 
     pub fn insert_terminal(&self, t: &TerminalTab) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO terminals (id, worktree_id, name, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![t.id.as_str(), t.worktree_id.as_str(), t.name, t.sort_order, now_ms()],
+            "INSERT INTO terminals (id, worktree_id, name, sort_order, created_at, run_command) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![t.id.as_str(), t.worktree_id.as_str(), t.name, t.sort_order, now_ms(), t.run_command],
         )?;
         Ok(())
     }
@@ -836,6 +842,16 @@ impl Store {
 
     pub fn delete_terminal(&self, id: &TerminalId) -> Result<()> {
         self.delete_by_id("terminals", id.as_str())
+    }
+
+    /// Point a RUN TERMINAL at the command it runs next: `.nebula.json` is
+    /// read fresh at every `r`, so a restart picks up an edited file.
+    pub fn set_terminal_run_command(&self, id: &TerminalId, command: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE terminals SET run_command = ?2 WHERE id = ?1",
+            params![id.as_str(), command],
+        )?;
+        Ok(())
     }
 
     // ---- links ----
@@ -967,6 +983,19 @@ impl Store {
         )?)
     }
 
+    /// The worktree's RUN TERMINALS, oldest first. The DAEMON keeps one per
+    /// worktree; a list, so a stray second row can still be found and stopped.
+    pub fn run_terminals_in(&self, worktree_id: &WorktreeId) -> Result<Vec<TerminalTab>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {TERMINAL_COLUMNS} FROM terminals WHERE worktree_id = ?1 AND run_command IS NOT NULL ORDER BY created_at"
+        ))?;
+        let rows = stmt
+            .query_map(params![worktree_id.as_str()], row_to_terminal)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     // ---- whole tree ----
 
     pub fn load_tree(&self) -> Result<TreeRows> {
@@ -1038,7 +1067,7 @@ const WORKTREE_COLUMNS: &str = "id, project_id, path, branch, is_main, sort_orde
 const AGENT_COLUMNS: &str = "id, worktree_id, name, status, archived, kind, \
                              claude_session_id, sort_order, status_changed_at, model, effort, \
                              archived_at, unseen, cloud_session_id, recent_prompts";
-const TERMINAL_COLUMNS: &str = "id, worktree_id, name, sort_order";
+const TERMINAL_COLUMNS: &str = "id, worktree_id, name, sort_order, run_command";
 const LINK_COLUMNS: &str = "id, worktree_id, url, sort_order";
 
 fn row_to_workspace(r: &rusqlite::Row) -> rusqlite::Result<Workspace> {
@@ -1111,6 +1140,7 @@ fn row_to_terminal(r: &rusqlite::Row) -> rusqlite::Result<TerminalTab> {
         name: r.get(2)?,
         sort_order: r.get(3)?,
         alive: false,
+        run_command: r.get(4)?,
     })
 }
 
@@ -1869,6 +1899,7 @@ mod tests {
                 name: "shell".into(),
                 sort_order: 0,
                 alive: false,
+                run_command: None,
             })
             .unwrap();
 

@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_bytes = { workspace = true }
+serde_json = { workspace = true }
 ulid = { workspace = true }
 directories = { workspace = true }
 rmp-serde = { workspace = true }
