@@ -58,8 +58,9 @@ fn finish_daemon_handoff() {
         Ok(IdleShutdown::SessionsLive { count }) => {
             let plural = if count == 1 { "" } else { "s" };
             println!("note: the old daemon is still running with {count} live session{plural}.");
-            let installed =
-                std::env::var_os("PATH").and_then(|path| protocol_version_on_path(&path));
+            let installed = std::env::var_os("PATH").and_then(|path| {
+                protocol_version_on_path(&path, &nebula_core::paths::runtime_dir())
+            });
             match installed.filter(|v| *v != PROTOCOL_VERSION) {
                 Some(new) => {
                     println!("{}", protocol_change_note(new));
@@ -119,8 +120,10 @@ fn is_yes(answer: &str) -> bool {
 /// The protocol version of the first `nebula` on `path` — the one the user
 /// runs next, which is where install.sh just put the new build (it warns when
 /// that dir isn't on PATH). None when there is none, or it predates
-/// `_protocol-version`.
-fn protocol_version_on_path(path: &OsStr) -> Option<u32> {
+/// `_protocol-version`: such a build reads the word as `nebula <dir>`, so it
+/// runs from `cwd` — the runtime dir, where no directory by that name will
+/// ever sit to be registered as a project.
+fn protocol_version_on_path(path: &OsStr, cwd: &Path) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
     let exe = std::env::split_paths(path)
         .map(|dir| dir.join("nebula"))
@@ -128,7 +131,11 @@ fn protocol_version_on_path(path: &OsStr) -> Option<u32> {
             p.metadata()
                 .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })?;
-    let out = Command::new(exe).arg("_protocol-version").output().ok()?;
+    let out = Command::new(exe)
+        .arg("_protocol-version")
+        .current_dir(cwd)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -315,22 +322,45 @@ mod tests {
         fake_nebula(shadowed.path(), "#!/bin/sh\necho 12\n");
         let path = std::env::join_paths([empty.path(), newer.path(), shadowed.path()]).unwrap();
 
-        assert_eq!(protocol_version_on_path(&path), Some(44));
+        assert_eq!(protocol_version_on_path(&path, empty.path()), Some(44));
     }
 
-    // Every build released before `_protocol-version` exists answers with a
-    // clap usage error; that has to read as "unknown", not as a version.
+    // Every build released before `_protocol-version` reads the word as
+    // `nebula <dir>`: an error when no such directory exists, a registered
+    // project when one does. Either way it must come back "unknown", and the
+    // probe must run where the caller says, not wherever `upgrade` was run.
     #[test]
     fn a_nebula_without_the_hook_has_no_known_protocol() {
         let old = tempfile::tempdir().unwrap();
+        let added = old.path().join("added");
         fake_nebula(
             old.path(),
-            "#!/bin/sh\necho \"error: unrecognized subcommand '$1'\" >&2\nexit 2\n",
+            &format!(
+                "#!/bin/sh\nif [ -d \"$1\" ]; then : > '{}'; echo \"added project $1\"; \
+                 else echo \"Error: $1 does not exist\" >&2; exit 1; fi\n",
+                added.display()
+            ),
         );
-        assert_eq!(protocol_version_on_path(old.path().as_os_str()), None);
+        let clean = tempfile::tempdir().unwrap();
+        assert_eq!(
+            protocol_version_on_path(old.path().as_os_str(), clean.path()),
+            None
+        );
+        assert!(!added.exists());
+
+        let trap = tempfile::tempdir().unwrap();
+        std::fs::create_dir(trap.path().join("_protocol-version")).unwrap();
+        assert_eq!(
+            protocol_version_on_path(old.path().as_os_str(), trap.path()),
+            None
+        );
+        assert!(added.exists(), "the probe ran in the cwd it was given");
 
         let none = tempfile::tempdir().unwrap();
-        assert_eq!(protocol_version_on_path(none.path().as_os_str()), None);
+        assert_eq!(
+            protocol_version_on_path(none.path().as_os_str(), clean.path()),
+            None
+        );
     }
 
     #[test]

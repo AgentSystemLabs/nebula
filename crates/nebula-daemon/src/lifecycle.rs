@@ -56,15 +56,20 @@ impl PidfileLock {
     /// socket beside them — so a daemon left up over a long weekend would
     /// lose the file every liveness check and `nebula kill` starts from
     /// (#68). A file still in place is touched so the cleaner passes it by;
-    /// one already gone or replaced is re-created and locked again.
-    pub fn refresh(&mut self) {
+    /// one already gone or replaced is re-created and locked again. False
+    /// when another daemon has taken the path since: it owns the runtime
+    /// files now, and this one must leave them alone.
+    pub fn refresh(&mut self) -> bool {
         if self.still_at_path() {
             let _ = self.file.set_modified(SystemTime::now());
-            return;
+            return true;
         }
-        // `None`: another daemon has taken the path since, and owns it now.
-        if let Ok(Some(fresh)) = Self::acquire_at(&self.path) {
-            *self = fresh;
+        match Self::acquire_at(&self.path) {
+            Ok(Some(fresh)) => {
+                *self = fresh;
+                true
+            }
+            Ok(None) | Err(_) => false,
         }
     }
 
@@ -199,7 +204,7 @@ mod tests {
             .expect("lock is free");
         fs::remove_file(&path).unwrap();
 
-        lock.refresh();
+        assert!(lock.refresh(), "still this daemon's pidfile");
 
         assert_eq!(
             fs::read_to_string(&path).unwrap().trim(),
@@ -229,11 +234,30 @@ mod tests {
             .unwrap();
         let inode = fs::metadata(&path).unwrap().ino();
 
-        lock.refresh();
+        assert!(lock.refresh());
 
         let meta = fs::metadata(&path).unwrap();
         assert!(meta.modified().unwrap() > week_ago + Duration::from_secs(24 * 60 * 60));
         assert_eq!(meta.ino(), inode, "touched in place, not re-created");
+        assert!(PidfileLock::acquire_at(&path).unwrap().is_none());
+    }
+
+    // A second daemon that took the path after the first lost its file owns
+    // the runtime files; the first must neither steal the pidfile back nor
+    // overwrite that daemon's buildstamp with its own.
+    #[test]
+    fn refresh_yields_a_pidfile_another_daemon_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("daemon.pid");
+        let mut first = PidfileLock::acquire_at(&path)
+            .unwrap()
+            .expect("lock is free");
+        fs::remove_file(&path).unwrap();
+        let _second = PidfileLock::acquire_at(&path)
+            .unwrap()
+            .expect("path is free again");
+
+        assert!(!first.refresh());
         assert!(PidfileLock::acquire_at(&path).unwrap().is_none());
     }
 

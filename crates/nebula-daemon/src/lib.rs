@@ -236,10 +236,8 @@ async fn serve() -> Result<()> {
                 tokio::select! {
                     _ = daemon.shutdown.cancelled() => break,
                     _ = interval.tick() => {
-                        if let Ok(mut lock) = lock.lock() {
-                            lock.refresh();
-                        }
-                        if let Some(stamp) = &buildstamp {
+                        let owned = lock.lock().is_ok_and(|mut lock| lock.refresh());
+                        if let (true, Some(stamp)) = (owned, &buildstamp) {
                             lifecycle::rewrite_buildstamp(stamp);
                         }
                     }

@@ -624,13 +624,15 @@ pub async fn run_workspace_op(op: WorkspaceOp) -> Result<()> {
 /// A daemon on a different protocol version closes the socket right after
 /// the handshake, so `Shutdown` can never reach it — exactly the situation
 /// `nebula kill` exists to fix. Fall back to SIGTERM, which its handler turns
-/// into the same clean shutdown: at the pid in the pidfile, guarded by the
-/// daemon's flock so a stale pid is never signalled, and failing that at the
-/// pid the kernel says is listening on the socket. The pidfile alone is not
-/// enough: macOS's tmp_cleaner deletes regular files in /tmp untouched for
-/// three days but spares sockets, so a daemon that has been up that long —
-/// on any version before the one that refreshes its pidfile — is still
-/// listening with no pidfile beside it (#68).
+/// into the same clean shutdown, at the pid the kernel says is listening on
+/// the socket — the very daemon the handshake just failed with. Only when the
+/// kernel can't say does the pidfile decide, guarded by the daemon's flock so
+/// a stale pid is never signalled. The pidfile can't come first: macOS's
+/// tmp_cleaner deletes regular files in /tmp untouched for three days but
+/// spares sockets, so a daemon that has been up that long — on any version
+/// before the one that refreshes its pidfile — is still listening with no
+/// pidfile beside it (#68), and a refreshing daemon re-creates the file
+/// locked a moment before it writes the pid in.
 pub async fn kill_daemon() -> Result<bool> {
     kill_daemon_at(&paths::socket_path(), &paths::pidfile_path()).await
 }
@@ -647,10 +649,10 @@ async fn kill_daemon_at(sock: &std::path::Path, pidfile: &std::path::Path) -> Re
         wait_for_daemon_exit(pidfile, conn.daemon_pid as i32).await;
         return Ok(true);
     }
-    if kill_by_pidfile(pidfile).await? {
-        return Ok(true);
-    }
     let Some(pid) = listener_pid else {
+        if kill_by_pidfile(pidfile).await? {
+            return Ok(true);
+        }
         bail!(
             "a nebula daemon is listening on {} but this build can't talk to it or find its \
              pid — look it up with `pgrep -f 'nebula daemon'` and stop it with `kill <pid>` \
@@ -767,6 +769,14 @@ async fn wait_for_daemon_exit(pidfile: &std::path::Path, pid: i32) {
 fn process_running(pid: i32) -> bool {
     if send_signal(pid, 0) != 0 {
         return false;
+    }
+    // Linux: the state letter follows the parenthesised command name, which
+    // can itself hold spaces and parens — hence the last `)`. No `ps` needed.
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next());
+        return state != Some('Z');
     }
     match std::process::Command::new("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
