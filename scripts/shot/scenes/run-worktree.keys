@@ -1,0 +1,7 @@
+# r on the main checkout: its row wears `▶ running`, the Sessions panel lists `▶ run` with its
+# command, and Enter on that row shows the run's output in the pane (Ctrl+q hands the keys back).
+l
+r
+l
+Enter
+C-q
