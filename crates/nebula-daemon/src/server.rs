@@ -151,6 +151,18 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             let size = PaneSize { cols, rows };
                             let (events_rx, replay_end) =
                                 attach::bind(&session, &sref, &out_tx, size, from_seq).await;
+                            // A RUN TERMINAL whose command already exited
+                            // replays how it ended. Say it is over, or the
+                            // pane would offer to type into a process that
+                            // is gone.
+                            if let Some(exit_code) = daemon.finished_run_exit(&sref) {
+                                let _ = out_tx
+                                    .send(ServerEvent::SessionExited {
+                                        session: sref.clone(),
+                                        exit_code,
+                                    })
+                                    .await;
+                            }
 
                             let rebind = attached.remove(&sref);
                             if let Some(old) = &rebind {
@@ -571,6 +583,12 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientRequest::CloseTerminal { req_id, id } => {
                     reply_done(&out_tx, req_id, daemon.close_terminal(&id)).await;
+                }
+                ClientRequest::StartRun { req_id, worktree } => {
+                    reply(&out_tx, req_id, daemon.start_run(&worktree).map(Some)).await;
+                }
+                ClientRequest::StopRun { req_id, worktree } => {
+                    reply_done(&out_tx, req_id, daemon.stop_run(&worktree)).await;
                 }
             }
         }

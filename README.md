@@ -170,7 +170,7 @@ is open.
 | [**Keys**](docs/keys.md) | Every default binding, the WORKTREE views (`g` `f` `F` `b`), and the mouse. All of it rebindable. |
 | [**Commands**](docs/commands.md) | The `nebula` CLI: `add`, `rename`, `worktree`, `spawn`, `workspace`, `ssh`, `tunnel`, `browser`, `daemon`, `kill`, `upgrade`. |
 | [**Sessions**](docs/sessions.md) | The NEW SESSION PICKER, MODEL / EFFORT, Claude Cloud and the CLOUD SESSION PANEL, AGENT PRESETS, the PROJECT OPEN PRS group, the ISSUES MODAL. |
-| [**Configuration**](docs/configuration.md) | `config.json`, the SETTINGS OVERLAY, the HOTKEYS TAB, logs and environment overrides. |
+| [**Configuration**](docs/configuration.md) | `config.json`, the SETTINGS OVERLAY, the HOTKEYS TAB, the `.nebula.json` PROJECT FILE (`r` runs a worktree, `Shift+Enter` opens it), logs and environment overrides. |
 | [**How it works**](docs/how-it-works.md) | The DAEMON, the hook dialects, AUTO-TITLE, WORKTREE RELOCATION, prewarm and reaping, persistence. |
 | [**Architecture**](ARCHITECTURE.md) | Process model, the IPC CODEC and the crate layout. |
 
