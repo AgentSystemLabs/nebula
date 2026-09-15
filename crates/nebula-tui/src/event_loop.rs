@@ -25297,6 +25297,49 @@ diff --git a/src/c.rs b/src/c.rs
         });
     }
 
+    /// A rail beside an expanded panel stands in the column that panel's
+    /// splitter zone also claims — its rule plus the cell after it — and
+    /// splitters are registered first, so a click on ▶ armed a resize
+    /// drag on the neighbor instead of expanding the rail.
+    #[test]
+    fn clicking_a_rail_beside_an_expanded_panel_expands_it() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            seed_default_workspace(&mut app);
+            let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+
+            toggle_panel(&mut app, Focus::Worktrees);
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            // The rail is the one column right after the Projects rule,
+            // its expand chevron on the header row.
+            let x = app.splitter_x(0);
+            let y = app.body_area.y + app.workspaces_bar_h() + 1;
+            let cell = terminal.backend().buffer().cell((x, y)).unwrap();
+            assert_eq!(
+                cell.symbol(),
+                "▶",
+                "rail chevron at ({x}, {y}):\n{}",
+                buffer_text(&terminal)
+            );
+            assert_eq!(
+                app.hit_at(x, y),
+                Some(HitTarget::CollapsePanel(Focus::Worktrees)),
+                "the rail wins its own column"
+            );
+            assert_eq!(
+                app.hit_at(x - 1, y),
+                Some(HitTarget::Splitter(0)),
+                "the neighbor's rule still resizes"
+            );
+
+            click(&mut app, x, y, &mut out);
+            assert!(!app.hide_worktrees, "the click expands the panel");
+            assert!(app.splitter_drag.is_none(), "and arms no resize drag");
+        });
+    }
+
     #[test]
     fn collapsing_the_workspaces_bar_leaves_a_rail_way_back() {
         with_default_config(|| {

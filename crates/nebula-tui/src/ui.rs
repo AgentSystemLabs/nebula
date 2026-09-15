@@ -193,13 +193,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Splitter grab zones: the two touching border cells at each panel
     // boundary. Registered first so they win `hit_at`'s first-match scan —
     // and only over the panels, so the tab bar above stays clickable.
+    // Beside a rail the zone stops at the rule: the rail's one column is
+    // its expand chevron, and a click on ▶ must reach the rail rather
+    // than arm a drag on its neighbor.
     for i in app.splitter_indices() {
         let x = app.splitter_x(i);
+        let width = if app.splitter_abuts_rail(i) { 1 } else { 2 };
         app.hits.push((
             Rect {
                 x: x.saturating_sub(1),
                 y: panels_a.y,
-                width: 2,
+                width,
                 height: panels_a.height,
             },
             HitTarget::Splitter(i),

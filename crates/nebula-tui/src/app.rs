@@ -2846,6 +2846,15 @@ impl App {
             .sum()
     }
 
+    /// Whether the panel right of splitter `idx` is a rail — the one
+    /// column its grab zone would otherwise claim along with the rule.
+    pub fn splitter_abuts_rail(&self, idx: usize) -> bool {
+        self.visible_panel_indices()
+            .into_iter()
+            .find(|visible| *visible > idx)
+            .is_some_and(|next| !self.panel_expanded(next))
+    }
+
     /// Move splitter `idx` so its boundary lands at `boundary_x`, clamped so
     /// the panel keeps `MIN_PANEL_W` and the terminal pane keeps `MIN_TERM_W`.
     /// Rails are fixed width: dragging at one does nothing, and neighbors
