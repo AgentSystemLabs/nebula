@@ -50,12 +50,16 @@ pub fn run_daemon() -> Result<()> {
 }
 
 async fn serve() -> Result<()> {
-    let Some(_lock) = lifecycle::PidfileLock::try_acquire()? else {
+    let Some(lock) = lifecycle::PidfileLock::try_acquire()? else {
         bail!("another nebula daemon is already running");
     };
+    // Shared with the refresh loop below, and held here until the socket is
+    // gone: a new daemon must not take the lock while this one still has a
+    // socket path to unlink.
+    let lock = std::sync::Arc::new(std::sync::Mutex::new(lock));
     // Record which build this daemon runs so installers can tell an
     // up-to-date daemon from a stale one (`nebula _stale-daemon-note`).
-    lifecycle::write_buildstamp();
+    let buildstamp = lifecycle::write_buildstamp();
 
     let sock = paths::socket_path();
     lifecycle::unlink_stale_socket(&sock);
@@ -221,6 +225,29 @@ async fn serve() -> Result<()> {
         });
     }
 
+    // Keep the pidfile and buildstamp from aging out of a /tmp runtime dir
+    // (see `PidfileLock::refresh`).
+    {
+        let daemon = daemon.clone();
+        let lock = lock.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(lifecycle::RUNTIME_FILE_REFRESH);
+            loop {
+                tokio::select! {
+                    _ = daemon.shutdown.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Ok(mut lock) = lock.lock() {
+                            lock.refresh();
+                        }
+                        if let Some(stamp) = &buildstamp {
+                            lifecycle::rewrite_buildstamp(stamp);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // SIGTERM/SIGINT → clean shutdown.
     {
         let daemon = daemon.clone();
@@ -245,6 +272,7 @@ async fn serve() -> Result<()> {
     // phase 4/5 when the store exists.)
     daemon.kill_all();
     let _ = std::fs::remove_file(&sock);
+    drop(lock);
     tracing::info!("daemon exited cleanly");
     Ok(())
 }

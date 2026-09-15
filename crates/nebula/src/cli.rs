@@ -103,6 +103,8 @@ pub(crate) enum Command {
     /// Shut the running daemon down (stops all sessions).
     ///
     /// Asks the daemon to exit cleanly; every session it owns stops with it.
+    /// A daemon from a build on another protocol can't take that request, so
+    /// it gets SIGTERM instead, which it handles the same clean way.
     /// Quitting the TUI does not do this — the daemon outlives its clients on
     /// purpose — so this is how you stop everything, and how you move onto a
     /// newly installed binary.
@@ -272,7 +274,8 @@ pub(crate) enum Command {
     ///
     /// Runs the install script for the newest release. Upgrading with a daemon
     /// running is safe: sessions keep running on the old binary until you
-    /// restart it with `nebula kill` (which stops all sessions).
+    /// restart it with `nebula kill` (which stops all sessions). When the new
+    /// build can't attach to that daemon, it says so and offers the restart.
     #[command(after_help = UPGRADE_EXAMPLES)]
     Upgrade {
         /// Upgrade even when running from a local cargo build.
@@ -289,6 +292,11 @@ pub(crate) enum Command {
     /// a different build than this binary (see `make install` / install.sh).
     #[command(hide = true, name = "_stale-daemon-note")]
     StaleDaemonNote,
+    /// Upgrade hook: print the protocol version this binary speaks, so the
+    /// `nebula upgrade` that installed it can tell whether it will still
+    /// attach to the daemon left running.
+    #[command(hide = true, name = "_protocol-version")]
+    ProtocolVersion,
 }
 
 const ADD_EXAMPLES: &str = "\
