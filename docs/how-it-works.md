@@ -54,6 +54,14 @@
   `stat` calls (`NEBULA_WORKTREE_SYNC_MS` overrides the 2 s beat; the e2e tests turn it down to
   100 ms). This structural sync is the *only* git polling the DAEMON does — the pull request lookups
   further down are the TUI's own.
+- **The root checkout changes branch in place — the BRANCH SWITCHER.** `c` on the ROOT WORKTREE (or
+  from the Projects panel) lists the repo's branches with one `git for-each-ref` and switches with
+  `git switch`, asking first when the checkout has uncommitted changes whether to stash, bring along,
+  commit or discard them. That git is the TUI's, like the diff viewer's: the writes and the background
+  `git fetch --all` run in a session of their own with stdin closed, so an `ssh` passphrase prompt fails
+  instead of painting over the screen, and the TUI renames the root row the moment git says yes. The
+  WORKTREE SYNC above then sees the moved `.git/HEAD` and confirms the branch from the DAEMON's side.
+  Linked worktrees don't switch: each is named after the branch it was cut for.
 - **A worktree's outside resources are yours to hook — WORKTREE HOOKS.** `git config
   nebula.worktreeCreateHook` / `nebula.worktreeDeleteHook` name an executable the DAEMON runs after it
   creates or removes a checkout, from the main repository, with the repo path and the worktree path as

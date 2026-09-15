@@ -76,6 +76,9 @@ pub enum Action {
     /// `i`: the ISSUES MODAL — the project's open GitHub issues, read in
     /// place, with a QUICK PROMPT or an AGENT PRESET launched on one.
     Issues,
+    /// `c`: the BRANCH SWITCHER — move the project's ROOT WORKTREE onto
+    /// another branch, asking what to do with uncommitted changes.
+    SwitchBranch,
     // sessions
     NewTerminal,
     Rename,
@@ -316,6 +319,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["i"],
+    },
+    ActionSpec {
+        action: Action::SwitchBranch,
+        id: "switch_branch",
+        label: "Switch root branch",
+        hint: "Fuzzy-pick a branch or remote for the project's root checkout; uncommitted changes get stash / bring / commit / discard",
+        group: "PROJECTS & WORKTREES",
+        scope: Scope::Global,
+        defaults: &["c"],
     },
     // ---- SESSIONS ----
     ActionSpec {

@@ -2,6 +2,7 @@ pub mod agent_picker;
 pub mod agent_presets;
 pub mod app;
 pub mod branch_name;
+pub mod branch_switch;
 pub mod claude_catalogue;
 pub mod completion;
 pub mod config;

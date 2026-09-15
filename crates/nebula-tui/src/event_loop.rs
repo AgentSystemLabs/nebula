@@ -303,6 +303,11 @@ async fn main_loop(
     let (issues_tx, mut issues_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::issues::IssuesAnswer>();
     app.issues_tx = Some(issues_tx);
+    // The BRANCH SWITCHER's git — the listing, the changed-file count,
+    // the background fetch and the switch itself — lands here too.
+    let (branch_tx, mut branch_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::branch_switch::Answer>();
+    app.branch_switch.tx = Some(branch_tx);
     // A newer nebula published on GitHub, probed off the loop at start and
     // then on a slow beat (`update_check::interval`; the e2e tests turn it
     // off). Only a newer version ever arrives, so the footer's indicator,
@@ -540,6 +545,11 @@ async fn main_loop(
             answer = issues_rx.recv() => {
                 if let Some(answer) = answer {
                     crate::issues::land_answer(&mut app, answer);
+                }
+            }
+            answer = branch_rx.recv() => {
+                if let Some(answer) = answer {
+                    crate::branch_switch::land_answer(&mut app, answer);
                 }
             }
         }
@@ -1853,6 +1863,12 @@ fn paste_into_overlay(app: &mut App, text: &str) -> bool {
                 crate::git_diff::load_selected_diff(view);
             }
         }
+        // The query, or the commit message while that is being typed.
+        Overlay::BranchSwitch(view) => {
+            if !crate::branch_switch::paste(view, text) {
+                return false;
+            }
+        }
         // Only types while its add/edit input is open.
         Overlay::Hosts(view) => match &mut view.input {
             Some(input) => input.insert_str(text),
@@ -2111,6 +2127,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::AgentPresets => crate::preset_overlays::open_agent_presets(app),
         Action::QuickPrompt => crate::quick_prompt::open_quick_prompt(app),
         Action::Issues => crate::issues::open_issues(app),
+        Action::SwitchBranch => crate::branch_switch::open_branch_switch(app),
         // Ctrl+→ still reaches the terminal pane (the counterpart of the
         // Ctrl+← escape hatch).
         Action::FocusTerminal => {
@@ -3735,7 +3752,12 @@ fn open_context_menu_for_selection(app: &mut App) {
                     MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
                     MenuItem::new("New terminal", MenuAction::NewTerminal(w.id.clone())),
                 ];
-                if !w.is_main {
+                if w.is_main {
+                    items.push(MenuItem::new(
+                        "Switch branch…",
+                        MenuAction::SwitchBranch(w.id.clone()),
+                    ));
+                } else {
                     items.push(MenuItem::destructive(
                         "Delete worktree",
                         MenuAction::DeleteWorktree(w.id.clone()),
@@ -3853,6 +3875,7 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
         Overlay::AgentPresets(_) => crate::preset_overlays::handle_list_key(app, key),
         Overlay::AgentPresetEditor(_) => crate::preset_overlays::handle_editor_key(app, key),
         Overlay::Issues(_) => crate::issues::handle_key(app, key),
+        Overlay::BranchSwitch(_) => crate::branch_switch::handle_key(app, key),
         Overlay::Menu(menu) => match key.code {
             // Type-ahead in the MODEL / EFFORT submenus: letters narrow the
             // rows (so ↑/↓ move there, not j/k), Backspace widens, and Esc
@@ -5436,6 +5459,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 }));
             }
         }
+        MenuAction::SwitchBranch(id) => crate::branch_switch::open_for(app, &id),
         MenuAction::AddProject => open_prompt(app, PromptKind::AddProject),
         MenuAction::RenameProject(id) => open_prompt(app, PromptKind::RenameProject { id }),
         MenuAction::OpenWorkspace(id) => {
@@ -7274,6 +7298,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         crate::issues::handle_mouse(app, mouse, mouse_pos);
         return;
     }
+    if matches!(&app.overlay, Some(Overlay::BranchSwitch(_))) {
+        crate::branch_switch::handle_mouse(app, mouse, mouse_pos);
+        return;
+    }
     // Hosts picker: the wheel moves the selection, a click on a row connects
     // (the context-menu convention — rows are actions, not editable items);
     // everything else inside the box is swallowed.
@@ -7794,7 +7822,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                             MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
                             MenuItem::new("New terminal", MenuAction::NewTerminal(w.id.clone())),
                         ];
-                        if !w.is_main {
+                        if w.is_main {
+                            items.push(MenuItem::new(
+                                "Switch branch…",
+                                MenuAction::SwitchBranch(w.id.clone()),
+                            ));
+                        } else {
                             items.push(MenuItem::destructive(
                                 "Delete worktree",
                                 MenuAction::DeleteWorktree(w.id.clone()),
@@ -18607,6 +18640,146 @@ diff --git a/src/c.rs b/src/c.rs
         );
     }
 
+    // ---- branch switcher ----
+
+    /// A linked worktree beside `seed_tree`'s root, on its own branch.
+    fn seed_linked_worktree(app: &mut App) {
+        use nebula_core::{Entity, ProjectId, Worktree, WorktreeId};
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w2".into()),
+                    project_id: ProjectId("p1".into()),
+                    path: "/tmp/demo-worktrees/feature".into(),
+                    branch: "feature".into(),
+                    is_main: false,
+                    sort_order: 0,
+                }),
+            },
+        );
+    }
+
+    fn branch_switch_target(app: &App) -> Option<WorktreeId> {
+        match &app.overlay {
+            Some(Overlay::BranchSwitch(view)) => Some(view.worktree.clone()),
+            _ => None,
+        }
+    }
+
+    /// `c` moves the ROOT WORKTREE and nothing else: from its own row, from
+    /// the Projects panel whatever the Worktrees cursor is on, and never
+    /// from a linked worktree's row, which stays on the branch it was cut
+    /// for.
+    #[test]
+    fn c_opens_the_branch_switcher_on_the_root_and_refuses_a_linked_worktree() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        seed_tree(&mut app);
+        seed_linked_worktree(&mut app);
+        let root = WorktreeId("w1".into());
+        let mains: Vec<bool> = app.visible_worktrees().iter().map(|w| w.is_main).collect();
+        assert_eq!(mains, [true, false], "the root row leads");
+
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 1;
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "{:?}", app.overlay);
+        assert!(
+            app.flash
+                .as_deref()
+                .is_some_and(|f| f.contains("root checkout")),
+            "{:?}",
+            app.flash
+        );
+
+        app.focus = Focus::Projects;
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            branch_switch_target(&app),
+            Some(root.clone()),
+            "the Projects panel means the project's root"
+        );
+        app.overlay = None;
+
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 0;
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE, &mut out);
+        assert_eq!(branch_switch_target(&app), Some(root));
+    }
+
+    /// The root row's menu is where the mouse finds the switcher, in the
+    /// seat a linked worktree's Delete takes.
+    #[test]
+    fn the_root_rows_menu_offers_switch_branch_and_a_worktree_row_offers_delete() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        seed_tree(&mut app);
+        seed_linked_worktree(&mut app);
+        app.focus = Focus::Worktrees;
+        let labels = |app: &App| match &app.overlay {
+            Some(Overlay::Menu(menu)) => menu
+                .items
+                .iter()
+                .map(|i| i.label.clone())
+                .collect::<Vec<_>>(),
+            other => panic!("no menu: {other:?}"),
+        };
+
+        app.sel_worktree = 1;
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE, &mut out);
+        let linked = labels(&app);
+        assert!(linked.iter().any(|l| l == "Delete worktree"), "{linked:?}");
+        assert!(!linked.iter().any(|l| l == "Switch branch…"), "{linked:?}");
+        app.overlay = None;
+
+        app.sel_worktree = 0;
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE, &mut out);
+        let root = labels(&app);
+        assert!(!root.iter().any(|l| l == "Delete worktree"), "{root:?}");
+        let at = root
+            .iter()
+            .position(|l| l == "Switch branch…")
+            .expect("the root row offers it");
+        if let Some(Overlay::Menu(menu)) = &mut app.overlay {
+            menu.hover = at;
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(branch_switch_target(&app), Some(WorktreeId("w1".into())));
+    }
+
+    /// Through the real key path — the KEYMAP's `c`, a query typed into the
+    /// modal (so `f`, `e` and `a` feed the filter instead of firing their
+    /// panel hotkeys), `Enter` — a real root checkout moves and its row
+    /// follows before the DAEMON's sync has said a word.
+    #[test]
+    fn the_branch_switcher_moves_a_real_root_through_the_key_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        run_git(&repo, &["branch", "feature"]);
+        let mut app = App::new();
+        let mut out = Vec::new();
+        seed_repo_tree(&mut app, &repo);
+        app.focus = Focus::Worktrees;
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE, &mut out);
+        for c in "feat".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "{:?}", app.overlay);
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "feature");
+        assert_eq!(
+            app.selected_worktree().map(|w| w.branch.as_str()),
+            Some("feature")
+        );
+    }
+
     // ---- git-diff modal ----
 
     pub(super) fn press(
@@ -27046,6 +27219,14 @@ diff --git a/src/c.rs b/src/c.rs
                 None,
             ),
             (
+                "BranchSwitch",
+                |app| {
+                    seed_tree(app);
+                    press(app, KeyCode::Char('c'), KeyModifiers::NONE, &mut Vec::new());
+                },
+                None,
+            ),
+            (
                 "Hosts",
                 |app| {
                     app.overlay = Some(Overlay::Hosts(crate::app::HostsView::new(vec![
@@ -27216,6 +27397,7 @@ diff --git a/src/c.rs b/src/c.rs
             Overlay::AgentPresets(_) => "AgentPresets",
             Overlay::AgentPresetEditor(_) => "AgentPresetEditor",
             Overlay::Issues(_) => "Issues",
+            Overlay::BranchSwitch(_) => "BranchSwitch",
         }
     }
 
@@ -27244,7 +27426,7 @@ diff --git a/src/c.rs b/src/c.rs
             let mut unique = seen.clone();
             unique.dedup();
             assert_eq!(unique, seen, "two rows for the same variant");
-            assert_eq!(seen.len(), 16, "a variant came or went: {seen:?}");
+            assert_eq!(seen.len(), 17, "a variant came or went: {seen:?}");
         });
     }
 

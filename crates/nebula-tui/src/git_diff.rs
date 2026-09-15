@@ -82,7 +82,7 @@ pub fn classify_diff_line(line: &str) -> DiffLineKind {
 /// create '.git/index.lock': File exists" (issue #15). Nothing the TUI
 /// runs needs the refresh persisted — the agent CLIs themselves run their
 /// background git with `--no-optional-locks` for the same reason — and
-/// commands that must lock (none of ours) still do: `GIT_OPTIONAL_LOCKS=0`
+/// commands that must lock (the BRANCH SWITCHER's switch, stash and commit) still do: `GIT_OPTIONAL_LOCKS=0`
 /// only skips the optional ones. Every TUI-side git goes through here.
 pub(crate) fn git_command(root: &Path) -> Command {
     let mut cmd = Command::new("git");
