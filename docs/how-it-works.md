@@ -27,7 +27,11 @@
   handshake refuses a mismatched pair — the DAEMON answers `Incompatible`, the TUI bails, and the
   VERSION SKEW message names both binaries. Which side is stale decides the fix, and getting it
   backwards costs an afternoon: when the DAEMON is the *older* build, `nebula kill` and relaunch is the
-  whole remedy (it stops every live session on the way). When the DAEMON is *ahead* of the `nebula` you
+  whole remedy (it stops every live session on the way). A DAEMON that can't take the `Shutdown`
+  request gets SIGTERM instead, at the pid the kernel reports on the other end of the socket or, when
+  it can't say, at the pid in its pidfile — which can't come first, because macOS's tmp cleaner deletes
+  regular files in `/tmp` after three idle days but spares sockets, so the DAEMON touches its pidfile
+  hourly and puts it back if it vanishes. When the DAEMON is *ahead* of the `nebula` you
   just ran, `nebula kill` does nothing for you — a live instance respawns its DAEMON from its own
   binary, so the skew survives every restart, and the fix is to install the DAEMON's build over yours
   (`make install` from that checkout) instead. The usual shape in a checkout is a `make dev` DAEMON out
