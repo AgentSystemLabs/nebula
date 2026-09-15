@@ -28,16 +28,19 @@
 //! otherwise open `/dev/tty` and paint over the frame; detached, it fails
 //! instead. (A pinentry that opens `$GPG_TTY` by path is beyond its reach.)
 //!
-//! Every checkout of a repository shares one stash stack, and agents run
-//! git in all of them, so a switch never trusts a position on it: its own
-//! stash entry is found by commit and message, and put back by commit.
+//! Agents run git in the same repository while a switch runs, so nothing
+//! here trusts a position or a moment: a stash entry is found by commit and
+//! message, the prompt's list is fingerprinted so a discard never throws
+//! away an edit it did not show, and a checkout git abandons part-way is
+//! undone only for files byte-identical to the branch it was writing.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use nebula_core::WorktreeId;
@@ -72,6 +75,9 @@ const FETCH_GAP: Duration = Duration::from_secs(60);
 /// `git for-each-ref` record: NUL between fields, RS after each record (a
 /// subject is one line, but a record separator costs nothing).
 const REF_FORMAT: &str = "--format=%(refname)%00%(symref)%00%(HEAD)%00%(worktreepath)%00%(committerdate:unix)%00%(contents:subject)%1e";
+/// Paths per `git hash-object` / `git checkout` call, well inside any
+/// argument-length limit.
+const PATH_CHUNK: usize = 200;
 
 extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
@@ -349,16 +355,40 @@ fn unmerged(file: &DiffFile) -> bool {
     file.xy.contains(&'U') || file.xy == ['A', 'A'] || file.xy == ['D', 'D']
 }
 
-/// A change as the DISCARD prompt promised it: status and path.
-fn file_key(file: &DiffFile) -> String {
-    format!("{}{} {}", file.xy[0], file.xy[1], file.path)
-}
-
 /// The checkout's uncommitted changes, nested repositories left out.
 pub fn changes(root: &Path) -> Result<Vec<DiffFile>, String> {
     let mut files = crate::git_diff::changed_files(root)?;
     files.retain(|f| !nested_repo(root, f));
     Ok(files)
+}
+
+/// Each change as a prompt shows it: status, path, and the file's size and
+/// modification time, so another edit to a file already listed still reads
+/// as a change.
+fn fingerprints(root: &Path, files: &[DiffFile]) -> Vec<String> {
+    files
+        .iter()
+        .map(|f| {
+            let stamp = std::fs::symlink_metadata(root.join(&f.path))
+                .map(|m| {
+                    let modified = m
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_nanos());
+                    format!("{} {modified}", m.len())
+                })
+                .unwrap_or_else(|_| "-".into());
+            format!("{}{} {} {stamp}", f.xy[0], f.xy[1], f.path)
+        })
+        .collect()
+}
+
+/// The checkout's changes, fingerprinted; empty when git can't say.
+fn fingerprint_now(root: &Path) -> Vec<String> {
+    changes(root)
+        .map(|files| fingerprints(root, &files))
+        .unwrap_or_default()
 }
 
 /// The operation git is in the middle of, if any. No switch is safe then:
@@ -409,7 +439,14 @@ fn stash_push(root: &Path, message: &str) -> Result<Option<String>, String> {
     let before: HashSet<String> = stash_entries(root).into_iter().map(|(c, _)| c).collect();
     run(
         root,
-        &["stash", "push", "--include-untracked", "-m", message],
+        &[
+            "stash",
+            "push",
+            "--quiet",
+            "--include-untracked",
+            "-m",
+            message,
+        ],
     )?;
     Ok(stash_entries(root)
         .into_iter()
@@ -418,19 +455,123 @@ fn stash_push(root: &Path, message: &str) -> Result<Option<String>, String> {
 }
 
 /// Apply the stash entry `commit` back and drop it. False when it would
-/// not apply, which leaves the entry where it is.
+/// not apply, which leaves the entry where it is. The drop names a
+/// position, so the position is checked against the commit right before —
+/// another checkout's push in between would otherwise drop its entry.
 fn stash_restore(root: &Path, commit: &str) -> bool {
     let applied = run(root, &["stash", "apply", "--quiet", "--index", commit]).is_ok()
         || run(root, &["stash", "apply", "--quiet", commit]).is_ok();
     if applied {
         if let Some(i) = stash_entries(root).iter().position(|(c, _)| c == commit) {
-            let _ = run(
-                root,
-                &["stash", "drop", "--quiet", &format!("stash@{{{i}}}")],
-            );
+            let entry = format!("stash@{{{i}}}");
+            if read(root, &["rev-parse", &entry]).is_ok_and(|c| c.trim() == commit) {
+                let _ = run(root, &["stash", "drop", "--quiet", &entry]);
+            }
         }
     }
     applied
+}
+
+/// The index file's bytes, saved before a commit or a discard rewrites it,
+/// to put back exactly — intent-to-add entries and all, which a
+/// `write-tree` / `read-tree` round trip loses.
+struct SavedIndex {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+fn save_index(root: &Path) -> Option<SavedIndex> {
+    let path = root.join(
+        read(root, &["rev-parse", "--git-path", "index"])
+            .ok()?
+            .trim(),
+    );
+    let bytes = std::fs::read(&path).ok()?;
+    Some(SavedIndex { path, bytes })
+}
+
+/// Write the saved index back the way git writes one — into
+/// `index.lock`, renamed over the index — so it never lands under a lock
+/// another git holds. False when the lock was taken or the write failed.
+fn restore_index(saved: &SavedIndex) -> bool {
+    let mut lock = saved.path.clone().into_os_string();
+    lock.push(".lock");
+    let lock = PathBuf::from(lock);
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+    else {
+        return false;
+    };
+    let written = file.write_all(&saved.bytes).and_then(|_| file.sync_all());
+    drop(file);
+    if written.is_ok() && std::fs::rename(&lock, &saved.path).is_ok() {
+        return true;
+    }
+    let _ = std::fs::remove_file(&lock);
+    false
+}
+
+/// Undo what a `git switch` wrote before it stopped part-way. A filter git
+/// cannot run — git-lfs missing from the TUI's PATH — kills the checkout
+/// after some of the target's files are on disk but before HEAD moves, and
+/// the stash can't be applied over them. Only a file byte-identical to the
+/// target's version is touched (a tracked one restored from HEAD, an
+/// untracked one removed), plus a tracked file the target lacks that is
+/// gone from disk (restored): anything else — a change the user or an
+/// agent made — is left alone, and nothing touched is lost, since the
+/// target branch still holds it.
+fn undo_partial_checkout(root: &Path, target: &str) -> Result<(), String> {
+    let now = changes(root)?;
+    if now.is_empty() {
+        return Ok(());
+    }
+    let theirs: HashMap<String, String> = read(root, &["ls-tree", "-r", "-z", target])?
+        .split('\0')
+        .filter_map(|entry| {
+            let (meta, path) = entry.split_once('\t')?;
+            let mut meta = meta.split_whitespace();
+            let (_, kind, sha) = (meta.next()?, meta.next()?, meta.next()?);
+            (kind == "blob").then(|| (path.to_string(), sha.to_string()))
+        })
+        .collect();
+    let candidates: Vec<&DiffFile> = now
+        .iter()
+        .filter(|f| theirs.contains_key(&f.path))
+        .filter(|f| std::fs::symlink_metadata(root.join(&f.path)).is_ok_and(|m| m.is_file()))
+        .collect();
+    let mut written: Vec<&DiffFile> = Vec::new();
+    for chunk in candidates.chunks(PATH_CHUNK) {
+        let mut args = vec!["hash-object", "--no-filters", "--"];
+        args.extend(chunk.iter().map(|f| f.path.as_str()));
+        let hashes = read(root, &args)?;
+        for (file, hash) in chunk.iter().zip(hashes.lines()) {
+            if theirs.get(&file.path).is_some_and(|sha| sha == hash.trim()) {
+                written.push(file);
+            }
+        }
+    }
+    let restore: Vec<&str> = written
+        .iter()
+        .filter(|f| !f.is_untracked())
+        .map(|f| f.path.as_str())
+        .chain(
+            now.iter()
+                .filter(|f| f.xy == [' ', 'D'] && !theirs.contains_key(&f.path))
+                .map(|f| f.path.as_str()),
+        )
+        .collect();
+    for chunk in restore.chunks(PATH_CHUNK) {
+        let mut args = vec!["--literal-pathspecs", "checkout", "-q", "HEAD", "--"];
+        args.extend(chunk.iter().copied());
+        run(root, &args)?;
+    }
+    for file in written.iter().filter(|f| f.is_untracked()) {
+        std::fs::remove_file(root.join(&file.path))
+            .map_err(|e| format!("couldn't remove {}: {e}", file.path))?;
+    }
+    Ok(())
 }
 
 /// How uncommitted changes travel with a switch.
@@ -450,9 +591,9 @@ pub enum Carry {
     Commit(String),
     /// `git switch --discard-changes`, after unstaging everything: a staged
     /// file that was never committed would otherwise be deleted, and the
-    /// prompt promises untracked files stay. Carries the changes the prompt
-    /// showed ([`file_key`]s); if the checkout no longer matches them,
-    /// nothing is discarded and the prompt asks again.
+    /// prompt promises untracked files stay. Carries the [`fingerprints`]
+    /// of the changes the prompt showed; if the checkout no longer matches
+    /// them, nothing is discarded and the prompt asks again.
     Discard(Vec<String>),
     /// `git switch --create`: a new branch off HEAD, which every change
     /// comes along to.
@@ -469,15 +610,24 @@ pub enum Outcome {
         note: Option<String>,
     },
     /// The checkout has these changes and the switch needs an answer about
-    /// them; nothing was touched.
-    Dirty(Vec<DiffFile>),
+    /// them; nothing was touched. `keys` are their [`fingerprints`].
+    Dirty {
+        files: Vec<DiffFile>,
+        keys: Vec<String>,
+    },
+    /// Nothing moved: the checkout is as the prompt left it.
     Failed(String),
+    /// The switch failed and the checkout is no longer what the prompt
+    /// listed — a commit went in, or git left something behind — so the
+    /// prompt's list is stale.
+    Stopped(String),
 }
 
 /// Move the checkout at `root` from `from` onto `target`, carrying its
 /// changes as `carry` says. Nothing runs mid-merge or with conflicts, and a
-/// switch git refuses leaves the checkout as it found it: a stash is
-/// applied back, a discard's unstaging undone.
+/// switch git refuses leaves the checkout as it found it: what git wrote
+/// before stopping part-way is undone, a stash applied back, a discard's
+/// unstaging put back.
 pub fn switch(root: &Path, from: &str, target: &Branch, carry: &Carry) -> Outcome {
     let to = target.local_name().to_string();
     if let Some(what) = in_progress(root) {
@@ -501,15 +651,32 @@ pub fn switch(root: &Path, from: &str, target: &Branch, carry: &Carry) -> Outcom
 
     let mut note: Option<String> = None;
     let mut stash: Option<String> = None;
-    let mut unstaged_index: Option<String> = None;
+    let mut saved_index: Option<SavedIndex> = None;
     let mut args = vec!["switch", "--quiet"];
     match carry {
         Carry::Ask => {
             if !files.is_empty() {
-                return Outcome::Dirty(files);
+                let keys = fingerprints(root, &files);
+                return Outcome::Dirty { files, keys };
             }
         }
-        Carry::Bring | Carry::Create => {}
+        Carry::Bring => {}
+        Carry::Create => {
+            // `origin/x` as a local name would shadow the remote branch
+            // everywhere git resolves the name.
+            let remotes = read(root, &["remote"]).unwrap_or_default();
+            let prefix = |r: &str| format!("{r}/");
+            if let Some(remote) = remotes
+                .lines()
+                .map(str::trim)
+                .find(|r| !r.is_empty() && target.name.starts_with(&prefix(r)))
+            {
+                return Outcome::Failed(format!(
+                    "a branch named {} would be mistaken for {remote}'s — pick another name",
+                    target.name
+                ));
+            }
+        }
         Carry::Stash => {
             let message = format!("nebula: {from} before switching to {to}");
             match stash_push(root, &message) {
@@ -531,7 +698,7 @@ pub fn switch(root: &Path, from: &str, target: &Branch, carry: &Carry) -> Outcom
             }
             // A failing hook must not leave the user's staging replaced by
             // "everything": the index goes back as it was.
-            let index = read(root, &["write-tree"]).map(|t| t.trim().to_string());
+            let saved = save_index(root);
             let excludes: Vec<String> = nested
                 .iter()
                 .map(|f| format!(":(exclude,literal){}", f.path))
@@ -545,8 +712,8 @@ pub fn switch(root: &Path, from: &str, target: &Branch, carry: &Carry) -> Outcom
                         .map_err(|e| format!("commit failed: {e}"))
                 });
             if let Err(e) = committed {
-                if let Ok(tree) = &index {
-                    let _ = run(root, &["read-tree", tree]);
+                if let Some(saved) = &saved {
+                    restore_index(saved);
                 }
                 return Outcome::Failed(e);
             }
@@ -554,13 +721,11 @@ pub fn switch(root: &Path, from: &str, target: &Branch, carry: &Carry) -> Outcom
             note = Some(format!("committed {} on {from}", sha.trim()));
         }
         Carry::Discard(expected) => {
-            let now: Vec<String> = files.iter().map(file_key).collect();
-            if &now != expected {
-                return Outcome::Dirty(files);
+            let keys = fingerprints(root, &files);
+            if &keys != expected {
+                return Outcome::Dirty { files, keys };
             }
-            unstaged_index = read(root, &["write-tree"])
-                .ok()
-                .map(|t| t.trim().to_string());
+            saved_index = save_index(root);
             if let Err(e) = run(root, &["reset", "--quiet"]) {
                 return Outcome::Failed(format!("unstaging failed: {e}"));
             }
@@ -575,6 +740,10 @@ pub fn switch(root: &Path, from: &str, target: &Branch, carry: &Carry) -> Outcom
     }
     args.push(&target.name);
 
+    // What the checkout holds as the switch starts — clean for a stash, a
+    // commit or a clean checkout — to tell a refused switch from one git
+    // abandoned part-way.
+    let before = fingerprint_now(root);
     let error = match run(root, &args) {
         Ok(_) => return Outcome::Switched { branch: to, note },
         Err(e) => e,
@@ -593,21 +762,36 @@ pub fn switch(root: &Path, from: &str, target: &Branch, carry: &Carry) -> Outcom
             note: Some(note),
         };
     }
-    let error = if error.contains("would be overwritten") {
+    let mut error = if error.contains("would be overwritten") {
         format!("files in the checkout collide with {to} — stash or commit them instead")
     } else {
         error
     };
-    if let Some(tree) = &unstaged_index {
-        let _ = run(root, &["read-tree", tree]);
+    let mut changed = false;
+    if fingerprint_now(root) != before {
+        let undone = undo_partial_checkout(root, &target.name);
+        if undone.is_ok() && fingerprint_now(root) == before {
+            error = format!("{error} (git stopped part-way; what it wrote was put back)");
+        } else {
+            changed = true;
+            error = format!(
+                "{error} — git stopped part-way and left files from {to} in the checkout; check git status"
+            );
+        }
+    }
+    if let Some(saved) = &saved_index {
+        restore_index(saved);
     }
     if let Some(entry) = &stash {
         if !stash_restore(root, entry) {
-            return Outcome::Failed(format!("{error} (your changes are still in the stash)"));
+            return Outcome::Stopped(format!("{error} (your changes are still in the stash)"));
         }
     }
     if let (Carry::Commit(_), Some(note)) = (carry, note) {
-        return Outcome::Failed(format!("{note}, but the switch failed: {error}"));
+        return Outcome::Stopped(format!("{note}, but the switch failed: {error}"));
+    }
+    if changed {
+        return Outcome::Stopped(error);
     }
     Outcome::Failed(error)
 }
@@ -645,9 +829,10 @@ pub struct Job {
     pub request: u64,
     pub target: Branch,
     pub carry: Carry,
-    /// What the DIRTY prompt listed (empty for a clean switch), so a
-    /// failure goes back to the prompt it came from.
+    /// What the DIRTY prompt listed (empty for a clean switch) and its
+    /// fingerprints, so a failure goes back to the prompt it came from.
     pub files: Vec<DiffFile>,
+    pub keys: Vec<String>,
 }
 
 /// The switcher's state that outlives the modal, on `App::branch_switch`.
@@ -729,9 +914,7 @@ impl Choice {
                 "unavailable: HEAD is detached, the commit would belong to no branch".into()
             }
             Choice::Commit => format!("commit everything on {from} first, untracked files too"),
-            Choice::Discard => {
-                "throw away changes to tracked files; untracked and new files stay".into()
-            }
+            Choice::Discard => "throw away tracked changes; untracked and new files stay".into(),
         }
     }
 
@@ -746,10 +929,12 @@ pub enum Stage {
     /// Filtering the list.
     Pick,
     /// The checkout has changes: how should they travel to `target`?
-    /// `discard_armed` is the first press of the destructive choice.
+    /// `keys` fingerprint them as shown; `discard_armed` is the first press
+    /// of the destructive choice.
     Dirty {
         target: Branch,
         files: Vec<DiffFile>,
+        keys: Vec<String>,
         choice: usize,
         discard_armed: bool,
     },
@@ -757,6 +942,7 @@ pub enum Stage {
     Commit {
         target: Branch,
         files: Vec<DiffFile>,
+        keys: Vec<String>,
         message: TextInput,
     },
     /// git is running.
@@ -1211,7 +1397,7 @@ fn land_switch(app: &mut App, worktree: WorktreeId, request: u64, outcome: Outco
                 None => format!("⌂ root is on {branch}"),
             });
         }
-        Outcome::Dirty(files) if showing => {
+        Outcome::Dirty { files, keys } if showing => {
             if let Some(view) = view_for(app, &worktree) {
                 view.changes = Some(files.len());
                 if matches!(job.carry, Carry::Discard(_)) {
@@ -1222,12 +1408,13 @@ fn land_switch(app: &mut App, worktree: WorktreeId, request: u64, outcome: Outco
                 view.stage = Stage::Dirty {
                     target: job.target,
                     files,
+                    keys,
                     choice: 0,
                     discard_armed: false,
                 };
             }
         }
-        Outcome::Dirty(files) => {
+        Outcome::Dirty { files, .. } => {
             app.flash = Some(format!(
                 "not switched: {from} has {} — c to choose what happens to them",
                 changes_text(files.len())
@@ -1242,6 +1429,7 @@ fn land_switch(app: &mut App, worktree: WorktreeId, request: u64, outcome: Outco
                     Stage::Dirty {
                         target: job.target,
                         files: job.files,
+                        keys: job.keys,
                         choice,
                         discard_armed: false,
                     }
@@ -1249,7 +1437,21 @@ fn land_switch(app: &mut App, worktree: WorktreeId, request: u64, outcome: Outco
                 view.status = Some(Status::error(error));
             }
         }
-        Outcome::Failed(error) => app.flash = Some(format!("switch branch failed: {error}")),
+        // The prompt's list no longer describes the checkout: back to the
+        // branches, with the count asked for again.
+        Outcome::Stopped(error) if showing => {
+            let root = view_for(app, &worktree).map(|view| {
+                view.stage = Stage::Pick;
+                view.status = Some(Status::error(error));
+                view.root.clone()
+            });
+            if let Some(root) = root {
+                request_list(app, worktree, root);
+            }
+        }
+        Outcome::Failed(error) | Outcome::Stopped(error) => {
+            app.flash = Some(format!("switch branch failed: {error}"))
+        }
     }
 }
 
@@ -1264,7 +1466,13 @@ fn carry_choice(carry: &Carry) -> Choice {
 
 /// Run a switch off the loop (inline in the unit tests) — unless one is
 /// already running in the checkout.
-fn start_switch(app: &mut App, target: Branch, carry: Carry, files: Vec<DiffFile>) {
+fn start_switch(
+    app: &mut App,
+    target: Branch,
+    carry: Carry,
+    files: Vec<DiffFile>,
+    keys: Vec<String>,
+) {
     let Some(Overlay::BranchSwitch(view)) = &mut app.overlay else {
         return;
     };
@@ -1281,6 +1489,7 @@ fn start_switch(app: &mut App, target: Branch, carry: Carry, files: Vec<DiffFile
         target,
         carry,
         files,
+        keys,
     };
     shared.switching.insert(view.worktree.clone(), job.clone());
     let (worktree, root, from) = (
@@ -1329,7 +1538,8 @@ fn activate_selected(app: &mut App) {
         // an IDE's switcher offers to.
         let name = view.query.as_str().trim().to_string();
         if view.listed && !name.is_empty() {
-            start_switch(app, Branch::new_local(name), Carry::Create, Vec::new());
+            let target = Branch::new_local(name);
+            start_switch(app, target, Carry::Create, Vec::new(), Vec::new());
         }
         return;
     };
@@ -1345,7 +1555,7 @@ fn activate_selected(app: &mut App) {
         )));
         return;
     }
-    start_switch(app, branch, Carry::Ask, Vec::new());
+    start_switch(app, branch, Carry::Ask, Vec::new(), Vec::new());
 }
 
 /// `Ctrl+r`: fetch the remotes now, past the minute's gap, and list again.
@@ -1368,6 +1578,7 @@ fn choose(app: &mut App, choice: Choice) {
     let Stage::Dirty {
         target,
         files,
+        keys,
         choice: at,
         discard_armed,
     } = &mut view.stage
@@ -1377,10 +1588,10 @@ fn choose(app: &mut App, choice: Choice) {
     let armed = *discard_armed && *at == choice.index();
     *at = choice.index();
     *discard_armed = false;
-    let (target, files) = (target.clone(), files.clone());
+    let (target, files, keys) = (target.clone(), files.clone(), keys.clone());
     match choice {
-        Choice::Stash => start_switch(app, target, Carry::Stash, files),
-        Choice::Bring => start_switch(app, target, Carry::Bring, files),
+        Choice::Stash => start_switch(app, target, Carry::Stash, files, keys),
+        Choice::Bring => start_switch(app, target, Carry::Bring, files, keys),
         Choice::Commit if detached => {
             view.status = Some(Status::error(
                 "HEAD is detached — a commit here would belong to no branch; stash instead",
@@ -1391,12 +1602,13 @@ fn choose(app: &mut App, choice: Choice) {
             view.stage = Stage::Commit {
                 target,
                 files,
+                keys,
                 message: TextInput::new(),
             };
         }
         Choice::Discard if armed => {
-            let expected = files.iter().map(file_key).collect();
-            start_switch(app, target, Carry::Discard(expected), files);
+            let carry = Carry::Discard(keys.clone());
+            start_switch(app, target, carry, files, keys);
         }
         Choice::Discard => {
             if let Stage::Dirty { discard_armed, .. } = &mut view.stage {
@@ -1471,12 +1683,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         Stage::Commit {
             target,
             files,
+            keys,
             message,
         } => match key.code {
             KeyCode::Esc => {
                 view.stage = Stage::Dirty {
                     target: target.clone(),
                     files: files.clone(),
+                    keys: keys.clone(),
                     choice: Choice::Commit.index(),
                     discard_armed: false,
                 };
@@ -1487,8 +1701,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 if text.is_empty() {
                     view.status = Some(Status::error("type a commit message first"));
                 } else {
-                    let (target, files) = (target.clone(), files.clone());
-                    start_switch(app, target, Carry::Commit(text), files);
+                    let (target, files, keys) = (target.clone(), files.clone(), keys.clone());
+                    start_switch(app, target, Carry::Commit(text), files, keys);
                 }
             }
             _ => {
@@ -1574,7 +1788,7 @@ pub fn footer_hint(view: &BranchSwitchView) -> &'static str {
         Stage::Pick => "type: filter  ↑/↓ ^n/^p: move  Enter: switch (nothing matching: create)  ^r: fetch  Esc: clear/close",
         Stage::Dirty { .. } => "s: stash  b: bring along  c: commit  d: discard  ↑/↓ Enter: choose  Esc: back to the list",
         Stage::Commit { .. } => "type the commit message  Enter: commit & switch  Esc: back",
-        Stage::Working(_) => "git is running  Esc: hide (c shows it again; the result lands in the footer)",
+        Stage::Working(_) => "git is running  Esc: hide (c shows it again; a result that lands while hidden goes to the footer)",
     }
 }
 
@@ -1714,6 +1928,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &BranchSwitchView, th: Th
             files,
             choice,
             discard_armed,
+            ..
         } => {
             choices_area = draw_dirty(f, view, target, files, *choice, *discard_armed, body, th);
         }
@@ -1725,6 +1940,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &BranchSwitchView, th: Th
             target,
             files,
             message,
+            ..
         } => draw_commit(f, view, target, files, message, body, th),
         Stage::Pick | Stage::Working(_) => {
             (list_area, selected) = draw_list(f, view, body, th);
@@ -2038,6 +2254,32 @@ mod tests {
         repo
     }
 
+    /// A branch `lfs` whose checkout dies part-way, the way one does when
+    /// git-lfs is missing from PATH: its `.gitattributes` names a required
+    /// process filter whose binary does not exist, so git writes `a.txt`
+    /// and `.gitattributes`, fails on the first filtered file, and exits
+    /// with HEAD unmoved.
+    fn lfs_branch(repo: &Path) {
+        git(repo, &["switch", "-q", "-c", "lfs"]);
+        std::fs::write(repo.join("a.txt"), "lfs\n").unwrap();
+        std::fs::write(repo.join("p1.txt"), "large\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "files"]);
+        std::fs::write(repo.join(".gitattributes"), "p*.txt filter=broken\n").unwrap();
+        git(repo, &["add", ".gitattributes"]);
+        git(repo, &["commit", "-q", "-m", "attributes"]);
+        git(repo, &["switch", "-q", "main"]);
+        git(
+            repo,
+            &[
+                "config",
+                "filter.broken.process",
+                "no-such-git-lfs filter-process",
+            ],
+        );
+        git(repo, &["config", "filter.broken.required", "true"]);
+    }
+
     fn head(repo: &Path) -> String {
         git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
     }
@@ -2065,7 +2307,7 @@ mod tests {
     }
 
     fn keys(repo: &Path) -> Vec<String> {
-        changes(repo).unwrap().iter().map(file_key).collect()
+        fingerprint_now(repo)
     }
 
     fn record(
@@ -2216,10 +2458,12 @@ mod tests {
         let repo = repo(&dir);
         std::fs::write(repo.join("b.txt"), "edited\n").unwrap();
         std::fs::write(repo.join("new.txt"), "untracked\n").unwrap();
-        let Outcome::Dirty(files) = switch(&repo, "main", &local("feature"), &Carry::Ask) else {
+        let Outcome::Dirty { files, keys } = switch(&repo, "main", &local("feature"), &Carry::Ask)
+        else {
             panic!("a dirty checkout must ask");
         };
         assert_eq!(files.len(), 2);
+        assert_eq!(keys.len(), 2);
         assert_eq!(head(&repo), "main");
         assert_eq!(read_file(&repo, "b.txt"), "edited\n");
     }
@@ -2312,6 +2556,56 @@ mod tests {
     }
 
     #[test]
+    fn a_checkout_git_abandons_part_way_is_undone_and_the_stash_applied_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(&dir);
+        lfs_branch(&repo);
+        std::fs::write(repo.join("a.txt"), "mine\n").unwrap();
+        std::fs::write(repo.join("mine.txt"), "an untracked file of mine\n").unwrap();
+        let Outcome::Failed(error) = switch(&repo, "main", &local("lfs"), &Carry::Stash) else {
+            panic!("the checkout dies, and is put back");
+        };
+        assert!(error.contains("part-way"), "{error}");
+        assert_eq!(head(&repo), "main");
+        assert_eq!(
+            read_file(&repo, "a.txt"),
+            "mine\n",
+            "the stash applied back"
+        );
+        assert_eq!(read_file(&repo, "mine.txt"), "an untracked file of mine\n");
+        assert!(
+            !repo.join(".gitattributes").exists(),
+            "what git wrote is gone"
+        );
+        assert_eq!(git(&repo, &["stash", "list"]), "");
+    }
+
+    #[test]
+    fn a_part_way_checkout_leaves_an_edit_that_is_not_the_targets_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(&dir);
+        lfs_branch(&repo);
+        let Outcome::Failed(error) = switch(&repo, "main", &local("lfs"), &Carry::Ask) else {
+            panic!("a clean checkout's part-way switch is undone");
+        };
+        assert!(error.contains("part-way"), "{error}");
+        assert_eq!(read_file(&repo, "a.txt"), "main\n");
+        assert!(changes(&repo).unwrap().is_empty());
+
+        // Bring: the user's own edit is not the target's bytes, so the undo
+        // must not touch it — the switch is reported as having changed the
+        // checkout only if git's writes could not all be undone.
+        std::fs::write(repo.join("b.txt"), "edited\n").unwrap();
+        let outcome = switch(&repo, "main", &local("lfs"), &Carry::Bring);
+        assert!(
+            matches!(&outcome, Outcome::Failed(e) if e.contains("part-way")),
+            "{outcome:?}"
+        );
+        assert_eq!(read_file(&repo, "b.txt"), "edited\n");
+        assert_eq!(read_file(&repo, "a.txt"), "main\n");
+    }
+
+    #[test]
     fn a_failing_post_checkout_hook_is_still_a_switch_and_the_stash_stays_put() {
         let dir = tempfile::tempdir().unwrap();
         let repo = repo(&dir);
@@ -2395,12 +2689,14 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_a_hook_refuses_puts_the_staging_back_as_it_was() {
+    fn a_commit_a_hook_refuses_puts_the_index_back_exactly() {
         let dir = tempfile::tempdir().unwrap();
         let repo = repo(&dir);
         hook(&repo, "pre-commit", "exit 1");
         std::fs::write(repo.join("b.txt"), "staged\n").unwrap();
         git(&repo, &["add", "b.txt"]);
+        std::fs::write(repo.join("ita.txt"), "intent to add\n").unwrap();
+        git(&repo, &["add", "-N", "ita.txt"]);
         std::fs::write(repo.join("new.txt"), "not staged\n").unwrap();
         let carry = Carry::Commit("blocked".into());
         let Outcome::Failed(error) = switch(&repo, "main", &local("feature"), &carry) else {
@@ -2408,6 +2704,12 @@ mod tests {
         };
         assert!(error.starts_with("commit failed"), "{error}");
         assert_eq!(git(&repo, &["diff", "--cached", "--name-only"]), "b.txt");
+        let status = git(&repo, &["status", "--porcelain"]);
+        assert!(
+            status.contains(" A ita.txt"),
+            "intent-to-add survives: {status}"
+        );
+        assert!(status.contains("?? new.txt"), "{status}");
         assert_eq!(head(&repo), "main");
     }
 
@@ -2459,10 +2761,17 @@ mod tests {
         std::fs::write(repo.join("b.txt"), "an agent wrote this meanwhile\n").unwrap();
         let outcome = switch(&repo, "main", &local("feature"), &Carry::Discard(stale));
         assert!(
-            matches!(&outcome, Outcome::Dirty(files) if files.len() == 2),
+            matches!(&outcome, Outcome::Dirty { files, .. } if files.len() == 2),
             "{outcome:?}"
         );
         assert_eq!(read_file(&repo, "b.txt"), "an agent wrote this meanwhile\n");
+
+        // Another edit to a file the prompt already listed moves it too.
+        let shown = keys(&repo);
+        std::fs::write(repo.join("a.txt"), "collides, and then some more\n").unwrap();
+        let outcome = switch(&repo, "main", &local("feature"), &Carry::Discard(shown));
+        assert!(matches!(outcome, Outcome::Dirty { .. }), "{outcome:?}");
+        assert_eq!(read_file(&repo, "a.txt"), "collides, and then some more\n");
         assert_eq!(head(&repo), "main");
     }
 
@@ -2491,14 +2800,25 @@ mod tests {
     }
 
     #[test]
-    fn create_starts_a_branch_off_head_with_the_changes_along() {
+    fn create_starts_a_branch_off_head_with_the_changes_along_but_never_a_remotes_name() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = repo(&dir);
-        std::fs::write(repo.join("b.txt"), "edited\n").unwrap();
-        let outcome = switch(&repo, "main", &local("brand-new"), &Carry::Create);
+        let origin = repo(&dir);
+        git(
+            dir.path(),
+            &["clone", "-q", origin.to_str().unwrap(), "clone"],
+        );
+        let clone = dir.path().join("clone");
+        std::fs::write(clone.join("b.txt"), "edited\n").unwrap();
+        let Outcome::Failed(error) = switch(&clone, "main", &local("origin/x"), &Carry::Create)
+        else {
+            panic!("origin/x would shadow the remote branch");
+        };
+        assert!(error.contains("origin"), "{error}");
+
+        let outcome = switch(&clone, "main", &local("brand-new"), &Carry::Create);
         assert!(matches!(outcome, Outcome::Switched { .. }), "{outcome:?}");
-        assert_eq!(head(&repo), "brand-new");
-        assert_eq!(read_file(&repo, "b.txt"), "edited\n");
+        assert_eq!(head(&clone), "brand-new");
+        assert_eq!(read_file(&clone, "b.txt"), "edited\n");
     }
 
     #[test]
@@ -2788,6 +3108,45 @@ mod tests {
         assert_eq!(head(&repo), "main");
     }
 
+    /// A switch that failed after changing the checkout — a commit that went
+    /// in — can't go back to a prompt listing changes that are gone: it lands
+    /// on the list with the reason, and the count is asked for again.
+    #[test]
+    fn a_stopped_switch_lands_on_the_list_not_a_stale_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(&dir);
+        std::fs::write(repo.join("a.txt"), "collides\n").unwrap();
+        let mut app = app_on(&repo);
+        open_for(&mut app, &w1());
+        let files = changes(&repo).unwrap();
+        let job = Job {
+            request: 1,
+            target: local("feature"),
+            carry: Carry::Commit("went in".into()),
+            keys: fingerprints(&repo, &files),
+            files,
+        };
+        app.branch_switch.switching.insert(w1(), job.clone());
+        view_mut(&mut app).stage = Stage::Working(job);
+        land_answer(
+            &mut app,
+            Answer::Switched {
+                worktree: w1(),
+                request: 1,
+                outcome: Outcome::Stopped("committed abc on main, but the switch failed".into()),
+            },
+        );
+        let v = view(&app);
+        assert!(matches!(v.stage, Stage::Pick), "{:?}", v.stage);
+        assert!(v
+            .status
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("but the switch failed"));
+        assert_eq!(v.changes, Some(1), "asked again");
+    }
+
     /// One switch per checkout: a running one reopens as the working modal,
     /// `Enter` can't start a second, and the answer to a hidden modal lands
     /// in the footer — including a dirty checkout, which has to be said.
@@ -2801,6 +3160,7 @@ mod tests {
             target: local("feature"),
             carry: Carry::Ask,
             files: Vec::new(),
+            keys: Vec::new(),
         };
         app.branch_switch.switching.insert(w1(), job);
         app.branch_switch.requests = 7;
@@ -2836,22 +3196,26 @@ mod tests {
         );
         assert!(app.branch_switch.switching.contains_key(&w1()));
 
+        let files = vec![DiffFile {
+            path: "a.txt".into(),
+            orig_path: None,
+            xy: [' ', 'M'],
+        }];
         land_answer(
             &mut app,
             Answer::Switched {
                 worktree: w1(),
                 request: 7,
-                outcome: Outcome::Dirty(changes(&repo).unwrap()),
+                outcome: Outcome::Dirty {
+                    files,
+                    keys: Vec::new(),
+                },
             },
         );
         assert!(app.branch_switch.switching.is_empty());
-        assert!(
-            app.flash
-                .as_deref()
-                .unwrap()
-                .starts_with("not switched: main has 0"),
-            "{:?}",
-            app.flash
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("not switched: main has 1 uncommitted change — c to choose what happens to them")
         );
     }
 
@@ -2861,7 +3225,7 @@ mod tests {
         let mut main = local("main");
         main.current = true;
         let rows = vec![main, local("feature"), local("other")];
-        app.branch_switch.lists.insert(w1(), rows.clone());
+        app.branch_switch.lists.insert(w1(), rows);
         app.tree.worktrees[0].branch = "feature".into();
         open_for(&mut app, &w1());
         let v = view(&app);
@@ -2878,15 +3242,15 @@ mod tests {
         // Untouched, a landing listing sends the cursor home; moved, it
         // keeps its branch.
         let mut v = BranchSwitchView::new(w1(), "/x".into(), "demo".into(), "main".into(), 0);
-        v.set_branches(parse_rows(&["*main", "feature", "other"]));
+        v.set_branches(rows_named(&["*main", "feature", "other"]));
         assert_eq!(v.selected_branch().unwrap().name, "feature");
         v.select(2);
-        v.set_branches(parse_rows(&["*main", "other", "feature"]));
+        v.set_branches(rows_named(&["*main", "other", "feature"]));
         assert_eq!(v.selected_branch().unwrap().name, "other");
     }
 
     /// Rows from names, `*` marking the current one.
-    fn parse_rows(names: &[&str]) -> Vec<Branch> {
+    fn rows_named(names: &[&str]) -> Vec<Branch> {
         names
             .iter()
             .map(|n| {
