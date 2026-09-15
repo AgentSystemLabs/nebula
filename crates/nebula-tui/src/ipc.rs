@@ -84,7 +84,7 @@ fn spawn_daemon() -> Result<()> {
 }
 
 // Avoid a libc dependency for one call (same pattern as nebula-core's geteuid).
-fn libc_setsid() -> i32 {
+pub(crate) fn libc_setsid() -> i32 {
     extern "C" {
         fn setsid() -> i32;
     }
@@ -92,6 +92,9 @@ fn libc_setsid() -> i32 {
 }
 
 async fn handshake(mut stream: UnixStream) -> Result<Connection> {
+    // Asked of the kernel before the daemon gets a word in: a daemon on
+    // another protocol hangs up right after its answer.
+    let listener_pid = peer_pid(&stream);
     write_frame(
         &mut stream,
         &ClientRequest::Hello {
@@ -103,9 +106,17 @@ async fn handshake(mut stream: UnixStream) -> Result<Connection> {
         Some(ServerEvent::HelloOk { daemon_pid, .. }) => Ok(Connection { stream, daemon_pid }),
         Some(ServerEvent::Incompatible {
             daemon_protocol_version,
-        }) => bail!(version_skew_message(daemon_protocol_version)),
+        }) => bail!(version_skew_message(daemon_protocol_version, listener_pid)),
         other => bail!("unexpected handshake reply: {other:?}"),
     }
+}
+
+/// The pid of the process listening on the far end of `stream`, from the
+/// kernel's peer credentials (`SO_PEERCRED`, `LOCAL_PEEREPID`) — which need
+/// neither a protocol the daemon speaks nor a pidfile that is still there.
+fn peer_pid(stream: &UnixStream) -> Option<i32> {
+    let pid = stream.peer_cred().ok()?.pid()?;
+    (pid > 1 && pid.unsigned_abs() != std::process::id()).then_some(pid)
 }
 
 /// Explain a failed version handshake in terms of the fix.
@@ -118,11 +129,21 @@ async fn handshake(mut stream: UnixStream) -> Result<Connection> {
 /// skew survives every restart. That is the common shape in a checkout,
 /// where `make dev` runs `target/debug` while PATH still finds an older
 /// `nebula` from the last `make install`.
-fn version_skew_message(daemon_protocol_version: u32) -> String {
+///
+/// `daemon_pid` comes off the socket, so the message can name the process
+/// even when its pidfile is gone — and offer the plain SIGTERM that stops it
+/// cleanly if `nebula kill` somehow can't, before anyone reaches for `-9`.
+fn version_skew_message(daemon_protocol_version: u32, daemon_pid: Option<i32>) -> String {
     let client = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".into());
-    let daemon = daemon_exe_path().unwrap_or_else(|| "unknown".into());
+    let daemon = match daemon_pid {
+        Some(pid) => format!(
+            "{} (pid {pid})",
+            daemon_exe_path(pid).unwrap_or_else(|| "unknown".into())
+        ),
+        None => "unknown".into(),
+    };
     let header = format!(
         "protocol mismatch: the daemon speaks v{daemon_protocol_version}, this client \
          v{PROTOCOL_VERSION}\n  this client: {client}\n  the daemon:  {daemon}\n"
@@ -134,30 +155,33 @@ fn version_skew_message(daemon_protocol_version: u32) -> String {
              build over this one instead (`make install` from that checkout)."
         )
     } else {
+        let by_hand = daemon_pid
+            .map(|pid| {
+                format!(
+                    " Should that fail, `kill {pid}` asks the daemon for the same clean \
+                     shutdown — never `kill -9`, which skips flushing its database."
+                )
+            })
+            .unwrap_or_default();
         format!(
             "{header}The daemon is the older build — run `nebula kill` and relaunch. That \
-             stops every live session."
+             stops every live session.{by_hand}"
         )
     }
 }
 
-/// Best-effort path of the binary the running daemon was launched from, so
-/// the mismatch message can name it. Read from the pidfile rather than the
+/// Best-effort path of the binary the daemon at `pid` was launched from, so
+/// the mismatch message can name it. Asked of the OS rather than the
 /// handshake: `Incompatible` is what a *newer* daemon sends an older client,
 /// so adding a field to it would only break decoding on the clients that
 /// need this message most. The buildstamp beside the pidfile is no help
 /// either — it is a content hash, not a path.
-fn daemon_exe_path() -> Option<String> {
-    let pid = std::fs::read_to_string(paths::pidfile_path()).ok()?;
-    let pid = pid.trim();
-    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
+fn daemon_exe_path(pid: i32) -> Option<String> {
     if let Ok(path) = std::fs::read_link(format!("/proc/{pid}/exe")) {
         return Some(path.display().to_string());
     }
     let out = std::process::Command::new("ps")
-        .args(["-p", pid, "-o", "comm="])
+        .args(["-p", &pid.to_string(), "-o", "comm="])
         .output()
         .ok()?;
     let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -599,21 +623,46 @@ pub async fn run_workspace_op(op: WorkspaceOp) -> Result<()> {
 ///
 /// A daemon on a different protocol version closes the socket right after
 /// the handshake, so `Shutdown` can never reach it — exactly the situation
-/// `nebula kill` exists to fix. Fall back to SIGTERM via the pidfile, guarded
-/// by the daemon's flock so a stale pid is never signalled.
+/// `nebula kill` exists to fix. Fall back to SIGTERM, which its handler turns
+/// into the same clean shutdown, at the pid the kernel says is listening on
+/// the socket — the very daemon the handshake just failed with. Only when the
+/// kernel can't say does the pidfile decide, guarded by the daemon's flock so
+/// a stale pid is never signalled. The pidfile can't come first: macOS's
+/// tmp_cleaner deletes regular files in /tmp untouched for three days but
+/// spares sockets, so a daemon that has been up that long — on any version
+/// before the one that refreshes its pidfile — is still listening with no
+/// pidfile beside it (#68), and a refreshing daemon re-creates the file
+/// locked a moment before it writes the pid in.
 pub async fn kill_daemon() -> Result<bool> {
-    let sock = paths::socket_path();
-    if let Ok(stream) = try_connect(&sock).await {
-        if let Ok(mut conn) = handshake(stream).await {
-            write_frame(&mut conn.stream, &ClientRequest::Shutdown).await?;
-            wait_for_daemon_exit().await;
+    kill_daemon_at(&paths::socket_path(), &paths::pidfile_path()).await
+}
+
+async fn kill_daemon_at(sock: &std::path::Path, pidfile: &std::path::Path) -> Result<bool> {
+    let Ok(stream) = try_connect(sock).await else {
+        // Nothing listening — but a wedged or mid-boot daemon may still hold
+        // the pidfile lock; fall through to the same check.
+        return kill_by_pidfile(pidfile).await;
+    };
+    let listener_pid = peer_pid(&stream);
+    if let Ok(mut conn) = handshake(stream).await {
+        write_frame(&mut conn.stream, &ClientRequest::Shutdown).await?;
+        wait_for_daemon_exit(pidfile, conn.daemon_pid as i32).await;
+        return Ok(true);
+    }
+    let Some(pid) = listener_pid else {
+        if kill_by_pidfile(pidfile).await? {
             return Ok(true);
         }
-        return kill_by_pidfile().await;
-    }
-    // Nothing listening — but a wedged or mid-boot daemon may still hold the
-    // pidfile lock; fall through to the same check.
-    kill_by_pidfile().await
+        bail!(
+            "a nebula daemon is listening on {} but this build can't talk to it or find its \
+             pid — look it up with `pgrep -f 'nebula daemon'` and stop it with `kill <pid>` \
+             (never `kill -9`, which skips flushing its database)",
+            sock.display()
+        );
+    };
+    terminate(pid)?;
+    wait_for_daemon_exit(pidfile, pid).await;
+    Ok(true)
 }
 
 /// Outcome of `shutdown_if_idle`.
@@ -654,7 +703,7 @@ pub async fn shutdown_if_idle() -> Result<IdleShutdown> {
                     return Ok(IdleShutdown::SessionsLive { count: live });
                 }
                 write_frame(&mut conn.stream, &ClientRequest::Shutdown).await?;
-                wait_for_daemon_exit().await;
+                wait_for_daemon_exit(&paths::pidfile_path(), conn.daemon_pid as i32).await;
                 return Ok(IdleShutdown::ShutDown);
             }
             Some(_) => continue,
@@ -664,22 +713,29 @@ pub async fn shutdown_if_idle() -> Result<IdleShutdown> {
 }
 
 /// SIGTERM the daemon recorded in the pidfile (its SIGTERM handler runs the
-/// same clean shutdown as `Shutdown`). Ok(false) when no daemon is alive.
-async fn kill_by_pidfile() -> Result<bool> {
-    let path = paths::pidfile_path();
-    if !daemon_holds_pidfile_lock(&path) {
+/// same clean shutdown as `Shutdown`). Ok(false) when no daemon holds it.
+async fn kill_by_pidfile(path: &std::path::Path) -> Result<bool> {
+    if !daemon_holds_pidfile_lock(path) {
         return Ok(false);
     }
-    let pid: i32 = std::fs::read_to_string(&path)
+    let pid: i32 = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .filter(|pid| *pid > 0)
         .context("daemon is running but its pidfile is unreadable — kill it manually")?;
-    if send_sigterm(pid) != 0 {
+    terminate(pid)?;
+    wait_for_daemon_exit(path, pid).await;
+    Ok(true)
+}
+
+/// SIGTERM `pid`. A daemon that exits between being found and being
+/// signalled — mid-shutdown under a second `nebula kill` — has done what
+/// was asked, so only a process still running makes a failed signal an error.
+fn terminate(pid: i32) -> Result<()> {
+    if send_signal(pid, SIGTERM) != 0 && process_running(pid) {
         bail!("failed to signal daemon pid {pid} — kill it manually");
     }
-    wait_for_daemon_exit().await;
-    Ok(true)
+    Ok(())
 }
 
 /// Liveness = flock possession (mirrors the daemon's PidfileLock): if we can
@@ -696,13 +752,43 @@ fn daemon_holds_pidfile_lock(path: &std::path::Path) -> bool {
     flock_try_exclusive(file.as_raw_fd()) != 0
 }
 
-/// Poll until the daemon releases its pidfile lock, so a relaunch right after
-/// `nebula kill` can't race the old daemon's teardown.
-async fn wait_for_daemon_exit() {
-    let path = paths::pidfile_path();
+/// Poll until the daemon has released its pidfile lock and exited, so a
+/// relaunch right after `nebula kill` can't race the old daemon's teardown —
+/// which ends by unlinking the socket path, a new daemon's socket included.
+/// The process is watched as well as the lock because the lock may be on a
+/// pidfile the tmp cleaner already deleted, where no client can see it.
+async fn wait_for_daemon_exit(pidfile: &std::path::Path, pid: i32) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while daemon_holds_pidfile_lock(&path) && tokio::time::Instant::now() < deadline {
+    while (daemon_holds_pidfile_lock(pidfile) || process_running(pid))
+        && tokio::time::Instant::now() < deadline
+    {
         tokio::time::sleep(POLL_STEP).await;
+    }
+}
+
+/// Whether `pid` has yet to exit. A zombie still answers signal 0, but it
+/// has exited and holds nothing — it is only waiting for its parent to reap
+/// it, and a daemon's parent is whichever TUI spawned it, possibly still open.
+fn process_running(pid: i32) -> bool {
+    if send_signal(pid, 0) != 0 {
+        return false;
+    }
+    // Linux: the state letter follows the parenthesised command name, which
+    // can itself hold spaces and parens — hence the last `)`. No `ps` needed.
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next());
+        return state != Some('Z');
+    }
+    match std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+    {
+        Ok(out) => !String::from_utf8_lossy(&out.stdout)
+            .trim_start()
+            .starts_with('Z'),
+        Err(_) => true,
     }
 }
 
@@ -716,12 +802,13 @@ fn flock_try_exclusive(fd: i32) -> i32 {
     unsafe { flock(fd, LOCK_EX | LOCK_NB) }
 }
 
-fn send_sigterm(pid: i32) -> i32 {
+const SIGTERM: i32 = 15;
+
+fn send_signal(pid: i32, sig: i32) -> i32 {
     extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
-    const SIGTERM: i32 = 15;
-    unsafe { kill(pid, SIGTERM) }
+    unsafe { kill(pid, sig) }
 }
 
 #[cfg(test)]
@@ -747,7 +834,7 @@ mod tests {
     // in a circle (kill the daemon, the live TUI respawns the same one).
     #[test]
     fn skew_message_blames_the_older_side() {
-        let daemon_ahead = version_skew_message(PROTOCOL_VERSION + 2);
+        let daemon_ahead = version_skew_message(PROTOCOL_VERSION + 2, None);
         assert!(daemon_ahead.contains("This client is the older build"));
         assert!(
             !daemon_ahead.contains("run `nebula kill` and relaunch"),
@@ -755,14 +842,125 @@ mod tests {
         );
         assert!(daemon_ahead.contains("make install"));
 
-        let daemon_behind = version_skew_message(PROTOCOL_VERSION - 1);
+        let daemon_behind = version_skew_message(PROTOCOL_VERSION - 1, None);
         assert!(daemon_behind.contains("The daemon is the older build"));
         assert!(daemon_behind.contains("run `nebula kill` and relaunch"));
     }
 
+    // #68: with the daemon's pid known, the stale-daemon message names it
+    // and hands over the manual fallback — SIGTERM, with -9 ruled out.
+    #[test]
+    fn skew_message_offers_a_clean_manual_kill_by_pid() {
+        let msg = version_skew_message(PROTOCOL_VERSION - 1, Some(4242));
+        assert!(msg.contains("(pid 4242)"), "{msg}");
+        assert!(msg.contains("`kill 4242`"), "{msg}");
+        assert!(msg.contains("never `kill -9`"), "{msg}");
+
+        let unknown = version_skew_message(PROTOCOL_VERSION - 1, None);
+        assert!(unknown.contains("the daemon:  unknown"), "{unknown}");
+        assert!(!unknown.contains("`kill "), "no pid, no command: {unknown}");
+    }
+
+    /// Env var that turns [`fake_skewed_daemon`] from a no-op into a daemon.
+    const FAKE_DAEMON_SOCK: &str = "NEBULA_TEST_FAKE_DAEMON_SOCK";
+
+    /// A child re-exec of this test binary playing the daemon from #68: on
+    /// an older protocol, with no pidfile, answering every `Hello` with
+    /// `Incompatible` and hanging up — so only a signal stops it. A no-op
+    /// when run any other way.
+    #[test]
+    #[ignore = "run as a child process by kill_stops_a_skewed_daemon_whose_pidfile_is_gone"]
+    fn fake_skewed_daemon() {
+        let Some(sock) = std::env::var_os(FAKE_DAEMON_SOCK) else {
+            return;
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::UnixListener::bind(sock).unwrap();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = read_frame::<ClientRequest, _>(&mut stream).await;
+                let _ = write_frame(
+                    &mut stream,
+                    &ServerEvent::Incompatible {
+                        daemon_protocol_version: PROTOCOL_VERSION - 1,
+                    },
+                )
+                .await;
+            }
+        });
+    }
+
+    /// Kills the child if the test fails before it has exited.
+    struct Reap(std::process::Child);
+
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    // #68: the pidfile is gone (macOS's tmp_cleaner) and the daemon speaks a
+    // protocol this build doesn't, so neither `Shutdown` over the socket nor
+    // SIGTERM via the pidfile can reach it — and `nebula kill` used to report
+    // "no nebula daemon running" about a daemon still listening.
+    #[tokio::test]
+    async fn kill_stops_a_skewed_daemon_whose_pidfile_is_gone() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let pidfile = dir.path().join("daemon.pid");
+        let mut daemon = Reap(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "ipc::tests::fake_skewed_daemon", "--ignored"])
+                .env(FAKE_DAEMON_SOCK, &sock)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = daemon.0.id();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let stream = loop {
+            match UnixStream::connect(&sock).await {
+                Ok(stream) => break stream,
+                Err(e) if tokio::time::Instant::now() > deadline => {
+                    panic!("fake daemon never listened: {e}")
+                }
+                Err(_) => tokio::time::sleep(POLL_STEP).await,
+            }
+        };
+
+        // What the TUI shows first: the pid, straight off the socket.
+        let err = handshake(stream).await.err().expect("skewed").to_string();
+        assert!(err.contains(&format!("`kill {pid}`")), "{err}");
+
+        let started = std::time::Instant::now();
+        assert!(
+            kill_daemon_at(&sock, &pidfile).await.unwrap(),
+            "a listening daemon is not \"no daemon running\""
+        );
+        // Its parent — this test — hasn't reaped it, so it is a zombie now:
+        // exited, but still answering signal 0. The wait must count that as
+        // gone rather than sit out its deadline.
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "kill waited {:?}",
+            started.elapsed()
+        );
+        let status = daemon.0.try_wait().unwrap().expect("daemon exited");
+        assert_eq!(status.signal(), Some(SIGTERM), "{status:?}");
+    }
+
     #[test]
     fn skew_message_names_both_binaries() {
-        let msg = version_skew_message(PROTOCOL_VERSION + 1);
+        let msg = version_skew_message(PROTOCOL_VERSION + 1, None);
         assert!(msg.contains("this client: "), "{msg}");
         assert!(msg.contains("the daemon:  "), "{msg}");
         // current_exe resolves under a test binary, so this half is never

@@ -242,6 +242,12 @@ pub struct TerminalTab {
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this terminal.
     pub alive: bool,
+    /// Set on a RUN TERMINAL — the one `r` starts on a worktree: the
+    /// `.nebula.json` `run` command it was launched with, run through the
+    /// login shell in place of an interactive one. While its PTY is alive
+    /// the worktree is RUNNING. None for a plain shell tab.
+    #[serde(default)]
+    pub run_command: Option<String>,
 }
 
 /// A URL pinned to a worktree — the pull request, the ticket, the design

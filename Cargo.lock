@@ -1152,6 +1152,8 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_bytes",
+ "serde_json",
+ "tempfile",
  "tokio",
  "ulid",
 ]
@@ -1179,6 +1181,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+ "vt100",
 ]
 
 [[package]]
@@ -1186,6 +1189,7 @@ name = "nebula-tui"
 version = "0.26.0"
 dependencies = [
  "anyhow",
+ "base64",
  "crossterm",
  "futures",
  "nebula-core",

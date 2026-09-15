@@ -9,6 +9,7 @@ use crate::store::Store;
 use crate::worktree_hooks::{self, HookContext, WorktreeHook};
 use anyhow::{bail, Context, Result};
 use nebula_core::env;
+use nebula_core::project_file::{self, ProjectCommand};
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, EnterOutcome, Entity, EntityId, Link, LinkId,
     PrewarmInfo, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Workspace,
@@ -62,6 +63,14 @@ const LOGIN_SHELL_ARGS: [&str; 3] = ["-l", "-i", "-c"];
 /// stall a create forever, so on timeout the CLI is assumed present and
 /// the spawn itself gets to report.
 const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// A RUN TERMINAL whose command exited on its own: the PTY, kept for the
+/// replay, and the exit code the OS reported.
+type FinishedRun = (Arc<PtySession>, Option<i32>);
+/// What a RUN TERMINAL's row is called in the Sessions panel.
+const RUN_TERMINAL_NAME: &str = "run";
+/// Why a RUN TERMINAL with nothing left to replay will not attach — its
+/// run ended before a DAEMON restart, typically.
+const RUN_NOT_RUNNING: &str = "this run has stopped — press r on its worktree to start it again";
 
 pub(crate) struct CreateAgentSpec {
     pub worktree: WorktreeId,
@@ -165,6 +174,11 @@ pub struct Daemon {
     /// dies inside [`RESUME_FAIL_WINDOW`] could not find its session, and
     /// `watch_for_exit` reads that off this record.
     resumes: Mutex<HashMap<AgentId, ResumeWatch>>,
+    /// RUN TERMINALS whose command exited on its own, with its exit code.
+    /// The PTY is kept — outside `sessions`, so the row reads as not alive
+    /// — so an attach replays how the run ended instead of running it
+    /// again. Dropped when the run starts again, is stopped, or its row goes.
+    finished_runs: Mutex<HashMap<TerminalId, FinishedRun>>,
 }
 
 impl Daemon {
@@ -190,6 +204,7 @@ impl Daemon {
             spawn_gate: Mutex::new(()),
             prewarm_sweep: Mutex::new(None),
             resumes: Mutex::new(HashMap::new()),
+            finished_runs: Mutex::new(HashMap::new()),
         })
     }
 
@@ -451,7 +466,11 @@ impl Daemon {
                     // Row vanished mid-sweep: its delete kills the PTY anyway.
                     None => true,
                 },
-                SessionRef::Terminal(_) => shell_has_children(&session),
+                // A RUN TERMINAL is the server `r` started: sitting quiet
+                // is what it is for, and only `r` again stops it.
+                SessionRef::Terminal(id) => {
+                    self.is_run_terminal(id) || shell_has_children(&session)
+                }
             };
             if spared {
                 continue;
@@ -1327,6 +1346,7 @@ impl Daemon {
             .filter(|t| worktree_ids.contains(&t.worktree_id))
         {
             self.kill_session(&SessionRef::Terminal(t.id.clone()));
+            self.finished_runs.lock().unwrap().remove(&t.id);
         }
         self.kill_prewarmed_in(worktree_ids);
     }
@@ -1905,6 +1925,7 @@ impl Daemon {
             name,
             sort_order: 0,
             alive: false,
+            run_command: None,
         };
         self.store.insert_terminal(&terminal)?;
         self.spawn_terminal_session(&terminal, &worktree, DEFAULT_COLS, DEFAULT_ROWS)?;
@@ -1930,11 +1951,111 @@ impl Daemon {
 
     pub fn close_terminal(self: &Arc<Self>, id: &TerminalId) -> Result<()> {
         self.kill_session(&SessionRef::Terminal(id.clone()));
+        self.finished_runs.lock().unwrap().remove(id);
         self.store.delete_terminal(id)?;
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Terminal(id.clone()),
         });
         Ok(())
+    }
+
+    // ---- run terminals ----
+
+    /// `r` on a worktree: start its RUN COMMAND — `.nebula.json`'s `run`,
+    /// read fresh from the worktree's checkout, else the main checkout's —
+    /// in the worktree's RUN TERMINAL. A run that already exited lends its
+    /// row; one still going is the answer as it stands, so a second
+    /// client's `r` never starts a second server.
+    pub fn start_run(self: &Arc<Self>, worktree_id: &WorktreeId) -> Result<EntityId> {
+        let worktree = self
+            .store
+            .get_worktree(worktree_id)?
+            .context("worktree not found")?;
+        // Held across the check and the spawn, like `ensure_session`: two
+        // presses racing must produce one run, not two.
+        let _gate = self.spawn_gate.lock().unwrap();
+        let existing = self.store.run_terminals_in(worktree_id)?.into_iter().next();
+        if let Some(term) = &existing {
+            if self.is_alive(&SessionRef::Terminal(term.id.clone())) {
+                return Ok(EntityId::Terminal(term.id.clone()));
+            }
+        }
+        let main = self
+            .store
+            .get_project(&worktree.project_id)?
+            .map_or_else(|| worktree.path.clone(), |p| p.repo_path);
+        let command = project_file::command(&worktree.path, &main, ProjectCommand::Run)
+            .map_err(anyhow::Error::msg)?;
+        let mut term = match existing {
+            Some(mut term) => {
+                self.store.set_terminal_run_command(&term.id, &command)?;
+                term.run_command = Some(command.clone());
+                term
+            }
+            None => {
+                let term = TerminalTab {
+                    id: TerminalId::generate(),
+                    worktree_id: worktree_id.clone(),
+                    name: RUN_TERMINAL_NAME.into(),
+                    sort_order: 0,
+                    alive: false,
+                    run_command: Some(command.clone()),
+                };
+                self.store.insert_terminal(&term)?;
+                term
+            }
+        };
+        self.finished_runs.lock().unwrap().remove(&term.id);
+        let spawned = self.spawn_terminal_session(&term, &worktree, DEFAULT_COLS, DEFAULT_ROWS);
+        tracing::info!(worktree = %worktree_id, %command, ok = spawned.is_ok(), "run started");
+        let id = term.id.clone();
+        {
+            // Stamped and sent under the sessions lock: a command that exits
+            // at once is dropped from the map, and its not-alive upsert sent,
+            // only after this one — never the other way round, which would
+            // leave every client showing a finished run as still going.
+            let sessions = self.sessions.lock().unwrap();
+            term.alive = sessions.contains_key(&SessionRef::Terminal(id.clone()));
+            self.broadcast(ServerEvent::EntityUpserted {
+                entity: Entity::Terminal(term),
+            });
+        }
+        spawned?;
+        Ok(EntityId::Terminal(id))
+    }
+
+    /// `r` on a running worktree: kill its RUN TERMINAL and drop the row, so
+    /// a stopped run leaves nothing behind. Nothing running is not an
+    /// error — two clients may both have pressed it.
+    pub fn stop_run(self: &Arc<Self>, worktree_id: &WorktreeId) -> Result<()> {
+        for term in self.store.run_terminals_in(worktree_id)? {
+            tracing::info!(worktree = %worktree_id, "run stopped");
+            self.close_terminal(&term.id)?;
+        }
+        Ok(())
+    }
+
+    /// Whether `id` is a RUN TERMINAL's row.
+    fn is_run_terminal(&self, id: &TerminalId) -> bool {
+        self.store
+            .get_terminal(id)
+            .ok()
+            .flatten()
+            .is_some_and(|t| t.run_command.is_some())
+    }
+
+    /// A RUN TERMINAL that exited on its own: its exit code (None when the
+    /// OS reported none), for the attach replaying it. None for a live
+    /// session or anything that is not a finished run.
+    pub fn finished_run_exit(&self, sref: &SessionRef) -> Option<Option<i32>> {
+        let SessionRef::Terminal(id) = sref else {
+            return None;
+        };
+        self.finished_runs
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|(_, code)| *code)
     }
 
     // ---- links ----
@@ -2022,6 +2143,16 @@ impl Daemon {
             }
             SessionRef::Terminal(id) => {
                 let term = self.store.get_terminal(id)?.context("terminal not found")?;
+                // A RUN TERMINAL is only ever started by `r`: an attach, or
+                // the prewarm sweep walking past, must never run a command
+                // that exited again. What it can show is how the run ended,
+                // while the DAEMON still holds that PTY.
+                if term.run_command.is_some() {
+                    if let Some((session, _)) = self.finished_runs.lock().unwrap().get(id) {
+                        return Ok(session.clone());
+                    }
+                    bail!("{RUN_NOT_RUNNING}");
+                }
                 let worktree = self
                     .store
                     .get_worktree(&term.worktree_id)?
@@ -2083,7 +2214,9 @@ impl Daemon {
             .chain(
                 terminals
                     .iter()
-                    .filter(|t| &t.worktree_id == worktree_id)
+                    // A RUN TERMINAL never boots from a sweep (see
+                    // `ensure_session`).
+                    .filter(|t| &t.worktree_id == worktree_id && t.run_command.is_none())
                     .map(|t| SessionRef::Terminal(t.id.clone())),
             )
             .collect();
@@ -2398,11 +2531,19 @@ impl Daemon {
         cols: u16,
         rows: u16,
     ) -> Result<Arc<PtySession>> {
-        // `-l` makes it a login shell, matching Terminal.app: zsh then sources
-        // /etc/zprofile (path_helper), ~/.zprofile, and ~/.zshrc.
+        let (program, args) = match &terminal.run_command {
+            // A RUN TERMINAL runs its command line through the login +
+            // interactive shell an agent launch uses, so `npm` or `bun`
+            // resolve the way they do typed. The PTY lives exactly as long
+            // as the command, which is what makes it the RUNNING state.
+            Some(command) => login_shell_line(&user_shell(), command),
+            // `-l` makes it a login shell, matching Terminal.app: zsh then
+            // sources /etc/zprofile (path_helper), ~/.zprofile, and ~/.zshrc.
+            None => (user_shell(), vec!["-l".into()]),
+        };
         let spec = SpawnSpec {
-            program: user_shell(),
-            args: vec!["-l".into()],
+            program,
+            args,
             cwd: worktree.path.clone(),
             env: vec![],
             scrub_env: env::AGENT_SESSION_VARS,
@@ -2463,6 +2604,17 @@ impl Daemon {
                             break;
                         }
                         tracing::info!(session = ?sref, exit_code, "session exited");
+                        // A run that ended on its own keeps its PTY for the
+                        // attach that wants to read how it ended.
+                        if let SessionRef::Terminal(id) = &sref {
+                            if daemon.is_run_terminal(id) {
+                                daemon
+                                    .finished_runs
+                                    .lock()
+                                    .unwrap()
+                                    .insert(id.clone(), (session.clone(), exit_code));
+                            }
+                        }
                         if let SessionRef::Agent(id) = &sref {
                             daemon.apply_hook_event(
                                 id,
@@ -2992,6 +3144,18 @@ fn cli_missing_message(kind: AgentKind) -> String {
 /// the same three against the daemon's inherited environment; this covers
 /// the profile's.
 fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec<String>) {
+    let mut line = command_word(program);
+    for arg in args {
+        line.push(' ');
+        line.push_str(&shell_quote(arg));
+    }
+    login_shell_line(shell, &line)
+}
+
+/// [`login_shell_wrap`] for a line that is already shell syntax — a RUN
+/// TERMINAL's `.nebula.json` `run`, pipes and `&&` and all — behind the
+/// same prelude.
+fn login_shell_line(shell: &str, line: &str) -> (String, Vec<String>) {
     let mut cmdline = String::from("unset");
     for name in env::PANE_COLOR_OVERRIDES {
         cmdline.push(' ');
@@ -3002,11 +3166,7 @@ fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec
     cmdline.push_str(" COLORTERM=");
     cmdline.push_str(env::PANE_COLORTERM);
     cmdline.push_str("; ");
-    cmdline.push_str(&command_word(program));
-    for arg in args {
-        cmdline.push(' ');
-        cmdline.push_str(&shell_quote(arg));
-    }
+    cmdline.push_str(line);
     let args = LOGIN_SHELL_ARGS
         .iter()
         .map(|s| s.to_string())
@@ -3748,6 +3908,116 @@ mod tests {
             dirs.contains(&PathBuf::from("/cfg/alt/projects")),
             "{dirs:?}"
         );
+    }
+
+    /// A project whose main checkout is a fresh directory, registered with
+    /// `daemon`, for the RUN TERMINAL tests to write `.nebula.json` into.
+    fn run_worktree(daemon: &Daemon) -> (tempfile::TempDir, Worktree) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId::generate(),
+            name: "demo".into(),
+            repo_path: dir.path().to_path_buf(),
+            sort_order: 0,
+        };
+        daemon.store.insert_project(&project).unwrap();
+        let worktree = Worktree {
+            id: WorktreeId::generate(),
+            project_id: project.id,
+            path: dir.path().to_path_buf(),
+            branch: "main".into(),
+            is_main: true,
+            sort_order: 0,
+        };
+        daemon.store.insert_worktree(&worktree).unwrap();
+        (dir, worktree)
+    }
+
+    #[tokio::test]
+    async fn run_needs_a_project_file_starts_once_and_stops() {
+        let daemon = test_daemon();
+        let (dir, worktree) = run_worktree(&daemon);
+
+        let missing = daemon.start_run(&worktree.id).unwrap_err();
+        assert!(missing.to_string().contains("no .nebula.json"), "{missing}");
+        assert!(daemon
+            .store
+            .run_terminals_in(&worktree.id)
+            .unwrap()
+            .is_empty());
+
+        std::fs::write(dir.path().join(".nebula.json"), r#"{"run": "sleep 30"}"#).unwrap();
+        let EntityId::Terminal(id) = daemon.start_run(&worktree.id).unwrap() else {
+            panic!("a run lives in a terminal");
+        };
+        let sref = SessionRef::Terminal(id.clone());
+        assert!(daemon.is_alive(&sref));
+        let row = daemon.store.get_terminal(&id).unwrap().unwrap();
+        assert_eq!(row.run_command.as_deref(), Some("sleep 30"));
+
+        // A second press while it runs starts nothing new.
+        assert_eq!(
+            daemon.start_run(&worktree.id).unwrap(),
+            EntityId::Terminal(id.clone())
+        );
+        assert_eq!(
+            daemon.store.run_terminals_in(&worktree.id).unwrap().len(),
+            1
+        );
+
+        daemon.stop_run(&worktree.id).unwrap();
+        assert!(!daemon.is_alive(&sref));
+        assert!(daemon
+            .store
+            .run_terminals_in(&worktree.id)
+            .unwrap()
+            .is_empty());
+        // Nothing left to stop is not an error.
+        daemon.stop_run(&worktree.id).unwrap();
+    }
+
+    /// A run that ends on its own keeps its output for the attach that
+    /// comes to read it, and never runs again on that attach — only `r`
+    /// starts a RUN COMMAND.
+    #[tokio::test]
+    async fn an_exited_run_replays_instead_of_running_again() {
+        let daemon = test_daemon();
+        let (dir, worktree) = run_worktree(&daemon);
+        std::fs::write(
+            dir.path().join(".nebula.json"),
+            r#"{"run": "echo run-finished"}"#,
+        )
+        .unwrap();
+        let EntityId::Terminal(id) = daemon.start_run(&worktree.id).unwrap() else {
+            panic!("a run lives in a terminal");
+        };
+        let sref = SessionRef::Terminal(id.clone());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while daemon.finished_run_exit(&sref).is_none() {
+            assert!(Instant::now() < deadline, "the run never exited");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!daemon.is_alive(&sref));
+
+        let session = daemon.ensure_session(&sref, 80, 24).unwrap();
+        assert!(!daemon.is_alive(&sref), "an attach spawned nothing");
+        let (_, bytes) = session.snapshot(None);
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("run-finished"),
+            "the replay is the run's output"
+        );
+
+        // `r` again reuses the row.
+        assert_eq!(
+            daemon.start_run(&worktree.id).unwrap(),
+            EntityId::Terminal(id)
+        );
+        assert_eq!(
+            daemon.store.run_terminals_in(&worktree.id).unwrap().len(),
+            1
+        );
+        daemon.stop_run(&worktree.id).unwrap();
     }
 
     #[tokio::test]

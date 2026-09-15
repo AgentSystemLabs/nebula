@@ -1,15 +1,19 @@
-//! TUI user settings, read from the same `paths::config_path()` JSON the
-//! daemon reads (each side deserializes only its own fields; serde ignores
-//! the rest). Loaded fresh at each use so edits apply without restarting
-//! the TUI. A missing file or unknown fields fall back to defaults; a
-//! malformed file is logged and ignored.
+//! TUI user settings, read from the same two layers the daemon reads —
+//! `paths::config_path()` with `paths::config_local_path()` over it, see
+//! `nebula_core::settings` (each side deserializes only its own fields;
+//! serde ignores the rest). Loaded fresh at each use so edits apply without
+//! restarting the TUI. A missing file or unknown fields fall back to
+//! defaults; a value this build can't read costs only its own key, which is
+//! logged and left as stored.
 //!
 //! The settings overlay is the writer: it patches known keys and leaves
-//! any other JSON fields (including future daemon keys) untouched.
+//! any other JSON fields (including future daemon keys) untouched, and a
+//! key `config.local.json` holds is written back there, never into the
+//! portable file.
 
 use nebula_core::AgentKind;
-use serde::Deserialize;
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Values the settings overlay cycles through for `session_idle_timeout`
@@ -205,6 +209,7 @@ pub enum SettingKind {
     WorktreeBaseBranch,
     Editor,
     CloseFinderOnOpen,
+    SshSyncConfig,
     SkipSessionNaming,
     ConfirmOnArchive,
     SessionIdleTimeout,
@@ -284,6 +289,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::CloseFinderOnOpen,
                 label: "Finder closes on open",
                 hint: "Opening a file closes f/F, so quitting the editor is one Esc",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::SshSyncConfig,
+                label: "Sync settings over ssh",
+                hint: "nebula ssh / tunnel carry config.json and presets to the remote (config.local.json stays)",
                 group: "",
             },
         ]),
@@ -647,7 +658,7 @@ fn grouped(
     rows
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     /// `/` palette: Enter on a session attaches and focuses the terminal.
@@ -684,6 +695,11 @@ pub struct Config {
     /// touch the tree browser (`b`), whose editor is embedded in its own
     /// preview pane, or ⌥click, which has no overlay to close.
     pub close_finder_on_open: bool,
+    /// `nebula ssh` and `nebula tunnel` carry this machine's `config.json`
+    /// and AGENT PRESETS to the remote nebula, which merges them into its
+    /// own on every connect — its `config.local.json` still wins there. On
+    /// by default; `--no-sync-config` leaves them behind for one connection.
+    pub ssh_sync_config: bool,
     /// Create new agent sessions straight from the kind picker, with no
     /// task box: the session takes the generated default name and
     /// agent-driven auto-titling, and the first prompt is typed in the
@@ -838,6 +854,12 @@ pub struct Config {
     /// written, so the file stays small and new defaults reach existing
     /// installs. See [`crate::keymap`].
     pub keybindings: BTreeMap<String, String>,
+    /// Keys the files held that this build could not read; they loaded as
+    /// defaults. Never written: [`Config::save`] reads it to leave those
+    /// stored values alone — most likely a newer nebula's — unless the
+    /// setting has been changed since. See `nebula_core::settings`.
+    #[serde(skip)]
+    pub skipped: BTreeSet<String>,
 }
 
 impl Default for Config {
@@ -848,6 +870,7 @@ impl Default for Config {
             worktree_base_branch: String::new(),
             editor: "vim".into(),
             close_finder_on_open: true,
+            ssh_sync_config: true,
             skip_session_naming: false,
             confirm_on_archive: false,
             session_idle_timeout: "5m".into(),
@@ -882,13 +905,14 @@ impl Default for Config {
             quick_prompt_kind: AgentKind::Claude.as_str().into(),
             quick_prompt_focus: false,
             keybindings: BTreeMap::new(),
+            skipped: BTreeSet::new(),
         }
     }
 }
 
 impl Config {
     pub fn load() -> Self {
-        let cfg = load_from(&settings_path());
+        let cfg = load_layers(&settings_path(), &local_settings_path());
         // The Claude model rows follow `claude_models` live, as every
         // other hand edit does. Not under test: the list is process-global
         // and a test that never pinned the path would install the dev's.
@@ -897,8 +921,9 @@ impl Config {
         cfg
     }
 
-    /// Patch this config's known keys into the JSON file, preserving any
-    /// other fields already there.
+    /// Patch this config's known keys into the settings files, preserving
+    /// any other fields already there: a key `config.local.json` holds goes
+    /// back into it, every other key into `config.json`.
     pub fn save(&self) -> std::io::Result<()> {
         // A test that reaches a save without pinning the path would write
         // the dev's own settings file (and `NEBULA_DATA_DIR` only moves it
@@ -911,26 +936,19 @@ impl Config {
             "Config::save() in a test without a path override — wrap the \
              test body in config::with_config_path (or with_default_config)"
         );
-        self.save_to(&settings_path())
+        self.write_layers(&settings_path(), &local_settings_path(), false)
     }
 
+    /// [`Config::save`] into `path`, with its local layer beside it.
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
-        let root = match std::fs::read_to_string(path) {
-            Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
-                .ok()
-                .filter(|v| v.is_object())
-                .unwrap_or_else(|| serde_json::json!({})),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-            Err(err) => return Err(err),
-        };
-        self.write_into(path, root)
+        self.write_layers(path, &sibling_local_path(path), false)
     }
 
-    /// Put every setting back to its default and return the result. The
-    /// file is rewritten from scratch rather than patched like
-    /// [`Config::save`], so keys the overlay doesn't own — anything
-    /// hand-added — go too: a reset reads as if the file had never been
-    /// edited.
+    /// Put every setting back to its default and return the result.
+    /// `config.json` is rewritten from scratch rather than patched like
+    /// [`Config::save`] and `config.local.json` is removed, so keys the
+    /// overlay doesn't own — anything hand-added — go too: a reset reads as
+    /// if neither file had ever been edited.
     pub fn reset_to_defaults() -> std::io::Result<Self> {
         #[cfg(test)]
         assert!(
@@ -938,145 +956,57 @@ impl Config {
             "Config::reset_to_defaults() in a test without a path override — wrap \
              the test body in config::with_config_path (or with_default_config)"
         );
+        let local = local_settings_path();
+        match std::fs::remove_file(&local) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
+            _ => {}
+        }
         let cfg = Self::default();
-        cfg.write_into(&settings_path(), serde_json::json!({}))?;
+        cfg.write_layers(&settings_path(), &local, true)?;
         Ok(cfg)
     }
 
-    /// Write this config's known keys over `root` (an object) and swap the
-    /// result into place atomically.
-    fn write_into(&self, path: &Path, mut root: serde_json::Value) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    /// Write this config's known keys into the two layers and swap each
+    /// file that changed into place atomically. `fresh` starts `config.json`
+    /// from an empty object instead of patching what is there.
+    fn write_layers(&self, path: &Path, local: &Path, fresh: bool) -> std::io::Result<()> {
+        use nebula_core::settings;
+        let mut root = if fresh {
+            settings::Object::new()
+        } else {
+            patchable_object(path)?
+        };
+        // A local layer that isn't a readable object was ignored on load,
+        // so it holds no keys — and is never rewritten from a partial view.
+        let mut local_root = settings::read_object(local).ok().flatten();
+        let serde_json::Value::Object(known) = serde_json::to_value(self).map_err(invalid_data)?
+        else {
+            unreachable!("Config serializes to a JSON object");
+        };
+        let defaults = serde_json::to_value(Self::default()).map_err(invalid_data)?;
+        let mut local_changed = false;
+        for (key, value) in known {
+            // A stored value this build couldn't read loaded as its default.
+            // Unless it has been changed since, leave the stored one alone.
+            if self.skipped.contains(&key) && defaults.get(&key) == Some(&value) {
+                continue;
+            }
+            match local_root.as_mut() {
+                Some(held) if held.contains_key(&key) => {
+                    if held.get(&key) != Some(&value) {
+                        held.insert(key, value);
+                        local_changed = true;
+                    }
+                }
+                _ => {
+                    root.insert(key, value);
+                }
+            }
         }
-        let obj = root
-            .as_object_mut()
-            .expect("root filtered to object or empty object");
-        obj.insert(
-            "palette_enter_attaches".into(),
-            serde_json::json!(self.palette_enter_attaches),
-        );
-        obj.insert(
-            "git_init_on_create".into(),
-            serde_json::json!(self.git_init_on_create),
-        );
-        obj.insert(
-            "worktree_base_branch".into(),
-            serde_json::json!(self.worktree_base_branch),
-        );
-        obj.insert("editor".into(), serde_json::json!(self.editor));
-        obj.insert(
-            "close_finder_on_open".into(),
-            serde_json::json!(self.close_finder_on_open),
-        );
-        obj.insert(
-            "skip_session_naming".into(),
-            serde_json::json!(self.skip_session_naming),
-        );
-        obj.insert(
-            "confirm_on_archive".into(),
-            serde_json::json!(self.confirm_on_archive),
-        );
-        obj.insert(
-            "session_idle_timeout".into(),
-            serde_json::json!(self.session_idle_timeout),
-        );
-        obj.insert(
-            "prewarm_agents".into(),
-            serde_json::json!(self.prewarm_agents),
-        );
-        obj.insert(
-            "prewarm_sessions".into(),
-            serde_json::json!(self.prewarm_sessions),
-        );
-        obj.insert("done_sound".into(), serde_json::json!(self.done_sound));
-        obj.insert(
-            "feedback_sound".into(),
-            serde_json::json!(self.feedback_sound),
-        );
-        obj.insert("theme".into(), serde_json::json!(self.theme));
-        obj.insert("animations".into(), serde_json::json!(self.animations));
-        obj.insert("focus_tint".into(), serde_json::json!(self.focus_tint));
-        obj.insert(
-            "show_workspaces".into(),
-            serde_json::json!(self.show_workspaces),
-        );
-        obj.insert(
-            "hide_projects".into(),
-            serde_json::json!(self.hide_projects),
-        );
-        obj.insert(
-            "hide_worktrees".into(),
-            serde_json::json!(self.hide_worktrees),
-        );
-        obj.insert(
-            "hide_draft_prs".into(),
-            serde_json::json!(self.hide_draft_prs),
-        );
-        obj.insert(
-            "hide_root_worktree".into(),
-            serde_json::json!(self.hide_root_worktree),
-        );
-        obj.insert(
-            "recent_prompts".into(),
-            serde_json::json!(self.recent_prompts),
-        );
-        obj.insert(
-            "recent_prompts_count".into(),
-            serde_json::json!(self.recent_prompts_count),
-        );
-        obj.insert(
-            "show_key_combos".into(),
-            serde_json::json!(self.show_key_combos),
-        );
-        obj.insert("claude_model".into(), serde_json::json!(self.claude_model));
-        obj.insert(
-            "claude_models".into(),
-            serde_json::json!(self.claude_models),
-        );
-        obj.insert(
-            "claude_effort".into(),
-            serde_json::json!(self.claude_effort),
-        );
-        obj.insert("codex_model".into(), serde_json::json!(self.codex_model));
-        obj.insert("codex_effort".into(), serde_json::json!(self.codex_effort));
-        obj.insert("cursor_model".into(), serde_json::json!(self.cursor_model));
-        obj.insert(
-            "cursor_effort".into(),
-            serde_json::json!(self.cursor_effort),
-        );
-        obj.insert("pi_model".into(), serde_json::json!(self.pi_model));
-        obj.insert("pi_effort".into(), serde_json::json!(self.pi_effort));
-        obj.insert(
-            "claude_enabled".into(),
-            serde_json::json!(self.claude_enabled),
-        );
-        obj.insert(
-            "codex_enabled".into(),
-            serde_json::json!(self.codex_enabled),
-        );
-        obj.insert(
-            "cursor_enabled".into(),
-            serde_json::json!(self.cursor_enabled),
-        );
-        obj.insert("pi_enabled".into(), serde_json::json!(self.pi_enabled));
-        obj.insert(
-            "quick_prompt_kind".into(),
-            serde_json::json!(self.quick_prompt_kind),
-        );
-        obj.insert(
-            "quick_prompt_focus".into(),
-            serde_json::json!(self.quick_prompt_focus),
-        );
-        obj.insert("keybindings".into(), serde_json::json!(self.keybindings));
-        let mut bytes = serde_json::to_vec_pretty(&root)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-        if !bytes.ends_with(b"\n") {
-            bytes.push(b'\n');
+        settings::write_json(path, &serde_json::Value::Object(root))?;
+        if let (true, Some(held)) = (local_changed, local_root) {
+            settings::write_json(local, &serde_json::Value::Object(held))?;
         }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 
@@ -1180,6 +1110,7 @@ impl Config {
             },
             SettingKind::Editor => self.editor.clone(),
             SettingKind::CloseFinderOnOpen => on_off(self.close_finder_on_open).into(),
+            SettingKind::SshSyncConfig => on_off(self.ssh_sync_config).into(),
             SettingKind::SkipSessionNaming => on_off(self.skip_session_naming).into(),
             SettingKind::ConfirmOnArchive => on_off(self.confirm_on_archive).into(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
@@ -1246,6 +1177,9 @@ impl Config {
             }
             SettingKind::CloseFinderOnOpen => {
                 self.close_finder_on_open = !self.close_finder_on_open;
+            }
+            SettingKind::SshSyncConfig => {
+                self.ssh_sync_config = !self.ssh_sync_config;
             }
             SettingKind::SkipSessionNaming => {
                 self.skip_session_naming = !self.skip_session_naming;
@@ -1492,14 +1426,51 @@ pub(crate) fn cycle_choice<'a>(current: &str, choices: &[&'a str], delta: i32) -
     choices[(pos + delta).rem_euclid(n) as usize]
 }
 
+/// The two settings layers merged, `local` over `path`. What this build
+/// can't read is logged and remembered in [`Config::skipped`], so a save
+/// leaves it as stored.
+fn load_layers(path: &Path, local: &Path) -> Config {
+    let loaded = nebula_core::settings::load::<Config>(path, local);
+    for problem in &loaded.problems {
+        tracing::warn!("{problem}");
+    }
+    if !loaded.skipped.is_empty() {
+        tracing::warn!(keys = ?loaded.skipped, "settings this build can't read keep their defaults");
+    }
+    Config {
+        skipped: loaded.skipped,
+        ..loaded.value
+    }
+}
+
+/// Test shorthand: the settings at `path`, local layer beside it.
+#[cfg(test)]
 fn load_from(path: &Path) -> Config {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return Config::default();
-    };
-    serde_json::from_str(&raw).unwrap_or_else(|err| {
-        tracing::warn!("ignoring malformed {}: {err}", path.display());
-        Config::default()
-    })
+    load_layers(path, &sibling_local_path(path))
+}
+
+/// The object a settings file holds, to patch keys into: empty when the
+/// file is missing or isn't a JSON object (the save replaces it, as it
+/// always has), an error only when the file is there and can't be read.
+fn patchable_object(path: &Path) -> std::io::Result<nebula_core::settings::Object> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => Ok(match serde_json::from_str(&raw) {
+            Ok(serde_json::Value::Object(obj)) => obj,
+            _ => nebula_core::settings::Object::new(),
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(err) => Err(err),
+    }
+}
+
+fn invalid_data(err: serde_json::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, err)
+}
+
+/// `config.local.json` beside `path`: the local layer of a settings file
+/// that is not this nebula's own — a test's, or [`Config::save_to`]'s.
+fn sibling_local_path(path: &Path) -> PathBuf {
+    path.with_file_name("config.local.json")
 }
 
 fn settings_path() -> PathBuf {
@@ -1510,6 +1481,18 @@ fn settings_path() -> PathBuf {
         }
     }
     nebula_core::paths::config_path()
+}
+
+/// The local layer. A test's path override moves it too, beside the
+/// overriding file, so no test reads the dev's own.
+fn local_settings_path() -> PathBuf {
+    #[cfg(test)]
+    {
+        if let Some(path) = CONFIG_PATH_OVERRIDE.with(|p| p.borrow().clone()) {
+            return sibling_local_path(&path);
+        }
+    }
+    nebula_core::paths::config_local_path()
 }
 
 #[cfg(test)]
@@ -1532,6 +1515,157 @@ pub fn with_config_path<T>(path: PathBuf, f: impl FnOnce() -> T) -> T {
 mod tests {
     use super::*;
     use crate::keymap::Keymap;
+
+    /// Config files earlier releases wrote, every value off its default.
+    /// Add one per release; see [`config_files_from_earlier_releases_still_load_every_key`].
+    const CONFIG_FIXTURES: &[(&str, &str)] = &[(
+        "0.26.0",
+        include_str!("../../nebula-core/fixtures/config-0.26.0.json"),
+    )];
+
+    fn read_json_file(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// The first compatibility rule in docs/configuration.md: a key, once
+    /// shipped, keeps its name, its type and its meaning. Every key a
+    /// release wrote must still load to exactly the value it wrote — a
+    /// rename leaves the key unknown, a type change leaves it unreadable,
+    /// and either reads back as something else here.
+    #[test]
+    fn config_files_from_earlier_releases_still_load_every_key() {
+        for (release, raw) in CONFIG_FIXTURES {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.json");
+            std::fs::write(&path, raw).unwrap();
+            let loaded = load_from(&path);
+            assert!(
+                loaded.skipped.is_empty(),
+                "{release}: keys this build can't read: {:?}",
+                loaded.skipped
+            );
+            let known = serde_json::to_value(&loaded).unwrap();
+            let fixture: serde_json::Value = serde_json::from_str(raw).unwrap();
+            for (key, value) in fixture.as_object().unwrap() {
+                assert_eq!(
+                    known.get(key),
+                    Some(value),
+                    "{release}: `{key}` no longer loads as that release wrote it"
+                );
+            }
+            // A save writes every one of them back unchanged.
+            loaded.save_to(&path).unwrap();
+            let saved = read_json_file(&path);
+            for (key, value) in fixture.as_object().unwrap() {
+                assert_eq!(
+                    saved.get(key),
+                    Some(value),
+                    "{release}: `{key}` after a save"
+                );
+            }
+        }
+    }
+
+    /// A value this build can't read — a newer nebula's, most likely — costs
+    /// only its own key, and a save leaves it as stored until the setting is
+    /// changed here.
+    #[test]
+    fn an_unreadable_key_keeps_the_rest_and_outlives_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"theme": "ocean", "recent_prompts_count": "auto", "animations": false}"#,
+        )
+        .unwrap();
+        let mut cfg = load_from(&path);
+        assert_eq!(cfg.theme, "ocean");
+        assert!(!cfg.animations);
+        assert_eq!(cfg.recent_prompts_count, DEFAULT_RECENT_PROMPTS_COUNT);
+        assert_eq!(
+            cfg.skipped,
+            BTreeSet::from(["recent_prompts_count".to_string()])
+        );
+
+        cfg.focus_tint = false;
+        cfg.save_to(&path).unwrap();
+        let saved = read_json_file(&path);
+        assert_eq!(saved["recent_prompts_count"], "auto", "left as stored");
+        assert_eq!(saved["focus_tint"], false);
+        assert_eq!(saved["theme"], "ocean");
+
+        let (t, r) = locate(SettingKind::RecentPromptsCount).unwrap();
+        cfg.cycle(t, r, 1);
+        cfg.save_to(&path).unwrap();
+        assert_eq!(
+            read_json_file(&path)["recent_prompts_count"],
+            4,
+            "changing it here is a real edit"
+        );
+    }
+
+    /// `config.local.json` wins key by key, and a key it holds is saved back
+    /// into it — never copied into the portable `config.json`.
+    #[test]
+    fn the_local_layer_overrides_and_keeps_its_own_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let local = dir.path().join("config.local.json");
+        std::fs::write(&path, r#"{"editor": "nvim", "theme": "ocean"}"#).unwrap();
+        std::fs::write(&local, r#"{"editor": "nano"}"#).unwrap();
+        let mut cfg = load_from(&path);
+        assert_eq!(cfg.editor, "nano");
+        assert_eq!(cfg.theme, "ocean");
+
+        cfg.theme = "forest".into();
+        cfg.save_to(&path).unwrap();
+        assert_eq!(read_json_file(&path)["theme"], "forest");
+        assert_eq!(
+            read_json_file(&path)["editor"],
+            "nvim",
+            "the local value stays local"
+        );
+        assert_eq!(
+            read_json_file(&local),
+            serde_json::json!({"editor": "nano"})
+        );
+
+        cfg.editor = "hx".into();
+        cfg.save_to(&path).unwrap();
+        assert_eq!(read_json_file(&local)["editor"], "hx");
+        assert_eq!(read_json_file(&path)["editor"], "nvim");
+    }
+
+    #[test]
+    fn reset_removes_the_local_layer_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let local = dir.path().join("config.local.json");
+        with_config_path(path.clone(), || {
+            std::fs::write(&local, r#"{"theme": "rose"}"#).unwrap();
+            assert_eq!(Config::load().theme, "rose");
+            Config::reset_to_defaults().unwrap();
+            assert!(!local.exists());
+            assert_eq!(Config::load().theme, Config::default().theme);
+        });
+    }
+
+    #[test]
+    fn ssh_sync_defaults_on_and_toggles_from_the_general_tab() {
+        assert!(Config::default().ssh_sync_config);
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.ssh_sync_config);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut cfg = Config::default();
+        let (t, r) = locate(SettingKind::SshSyncConfig).unwrap();
+        assert_eq!(SETTINGS_TABS[t].title, "General");
+        cfg.cycle(t, r, 0);
+        assert_eq!(cfg.value_label(SettingKind::SshSyncConfig), "off");
+        cfg.save_to(&path).unwrap();
+        assert_eq!(read_json_file(&path)["ssh_sync_config"], false);
+        assert!(!load_from(&path).ssh_sync_config);
+    }
 
     #[test]
     fn defaults_close_the_finder_on_open() {

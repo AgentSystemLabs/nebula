@@ -61,10 +61,25 @@ pub fn db_path() -> PathBuf {
     data_dir().join("nebula.db")
 }
 
-/// User settings file (JSON). Lives beside the DB so `NEBULA_DATA_DIR`
-/// isolates it for tests and parallel instances too.
+/// User settings file (JSON) — the portable layer, which backups and
+/// `nebula ssh` carry. Lives beside the DB so `NEBULA_DATA_DIR` isolates it
+/// for tests and parallel instances too; `NEBULA_CONFIG_FILE` moves this one
+/// file alone (a leading `~/` is expanded, since a quoted value never is).
 pub fn config_path() -> PathBuf {
-    data_dir().join("config.json")
+    match env::non_empty(env::CONFIG_FILE) {
+        Some(file) => match file.strip_prefix("~/") {
+            Some(rest) => env::home_dir().unwrap_or_default().join(rest),
+            None => PathBuf::from(file),
+        },
+        None => data_dir().join("config.json"),
+    }
+}
+
+/// This machine's settings, layered over [`config_path`] key by key: never
+/// exported, forwarded or overwritten by an import. Stays in the data dir
+/// when `NEBULA_CONFIG_FILE` moves the portable file.
+pub fn config_local_path() -> PathBuf {
+    data_dir().join("config.local.json")
 }
 
 pub fn log_dir() -> PathBuf {
@@ -118,7 +133,9 @@ mod tests {
         let _restore = (
             EnvRestore::new(crate::env::RUNTIME_DIR),
             EnvRestore::new(crate::env::DATA_DIR),
+            EnvRestore::new(crate::env::CONFIG_FILE),
         );
+        std::env::remove_var(crate::env::CONFIG_FILE);
         let runtime = std::env::temp_dir().join(format!("nebula-paths-rt-{}", std::process::id()));
         let data = std::env::temp_dir().join(format!("nebula-paths-data-{}", std::process::id()));
 
@@ -131,11 +148,30 @@ mod tests {
         assert_eq!(data_dir(), data);
         assert_eq!(db_path(), data.join("nebula.db"));
         assert_eq!(config_path(), data.join("config.json"));
+        assert_eq!(config_local_path(), data.join("config.local.json"));
         // Logs follow the data override so isolated instances keep their
         // logs beside their state.
         assert_eq!(log_dir(), data.join("state"));
         assert_eq!(daemon_log_path(), data.join("state").join("daemon.log"));
         assert_eq!(tui_log_path(), data.join("state").join("tui.log"));
+
+        // The config file override moves that one file; the local layer and
+        // everything else stay in the data dir.
+        let dotfile = std::env::temp_dir().join("dotfiles").join("nebula.json");
+        std::env::set_var(crate::env::CONFIG_FILE, &dotfile);
+        assert_eq!(config_path(), dotfile);
+        assert_eq!(config_local_path(), data.join("config.local.json"));
+        assert_eq!(db_path(), data.join("nebula.db"));
+        std::env::set_var(crate::env::CONFIG_FILE, "~/dotfiles/nebula.json");
+        assert_eq!(
+            config_path(),
+            crate::env::home_dir()
+                .unwrap()
+                .join("dotfiles")
+                .join("nebula.json")
+        );
+        std::env::set_var(crate::env::CONFIG_FILE, "");
+        assert_eq!(config_path(), data.join("config.json"));
 
         std::env::set_var(crate::env::RUNTIME_DIR, "");
         std::env::set_var(crate::env::DATA_DIR, "");
