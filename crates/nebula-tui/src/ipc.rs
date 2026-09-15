@@ -728,8 +728,11 @@ async fn kill_by_pidfile(path: &std::path::Path) -> Result<bool> {
     Ok(true)
 }
 
+/// SIGTERM `pid`. A daemon that exits between being found and being
+/// signalled — mid-shutdown under a second `nebula kill` — has done what
+/// was asked, so only a process still running makes a failed signal an error.
 fn terminate(pid: i32) -> Result<()> {
-    if send_signal(pid, SIGTERM) != 0 {
+    if send_signal(pid, SIGTERM) != 0 && process_running(pid) {
         bail!("failed to signal daemon pid {pid} — kill it manually");
     }
     Ok(())
