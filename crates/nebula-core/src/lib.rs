@@ -8,6 +8,7 @@ pub mod mem;
 pub mod paths;
 pub mod project_file;
 pub mod protocol;
+pub mod settings;
 
 pub use entities::*;
 pub use ids::*;

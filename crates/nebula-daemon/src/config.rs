@@ -1,7 +1,9 @@
-//! User settings, read from `paths::config_path()` (JSON). Loaded fresh at
-//! each use so edits apply without restarting the daemon. A missing file or
-//! unknown fields fall back to defaults; a malformed file is logged and
-//! ignored rather than failing the operation that read it.
+//! User settings, read from `paths::config_path()` with
+//! `paths::config_local_path()` over it (JSON; see `nebula_core::settings`).
+//! Loaded fresh at each use so edits apply without restarting the daemon. A
+//! missing file or unknown fields fall back to defaults; a malformed file is
+//! logged and ignored rather than failing the operation that read it, and a
+//! value this build can't read costs only its own key.
 
 use serde::Deserialize;
 
@@ -55,14 +57,17 @@ pub const DEFAULT_SESSION_IDLE_TIMEOUT: &str = "5m";
 
 impl Config {
     pub fn load() -> Self {
-        let path = nebula_core::paths::config_path();
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            return Self::default();
-        };
-        serde_json::from_str(&raw).unwrap_or_else(|err| {
-            tracing::warn!("ignoring malformed {}: {err}", path.display());
-            Self::default()
-        })
+        let loaded = nebula_core::settings::load::<Self>(
+            &nebula_core::paths::config_path(),
+            &nebula_core::paths::config_local_path(),
+        );
+        for problem in &loaded.problems {
+            tracing::warn!("{problem}");
+        }
+        if !loaded.skipped.is_empty() {
+            tracing::warn!(keys = ?loaded.skipped, "settings this build can't read keep their defaults");
+        }
+        loaded.value
     }
 
     /// `session_idle_timeout` parsed to a duration; None = reaping disabled.
@@ -117,6 +122,36 @@ mod tests {
         assert!(cfg.git_init_on_create);
         let cfg: Config = serde_json::from_str(r#"{"git_init_on_create": false}"#).unwrap();
         assert!(!cfg.git_init_on_create);
+    }
+
+    /// One mistyped key — or a key a newer nebula changed the type of —
+    /// takes its default without dragging every other setting down with it.
+    #[test]
+    fn an_unreadable_key_costs_only_that_key() {
+        let obj = serde_json::json!({
+            "prewarm_agents": "nope",
+            "session_idle_timeout": "1h",
+            "git_init_on_create": false,
+        });
+        let (cfg, skipped) =
+            nebula_core::settings::parse_lenient::<Config>(obj.as_object().unwrap());
+        assert!(cfg.prewarm_agents, "the unreadable key takes its default");
+        assert_eq!(cfg.session_idle_timeout, "1h");
+        assert!(!cfg.git_init_on_create);
+        assert_eq!(skipped.len(), 1);
+    }
+
+    /// The daemon's half of the TUI's fixture test: every daemon key an
+    /// earlier release wrote still reads as written.
+    #[test]
+    fn config_files_from_earlier_releases_still_load_the_daemon_keys() {
+        let raw = include_str!("../../nebula-core/fixtures/config-0.26.0.json");
+        let obj: serde_json::Map<String, serde_json::Value> = serde_json::from_str(raw).unwrap();
+        let (cfg, skipped) = nebula_core::settings::parse_lenient::<Config>(&obj);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(!cfg.git_init_on_create && !cfg.prewarm_agents && !cfg.prewarm_sessions);
+        assert_eq!(cfg.session_idle_timeout, "30m");
+        assert_eq!(cfg.worktree_base_branch, "develop");
     }
 
     #[test]

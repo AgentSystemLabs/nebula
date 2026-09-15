@@ -1153,6 +1153,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "tempfile",
  "tokio",
  "ulid",
 ]
@@ -1187,6 +1188,7 @@ name = "nebula-tui"
 version = "0.26.0"
 dependencies = [
  "anyhow",
+ "base64",
  "crossterm",
  "futures",
  "nebula-core",

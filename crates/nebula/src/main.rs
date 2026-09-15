@@ -6,11 +6,15 @@ mod upgrade;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Command, WorkspaceCommand};
+use cli::{Cli, Command, ConfigCommand, WorkspaceCommand};
 use std::path::Path;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // A `nebula ssh` / `nebula tunnel` from another machine may have sent its
+    // settings along. Merge them before anything reads a setting, and before
+    // a thread or a child exists to inherit the variable.
+    nebula_tui::bundle::apply_forwarded();
     match cli.command {
         Some(Command::Daemon { foreground }) => {
             init_daemon_logging(foreground)?;
@@ -33,6 +37,11 @@ fn main() -> Result<()> {
             };
             nebula_tui::run_workspace(op)
         }
+        Some(Command::Config { command }) => nebula_tui::run_config(match command {
+            ConfigCommand::Path => nebula_tui::ConfigOp::Path,
+            ConfigCommand::Export { path } => nebula_tui::ConfigOp::Export { path },
+            ConfigCommand::Import { source } => nebula_tui::ConfigOp::Import { source },
+        }),
         Some(Command::Kill) => nebula_tui::run_kill(),
         Some(Command::Rename { title, force }) => {
             let mode = if force {
@@ -63,17 +72,23 @@ fn main() -> Result<()> {
             credential,
             open: !no_open,
         }),
-        Some(Command::Ssh { host, path }) => ssh::run_ssh(&host, path.as_deref()),
+        Some(Command::Ssh {
+            host,
+            path,
+            no_sync_config,
+        }) => ssh::run_ssh(&host, path.as_deref(), !no_sync_config),
         Some(Command::Tunnel {
             host,
             path,
             port,
             remote_port,
+            no_sync_config,
         }) => tunnel::run_tunnel(tunnel::TunnelOpts {
             host,
             path,
             port,
             remote_port,
+            sync_config: !no_sync_config,
         }),
         Some(Command::Upgrade { force }) => upgrade::run_upgrade(force),
         Some(Command::StaleDaemonNote) => {
@@ -102,7 +117,7 @@ fn main() -> Result<()> {
                     // local daemon and its sessions stay up).
                     Some(entry) => {
                         eprintln!("nebula: connecting to {}…", entry.host);
-                        ssh::run_ssh(&entry.host, entry.path.as_deref())
+                        ssh::run_ssh(&entry.host, entry.path.as_deref(), true)
                     }
                     None => Ok(()),
                 }

@@ -112,7 +112,7 @@ dev-seed: ## Copy real projects/workspaces/settings into the dev instance (only 
 	mkdir -p $(DEV_DATA); \
 	sqlite3 "$$real/nebula.db" ".backup '$(DEV_DATA)/nebula.db'"; \
 	sqlite3 $(DEV_DATA)/nebula.db "DELETE FROM agents; DELETE FROM terminals;"; \
-	for f in config.json reviewed.json; do \
+	for f in config.json config.local.json reviewed.json; do \
 		if [ -f "$$real/$$f" ]; then cp "$$real/$$f" $(DEV_DATA)/; fi; \
 	done; \
 	echo "seeded dev instance from $$real (projects, worktrees, workspaces, settings — no sessions)"

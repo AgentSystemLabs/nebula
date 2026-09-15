@@ -16,6 +16,13 @@ pub const API_TOKEN: &str = "NEBULA_API_TOKEN";
 pub const RUNTIME_DIR: &str = "NEBULA_RUNTIME_DIR";
 /// Overrides the data dir holding the database, config and logs.
 pub const DATA_DIR: &str = "NEBULA_DATA_DIR";
+/// Moves `config.json` alone — into a dotfiles checkout, say — leaving the
+/// database, the logs and `config.local.json` in the data dir.
+pub const CONFIG_FILE: &str = "NEBULA_CONFIG_FILE";
+/// A SETTINGS BUNDLE (base64 JSON) that `nebula ssh` / `nebula tunnel` hand
+/// the remote nebula. Read once at startup, merged into that machine's
+/// settings, and removed from the environment before anything is spawned.
+pub const IMPORT_BUNDLE: &str = "NEBULA_IMPORT_BUNDLE";
 /// Replaces every agent CLI with one command line, taken verbatim (tests
 /// stand in `/bin/sh` or a stub script for `claude`).
 pub const AGENT_CMD: &str = "NEBULA_AGENT_CMD";
