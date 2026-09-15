@@ -35,6 +35,7 @@ pub(super) fn submit(
                 project.clone(),
                 branch.clone(),
                 launch.kind,
+                launch.custom.clone(),
                 launch.model.clone(),
                 launch.effort.clone(),
                 out,
@@ -114,6 +115,7 @@ fn draft(
     AgentLaunchDraft {
         worktree,
         kind: launch.kind,
+        custom: launch.custom.clone(),
         model: launch.model.clone(),
         effort: launch.effort.clone(),
         name: String::new(),

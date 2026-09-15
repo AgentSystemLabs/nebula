@@ -510,6 +510,7 @@ pub enum ConfigOp {
     Path,
     Export { path: Option<String> },
     Import { source: String },
+    Harnesses,
 }
 
 pub fn run(op: ConfigOp) -> Result<()> {
@@ -525,6 +526,19 @@ pub fn run(op: ConfigOp) -> Result<()> {
                 println!("{label:<20}{}", path.display());
             }
             Ok(())
+        }
+        ConfigOp::Harnesses => {
+            // The registry as launches read it: the compiled-in rows with
+            // the `harnesses` map, the legacy list and the legacy keys
+            // folded in. Copy a row into config.json `harnesses` to
+            // override it field by field (`null` clears a nullable row).
+            let registry = crate::config::Config::load().harness_registry();
+            let mut text = serde_json::to_string_pretty(&registry)?;
+            text.push('\n');
+            std::io::stdout()
+                .lock()
+                .write_all(text.as_bytes())
+                .context("writing to stdout")
         }
         ConfigOp::Export { path } => {
             let (bundle, warnings) = export(&paths, Scope::Backup);

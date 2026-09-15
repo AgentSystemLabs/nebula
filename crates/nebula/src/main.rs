@@ -41,6 +41,7 @@ fn main() -> Result<()> {
             ConfigCommand::Path => nebula_tui::ConfigOp::Path,
             ConfigCommand::Export { path } => nebula_tui::ConfigOp::Export { path },
             ConfigCommand::Import { source } => nebula_tui::ConfigOp::Import { source },
+            ConfigCommand::Harnesses => nebula_tui::ConfigOp::Harnesses,
         }),
         Some(Command::Kill) => nebula_tui::run_kill(),
         Some(Command::Rename { title, force }) => {

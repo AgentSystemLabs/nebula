@@ -7,8 +7,15 @@ Everything that can start an AGENT, and what each launch path does differently.
 ## The NEW SESSION PICKER
 
 With a WORKTREE selected, press `n` in the SESSIONS PANEL. A menu asks what to
-run — **Claude**, **Codex**, **Cursor**, or **Pi** (a plain shell is `t` — see [Keys](keys.md)); a CLI you never use can be
-switched off on the settings overlay's Agents tab and drops out of the menu entirely. `→` on any row drills
+run — **Claude**, **Codex**, **Cursor**, **Pi**, or **Muse** (a plain shell is `t` — see [Keys](keys.md)); a CLI you never use can be
+switched off on the settings overlay's Agents tab and drops out of the menu entirely. Turn on `Hide missing CLIs`
+on the Agents tab and the menu lists only enabled harnesses whose CLI is found on PATH (the daemon still
+checks through the login shell at launch). Your own CLIs join the menu too: add them to config.json
+`custom_harnesses` (see [Configuration](configuration.md)) and they appear after the built-ins under their
+own labels, toggled per entry on the Agents tab's Custom harnesses row, with the session row wearing the
+entry's label as its badge. A custom entry launches with its program and model flag, boots fresh every
+time (no resume mapping), and — unless it names a built-in hook dialect — stays process-based: yellow
+while the PTY is live, green when it ends, never red. `→` on any row drills
 into model and reasoning-effort submenus (Cursor's model is a family such as `claude-opus-5-thinking`, and
 its effort list follows the family, `-fast` variants included — `cursor-agent --list-models` bakes both
 into the id, so nebula launches `--model claude-opus-5-thinking-high-fast`; the list is a built-in seed
@@ -42,7 +49,8 @@ is spawned with no permission flag at all and keeps its normal prompts — it st
 things it is configured to ask about. Codex is spawned with `--yolo` and Cursor with `--force`, so
 **neither of those two ever stops to ask**: they edit files and run commands on their own judgment for
 the life of the SESSION, and nothing in the picker or the settings overlay softens that. Pi has no
-permission gate to begin with — nebula passes no flag, and it runs its tools as it sees fit. Pick the
+permission gate to begin with — nebula passes no flag, and it runs its tools as it sees fit. Muse is
+the same: no flag mapped yet. Pick the
 harness with that in mind, especially in the ROOT WORKTREE.
 
 The same choice reaches the STATUS DOT, because an AGENT can only report what its hook set can see.
@@ -62,7 +70,8 @@ nebula installs one managed extension (`~/.pi/agent/extensions/nebula.ts`, inert
 posts pi's `session_start`, `before_agent_start`, `agent_end` and `ask_question` tool events as
 `SessionStart`, `UserPromptSubmit`, `Stop` and `PreToolUse` / `PostToolUse`, and any blocking prompt an
 extension raises mid-run as `PermissionRequest` — so a Pi row goes yellow, red while its `ask_question`
-tool waits on you, and green when the run ends, a cancelled run included.
+tool waits on you, and green when the run ends, a cancelled run included. Muse has no hooks at all yet:
+its row is yellow while the PTY is live and green when the process ends, and it never goes red.
 
 ## AGENT PRESETS
 
@@ -77,7 +86,9 @@ and `Enter` launches it at once, no box at all; the list marks those rows `no ta
 picked with `Shift+Tab` in a quick prompt, or with `e` in the issues modal, launches the same way when
 the box is still empty, while text you already typed stays yours to send. The row it creates is an
 ordinary session: it names itself on that first turn, resumes, and shows status like any other. Presets
-live in `agent_presets.json` beside `config.json`.
+live in `agent_presets.json` beside `config.json`. The form's Harness row lists custom registry entries
+by id alongside the built-ins — a preset on one launches with the entry's program and defaults, and
+refuses with the reason when its entry is switched off or gone.
 
 ## RECENT PROMPTS
 
@@ -120,10 +131,10 @@ list on its own, and the one under your cursor goes the moment GitHub says it's 
 on one and the right-hand pane reads it to you — description, stats and the whole conversation — without
 leaving nebula; `g` opens its diff in the same viewer your worktree diffs use, `Enter` or a double-click
 opens it in the browser, and `/` finds it by title. Press `n` — or choose **New Claude session**, **New
-Codex session** or **New Cursor session** from `m` / right-click — to start a SESSION on any enabled
+Codex session**, **New Cursor session**, **New Pi session** or **New Muse session** from `m` / right-click — to start a SESSION on any enabled
 harness in the PROJECT's ROOT WORKTREE, through the same MODEL / EFFORT submenus as the NEW SESSION
-PICKER, with a rule that limits all work to that PR and includes its URL: Claude gets it as an appended
-system prompt, Codex and Cursor as their first prompt. The URL is kept with the AGENT, so RESUME
+PICKER, with a rule that limits all work to that PR and includes its URL: Claude and Pi get it as an appended
+system prompt, Codex, Cursor and Muse as their first prompt. The URL is kept with the AGENT, so RESUME
 reapplies the same scope. Only the row you actually stop on is fetched.
 
 The group folds. Click its header — or pick **Show/hide open PRs** from the panel's right-click
@@ -172,7 +183,7 @@ Either way the launch is an ISSUE SESSION. The create carries the issue's URL
 (`CreateAgent::issue_url`); the DAEMON validates it, keeps it with the AGENT row beside a PR
 SESSION's URL, refuses to hand the launch to a PREWARM POOL spare (which booted without it), and on
 every cold spawn and RESUME composes an issue-context rule naming the URL, the checkout and its
-branch — Claude and Pi receive it through `--append-system-prompt`, Codex and Cursor as the opening
+branch — Claude and Pi receive it through `--append-system-prompt`, Codex, Cursor and Muse as the opening
 of their first prompt, exactly as the PR rule travels. The harness therefore knows which issue the
 session exists for before it reads your task, is told to read the issue with `gh issue view` first,
 and to reference it in commits and close it from the pull request. The row it creates is an

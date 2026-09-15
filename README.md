@@ -4,7 +4,7 @@
 
 **Mission control for your coding agents.**
 
-Run **Claude Code**, **Codex**, **Cursor** and **Pi** across every project and git WORKTREE you own — from one
+Run **Claude Code**, **Codex**, **Cursor**, **Pi** and **Muse** across every project and git WORKTREE you own — from one
 terminal, one keyboard, one tree. They keep working when you close it.
 
 [![Release](https://img.shields.io/github/v/release/AgentSystemLabs/nebula?style=flat-square&color=e8c547&label=release)](https://github.com/AgentSystemLabs/nebula/releases)
@@ -73,7 +73,7 @@ build speaks a different protocol, in which case it can't attach until that rest
 says so and offers to do it for you. `nebula --version`
 (`-V`) says which binary you are on.
 
-> **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, or `pi`.
+> **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, `pi`, or `muse`.
 > nebula spawns them; it doesn't ship them.
 >
 > Three commands each want one more binary, and only those commands: `nebula ssh` and `nebula tunnel`
@@ -102,7 +102,7 @@ in the WORKTREES PANEL to branch off into a real `git worktree`. That's the whol
 two agents in two WORKTREES edit two directories and never collide.
 
 **4. Start the agent.** `n` in the SESSIONS PANEL opens the NEW SESSION PICKER — **Claude**, **Codex**,
-**Cursor** or **Pi**, `→` for MODEL and EFFORT, `Enter` for your defaults — then type the agent's first prompt
+**Cursor**, **Pi** or **Muse**, `→` for MODEL and EFFORT, `Enter` for your defaults — then type the agent's first prompt
 in the box that follows (or `Enter` on it empty to start in the CLI). Or skip the picker entirely: `p` from any
 PANEL opens the QUICK PROMPT, you type the task, and an agent starts working on it in the selected
 WORKTREE — or, from the WORKTREES PANEL or with `Ctrl+N` inside the box, in a fresh worktree cut for the
@@ -132,7 +132,8 @@ Claude's prompt box and `/resume` picker on your next prompt.
 | ○ | disconnected — the DAEMON restarted while the agent was live |
 
 A Cursor SESSION never goes red: nebula runs `cursor-agent --force` and Cursor reports no permission
-event, so waiting-on-you is not detectable there.
+event, so waiting-on-you is not detectable there. A Muse SESSION never goes red either yet: `muse`
+has no managed hooks, so its status is process-based until a hook dialect is mapped.
 
 WORKTREE and PROJECT rows ROLL UP their children: red beats yellow beats done, and a parent's dot is
 violet whenever anything UNSEEN finished under it — so the violet walks up the tree and turns green as

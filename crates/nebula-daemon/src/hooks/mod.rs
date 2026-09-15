@@ -406,7 +406,12 @@ async fn receive_hook(
                 .agent_title_state(&agent_id)
                 .ok()
                 .flatten()
-                .and_then(|s| s.to_push().map(str::to_string)),
+                .and_then(|s| {
+                    // Custom rows on the Claude dialect title-push like
+                    // Claude; any other custom row stays quiet (see
+                    // `TitleState::to_push`, which resolves the dialect).
+                    s.to_push().map(str::to_string)
+                }),
             HookCli::Codex | HookCli::Cursor | HookCli::Pi => None,
         };
         return (
@@ -477,6 +482,7 @@ mod tests {
             archived_at: 0,
             unseen: false,
             kind: AgentKind::Claude,
+            custom_harness: None,
             model: None,
             effort: None,
             session_id: None,

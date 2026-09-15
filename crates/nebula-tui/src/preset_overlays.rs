@@ -111,26 +111,35 @@ impl PresetField {
     ];
 
     /// The field `delta` steps away in Tab order, wrapping, and skipping
-    /// an Effort the (kind, model) pair has no choice for — a Cursor
+    /// an Effort the (harness, model) pair has no choice for — a Cursor
     /// family without effort variants, or no Cursor model yet.
-    pub fn step(self, kind: AgentKind, model: &str, delta: i32) -> PresetField {
+    pub fn step(
+        self,
+        kind: AgentKind,
+        custom: Option<&str>,
+        model: &str,
+        delta: i32,
+    ) -> PresetField {
         let n = Self::ALL.len() as i32;
         let mut pos = Self::ALL.iter().position(|f| *f == self).unwrap_or(0) as i32;
         for _ in 0..n {
             pos = (pos + delta).rem_euclid(n);
             let next = Self::ALL[pos as usize];
-            if next.available(kind, model) {
+            if next.available(kind, custom, model) {
                 return next;
             }
         }
         self
     }
 
-    /// Whether the field applies to `kind` (with `model` chosen) at all.
-    pub fn available(self, kind: AgentKind, model: &str) -> bool {
+    /// Whether the field applies to the harness (with `model` chosen) at
+    /// all.
+    pub fn available(self, kind: AgentKind, custom: Option<&str>, model: &str) -> bool {
         match self {
-            PresetField::Model => !crate::config::model_choices(kind).is_empty(),
-            PresetField::Effort => !crate::config::effort_choices(kind, Some(model)).is_empty(),
+            PresetField::Model => !crate::config::model_choices(kind, custom).is_empty(),
+            PresetField::Effort => {
+                !crate::config::effort_choices(kind, Some(model), custom).is_empty()
+            }
             _ => true,
         }
     }
@@ -169,6 +178,8 @@ pub struct AgentPresetEditor {
     pub editing: Option<usize>,
     pub name: TextInput,
     pub kind: AgentKind,
+    /// Registry id when `kind` is [`AgentKind::Custom`].
+    pub custom: Option<String>,
     pub model: String,
     pub effort: String,
     pub prefix: TextInput,
@@ -195,6 +206,7 @@ impl AgentPresetEditor {
             editing: None,
             name: TextInput::new(),
             kind: AgentKind::Claude,
+            custom: None,
             model: crate::config::DEFAULT_CHOICE.into(),
             effort: crate::config::DEFAULT_CHOICE.into(),
             prefix: TextInput::new(),
@@ -217,6 +229,7 @@ impl AgentPresetEditor {
             editing: Some(index),
             name: TextInput::with_text(preset.name.clone()),
             kind: preset.kind,
+            custom: preset.custom_harness.clone(),
             model: choice(&preset.model),
             effort: choice(&preset.effort),
             prefix: TextInput::with_text(preset.prefix.clone()),
@@ -243,25 +256,36 @@ impl AgentPresetEditor {
 
     /// Switch harness, dropping a model / effort the new kind doesn't list
     /// back to the default so the form never holds a choice it can't show.
-    pub fn set_kind(&mut self, kind: AgentKind) {
+    pub fn set_kind(&mut self, kind: AgentKind, custom: Option<String>) {
         self.kind = kind;
-        if !fits(&self.model, crate::config::model_choices(kind)) {
+        self.custom = custom;
+        if !fits(
+            &self.model,
+            &crate::config::model_choices(kind, self.custom.as_deref()),
+        ) {
             self.model = crate::config::DEFAULT_CHOICE.into();
         }
         self.fit_effort();
-        if !self.field.available(kind, &self.model) {
+        if !self.field.available(kind, self.custom.as_deref(), &self.model) {
             self.field = PresetField::Prefix;
         }
     }
 
-    /// Drop an effort the current (kind, model) pair doesn't list — Cursor's
-    /// list follows the family — to what "default" would launch: the
-    /// family's fallback for a Cursor family with no bare id, else default.
+    /// Drop an effort the current (harness, model) pair doesn't list — a
+    /// composing harness's list follows the family — to what "default"
+    /// would launch: the family's fallback for a family with no bare id,
+    /// else default.
     fn fit_effort(&mut self) {
-        let choices = crate::config::effort_choices(self.kind, Some(&self.model));
-        if !fits(&self.effort, choices) {
-            self.effort = crate::config::fit_effort(self.kind, Some(&self.model), None)
-                .unwrap_or_else(|| crate::config::DEFAULT_CHOICE.into());
+        let choices =
+            crate::config::effort_choices(self.kind, Some(&self.model), self.custom.as_deref());
+        if !fits(&self.effort, &choices) {
+            self.effort = crate::config::fit_effort(
+                self.kind,
+                Some(&self.model),
+                None,
+                self.custom.as_deref(),
+            )
+            .unwrap_or_else(|| crate::config::DEFAULT_CHOICE.into());
         }
     }
 
@@ -270,18 +294,24 @@ impl AgentPresetEditor {
     /// a text row and on an `n/a` row.
     fn row_choices(&self) -> Vec<String> {
         match self.field {
-            PresetField::Kind => AgentKind::ALL
-                .iter()
-                .map(|k| k.as_str().to_string())
+            // Every offered harness by id — built-ins and customs alike,
+            // in registry order. Never a bare `custom`, which carries no
+            // entry.
+            PresetField::Kind => crate::config::Config::load()
+                .offered_harnesses()
+                .into_iter()
+                .map(|(kind, custom)| {
+                    custom.unwrap_or_else(|| kind.as_str().to_string())
+                })
                 .collect(),
-            PresetField::Model => crate::config::model_choices(self.kind)
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            PresetField::Effort => crate::config::effort_choices(self.kind, Some(&self.model))
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            PresetField::Model => {
+                crate::config::model_choices(self.kind, self.custom.as_deref())
+            }
+            PresetField::Effort => crate::config::effort_choices(
+                self.kind,
+                Some(&self.model),
+                self.custom.as_deref(),
+            ),
             PresetField::Task => vec![TASK_ASK.to_string(), TASK_SKIP.to_string()],
             _ => Vec::new(),
         }
@@ -289,7 +319,11 @@ impl AgentPresetEditor {
 
     fn row_value(&self) -> String {
         match self.field {
-            PresetField::Kind => self.kind.as_str().to_string(),
+            PresetField::Kind => self
+                .custom
+                .as_deref()
+                .unwrap_or_else(|| self.kind.as_str())
+                .to_string(),
             PresetField::Model => self.model.clone(),
             PresetField::Effort => self.effort.clone(),
             PresetField::Task => self.task_choice().to_string(),
@@ -301,7 +335,13 @@ impl AgentPresetEditor {
         match self.field {
             PresetField::Kind => {
                 if let Some(kind) = AgentKind::parse(value) {
-                    self.set_kind(kind);
+                    self.set_kind(kind, None);
+                } else if crate::config::Config::load()
+                    .harness_registry()
+                    .iter()
+                    .any(|entry| entry.id == value)
+                {
+                    self.set_kind(AgentKind::Custom, Some(value.to_string()));
                 }
             }
             PresetField::Model => {
@@ -395,6 +435,7 @@ impl AgentPresetEditor {
         AgentPreset {
             name: self.name.trim().to_string(),
             kind: self.kind,
+            custom_harness: self.custom.clone(),
             model: crate::config::non_default(&self.model),
             effort: crate::config::non_default(&self.effort),
             prefix: self.prefix.as_str().to_string(),
@@ -527,10 +568,10 @@ pub(crate) fn open_agent_preset_task(
         app.flash = Some("no preset selected — a creates one".into());
         return;
     };
-    if !crate::config::Config::load().kind_enabled(preset.kind) {
+    if !crate::config::Config::load().preset_harness_usable(&preset) {
         app.flash = Some(format!(
             "{} is turned off in Settings → Agents",
-            preset.kind.as_str()
+            preset.custom_harness.as_deref().unwrap_or(preset.kind.as_str())
         ));
         return;
     }
@@ -565,10 +606,10 @@ fn apply_preset_to_quick_prompt(
         return;
     };
     let cfg = crate::config::Config::load();
-    if !cfg.kind_enabled(preset.kind) {
+    if !cfg.preset_harness_usable(&preset) {
         app.flash = Some(format!(
             "{} is turned off in Settings → Agents",
-            preset.kind.as_str()
+            preset.custom_harness.as_deref().unwrap_or(preset.kind.as_str())
         ));
         return;
     }
@@ -656,11 +697,21 @@ pub(crate) fn handle_editor_key(app: &mut App, key: KeyEvent) {
         // Leaving a choice row drops its type-ahead.
         KeyCode::Tab | KeyCode::Down => {
             editor.filter.clear();
-            editor.field = editor.field.step(editor.kind, &editor.model, 1)
+            editor.field = editor.field.step(
+                editor.kind,
+                editor.custom.as_deref(),
+                &editor.model,
+                1,
+            )
         }
         KeyCode::BackTab | KeyCode::Up => {
             editor.filter.clear();
-            editor.field = editor.field.step(editor.kind, &editor.model, -1)
+            editor.field = editor.field.step(
+                editor.kind,
+                editor.custom.as_deref(),
+                &editor.model,
+                -1,
+            )
         }
         // A hard line in the prefix / postfix, as in the task editor.
         KeyCode::Char('j') if multiline && ctrl => editor.prefix_or_postfix_newline(),
@@ -841,7 +892,8 @@ pub(crate) fn draw_editor(f: &mut Frame, app: &mut App, editor: &AgentPresetEdit
             break;
         };
         let focused = editor.field == *field;
-        let available = field.available(editor.kind, &editor.model);
+        let available =
+            field.available(editor.kind, editor.custom.as_deref(), &editor.model);
         let label_style = if focused {
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
         } else if available {
@@ -866,7 +918,11 @@ pub(crate) fn draw_editor(f: &mut Frame, app: &mut App, editor: &AgentPresetEdit
             }
             _ => {
                 let value = match field {
-                    PresetField::Kind => editor.kind.as_str().to_string(),
+                    PresetField::Kind => editor
+                        .custom
+                        .as_deref()
+                        .unwrap_or_else(|| editor.kind.as_str())
+                        .to_string(),
                     PresetField::Model => editor.model.clone(),
                     PresetField::Effort => editor.effort.clone(),
                     PresetField::Task => editor.task_choice().to_string(),
@@ -968,5 +1024,46 @@ pub(crate) fn draw_editor(f: &mut Frame, app: &mut App, editor: &AgentPresetEdit
     // of backs out from.
     if let Some(Overlay::AgentPresetEditor(e)) = &mut app.overlay {
         e.area = area;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nebula_core::WorktreeId;
+
+    fn pinned<T>(json: &str, f: impl FnOnce() -> T) -> T {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, json).unwrap();
+        crate::config::with_config_path(path, f)
+    }
+
+    /// The Harness row lists custom entries by id after the built-ins —
+    /// never a bare `custom` — and picking one stores the registry id.
+    #[test]
+    fn kind_choices_list_custom_entries_by_id() {
+        pinned(
+            r#"{"custom_harnesses": [{"id": "agy", "program": "agy"}]}"#,
+            || {
+                let mut editor = AgentPresetEditor::new(WorktreeId("w1".into()));
+                editor.field = PresetField::Kind;
+                let choices = editor.row_choices();
+                assert!(choices.contains(&"claude".to_string()), "{choices:?}");
+                assert!(choices.contains(&"agy".to_string()), "{choices:?}");
+                assert!(!choices.contains(&"custom".to_string()), "{choices:?}");
+
+                editor.set_row_value("agy");
+                assert_eq!(editor.kind, AgentKind::Custom);
+                assert_eq!(editor.custom.as_deref(), Some("agy"));
+                assert_eq!(editor.row_value(), "agy");
+                let preset = editor.to_preset();
+                assert_eq!(preset.custom_harness.as_deref(), Some("agy"));
+
+                editor.set_row_value("codex");
+                assert_eq!(editor.kind, AgentKind::Codex);
+                assert_eq!(editor.custom, None);
+            },
+        );
     }
 }

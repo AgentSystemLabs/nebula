@@ -66,10 +66,19 @@ impl Daemon {
         } else {
             (None, None)
         };
+        // A sibling on the same harness keeps its custom registry id; an
+        // override to another harness drops it (an override to Custom
+        // without an id is refused at create with its reason).
+        let custom_harness = if kind == caller.kind {
+            caller.custom_harness.clone()
+        } else {
+            None
+        };
         Ok(CreateAgentSpec {
             worktree: caller.worktree_id.clone(),
             name: sibling_name(&taken),
             kind,
+            custom_harness,
             model,
             effort,
             auto_title: true,
@@ -146,6 +155,7 @@ mod tests {
             archived_at: 0,
             unseen: false,
             kind,
+            custom_harness: None,
             model: model.map(str::to_string),
             effort: model.map(|_| "high".to_string()),
             session_id: Some("s1".into()),

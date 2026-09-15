@@ -143,10 +143,11 @@ pub(crate) struct LaunchPrompts {
 /// Fold a launch rule (the PR rule, the issue rule — see [`combined_rule`])
 /// into a spawn's prompts. `initial` is the first prompt the spawn already
 /// had — a RELOCATION PROMPT or an AGENT PRESET's composed task — and stays
-/// where it was; `resumed` tells a Codex / Cursor resume (which needs no
-/// rule) from a cold spawn (which opens with it).
+/// where it was; `system_append` tells a harness with a system-prompt flag
+/// (whose rule rides it) from one without (whose rule opens a cold spawn
+/// as its first prompt, and whose resume transcript already holds it).
 pub(crate) fn launch_prompts(
-    kind: AgentKind,
+    system_append: bool,
     resumed: bool,
     rule: Option<&str>,
     initial: Option<&str>,
@@ -158,25 +159,24 @@ pub(crate) fn launch_prompts(
             initial: initial_owned,
         };
     };
-    match kind {
-        AgentKind::Claude | AgentKind::Pi => LaunchPrompts {
+    if system_append {
+        return LaunchPrompts {
             system: Some(rule.to_string()),
             initial: initial_owned,
-        },
-        // Every other CLI has no system-prompt flag: the rule opens a cold
-        // spawn as its first prompt, and a resume's transcript already
-        // holds it.
-        _ if resumed => LaunchPrompts {
+        };
+    }
+    if resumed {
+        return LaunchPrompts {
             system: None,
             initial: initial_owned,
-        },
-        _ => LaunchPrompts {
-            system: None,
-            initial: Some(match initial {
-                Some(task) => format!("{rule}\n\n{task}"),
-                None => rule_as_first_prompt(rule),
-            }),
-        },
+        };
+    }
+    LaunchPrompts {
+        system: None,
+        initial: Some(match initial {
+            Some(task) => format!("{rule}\n\n{task}"),
+            None => rule_as_first_prompt(rule),
+        }),
     }
 }
 
@@ -260,6 +260,9 @@ pub(crate) struct CreatePrAgentSpec {
     pub project: ProjectId,
     pub name: String,
     pub kind: AgentKind,
+    /// Registry id of the custom harness, when `kind` is
+    /// [`AgentKind::Custom`].
+    pub custom_harness: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub auto_title: bool,
@@ -279,6 +282,7 @@ impl Daemon {
             project,
             name,
             kind,
+            custom_harness,
             model,
             effort,
             auto_title,
@@ -293,6 +297,7 @@ impl Daemon {
             worktree: worktree.id,
             name,
             kind,
+            custom_harness,
             model,
             effort,
             auto_title,
@@ -341,52 +346,44 @@ mod tests {
     }
 
     #[test]
-    fn claude_and_pi_take_the_rule_as_a_system_prompt_and_keep_their_first_prompt() {
+    fn system_prompt_harnesses_take_the_rule_as_a_system_prompt_and_keep_their_first_prompt() {
         let scope = scope(None);
         let text = rule(&scope);
-        for kind in [AgentKind::Claude, AgentKind::Pi] {
-            for resumed in [false, true] {
-                let prompts = launch_prompts(kind, resumed, Some(&text), Some("relocated"));
-                assert_eq!(
-                    prompts.system.as_deref(),
-                    Some(rule(&scope).as_str()),
-                    "{kind:?}"
-                );
-                assert_eq!(prompts.initial.as_deref(), Some("relocated"), "{kind:?}");
-            }
+        for resumed in [false, true] {
+            let prompts = launch_prompts(true, resumed, Some(&text), Some("relocated"));
+            assert_eq!(prompts.system.as_deref(), Some(rule(&scope).as_str()));
+            assert_eq!(prompts.initial.as_deref(), Some("relocated"));
         }
     }
 
     #[test]
-    fn codex_and_cursor_open_a_cold_spawn_with_the_rule_and_resume_without_it() {
+    fn harnesses_without_a_system_prompt_flag_open_cold_with_the_rule() {
         let scope = scope(None);
         let text = rule(&scope);
-        for kind in [AgentKind::Codex, AgentKind::Cursor] {
-            let cold = launch_prompts(kind, false, Some(&text), None);
-            assert_eq!(cold.system, None, "{kind:?} has no system-prompt flag");
-            let first = cold.initial.expect("the rule is the first prompt");
-            assert!(first.starts_with(&rule(&scope)), "{first}");
-            assert!(first.contains("wait for the user's request"), "{first}");
+        let cold = launch_prompts(false, false, Some(&text), None);
+        assert_eq!(cold.system, None, "no system-prompt flag");
+        let first = cold.initial.expect("the rule is the first prompt");
+        assert!(first.starts_with(&rule(&scope)), "{first}");
+        assert!(first.contains("wait for the user's request"), "{first}");
 
-            let with_task = launch_prompts(kind, false, Some(&text), Some("fix the tests"));
-            assert_eq!(
-                with_task.initial.as_deref(),
-                Some(format!("{}\n\nfix the tests", rule(&scope)).as_str())
-            );
+        let with_task = launch_prompts(false, false, Some(&text), Some("fix the tests"));
+        assert_eq!(
+            with_task.initial.as_deref(),
+            Some(format!("{}\n\nfix the tests", rule(&scope)).as_str())
+        );
 
-            let resumed = launch_prompts(kind, true, Some(&text), None);
-            assert_eq!(
-                resumed,
-                LaunchPrompts::default(),
-                "the transcript carries the rule through a resume"
-            );
-        }
+        let resumed = launch_prompts(false, true, Some(&text), None);
+        assert_eq!(
+            resumed,
+            LaunchPrompts::default(),
+            "the transcript carries the rule through a resume"
+        );
     }
 
     #[test]
     fn no_scope_changes_nothing() {
-        for kind in AgentKind::ALL {
-            let prompts = launch_prompts(kind, false, None, Some("task"));
+        for system_append in [false, true] {
+            let prompts = launch_prompts(system_append, false, None, Some("task"));
             assert_eq!(
                 prompts,
                 LaunchPrompts {

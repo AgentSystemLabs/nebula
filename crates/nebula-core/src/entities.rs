@@ -56,16 +56,29 @@ pub enum AgentKind {
     /// `@earendil-works/pi-coding-agent`). Status comes from a managed
     /// TypeScript extension rather than shell hooks.
     Pi,
+    /// Meta's Muse Spark coding agent: the `muse` CLI. No managed
+    /// hooks yet, so status is process-based (running while the PTY
+    /// is live) until a hook dialect is mapped.
+    Muse,
+    /// A user-defined harness from the `custom_harnesses` registry: the
+    /// entry id travels beside the session (see `Agent::custom_harness`),
+    /// never in this variant. Launches with the entry's program and model
+    /// flag, with process-based status and no resume — like [`AgentKind::Muse`].
+    Custom,
 }
 
 impl AgentKind {
     /// Every kind, for callers that must cover all of them (menus, the
     /// boot-time CLI probe warm) and should fail to compile if one is added.
-    pub const ALL: [AgentKind; 4] = [
+    /// `Custom` rides along: it never launches without its registry entry,
+    /// so loops over ALL skip it explicitly where a bare kind is meaningless.
+    pub const ALL: [AgentKind; 6] = [
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::Cursor,
         AgentKind::Pi,
+        AgentKind::Muse,
+        AgentKind::Custom,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -74,27 +87,39 @@ impl AgentKind {
             AgentKind::Codex => "codex",
             AgentKind::Cursor => "cursor",
             AgentKind::Pi => "pi",
+            AgentKind::Muse => "muse",
+            AgentKind::Custom => "custom",
         }
     }
 
+    /// Parse a harness name from settings or the CLI. Bare `"custom"`
+    /// never parses: a custom harness is meaningless without its registry
+    /// id, which travels in its own field.
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "claude" => AgentKind::Claude,
             "codex" => AgentKind::Codex,
             "cursor" => AgentKind::Cursor,
             "pi" => AgentKind::Pi,
+            "muse" => AgentKind::Muse,
             _ => return None,
         })
     }
 
     /// Binary the kind launches. Differs from `as_str` only for Cursor,
     /// whose agent CLI ships as `cursor-agent` (`cursor` opens the editor).
+    /// `Custom` has no static program — its entry names it — so every
+    /// launch path resolves through the harness registry first; the
+    /// placeholder below only surfaces as a "not found on PATH" error if
+    /// one ever launches it bare.
     pub fn cli_program(&self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::Cursor => "cursor-agent",
             AgentKind::Pi => "pi",
+            AgentKind::Muse => "muse",
+            AgentKind::Custom => "custom",
         }
     }
 }
@@ -174,6 +199,11 @@ pub struct Agent {
     pub status_changed_at: i64,
     #[serde(default)]
     pub kind: AgentKind,
+    /// Registry id of the custom harness, when `kind` is
+    /// [`AgentKind::Custom`]. Persisted beside the row so respawns find
+    /// the same entry; None for every built-in harness.
+    #[serde(default)]
+    pub custom_harness: Option<String>,
     /// Model the CLI is launched with (claude `--model` / codex `-m`);
     /// None = the CLI's own default. Persisted so respawns keep it.
     #[serde(default)]

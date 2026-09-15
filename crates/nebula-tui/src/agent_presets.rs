@@ -24,6 +24,9 @@ pub struct AgentPreset {
     /// The CLI the preset launches.
     #[serde(default)]
     pub kind: AgentKind,
+    /// Registry id when `kind` is [`AgentKind::Custom`].
+    #[serde(default)]
+    pub custom_harness: Option<String>,
     /// Launch model; None = follow the Settings → Agents default.
     #[serde(default)]
     pub model: Option<String>,
@@ -47,7 +50,11 @@ impl AgentPreset {
     /// `claude · opus · high` / `codex · gpt-5.5` / `cursor` — the kind plus
     /// whichever of model and effort the preset pins.
     pub fn spec_label(&self) -> String {
-        let mut parts = vec![self.kind.as_str().to_string()];
+        let harness = self
+            .custom_harness
+            .as_deref()
+            .unwrap_or_else(|| self.kind.as_str());
+        let mut parts = vec![harness.to_string()];
         parts.extend(self.model.iter().cloned());
         parts.extend(self.effort.iter().cloned());
         parts.join(" · ")
@@ -169,6 +176,7 @@ mod tests {
         AgentPreset {
             name: name.into(),
             kind,
+            custom_harness: None,
             model: None,
             effort: None,
             prefix: String::new(),

@@ -12,6 +12,7 @@
 //! portable file.
 
 use nebula_core::AgentKind;
+use nebula_core::harness::{CustomHarness, HarnessDescriptor};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -70,106 +71,207 @@ pub const DEFAULT_CHOICE: &str = "default";
 /// `""`, never this word.
 pub const AUTO_CHOICE: &str = "auto";
 
-/// Model/effort choices for the new-session submenus and the settings
-/// overlay. [`DEFAULT_CHOICE`] everywhere means "don't pass the flag — let
-/// the CLI pick" and is what the daemon sees as None. `CLAUDE_MODELS` is
-/// the built-in alias list; what the pickers show is
-/// `claude_catalogue::models()`, which swaps it for `claude_models` in
-/// CONFIG.JSON or Claude Code's own `availableModels` allowlist.
-pub const CLAUDE_MODELS: &[&str] = &[DEFAULT_CHOICE, "fable", "opus", "sonnet", "haiku"];
-pub const CLAUDE_EFFORTS: &[&str] = &[DEFAULT_CHOICE, "low", "medium", "high", "xhigh", "max"];
-pub const CODEX_MODELS: &[&str] = &[
-    DEFAULT_CHOICE,
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
-    "gpt-5.5",
-];
-pub const CODEX_EFFORTS: &[&str] = &[DEFAULT_CHOICE, "minimal", "low", "medium", "high", "xhigh"];
-/// Pi's `--model` takes a fuzzy pattern across every provider it has
-/// credentials for (`opus` finds `anthropic/claude-opus-…`), so the list is
-/// families, not ids; a hand-edited `provider/id` passes through verbatim.
-pub const PI_MODELS: &[&str] = &[DEFAULT_CHOICE, "opus", "sonnet", "haiku", "gpt-5.5"];
-/// Pi's `--thinking` levels, in the CLI's own order.
-pub const PI_EFFORTS: &[&str] = &[
-    DEFAULT_CHOICE,
-    "off",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max",
-];
+/// The static model/effort lists live in the core registry table now
+/// ([`nebula_core::harness::builtin`]); what the pickers show is built
+/// below from the effective descriptor, so a `harnesses` override renames
+/// the rows everywhere at once. Claude's models still come from
+/// `claude_catalogue.rs` at runtime — CONFIG.JSON's `claude_models`, else
+/// Claude Code's own `availableModels`, else the aliases — and Cursor's
+/// from its catalogue (a seed plus a cached `cursor-agent --list-models`).
 
-/// The `quick_prompt_kind` choices — every AGENT KIND, by the name the
-/// config file stores. Spelled out rather than derived because
-/// [`cycle_choice`] works over `&'static [&'static str]`;
-/// `quick_prompt_kinds_are_every_agent_kind` keeps it honest.
-pub const AGENT_KIND_NAMES: &[&str] = &["claude", "codex", "cursor", "pi"];
+/// The `quick_prompt_kind` choices: every built-in harness id, by the name
+/// the config file stores. Derived from the registry table rather than
+/// spelled out, so a new built-in joins the cycle without a second edit.
+pub fn agent_kind_names() -> Vec<String> {
+    nebula_core::harness::builtins()
+        .iter()
+        .map(|descriptor| descriptor.id.clone())
+        .collect()
+}
 
-/// Model choices for a session kind. Claude's come from
-/// `claude_catalogue.rs`: CONFIG.JSON's `claude_models`, else Claude Code's
-/// `availableModels`, else [`CLAUDE_MODELS`]. Cursor's come from the CURSOR
-/// CATALOGUE (`cursor_catalogue.rs`): a seed plus a cached
-/// `cursor-agent --list-models`.
-pub fn model_choices(kind: AgentKind) -> &'static [&'static str] {
-    match kind {
-        AgentKind::Claude => crate::claude_catalogue::models(),
-        AgentKind::Codex => CODEX_MODELS,
-        AgentKind::Cursor => crate::cursor_catalogue::models(),
-        AgentKind::Pi => PI_MODELS,
+/// The model rows for a harness: [`DEFAULT_CHOICE`] first ("don't pass the
+/// flag — let the CLI pick", what the daemon sees as None), then the
+/// runtime catalogue (Claude/Cursor, already headed) or the descriptor's
+/// static list. Pi's `--model` takes a fuzzy pattern across providers, so
+/// its list is families, not ids; a hand-edited `provider/id` passes
+/// through verbatim.
+pub fn model_choices(kind: AgentKind, custom: Option<&str>) -> Vec<String> {
+    model_choices_in(&describe(kind, custom))
+}
+
+/// [`model_choices`] against an explicit descriptor, for callers that
+/// already resolved one (the Agents tab, the launch sites).
+pub fn model_choices_in(descriptor: &nebula_core::harness::HarnessDescriptor) -> Vec<String> {
+    match descriptor.model.catalog {
+        Some(nebula_core::harness::HarnessCatalog::Claude) => crate::claude_catalogue::models()
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        Some(nebula_core::harness::HarnessCatalog::Cursor) => crate::cursor_catalogue::models()
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        None => headed(
+            descriptor.model.models.iter().map(|entry| entry.id.clone()).collect(),
+        ),
     }
 }
 
-/// Effort choices for a session kind given its chosen model (None or
-/// "default" = the CLI's pick). Claude and Codex take any effort with any
-/// model; Cursor's list follows the family (`-fast` variants ride in the
-/// effort, `high-fast`), leads with "default" only when the bare family id
-/// exists, and is empty — no Effort row, no effort submenu — when the model
-/// is unset or the family has no effort variants (`auto`).
-pub fn effort_choices(kind: AgentKind, model: Option<&str>) -> &'static [&'static str] {
-    match kind {
-        AgentKind::Claude => CLAUDE_EFFORTS,
-        AgentKind::Codex => CODEX_EFFORTS,
-        AgentKind::Cursor => crate::cursor_catalogue::efforts(model),
-        AgentKind::Pi => PI_EFFORTS,
+/// Effort rows for a harness given its chosen model (None or "default" =
+/// the CLI's pick). Empty — no Effort row, no effort submenu — while the
+/// harness offers no effort. Cursor's list follows the family (`-fast`
+/// variants ride in the effort, `high-fast`); any other harness takes its
+/// static list with any model.
+pub fn effort_choices(
+    kind: AgentKind,
+    model: Option<&str>,
+    custom: Option<&str>,
+) -> Vec<String> {
+    effort_choices_in(&describe(kind, custom), model)
+}
+
+/// [`effort_choices`] against an explicit descriptor, for callers that
+/// already resolved one (the Agents tab, the launch sites).
+pub fn effort_choices_in(
+    descriptor: &nebula_core::harness::HarnessDescriptor,
+    model: Option<&str>,
+) -> Vec<String> {
+    if !descriptor.effort.offered {
+        return Vec::new();
     }
+    if descriptor.model.catalog == Some(nebula_core::harness::HarnessCatalog::Cursor) {
+        return crate::cursor_catalogue::efforts(model)
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    }
+    headed(descriptor.effort.efforts.clone())
+}
+
+/// [`DEFAULT_CHOICE`] heading a choice list, without doubling a default
+/// the source already carries.
+fn headed(mut rest: Vec<String>) -> Vec<String> {
+    rest.retain(|choice| !choice.eq_ignore_ascii_case(DEFAULT_CHOICE));
+    let mut out = vec![DEFAULT_CHOICE.to_string()];
+    out.append(&mut rest);
+    out
 }
 
 /// Whether `value` is one of `choices`, case-insensitively and trimmed —
 /// how a form decides a saved or cycled choice still has a row.
-pub(crate) fn fits(value: &str, choices: &[&str]) -> bool {
-    choices.iter().any(|c| c.eq_ignore_ascii_case(value.trim()))
+pub(crate) fn fits(value: &str, choices: &[impl AsRef<str>]) -> bool {
+    choices
+        .iter()
+        .any(|c| c.as_ref().eq_ignore_ascii_case(value.trim()))
 }
 
-/// The effort to launch `kind` with, given its model and the picked effort.
-/// Claude, Codex and Pi pass through. For Cursor: no family → None; an effort
-/// the family ships → itself; anything else ("default", unset, a suffix the
-/// family lacks) → None when the bare family id exists, otherwise the
-/// family's fallback (`high` > `medium` > first) — most families have no
-/// bare id, and `--model claude-fable-5` alone is refused at spawn.
-pub fn fit_effort(kind: AgentKind, model: Option<&str>, effort: Option<String>) -> Option<String> {
-    match kind {
-        AgentKind::Claude | AgentKind::Codex | AgentKind::Pi => effort,
-        AgentKind::Cursor => {
-            let family = model
-                .map(str::trim)
-                .filter(|m| !m.eq_ignore_ascii_case(DEFAULT_CHOICE))?;
-            let choices = crate::cursor_catalogue::efforts(Some(family));
-            if choices.is_empty() {
-                return None;
-            }
-            let picked = effort
-                .map(|e| e.trim().to_ascii_lowercase())
-                .filter(|e| e != DEFAULT_CHOICE);
-            match picked {
-                Some(e) if fits(&e, choices) => Some(e),
-                _ if choices[0] == DEFAULT_CHOICE => None,
-                _ => crate::cursor_catalogue::fallback_effort(family).map(String::from),
-            }
-        }
+/// Step `current` through an owned choice list, wrapping around; a value
+/// off the list steps onto it. The owned twin of [`cycle_choice`], for
+/// rows the registry builds at runtime.
+pub(crate) fn cycle_owned(current: &str, choices: &[String], delta: i32) -> String {
+    if choices.is_empty() {
+        return current.to_string();
     }
+    let n = choices.len() as i32;
+    let pos = choices
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case(current.trim()))
+        .unwrap_or(0) as i32;
+    choices[(pos + delta).rem_euclid(n) as usize].clone()
+}
+
+/// The effort to launch with, given the harness, its model and the picked
+/// effort. Most harnesses pass through. A composing harness (Cursor's
+/// family-suffix shape: `--model <family>-<effort>`) fits instead: no
+/// family → None; an effort the family ships → itself; anything else
+/// ("default", unset, a suffix the family lacks) → None when the bare
+/// family id exists, otherwise the family's fallback — most families have
+/// no bare id, and a bare `--model claude-fable-5` is refused at spawn.
+pub fn fit_effort(
+    kind: AgentKind,
+    model: Option<&str>,
+    effort: Option<String>,
+    custom: Option<&str>,
+) -> Option<String> {
+    fit_effort_in(&describe(kind, custom), model, effort)
+}
+
+/// [`fit_effort`] against an explicit descriptor, for callers that
+/// already resolved one (the Agents tab, the launch sites).
+pub fn fit_effort_in(
+    descriptor: &nebula_core::harness::HarnessDescriptor,
+    model: Option<&str>,
+    effort: Option<String>,
+) -> Option<String> {
+    if !descriptor.compose_model_effort {
+        return effort;
+    }
+    let family = model
+        .map(str::trim)
+        .filter(|m| !m.eq_ignore_ascii_case(DEFAULT_CHOICE))?;
+    if descriptor.model.catalog == Some(nebula_core::harness::HarnessCatalog::Cursor) {
+        let choices = crate::cursor_catalogue::efforts(Some(family));
+        if choices.is_empty() {
+            return None;
+        }
+        let picked = effort
+            .map(|e| e.trim().to_ascii_lowercase())
+            .filter(|e| e != DEFAULT_CHOICE);
+        return match picked {
+            Some(e) if fits(&e, choices) => Some(e),
+            _ if choices[0] == DEFAULT_CHOICE => None,
+            _ => crate::cursor_catalogue::fallback_effort(family).map(String::from),
+        };
+    }
+    if descriptor.effort.efforts.is_empty() {
+        return None;
+    }
+    let picked = effort
+        .map(|e| e.trim().to_ascii_lowercase())
+        .filter(|e| e != DEFAULT_CHOICE);
+    match picked {
+        Some(e) if fits(&e, &descriptor.effort.efforts) => Some(e),
+        _ => static_fallback_effort(&descriptor.effort.efforts).map(String::from),
+    }
+}
+
+/// The fallback effort for a static list: `high`, else `medium`, else the
+/// first the harness ships.
+fn static_fallback_effort(efforts: &[String]) -> Option<&str> {
+    efforts
+        .iter()
+        .find(|e| e.as_str() == "high")
+        .or_else(|| efforts.iter().find(|e| e.as_str() == "medium"))
+        .or_else(|| efforts.first())
+        .map(String::as_str)
+}
+
+/// The effective descriptor `(kind, custom)` reads as: the registry row
+/// with the `harnesses` map, the legacy list entry, and the legacy
+/// per-harness keys folded in. Loads the config fresh, like every other
+/// reader here. A broken entry still resolves (the picker, not the read,
+/// hides it); launches refuse it with its reason. An id the registry no
+/// longer names degrades to a placeholder under its own name, so rows
+/// outliving their entry still render.
+fn describe(kind: AgentKind, custom: Option<&str>) -> nebula_core::harness::HarnessDescriptor {
+    let id = match kind {
+        AgentKind::Custom => custom.unwrap_or_default().trim(),
+        _ => kind.as_str(),
+    };
+    let cfg = Config::load();
+    if let Some(descriptor) = cfg.harness_registry().into_iter().find(|entry| entry.id == id) {
+        return descriptor;
+    }
+    nebula_core::harness::CustomHarness {
+        id: id.to_string(),
+        label: String::new(),
+        program: id.to_string(),
+        enabled: true,
+        model: "default".into(),
+        model_flag: "--model".into(),
+        hooks: None,
+    }
+    .as_descriptor()
 }
 
 /// One setting row in the overlay; rows live inside a [`SettingsTab`].
@@ -186,12 +288,39 @@ pub struct SettingSpec {
 
 /// What a tab shows. Ordinary tabs are a list of value settings; the
 /// Hotkeys tab is generated from [`crate::keymap::ACTIONS`] instead, so a
-/// new action shows up there without being declared twice.
+/// new action shows up there without being declared twice — and the Agents
+/// tab is generated from the harness registry, so a new CLI shows up
+/// there without being declared twice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabBody {
     Values(&'static [SettingSpec]),
     Hotkeys,
+    Agents,
 }
+
+/// The Agents tab's static head: the cross-harness quick-prompt rows. The
+/// per-harness sections below them are generated from the registry (see
+/// [`Config::agent_rows`]).
+pub const AGENTS_HEAD: &[SettingSpec] = &[
+    SettingSpec {
+        kind: SettingKind::QuickPromptKind,
+        label: "Agent",
+        hint: "Harness the quick prompt hotkey launches, with that kind's model/effort",
+        group: "Quick prompt",
+    },
+    SettingSpec {
+        kind: SettingKind::QuickPromptFocus,
+        label: "Focus",
+        hint: "Enter the new session's terminal on launch (off = just select its row)",
+        group: "Quick prompt",
+    },
+    SettingSpec {
+        kind: SettingKind::HideUninstalledHarnesses,
+        label: "Hide missing CLIs",
+        hint: "List only harnesses found on PATH in the New session picker (daemon still checks at launch)",
+        group: "Quick prompt",
+    },
+];
 
 /// One tab of the settings overlay. Selection indices are per-tab: within
 /// a `Values` tab they index its settings, within `Hotkeys` they index
@@ -230,18 +359,28 @@ pub enum SettingKind {
     RecentPrompts,
     RecentPromptsCount,
     ShowKeyCombos,
-    ClaudeEnabled,
-    ClaudeModel,
-    ClaudeEffort,
-    CodexEnabled,
-    CodexModel,
-    CodexEffort,
-    CursorEnabled,
-    CursorModel,
-    CursorEffort,
-    PiEnabled,
-    PiModel,
-    PiEffort,
+    HideUninstalledHarnesses,
+}
+
+/// One harness field row in the Agents tab. The tab renders one section
+/// per registry entry — built-ins, legacy customs and `harnesses` map ids
+/// alike — with an Enabled row, a Model row, and an Effort row while the
+/// harness offers effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessField {
+    Enabled,
+    Model,
+    Effort,
+}
+
+impl HarnessField {
+    pub fn label(self) -> &'static str {
+        match self {
+            HarnessField::Enabled => "Enabled",
+            HarnessField::Model => "Model",
+            HarnessField::Effort => "Effort",
+        }
+    }
 }
 
 impl SettingKind {
@@ -393,97 +532,13 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             },
         ]),
     },
-    // Grouped per harness: the two cross-kind quick prompt rows first,
-    // then one section per agent kind holding its enabled toggle and
-    // its model / effort defaults, in that order.
+    // Generated from the harness registry: the static quick-prompt head
+    // first, then one section per entry holding its enabled toggle and
+    // its model / effort defaults, in registry order. A new CLI in the
+    // `harnesses` map grows its own section with no code change.
     SettingsTab {
         title: "Agents",
-        body: TabBody::Values(&[
-            SettingSpec {
-                kind: SettingKind::QuickPromptKind,
-                label: "Agent",
-                hint: "Harness the quick prompt hotkey launches, with that kind's model/effort",
-                group: "Quick prompt",
-            },
-            SettingSpec {
-                kind: SettingKind::QuickPromptFocus,
-                label: "Focus",
-                hint: "Enter the new session's terminal on launch (off = just select its row)",
-                group: "Quick prompt",
-            },
-            SettingSpec {
-                kind: SettingKind::ClaudeEnabled,
-                label: "Enabled",
-                hint: "Offer Claude in the New session picker (off hides it; existing sessions keep running)",
-                group: "Claude",
-            },
-            SettingSpec {
-                kind: SettingKind::ClaudeModel,
-                label: "Model",
-                hint: "Default model; rows follow Claude's availableModels or config.json claude_models",
-                group: "Claude",
-            },
-            SettingSpec {
-                kind: SettingKind::ClaudeEffort,
-                label: "Effort",
-                hint: "Default reasoning effort for new Claude sessions",
-                group: "Claude",
-            },
-            SettingSpec {
-                kind: SettingKind::CodexEnabled,
-                label: "Enabled",
-                hint: "Offer Codex in the New session picker (off hides it; existing sessions keep running)",
-                group: "Codex",
-            },
-            SettingSpec {
-                kind: SettingKind::CodexModel,
-                label: "Model",
-                hint: "Default model for new Codex sessions (default = CLI's pick)",
-                group: "Codex",
-            },
-            SettingSpec {
-                kind: SettingKind::CodexEffort,
-                label: "Effort",
-                hint: "Default reasoning effort for new Codex sessions",
-                group: "Codex",
-            },
-            SettingSpec {
-                kind: SettingKind::CursorEnabled,
-                label: "Enabled",
-                hint: "Offer Cursor in the New session picker (off hides it; existing sessions keep running)",
-                group: "Cursor",
-            },
-            SettingSpec {
-                kind: SettingKind::CursorModel,
-                label: "Model",
-                hint: "Default model family for new Cursor sessions (default = CLI's pick)",
-                group: "Cursor",
-            },
-            SettingSpec {
-                kind: SettingKind::CursorEffort,
-                label: "Effort",
-                hint: "Effort (and -fast) variant of the chosen Cursor model; n/a while it is default or auto",
-                group: "Cursor",
-            },
-            SettingSpec {
-                kind: SettingKind::PiEnabled,
-                label: "Enabled",
-                hint: "Offer Pi in the New session picker (off hides it; existing sessions keep running)",
-                group: "Pi",
-            },
-            SettingSpec {
-                kind: SettingKind::PiModel,
-                label: "Model",
-                hint: "Default --model pattern for new Pi sessions (default = CLI's pick)",
-                group: "Pi",
-            },
-            SettingSpec {
-                kind: SettingKind::PiEffort,
-                label: "Effort",
-                hint: "Default --thinking level for new Pi sessions",
-                group: "Pi",
-            },
-        ]),
+        body: TabBody::Agents,
     },
     // Behaviors that change how the tree is worked, off by default until
     // they have earned a tab of their own. Before Hotkeys, which stays
@@ -531,44 +586,72 @@ pub fn hotkeys_tab() -> usize {
         .expect("SETTINGS_TABS declares a Hotkeys tab")
 }
 
+/// Index of the Agents tab, generated from the harness registry.
+pub fn agents_tab() -> usize {
+    SETTINGS_TABS
+        .iter()
+        .position(|t| t.body == TabBody::Agents)
+        .expect("SETTINGS_TABS declares an Agents tab")
+}
+
 pub fn tab_count() -> usize {
     SETTINGS_TABS.len()
 }
 
-/// The value settings of a tab; empty for the Hotkeys tab.
+/// The static value settings of a tab: the declared list, or the Agents
+/// head (its per-harness sections are generated — see
+/// [`Config::agent_rows`]). Empty for the Hotkeys tab.
 pub fn tab_settings(tab: usize) -> &'static [SettingSpec] {
     match SETTINGS_TABS.get(tab).map(|t| t.body) {
         Some(TabBody::Values(settings)) => settings,
+        Some(TabBody::Agents) => AGENTS_HEAD,
         _ => &[],
     }
 }
 
-/// How many selectable rows a tab holds.
+/// How many selectable rows a tab holds. The Agents tab reads the
+/// registry, so a new CLI grows it without a code change.
 pub fn tab_len(tab: usize) -> usize {
     match SETTINGS_TABS.get(tab).map(|t| t.body) {
         Some(TabBody::Values(settings)) => settings.len(),
         Some(TabBody::Hotkeys) => crate::keymap::ACTIONS.len(),
+        Some(TabBody::Agents) => AGENTS_HEAD.len() + Config::load().agent_rows().len(),
         None => 0,
     }
 }
 
-/// The value setting at a tab-local index, if the tab has one there.
+/// The static value setting at a tab-local index, if the tab declares one
+/// there: the full list on ordinary tabs, the head on the Agents tab
+/// (its harness rows resolve through [`Config::agent_row`]), never on
+/// Hotkeys.
 pub fn setting_at(tab: usize, index: usize) -> Option<&'static SettingSpec> {
     tab_settings(tab).get(index)
 }
 
-/// Where a setting lives, as `(tab, row)`. The overlay addresses settings
-/// by position, so anything that wants to talk about one by name — tests,
-/// and anything that ever jumps the cursor to a named setting — goes
-/// through here rather than hardcoding an index.
+/// Where a static setting lives, as `(tab, row)`. The overlay addresses
+/// settings by position, so anything that wants to talk about one by name
+/// — tests, and anything that ever jumps the cursor to a named setting —
+/// goes through here rather than hardcoding an index. Harness rows locate
+/// through [`locate_agent`].
 pub fn locate(kind: SettingKind) -> Option<(usize, usize)> {
     SETTINGS_TABS.iter().enumerate().find_map(|(t, tab)| {
         match tab.body {
             TabBody::Values(settings) => settings.iter().position(|s| s.kind == kind),
+            TabBody::Agents => AGENTS_HEAD.iter().position(|s| s.kind == kind),
             TabBody::Hotkeys => None,
         }
         .map(|i| (t, i))
     })
+}
+
+/// Where an Agents tab harness row lives, as `(tab, row)`. Reads the
+/// registry, like the tab itself.
+pub fn locate_agent(id: &str, field: HarnessField) -> Option<(usize, usize)> {
+    let tab = agents_tab();
+    let rows = Config::load().agent_rows();
+    rows.iter()
+        .position(|(row_id, row_field)| row_id == id && *row_field == field)
+        .map(|i| (tab, AGENTS_HEAD.len() + i))
 }
 
 /// The row declared for `kind`, wherever it sits — for anything that
@@ -579,7 +662,9 @@ pub fn spec_for(kind: SettingKind) -> Option<&'static SettingSpec> {
         .find(|spec| spec.kind == kind)
 }
 
-/// Every value setting, tab by tab, for coverage checks.
+/// Every static value setting, tab by tab, for coverage checks. The
+/// Agents tab contributes its head; its harness rows are covered through
+/// [`Config::agent_rows`].
 pub fn all_settings() -> impl Iterator<Item = (usize, usize, &'static SettingSpec)> {
     SETTINGS_TABS.iter().enumerate().flat_map(|(t, tab)| {
         tab_settings(t).iter().enumerate().map(move |(i, s)| {
@@ -590,20 +675,27 @@ pub fn all_settings() -> impl Iterator<Item = (usize, usize, &'static SettingSpe
 }
 
 /// The one-line hint under the selected row, whatever kind of row it is.
-pub fn hint_at(tab: usize, index: usize) -> &'static str {
+/// The Agents tab reads the registry for its harness rows.
+pub fn hint_at(tab: usize, index: usize) -> String {
     match SETTINGS_TABS.get(tab).map(|t| t.body) {
-        Some(TabBody::Values(settings)) => settings.get(index).map(|s| s.hint).unwrap_or(""),
-        Some(TabBody::Hotkeys) => crate::keymap::spec_at(index).map(|s| s.hint).unwrap_or(""),
-        None => "",
+        Some(TabBody::Values(settings)) => {
+            settings.get(index).map(|s| s.hint).unwrap_or("").to_string()
+        }
+        Some(TabBody::Hotkeys) => crate::keymap::spec_at(index)
+            .map(|s| s.hint)
+            .unwrap_or("")
+            .to_string(),
+        Some(TabBody::Agents) => Config::load().agent_hint_by_index(index),
+        None => String::new(),
     }
 }
 
 /// One terminal row of the settings overlay body, in display order.
 /// Shared by the renderer and mouse hit-testing so they can't drift.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsRow {
     Blank,
-    Header(&'static str),
+    Header(String),
     /// Label + value line for the value setting at this tab-local index.
     Setting(usize),
     /// Label + chord list for `keymap::ACTIONS[index]`.
@@ -613,9 +705,9 @@ pub enum SettingsRow {
 impl SettingsRow {
     /// The tab-local selection index this row stands for, if it's one the
     /// cursor can land on.
-    pub fn index(self) -> Option<usize> {
+    pub fn index(&self) -> Option<usize> {
         match self {
-            SettingsRow::Setting(i) | SettingsRow::Hotkey(i) => Some(i),
+            SettingsRow::Setting(i) | SettingsRow::Hotkey(i) => Some(*i),
             _ => None,
         }
     }
@@ -623,13 +715,23 @@ impl SettingsRow {
 
 pub fn settings_rows(tab: usize) -> Vec<SettingsRow> {
     match SETTINGS_TABS.get(tab).map(|t| t.body) {
-        Some(TabBody::Values(settings)) => {
-            grouped(settings.iter().map(|s| s.group), SettingsRow::Setting)
-        }
+        Some(TabBody::Values(settings)) => grouped(
+            settings.iter().map(|s| s.group.to_string()),
+            SettingsRow::Setting,
+        ),
         Some(TabBody::Hotkeys) => grouped(
-            crate::keymap::ACTIONS.iter().map(|s| s.group),
+            crate::keymap::ACTIONS.iter().map(|s| s.group.to_string()),
             SettingsRow::Hotkey,
         ),
+        Some(TabBody::Agents) => {
+            let cfg = Config::load();
+            let head = AGENTS_HEAD.iter().map(|s| s.group.to_string());
+            let rows = cfg.agent_rows();
+            let groups = rows.iter().map(|(id, _)| {
+                cfg.effective_harness_by_id(id).display_label().to_string()
+            });
+            grouped(head.chain(groups), SettingsRow::Setting)
+        }
         None => Vec::new(),
     }
 }
@@ -640,17 +742,17 @@ pub fn settings_rows(tab: usize) -> Vec<SettingsRow> {
 /// whose group is empty — so a tab with no groups is the bare list it
 /// always was.
 fn grouped(
-    groups: impl Iterator<Item = &'static str>,
+    groups: impl Iterator<Item = String>,
     row: fn(usize) -> SettingsRow,
 ) -> Vec<SettingsRow> {
     let mut rows = Vec::new();
-    let mut current: Option<&'static str> = None;
+    let mut current: Option<String> = None;
     for (i, group) in groups.enumerate() {
-        if !group.is_empty() && current != Some(group) {
+        if !group.is_empty() && current.as_deref() != Some(&group) {
             if !rows.is_empty() {
                 rows.push(SettingsRow::Blank);
             }
-            rows.push(SettingsRow::Header(group));
+            rows.push(SettingsRow::Header(group.clone()));
             current = Some(group);
         }
         rows.push(row(i));
@@ -825,6 +927,10 @@ pub struct Config {
     /// Pi's pair: a `--model` pattern and a `--thinking` level.
     pub pi_model: String,
     pub pi_effort: String,
+    /// Muse's `--model` id. `muse_effort` is reserved until the CLI
+    /// documents a reasoning flag; it stores but sends nothing.
+    pub muse_model: String,
+    pub muse_effort: String,
     /// Which AGENT KINDS the NEW SESSION PICKER offers. Off leaves that
     /// harness out of the picker and the PR SESSION picker (and, for
     /// Claude, out of the standing PREWARM POOL slot); sessions that already
@@ -834,6 +940,28 @@ pub struct Config {
     pub codex_enabled: bool,
     pub cursor_enabled: bool,
     pub pi_enabled: bool,
+    pub muse_enabled: bool,
+    /// When on, the New session picker lists only enabled harnesses whose
+    /// CLI is found on this machine's PATH. Off by default: a login shell
+    /// (mise, brew shims) can see CLIs a plain PATH lookup misses, and the
+    /// daemon re-checks through the login shell at launch anyway.
+    pub hide_uninstalled_harnesses: bool,
+    /// User-defined harnesses (`custom_harnesses` in config.json): offered
+    /// in the New session picker after the built-ins when enabled, launched
+    /// with the entry's program and model flag, with process-based status
+    /// unless the entry names a hook dialect. Empty by default. Legacy:
+    /// new harnesses belong in `harnesses` as full descriptors, where
+    /// they also gain resume, effort, system-prompt and hook-dialect rows.
+    pub custom_harnesses: Vec<CustomHarness>,
+    /// Per-harness deltas over the compiled-in registry (`harnesses` in
+    /// config.json): disable a built-in, repoint a program, rename a
+    /// flag, or define a whole new CLI. Merged by
+    /// [`Config::harness_registry`]; the Agents tab, the `n` picker, the
+    /// `e` presets, spawn and hooks all read the merged rows. A hand edit
+    /// that breaks one entry refuses its launches with the reason, never
+    /// the whole file (see `nebula_core::settings`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub harnesses: BTreeMap<String, nebula_core::harness::HarnessOverride>,
     /// Which AGENT KIND the QUICK PROMPT hotkey launches. Its model and
     /// effort come from that kind's own defaults above, so the setting is
     /// one name, not a third model/effort pair. Read through
@@ -898,10 +1026,16 @@ impl Default for Config {
             cursor_effort: DEFAULT_CHOICE.into(),
             pi_model: DEFAULT_CHOICE.into(),
             pi_effort: DEFAULT_CHOICE.into(),
+            muse_model: DEFAULT_CHOICE.into(),
+            muse_effort: DEFAULT_CHOICE.into(),
             claude_enabled: true,
             codex_enabled: true,
             cursor_enabled: true,
             pi_enabled: true,
+            muse_enabled: true,
+            hide_uninstalled_harnesses: false,
+            custom_harnesses: Vec::new(),
+            harnesses: BTreeMap::new(),
             quick_prompt_kind: AgentKind::Claude.as_str().into(),
             quick_prompt_focus: false,
             keybindings: BTreeMap::new(),
@@ -1024,39 +1158,136 @@ impl Config {
         )
     }
 
+    /// The effective registry this config reads: the compiled-in known
+    /// harnesses with the `harnesses` map applied, then the legacy
+    /// `custom_harnesses` list, then map-only new ids — plus, for
+    /// built-ins, the legacy per-harness keys (`claude_model`,
+    /// `codex_enabled`, …) wherever the map stays silent on that field.
+    /// The map wins where both speak; the Agents tab writes the legacy
+    /// keys for built-ins, so its edits apply without a migration.
+    pub fn harness_registry(&self) -> Vec<HarnessDescriptor> {
+        let mut all = nebula_core::harness::registry(&self.harnesses, &self.custom_harnesses);
+        for entry in &mut all {
+            if nebula_core::harness::builtin(&entry.id).is_none() {
+                continue;
+            }
+            let over = self.harnesses.get(&entry.id);
+            let (legacy_enabled, legacy_model, legacy_effort) =
+                self.legacy_harness_fields(&entry.id);
+            if over.and_then(|o| o.enabled).is_none() {
+                if let Some(enabled) = legacy_enabled {
+                    entry.enabled = enabled;
+                }
+            }
+            if over.and_then(|o| o.model_default.clone()).is_none() {
+                if let Some(default) = legacy_model {
+                    entry.model.default = default;
+                }
+            }
+            if over.and_then(|o| o.effort_default.clone()).is_none() {
+                if let Some(default) = legacy_effort {
+                    entry.effort.default = default;
+                }
+            }
+        }
+        all
+    }
+
+    /// The legacy per-harness keys for a built-in id, as
+    /// `(enabled, model, effort)` — `Some` only where the file differs
+    /// from the default, i.e. where the user said something. Newer than
+    /// the table, older than the `harnesses` map.
+    fn legacy_harness_fields(&self, id: &str) -> (Option<bool>, Option<String>, Option<String>) {
+        let (enabled, model, effort) = match id {
+            "claude" => (&self.claude_enabled, &self.claude_model, &self.claude_effort),
+            "codex" => (&self.codex_enabled, &self.codex_model, &self.codex_effort),
+            "cursor" => (&self.cursor_enabled, &self.cursor_model, &self.cursor_effort),
+            "pi" => (&self.pi_enabled, &self.pi_model, &self.pi_effort),
+            "muse" => (&self.muse_enabled, &self.muse_model, &self.muse_effort),
+            _ => return (None, None, None),
+        };
+        (
+            (!enabled).then_some(false),
+            non_default(model),
+            non_default(effort),
+        )
+    }
+
+    /// The effective built-in descriptor `kind` reads as, regardless of
+    /// whether the entry is enabled or valid (the picker hides broken
+    /// rows; reads degrade gracefully).
+    fn builtin_descriptor(&self, kind: AgentKind) -> HarnessDescriptor {
+        let id = kind.as_str();
+        self.harness_registry()
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .or_else(|| nebula_core::harness::builtin(id))
+            .expect("every built-in AgentKind describes")
+    }
+
+    /// The effective descriptor `(kind, custom)` reads as: the registry
+    /// row, or a placeholder under its own name when the registry no
+    /// longer names the id, so rows outliving their entry still render.
+    pub fn effective_harness(&self, kind: AgentKind, custom: Option<&str>) -> HarnessDescriptor {
+        let id = match kind {
+            AgentKind::Custom => custom.unwrap_or_default().trim(),
+            _ => kind.as_str(),
+        };
+        if let Some(descriptor) = self.harness_registry().into_iter().find(|entry| entry.id == id)
+        {
+            return descriptor;
+        }
+        CustomHarness {
+            id: id.to_string(),
+            label: String::new(),
+            program: id.to_string(),
+            enabled: true,
+            model: "default".into(),
+            model_flag: "--model".into(),
+            hooks: None,
+        }
+        .as_descriptor()
+    }
+
     /// The configured default model for new sessions of `kind`, as the
     /// daemon wants it: None = "default" = don't pass the flag.
     pub fn default_model(&self, kind: AgentKind) -> Option<String> {
-        let value = match kind {
-            AgentKind::Claude => &self.claude_model,
-            AgentKind::Codex => &self.codex_model,
-            AgentKind::Cursor => &self.cursor_model,
-            AgentKind::Pi => &self.pi_model,
-        };
-        non_default(value)
+        // Custom defaults resolve from the entry at the launch site,
+        // where the id is known — never through this kind-only helper.
+        if kind == AgentKind::Custom {
+            return None;
+        }
+        self.builtin_descriptor(kind).default_model().map(str::to_string)
     }
 
     /// The configured default effort for new sessions of `kind`;
-    /// None = "default" = don't pass the flag. For Cursor an effort the
-    /// configured family does not ship is None too ([`fit_effort`]).
+    /// None = "default" = don't pass the flag. A composing harness fits
+    /// the effort against its configured family ([`fit_effort`]). A
+    /// reserved effort (stored, like Muse's, but with no flag mapped yet)
+    /// is None whatever the file holds — spawn would drop it anyway.
     pub fn default_effort(&self, kind: AgentKind) -> Option<String> {
-        let value = match kind {
-            AgentKind::Claude => &self.claude_effort,
-            AgentKind::Codex => &self.codex_effort,
-            AgentKind::Cursor => &self.cursor_effort,
-            AgentKind::Pi => &self.pi_effort,
-        };
-        fit_effort(kind, Some(&self.cursor_model), non_default(value))
+        if kind == AgentKind::Custom {
+            return None;
+        }
+        let descriptor = self.builtin_descriptor(kind);
+        if descriptor.effort.flag.is_none()
+            && descriptor.effort.config_key.is_none()
+            && !descriptor.compose_model_effort
+        {
+            return None;
+        }
+        let model = descriptor.default_model().map(str::to_string);
+        let effort = descriptor.default_effort().map(str::to_string);
+        fit_effort_in(&descriptor, model.as_deref(), effort)
     }
 
     /// Whether the NEW SESSION PICKER offers `kind` at all.
     pub fn kind_enabled(&self, kind: AgentKind) -> bool {
-        match kind {
-            AgentKind::Claude => self.claude_enabled,
-            AgentKind::Codex => self.codex_enabled,
-            AgentKind::Cursor => self.cursor_enabled,
-            AgentKind::Pi => self.pi_enabled,
+        if kind == AgentKind::Custom {
+            // A bare Custom kind is never enabled: entries gate themselves.
+            return false;
         }
+        self.builtin_descriptor(kind).enabled
     }
 
     /// The AGENT KINDS the picker lists, in `AgentKind::ALL` order. Empty
@@ -1067,6 +1298,306 @@ impl Config {
             .into_iter()
             .filter(|kind| self.kind_enabled(*kind))
             .collect()
+    }
+
+    /// The kinds the picker shows: enabled, and when
+    /// `hide_uninstalled_harnesses` is on, only those whose CLI is found
+    /// on PATH right now. The daemon stays authoritative at launch (it
+    /// probes through the login shell, which sees more than PATH).
+    pub fn visible_kinds(&self) -> Vec<AgentKind> {
+        let all = self.harness_registry();
+        let kinds = self.enabled_kinds();
+        if !self.hide_uninstalled_harnesses {
+            return kinds;
+        }
+        kinds
+            .into_iter()
+            .filter(|kind| {
+                all.iter()
+                    .find(|entry| entry.id == kind.as_str())
+                    .is_some_and(|entry| program_installed(&entry.program))
+            })
+            .collect()
+    }
+
+    /// Every harness the picker and presets offer, in registry order:
+    /// `(kind, None)` for built-ins, `(Custom, Some(id))` for customs.
+    /// Disabled and broken entries are out (broken ones surface in the
+    /// Agents tab with their reason); under `hide_uninstalled_harnesses`
+    /// so is anything whose program is missing from PATH. The daemon
+    /// stays authoritative at launch.
+    pub fn offered_harnesses(&self) -> Vec<(AgentKind, Option<String>)> {
+        let all = self.harness_registry();
+        nebula_core::harness::usable(&all)
+            .into_iter()
+            .filter(|entry| !self.hide_uninstalled_harnesses || program_installed(&entry.program))
+            .map(|entry| match AgentKind::parse(&entry.id) {
+                Some(kind) => (kind, None),
+                None => (AgentKind::Custom, Some(entry.id.clone())),
+            })
+            .collect()
+    }
+
+    /// Whether a preset may launch: its harness's Agents tab switch,
+    /// enabled and valid.
+    pub fn preset_harness_usable(&self, preset: &crate::agent_presets::AgentPreset) -> bool {
+        let id = match preset.kind {
+            AgentKind::Custom => preset.custom_harness.clone().unwrap_or_default(),
+            _ => preset.kind.as_str().to_string(),
+        };
+        self.harness_registry()
+            .iter()
+            .find(|entry| entry.id == id)
+            .is_some_and(|entry| entry.enabled && entry.problem().is_none())
+    }
+
+    /// The effective descriptor for a registry id, or a placeholder under
+    /// its own name when the registry no longer names it, so rows
+    /// outliving their entry still render.
+    pub fn effective_harness_by_id(&self, id: &str) -> HarnessDescriptor {
+        if let Some(descriptor) = self.harness_registry().into_iter().find(|entry| entry.id == id)
+        {
+            return descriptor;
+        }
+        CustomHarness {
+            id: id.to_string(),
+            label: String::new(),
+            program: id.to_string(),
+            enabled: true,
+            model: "default".into(),
+            model_flag: "--model".into(),
+            hooks: None,
+        }
+        .as_descriptor()
+    }
+
+    /// `(id, field)` rows below the Agents head, in registry order: every
+    /// entry, enabled or not, valid or not (broken rows show their reason
+    /// so they can be fixed); Effort only while the harness offers effort.
+    pub fn agent_rows(&self) -> Vec<(String, HarnessField)> {
+        let mut rows = Vec::new();
+        for entry in self.harness_registry() {
+            rows.push((entry.id.clone(), HarnessField::Enabled));
+            rows.push((entry.id.clone(), HarnessField::Model));
+            if entry.effort.offered {
+                rows.push((entry.id.clone(), HarnessField::Effort));
+            }
+        }
+        rows
+    }
+
+    /// The harness row at a tab-local Agents index, or None while the
+    /// index lands on the static head.
+    pub fn agent_row(&self, index: usize) -> Option<(String, HarnessField)> {
+        self.agent_rows()
+            .into_iter()
+            .nth(index.checked_sub(AGENTS_HEAD.len())?)
+    }
+
+    /// The value an Agents harness row shows.
+    pub fn agent_value(&self, id: &str, field: HarnessField) -> String {
+        let descriptor = self.effective_harness_by_id(id);
+        match field {
+            HarnessField::Enabled => on_off(descriptor.enabled).into(),
+            HarnessField::Model => descriptor.model.default.clone(),
+            HarnessField::Effort => {
+                let choices = effort_choices_in(
+                    &descriptor,
+                    descriptor.default_model().map(str::to_string).as_deref(),
+                );
+                if choices.is_empty() {
+                    "n/a".into()
+                } else {
+                    descriptor.effort.default.clone()
+                }
+            }
+        }
+    }
+
+    /// The hint an Agents harness row shows: what the row edits, with the
+    /// entry's problem appended while it is broken.
+    pub fn agent_hint(&self, id: &str, field: HarnessField) -> String {
+        let descriptor = self.effective_harness_by_id(id);
+        let label = descriptor.display_label();
+        let mut hint = match field {
+            HarnessField::Enabled => format!(
+                "Offer {label} in the New session picker (off hides it; existing sessions keep running)"
+            ),
+            HarnessField::Model => match descriptor.model.catalog {
+                Some(nebula_core::harness::HarnessCatalog::Claude) => format!(
+                    "Default model for new {label} sessions; rows follow Claude's availableModels or config.json claude_models"
+                ),
+                Some(nebula_core::harness::HarnessCatalog::Cursor) => format!(
+                    "Default model family for new {label} sessions; rows follow cursor-agent --list-models"
+                ),
+                None => format!("Default model for new {label} sessions (default = CLI's pick)"),
+            },
+            HarnessField::Effort => {
+                if descriptor.compose_model_effort {
+                    format!(
+                        "Effort (and -fast) variant of the chosen {label} model; n/a while it is default or auto"
+                    )
+                } else if let Some(flag) = descriptor.effort.flag.as_deref() {
+                    format!("Default reasoning effort ({flag}) for new {label} sessions")
+                } else if let (Some(flag), Some(key)) = (
+                    descriptor.effort.config_flag.as_deref(),
+                    descriptor.effort.config_key.as_deref(),
+                ) {
+                    format!("Default reasoning effort ({flag} {key}=) for new {label} sessions")
+                } else {
+                    format!("Reserved until the {label} CLI documents a reasoning flag (default = unset)")
+                }
+            }
+        };
+        if let Some(problem) = descriptor.problem() {
+            hint.push_str(&format!(" — broken: {problem}"));
+        }
+        hint
+    }
+
+    /// The hint for a tab-local Agents index: the head row's own hint, or
+    /// the harness row's.
+    pub fn agent_hint_by_index(&self, index: usize) -> String {
+        if let Some(spec) = AGENTS_HEAD.get(index) {
+            return spec.hint.to_string();
+        }
+        match self.agent_row(index) {
+            Some((id, field)) => self.agent_hint(&id, field),
+            None => String::new(),
+        }
+    }
+
+    /// Cycle an Agents harness row: toggle Enabled, step Model / Effort
+    /// through the rows the pickers offer. A composing harness refits its
+    /// effort against the new model, so the row never holds an id the CLI
+    /// would refuse.
+    pub fn cycle_agent_row(&mut self, id: &str, field: HarnessField, delta: i32) {
+        let Some(descriptor) = self
+            .harness_registry()
+            .into_iter()
+            .find(|entry| entry.id == id)
+        else {
+            return;
+        };
+        let step = if delta == 0 { 1 } else { delta };
+        match field {
+            HarnessField::Enabled => self.set_harness_enabled(id, !descriptor.enabled),
+            HarnessField::Model => {
+                let choices = model_choices_in(&descriptor);
+                let next = cycle_owned(&descriptor.model.default, &choices, step);
+                self.set_harness_model(id, next.clone());
+                let descriptor = self.effective_harness_by_id(id);
+                if descriptor.compose_model_effort {
+                    let choices = effort_choices_in(&descriptor, Some(&next));
+                    if !fits(&descriptor.effort.default, &choices) {
+                        let fitted = fit_effort_in(&descriptor, Some(&next), None)
+                            .unwrap_or_else(|| DEFAULT_CHOICE.into());
+                        self.set_harness_effort(id, fitted);
+                    }
+                }
+            }
+            HarnessField::Effort => {
+                let choices = effort_choices_in(
+                    &descriptor,
+                    descriptor.default_model().map(str::to_string).as_deref(),
+                );
+                if choices.is_empty() {
+                    return;
+                }
+                let next = cycle_owned(&descriptor.effort.default, &choices, step);
+                self.set_harness_effort(id, next);
+            }
+        }
+    }
+
+    /// Write an Enabled toggle: the `harnesses` map where it speaks, else
+    /// the legacy layer (the built-in switch, the list entry).
+    fn set_harness_enabled(&mut self, id: &str, enabled: bool) {
+        if self.harnesses.get(id).and_then(|o| o.enabled).is_some() {
+            self.harness_override_mut(id).enabled = Some(enabled);
+            return;
+        }
+        if nebula_core::harness::builtin(id).is_some() {
+            self.set_legacy_enabled(id, enabled);
+            return;
+        }
+        if let Some(entry) = self.custom_harnesses.iter_mut().find(|entry| entry.id == id) {
+            entry.enabled = enabled;
+            return;
+        }
+        self.harness_override_mut(id).enabled = Some(enabled);
+    }
+
+    /// Write a Model default: the map where it speaks, else the legacy
+    /// layer (the built-in model key, the list entry's model).
+    fn set_harness_model(&mut self, id: &str, model: String) {
+        if self.harnesses.get(id).and_then(|o| o.model_default.clone()).is_some() {
+            self.harness_override_mut(id).model_default = Some(model);
+            return;
+        }
+        if nebula_core::harness::builtin(id).is_some() {
+            self.set_legacy_model(id, model);
+            return;
+        }
+        if let Some(entry) = self.custom_harnesses.iter_mut().find(|entry| entry.id == id) {
+            entry.model = model;
+            return;
+        }
+        self.harness_override_mut(id).model_default = Some(model);
+    }
+
+    /// Write an Effort default: the map where it speaks, else the legacy
+    /// built-in effort key (legacy list entries hold no effort; the map
+    /// owns theirs).
+    fn set_harness_effort(&mut self, id: &str, effort: String) {
+        if nebula_core::harness::builtin(id).is_some()
+            && self.harnesses.get(id).and_then(|o| o.effort_default.clone()).is_none()
+        {
+            self.set_legacy_effort(id, effort);
+            return;
+        }
+        self.harness_override_mut(id).effort_default = Some(effort);
+    }
+
+    /// The `harnesses` map entry for `id`, created when absent.
+    fn harness_override_mut(
+        &mut self,
+        id: &str,
+    ) -> &mut nebula_core::harness::HarnessOverride {
+        self.harnesses.entry(id.to_string()).or_default()
+    }
+
+    fn set_legacy_enabled(&mut self, id: &str, enabled: bool) {
+        match id {
+            "claude" => self.claude_enabled = enabled,
+            "codex" => self.codex_enabled = enabled,
+            "cursor" => self.cursor_enabled = enabled,
+            "pi" => self.pi_enabled = enabled,
+            "muse" => self.muse_enabled = enabled,
+            _ => {}
+        }
+    }
+
+    fn set_legacy_model(&mut self, id: &str, model: String) {
+        match id {
+            "claude" => self.claude_model = model,
+            "codex" => self.codex_model = model,
+            "cursor" => self.cursor_model = model,
+            "pi" => self.pi_model = model,
+            "muse" => self.muse_model = model,
+            _ => {}
+        }
+    }
+
+    fn set_legacy_effort(&mut self, id: &str, effort: String) {
+        match id {
+            "claude" => self.claude_effort = effort,
+            "codex" => self.codex_effort = effort,
+            "cursor" => self.cursor_effort = effort,
+            "pi" => self.pi_effort = effort,
+            "muse" => self.muse_effort = effort,
+            _ => {}
+        }
     }
 
     /// The AGENT KIND the QUICK PROMPT launches: the `quick_prompt_kind`
@@ -1132,24 +1663,7 @@ impl Config {
                 .recent_prompts_count
                 .clamp(1, nebula_core::RECENT_PROMPTS_KEPT)
                 .to_string(),
-            SettingKind::ClaudeModel => self.claude_model.clone(),
-            SettingKind::ClaudeEffort => self.claude_effort.clone(),
-            SettingKind::CodexModel => self.codex_model.clone(),
-            SettingKind::CodexEffort => self.codex_effort.clone(),
-            SettingKind::CursorModel => self.cursor_model.clone(),
-            SettingKind::CursorEffort => {
-                if effort_choices(AgentKind::Cursor, Some(&self.cursor_model)).is_empty() {
-                    "n/a".into()
-                } else {
-                    self.cursor_effort.clone()
-                }
-            }
-            SettingKind::PiModel => self.pi_model.clone(),
-            SettingKind::PiEffort => self.pi_effort.clone(),
-            SettingKind::ClaudeEnabled => on_off(self.claude_enabled).into(),
-            SettingKind::CodexEnabled => on_off(self.codex_enabled).into(),
-            SettingKind::CursorEnabled => on_off(self.cursor_enabled).into(),
-            SettingKind::PiEnabled => on_off(self.pi_enabled).into(),
+            SettingKind::HideUninstalledHarnesses => on_off(self.hide_uninstalled_harnesses).into(),
             SettingKind::QuickPromptKind => self.quick_prompt_kind.clone(),
             SettingKind::QuickPromptFocus => on_off(self.quick_prompt_focus).into(),
         }
@@ -1158,12 +1672,28 @@ impl Config {
     /// `delta == 0` means activate (toggle a bool, cycle a choice forward).
     /// Non-zero delta cycles a choice; bools still toggle. `index` is
     /// tab-local — the Hotkeys tab has no cyclable values and no-ops here.
+    /// The Agents tab resolves its head rows statically and its harness
+    /// rows through the registry.
     pub fn cycle(&mut self, tab: usize, index: usize, delta: i32) {
+        if tab == agents_tab() {
+            if let Some(spec) = AGENTS_HEAD.get(index) {
+                self.cycle_kind(spec.kind, delta);
+            } else if let Some((id, field)) = self.agent_row(index) {
+                self.cycle_agent_row(&id, field, delta);
+            }
+            return;
+        }
         let Some(spec) = setting_at(tab, index) else {
             return;
         };
+        self.cycle_kind(spec.kind, delta);
+    }
+
+    /// Cycle one static setting row. The Agents tab's harness rows cycle
+    /// through [`Config::cycle_agent_row`] instead.
+    fn cycle_kind(&mut self, kind: SettingKind, delta: i32) {
         let step = if delta == 0 { 1 } else { delta };
-        match spec.kind {
+        match kind {
             SettingKind::PaletteEnterAttaches => {
                 self.palette_enter_attaches = !self.palette_enter_attaches;
             }
@@ -1240,63 +1770,15 @@ impl Config {
             SettingKind::ShowKeyCombos => {
                 self.show_key_combos = !self.show_key_combos;
             }
-            SettingKind::ClaudeModel => {
-                self.claude_model =
-                    cycle_choice(&self.claude_model, model_choices(AgentKind::Claude), step).into();
-            }
-            SettingKind::ClaudeEffort => {
-                self.claude_effort = cycle_choice(&self.claude_effort, CLAUDE_EFFORTS, step).into();
-            }
-            SettingKind::CodexModel => {
-                self.codex_model = cycle_choice(&self.codex_model, CODEX_MODELS, step).into();
-            }
-            SettingKind::CodexEffort => {
-                self.codex_effort = cycle_choice(&self.codex_effort, CODEX_EFFORTS, step).into();
-            }
-            SettingKind::ClaudeEnabled => {
-                self.claude_enabled = !self.claude_enabled;
-            }
-            SettingKind::CodexEnabled => {
-                self.codex_enabled = !self.codex_enabled;
-            }
-            SettingKind::CursorEnabled => {
-                self.cursor_enabled = !self.cursor_enabled;
-            }
-            SettingKind::PiEnabled => {
-                self.pi_enabled = !self.pi_enabled;
-            }
-            SettingKind::PiModel => {
-                self.pi_model = cycle_choice(&self.pi_model, PI_MODELS, step).into();
-            }
-            SettingKind::PiEffort => {
-                self.pi_effort = cycle_choice(&self.pi_effort, PI_EFFORTS, step).into();
-            }
-            SettingKind::CursorModel => {
-                self.cursor_model =
-                    cycle_choice(&self.cursor_model, crate::cursor_catalogue::models(), step)
-                        .into();
-                // The effort list follows the family: an effort the new
-                // family lacks becomes its fallback (or default), never an
-                // id the CLI would refuse.
-                let choices = effort_choices(AgentKind::Cursor, Some(&self.cursor_model));
-                if !fits(&self.cursor_effort, choices) {
-                    self.cursor_effort =
-                        fit_effort(AgentKind::Cursor, Some(&self.cursor_model), None)
-                            .unwrap_or_else(|| DEFAULT_CHOICE.into());
-                }
+            SettingKind::HideUninstalledHarnesses => {
+                self.hide_uninstalled_harnesses = !self.hide_uninstalled_harnesses;
             }
             SettingKind::QuickPromptKind => {
                 self.quick_prompt_kind =
-                    cycle_choice(&self.quick_prompt_kind, AGENT_KIND_NAMES, step).into();
+                    cycle_owned(&self.quick_prompt_kind, &agent_kind_names(), step);
             }
             SettingKind::QuickPromptFocus => {
                 self.quick_prompt_focus = !self.quick_prompt_focus;
-            }
-            SettingKind::CursorEffort => {
-                let choices = effort_choices(AgentKind::Cursor, Some(&self.cursor_model));
-                if !choices.is_empty() {
-                    self.cursor_effort = cycle_choice(&self.cursor_effort, choices, step).into();
-                }
             }
         }
     }
@@ -1393,6 +1875,29 @@ fn resolve_editor(env: Option<&str>, configured: &str) -> String {
         }
     }
     "vim".into()
+}
+
+/// Whether `kind`'s CLI resolves on this process's PATH right now. A fast
+/// synchronous check for picker filtering only; the daemon re-probes
+/// through the login shell at launch, which can see shims PATH misses.
+/// Whether `program` resolves on this process's PATH right now — the
+/// fast check behind `hide_uninstalled_harnesses`, for built-ins and
+/// customs alike.
+pub fn program_installed(program: &str) -> bool {
+    let program = program.trim();
+    if program.is_empty() {
+        return false;
+    }
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&paths) {
+        let candidate = dir.join(program);
+        if candidate.is_file() {
+            return true;
+        }
+    }
+    false
 }
 
 /// [`DEFAULT_CHOICE`] (or blank) → None; anything else passes through.
@@ -1531,6 +2036,27 @@ mod tests {
 
     fn read_json_file(path: &Path) -> serde_json::Value {
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// Run `f` with the config pinned to an empty temp file, so every
+    /// registry read (Agents rows, choice lists, tab lengths) sees a
+    /// fresh install — never the dev's own file.
+    fn with_empty_config<T>(f: impl FnOnce() -> T) -> T {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        with_config_path(path, f)
+    }
+
+    /// Where an Agents harness row lives in `cfg`'s own rows, without
+    /// loading anything: [`locate_agent`] reads the live file, which a
+    /// test's in-memory config may have left behind.
+    fn locate_in(cfg: &Config, id: &str, field: HarnessField) -> Option<(usize, usize)> {
+        let tab = agents_tab();
+        cfg.agent_rows()
+            .iter()
+            .position(|(row_id, row_field)| row_id == id && *row_field == field)
+            .map(|i| (tab, AGENTS_HEAD.len() + i))
     }
 
     /// The first compatibility rule in docs/configuration.md: a key, once
@@ -2363,8 +2889,12 @@ mod tests {
     /// off since it was chosen.
     #[test]
     fn quick_prompt_kind_cycles_every_harness_and_persists() {
-        let names: Vec<&str> = AgentKind::ALL.iter().map(|k| k.as_str()).collect();
-        assert_eq!(AGENT_KIND_NAMES, names.as_slice(), "one choice per kind");
+        let names: Vec<String> = AgentKind::ALL
+            .iter()
+            .filter(|k| **k != AgentKind::Custom)
+            .map(|k| k.as_str().to_string())
+            .collect();
+        assert_eq!(agent_kind_names(), names, "one choice per kind");
 
         let mut cfg = Config::default();
         assert_eq!(cfg.quick_prompt_kind(), AgentKind::Claude);
@@ -2401,16 +2931,34 @@ mod tests {
     fn harness_toggles_default_on_and_persist() {
         let mut cfg = Config::default();
         assert!(cfg.claude_enabled && cfg.codex_enabled && cfg.cursor_enabled);
-        assert_eq!(cfg.enabled_kinds(), AgentKind::ALL.to_vec());
+        assert!(cfg.pi_enabled && cfg.muse_enabled);
+        let builtin: Vec<AgentKind> = AgentKind::ALL
+            .into_iter()
+            .filter(|kind| *kind != AgentKind::Custom)
+            .collect();
+        assert_eq!(cfg.enabled_kinds(), builtin);
+        assert!(
+            !cfg.kind_enabled(AgentKind::Custom),
+            "a bare Custom kind is never enabled: entries gate themselves"
+        );
 
-        let (tab, row) = locate(SettingKind::CodexEnabled).unwrap();
+        let (tab, row) = locate_in(&cfg, "codex", HarnessField::Enabled).unwrap();
         cfg.cycle(tab, row, 0);
         assert!(!cfg.codex_enabled);
         assert!(!cfg.kind_enabled(AgentKind::Codex));
         assert_eq!(
             cfg.enabled_kinds(),
-            vec![AgentKind::Claude, AgentKind::Cursor, AgentKind::Pi],
+            vec![
+                AgentKind::Claude,
+                AgentKind::Cursor,
+                AgentKind::Pi,
+                AgentKind::Muse
+            ],
             "the disabled kind drops out, order kept"
+        );
+        assert!(
+            !cfg.enabled_kinds().contains(&AgentKind::Custom),
+            "a bare Custom kind never lists"
         );
         // ←/→ toggle a bool just like Enter does.
         cfg.cycle(tab, row, -1);
@@ -2425,16 +2973,173 @@ mod tests {
         assert!(loaded.claude_enabled);
         assert!(!loaded.codex_enabled);
         assert!(loaded.cursor_enabled);
-        // A config predating the keys offers every harness.
+        // A config predating the keys offers every built-in harness (a
+        // bare Custom kind never lists — entries come from the registry).
         let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(cfg.enabled_kinds().len(), AgentKind::ALL.len());
+        assert_eq!(cfg.enabled_kinds().len(), AgentKind::ALL.len() - 1);
 
         // Every kind off is representable (a hand edit), and reads as empty.
         let cfg: Config = serde_json::from_str(
-            r#"{"claude_enabled":false,"codex_enabled":false,"cursor_enabled":false,"pi_enabled":false}"#,
+            r#"{"claude_enabled":false,"codex_enabled":false,"cursor_enabled":false,"pi_enabled":false,"muse_enabled":false}"#,
         )
         .unwrap();
         assert!(cfg.enabled_kinds().is_empty());
+    }
+
+    #[test]
+    fn visible_kinds_hides_only_when_asked_and_only_missing_clis() {
+        // Off by default: the picker lists everything enabled, even when
+        // no CLI is on PATH (the daemon checks through the login shell).
+        let cfg = Config::default();
+        assert!(!cfg.hide_uninstalled_harnesses);
+        assert_eq!(cfg.visible_kinds(), cfg.enabled_kinds());
+        assert!(cfg.visible_kinds().contains(&AgentKind::Muse));
+
+        // On: only CLIs found on PATH survive. Point PATH at a dir
+        // holding just a fake `muse` binary.
+        let dir = tempfile::tempdir().unwrap();
+        let muse_bin = dir.path().join("muse");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&muse_bin, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut perms = std::fs::metadata(&muse_bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&muse_bin, perms).unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::write(&muse_bin, "").unwrap();
+        let prior = std::env::var_os("PATH");
+        std::env::set_var("PATH", dir.path());
+        let filtered = Config {
+            hide_uninstalled_harnesses: true,
+            ..Config::default()
+        }
+        .visible_kinds();
+        if let Some(prior) = prior {
+            std::env::set_var("PATH", prior);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        assert_eq!(filtered, vec![AgentKind::Muse]);
+    }
+
+    #[test]
+    fn offered_harnesses_list_usable_entries_in_registry_order() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.offered_harnesses(),
+            vec![
+                (AgentKind::Claude, None),
+                (AgentKind::Codex, None),
+                (AgentKind::Cursor, None),
+                (AgentKind::Pi, None),
+                (AgentKind::Muse, None),
+            ]
+        );
+
+        // Disabled and broken entries are out; the tab still lists them
+        // (with their reason) so they can be fixed.
+        let cfg: Config = serde_json::from_str(
+            r#"{"custom_harnesses": [
+                {"id": "agy", "program": "agy"},
+                {"id": "off", "program": "off", "enabled": false},
+                {"id": "broken", "program": ""}
+            ]}"#,
+        )
+        .unwrap();
+        let offered = cfg.offered_harnesses();
+        assert_eq!(offered.len(), 6);
+        assert_eq!(offered[5], (AgentKind::Custom, Some("agy".into())));
+        let rows = cfg.agent_rows();
+        assert!(rows.contains(&("off".to_string(), HarnessField::Enabled)));
+        assert!(rows.contains(&("broken".to_string(), HarnessField::Enabled)));
+        assert!(
+            cfg.agent_hint("broken", HarnessField::Enabled)
+                .contains("broken:"),
+            "the tab names the reason"
+        );
+
+        // Under the hide switch an entry survives only when its program
+        // is on PATH, built-ins and customs alike.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("agy"), "").unwrap();
+        let prior = std::env::var_os("PATH");
+        std::env::set_var("PATH", dir.path());
+        let hiding = Config {
+            hide_uninstalled_harnesses: true,
+            ..serde_json::from_str::<Config>(
+                r#"{"custom_harnesses": [
+                    {"id": "agy", "program": "agy"},
+                    {"id": "missing", "program": "definitely-not-on-path"}
+                ]}"#,
+            )
+            .unwrap()
+        };
+        let offered = hiding.offered_harnesses();
+        if let Some(prior) = prior {
+            std::env::set_var("PATH", prior);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0], (AgentKind::Custom, Some("agy".into())));
+    }
+
+    /// Safety: one broken `harnesses` entry never takes the rest down.
+    /// The picker hides it, the tab shows its reason, and every other
+    /// harness launches exactly as before.
+    #[test]
+    fn a_broken_harness_entry_isolates_itself() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"harnesses": {
+                "codex": {"program": ""},
+                "agy": {"program": "agy", "resume_flag": "--resume"}
+            }}"#,
+        )
+        .unwrap();
+        let offered = cfg.offered_harnesses();
+        assert!(
+            !offered.iter().any(|(kind, _)| *kind == AgentKind::Codex),
+            "the broken built-in hides"
+        );
+        assert!(
+            offered.contains(&(AgentKind::Custom, Some("agy".into()))),
+            "the valid newcomer offers"
+        );
+        assert_eq!(cfg.default_model(AgentKind::Claude), None);
+        assert_eq!(cfg.default_model(AgentKind::Codex), None);
+        assert!(cfg.agent_hint("codex", HarnessField::Enabled).contains("broken:"));
+        // The entry still resolves for reads (placeholder-free), while
+        // launches refuse it with the reason.
+        let codex = cfg.effective_harness_by_id("codex");
+        assert!(codex.problem().is_some());
+        assert_eq!(
+            nebula_core::harness::resolve(&cfg.harness_registry(), AgentKind::Codex, None)
+                .unwrap_err(),
+            "harness `codex` has no program"
+        );
+    }
+
+    /// Safety: a `harnesses` map that fails to parse costs only its own
+    /// key — every other setting keeps its value, and the registry reads
+    /// as a fresh install.
+    #[test]
+    fn an_unreadable_harnesses_map_costs_only_that_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"harnesses": {"claude": {"enabled": "yes"}}, "theme": "ocean"}"#,
+        )
+        .unwrap();
+        let cfg = load_from(&path);
+        assert_eq!(cfg.theme, "ocean");
+        assert_eq!(
+            cfg.skipped,
+            BTreeSet::from(["harnesses".to_string()])
+        );
+        assert!(cfg.harness_registry().iter().all(|entry| entry.enabled));
     }
 
     #[test]
@@ -2465,12 +3170,22 @@ mod tests {
         cfg.pi_effort = "xhigh".into();
         assert_eq!(cfg.default_model(AgentKind::Pi).as_deref(), Some("sonnet"));
         assert_eq!(cfg.default_effort(AgentKind::Pi).as_deref(), Some("xhigh"));
-        let (tab, row) = locate(SettingKind::PiEffort).unwrap();
+        // Muse passes --model through verbatim; effort is reserved and
+        // never sent, whatever the file holds.
+        assert_eq!(cfg.default_model(AgentKind::Muse), None);
+        assert_eq!(cfg.default_effort(AgentKind::Muse), None);
+        cfg.muse_model = "spark".into();
+        cfg.muse_effort = "high".into();
+        assert_eq!(cfg.default_model(AgentKind::Muse).as_deref(), Some("spark"));
+        assert_eq!(cfg.default_effort(AgentKind::Muse), None);
+        assert_eq!(AgentKind::parse("muse"), Some(AgentKind::Muse));
+        assert_eq!(AgentKind::Muse.cli_program(), "muse");
+        let (tab, row) = locate_in(&cfg, "pi", HarnessField::Effort).unwrap();
         cfg.cycle(tab, row, 1);
-        assert_eq!(cfg.value_label(SettingKind::PiEffort), "max");
+        assert_eq!(cfg.agent_value("pi", HarnessField::Effort), "max");
         cfg.cycle(tab, row, 1);
         assert_eq!(
-            cfg.value_label(SettingKind::PiEffort),
+            cfg.agent_value("pi", HarnessField::Effort),
             DEFAULT_CHOICE,
             "wraps"
         );
@@ -2512,13 +3227,13 @@ mod tests {
         );
 
         // The settings rows walk the same choice lists the submenus show.
-        let (tab, row) = locate(SettingKind::ClaudeModel).unwrap();
+        let (tab, row) = locate_in(&cfg, "claude", HarnessField::Model).unwrap();
         cfg.claude_model = "default".into();
         cfg.cycle(tab, row, 1);
         assert_eq!(cfg.claude_model, "fable");
         cfg.cycle(tab, row, -1);
         assert_eq!(cfg.claude_model, "default");
-        let (tab, row) = locate(SettingKind::CodexEffort).unwrap();
+        let (tab, row) = locate_in(&cfg, "codex", HarnessField::Effort).unwrap();
         cfg.cycle(tab, row, 0);
         assert_eq!(
             cfg.codex_effort, "xhigh",
@@ -2529,17 +3244,17 @@ mod tests {
     #[test]
     fn cursor_settings_rows_follow_the_family() {
         let mut cfg = Config::default();
-        let (tab, model_row) = locate(SettingKind::CursorModel).unwrap();
-        let (_, effort_row) = locate(SettingKind::CursorEffort).unwrap();
+        let (tab, model_row) = locate_in(&cfg, "cursor", HarnessField::Model).unwrap();
+        let (_, effort_row) = locate_in(&cfg, "cursor", HarnessField::Effort).unwrap();
         // No family: the effort row is n/a and does not cycle.
-        assert_eq!(cfg.value_label(SettingKind::CursorEffort), "n/a");
+        assert_eq!(cfg.agent_value("cursor", HarnessField::Effort), "n/a");
         cfg.cycle(tab, effort_row, 1);
         assert_eq!(cfg.cursor_effort, "default");
         // default → auto (still no efforts) → claude-fable-5, which has no
         // bare id, so the effort lands on its fallback at once.
         cfg.cycle(tab, model_row, 1);
         assert_eq!(cfg.cursor_model, "auto");
-        assert_eq!(cfg.value_label(SettingKind::CursorEffort), "n/a");
+        assert_eq!(cfg.agent_value("cursor", HarnessField::Effort), "n/a");
         cfg.cycle(tab, model_row, 1);
         assert_eq!(cfg.cursor_model, "claude-fable-5");
         assert_eq!(cfg.cursor_effort, "high");
@@ -2566,8 +3281,9 @@ mod tests {
 
     #[test]
     fn fit_effort_resolves_cursor_pairs() {
+        let cursor = nebula_core::harness::builtin("cursor").unwrap();
         let fit = |m: Option<&str>, e: Option<&str>| {
-            fit_effort(AgentKind::Cursor, m, e.map(String::from))
+            fit_effort_in(&cursor, m, e.map(String::from))
         };
         assert_eq!(fit(None, Some("high")), None, "no family, nothing to join");
         assert_eq!(fit(Some("default"), Some("high")), None);
@@ -2601,8 +3317,9 @@ mod tests {
             fit(Some("gpt-5.5"), Some("extra-high-fast")).as_deref(),
             Some("extra-high-fast")
         );
+        let codex = nebula_core::harness::builtin("codex").unwrap();
         assert_eq!(
-            fit_effort(AgentKind::Codex, None, Some("high".into())).as_deref(),
+            fit_effort_in(&codex, None, Some("high".into())).as_deref(),
             Some("high"),
             "claude/codex pass through"
         );
@@ -2692,106 +3409,200 @@ mod tests {
 
     #[test]
     fn tabs_cover_every_setting_once_and_rows_match() {
-        // Every SettingKind appears exactly once across the tabs.
-        let mut kinds: Vec<SettingKind> = all_settings().map(|(_, _, s)| s.kind).collect();
-        let total = kinds.len();
-        kinds.sort_by_key(|k| format!("{k:?}"));
-        kinds.dedup();
-        assert_eq!(kinds.len(), total, "a kind repeats across tabs");
+        with_empty_config(|| {
+            // Every SettingKind appears exactly once across the tabs.
+            let mut kinds: Vec<SettingKind> = all_settings().map(|(_, _, s)| s.kind).collect();
+            let total = kinds.len();
+            kinds.sort_by_key(|k| format!("{k:?}"));
+            kinds.dedup();
+            assert_eq!(kinds.len(), total, "a kind repeats across tabs");
 
-        // Each tab's rows walk its own index space, in order.
-        for (t, tab) in SETTINGS_TABS.iter().enumerate() {
-            let indices: Vec<usize> = settings_rows(t)
-                .into_iter()
-                .filter_map(|row| row.index())
-                .collect();
-            assert_eq!(
-                indices,
-                (0..tab_len(t)).collect::<Vec<_>>(),
-                "{} rows",
-                tab.title
-            );
-        }
-
-        // A value tab carries headers exactly when its rows name groups;
-        // Hotkeys always does.
-        for (t, tab) in SETTINGS_TABS.iter().enumerate() {
-            let headers = settings_rows(t)
-                .into_iter()
-                .filter(|row| matches!(row, SettingsRow::Header(_)))
-                .count();
-            match tab.body {
-                TabBody::Values(settings) => {
-                    let grouped = settings.iter().any(|s| !s.group.is_empty());
-                    assert_eq!(headers > 0, grouped, "{}", tab.title);
-                }
-                TabBody::Hotkeys => assert!(headers > 0, "hotkeys tab groups its rows"),
+            // Each tab's rows walk its own index space, in order.
+            for (t, tab) in SETTINGS_TABS.iter().enumerate() {
+                let indices: Vec<usize> = settings_rows(t)
+                    .into_iter()
+                    .filter_map(|row| row.index())
+                    .collect();
+                assert_eq!(
+                    indices,
+                    (0..tab_len(t)).collect::<Vec<_>>(),
+                    "{} rows",
+                    tab.title
+                );
             }
-        }
+
+            // A value tab carries headers exactly when its rows name
+            // groups; Hotkeys and Agents always do.
+            for (t, tab) in SETTINGS_TABS.iter().enumerate() {
+                let headers = settings_rows(t)
+                    .into_iter()
+                    .filter(|row| matches!(row, SettingsRow::Header(_)))
+                    .count();
+                match tab.body {
+                    TabBody::Values(settings) => {
+                        let grouped = settings.iter().any(|s| !s.group.is_empty());
+                        assert_eq!(headers > 0, grouped, "{}", tab.title);
+                    }
+                    TabBody::Hotkeys => assert!(headers > 0, "hotkeys tab groups its rows"),
+                    TabBody::Agents => assert!(headers > 0, "agents tab groups its rows"),
+                }
+            }
+        });
     }
 
     #[test]
     fn agents_tab_groups_its_rows_per_harness() {
-        let (tab, _) = locate(SettingKind::ClaudeEnabled).unwrap();
-        assert_eq!(SETTINGS_TABS[tab].title, "Agents");
+        with_empty_config(|| {
+            let tab = agents_tab();
+            assert_eq!(SETTINGS_TABS[tab].title, "Agents");
+            let cfg = Config::load();
 
-        // Read the rows back the way the screen shows them: a header,
-        // then the labels under it, with a blank between sections.
-        let mut sections: Vec<(&str, Vec<&str>)> = Vec::new();
-        for row in settings_rows(tab) {
-            match row {
-                SettingsRow::Header(title) => sections.push((title, Vec::new())),
-                SettingsRow::Setting(i) => sections
-                    .last_mut()
-                    .expect("every Agents row sits under a header")
-                    .1
-                    .push(setting_at(tab, i).unwrap().label),
-                SettingsRow::Blank => assert!(!sections.is_empty(), "no leading blank"),
-                SettingsRow::Hotkey(_) => unreachable!(),
+            // Read the rows back the way the screen shows them: a header,
+            // then the labels under it, with a blank between sections.
+            let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+            for row in settings_rows(tab) {
+                match row {
+                    SettingsRow::Header(title) => sections.push((title, Vec::new())),
+                    SettingsRow::Setting(i) => {
+                        let label = match AGENTS_HEAD.get(i) {
+                            Some(spec) => spec.label.to_string(),
+                            None => {
+                                cfg.agent_row(i)
+                                    .map(|(_, field)| field.label().to_string())
+                                    .expect("every Agents row resolves")
+                            }
+                        };
+                        sections
+                            .last_mut()
+                            .expect("every Agents row sits under a header")
+                            .1
+                            .push(label);
+                    }
+                    SettingsRow::Blank => assert!(!sections.is_empty(), "no leading blank"),
+                    SettingsRow::Hotkey(_) => unreachable!(),
+                }
             }
-        }
-        assert_eq!(
-            sections,
-            vec![
-                ("Quick prompt", vec!["Agent", "Focus"]),
-                ("Claude", vec!["Enabled", "Model", "Effort"]),
-                ("Codex", vec!["Enabled", "Model", "Effort"]),
-                ("Cursor", vec!["Enabled", "Model", "Effort"]),
-                ("Pi", vec!["Enabled", "Model", "Effort"]),
-            ]
-        );
-
-        // The header a row sits under names the kind whose setting it is,
-        // so the shortened labels can never drift onto the wrong harness.
-        for (_, _, spec) in all_settings().filter(|(t, _, _)| *t == tab) {
-            let kind = format!("{:?}", spec.kind);
-            let harness = match spec.group {
-                "Quick prompt" => "QuickPrompt",
-                other => other,
-            };
-            assert!(
-                kind.starts_with(harness),
-                "{kind} sits under {}",
-                spec.group
+            assert_eq!(
+                sections,
+                vec![
+                    (
+                        "Quick prompt".to_string(),
+                        vec![
+                            "Agent".to_string(),
+                            "Focus".to_string(),
+                            "Hide missing CLIs".to_string()
+                        ]
+                    ),
+                    (
+                        "Claude".to_string(),
+                        vec!["Enabled".to_string(), "Model".to_string(), "Effort".to_string()]
+                    ),
+                    (
+                        "Codex".to_string(),
+                        vec!["Enabled".to_string(), "Model".to_string(), "Effort".to_string()]
+                    ),
+                    (
+                        "Cursor".to_string(),
+                        vec!["Enabled".to_string(), "Model".to_string(), "Effort".to_string()]
+                    ),
+                    (
+                        "Pi".to_string(),
+                        vec!["Enabled".to_string(), "Model".to_string(), "Effort".to_string()]
+                    ),
+                    (
+                        "Muse".to_string(),
+                        vec!["Enabled".to_string(), "Model".to_string(), "Effort".to_string()]
+                    ),
+                ]
             );
-        }
 
-        // One blank line separates the sections and nothing else does.
-        let blanks = settings_rows(tab)
-            .into_iter()
-            .filter(|row| *row == SettingsRow::Blank)
-            .count();
-        assert_eq!(blanks, sections.len() - 1);
+            // One blank line separates the sections and nothing else does.
+            let blanks = settings_rows(tab)
+                .into_iter()
+                .filter(|row| *row == SettingsRow::Blank)
+                .count();
+            assert_eq!(blanks, sections.len() - 1);
+        });
+    }
+
+    /// A new CLI in the registry grows its own Agents section — model and
+    /// effort rows included — with no code change, and the picker offers
+    /// it in the same order.
+    #[test]
+    fn agents_tab_grows_a_section_per_registry_entry() {
+        with_empty_config(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.json");
+            std::fs::write(
+                &path,
+                r#"{"harnesses": {
+                    "agy": {
+                        "program": "agy",
+                        "model_default": "big-1",
+                        "effort_flag": "--effort",
+                        "efforts": ["low", "high"],
+                        "resume_flag": "--resume",
+                        "hooks": "claude"
+                    }
+                }}"#,
+            )
+            .unwrap();
+            with_config_path(path, || {
+                let tab = agents_tab();
+                let cfg = Config::load();
+                let sections: Vec<String> = settings_rows(tab)
+                    .into_iter()
+                    .filter_map(|row| match row {
+                        SettingsRow::Header(title) => Some(title),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    sections,
+                    vec!["Quick prompt", "Claude", "Codex", "Cursor", "Pi", "Muse", "agy"]
+                );
+                let (_, model_row) =
+                    locate_agent("agy", HarnessField::Model).expect("the newcomer locates");
+                assert_eq!(cfg.agent_value("agy", HarnessField::Model), "big-1");
+                let (_, effort_row) =
+                    locate_agent("agy", HarnessField::Effort).expect("its effort row shows");
+                assert_eq!(cfg.agent_value("agy", HarnessField::Effort), "default");
+                assert_eq!(tab_len(tab), AGENTS_HEAD.len() + cfg.agent_rows().len());
+                // ... and the picker offers it after the built-ins.
+                let offered = cfg.offered_harnesses();
+                assert_eq!(
+                    offered.last(),
+                    Some(&(AgentKind::Custom, Some("agy".to_string())))
+                );
+                // Cycling its rows edits the map entry a save persists:
+                // an off-list hand edit steps onto the list, effort
+                // steps forward through its rows.
+                let mut cfg = cfg;
+                cfg.cycle(tab, model_row, 0);
+                assert_eq!(
+                    cfg.harnesses["agy"].model_default.as_deref(),
+                    Some("default"),
+                    "an off-list hand edit steps onto the offered rows"
+                );
+                cfg.cycle(tab, effort_row, 1);
+                assert_eq!(
+                    cfg.harnesses["agy"].effort_default.as_deref(),
+                    Some("low")
+                );
+            });
+        });
     }
 
     #[test]
     fn every_tab_holds_something() {
-        assert!(tab_count() >= 2);
-        for (t, tab) in SETTINGS_TABS.iter().enumerate() {
-            assert!(tab_len(t) > 0, "{} is empty", tab.title);
-            assert!(!tab.title.is_empty());
-        }
-        assert_eq!(tab_len(hotkeys_tab()), crate::keymap::ACTIONS.len());
+        with_empty_config(|| {
+            assert!(tab_count() >= 2);
+            for (t, tab) in SETTINGS_TABS.iter().enumerate() {
+                assert!(tab_len(t) > 0, "{} is empty", tab.title);
+                assert!(!tab.title.is_empty());
+            }
+            assert_eq!(tab_len(hotkeys_tab()), crate::keymap::ACTIONS.len());
+        });
     }
 
     #[test]

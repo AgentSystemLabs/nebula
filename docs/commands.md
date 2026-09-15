@@ -59,7 +59,8 @@ nebula worktree [name] [--base <ref>]  # move the current session into a worktre
                           # worktree; no name invents one; --base picks a new branch's start point,
                           # a branch name meaning origin's fetched copy — main is origin/main;
                           # without it the worktree_base_branch setting, else origin's default)
-nebula spawn <task> [--kind <claude|codex|cursor|pi>]  # start a new agent session beside the current
+nebula spawn <task> [--kind <claude|codex|cursor|pi|muse>]  # start a new agent session beside the current
+                          # (custom harnesses launch from the TUI picker and presets, not --kind)
                           # one, in the same worktree, opening on <task> (agents run this when you
                           # ask for a new nebula session; --kind defaults to this session's harness)
 nebula open <file>…       # show the files in this nebula's FILE TABS — a modal with one tab per
@@ -89,6 +90,9 @@ nebula config import <source>   # merge a backup in: an export, a bare config.js
                                 # agent_presets.json / ssh_hosts.json, a folder holding any of
                                 # them, or - for stdin. Keys it sets replace this machine's, keys
                                 # it lacks stay, and config.local.json is never written
+nebula config harnesses         # print the effective harness registry: every harness with
+                                # the program, flags, resume shape, hook dialect and defaults a
+                                # launch uses. Copy a row into config.json `harnesses` to override it
 ```
 
 See [Configuration](configuration.md#backup-restore-and-other-machines).
