@@ -719,7 +719,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "SESSIONS",
                     &[
                         (Act(&[New]), "new agent (pick CLI kind)"),
-                        (Act(&[AgentPresets]), "agent presets: launch with a task"),
+                        (Act(&[AgentPresets]), "agent presets: saved launches"),
                         (Act(&[NewTerminal]), "new shell terminal"),
                         (Act(&[Activate]), "attach session / open link"),
                         (Act(&[HalfPageDown, HalfPageUp]), "half a panel down / up"),
@@ -3682,10 +3682,21 @@ fn draw_session_row(
             // flight) reads as not-there-yet: hollow dot, no sweep, and
             // the word in the badge slot the harness would take.
             let pending = app.is_placeholder_agent(&a.id);
+            // A cold session — no live PTY behind it: the IDLE REAPER took
+            // it, or nothing has booted it since the daemon started — goes
+            // gray whatever its last status was, dot and rail both, until an
+            // attach warms it again: that status is what it last did, not
+            // what it is doing. A Cloud row never has a local PTY to be warm.
+            let cold = !a.alive && a.cloud_session_id.is_none();
             let dot = if a.archived {
                 Span::styled("⊘ ", Style::default().fg(th.dim))
             } else if pending {
                 status_dot(None, false, th)
+            } else if cold {
+                Span {
+                    style: Style::default().fg(th.dim),
+                    ..status_dot(Some(a.status), false, th)
+                }
             } else {
                 status_dot(Some(a.status), a.unseen && !a.archived, th)
             };
@@ -3735,7 +3746,7 @@ fn draw_session_row(
             let free = (width.saturating_sub(3) as usize).saturating_sub(badge.chars().count());
             let (ago, name_max) = fit_ago(ago, free);
             // Archived rows stay quiet even if their last status was live.
-            let ramp = if a.archived || pending {
+            let ramp = if a.archived || pending || cold {
                 None
             } else {
                 sweep_ramp(Some(a.status), th, app.animations)
@@ -3751,7 +3762,7 @@ fn draw_session_row(
                 spans.push(Span::styled(ago, Style::default().fg(th.dim)));
             }
             spans.push(Span::styled(badge, badge_style));
-            let mark = if a.archived || pending {
+            let mark = if a.archived || pending || cold {
                 th.dim
             } else {
                 status_color(Some(a.status), a.unseen, th)
@@ -4457,7 +4468,7 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
         )
     } else if matches!(&app.overlay, Some(Overlay::AgentPresets(_))) {
         Span::styled(
-            "↑/↓: select  Enter: launch with a task  a: new  e: edit  d: delete  Esc: close",
+            "↑/↓: select  Enter: launch  a: new  e: edit  d: delete  Esc: close",
             Style::default().fg(th.dim),
         )
     } else if matches!(&app.overlay, Some(Overlay::AgentPresetEditor(_))) {
@@ -5535,12 +5546,13 @@ mod tests {
 
     /// The selection rail of the focused SESSION row is its STATUS DOT's
     /// color, not the accent: yellow while it runs, violet while its
-    /// finish is UNSEEN, green once read, and a FRESH row's gray lifted
-    /// to muted so it still reads as the cursor on the fill.
+    /// finish is UNSEEN, green once read, and a FRESH or cold row's gray
+    /// lifted to muted so it still reads as the cursor on the fill.
     #[test]
     fn session_rail_takes_the_status_dot_color() {
         use nebula_core::AgentStatus;
         let mut app = hit_test_app(&["main"], &["agent"], &[]);
+        app.tree.agents[0].alive = true;
         app.focus = Focus::Sessions;
         let th = app.theme;
         let area = Rect::new(0, 0, 30, 12);
@@ -5567,6 +5579,11 @@ mod tests {
             app.tree.agents[0].unseen = unseen;
             assert_eq!(rail(&mut app), want, "{status:?} unseen={unseen}");
         }
+        // Cold (no live PTY): a running row's rail is the gray dot's too.
+        app.tree.agents[0].status = AgentStatus::Running;
+        app.tree.agents[0].alive = false;
+        assert_eq!(rail(&mut app), th.muted, "cold");
+        app.tree.agents[0].alive = true;
         // Unfocused, the rail is the quiet gray whatever the status.
         app.focus = Focus::Worktrees;
         assert_eq!(rail(&mut app), th.dim, "unfocused panel");
@@ -5902,6 +5919,8 @@ mod tests {
         let now = crate::app::now_ms();
         for a in &mut app.tree.agents {
             a.status = AgentStatus::Running;
+            // Warm, or the rail is a cold row's gray rather than RUNNING's.
+            a.alive = true;
             a.recent_prompts = (1..=2)
                 .map(|n| PromptEntry {
                     text: format!("ask {n}"),

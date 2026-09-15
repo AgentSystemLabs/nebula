@@ -2,9 +2,10 @@
 //! the PRESET EDITOR form behind its `a` / `e` — their state, keys, mouse
 //! and drawing. The presets themselves (and their file) are
 //! `crate::agent_presets`; the task prompt a launch opens is an ordinary
-//! multi-line `PromptDialog` (`PromptKind::AgentPresetTask`), and the
-//! create it ends in goes through `event_loop::create_agent` like every
-//! other session.
+//! multi-line `PromptDialog` (`PromptKind::AgentPresetTask`) — sent on at
+//! once, empty, for a `skip_task` preset (`event_loop::submit_prompt_now`)
+//! — and the create it ends in goes through `event_loop::create_agent`
+//! like every other session.
 
 use crate::agent_presets::AgentPreset;
 use crate::app::{
@@ -17,7 +18,7 @@ use crate::ui::{
     row_rect, truncate,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use nebula_core::{AgentKind, WorktreeId};
+use nebula_core::{AgentKind, ClientRequest, WorktreeId};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -26,14 +27,19 @@ use ratatui::Frame;
 
 const AGENT_PRESETS_W: u16 = 72;
 /// The PRESET EDITOR's width and the tallest it draws (four single rows, a
-/// blank, and two 4-row prefix/postfix boxes with their borders).
+/// blank, two 4-row prefix/postfix boxes with their borders, and the Task
+/// row under them).
 const PRESET_EDITOR_W: u16 = 76;
-const PRESET_EDITOR_H: u16 = 19;
+const PRESET_EDITOR_H: u16 = 20;
+/// The Task row's two choices: ask for an (optional) task on launch, or
+/// launch at once (`AgentPreset::skip_task`).
+const TASK_ASK: &str = "ask";
+const TASK_SKIP: &str = "skip";
 
 /// The AGENT PRESETS list (`e` in the SESSIONS PANEL): every saved preset,
 /// snapshot from the store when the modal opens. Enter launches the
-/// selected one into `worktree` after asking for a task; `a` / `e` / `d`
-/// create, edit and delete.
+/// selected one into `worktree` after asking for an optional task — at
+/// once for a `skip_task` preset; `a` / `e` / `d` create, edit and delete.
 #[derive(Debug, Clone)]
 pub struct AgentPresetsView {
     pub presets: Vec<AgentPreset>,
@@ -88,18 +94,20 @@ pub enum PresetField {
     Effort,
     Prefix,
     Postfix,
+    Task,
 }
 
 use crate::config::fits;
 
 impl PresetField {
-    pub const ALL: [PresetField; 6] = [
+    pub const ALL: [PresetField; 7] = [
         PresetField::Name,
         PresetField::Kind,
         PresetField::Model,
         PresetField::Effort,
         PresetField::Prefix,
         PresetField::Postfix,
+        PresetField::Task,
     ];
 
     /// The field `delta` steps away in Tab order, wrapping, and skipping
@@ -143,6 +151,7 @@ impl PresetField {
             PresetField::Effort => "Effort",
             PresetField::Prefix => "Prefix",
             PresetField::Postfix => "Postfix",
+            PresetField::Task => "Task",
         }
     }
 }
@@ -164,6 +173,9 @@ pub struct AgentPresetEditor {
     pub effort: String,
     pub prefix: TextInput,
     pub postfix: TextInput,
+    /// Launch without asking for a task (`AgentPreset::skip_task`); the
+    /// Task row shows it as `ask` / `skip`.
+    pub skip_task: bool,
     /// The field with the caret / cycle focus.
     pub field: PresetField,
     /// Type-ahead on the focused choice row (Harness / Model / Effort): the
@@ -187,6 +199,7 @@ impl AgentPresetEditor {
             effort: crate::config::DEFAULT_CHOICE.into(),
             prefix: TextInput::new(),
             postfix: TextInput::new(),
+            skip_task: false,
             field: PresetField::Name,
             area: Rect::default(),
             filter: String::new(),
@@ -208,6 +221,7 @@ impl AgentPresetEditor {
             effort: choice(&preset.effort),
             prefix: TextInput::with_text(preset.prefix.clone()),
             postfix: TextInput::with_text(preset.postfix.clone()),
+            skip_task: preset.skip_task,
             field: PresetField::Name,
             area: Rect::default(),
             filter: String::new(),
@@ -216,6 +230,15 @@ impl AgentPresetEditor {
 
     pub fn is_edit(&self) -> bool {
         self.editing.is_some()
+    }
+
+    /// The Task row's value: `ask` or `skip`.
+    fn task_choice(&self) -> &'static str {
+        if self.skip_task {
+            TASK_SKIP
+        } else {
+            TASK_ASK
+        }
     }
 
     /// Switch harness, dropping a model / effort the new kind doesn't list
@@ -243,8 +266,8 @@ impl AgentPresetEditor {
     }
 
     /// The choices the focused row cycles: harness names, the kind's
-    /// models, or the (kind, model) pair's efforts. Empty on a text row and
-    /// on an `n/a` row.
+    /// models, the (kind, model) pair's efforts, or `ask` / `skip`. Empty on
+    /// a text row and on an `n/a` row.
     fn row_choices(&self) -> Vec<String> {
         match self.field {
             PresetField::Kind => AgentKind::ALL
@@ -259,6 +282,7 @@ impl AgentPresetEditor {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            PresetField::Task => vec![TASK_ASK.to_string(), TASK_SKIP.to_string()],
             _ => Vec::new(),
         }
     }
@@ -268,6 +292,7 @@ impl AgentPresetEditor {
             PresetField::Kind => self.kind.as_str().to_string(),
             PresetField::Model => self.model.clone(),
             PresetField::Effort => self.effort.clone(),
+            PresetField::Task => self.task_choice().to_string(),
             _ => String::new(),
         }
     }
@@ -284,6 +309,7 @@ impl AgentPresetEditor {
                 self.fit_effort();
             }
             PresetField::Effort => self.effort = value.to_string(),
+            PresetField::Task => self.skip_task = value == TASK_SKIP,
             _ => {}
         }
     }
@@ -373,6 +399,7 @@ impl AgentPresetEditor {
             effort: crate::config::non_default(&self.effort),
             prefix: self.prefix.as_str().to_string(),
             postfix: self.postfix.as_str().to_string(),
+            skip_task: self.skip_task,
         }
     }
 
@@ -486,10 +513,16 @@ pub(crate) fn open_delete_preset_confirm(app: &mut App, view: &AgentPresetsView)
     }));
 }
 
-/// The list's Enter: ask for the task that the preset's prefix and postfix
-/// will wrap. A harness switched off in Settings → Agents is refused here,
-/// where the row is, rather than by a failed spawn later.
-pub(crate) fn open_agent_preset_task(app: &mut App, view: &AgentPresetsView) {
+/// The list's Enter: ask for the optional task that the preset's prefix and
+/// postfix will wrap — or, for a `skip_task` preset, launch on them at once,
+/// through the same submit an empty task box takes. A harness switched off
+/// in Settings → Agents is refused here, where the row is, rather than by a
+/// failed spawn later.
+pub(crate) fn open_agent_preset_task(
+    app: &mut App,
+    view: &AgentPresetsView,
+    out: &mut Vec<ClientRequest>,
+) {
     let Some(preset) = view.presets.get(view.selected).cloned() else {
         app.flash = Some("no preset selected — a creates one".into());
         return;
@@ -501,25 +534,31 @@ pub(crate) fn open_agent_preset_task(app: &mut App, view: &AgentPresetsView) {
         ));
         return;
     }
-    crate::event_loop::open_prompt(
-        app,
-        PromptKind::AgentPresetTask {
-            worktree: view.worktree.clone(),
-            preset,
-        },
-    );
+    let skip = preset.skip_task;
+    let kind = PromptKind::AgentPresetTask {
+        worktree: view.worktree.clone(),
+        preset,
+    };
+    if skip {
+        crate::event_loop::submit_prompt_now(app, kind, out);
+    } else {
+        crate::event_loop::open_prompt(app, kind);
+    }
 }
 
 /// The picker's Enter: adopt the hovered AGENT PRESET — its harness,
 /// MODEL / EFFORT and prefix/postfix — for the QUICK PROMPT that opened
-/// the list, and hand the box back with its text. A harness switched off
-/// in Settings → Agents is refused here, where the row is, rather than by
-/// a failed spawn later.
+/// the list, and hand the box back with its text — or, for a `skip_task`
+/// preset picked over an empty box, launch it as Enter on that box would;
+/// typed text stays the user's to send. A harness switched off in
+/// Settings → Agents is refused here, where the row is, rather than by a
+/// failed spawn later.
 fn apply_preset_to_quick_prompt(
     app: &mut App,
     presets: &[AgentPreset],
     selected: usize,
     back: crate::quick_prompt::QuickReturn,
+    out: &mut Vec<ClientRequest>,
 ) {
     let Some(preset) = presets.get(selected).cloned() else {
         app.flash = Some("no preset selected".into());
@@ -533,14 +572,19 @@ fn apply_preset_to_quick_prompt(
         ));
         return;
     }
+    let launch_now = preset.skip_task && back.text.trim().is_empty();
     let launch = crate::quick_prompt::QuickLaunch::of_preset(back.launch.target, preset, &cfg)
         .with_issue(back.launch.issue)
         .with_origin(back.launch.origin);
-    crate::quick_prompt::reopen(app, launch, &back.text);
+    if launch_now {
+        crate::event_loop::submit_prompt_now(app, PromptKind::QuickPrompt(launch), out);
+    } else {
+        crate::quick_prompt::reopen(app, launch, &back.text);
+    }
 }
 
 /// Keys in the AGENT PRESETS list.
-pub(crate) fn handle_list_key(app: &mut App, key: KeyEvent) {
+pub(crate) fn handle_list_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     let Some(Overlay::AgentPresets(view)) = &mut app.overlay else {
         return;
     };
@@ -582,8 +626,10 @@ pub(crate) fn handle_list_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => {
             let view = view.clone();
             match view.quick {
-                Some(back) => apply_preset_to_quick_prompt(app, &view.presets, view.selected, back),
-                None => open_agent_preset_task(app, &view),
+                Some(back) => {
+                    apply_preset_to_quick_prompt(app, &view.presets, view.selected, back, out)
+                }
+                None => open_agent_preset_task(app, &view, out),
             }
         }
         _ => {}
@@ -646,7 +692,12 @@ pub(crate) fn handle_editor_key(app: &mut App, key: KeyEvent) {
 /// Mouse in the AGENT PRESETS list: the wheel moves the selection, a click
 /// on a row launches it (rows are actions, as in the hosts picker — editing
 /// is `e`), a click outside the modal closes; everything else is swallowed.
-pub(crate) fn handle_list_mouse(app: &mut App, mouse: MouseEvent, mouse_pos: Position) {
+pub(crate) fn handle_list_mouse(
+    app: &mut App,
+    mouse: MouseEvent,
+    mouse_pos: Position,
+    out: &mut Vec<ClientRequest>,
+) {
     let Some(Overlay::AgentPresets(view)) = &mut app.overlay else {
         return;
     };
@@ -667,7 +718,7 @@ pub(crate) fn handle_list_mouse(app: &mut App, mouse: MouseEvent, mouse_pos: Pos
                 if index < view.presets.len() {
                     view.selected = index;
                     let view = view.clone();
-                    open_agent_preset_task(app, &view);
+                    open_agent_preset_task(app, &view, out);
                 }
             }
             app.dirty = true;
@@ -712,14 +763,17 @@ pub(crate) fn draw_list(f: &mut Frame, app: &mut App, view: &AgentPresetsView, t
             break;
         };
         let budget = (inner.width as usize).saturating_sub(2);
-        // "name  claude · opus · high" left, a dim "+prefix +postfix"
-        // pinned right when the preset wraps the task.
+        // "name  claude · opus · high" left, a dim "+prefix +postfix
+        // no task" pinned right for what the preset adds to a launch.
         let mut marks = Vec::new();
         if !preset.prefix.trim().is_empty() {
             marks.push("+prefix");
         }
         if !preset.postfix.trim().is_empty() {
             marks.push("+postfix");
+        }
+        if preset.skip_task {
+            marks.push("no task");
         }
         let marks = marks.join(" ");
         let marks_w = marks.chars().count();
@@ -751,11 +805,11 @@ pub(crate) fn draw_list(f: &mut Frame, app: &mut App, view: &AgentPresetsView, t
 
 /// The PRESET EDITOR form.
 pub(crate) fn draw_editor(f: &mut Frame, app: &mut App, editor: &AgentPresetEditor, th: Theme) {
-    // Four single rows, a blank, then the two text boxes; the boxes
-    // give up rows first on a short screen, down to one line each.
-    let frame_h = f.area().height.max(9);
-    let box_h = ((frame_h.min(PRESET_EDITOR_H).saturating_sub(7)) / 2).clamp(3, 6);
-    let height = 7 + 2 * box_h;
+    // Four single rows, a blank, the two text boxes, then the Task row;
+    // the boxes give up rows first on a short screen, down to one line each.
+    let frame_h = f.area().height.max(10);
+    let box_h = ((frame_h.min(PRESET_EDITOR_H).saturating_sub(8)) / 2).clamp(3, 6);
+    let height = 8 + 2 * box_h;
     let area = centered_rect(f.area(), PRESET_EDITOR_W, height);
     f.render_widget(Clear, area);
     let hint = if area.width >= 72 {
@@ -774,14 +828,16 @@ pub(crate) fn draw_editor(f: &mut Frame, app: &mut App, editor: &AgentPresetEdit
     f.render_widget(block, area);
 
     let label_w = 9usize;
+    // The four rows above the boxes, and the Task row below them.
     let single = [
-        PresetField::Name,
-        PresetField::Kind,
-        PresetField::Model,
-        PresetField::Effort,
+        (PresetField::Name, 0),
+        (PresetField::Kind, 1),
+        (PresetField::Model, 2),
+        (PresetField::Effort, 3),
+        (PresetField::Task, 5 + 2 * box_h as usize),
     ];
-    for (i, field) in single.iter().enumerate() {
-        let Some(row_area) = row_rect(inner, i) else {
+    for (field, row) in single.iter() {
+        let Some(row_area) = row_rect(inner, *row) else {
             break;
         };
         let focused = editor.field == *field;
@@ -813,6 +869,7 @@ pub(crate) fn draw_editor(f: &mut Frame, app: &mut App, editor: &AgentPresetEdit
                     PresetField::Kind => editor.kind.as_str().to_string(),
                     PresetField::Model => editor.model.clone(),
                     PresetField::Effort => editor.effort.clone(),
+                    PresetField::Task => editor.task_choice().to_string(),
                     _ => String::new(),
                 };
                 if !available {
@@ -836,6 +893,14 @@ pub(crate) fn draw_editor(f: &mut Frame, app: &mut App, editor: &AgentPresetEdit
                     }
                 } else {
                     spans.push(Span::raw(value));
+                }
+                if *field == PresetField::Task {
+                    let what = if editor.skip_task {
+                        "  Enter launches at once on prefix + postfix"
+                    } else {
+                        "  Enter asks for a task (optional)"
+                    };
+                    spans.push(Span::styled(what, Style::default().fg(th.dim)));
                 }
             }
         }

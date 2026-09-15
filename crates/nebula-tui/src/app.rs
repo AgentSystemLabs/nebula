@@ -1258,14 +1258,15 @@ pub struct WorktreeRollback {
     pub agents: Vec<(usize, Agent)>,
 }
 
-/// The rows a QUICK PROMPT into a WORKTREE that does not exist yet puts up
-/// the moment Enter is pressed — a checkout row and its one session row,
+/// The rows a launch into a WORKTREE that does not exist yet puts up the
+/// moment Enter is pressed — a checkout row and its one session row,
 /// under ids this client made up — so the panels never wait on the
-/// DAEMON's `git worktree add` and CLI spawn. Carried by the PENDING
-/// INTENTs of the two creates: the Acks turn them into the real rows,
-/// an Error takes them down (`event_loop::placeholder`). The NEW
-/// WORKTREE modal puts up the checkout row alone, under
-/// `PendingIntent::SelectCreatedWorktree`.
+/// DAEMON's `git worktree add` and CLI spawn. A QUICK PROMPT's ride the
+/// PENDING INTENTs of its two creates, a PR SESSION's the one
+/// `CreatePrAgent` that cuts the checkout and spawns in it: the Acks turn
+/// them into the real rows, an Error takes them down
+/// (`event_loop::placeholder`). The NEW WORKTREE modal puts up the
+/// checkout row alone, under `PendingIntent::SelectCreatedWorktree`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaceholderRows {
     pub worktree: WorktreeId,
@@ -1323,6 +1324,17 @@ pub enum PendingIntent {
         /// The stand-in rows on screen meanwhile.
         placeholder: PlaceholderRows,
     },
+    /// A PR SESSION whose head branch had no checkout yet: the DAEMON
+    /// fetches the branch, cuts the worktree and spawns the CLI in it
+    /// behind this one request, and the Ack names only the session. The
+    /// stand-in checkout row is adopted by the worktree's upsert as it
+    /// lands (`placeholder::adopt_worktree`), the session row by the Ack,
+    /// which then attaches it like `AttachCreated` — `focus` enters and
+    /// locks the pane. An Error takes down whatever is still a stand-in.
+    AttachCreatedPrSession {
+        focus: bool,
+        placeholder: PlaceholderRows,
+    },
     /// Open the workspace this Ack just created (switcher's "New workspace…"
     /// flow: creating from there means you want to be in it).
     OpenCreatedWorkspace,
@@ -1335,7 +1347,8 @@ impl PendingIntent {
     /// The stand-in worktree row this in-flight request is holding up.
     pub fn placeholder_worktree(&self) -> Option<&WorktreeId> {
         match self {
-            PendingIntent::LaunchInCreatedWorktree { placeholder, .. } => {
+            PendingIntent::LaunchInCreatedWorktree { placeholder, .. }
+            | PendingIntent::AttachCreatedPrSession { placeholder, .. } => {
                 Some(&placeholder.worktree)
             }
             PendingIntent::SelectCreatedWorktree { placeholder, .. } => Some(placeholder),
@@ -1346,7 +1359,8 @@ impl PendingIntent {
     /// The stand-in session row this in-flight request is holding up.
     pub fn placeholder_agent(&self) -> Option<&AgentId> {
         match self {
-            PendingIntent::LaunchInCreatedWorktree { placeholder, .. } => Some(&placeholder.agent),
+            PendingIntent::LaunchInCreatedWorktree { placeholder, .. }
+            | PendingIntent::AttachCreatedPrSession { placeholder, .. } => Some(&placeholder.agent),
             PendingIntent::AttachCreatedWithCloudRetry { placeholder, .. } => placeholder.as_ref(),
             _ => None,
         }

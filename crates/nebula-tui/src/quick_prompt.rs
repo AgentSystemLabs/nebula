@@ -154,13 +154,14 @@ impl QuickLaunch {
         self.issue.as_ref().map(|issue| issue.default_task())
     }
 
-    /// Does Enter on an empty box launch, with no STARTING PROMPT? Only
-    /// the NEW SESSION PICKER's box, and only with no AGENT PRESET on it —
-    /// a preset's prefix and postfix wrap a task, so an empty box is a
-    /// change of mind there as it is after `p`. (An ISSUE SESSION's empty
-    /// box is `default_task`'s: the issue is the task.)
+    /// Does Enter on an empty box launch? The NEW SESSION PICKER's box
+    /// does, with no STARTING PROMPT, and so does any box an AGENT PRESET
+    /// is on — a preset's task is optional, so its empty box sends the
+    /// prefix and postfix alone (nothing at all for a bare preset). After
+    /// `p` with no preset an empty box is a change of mind. (An ISSUE
+    /// SESSION's empty box is `default_task`'s: the issue is the task.)
     pub fn launches_empty(&self) -> bool {
-        self.origin == QuickOrigin::NewSession && self.preset.is_none()
+        self.origin == QuickOrigin::NewSession || self.preset.is_some()
     }
 
     /// The launch an AGENT PRESET describes: its harness, its pinned
@@ -217,10 +218,15 @@ impl QuickLaunch {
     /// The line under the title: what Enter will send.
     pub fn label(&self) -> String {
         match (&self.preset, &self.issue) {
-            (Some(preset), _) if preset.has_wrapping() => {
-                format!("{} — prefix + your task + postfix", preset.name)
+            (Some(preset), issue) => {
+                let (sends, empty) = match (preset.has_wrapping(), issue) {
+                    (true, Some(_)) => ("prefix + your task + postfix", "fix the issue"),
+                    (true, None) => ("prefix + your task + postfix", "prefix + postfix only"),
+                    (false, Some(_)) => ("sent as the first prompt", "fix the issue"),
+                    (false, None) => ("sent as the first prompt", "start with no prompt"),
+                };
+                format!("{} — {sends} (empty = {empty})", preset.name)
             }
-            (Some(preset), _) => format!("{} — sent as the first prompt", preset.name),
             (None, Some(issue)) => format!(
                 "what should the agent do about #{}? (empty = fix the issue)",
                 issue.number
@@ -477,6 +483,7 @@ mod tests {
             effort: None,
             prefix: String::new(),
             postfix: String::new(),
+            skip_task: false,
         }
     }
 
@@ -594,10 +601,16 @@ mod tests {
             &cfg,
         );
         assert_eq!(wrapped.title(), "Quick prompt · reviewer (cursor)");
-        assert_eq!(wrapped.label(), "reviewer — prefix + your task + postfix");
+        assert_eq!(
+            wrapped.label(),
+            "reviewer — prefix + your task + postfix (empty = prefix + postfix only)"
+        );
 
         let bare = QuickLaunch::of_preset(worktree(), preset("scratch", AgentKind::Cursor), &cfg);
-        assert_eq!(bare.label(), "scratch — sent as the first prompt");
+        assert_eq!(
+            bare.label(),
+            "scratch — sent as the first prompt (empty = start with no prompt)"
+        );
     }
 
     /// An ISSUE SESSION's box names the issue first, offers the issue as
@@ -631,7 +644,10 @@ mod tests {
             wrapped.title(),
             "Quick prompt · issue #15 · reviewer · new worktree issue-15-fix-login-redirect (cursor)"
         );
-        assert_eq!(wrapped.label(), "reviewer — sent as the first prompt");
+        assert_eq!(
+            wrapped.label(),
+            "reviewer — sent as the first prompt (empty = fix the issue)"
+        );
         assert!(wrapped.default_task().is_some());
         let none = QuickLaunch::of_kind(worktree(), AgentKind::Claude, None, None, &cfg);
         assert_eq!(none.default_task(), None, "an empty ordinary box cancels");
@@ -667,8 +683,8 @@ mod tests {
     }
 
     /// The NEW SESSION PICKER's box: titled for the picker, launching on
-    /// an empty Enter — unless an AGENT PRESET is on it — and keeping its
-    /// origin through the rebuilds its pickers and `Ctrl+N` do.
+    /// an empty Enter — as any box an AGENT PRESET is on does — and keeping
+    /// its origin through the rebuilds its pickers and `Ctrl+N` do.
     #[test]
     fn the_new_session_box_is_titled_for_the_picker_and_launches_empty() {
         let cfg = Config::default();
@@ -698,10 +714,16 @@ mod tests {
         assert_eq!(picked.picker_title(), "New session agent");
         assert!(picked.launches_empty());
 
-        // A preset wraps a task, so an empty box is a change of mind again.
+        // A preset's task is optional: its empty box launches, whichever
+        // surface put the box up.
         let mut wrapped = picked.clone();
         wrapped.preset = Some(preset("reviewer", AgentKind::Claude));
-        assert!(!wrapped.launches_empty());
+        assert!(wrapped.launches_empty());
+        let hotkey_preset = QuickLaunch {
+            preset: wrapped.preset.clone(),
+            ..hotkey.clone()
+        };
+        assert!(hotkey_preset.launches_empty());
         assert_eq!(
             wrapped.title(),
             "New session · reviewer (claude · opus · high)"

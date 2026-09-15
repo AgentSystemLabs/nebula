@@ -38,6 +38,21 @@ const PREWARM_STAGGER: Duration = Duration::from_millis(1500);
 /// Hook events buffered on a warm session before its row exists (oldest
 /// dropped beyond this).
 const PREWARM_HOOK_BUFFER_CAP: usize = 64;
+/// A resumed agent CLI that exits with an error this soon after its spawn
+/// is taken to have not found the session it was told to resume. Generous
+/// on purpose: the login shell alone takes most of a second, and a worktree
+/// prewarm sweep boots CLIs back to back — the 2 s this used to be let slow
+/// failures through, leaving the pane on the CLI's error.
+const RESUME_FAIL_WINDOW: Duration = Duration::from_secs(10);
+
+/// A resumed spawn, watched for the fast failure of a missing session.
+struct ResumeWatch {
+    /// The PTY it booted, so a later respawn's exit is never mistaken for it.
+    session: std::sync::Weak<PtySession>,
+    spawned_at: Instant,
+    cols: u16,
+    rows: u16,
+}
 /// `$SHELL -l -i -c <cmd>`: a login *and* interactive shell, so zsh sources
 /// ~/.zprofile and ~/.zshrc both and the child sees the PATH the user's
 /// terminal has. The CLI probe and the spawn wrapper share it so they can
@@ -146,6 +161,10 @@ pub struct Daemon {
     /// cancel it. Stepping through the Workspaces column fires a sweep per
     /// row, and only the row the cursor rests on is worth warming.
     prewarm_sweep: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Resumed agent spawns, by agent, until their PTY exits: a resume that
+    /// dies inside [`RESUME_FAIL_WINDOW`] could not find its session, and
+    /// `watch_for_exit` reads that off this record.
+    resumes: Mutex<HashMap<AgentId, ResumeWatch>>,
 }
 
 impl Daemon {
@@ -170,6 +189,7 @@ impl Daemon {
             pending_moves: Mutex::new(HashMap::new()),
             spawn_gate: Mutex::new(()),
             prewarm_sweep: Mutex::new(None),
+            resumes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -2152,6 +2172,30 @@ impl Daemon {
 
         // NEBULA_AGENT_CMD overrides for tests; default is the kind's CLI.
         let cmd_override = std::env::var(env::AGENT_CMD).ok();
+        // A Claude session id with no transcript behind it — a CLI nobody
+        // sent a prompt, or a session Claude's cleanup has deleted — resumes
+        // into "No conversation found" and a dead pane: boot fresh instead.
+        // An override (tests) never resumes, so it skips the look.
+        let unresumable;
+        let agent = match agent.session_id.as_deref() {
+            Some(sid)
+                if agent.kind == AgentKind::Claude
+                    && cloud_task.is_none()
+                    && cmd_override.is_none()
+                    && claude_transcript_exists(&self.claude_projects_dirs(), sid)
+                        == Some(false) =>
+            {
+                tracing::info!(agent = %agent.id, session = %sid, "no Claude transcript for the session — spawning fresh");
+                if let Err(e) = self.store.set_agent_session_id(&agent.id, None) {
+                    tracing::warn!(agent = %agent.id, error = %e, "clear session id failed");
+                }
+                let mut fresh = agent.clone();
+                fresh.session_id = None;
+                unresumable = fresh;
+                &unresumable
+            }
+            _ => agent,
+        };
         // A PR SESSION's rule — or an ISSUE SESSION's — rides Claude's
         // system prompt, or opens a Codex / Cursor cold spawn as its first
         // prompt (see `pr_scope`). Rebuilt from the row's *current*
@@ -2239,10 +2283,25 @@ impl Daemon {
         };
         let sref = SessionRef::Agent(agent.id.clone());
         let session = PtySession::spawn(sref, spec)?;
-        self.install_session(session.clone());
-        if resumed {
-            self.arm_resume_fallback(agent.clone(), worktree.clone(), session.clone(), cols, rows);
+        // Recorded before the install, so a CLI that dies at once still
+        // finds its watch when `watch_for_exit` sees it go.
+        {
+            let mut resumes = self.resumes.lock().unwrap();
+            if resumed {
+                resumes.insert(
+                    agent.id.clone(),
+                    ResumeWatch {
+                        session: Arc::downgrade(&session),
+                        spawned_at: Instant::now(),
+                        cols,
+                        rows,
+                    },
+                );
+            } else {
+                resumes.remove(&agent.id);
+            }
         }
+        self.install_session(session.clone());
         // The create prints the session id and exits at once: capture it
         // off the output (`watch_for_exit` persists it and re-broadcasts the
         // row), which is what turns the row's pane into the link panel.
@@ -2253,54 +2312,83 @@ impl Daemon {
     }
 
     /// A resumed session (`claude --resume` / `codex resume` /
-    /// `cursor-agent --resume`) dies fast when
-    /// it is stale/deleted — fall back to a fresh session instead of leaving
-    /// a dead pane. (`pi --session-id` creates a missing id instead of
-    /// dying, so pi never takes this path; arming it is harmless.)
-    fn arm_resume_fallback(
-        self: &Arc<Self>,
-        agent: Agent,
-        worktree: Worktree,
-        session: Arc<PtySession>,
-        cols: u16,
-        rows: u16,
-    ) {
-        let daemon = self.clone();
-        let mut rx = session.events.subscribe();
-        tokio::spawn(async move {
-            let early_exit = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                loop {
-                    match rx.recv().await {
-                        Ok(PtyEvent::Exited { exit_code }) => return exit_code.unwrap_or(1) != 0,
-                        Ok(_) => continue,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => return false,
-                    }
-                }
-            })
-            .await;
-            if early_exit != Ok(true) {
-                return;
+    /// `cursor-agent --resume`) that died inside [`RESUME_FAIL_WINDOW`]
+    /// could not find its session: clear the id and boot fresh instead of
+    /// leaving a dead pane. Reached from `watch_for_exit` on a natural death
+    /// only, so a restart or relocation that killed the PTY on purpose (and
+    /// has respawned it already) never gets a second CLI. (`pi --session-id`
+    /// creates a missing id instead of dying, so pi never lands here.)
+    fn respawn_failed_resume(self: &Arc<Self>, id: &AgentId, cols: u16, rows: u16) {
+        // `ensure_session`'s gate: an Attach reaching for the dead session
+        // right now must not fork a CLI beside this one.
+        let _gate = self.spawn_gate.lock().unwrap();
+        if self.is_alive(&SessionRef::Agent(id.clone())) {
+            return; // respawned already, and that spawn is watched itself
+        }
+        // Archived or deleted inside the window: never resurrect those.
+        let Ok(Some(mut agent)) = self.store.get_agent(id) else {
+            return;
+        };
+        if agent.archived || agent.cloud_session_id.is_some() {
+            return;
+        }
+        let Some(sid) = agent.session_id.take() else {
+            return;
+        };
+        // A Claude transcript still on disk says the id is good and the CLI
+        // quit over something else — a bad flag, a login: keep the id for
+        // the next attach, and the pane keeps the CLI's reason.
+        if agent.kind == AgentKind::Claude
+            && claude_transcript_exists(&self.claude_projects_dirs(), &sid) == Some(true)
+        {
+            tracing::info!(agent = %id, "resume failed fast with its transcript intact — keeping the session id");
+            return;
+        }
+        let Ok(Some(worktree)) = self.store.get_worktree(&agent.worktree_id) else {
+            return;
+        };
+        tracing::info!(agent = %id, "resume failed fast — respawning fresh");
+        if let Err(e) = self.store.set_agent_session_id(id, None) {
+            tracing::warn!(agent = %id, error = %e, "clear session id failed");
+        }
+        if self
+            .spawn_agent_session(&agent, &worktree, cols, rows)
+            .is_ok()
+        {
+            agent.alive = true;
+            self.broadcast(ServerEvent::EntityUpserted {
+                entity: Entity::Agent(agent),
+            });
+        }
+    }
+
+    /// The resume watch `session` was spawned under, while it is still the
+    /// agent's latest — taken, so each is judged once.
+    fn take_resume_watch(&self, id: &AgentId, session: &Arc<PtySession>) -> Option<ResumeWatch> {
+        let mut resumes = self.resumes.lock().unwrap();
+        match resumes.get(id) {
+            Some(watch) if std::ptr::eq(watch.session.as_ptr(), Arc::as_ptr(session)) => {
+                resumes.remove(id)
             }
-            // A deliberate kill looks identical to a failed resume from here:
-            // the agent may have been archived or deleted inside the window —
-            // never resurrect those.
-            match daemon.store.get_agent(&agent.id) {
-                Ok(Some(current)) if !current.archived => {}
-                _ => return,
-            }
-            tracing::info!(agent = %agent.id, "resume failed fast — respawning fresh");
-            let _ = daemon.store.set_agent_session_id(&agent.id, None);
-            let mut fresh = agent.clone();
-            fresh.session_id = None;
-            if let Ok(_session) = daemon.spawn_agent_session(&fresh, &worktree, cols, rows) {
-                let mut broadcast_agent = fresh;
-                broadcast_agent.alive = true;
-                daemon.broadcast(ServerEvent::EntityUpserted {
-                    entity: Entity::Agent(broadcast_agent),
-                });
-            }
-        });
+            _ => None,
+        }
+    }
+
+    /// Every Claude projects dir a transcript may sit in: the ones this
+    /// daemon's Claude hooks reported (wherever the agent's shell pointed
+    /// `CLAUDE_CONFIG_DIR`), then the default.
+    fn claude_projects_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = self
+            .transcripts
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|t| Some(t.transcript_path.parent()?.parent()?.to_path_buf()))
+            .collect();
+        dirs.extend(claude_config_dir().map(|dir| dir.join("projects")));
+        dirs.sort();
+        dirs.dedup();
+        dirs
     }
 
     fn spawn_terminal_session(
@@ -2365,6 +2453,12 @@ impl Daemon {
                         if was_registered {
                             daemon.session_interest.lock().unwrap().remove(&sref);
                         }
+                        // Taken on any exit, so a killed resume leaves no
+                        // record behind; acted on for a natural death only.
+                        let resume = match &sref {
+                            SessionRef::Agent(id) => daemon.take_resume_watch(id, &session),
+                            SessionRef::Terminal(_) => None,
+                        };
                         if !was_registered {
                             break;
                         }
@@ -2384,6 +2478,13 @@ impl Daemon {
                         };
                         if let Ok(entity) = upsert {
                             daemon.broadcast(ServerEvent::EntityUpserted { entity });
+                        }
+                        if let (SessionRef::Agent(id), Some(watch)) = (&sref, resume) {
+                            if exit_code.unwrap_or(1) != 0
+                                && watch.spawned_at.elapsed() < RESUME_FAIL_WINDOW
+                            {
+                                daemon.respawn_failed_resume(id, watch.cols, watch.rows);
+                            }
                         }
                         break;
                     }
@@ -2441,6 +2542,40 @@ impl Daemon {
             }
         });
     }
+}
+
+/// Claude Code's config dir: `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
+fn claude_config_dir() -> Option<PathBuf> {
+    env::non_empty("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| env::home_dir().map(|home| home.join(".claude")))
+}
+
+/// Whether Claude Code still holds the transcript `claude --resume <id>`
+/// reads — `<projects>/<cwd slug>/<id>.jsonl` under any of `roots`, in any
+/// slug: a session `nebula worktree` relocated keeps its transcript where
+/// it began, and resumes from there. `None` when no root could be read at
+/// all, which is no verdict.
+fn claude_transcript_exists(roots: &[PathBuf], session_id: &str) -> Option<bool> {
+    let file = format!("{session_id}.jsonl");
+    // An id that isn't one plain file name names no transcript.
+    if Path::new(&file).file_name() != Some(std::ffi::OsStr::new(&file)) {
+        return Some(false);
+    }
+    let mut read_any = false;
+    for root in roots {
+        let Ok(slugs) = std::fs::read_dir(root) else {
+            continue;
+        };
+        read_any = true;
+        if slugs
+            .flatten()
+            .any(|slug| slug.path().join(&file).is_file())
+        {
+            return Some(true);
+        }
+    }
+    read_any.then_some(false)
 }
 
 /// Program + args for an agent PTY. An override (tests) is used verbatim —
@@ -2919,6 +3054,30 @@ mod tests {
                 .join("\n\n"),
             ])
             .collect()
+    }
+
+    #[test]
+    fn claude_transcript_lookup_searches_every_project_slug() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        for slug in ["-w-issue-68", "-w-root-branch-switcher"] {
+            std::fs::create_dir_all(projects.join(slug)).unwrap();
+        }
+        std::fs::write(projects.join("-w-issue-68").join("sid-1.jsonl"), "{}\n").unwrap();
+        let missing = tmp.path().join("no-such-config").join("projects");
+        let roots = [missing.clone(), projects];
+        // Found under the slug the session began in, whichever checkout
+        // resumes it (a relocated session).
+        assert_eq!(claude_transcript_exists(&roots, "sid-1"), Some(true));
+        // A CLI nobody prompted: an id, and no file behind it.
+        assert_eq!(claude_transcript_exists(&roots, "sid-2"), Some(false));
+        // An id that tries to be a path names nothing.
+        assert_eq!(
+            claude_transcript_exists(&roots, "../-w-issue-68/sid-1"),
+            Some(false)
+        );
+        // Nothing readable: no verdict, so the resume is still tried.
+        assert_eq!(claude_transcript_exists(&[missing], "sid-1"), None);
     }
 
     #[test]
@@ -3567,6 +3726,28 @@ mod tests {
                 token: String::new(),
             },
         )
+    }
+
+    #[test]
+    fn claude_projects_dirs_follow_the_transcripts_hooks_reported() {
+        // An agent's shell may point CLAUDE_CONFIG_DIR somewhere the daemon's
+        // own env never heard of; its hooks name the real transcript.
+        let daemon = test_daemon();
+        let reported = crate::session_title::TranscriptRef::from_payload(
+            Some("/cfg/alt/projects/-w-feat/sid-9.jsonl"),
+            Some("sid-9"),
+        )
+        .unwrap();
+        daemon
+            .transcripts
+            .lock()
+            .unwrap()
+            .insert(AgentId("a1".into()), reported);
+        let dirs = daemon.claude_projects_dirs();
+        assert!(
+            dirs.contains(&PathBuf::from("/cfg/alt/projects")),
+            "{dirs:?}"
+        );
     }
 
     #[tokio::test]

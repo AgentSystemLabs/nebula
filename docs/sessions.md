@@ -67,12 +67,17 @@ tool waits on you, and green when the run ends, a cancelled run included.
 ## AGENT PRESETS
 
 If you keep starting the same kind of session with the same framing, save it as an **agent preset**:
-`e` in the Sessions column lists them, `a` opens a small form — name, harness, model, effort, and an
-optional prefix and postfix — and `e` / `d` edit or delete. `Enter` on a preset asks for the task in the
-same wrapped editor, then launches the CLI with `prefix + task + postfix` as its very first prompt, so
-the agent is already working when the pane opens. The row it creates is an ordinary session: it names
-itself on that first turn, resumes, and shows status like any other. Presets live in
-`agent_presets.json` beside `config.json`.
+`e` in the Sessions column lists them, `a` opens a small form — name, harness, model, effort, an
+optional prefix and postfix, and **Task** (`ask` or `skip`) — and `e` / `d` edit or delete. `Enter` on a
+preset asks for the task in the same wrapped editor, then launches the CLI with `prefix + task + postfix`
+as its very first prompt, so the agent is already working when the pane opens. The task is optional:
+send the box empty and the prefix and postfix go on their own (a preset with neither starts the CLI
+with no first prompt). Set **Task** to `skip` for a preset that never needs one — a "commit and push" —
+and `Enter` launches it at once, no box at all; the list marks those rows `no task`. A `skip` preset
+picked with `Shift+Tab` in a quick prompt, or with `e` in the issues modal, launches the same way when
+the box is still empty, while text you already typed stays yours to send. The row it creates is an
+ordinary session: it names itself on that first turn, resumes, and shows status like any other. Presets
+live in `agent_presets.json` beside `config.json`.
 
 ## RECENT PROMPTS
 

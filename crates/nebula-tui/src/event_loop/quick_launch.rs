@@ -16,7 +16,8 @@ use crate::quick_prompt::{QuickLaunch, QuickOrigin, QuickTarget};
 use nebula_core::{AgentId, ClientRequest, WorktreeId};
 
 /// Enter in the box, with `text` already sized — and non-empty, unless
-/// the box `launches_empty` (the NEW SESSION PICKER's, sent as it is).
+/// the box `launches_empty` (the NEW SESSION PICKER's, or one an AGENT
+/// PRESET is on, sent as it is).
 pub(super) fn submit(
     app: &mut App,
     launch: QuickLaunch,
@@ -29,8 +30,16 @@ pub(super) fn submit(
         }
         QuickTarget::NewWorktree { project, branch } => {
             // The rows first, so the panels never wait on git.
-            let placeholder =
-                placeholder::stage(app, project.clone(), branch.clone(), &launch, out);
+            let placeholder = placeholder::stage(
+                app,
+                project.clone(),
+                branch.clone(),
+                launch.kind,
+                launch.model.clone(),
+                launch.effort.clone(),
+                out,
+            );
+
             // `base: None` is the DAEMON's `worktree_base_branch` SETTING,
             // else its fetched `origin/HEAD` (`git::add_worktree_off_default`)
             // — never this checkout's HEAD.
@@ -110,9 +119,10 @@ fn draft(
         name: String::new(),
         cloud_prompt: None,
         // Sized in `submit_prompt`, with the task — composing cannot fail.
-        // Empty only from the NEW SESSION PICKER's box (`launches_empty`):
-        // no first prompt, the CLI's own input is it.
-        starting_prompt: (!text.is_empty()).then(|| launch.compose(&text)),
+        // An empty box (`launches_empty`) sends a preset's prefix + postfix
+        // alone; with nothing to wrap it either, there is no first prompt,
+        // the CLI's own input is it.
+        starting_prompt: Some(launch.compose(&text)).filter(|prompt| !prompt.is_empty()),
         // An ISSUE SESSION's context, persisted by the DAEMON with the row.
         issue_url: launch.issue.as_ref().map(|issue| issue.url.clone()),
         reopen_on_error: Some((PromptKind::QuickPrompt(launch), text)),

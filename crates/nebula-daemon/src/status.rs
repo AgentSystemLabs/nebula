@@ -30,6 +30,11 @@
 //!   dialog — the foreground turn, or the one subagent whose prompt it was
 //!   — is the answer and moves the agent back to `running`. Another
 //!   subagent's tool traffic says nothing about a dialog it did not raise.
+//! - An `AskUserQuestion` is the exception: Claude runs it alongside the
+//!   other calls of the response that asked it, so a read-only `Bash` or
+//!   `Read` batched beside the question finishes — and fires its tool
+//!   hooks — while the question is still on screen (seen with Claude Code
+//!   2.1.272). Only the question's own `PostToolUse` is its answer.
 //! - Claude's `permission_prompt` notification is *deferred*: a dialog
 //!   sends it once it has sat 6 s with no keystroke, from a timer, with the
 //!   hook detached from the turn, and its `AskUserQuestion` dialog sends
@@ -211,6 +216,10 @@ impl SubagentSet {
 pub struct AgentStatusMachine {
     status: AgentStatus,
     session_id: Option<String>,
+    /// The id last persisted for a resume — `session_id` is adopted the
+    /// moment a CLI reports it, but saved only once a turn gives it a
+    /// transcript.
+    saved_session_id: Option<String>,
     subagents: SubagentSet,
     finished_at: Option<Instant>,
     /// Set while a Stop is being held open because subagents were active.
@@ -225,6 +234,9 @@ pub struct AgentStatusMachine {
     /// While `needs_feedback`: who raised the open dialog. A tool event
     /// from that origin is its answer.
     waiting_on: Option<Origin>,
+    /// While `needs_feedback`: an `AskUserQuestion` is among the open
+    /// dialogs, so no tool event but its own `PostToolUse` leaves red.
+    question_open: bool,
     /// When the status last left `needs_feedback` — the user answered, or
     /// the turn ended around the dialog. A `permission_prompt` notification
     /// inside `LATE_PROMPT_NOTIFICATION_GRACE` of it is a late echo.
@@ -235,6 +247,7 @@ impl AgentStatusMachine {
     pub fn new(status: AgentStatus, session_id: Option<String>) -> Self {
         Self {
             status,
+            saved_session_id: session_id.clone(),
             session_id,
             subagents: SubagentSet::default(),
             finished_at: None,
@@ -242,6 +255,7 @@ impl AgentStatusMachine {
             drain_idle_since: None,
             subagent_alive_at: None,
             waiting_on: None,
+            question_open: false,
             feedback_left_at: None,
         }
     }
@@ -269,7 +283,6 @@ impl AgentStatusMachine {
                     self.stop_held = false;
                     self.drain_idle_since = None;
                     self.subagent_alive_at = None;
-                    effects.push(Effect::SaveSessionId(sid.to_string()));
                 }
             }
         } else if !matches!(event, HookEvent::SessionEnded { .. }) {
@@ -277,6 +290,21 @@ impl AgentStatusMachine {
                 if mine != theirs {
                     return effects; // foreign session — ignore entirely
                 }
+            }
+        }
+        // The id is saved for a resume only once a turn has run: the CLI
+        // writes the transcript a resume reads on the first prompt, so an
+        // id saved at SessionStart for a CLI nobody typed into resumes into
+        // "No conversation found". A Stop counts as well, for a first
+        // prompt whose submit hook never fired.
+        if let (HookEvent::UserPromptSubmit | HookEvent::Stop, Some(sid)) =
+            (&event, payload_session_id)
+        {
+            if self.session_id.as_deref() == Some(sid)
+                && self.saved_session_id.as_deref() != Some(sid)
+            {
+                self.saved_session_id = Some(sid.to_string());
+                effects.push(Effect::SaveSessionId(sid.to_string()));
             }
         }
 
@@ -300,7 +328,7 @@ impl AgentStatusMachine {
                 }
             }
             HookEvent::PermissionRequest { subagent_id } => {
-                self.wait_on(Origin::of(subagent_id.as_deref()), &mut effects);
+                self.wait_on(Origin::of(subagent_id.as_deref()), false, &mut effects);
             }
             HookEvent::Notification { notification_type } => {
                 match notification_type.as_deref() {
@@ -309,7 +337,7 @@ impl AgentStatusMachine {
                     // the last word of one the user has already closed.
                     Some("permission_prompt") => {
                         if !self.late_prompt_echo(now) {
-                            self.wait_on(Origin::Foreground, &mut effects);
+                            self.wait_on(Origin::Foreground, false, &mut effects);
                         }
                     }
                     // "Claude is waiting for your input". Claude fires this
@@ -329,10 +357,10 @@ impl AgentStatusMachine {
                     self.note_subagent_alive(now);
                 }
                 if asks_user(tool_name.as_deref()) {
-                    self.wait_on(Origin::of(subagent_id.as_deref()), &mut effects);
+                    self.wait_on(Origin::of(subagent_id.as_deref()), true, &mut effects);
                 } else {
-                    // The next call is being made: whatever this origin was
-                    // waiting on has been answered.
+                    // The next call is being made: whatever prompt this
+                    // origin was waiting on has been answered.
                     self.dialog_closed(Origin::of(subagent_id.as_deref()), &mut effects);
                 }
             }
@@ -426,6 +454,7 @@ impl AgentStatusMachine {
         }
         if was_waiting && self.status != AgentStatus::NeedsFeedback {
             self.waiting_on = None;
+            self.question_open = false;
             self.feedback_left_at = Some(now);
         }
         effects
@@ -479,21 +508,28 @@ impl AgentStatusMachine {
 
     /// A dialog opened (or is reported open): wait on its origin. A second
     /// report while already red keeps the first origin — one dialog shows
-    /// at a time, and the notification never names one anyway.
-    fn wait_on(&mut self, origin: Origin, effects: &mut Vec<Effect>) {
+    /// at a time, and the notification never names one anyway — but a
+    /// `question` among them sticks, since only its answer closes it.
+    fn wait_on(&mut self, origin: Origin, question: bool, effects: &mut Vec<Effect>) {
         if self.status != AgentStatus::NeedsFeedback {
             self.waiting_on = Some(origin);
         }
+        self.question_open |= question;
         self.set_status(AgentStatus::NeedsFeedback, effects);
     }
 
     /// A tool event from `origin` — its call completing, or its next call
-    /// starting — means no dialog of that origin can be open. If that is
-    /// the one being waited on, the user answered it: back to `running`.
+    /// starting — means no permission prompt of that origin can be open.
+    /// If that is the one being waited on, the user answered it: back to
+    /// `running`. Never while a question is open: the calls batched beside
+    /// it run, and fire these hooks, with the question still on screen.
     /// Only from red — a tool hook never starts a turn nebula did not see
     /// begin, and never revives a dead agent.
     fn dialog_closed(&mut self, origin: Origin, effects: &mut Vec<Effect>) {
-        if self.status == AgentStatus::NeedsFeedback && self.waiting_on.as_ref() == Some(&origin) {
+        if self.status == AgentStatus::NeedsFeedback
+            && !self.question_open
+            && self.waiting_on.as_ref() == Some(&origin)
+        {
             self.set_status(AgentStatus::Running, effects);
         }
     }
@@ -771,6 +807,67 @@ mod tests {
         }
         let fx = m.handle(tool("Bash", Some("sub1"), true), Some("s1"), now);
         assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+    }
+
+    #[test]
+    fn a_question_outlives_the_calls_batched_beside_it() {
+        // The reported bug: one response asked an AskUserQuestion and ran
+        // two read-only Bash calls beside it. Claude ran them with the
+        // question on screen, the first one's PostToolUse read as the
+        // answer 2 s in, and the question's own 6 s notification then fell
+        // inside the late-echo grace — the row never showed red for the
+        // twelve minutes the question waited.
+        for asker in [None, Some("sub1")] {
+            let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+            let now = t0();
+            m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+            let fx = m.handle(tool("AskUserQuestion", asker, false), Some("s1"), now);
+            assert_eq!(status_of(&fx), Some(AgentStatus::NeedsFeedback));
+            for (secs, post) in [(2, false), (2, true), (4, false), (4, true)] {
+                let at = now + Duration::from_secs(secs);
+                let fx = m.handle(tool("Bash", asker, post), Some("s1"), at);
+                assert!(fx.is_empty(), "{asker:?} at {secs}s: {fx:?}");
+            }
+            let fx = prompt_notification(&mut m, now + Duration::from_secs(6));
+            assert!(fx.is_empty(), "{fx:?}");
+            assert_eq!(m.status(), AgentStatus::NeedsFeedback);
+            let answered = now + Duration::from_secs(694);
+            let fx = m.handle(tool("AskUserQuestion", asker, true), Some("s1"), answered);
+            assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+        }
+    }
+
+    #[test]
+    fn approving_a_prompt_beside_an_open_question_stays_red() {
+        // A permission prompt and a question up together, whichever opened
+        // first: the prompt's tool running is not the question's answer.
+        for question_first in [true, false] {
+            let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+            let now = t0();
+            m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+            let mut opens = vec![
+                tool("AskUserQuestion", None, false),
+                HookEvent::PermissionRequest { subagent_id: None },
+            ];
+            if !question_first {
+                opens.reverse();
+            }
+            for ev in opens {
+                m.handle(ev, Some("s1"), now);
+            }
+            let fx = m.handle(tool("Bash", None, true), Some("s1"), now);
+            assert!(fx.is_empty(), "question_first={question_first}: {fx:?}");
+            let fx = m.handle(tool("AskUserQuestion", None, true), Some("s1"), now);
+            assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+            // Answered and gone: the next prompt is approvable as before.
+            m.handle(
+                HookEvent::PermissionRequest { subagent_id: None },
+                Some("s1"),
+                now,
+            );
+            let fx = m.handle(tool("Bash", None, true), Some("s1"), now);
+            assert_eq!(status_of(&fx), Some(AgentStatus::Running));
+        }
     }
 
     #[test]
@@ -1405,6 +1502,76 @@ mod tests {
         // Old subagents gone: a Stop finishes immediately.
         let fx = m.handle(HookEvent::Stop, Some("s2"), now + Duration::from_secs(6));
         assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    fn saved_ids(effects: &[Effect]) -> Vec<&str> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::SaveSessionId(sid) => Some(sid.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_session_id_is_saved_once_a_turn_gives_it_a_transcript() {
+        // The reported bug: a CLI booted and never prompted had its
+        // SessionStart id saved, Claude never wrote the transcript, and the
+        // next resume died on "No conversation found".
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        let start = HookEvent::SessionStart {
+            source: Some("startup".into()),
+        };
+        let fx = m.handle(start, Some("s1"), now);
+        assert!(saved_ids(&fx).is_empty(), "{fx:?}");
+        let fx = m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        assert_eq!(saved_ids(&fx), ["s1"]);
+        // Once, not on every turn.
+        let fx = m.handle(HookEvent::Stop, Some("s1"), now + Duration::from_secs(5));
+        assert!(saved_ids(&fx).is_empty(), "{fx:?}");
+        let fx = m.handle(
+            HookEvent::UserPromptSubmit,
+            Some("s1"),
+            now + Duration::from_secs(9),
+        );
+        assert!(saved_ids(&fx).is_empty(), "{fx:?}");
+    }
+
+    #[test]
+    fn a_turn_whose_prompt_hook_never_fired_saves_the_id_at_its_stop() {
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let now = t0();
+        m.handle(HookEvent::SessionStart { source: None }, Some("s1"), now);
+        let fx = m.handle(HookEvent::Stop, Some("s1"), now + Duration::from_secs(3));
+        assert_eq!(saved_ids(&fx), ["s1"]);
+        // A Stop never adopts: an id no start or prompt reported is not saved.
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        let fx = m.handle(HookEvent::Stop, Some("s9"), now);
+        assert!(saved_ids(&fx).is_empty(), "{fx:?}");
+    }
+
+    #[test]
+    fn a_resumed_or_cleared_session_keeps_the_saved_id_until_its_next_turn() {
+        // Resumed: the CLI reports the id the row already holds.
+        let mut m = AgentStatusMachine::new(AgentStatus::Finished, Some("s1".into()));
+        let now = t0();
+        let resume = HookEvent::SessionStart {
+            source: Some("resume".into()),
+        };
+        let fx = m.handle(resume, Some("s1"), now);
+        assert!(saved_ids(&fx).is_empty(), "{fx:?}");
+        let fx = m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        assert!(saved_ids(&fx).is_empty(), "{fx:?}");
+        // `/clear` starts s2; until s2 has a turn, s1 is what resumes.
+        let clear = HookEvent::SessionStart {
+            source: Some("clear".into()),
+        };
+        let fx = m.handle(clear, Some("s2"), now);
+        assert!(saved_ids(&fx).is_empty(), "{fx:?}");
+        let fx = m.handle(HookEvent::UserPromptSubmit, Some("s2"), now);
+        assert_eq!(saved_ids(&fx), ["s2"]);
     }
 
     #[test]

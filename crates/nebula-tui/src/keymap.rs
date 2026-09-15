@@ -394,7 +394,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::AgentPresets,
         id: "agent_presets",
         label: "Agent presets",
-        hint: "Saved launch presets (CLI, model, effort, prefix/postfix); Enter asks for a task",
+        hint: "Saved launch presets (CLI, model, effort, prefix/postfix); Enter asks for an optional task, or skips it",
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["e"],

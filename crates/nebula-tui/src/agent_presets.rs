@@ -1,6 +1,7 @@
 //! AGENT PRESETS: saved launch definitions — an AGENT KIND, a MODEL / EFFORT
-//! choice, and optional prefix / postfix text — that the SESSIONS PANEL's
-//! `e` lists. Launching one asks for a task and hands the CLI
+//! choice, optional prefix / postfix text, and whether to ask for a task at
+//! all — that the SESSIONS PANEL's `e` lists. Launching one asks for an
+//! optional task (or, with `skip_task`, nothing) and hands the CLI
 //! `prefix + task + postfix` as its positional starting prompt.
 //!
 //! A plain JSON list in the DATA DIR beside `config.json`, in list order.
@@ -31,6 +32,11 @@ pub struct AgentPreset {
     /// Text sent after the task (may be empty).
     #[serde(default)]
     pub postfix: String,
+    /// Launch without asking for a task: Enter on the preset starts the CLI
+    /// on prefix + postfix alone — a "commit and push" preset has nothing
+    /// left to say. Off, the task is still asked for, but optional.
+    #[serde(default)]
+    pub skip_task: bool,
 }
 
 impl AgentPreset {
@@ -49,7 +55,8 @@ impl AgentPreset {
     }
 
     /// The starting prompt: prefix, task and postfix — each trimmed, empty
-    /// parts skipped — joined by a blank line.
+    /// parts skipped — joined by a blank line. Empty when all three are:
+    /// the launch then has no starting prompt at all.
     pub fn compose(&self, task: &str) -> String {
         [self.prefix.as_str(), task, self.postfix.as_str()]
             .iter()
@@ -134,6 +141,7 @@ mod tests {
             effort: None,
             prefix: String::new(),
             postfix: String::new(),
+            skip_task: false,
         }
     }
 
@@ -156,7 +164,10 @@ mod tests {
                 postfix: "Run the tests.".into(),
                 ..preset("reviewer", AgentKind::Claude)
             },
-            preset("scratch", AgentKind::Codex),
+            AgentPreset {
+                skip_task: true,
+                ..preset("scratch", AgentKind::Codex)
+            },
         ];
         save_to(&path, &presets).unwrap();
         assert_eq!(load_from(&path), presets);
@@ -176,16 +187,19 @@ mod tests {
         assert_eq!(presets[0].kind, AgentKind::Claude);
         assert_eq!(presets[0].model, None);
         assert!(presets[0].prefix.is_empty() && presets[0].postfix.is_empty());
+        assert!(!presets[0].skip_task, "an old record still asks for a task");
     }
 
     #[test]
     fn compose_skips_empty_parts_and_trims() {
         let mut p = preset("p", AgentKind::Claude);
+        assert_eq!(p.compose(""), "", "nothing at all composes to nothing");
         assert_eq!(p.compose("  do it \n"), "do it");
         p.prefix = "PRE\n".into();
         assert_eq!(p.compose("do it"), "PRE\n\ndo it");
         p.postfix = "  POST".into();
         assert_eq!(p.compose("do it"), "PRE\n\ndo it\n\nPOST");
+        assert_eq!(p.compose(" \n"), "PRE\n\nPOST", "the task is optional");
         p.prefix = "   ".into();
         assert_eq!(p.compose("line1\nline2"), "line1\nline2\n\nPOST");
         assert!(p.has_wrapping());

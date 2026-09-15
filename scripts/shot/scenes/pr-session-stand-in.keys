@@ -1,0 +1,6 @@
+# Click the OPEN PRS row for #42 (row 18 at 190x50), `n` opens the PR SESSION picker, Enter takes Claude,
+# Enter takes the default name. Captured while the DAEMON is still cutting the checkout (see .setup.sh).
+click 25 18
+n
+Enter
+Enter

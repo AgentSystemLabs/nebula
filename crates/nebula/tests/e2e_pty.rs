@@ -2212,7 +2212,7 @@ async fn add_project_get_main_worktree(c: &mut UnixStream, repo: &Path) -> nebul
 /// PrewarmAgent boots the CLI while the user is "typing the name"; the
 /// following CreateAgent must adopt that already-running PTY (its slow boot
 /// output is already in scrollback) and replay the hooks it fired before the
-/// row existed (SessionStart → stored resume session id).
+/// row existed (SessionStart → the session id the row's first turn saves).
 #[tokio::test]
 async fn prewarmed_session_is_adopted_by_create_agent() {
     let env = TestEnv::new();
@@ -2325,7 +2325,30 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
     .await;
 
     // The SessionStart the warm CLI posted before the row existed was
-    // buffered and replayed: the agent row carries the resume session id.
+    // buffered and replayed. A session id is saved only once a turn has
+    // run, and a Stop saves only the id already adopted — so the first
+    // turn's Stop persisting warm-sid-99 proves the replay happened.
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: concat!(
+                r#"curl -sS -m 3 -X POST -H "Authorization: Bearer $NEBULA_API_TOKEN" -H 'Content-Type: application/json' -d '{"session_id":"warm-sid-99"}' "$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=Stop""#,
+                "\n"
+            )
+            .as_bytes()
+            .to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Finished, .. }
+                if *agent == agent_id)
+        })
+    })
+    .await;
     let mut c2 = connect(&env.sock()).await;
     handshake(&mut c2).await;
     write_frame(&mut c2, &ClientRequest::Subscribe)
@@ -2345,7 +2368,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
     assert_eq!(
         agent.session_id.as_deref(),
         Some("warm-sid-99"),
-        "buffered SessionStart replayed at adoption"
+        "buffered SessionStart replayed at adoption, saved at the first Stop"
     );
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();

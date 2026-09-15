@@ -72,7 +72,11 @@
   Restored agents resume with `claude --resume <session-id>` /
   `codex resume <session-id>` / `cursor-agent --resume <session-id>` (falling back to a fresh session
   when the old one is gone) / `pi --session-id <session-id>` (which creates a missing id instead of
-  dying). An AGENT created from a PROJECT OPEN PRS row also receives the PR URL and a PR-only
+  dying). A session's id is saved only once a turn has run in it — the CLI writes the transcript a
+  resume reads on the first prompt — so a CLI booted and never used resumes as nothing. Claude
+  ids are checked against the transcripts on disk before the spawn, and one with none boots fresh;
+  any resume that exits with an error within 10 s of its spawn is respawned fresh, unless its Claude
+  transcript is still there (then the id is kept, and the pane shows why the CLI quit). An AGENT created from a PROJECT OPEN PRS row also receives the PR URL and a PR-only
   work rule — Claude and Pi through `--append-system-prompt` on every spawn, Codex and Cursor as the first prompt of
   their cold spawn (their transcripts carry it through a resume); nebula persists that URL. An AGENT
   launched from the ISSUES MODAL (`i`) carries the GitHub issue's URL the same way — persisted with
@@ -112,13 +116,15 @@
   `PostToolUse` group is unmatched — every tool's end reaches nebula — and a tool event from the same
   origin as the open dialog (the foreground turn, or the one subagent whose prompt it was) moves the
   row from red back to yellow; another subagent's traffic says nothing about a dialog it did not
-  raise. An `AskUserQuestion` answer is that tool's own `PostToolUse`. The one signal nebula treats
-  with suspicion is Claude's `permission_prompt` notification: Claude sends it from a timer once a
-  dialog has sat 6 s with no keystroke, detached from the turn, and its question dialog sends the
-  same type — so one can land just *after* the answer that closed the dialog. Inside 5 s of the row
-  leaving red that notification is taken as the echo it is and ignored; a genuinely new dialog
-  announces itself through `PermissionRequest` or `PreToolUse` first, never through that notification
-  alone.
+  raise. An `AskUserQuestion` is answered only by that tool's own `PostToolUse`: Claude runs a question
+  alongside the other calls of the response that asked it, so a read-only `Bash` or `Read` batched
+  beside it finishes with the question still on screen, and its tool events leave the row red. The
+  one signal nebula treats with suspicion is Claude's `permission_prompt` notification: Claude sends
+  it from a timer once a dialog has sat 6 s with no keystroke, detached from the turn, and its
+  question dialog sends the same type — so one can land just *after* the answer that closed the
+  dialog. Inside 5 s of the row leaving red that notification is taken as the echo it is and
+  ignored; a genuinely new dialog announces itself through `PermissionRequest` or `PreToolUse`
+  first, never through that notification alone.
 - **Which of those signals you get depends on the harness.** Claude is installed with all nine hook
   groups — `UserPromptSubmit`, `Stop`, `SessionStart`, `PermissionRequest`, `Notification`, a
   `PreToolUse` on `AskUserQuestion`, an unmatched `PostToolUse` (the question's answer, a permission
@@ -201,7 +207,8 @@
   lands on a booted screen instead of a booting shell. To bound what that costs, idle PTYs in worktrees
   no client is watching are killed after `session_idle_timeout` (5m by default) — working agents, ones
   waiting on you, and terminals with a command running are all spared, and a reaped agent
-  revives on the next attach with its conversation resumed. Both halves of the PREWARM POOL are
+  revives on the next attach with its conversation resumed. Until then its row's STATUS DOT is gray,
+  whatever its last status was — a cold session shows what it last did, not what it is doing. Both halves of the PREWARM POOL are
   switchable — `prewarm_agents` and `prewarm_sessions`, `true` by default, on the SETTINGS OVERLAY's
   Sessions tab or by hand in CONFIG.JSON (see [Configuration](configuration.md)); switching the pool
   off drains its spares on the next sweep — and a warm spare nobody claims inside 15 min is reaped on
