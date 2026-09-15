@@ -84,7 +84,7 @@ fn spawn_daemon() -> Result<()> {
 }
 
 // Avoid a libc dependency for one call (same pattern as nebula-core's geteuid).
-fn libc_setsid() -> i32 {
+pub(crate) fn libc_setsid() -> i32 {
     extern "C" {
         fn setsid() -> i32;
     }

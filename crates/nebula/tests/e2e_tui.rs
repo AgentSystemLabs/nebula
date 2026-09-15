@@ -855,3 +855,70 @@ fn tui_git_diff_modal() {
     tui.send(b"g");
     tui.wait_for_text("no changes in main");
 }
+
+/// The BRANCH SWITCHER end to end: `c` lists the repo's branches, typing
+/// narrows them, `Enter` moves the root checkout on disk and the flash says
+/// where it landed; a dirty checkout stops on the prompt instead, where `s`
+/// stashes the changes under a named entry and switches.
+#[test]
+fn tui_branch_switcher_moves_the_root_checkout() {
+    let head = |repo: &Path| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let mut tui = TuiHarness::spawn();
+    let repo = tui.make_repo("switch-proj");
+    repo_git(&repo, &["branch", "feature-login"]);
+    repo_git(&repo, &["branch", "release-2"]);
+
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "switch-proj");
+    tui.wait_for_text("⌂ root");
+
+    // ---- a clean checkout switches on Enter ----
+    tui.send(b"c");
+    tui.wait_for_text("Switch branch — switch-proj");
+    tui.wait_for_text("release-2");
+    tui.type_str("login");
+    tui.wait_for_gone("release-2");
+    tui.send(ENTER);
+    tui.wait_for_text("⌂ root is on feature-login");
+    tui.wait_for_gone("Switch branch —");
+    assert_eq!(head(&repo), "feature-login");
+
+    // ---- a dirty one asks first; s stashes and switches ----
+    std::fs::write(repo.join(".keep"), "edited\n").unwrap();
+    tui.send(b"c");
+    tui.wait_for_text("Switch branch — switch-proj");
+    tui.wait_for_text("on feature-login");
+    // The switch dropped the cached listing: Enter needs the fresh one.
+    tui.wait_for_text("release-2");
+    tui.type_str("main");
+    tui.send(ENTER);
+    tui.wait_for_text("how should they travel to main?");
+    assert_eq!(
+        head(&repo),
+        "feature-login",
+        "nothing moves before the answer"
+    );
+    tui.send(b"s");
+    tui.wait_for_text("⌂ root is on main");
+    assert_eq!(head(&repo), "main");
+    let stashes = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["stash", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&stashes.stdout)
+            .contains("nebula: feature-login before switching to main"),
+        "{}",
+        String::from_utf8_lossy(&stashes.stdout)
+    );
+}

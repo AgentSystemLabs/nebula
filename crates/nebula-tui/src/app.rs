@@ -197,6 +197,8 @@ pub enum MenuAction {
     EditLink(LinkId),
     DeleteLink(LinkId),
     DeleteWorktree(WorktreeId),
+    /// The ROOT WORKTREE row's menu: open the BRANCH SWITCHER on it.
+    SwitchBranch(WorktreeId),
     /// Start the worktree's RUN COMMAND, or stop it while it runs (`r`).
     ToggleRun(WorktreeId),
     /// Fire the worktree's OPEN COMMAND (`Shift+Enter`).
@@ -1249,6 +1251,8 @@ pub enum Overlay {
     AgentPresetEditor(crate::preset_overlays::AgentPresetEditor),
     /// `i`: the ISSUES MODAL — the project's open GitHub issues.
     Issues(crate::issues::IssuesView),
+    /// `c`: the BRANCH SWITCHER — the ROOT WORKTREE onto another branch.
+    BranchSwitch(crate::branch_switch::BranchSwitchView),
 }
 
 /// Rows optimistically removed for an in-flight DeleteWorktree, kept so an
@@ -2470,6 +2474,9 @@ pub struct App {
     /// startup like `pr_diff_tx`, so the modal's own handlers can start a
     /// fetch. `None` in the unit tests, which then never spawn one.
     pub issues_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::issues::IssuesAnswer>>,
+    /// The BRANCH SWITCHER's answer channel, listing cache and fetch
+    /// throttle — what outlives the modal.
+    pub branch_switch: crate::branch_switch::Shared,
     /// Latest daemon metrics reading (daemon + per-session process trees),
     /// for the footer's memory/session readout. Refreshed on a slow poll;
     /// the metrics modal shares the same replies at a faster cadence.
@@ -2613,6 +2620,7 @@ impl App {
             issue_detail_failed: std::collections::HashSet::new(),
             pending_issue_detail: None,
             issues_tx: None,
+            branch_switch: Default::default(),
             last_metrics: None,
             client_rss_bytes: 0,
             splash_epoch: std::time::Instant::now(),

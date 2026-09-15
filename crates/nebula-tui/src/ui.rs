@@ -128,7 +128,7 @@ const HOSTS_W: u16 = 64;
 /// rather than the list.
 pub(crate) const SPLIT_PANE_LAYOUT_MIN: u16 = 20;
 /// What every filtered list says when nothing survives the filter.
-const NO_MATCHES: &str = "no matches";
+pub(crate) const NO_MATCHES: &str = "no matches";
 
 /// Columns the tree-browser preview must keep for the file text itself
 /// before a line-number gutter is worth drawing.
@@ -703,6 +703,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[OpenRepo]), "open the repo on GitHub"),
                         (Act(&[RefreshPullRequests]), "refresh pull requests now"),
                         (Act(&[Issues]), "github issues: prompt / preset on one"),
+                        (Act(&[SwitchBranch]), "switch the ⌂ root checkout's branch"),
                         (Act(&[Delete, DeleteAll]), "delete one / delete all"),
                     ],
                 ),
@@ -1732,6 +1733,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             crate::preset_overlays::draw_editor(f, app, &editor, th)
         }
         Overlay::Issues(view) => crate::issues::draw(f, app, &view, th),
+        Overlay::BranchSwitch(view) => crate::branch_switch::draw(f, app, &view, th),
         Overlay::FileTabs(view) => {
             // The TREE BROWSER's footprint: the editor Enter opens wants the
             // room, and the preview is a whole file.
@@ -2098,7 +2100,11 @@ fn below_first_row(inner: Rect) -> Rect {
 /// was truncated to `shown`: truncation puts `…` at the last char of
 /// `shown`, and a match landing on that index must not light the ellipsis.
 /// Untruncated text keeps every position.
-fn visible_positions<'a>(positions: &'a [usize], shown: &str, full: &str) -> &'a [usize] {
+pub(crate) fn visible_positions<'a>(
+    positions: &'a [usize],
+    shown: &str,
+    full: &str,
+) -> &'a [usize] {
     let shown_len = shown.chars().count();
     if shown_len < full.chars().count() {
         let keep = positions.iter().take_while(|&&p| p + 1 < shown_len).count();
@@ -4518,6 +4524,11 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             "↑/↓: issue  PgUp/PgDn ^d/^u: read  Enter/p: prompt an agent  e: preset  o: browser  r: refresh  Esc: close",
             Style::default().fg(th.dim),
         )
+    } else if let Some(Overlay::BranchSwitch(view)) = &app.overlay {
+        Span::styled(
+            crate::branch_switch::footer_hint(view),
+            Style::default().fg(th.dim),
+        )
     } else if matches!(&app.overlay, Some(Overlay::Menu(m)) if m.is_workspace_picker()) {
         Span::styled(
             "Enter: open  n: new  r: rename  d: delete  Esc: close",
@@ -5102,7 +5113,12 @@ pub(crate) fn input_spans(
 
 /// The always-live search row every fuzzy overlay shares: a dim placeholder
 /// until something is typed, then the field itself.
-fn search_line(input: &TextInput, placeholder: &str, area: Rect, th: Theme) -> Line<'static> {
+pub(crate) fn search_line(
+    input: &TextInput,
+    placeholder: &str,
+    area: Rect,
+    th: Theme,
+) -> Line<'static> {
     if input.is_empty() {
         return Line::from(Span::styled(
             placeholder.to_string(),
