@@ -1,0 +1,9 @@
+# Settings › General with the new "Sync settings over ssh" row selected, so its hint is on screen.
+# The first j leaves the tab strip for the rows.
+s
+j
+j
+j
+j
+j
+j
