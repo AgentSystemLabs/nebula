@@ -43,6 +43,11 @@ const CONFIG: &str = "config";
 const PRESETS: &str = "agent_presets";
 const HOSTS: &str = "ssh_hosts";
 
+/// `config.json` keys that name programs the daemon executes. They never
+/// leave the machine over `nebula ssh`: a remote keeps its own harness
+/// table, so a forwarded config can never repoint what the remote runs.
+const EXEC_KEYS: [&str; 2] = ["harnesses", "custom_harnesses"];
+
 /// Each section, with the name its file has in a data dir.
 const SECTIONS: [(&str, &str); 3] = [
     (CONFIG, "config.json"),
@@ -113,6 +118,22 @@ pub fn export(paths: &Paths, scope: Scope) -> (Value, Vec<String>) {
             &paths.hosts,
             settings::read_array(&paths.hosts).map(|list| list.map(Value::Array)),
         );
+    }
+    if scope == Scope::Remote {
+        if let Some(Value::Object(config)) = bundle.get_mut(CONFIG) {
+            let mut stripped = Vec::new();
+            for key in EXEC_KEYS {
+                if config.remove(key).is_some() {
+                    stripped.push(key);
+                }
+            }
+            if !stripped.is_empty() {
+                warnings.push(format!(
+                    "left {} out: the remote keeps its own harness table",
+                    stripped.join(", ")
+                ));
+            }
+        }
     }
     (Value::Object(bundle), warnings)
 }
@@ -642,6 +663,32 @@ mod tests {
             "destinations as seen from here stay here"
         );
         assert_eq!(section_count(&remote), 2);
+    }
+
+    #[test]
+    fn remote_bundles_leave_exec_capable_harness_keys_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        put(
+            &p.config,
+            json!({
+                "theme": "ocean",
+                "harnesses": {"grok": {"program": "/tmp/evil"}},
+                "custom_harnesses": [{"id": "x", "program": "/tmp/evil"}],
+            }),
+        );
+
+        let (backup, warnings) = export(&p, Scope::Backup);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(backup["config"].get("harnesses").is_some());
+        assert!(backup["config"].get("custom_harnesses").is_some());
+
+        let (remote, warnings) = export(&p, Scope::Remote);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("harnesses"), "{warnings:?}");
+        assert!(remote["config"].get("harnesses").is_none());
+        assert!(remote["config"].get("custom_harnesses").is_none());
+        assert_eq!(remote["config"]["theme"], "ocean");
     }
 
     #[test]
