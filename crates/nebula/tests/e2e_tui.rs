@@ -896,6 +896,8 @@ fn tui_branch_switcher_moves_the_root_checkout() {
     tui.send(b"c");
     tui.wait_for_text("Switch branch — switch-proj");
     tui.wait_for_text("on feature-login");
+    // The switch dropped the cached listing: Enter needs the fresh one.
+    tui.wait_for_text("release-2");
     tui.type_str("main");
     tui.send(ENTER);
     tui.wait_for_text("how should they travel to main?");

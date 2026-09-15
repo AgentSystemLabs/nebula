@@ -1,10 +1,10 @@
 //! The BRANCH SWITCHER (`c`): the project's ROOT WORKTREE moved onto
 //! another branch without leaving nebula. A fuzzy list of every local
 //! branch and every remote branch that has no local twin, filtered as you
-//! type; `Enter` switches. A checkout with uncommitted changes stops and
-//! asks how they should travel — the choices the IDEs offer at the same
-//! moment: stash them, bring them along, commit them first, or throw them
-//! away.
+//! type; `Enter` switches, or — with nothing matching — creates the typed
+//! branch. A checkout with uncommitted changes stops and asks how they
+//! should travel — the choices the IDEs offer at the same moment: stash
+//! them, bring them along, commit them first, or throw them away.
 //!
 //! Only the root checkout switches. A linked worktree is named after the
 //! branch it was cut for, and moving it would leave the directory name
@@ -13,23 +13,30 @@
 //!
 //! Everything here is client-side git, like the diff viewer: the list is
 //! one `git for-each-ref` (milliseconds, painted from a per-checkout cache
-//! on reopen), the changed-file count one `git status`, and a background
-//! `git fetch --all` refreshes the remotes at most once a minute per
-//! checkout, re-listing when it lands. Every call runs off the loop with
-//! its answer on `App::branch_switch.tx`. The DAEMON is not asked: its
-//! worktree sync already notices a root `HEAD` that moved and upserts the
-//! row's branch; the TUI renames the row itself the moment git says yes,
-//! so the panel never lags the switch by a sync tick.
+//! on reopen), the changed-file count one `git status`, and opening the
+//! modal starts a background `git fetch --all` — at most once a minute per
+//! checkout — that re-lists when it lands. Every call runs off the loop
+//! with its answer on `App::branch_switch.tx`, and none is stacked on one
+//! still running. The DAEMON is not asked: its worktree sync already
+//! notices a root `HEAD` that moved and upserts the row's branch; the TUI
+//! renames the row itself the moment git says yes, so the panel never lags
+//! the switch by a sync tick.
 //!
 //! Git that writes (the switch, a stash, a commit) and git that talks to a
 //! remote run in a session of their own with stdin closed. The TUI owns a
-//! terminal, and an `ssh` asking for a passphrase — or a signing agent
-//! asking for a PIN — would otherwise open `/dev/tty` and paint over the
-//! frame; detached, it fails instead, and the failure is reported.
+//! terminal, and an `ssh` asking for a passphrase or a host key would
+//! otherwise open `/dev/tty` and paint over the frame; detached, it fails
+//! instead. (A pinentry that opens `$GPG_TTY` by path is beyond its reach.)
+//!
+//! Every checkout of a repository shares one stash stack, and agents run
+//! git in all of them, so a switch never trusts a position on it: its own
+//! stash entry is found by commit and message, and put back by commit.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -46,21 +53,61 @@ use crate::text_input::TextInput;
 use crate::theme::Theme;
 use crate::ui::{
     centered_rect, empty_list_row, input_spans, modal_block, render_row, row_rect, search_line,
-    truncate, visible_positions, NO_MATCHES,
+    visible_positions, NO_MATCHES,
 };
 
 /// Outer (width, height) of the modal: the find-file modal's footprint,
 /// wider for the commit subjects.
 const SIZE: (u16, u16) = (92, 24);
-/// How long a background fetch may run before it is killed — the PR
-/// lookups' budget, for the same reason: a stalled network retries.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a background fetch may run. Generous — a fetch writes packs,
+/// and one cut short starts over on the next open — but bounded, since a
+/// stalled remote would otherwise hold it forever.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+/// Between the SIGTERM that lets git remove its lock and temporary pack
+/// files and the SIGKILL for a fetch that lingers.
+const FETCH_GRACE: Duration = Duration::from_secs(2);
 /// The least time between two background fetches of one checkout, so
 /// opening and closing the modal never hammers a remote.
 const FETCH_GAP: Duration = Duration::from_secs(60);
 /// `git for-each-ref` record: NUL between fields, RS after each record (a
 /// subject is one line, but a record separator costs nothing).
 const REF_FORMAT: &str = "--format=%(refname)%00%(symref)%00%(HEAD)%00%(worktreepath)%00%(committerdate:unix)%00%(contents:subject)%1e";
+
+extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+const SIGTERM: i32 = 15;
+const SIGKILL: i32 = 9;
+
+// ---- width ----
+
+/// Screen cells `s` takes: a gitmoji or a CJK subject is two a character.
+fn cells(s: &str) -> usize {
+    Span::raw(s).width()
+}
+
+/// `s` cut to `max` cells with a `…` marking the cut — `ui::truncate` by
+/// cells rather than chars, so wide text can't push past its budget.
+fn fit(s: &str, max: usize) -> String {
+    if cells(s) <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    let mut buf = [0u8; 4];
+    for c in s.chars() {
+        let w = cells(c.encode_utf8(&mut buf));
+        if used + w + 1 > max {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    if max > 0 {
+        out.push('…');
+    }
+    out
+}
 
 // ---- git ----
 
@@ -83,6 +130,18 @@ pub struct Branch {
 }
 
 impl Branch {
+    /// A branch the switch creates: nothing about it is known yet.
+    fn new_local(name: String) -> Self {
+        Self {
+            name,
+            remote: false,
+            current: false,
+            checked_out_at: None,
+            committed: 0,
+            subject: String::new(),
+        }
+    }
+
     /// The local branch a switch lands on: the name itself, or a remote
     /// branch's name without its remote (`origin/feature-x` → `feature-x`,
     /// what `git switch --track` creates).
@@ -151,33 +210,38 @@ pub fn parse_refs(out: &str) -> Vec<Branch> {
     local
 }
 
-/// Every branch the root checkout could switch to, as [`parse_refs`] orders
-/// them. `Err` is a one-line message for the modal.
-pub fn list_branches(root: &Path) -> Result<Vec<Branch>, String> {
-    let out = git_command(root)
-        .args(["for-each-ref", "--sort=-committerdate", REF_FORMAT])
-        .args(["refs/heads", "refs/remotes"])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("failed to run git: {e}"))?;
-    if !out.status.success() {
-        return Err(git_error(&String::from_utf8_lossy(&out.stderr)));
-    }
-    Ok(parse_refs(&String::from_utf8_lossy(&out.stdout)))
-}
-
-/// git's complaint as one line: the first thing it said, without the
-/// `error:` / `fatal:` it leads with.
+/// git's complaint as one line: the first `error:` or `fatal:` it printed,
+/// without the prefix, else the first thing it said at all.
 fn git_error(stderr: &str) -> String {
-    let line = stderr
+    let lines: Vec<&str> = stderr
         .lines()
         .map(str::trim)
-        .find(|l| !l.is_empty())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let line = lines
+        .iter()
+        .find(|l| l.starts_with("error: ") || l.starts_with("fatal: "))
+        .or(lines.first())
+        .copied()
         .unwrap_or("git failed");
     line.strip_prefix("error: ")
         .or_else(|| line.strip_prefix("fatal: "))
         .unwrap_or(line)
         .to_string()
+}
+
+/// Read-only `git -C root <args>`: stdout, or git's one-line complaint.
+fn read(root: &Path, args: &[&str]) -> Result<String, String> {
+    let out = git_command(root)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(git_error(&String::from_utf8_lossy(&out.stderr)))
+    }
 }
 
 /// `git -C root <args>` in a session of its own with stdin closed, for the
@@ -214,12 +278,23 @@ fn run(root: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// `git fetch --all`, killed — with the `ssh` it may have started, which
-/// shares its session — past [`FETCH_TIMEOUT`]. True when it finished.
-pub fn fetch(root: &Path) -> bool {
-    extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
+/// Every branch the root checkout could switch to, as [`parse_refs`] orders
+/// them. `Err` is a one-line message for the modal.
+pub fn list_branches(root: &Path) -> Result<Vec<Branch>, String> {
+    let args = [
+        "for-each-ref",
+        "--sort=-committerdate",
+        REF_FORMAT,
+        "refs/heads",
+        "refs/remotes",
+    ];
+    read(root, &args).map(|out| parse_refs(&out))
+}
+
+/// `git fetch --all`, stopped past [`FETCH_TIMEOUT`] or once `quit` is
+/// raised (the TUI is leaving, and the runtime's shutdown waits on this
+/// thread). True when it finished.
+pub fn fetch(root: &Path, quit: &AtomicBool) -> bool {
     let Ok(mut child) = detached(root, &["fetch", "--all", "--quiet"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -231,17 +306,131 @@ pub fn fetch(root: &Path) -> bool {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return status.success(),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) if Instant::now() < deadline && !quit.load(Ordering::Relaxed) => {
+                std::thread::sleep(Duration::from_millis(50))
+            }
             _ => {
-                // The child leads its own process group (setsid), so the
-                // negative pid reaches everything it spawned.
-                // SAFETY: plain syscall on a pid this process owns.
-                unsafe { kill(-(child.id() as i32), 9) };
-                let _ = child.wait();
+                stop(&mut child);
                 return false;
             }
         }
     }
+}
+
+/// End a fetch and the `ssh` it may have started, which share its session
+/// and so its process group: SIGTERM first, so git cleans up its lock and
+/// temporary pack files, and SIGKILL only for one that lingers.
+fn stop(child: &mut std::process::Child) {
+    let group = -(child.id() as i32);
+    // SAFETY: plain syscalls on a process group this process started and
+    // has not yet reaped the leader of, so the id cannot have been reused.
+    unsafe { kill(group, SIGTERM) };
+    let grace = Instant::now() + FETCH_GRACE;
+    while Instant::now() < grace {
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    unsafe { kill(group, SIGKILL) };
+    let _ = child.wait();
+}
+
+/// An untracked directory that is a git repository of its own — a clone or
+/// worktree nested in the root, like `.claude/worktrees/x`. No switch moves
+/// it, a stash skips it, and a commit must not turn it into a gitlink, so
+/// it is not a change.
+fn nested_repo(root: &Path, file: &DiffFile) -> bool {
+    file.is_untracked() && file.path.ends_with('/') && root.join(&file.path).join(".git").exists()
+}
+
+/// A path git has left conflicted.
+fn unmerged(file: &DiffFile) -> bool {
+    file.xy.contains(&'U') || file.xy == ['A', 'A'] || file.xy == ['D', 'D']
+}
+
+/// A change as the DISCARD prompt promised it: status and path.
+fn file_key(file: &DiffFile) -> String {
+    format!("{}{} {}", file.xy[0], file.xy[1], file.path)
+}
+
+/// The checkout's uncommitted changes, nested repositories left out.
+pub fn changes(root: &Path) -> Result<Vec<DiffFile>, String> {
+    let mut files = crate::git_diff::changed_files(root)?;
+    files.retain(|f| !nested_repo(root, f));
+    Ok(files)
+}
+
+/// The operation git is in the middle of, if any. No switch is safe then:
+/// git refuses most of them, and a commit would conclude a merge with its
+/// conflict markers in.
+fn in_progress(root: &Path) -> Option<&'static str> {
+    const MARKS: [(&str, &str); 5] = [
+        ("MERGE_HEAD", "a merge"),
+        ("rebase-merge", "a rebase"),
+        ("rebase-apply", "a rebase"),
+        ("CHERRY_PICK_HEAD", "a cherry-pick"),
+        ("REVERT_HEAD", "a revert"),
+    ];
+    let mut args = vec!["rev-parse"];
+    for (mark, _) in MARKS {
+        args.extend(["--git-path", mark]);
+    }
+    let out = read(root, &args).ok()?;
+    out.lines()
+        .zip(MARKS)
+        .find(|(path, _)| root.join(path).exists())
+        .map(|(_, (_, what))| what)
+}
+
+/// The branch HEAD is on; None when it is detached.
+fn head_branch(root: &Path) -> Option<String> {
+    read(root, &["symbolic-ref", "-q", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The stash stack, top first, as (commit, subject).
+fn stash_entries(root: &Path) -> Vec<(String, String)> {
+    read(root, &["stash", "list", "--format=%H%x00%s"])
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once('\0'))
+        .map(|(commit, subject)| (commit.to_string(), subject.to_string()))
+        .collect()
+}
+
+/// Stash the checkout's changes under `message` and return the entry's
+/// commit — found as the new entry carrying the message, not as the top of
+/// a stack other checkouts push onto too. None when there was nothing to
+/// save.
+fn stash_push(root: &Path, message: &str) -> Result<Option<String>, String> {
+    let before: HashSet<String> = stash_entries(root).into_iter().map(|(c, _)| c).collect();
+    run(
+        root,
+        &["stash", "push", "--include-untracked", "-m", message],
+    )?;
+    Ok(stash_entries(root)
+        .into_iter()
+        .find(|(commit, subject)| !before.contains(commit) && subject.ends_with(message))
+        .map(|(commit, _)| commit))
+}
+
+/// Apply the stash entry `commit` back and drop it. False when it would
+/// not apply, which leaves the entry where it is.
+fn stash_restore(root: &Path, commit: &str) -> bool {
+    let applied = run(root, &["stash", "apply", "--quiet", "--index", commit]).is_ok()
+        || run(root, &["stash", "apply", "--quiet", commit]).is_ok();
+    if applied {
+        if let Some(i) = stash_entries(root).iter().position(|(c, _)| c == commit) {
+            let _ = run(
+                root,
+                &["stash", "drop", "--quiet", &format!("stash@{{{i}}}")],
+            );
+        }
+    }
+    applied
 }
 
 /// How uncommitted changes travel with a switch.
@@ -249,113 +438,178 @@ pub fn fetch(root: &Path) -> bool {
 pub enum Carry {
     /// Expect a clean checkout: if it isn't, stop and ask.
     Ask,
-    /// `git stash push --include-untracked`, then switch.
+    /// `git stash push --include-untracked`, then switch; a switch git then
+    /// refuses applies the entry straight back.
     Stash,
     /// A plain `git switch`, which keeps changes that don't collide with
     /// the target and refuses otherwise.
     Bring,
     /// Commit everything — untracked files included — with this message,
-    /// then switch.
+    /// then switch. Refused on a detached HEAD, where the commit would
+    /// belong to no branch.
     Commit(String),
-    /// `git switch --discard-changes`: tracked changes are thrown away,
-    /// untracked files stay.
-    Discard,
+    /// `git switch --discard-changes`, after unstaging everything: a staged
+    /// file that was never committed would otherwise be deleted, and the
+    /// prompt promises untracked files stay. Carries the changes the prompt
+    /// showed ([`file_key`]s); if the checkout no longer matches them,
+    /// nothing is discarded and the prompt asks again.
+    Discard(Vec<String>),
+    /// `git switch --create`: a new branch off HEAD, which every change
+    /// comes along to.
+    Create,
 }
 
 /// What a switch came to.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
     /// The checkout is on `branch`; `note` says what happened to the
-    /// changes on the way.
+    /// changes on the way, or what git complained of once it had switched.
     Switched {
         branch: String,
         note: Option<String>,
     },
-    /// [`Carry::Ask`] found these changes; nothing was touched.
+    /// The checkout has these changes and the switch needs an answer about
+    /// them; nothing was touched.
     Dirty(Vec<DiffFile>),
     Failed(String),
 }
 
-/// The stash's top entry, to tell whether a `stash push` saved anything
-/// (it exits 0 with nothing to save).
-fn stash_top(root: &Path) -> Option<String> {
-    run(root, &["rev-parse", "-q", "--verify", "refs/stash"])
-        .ok()
-        .map(|s| s.trim().to_string())
-}
-
 /// Move the checkout at `root` from `from` onto `target`, carrying its
-/// changes as `carry` says. A switch that fails after a stash pops the
-/// stash straight back, so a refused switch leaves the checkout as it was.
+/// changes as `carry` says. Nothing runs mid-merge or with conflicts, and a
+/// switch git refuses leaves the checkout as it found it: a stash is
+/// applied back, a discard's unstaging undone.
 pub fn switch(root: &Path, from: &str, target: &Branch, carry: &Carry) -> Outcome {
     let to = target.local_name().to_string();
-    let mut args = vec!["switch"];
-    if *carry == Carry::Discard {
-        args.push("--discard-changes");
+    if let Some(what) = in_progress(root) {
+        return Outcome::Failed(format!(
+            "the checkout is in the middle of {what} — finish or abort it first"
+        ));
+    }
+    let all = match crate::git_diff::changed_files(root) {
+        Ok(files) => files,
+        Err(e) => return Outcome::Failed(e),
+    };
+    if let Some(file) = all.iter().find(|f| unmerged(f)) {
+        return Outcome::Failed(format!(
+            "{} has unresolved conflicts — resolve them first",
+            file.path
+        ));
+    }
+    let (nested, files): (Vec<DiffFile>, Vec<DiffFile>) =
+        all.into_iter().partition(|f| nested_repo(root, f));
+    let head = head_branch(root);
+
+    let mut note: Option<String> = None;
+    let mut stash: Option<String> = None;
+    let mut unstaged_index: Option<String> = None;
+    let mut args = vec!["switch", "--quiet"];
+    match carry {
+        Carry::Ask => {
+            if !files.is_empty() {
+                return Outcome::Dirty(files);
+            }
+        }
+        Carry::Bring | Carry::Create => {}
+        Carry::Stash => {
+            let message = format!("nebula: {from} before switching to {to}");
+            match stash_push(root, &message) {
+                Ok(entry) => {
+                    if entry.is_some() {
+                        note = Some(format!("changes stashed as \"{message}\""));
+                    }
+                    stash = entry;
+                }
+                Err(e) => return Outcome::Failed(format!("stash failed: {e}")),
+            }
+        }
+        Carry::Commit(message) => {
+            if head.is_none() {
+                return Outcome::Failed(
+                    "HEAD is detached — a commit here would belong to no branch; stash instead"
+                        .into(),
+                );
+            }
+            // A failing hook must not leave the user's staging replaced by
+            // "everything": the index goes back as it was.
+            let index = read(root, &["write-tree"]).map(|t| t.trim().to_string());
+            let excludes: Vec<String> = nested
+                .iter()
+                .map(|f| format!(":(exclude,literal){}", f.path))
+                .collect();
+            let mut add = vec!["add", "--all", "--", "."];
+            add.extend(excludes.iter().map(String::as_str));
+            let committed = run(root, &add)
+                .map_err(|e| format!("git add failed: {e}"))
+                .and_then(|_| {
+                    run(root, &["commit", "--quiet", "-m", message])
+                        .map_err(|e| format!("commit failed: {e}"))
+                });
+            if let Err(e) = committed {
+                if let Ok(tree) = &index {
+                    let _ = run(root, &["read-tree", tree]);
+                }
+                return Outcome::Failed(e);
+            }
+            let sha = read(root, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
+            note = Some(format!("committed {} on {from}", sha.trim()));
+        }
+        Carry::Discard(expected) => {
+            let now: Vec<String> = files.iter().map(file_key).collect();
+            if &now != expected {
+                return Outcome::Dirty(files);
+            }
+            unstaged_index = read(root, &["write-tree"])
+                .ok()
+                .map(|t| t.trim().to_string());
+            if let Err(e) = run(root, &["reset", "--quiet"]) {
+                return Outcome::Failed(format!("unstaging failed: {e}"));
+            }
+            args.push("--discard-changes");
+        }
     }
     if target.remote {
         args.push("--track");
     }
+    if *carry == Carry::Create {
+        args.push("--create");
+    }
     args.push(&target.name);
 
-    let mut note = None;
-    let mut stashed = false;
-    match carry {
-        Carry::Ask => match crate::git_diff::changed_files(root) {
-            Ok(files) if !files.is_empty() => return Outcome::Dirty(files),
-            Ok(_) => {}
-            Err(e) => return Outcome::Failed(e),
-        },
-        Carry::Bring | Carry::Discard => {}
-        Carry::Stash => {
-            let before = stash_top(root);
-            let message = format!("nebula: {from} before switching to {to}");
-            let pushed = [
-                "stash",
-                "push",
-                "--include-untracked",
-                "-m",
-                message.as_str(),
-            ];
-            if let Err(e) = run(root, &pushed) {
-                return Outcome::Failed(format!("stash failed: {e}"));
-            }
-            stashed = stash_top(root) != before;
-            if stashed {
-                note = Some(format!(
-                    "changes stashed (git stash pop on {from} restores them)"
-                ));
-            }
-        }
-        Carry::Commit(message) => {
-            if let Err(e) = run(root, &["add", "--all"]) {
-                return Outcome::Failed(format!("git add failed: {e}"));
-            }
-            if let Err(e) = run(root, &["commit", "--quiet", "-m", message]) {
-                return Outcome::Failed(format!("commit failed: {e}"));
-            }
-            let sha = run(root, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
-            note = Some(format!("committed {} on {from}", sha.trim()));
+    let error = match run(root, &args) {
+        Ok(_) => return Outcome::Switched { branch: to, note },
+        Err(e) => e,
+    };
+    // git exits non-zero when a post-checkout hook fails — after HEAD has
+    // moved. That switch happened, and putting the changes back now would
+    // land them on the wrong branch.
+    if head_branch(root).as_deref() == Some(to.as_str()) && head.as_deref() != Some(to.as_str()) {
+        let warning = format!("git complained after switching: {error}");
+        let note = match note {
+            Some(note) => format!("{note} · {warning}"),
+            None => warning,
+        };
+        return Outcome::Switched {
+            branch: to,
+            note: Some(note),
+        };
+    }
+    let error = if error.contains("would be overwritten") {
+        format!("files in the checkout collide with {to} — stash or commit them instead")
+    } else {
+        error
+    };
+    if let Some(tree) = &unstaged_index {
+        let _ = run(root, &["read-tree", tree]);
+    }
+    if let Some(entry) = &stash {
+        if !stash_restore(root, entry) {
+            return Outcome::Failed(format!("{error} (your changes are still in the stash)"));
         }
     }
-
-    match run(root, &args) {
-        Ok(_) => Outcome::Switched { branch: to, note },
-        Err(e) => {
-            let e = if e.contains("would be overwritten") {
-                format!("your changes collide with {to} — stash or commit them instead")
-            } else {
-                e
-            };
-            if stashed
-                && run(root, &["stash", "pop", "--index"]).is_err()
-                && run(root, &["stash", "pop"]).is_err()
-            {
-                return Outcome::Failed(format!("{e} (your changes are still in the stash)"));
-            }
-            Outcome::Failed(e)
-        }
+    if let (Carry::Commit(_), Some(note)) = (carry, note) {
+        return Outcome::Failed(format!("{note}, but the switch failed: {error}"));
     }
+    Outcome::Failed(error)
 }
 
 // ---- state ----
@@ -367,7 +621,8 @@ pub enum Answer {
         worktree: WorktreeId,
         list: Result<Vec<Branch>, String>,
     },
-    /// The checkout's changed-file count; None when git couldn't say.
+    /// The checkout's changed-file count; None when git couldn't say. It
+    /// follows its listing, and closes that request.
     Changes {
         worktree: WorktreeId,
         changes: Option<usize>,
@@ -378,8 +633,21 @@ pub enum Answer {
     },
     Switched {
         worktree: WorktreeId,
+        request: u64,
         outcome: Outcome,
     },
+}
+
+/// One switch, from the keypress that starts it until its answer lands.
+#[derive(Debug, Clone)]
+pub struct Job {
+    /// Tells this job's answer from any other's.
+    pub request: u64,
+    pub target: Branch,
+    pub carry: Carry,
+    /// What the DIRTY prompt listed (empty for a clean switch), so a
+    /// failure goes back to the prompt it came from.
+    pub files: Vec<DiffFile>,
 }
 
 /// The switcher's state that outlives the modal, on `App::branch_switch`.
@@ -392,10 +660,29 @@ pub struct Shared {
     /// Each checkout's last listing, so a reopen paints at once while the
     /// fresh one lands underneath.
     pub lists: HashMap<WorktreeId, Vec<Branch>>,
-    /// Checkouts with a background fetch running…
+    /// Checkouts with a listing in flight — never two at once — and the
+    /// ones asked for again meanwhile, listed once the first lands.
+    pub listing: HashSet<WorktreeId>,
+    pub relist: HashSet<WorktreeId>,
+    /// Checkouts with a background fetch running, and when each last
+    /// started one ([`FETCH_GAP`]).
     pub fetching: HashSet<WorktreeId>,
-    /// …and when each last started one ([`FETCH_GAP`]).
     pub fetched: HashMap<WorktreeId, Instant>,
+    /// The switch running in each checkout. One at a time: two gits on one
+    /// index trip over `index.lock`, and one's stash restore could land on
+    /// the branch the other moved to.
+    pub switching: HashMap<WorktreeId, Job>,
+    /// The last [`Job::request`] handed out.
+    pub requests: u64,
+    /// Raised when the TUI goes away, so a fetch still running is stopped
+    /// rather than holding the runtime's shutdown for its whole budget.
+    pub quit: Arc<AtomicBool>,
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        self.quit.store(true, Ordering::Relaxed);
+    }
 }
 
 /// The four ways uncommitted changes can travel, in the order offered —
@@ -434,12 +721,17 @@ impl Choice {
         }
     }
 
-    fn detail(self, from: &str, to: &str) -> String {
+    fn detail(self, from: &str, to: &str, detached: bool) -> String {
         match self {
-            Choice::Stash => format!("stash them; git stash pop on {from} brings them back"),
+            Choice::Stash => "stash them in a nebula entry — git stash list shows it".into(),
             Choice::Bring => format!("keep them on {to} — refused if they collide with it"),
+            Choice::Commit if detached => {
+                "unavailable: HEAD is detached, the commit would belong to no branch".into()
+            }
             Choice::Commit => format!("commit everything on {from} first, untracked files too"),
-            Choice::Discard => "throw away changes to tracked files; untracked files stay".into(),
+            Choice::Discard => {
+                "throw away changes to tracked files; untracked and new files stay".into()
+            }
         }
     }
 
@@ -467,13 +759,8 @@ pub enum Stage {
         files: Vec<DiffFile>,
         message: TextInput,
     },
-    /// git is running. `files` is what the DIRTY prompt listed (empty for a
-    /// clean switch), so a failure goes back to the prompt it came from.
-    Working {
-        target: Branch,
-        carry: Carry,
-        files: Vec<DiffFile>,
-    },
+    /// git is running.
+    Working(Job),
 }
 
 /// The line above the bottom border.
@@ -515,9 +802,13 @@ pub struct BranchSwitchView {
     pub matches: Vec<(usize, Vec<usize>)>,
     /// Index into `matches`.
     pub selected: usize,
+    /// Whether the user has moved the cursor or typed: from then on a
+    /// landing listing keeps the cursor on its branch.
+    pub touched: bool,
     /// Whether a listing has landed (a cached one counts).
     pub listed: bool,
     pub list_error: Option<String>,
+    pub fetch_failed: bool,
     pub changes: Option<usize>,
     pub stage: Stage,
     pub status: Option<Status>,
@@ -545,8 +836,10 @@ impl BranchSwitchView {
             branches: Vec::new(),
             matches: Vec::new(),
             selected: 0,
+            touched: false,
             listed: false,
             list_error: None,
+            fetch_failed: false,
             changes: None,
             stage: Stage::Pick,
             status: None,
@@ -561,6 +854,14 @@ impl BranchSwitchView {
         self.branches.get(*i)
     }
 
+    /// HEAD sits on no branch: a listing landed and no row is current.
+    pub fn detached(&self) -> bool {
+        self.listed
+            && self.list_error.is_none()
+            && !self.branches.is_empty()
+            && !self.branches.iter().any(|b| b.current)
+    }
+
     /// Re-rank against the query, list order breaking ties. The cursor is
     /// only clamped; callers decide where it goes.
     pub fn apply_filter(&mut self) {
@@ -573,23 +874,32 @@ impl BranchSwitchView {
     }
 
     /// Where the cursor starts: the best match for a query, and with none
-    /// the first branch the checkout isn't already on — so `c` `Enter`
+    /// the first branch a switch can actually land on — not the one the
+    /// checkout is on, not one another worktree holds — so `c` `Enter`
     /// goes somewhere.
     fn home_selection(&mut self) {
         self.selected = if self.query.as_str().trim().is_empty() {
             self.matches
                 .iter()
-                .position(|(i, _)| !self.branches[*i].current)
+                .position(|(i, _)| {
+                    let b = &self.branches[*i];
+                    !b.current && b.checked_out_at.is_none()
+                })
                 .unwrap_or(0)
         } else {
             0
         };
     }
 
-    /// A listing landed: the cursor stays on the branch it was on, by
-    /// name, or goes home.
+    /// A listing landed. Once the user has put the cursor somewhere it
+    /// stays on that branch, by name; until then it goes home, so a stale
+    /// cached `current` can't strand it on the branch the checkout is on.
     pub fn set_branches(&mut self, branches: Vec<Branch>) {
-        let keep = self.selected_branch().map(|b| b.name.clone());
+        let keep = if self.touched {
+            self.selected_branch().map(|b| b.name.clone())
+        } else {
+            None
+        };
         self.branches = branches;
         self.listed = true;
         self.apply_filter();
@@ -605,6 +915,15 @@ impl BranchSwitchView {
 
     pub fn select(&mut self, index: i64) {
         self.selected = clamp_selection(index, self.matches.len());
+        self.touched = true;
+    }
+
+    /// The query changed: re-rank, cursor on the best match.
+    fn requery(&mut self) {
+        self.apply_filter();
+        self.home_selection();
+        self.touched = true;
+        self.status = None;
     }
 }
 
@@ -645,9 +964,31 @@ pub(crate) fn open_branch_switch(app: &mut App) {
     }
 }
 
+/// A cached listing with `current` re-derived from the branch the tree
+/// says the checkout is on: something may have switched it since — an
+/// agent's own `git switch`.
+fn recurrent(cached: &[Branch], branch: &str) -> Vec<Branch> {
+    let mut rows: Vec<Branch> = cached
+        .iter()
+        .cloned()
+        .map(|mut b| {
+            if !b.remote {
+                b.current = b.name == branch;
+                if b.current {
+                    b.checked_out_at = None;
+                }
+            }
+            b
+        })
+        .collect();
+    rows.sort_by_key(|b| (b.remote, !b.current));
+    rows
+}
+
 /// Open the modal on `worktree`: the cached listing (if any) at once, a
 /// fresh one and the changed-file count off the loop, and a background
-/// fetch when the last one is a minute old.
+/// fetch when the last one is a minute old. A switch still running there
+/// shows as the working modal it was hidden from.
 pub(crate) fn open_for(app: &mut App, worktree: &WorktreeId) {
     let Some(w) = app
         .tree
@@ -685,20 +1026,30 @@ pub(crate) fn open_for(app: &mut App, worktree: &WorktreeId) {
         live,
     );
     if let Some(cached) = app.branch_switch.lists.get(&w.id) {
-        view.set_branches(cached.clone());
+        view.set_branches(recurrent(cached, &w.branch));
+    }
+    if let Some(job) = app.branch_switch.switching.get(&w.id) {
+        view.stage = Stage::Working(job.clone());
     }
     app.overlay = Some(Overlay::BranchSwitch(view));
     request_list(app, w.id.clone(), w.path.clone());
-    request_fetch(app, w.id, w.path);
+    request_fetch(app, w.id, w.path, false);
     app.dirty = true;
 }
 
 /// List the branches and count the changes, off the loop (inline in the
-/// unit tests). A checkout that isn't on disk is said so without a process.
+/// unit tests). One request per checkout at a time; asking again while one
+/// runs lists once more when it lands. A checkout that isn't on disk is
+/// said so without a process.
 fn request_list(app: &mut App, worktree: WorktreeId, root: PathBuf) {
     if !root.is_dir() {
         let list = Err(format!("{} is not on disk", root.display()));
         land_answer(app, Answer::Listed { worktree, list });
+        return;
+    }
+    let tx = app.branch_switch.tx.clone();
+    if tx.is_some() && !app.branch_switch.listing.insert(worktree.clone()) {
+        app.branch_switch.relist.insert(worktree);
         return;
     }
     let ask = move |send: &mut dyn FnMut(Answer)| {
@@ -706,10 +1057,10 @@ fn request_list(app: &mut App, worktree: WorktreeId, root: PathBuf) {
             worktree: worktree.clone(),
             list: list_branches(&root),
         });
-        let changes = crate::git_diff::changed_files(&root).ok().map(|f| f.len());
+        let changes = changes(&root).ok().map(|f| f.len());
         send(Answer::Changes { worktree, changes });
     };
-    match app.branch_switch.tx.clone() {
+    match tx {
         Some(tx) => {
             tokio::task::spawn_blocking(move || {
                 ask(&mut |answer| {
@@ -728,8 +1079,8 @@ fn request_list(app: &mut App, worktree: WorktreeId, root: PathBuf) {
 }
 
 /// Refresh the remotes in the background: skipped while one runs, within
-/// [`FETCH_GAP`] of the last, and in the unit tests.
-fn request_fetch(app: &mut App, worktree: WorktreeId, root: PathBuf) {
+/// [`FETCH_GAP`] of the last unless `force`d, and in the unit tests.
+fn request_fetch(app: &mut App, worktree: WorktreeId, root: PathBuf, force: bool) {
     let Some(tx) = app.branch_switch.tx.clone() else {
         return;
     };
@@ -738,13 +1089,14 @@ fn request_fetch(app: &mut App, worktree: WorktreeId, root: PathBuf) {
         .fetched
         .get(&worktree)
         .is_some_and(|at| at.elapsed() < FETCH_GAP);
-    if !root.is_dir() || recent || shared.fetching.contains(&worktree) {
+    if !root.is_dir() || (recent && !force) || shared.fetching.contains(&worktree) {
         return;
     }
     shared.fetching.insert(worktree.clone());
     shared.fetched.insert(worktree.clone(), Instant::now());
+    let quit = shared.quit.clone();
     tokio::task::spawn_blocking(move || {
-        let ok = fetch(&root);
+        let ok = fetch(&root, &quit);
         let _ = tx.send(Answer::Fetched { worktree, ok });
     });
 }
@@ -780,24 +1132,59 @@ pub(crate) fn land_answer(app: &mut App, answer: Answer) {
             }
         }
         Answer::Changes { worktree, changes } => {
-            if let Some(view) = view_for(app, &worktree) {
+            app.branch_switch.listing.remove(&worktree);
+            let root = view_for(app, &worktree).map(|view| {
                 view.changes = changes;
-            }
-        }
-        Answer::Fetched { worktree, ok } => {
-            app.branch_switch.fetching.remove(&worktree);
-            if let Some(root) = view_for(app, &worktree).map(|v| v.root.clone()) {
-                if ok {
+                view.root.clone()
+            });
+            if app.branch_switch.relist.remove(&worktree) {
+                if let Some(root) = root {
                     request_list(app, worktree, root);
                 }
             }
         }
-        Answer::Switched { worktree, outcome } => land_switch(app, worktree, outcome),
+        Answer::Fetched { worktree, ok } => {
+            app.branch_switch.fetching.remove(&worktree);
+            let root = view_for(app, &worktree).map(|view| {
+                view.fetch_failed = !ok;
+                view.root.clone()
+            });
+            if let (true, Some(root)) = (ok, root) {
+                request_list(app, worktree, root);
+            }
+        }
+        Answer::Switched {
+            worktree,
+            request,
+            outcome,
+        } => land_switch(app, worktree, request, outcome),
     }
     app.dirty = true;
 }
 
-fn land_switch(app: &mut App, worktree: WorktreeId, outcome: Outcome) {
+fn land_switch(app: &mut App, worktree: WorktreeId, request: u64, outcome: Outcome) {
+    // Only the running job's answer counts.
+    match app.branch_switch.switching.get(&worktree) {
+        Some(job) if job.request == request => {}
+        _ => return,
+    }
+    let Some(job) = app.branch_switch.switching.remove(&worktree) else {
+        return;
+    };
+    let from = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|w| w.id == worktree)
+        .map(|w| w.branch.clone())
+        .unwrap_or_default();
+    // Whether the modal is still showing this job: `Esc` hides it while git
+    // works, and the answer then goes to the footer.
+    let showing = matches!(
+        &app.overlay,
+        Some(Overlay::BranchSwitch(v))
+            if v.worktree == worktree && matches!(&v.stage, Stage::Working(j) if j.request == request)
+    );
     match outcome {
         Outcome::Switched { branch, note } => {
             // The row renames now rather than on the DAEMON's next sync,
@@ -824,38 +1211,45 @@ fn land_switch(app: &mut App, worktree: WorktreeId, outcome: Outcome) {
                 None => format!("⌂ root is on {branch}"),
             });
         }
-        Outcome::Dirty(files) => {
+        Outcome::Dirty(files) if showing => {
             if let Some(view) = view_for(app, &worktree) {
-                if let Stage::Working { target, .. } = &view.stage {
-                    view.changes = Some(files.len());
-                    view.stage = Stage::Dirty {
-                        target: target.clone(),
-                        files,
-                        choice: 0,
-                        discard_armed: false,
-                    };
+                view.changes = Some(files.len());
+                if matches!(job.carry, Carry::Discard(_)) {
+                    view.status = Some(Status::error(
+                        "the changes moved since the prompt opened — look again before discarding",
+                    ));
                 }
+                view.stage = Stage::Dirty {
+                    target: job.target,
+                    files,
+                    choice: 0,
+                    discard_armed: false,
+                };
             }
         }
-        Outcome::Failed(error) => match view_for(app, &worktree) {
-            Some(view) => {
-                view.stage = match std::mem::replace(&mut view.stage, Stage::Pick) {
-                    Stage::Working {
-                        target,
-                        carry,
-                        files,
-                    } if !files.is_empty() => Stage::Dirty {
-                        target,
-                        files,
-                        choice: carry_choice(&carry).index(),
+        Outcome::Dirty(files) => {
+            app.flash = Some(format!(
+                "not switched: {from} has {} — c to choose what happens to them",
+                changes_text(files.len())
+            ));
+        }
+        Outcome::Failed(error) if showing => {
+            if let Some(view) = view_for(app, &worktree) {
+                let choice = carry_choice(&job.carry).index();
+                view.stage = if job.files.is_empty() {
+                    Stage::Pick
+                } else {
+                    Stage::Dirty {
+                        target: job.target,
+                        files: job.files,
+                        choice,
                         discard_armed: false,
-                    },
-                    _ => Stage::Pick,
+                    }
                 };
                 view.status = Some(Status::error(error));
             }
-            None => app.flash = Some(format!("switch branch failed: {error}")),
-        },
+        }
+        Outcome::Failed(error) => app.flash = Some(format!("switch branch failed: {error}")),
     }
 }
 
@@ -863,37 +1257,61 @@ fn carry_choice(carry: &Carry) -> Choice {
     match carry {
         Carry::Commit(_) => Choice::Commit,
         Carry::Bring => Choice::Bring,
-        Carry::Discard => Choice::Discard,
-        Carry::Ask | Carry::Stash => Choice::Stash,
+        Carry::Discard(_) => Choice::Discard,
+        Carry::Ask | Carry::Stash | Carry::Create => Choice::Stash,
     }
 }
 
-/// Run the switch off the loop (inline in the unit tests).
+/// Run a switch off the loop (inline in the unit tests) — unless one is
+/// already running in the checkout.
 fn start_switch(app: &mut App, target: Branch, carry: Carry, files: Vec<DiffFile>) {
     let Some(Overlay::BranchSwitch(view)) = &mut app.overlay else {
         return;
     };
+    let shared = &mut app.branch_switch;
+    if shared.switching.contains_key(&view.worktree) {
+        view.status = Some(Status::error(
+            "a switch is already running in this checkout",
+        ));
+        return;
+    }
+    shared.requests += 1;
+    let job = Job {
+        request: shared.requests,
+        target,
+        carry,
+        files,
+    };
+    shared.switching.insert(view.worktree.clone(), job.clone());
     let (worktree, root, from) = (
         view.worktree.clone(),
         view.root.clone(),
         view.current.clone(),
     );
     view.status = None;
-    view.stage = Stage::Working {
-        target: target.clone(),
-        carry: carry.clone(),
-        files,
-    };
-    match app.branch_switch.tx.clone() {
+    view.stage = Stage::Working(job.clone());
+    let request = job.request;
+    match shared.tx.clone() {
         Some(tx) => {
             tokio::task::spawn_blocking(move || {
-                let outcome = switch(&root, &from, &target, &carry);
-                let _ = tx.send(Answer::Switched { worktree, outcome });
+                let outcome = switch(&root, &from, &job.target, &job.carry);
+                let _ = tx.send(Answer::Switched {
+                    worktree,
+                    request,
+                    outcome,
+                });
             });
         }
         None => {
-            let outcome = switch(&root, &from, &target, &carry);
-            land_answer(app, Answer::Switched { worktree, outcome });
+            let outcome = switch(&root, &from, &job.target, &job.carry);
+            land_answer(
+                app,
+                Answer::Switched {
+                    worktree,
+                    request,
+                    outcome,
+                },
+            );
         }
     }
     app.dirty = true;
@@ -901,12 +1319,18 @@ fn start_switch(app: &mut App, target: Branch, carry: Carry, files: Vec<DiffFile
 
 // ---- keys and mouse ----
 
-/// `Enter` on a row.
+/// `Enter` on the list.
 fn activate_selected(app: &mut App) {
     let Some(Overlay::BranchSwitch(view)) = &mut app.overlay else {
         return;
     };
     let Some(branch) = view.selected_branch().cloned() else {
+        // Nothing matches: create the typed branch off the current one, as
+        // an IDE's switcher offers to.
+        let name = view.query.as_str().trim().to_string();
+        if view.listed && !name.is_empty() {
+            start_switch(app, Branch::new_local(name), Carry::Create, Vec::new());
+        }
         return;
     };
     if branch.current {
@@ -924,11 +1348,23 @@ fn activate_selected(app: &mut App) {
     start_switch(app, branch, Carry::Ask, Vec::new());
 }
 
+/// `Ctrl+r`: fetch the remotes now, past the minute's gap, and list again.
+fn refresh(app: &mut App) {
+    let Some(Overlay::BranchSwitch(view)) = &mut app.overlay else {
+        return;
+    };
+    view.fetch_failed = false;
+    let (worktree, root) = (view.worktree.clone(), view.root.clone());
+    request_list(app, worktree.clone(), root.clone());
+    request_fetch(app, worktree, root, true);
+}
+
 /// Pick one of the [`CHOICES`] on the DIRTY prompt.
 fn choose(app: &mut App, choice: Choice) {
     let Some(Overlay::BranchSwitch(view)) = &mut app.overlay else {
         return;
     };
+    let detached = view.detached();
     let Stage::Dirty {
         target,
         files,
@@ -945,6 +1381,11 @@ fn choose(app: &mut App, choice: Choice) {
     match choice {
         Choice::Stash => start_switch(app, target, Carry::Stash, files),
         Choice::Bring => start_switch(app, target, Carry::Bring, files),
+        Choice::Commit if detached => {
+            view.status = Some(Status::error(
+                "HEAD is detached — a commit here would belong to no branch; stash instead",
+            ));
+        }
         Choice::Commit => {
             view.status = None;
             view.stage = Stage::Commit {
@@ -953,7 +1394,10 @@ fn choose(app: &mut App, choice: Choice) {
                 message: TextInput::new(),
             };
         }
-        Choice::Discard if armed => start_switch(app, target, Carry::Discard, files),
+        Choice::Discard if armed => {
+            let expected = files.iter().map(file_key).collect();
+            start_switch(app, target, Carry::Discard(expected), files);
+        }
         Choice::Discard => {
             if let Stage::Dirty { discard_armed, .. } = &mut view.stage {
                 *discard_armed = true;
@@ -977,8 +1421,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 // Two-stage, like every fuzzy overlay: the query first.
                 KeyCode::Esc if !view.query.as_str().is_empty() => {
                     view.query.clear();
-                    view.apply_filter();
-                    view.home_selection();
+                    view.requery();
                 }
                 KeyCode::Esc => app.overlay = None,
                 // j/k stay typeable in the query; Ctrl+n/p mirror ↑/↓.
@@ -988,12 +1431,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Char('p') if ctrl => view.select(selected - 1),
                 KeyCode::PageDown => view.select(selected + page),
                 KeyCode::PageUp => view.select(selected - page),
+                KeyCode::Char('r') if ctrl => refresh(app),
                 KeyCode::Enter => activate_selected(app),
                 _ => {
                     if view.query.handle_key(&key).changed() {
-                        view.apply_filter();
-                        view.home_selection();
-                        view.status = None;
+                        view.requery();
                     }
                 }
             }
@@ -1053,11 +1495,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 message.handle_key(&key);
             }
         },
-        // git is already running; Esc only hides the modal, and the result
-        // still lands in the footer.
-        Stage::Working { .. } => {
+        // git is already running: Esc only hides the modal (`c` brings it
+        // back), and the result lands in the footer.
+        Stage::Working(_) => {
             if key.code == KeyCode::Esc {
                 app.overlay = None;
+                app.flash = Some("still switching — c shows it, the result lands here".into());
             }
         }
     }
@@ -1069,8 +1512,7 @@ pub(crate) fn paste(view: &mut BranchSwitchView, text: &str) -> bool {
     match &mut view.stage {
         Stage::Pick => {
             view.query.insert_str(text);
-            view.apply_filter();
-            view.home_selection();
+            view.requery();
             true
         }
         Stage::Commit { message, .. } => {
@@ -1096,13 +1538,12 @@ pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent, pos: Position) {
         MouseEventKind::ScrollDown => 1,
         _ => 0,
     };
+    let click = mouse.kind == MouseEventKind::Down(MouseButton::Left);
     match &mut view.stage {
         Stage::Pick => {
             if delta != 0 {
                 view.select(view.selected as i64 + delta);
-            } else if mouse.kind == MouseEventKind::Down(MouseButton::Left)
-                && view.list_area.contains(pos)
-            {
+            } else if click && view.list_area.contains(pos) {
                 let start = window_start(view.selected, view.list_area.height as usize);
                 view.select((start + (pos.y - view.list_area.y) as usize) as i64);
             }
@@ -1115,9 +1556,7 @@ pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent, pos: Position) {
             if delta != 0 {
                 *choice = (*choice as i64 + delta).clamp(0, CHOICES.len() as i64 - 1) as usize;
                 *discard_armed = false;
-            } else if mouse.kind == MouseEventKind::Down(MouseButton::Left)
-                && view.choices_area.contains(pos)
-            {
+            } else if click && view.choices_area.contains(pos) {
                 if let Some(picked) = CHOICES.get((pos.y - view.choices_area.y) as usize) {
                     choose(app, *picked);
                 }
@@ -1132,19 +1571,19 @@ pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent, pos: Position) {
 /// The FOOTER's hint while the modal is up.
 pub fn footer_hint(view: &BranchSwitchView) -> &'static str {
     match view.stage {
-        Stage::Pick => "type: filter branches  ↑/↓ ^n/^p: move  Enter: switch  Ctrl+u: clear  Esc: clear/close",
+        Stage::Pick => "type: filter  ↑/↓ ^n/^p: move  Enter: switch (nothing matching: create)  ^r: fetch  Esc: clear/close",
         Stage::Dirty { .. } => "s: stash  b: bring along  c: commit  d: discard  ↑/↓ Enter: choose  Esc: back to the list",
         Stage::Commit { .. } => "type the commit message  Enter: commit & switch  Esc: back",
-        Stage::Working { .. } => "git is running  Esc: hide (the result lands in the footer)",
+        Stage::Working(_) => "git is running  Esc: hide (c shows it again; the result lands in the footer)",
     }
 }
 
 fn border_hint(stage: &Stage) -> &'static str {
     match stage {
-        Stage::Pick => " Enter switch · ↑↓ move · Esc clear/close ",
+        Stage::Pick => " Enter switch · ↑↓ move · ^r fetch · Esc clear/close ",
         Stage::Dirty { .. } => " s/b/c/d or ↑↓ Enter · Esc back ",
         Stage::Commit { .. } => " Enter commit & switch · Esc back ",
-        Stage::Working { .. } => " working… ",
+        Stage::Working(_) => " working… · Esc hide ",
     }
 }
 
@@ -1176,7 +1615,8 @@ fn name_spans(shown: &str, positions: &[usize], base: Style, th: Theme) -> Vec<S
     spans
 }
 
-/// One list row: glyph, name, subject, then the tag and age pinned right.
+/// One list row: glyph, name, subject, then the tag and age pinned right —
+/// measured in cells, so a wide subject can't push the age off the row.
 fn branch_row(
     branch: &Branch,
     positions: &[usize],
@@ -1193,7 +1633,7 @@ fn branch_row(
     let (tag, tag_color) = if branch.current {
         ("current", th.ok)
     } else if elsewhere {
-        ("in a worktree", th.warn)
+        ("in a worktree", th.dim)
     } else if branch.remote {
         ("remote", th.dim)
     } else {
@@ -1204,10 +1644,13 @@ fn branch_row(
     } else {
         String::new()
     };
-    let right_w = tag.chars().count() + age.chars().count() + usize::from(!tag.is_empty()) + 1;
-    let budget = width.saturating_sub(2 + right_w);
-    let name = truncate(&branch.name, budget.min(48).max(budget / 2));
-    let name_w = name.chars().count();
+    // `render_row` spends a column on its marker; after it come the glyph,
+    // the name and subject (`budget`), at least one space, the tag and age,
+    // and a column of margin so the age never touches the frame.
+    let right_w = cells(tag) + usize::from(!tag.is_empty()) + cells(&age);
+    let budget = width.saturating_sub(1 + cells(glyph) + 1 + right_w + 1);
+    let name = fit(&branch.name, budget.min(48).max(budget / 2));
+    let name_w = cells(&name);
     let base = if elsewhere {
         Style::default().fg(th.dim)
     } else if branch.current {
@@ -1225,8 +1668,8 @@ fn branch_row(
     let subject_w = budget.saturating_sub(name_w + 2);
     let mut used = name_w;
     if subject_w >= 8 && !branch.subject.is_empty() {
-        let subject = truncate(&branch.subject, subject_w);
-        used += 2 + subject.chars().count();
+        let subject = fit(&branch.subject, subject_w);
+        used += 2 + cells(&subject);
         spans.push(Span::styled(
             format!("  {subject}"),
             Style::default().fg(th.dim),
@@ -1274,35 +1717,32 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &BranchSwitchView, th: Th
         } => {
             choices_area = draw_dirty(f, view, target, files, *choice, *discard_armed, body, th);
         }
-        Stage::Working {
-            target,
-            files,
-            carry,
-        } if !files.is_empty() => {
-            let choice = carry_choice(carry).index();
-            draw_dirty(f, view, target, files, choice, false, body, th);
+        Stage::Working(job) if !job.files.is_empty() => {
+            let choice = carry_choice(&job.carry).index();
+            draw_dirty(f, view, &job.target, &job.files, choice, false, body, th);
         }
         Stage::Commit {
             target,
             files,
             message,
         } => draw_commit(f, view, target, files, message, body, th),
-        Stage::Pick | Stage::Working { .. } => {
+        Stage::Pick | Stage::Working(_) => {
             (list_area, selected) = draw_list(f, view, body, th);
         }
     }
 
-    // The status line: what just went wrong or right, else what's running,
+    // The status line: what's running, else what just went wrong or right,
     // else what the user should know before switching.
     let fetching = app.branch_switch.fetching.contains(&view.worktree);
-    let (text, color) = if let Stage::Working { target, carry, .. } = &view.stage {
-        let doing = match carry {
+    let (text, color) = if let Stage::Working(job) = &view.stage {
+        let doing = match job.carry {
             Carry::Stash => "stashing and switching",
             Carry::Commit(_) => "committing and switching",
-            Carry::Discard => "discarding and switching",
+            Carry::Discard(_) => "discarding and switching",
+            Carry::Create => "creating and switching",
             Carry::Ask | Carry::Bring => "switching",
         };
-        (format!("{doing} to {}…", target.local_name()), th.warn)
+        (format!("{doing} to {}…", job.target.local_name()), th.warn)
     } else if let Some(status) = &view.status {
         (
             status.text.clone(),
@@ -1310,7 +1750,8 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &BranchSwitchView, th: Th
         )
     } else {
         let mut parts: Vec<String> = Vec::new();
-        if let Some(n) = view.changes.filter(|n| *n > 0) {
+        // The prompts already lead with the count.
+        if let (Stage::Pick, Some(n)) = (&view.stage, view.changes.filter(|n| *n > 0)) {
             parts.push(changes_text(n));
         }
         if view.live_sessions > 0 {
@@ -1322,10 +1763,16 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &BranchSwitchView, th: Th
         }
         if fetching {
             parts.push("fetching remotes…".into());
+        } else if view.fetch_failed {
+            parts.push("couldn't reach the remotes (^r tries again)".into());
+        }
+        // With rows on screen, a failed refresh would otherwise go unseen.
+        if let (Some(e), false) = (&view.list_error, view.branches.is_empty()) {
+            parts.push(format!("couldn't refresh the list: {e}"));
         }
         (parts.join(" · "), th.dim)
     };
-    let text = truncate(&text, status_row.width.saturating_sub(1) as usize);
+    let text = fit(&text, status_row.width.saturating_sub(1) as usize);
     f.render_widget(
         Paragraph::new(Span::styled(format!(" {text}"), Style::default().fg(color))),
         status_row,
@@ -1358,13 +1805,20 @@ fn draw_list(f: &mut Frame, view: &BranchSwitchView, body: Rect, th: Theme) -> (
         ..body
     };
     if view.matches.is_empty() {
+        let query = view.query.as_str().trim();
         let text = match (&view.list_error, view.listed) {
-            (Some(e), _) => format!("couldn't list branches: {e}"),
-            (None, false) => "reading branches…".into(),
-            (None, true) if view.branches.is_empty() => "no branches".into(),
-            (None, true) => NO_MATCHES.into(),
+            (_, true) if view.branches.is_empty() && view.list_error.is_none() => {
+                "no branches".to_string()
+            }
+            (Some(e), _) if view.branches.is_empty() => format!("couldn't list branches: {e}"),
+            (_, false) => "reading branches…".into(),
+            _ if !query.is_empty() => format!(
+                "{NO_MATCHES} — Enter creates \"{query}\" off {}",
+                view.current
+            ),
+            _ => NO_MATCHES.into(),
         };
-        empty_list_row(f, list, &text, th);
+        empty_list_row(f, list, &fit(&text, list.width as usize), th);
     }
     let selected = view.selected.min(view.matches.len().saturating_sub(1));
     let start = window_start(selected, list.height as usize);
@@ -1390,7 +1844,7 @@ fn file_line(file: &DiffFile, width: usize, th: Theme) -> Line<'static> {
     let code: String = file.xy.iter().collect();
     Line::from(vec![
         Span::styled(format!("   {code} "), Style::default().fg(th.warn)),
-        Span::raw(truncate(&file.path, width.saturating_sub(7))),
+        Span::raw(fit(&file.path, width.saturating_sub(7))),
     ])
 }
 
@@ -1448,6 +1902,7 @@ fn draw_dirty(
     th: Theme,
 ) -> Rect {
     let to = target.local_name();
+    let detached = view.detached();
     if let Some(row) = row_rect(body, 0) {
         let question = format!(
             " {} has {} — how should they travel to {to}?",
@@ -1456,7 +1911,7 @@ fn draw_dirty(
         );
         f.render_widget(
             Paragraph::new(Span::styled(
-                truncate(&question, body.width as usize),
+                fit(&question, body.width as usize),
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             row,
@@ -1472,15 +1927,16 @@ fn draw_dirty(
             break;
         };
         let armed = discard_armed && *c == Choice::Discard;
+        let unavailable = detached && *c == Choice::Commit;
         let detail = if armed {
             format!("press d again to throw away {}", changes_text(files.len()))
         } else {
-            c.detail(&view.current, to)
+            c.detail(&view.current, to, detached)
         };
-        let label_color = if *c == Choice::Discard {
-            th.err
-        } else {
-            th.text
+        let label_color = match c {
+            _ if unavailable => th.dim,
+            Choice::Discard => th.err,
+            _ => th.text,
         };
         let spans = vec![
             Span::styled(
@@ -1492,7 +1948,7 @@ fn draw_dirty(
                 Style::default().fg(label_color),
             ),
             Span::styled(
-                truncate(&detail, (body.width as usize).saturating_sub(26)),
+                fit(&detail, (body.width as usize).saturating_sub(26)),
                 Style::default().fg(if armed { th.err } else { th.dim }),
             ),
         ];
@@ -1523,7 +1979,7 @@ fn draw_commit(
         );
         f.render_widget(
             Paragraph::new(Span::styled(
-                truncate(&line, body.width as usize),
+                fit(&line, body.width as usize),
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             row,
@@ -1586,15 +2042,19 @@ mod tests {
         git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
     }
 
+    fn read_file(repo: &Path, name: &str) -> String {
+        std::fs::read_to_string(repo.join(name)).unwrap()
+    }
+
+    fn hook(repo: &Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = repo.join(".git/hooks").join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     fn local(name: &str) -> Branch {
-        Branch {
-            name: name.into(),
-            remote: false,
-            current: false,
-            checked_out_at: None,
-            committed: 0,
-            subject: String::new(),
-        }
+        Branch::new_local(name.into())
     }
 
     fn remote(name: &str) -> Branch {
@@ -1602,6 +2062,10 @@ mod tests {
             remote: true,
             ..local(name)
         }
+    }
+
+    fn keys(repo: &Path) -> Vec<String> {
+        changes(repo).unwrap().iter().map(file_key).collect()
     }
 
     fn record(
@@ -1670,7 +2134,7 @@ mod tests {
     }
 
     #[test]
-    fn git_errors_read_as_one_line_without_the_prefix() {
+    fn git_errors_read_as_the_error_line_without_its_prefix() {
         assert_eq!(
             git_error("error: pathspec 'x' did not match\nhint: whatever\n"),
             "pathspec 'x' did not match"
@@ -1679,7 +2143,23 @@ mod tests {
             git_error("\nfatal: not a git repository\n"),
             "not a git repository"
         );
+        assert_eq!(
+            git_error("Switched to branch 'feature'\nfatal: hook said no\n"),
+            "hook said no",
+            "the error, not the chatter before it"
+        );
+        assert_eq!(git_error("something odd\n"), "something odd");
         assert_eq!(git_error(""), "git failed");
+    }
+
+    #[test]
+    fn cells_count_wide_characters_twice_and_fit_cuts_by_them() {
+        assert_eq!(cells("ab"), 2);
+        assert_eq!(cells("修复"), 4);
+        let cut = fit("修复登录重定向", 7);
+        assert!(cells(&cut) <= 7, "{cut:?}");
+        assert!(cut.ends_with('…'));
+        assert_eq!(fit("short", 10), "short");
     }
 
     #[test]
@@ -1741,9 +2221,44 @@ mod tests {
         };
         assert_eq!(files.len(), 2);
         assert_eq!(head(&repo), "main");
-        assert_eq!(
-            std::fs::read_to_string(repo.join("b.txt")).unwrap(),
-            "edited\n"
+        assert_eq!(read_file(&repo, "b.txt"), "edited\n");
+    }
+
+    #[test]
+    fn a_nested_repository_is_not_a_change_and_is_never_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(&dir);
+        let nested = repo.join(".claude/worktrees/x");
+        std::fs::create_dir_all(&nested).unwrap();
+        git(&nested, &["init", "-q", "-b", "x"]);
+        git(
+            &nested,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "n",
+            ],
+        );
+        assert!(changes(&repo).unwrap().is_empty(), "{:?}", changes(&repo));
+        assert!(matches!(
+            switch(&repo, "main", &local("feature"), &Carry::Ask),
+            Outcome::Switched { .. }
+        ));
+
+        std::fs::write(repo.join("b.txt"), "edited\n").unwrap();
+        let carry = Carry::Commit("keep b".into());
+        let outcome = switch(&repo, "feature", &local("main"), &carry);
+        assert!(matches!(outcome, Outcome::Switched { .. }), "{outcome:?}");
+        let tree = git(&repo, &["ls-tree", "-r", "--name-only", "feature"]);
+        assert!(
+            !tree.contains(".claude"),
+            "no gitlink for the nested repo: {tree}"
         );
     }
 
@@ -1759,7 +2274,7 @@ mod tests {
             panic!("stash then switch");
         };
         assert_eq!(branch, "feature");
-        assert!(note.unwrap().contains("stash"));
+        assert!(note.unwrap().contains("stashed"));
         assert_eq!(head(&repo), "feature");
         assert!(
             !repo.join("new.txt").exists(),
@@ -1773,9 +2288,12 @@ mod tests {
     }
 
     #[test]
-    fn a_switch_that_fails_after_the_stash_puts_the_changes_back() {
+    fn a_refused_switch_after_the_stash_applies_its_own_entry_back_by_commit() {
         let dir = tempfile::tempdir().unwrap();
         let repo = repo(&dir);
+        // Someone else's entry, already on the shared stack.
+        std::fs::write(repo.join("b.txt"), "someone else\n").unwrap();
+        git(&repo, &["stash", "push", "-q", "-m", "someone else"]);
         std::fs::write(repo.join("b.txt"), "edited\n").unwrap();
         // `git switch --track origin/nope` — no such remote branch.
         let Outcome::Failed(_) = switch(&repo, "main", &remote("origin/nope"), &Carry::Stash)
@@ -1783,15 +2301,40 @@ mod tests {
             panic!("the switch must fail");
         };
         assert_eq!(head(&repo), "main");
+        assert_eq!(read_file(&repo, "b.txt"), "edited\n");
+        let stashes = git(&repo, &["stash", "list"]);
         assert_eq!(
-            std::fs::read_to_string(repo.join("b.txt")).unwrap(),
-            "edited\n"
+            stashes.lines().count(),
+            1,
+            "only the other entry is left: {stashes}"
         );
+        assert!(stashes.contains("someone else"), "{stashes}");
+    }
+
+    #[test]
+    fn a_failing_post_checkout_hook_is_still_a_switch_and_the_stash_stays_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(&dir);
+        hook(&repo, "post-checkout", "echo 'lfs is missing' >&2; exit 1");
+        std::fs::write(repo.join("a.txt"), "collides\n").unwrap();
+        let Outcome::Switched { branch, note } =
+            switch(&repo, "main", &local("feature"), &Carry::Stash)
+        else {
+            panic!("HEAD moved, so it switched");
+        };
+        assert_eq!(branch, "feature");
+        let note = note.unwrap();
+        assert!(
+            note.contains("stashed") && note.contains("complained"),
+            "{note}"
+        );
+        assert_eq!(head(&repo), "feature");
         assert_eq!(
-            git(&repo, &["stash", "list"]),
-            "",
-            "the stash was popped back"
+            read_file(&repo, "a.txt"),
+            "feature\n",
+            "no stash popped onto feature"
         );
+        assert!(git(&repo, &["stash", "list"]).contains("nebula: main"));
     }
 
     #[test]
@@ -1801,10 +2344,7 @@ mod tests {
         std::fs::write(repo.join("b.txt"), "edited\n").unwrap();
         let outcome = switch(&repo, "main", &local("feature"), &Carry::Bring);
         assert!(matches!(outcome, Outcome::Switched { .. }), "{outcome:?}");
-        assert_eq!(
-            std::fs::read_to_string(repo.join("b.txt")).unwrap(),
-            "edited\n"
-        );
+        assert_eq!(read_file(&repo, "b.txt"), "edited\n");
 
         std::fs::write(repo.join("a.txt"), "collides\n").unwrap();
         let Outcome::Failed(error) = switch(&repo, "feature", &local("main"), &Carry::Bring) else {
@@ -1839,18 +2379,91 @@ mod tests {
     }
 
     #[test]
-    fn discard_and_switch_drops_tracked_changes_and_keeps_untracked_files() {
+    fn commit_is_refused_on_a_detached_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(&dir);
+        git(&repo, &["switch", "-q", "--detach", "main"]);
+        std::fs::write(repo.join("b.txt"), "edited\n").unwrap();
+        let before = git(&repo, &["rev-parse", "HEAD"]);
+        let carry = Carry::Commit("lost".into());
+        let Outcome::Failed(error) = switch(&repo, "detached", &local("feature"), &carry) else {
+            panic!("a detached commit must be refused");
+        };
+        assert!(error.contains("detached"), "{error}");
+        assert_eq!(git(&repo, &["rev-parse", "HEAD"]), before);
+        assert_eq!(read_file(&repo, "b.txt"), "edited\n");
+    }
+
+    #[test]
+    fn a_commit_a_hook_refuses_puts_the_staging_back_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(&dir);
+        hook(&repo, "pre-commit", "exit 1");
+        std::fs::write(repo.join("b.txt"), "staged\n").unwrap();
+        git(&repo, &["add", "b.txt"]);
+        std::fs::write(repo.join("new.txt"), "not staged\n").unwrap();
+        let carry = Carry::Commit("blocked".into());
+        let Outcome::Failed(error) = switch(&repo, "main", &local("feature"), &carry) else {
+            panic!("the hook refuses");
+        };
+        assert!(error.starts_with("commit failed"), "{error}");
+        assert_eq!(git(&repo, &["diff", "--cached", "--name-only"]), "b.txt");
+        assert_eq!(head(&repo), "main");
+    }
+
+    #[test]
+    fn nothing_switches_in_the_middle_of_a_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(&dir);
+        std::fs::write(repo.join("a.txt"), "main again\n").unwrap();
+        git(&repo, &["commit", "-q", "-am", "diverge"]);
+        let merge = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["merge", "-q", "feature"])
+            .output()
+            .unwrap();
+        assert!(!merge.status.success(), "the merge conflicts");
+        for carry in [Carry::Ask, Carry::Commit("markers".into()), Carry::Stash] {
+            let Outcome::Failed(error) = switch(&repo, "main", &local("feature"), &carry) else {
+                panic!("{carry:?} must refuse mid-merge");
+            };
+            assert!(error.contains("middle of a merge"), "{error}");
+        }
+        assert_eq!(head(&repo), "main");
+        assert!(read_file(&repo, "a.txt").contains("<<<<<<<"));
+    }
+
+    #[test]
+    fn discard_drops_tracked_changes_and_keeps_untracked_and_newly_added_files() {
         let dir = tempfile::tempdir().unwrap();
         let repo = repo(&dir);
         std::fs::write(repo.join("a.txt"), "collides\n").unwrap();
-        std::fs::write(repo.join("new.txt"), "untracked\n").unwrap();
-        let outcome = switch(&repo, "main", &local("feature"), &Carry::Discard);
+        std::fs::write(repo.join("added.txt"), "staged, never committed\n").unwrap();
+        git(&repo, &["add", "added.txt"]);
+        std::fs::write(repo.join("untracked.txt"), "untracked\n").unwrap();
+        let carry = Carry::Discard(keys(&repo));
+        let outcome = switch(&repo, "main", &local("feature"), &carry);
         assert!(matches!(outcome, Outcome::Switched { .. }), "{outcome:?}");
-        assert_eq!(
-            std::fs::read_to_string(repo.join("a.txt")).unwrap(),
-            "feature\n"
+        assert_eq!(read_file(&repo, "a.txt"), "feature\n");
+        assert_eq!(read_file(&repo, "added.txt"), "staged, never committed\n");
+        assert!(repo.join("untracked.txt").exists());
+    }
+
+    #[test]
+    fn discard_asks_again_when_the_changes_moved_since_the_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(&dir);
+        std::fs::write(repo.join("a.txt"), "collides\n").unwrap();
+        let stale = keys(&repo);
+        std::fs::write(repo.join("b.txt"), "an agent wrote this meanwhile\n").unwrap();
+        let outcome = switch(&repo, "main", &local("feature"), &Carry::Discard(stale));
+        assert!(
+            matches!(&outcome, Outcome::Dirty(files) if files.len() == 2),
+            "{outcome:?}"
         );
-        assert!(repo.join("new.txt").exists());
+        assert_eq!(read_file(&repo, "b.txt"), "an agent wrote this meanwhile\n");
+        assert_eq!(head(&repo), "main");
     }
 
     #[test]
@@ -1878,9 +2491,25 @@ mod tests {
     }
 
     #[test]
-    fn a_fetch_with_no_remotes_finishes() {
+    fn create_starts_a_branch_off_head_with_the_changes_along() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(fetch(&repo(&dir)));
+        let repo = repo(&dir);
+        std::fs::write(repo.join("b.txt"), "edited\n").unwrap();
+        let outcome = switch(&repo, "main", &local("brand-new"), &Carry::Create);
+        assert!(matches!(outcome, Outcome::Switched { .. }), "{outcome:?}");
+        assert_eq!(head(&repo), "brand-new");
+        assert_eq!(read_file(&repo, "b.txt"), "edited\n");
+    }
+
+    #[test]
+    fn a_fetch_with_no_remotes_finishes_and_a_raised_quit_stops_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(&dir);
+        assert!(fetch(&repo, &AtomicBool::new(false)));
+        // Whatever the fetch was doing, a raised flag ends the wait at once.
+        let started = Instant::now();
+        let _ = fetch(&repo, &AtomicBool::new(true));
+        assert!(started.elapsed() < FETCH_GRACE + Duration::from_secs(1));
     }
 
     // ---- the modal ----
@@ -1895,16 +2524,19 @@ mod tests {
             repo_path: path.to_path_buf(),
             sort_order: 0,
         });
-        let root = Worktree {
+        app.tree.worktrees.push(Worktree {
             id: WorktreeId("w1".into()),
             project_id: ProjectId("p1".into()),
             path: path.to_path_buf(),
             branch: "main".into(),
             is_main: true,
             sort_order: 0,
-        };
-        app.tree.worktrees.push(root);
+        });
         app
+    }
+
+    fn w1() -> WorktreeId {
+        WorktreeId("w1".into())
     }
 
     fn key(app: &mut App, code: KeyCode) {
@@ -1919,6 +2551,13 @@ mod tests {
 
     fn view(app: &App) -> &BranchSwitchView {
         match &app.overlay {
+            Some(Overlay::BranchSwitch(view)) => view,
+            other => panic!("no branch switcher: {other:?}"),
+        }
+    }
+
+    fn view_mut(app: &mut App) -> &mut BranchSwitchView {
+        match &mut app.overlay {
             Some(Overlay::BranchSwitch(view)) => view,
             other => panic!("no branch switcher: {other:?}"),
         }
@@ -1945,18 +2584,34 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_opens_on_the_newest_other_branch_and_the_filter_narrows() {
+    fn the_cursor_opens_on_the_newest_branch_it_can_switch_to_and_the_filter_narrows() {
         let dir = tempfile::tempdir().unwrap();
         let repo = repo(&dir);
         git(&repo, &["branch", "release-1.2", "feature"]);
+        // Same tip, so git's name order puts it ahead of `feature` — and a
+        // worktree holds it, so the cursor must pass it by.
+        let held = dir.path().join("held");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "aaa-held",
+                held.to_str().unwrap(),
+                "feature",
+            ],
+        );
         let mut app = app_on(&repo);
-        open_for(&mut app, &WorktreeId("w1".into()));
+        open_for(&mut app, &w1());
         let v = view(&app);
         assert!(v.listed);
         assert_eq!(v.changes, Some(0));
-        assert!(
-            !v.selected_branch().unwrap().current,
-            "c Enter goes somewhere"
+        assert_eq!(
+            v.selected_branch().unwrap().name,
+            "feature",
+            "c Enter goes to a branch it can switch to"
         );
 
         type_text(&mut app, "rel");
@@ -1977,13 +2632,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = repo(&dir);
         let mut app = app_on(&repo);
-        open_for(&mut app, &WorktreeId("w1".into()));
+        open_for(&mut app, &w1());
         type_text(&mut app, "feat");
         key(&mut app, KeyCode::Enter);
         assert!(app.overlay.is_none(), "{:?}", app.overlay);
         assert_eq!(head(&repo), "feature");
         assert_eq!(app.tree.worktrees[0].branch, "feature");
         assert_eq!(app.flash.as_deref(), Some("⌂ root is on feature"));
+        assert!(app.branch_switch.switching.is_empty());
+    }
+
+    #[test]
+    fn enter_with_nothing_matching_creates_the_typed_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(&dir);
+        let mut app = app_on(&repo);
+        open_for(&mut app, &w1());
+        type_text(&mut app, "brand-new");
+        assert!(view(&app).matches.is_empty());
+        assert!(screen(&mut app, 110, 30).contains("Enter creates \"brand-new\" off main"));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(head(&repo), "brand-new");
+        assert_eq!(app.flash.as_deref(), Some("⌂ root is on brand-new"));
     }
 
     #[test]
@@ -2001,7 +2671,7 @@ mod tests {
             ],
         );
         let mut app = app_on(&repo);
-        open_for(&mut app, &WorktreeId("w1".into()));
+        open_for(&mut app, &w1());
         type_text(&mut app, "main");
         key(&mut app, KeyCode::Enter);
         assert_eq!(view(&app).status.as_ref().unwrap().text, "already on main");
@@ -2022,7 +2692,7 @@ mod tests {
         let repo = repo(&dir);
         std::fs::write(repo.join("a.txt"), "collides\n").unwrap();
         let mut app = app_on(&repo);
-        open_for(&mut app, &WorktreeId("w1".into()));
+        open_for(&mut app, &w1());
         type_text(&mut app, "feat");
         key(&mut app, KeyCode::Enter);
         assert!(
@@ -2030,6 +2700,7 @@ mod tests {
             "{:?}",
             view(&app).stage
         );
+        assert!(app.branch_switch.switching.is_empty(), "the ask is over");
         let text = screen(&mut app, 110, 30);
         assert!(text.contains("main has 1 uncommitted change"), "{text}");
         assert!(
@@ -2056,7 +2727,7 @@ mod tests {
         let repo = repo(&dir);
         std::fs::write(repo.join("a.txt"), "collides\n").unwrap();
         let mut app = app_on(&repo);
-        open_for(&mut app, &WorktreeId("w1".into()));
+        open_for(&mut app, &w1());
         type_text(&mut app, "feat");
         key(&mut app, KeyCode::Enter);
         key(&mut app, KeyCode::Char('d'));
@@ -2068,10 +2739,7 @@ mod tests {
         assert_eq!(head(&repo), "main");
         key(&mut app, KeyCode::Char('d'));
         assert_eq!(head(&repo), "feature");
-        assert_eq!(
-            std::fs::read_to_string(repo.join("a.txt")).unwrap(),
-            "feature\n"
-        );
+        assert_eq!(read_file(&repo, "a.txt"), "feature\n");
     }
 
     #[test]
@@ -2080,7 +2748,7 @@ mod tests {
         let repo = repo(&dir);
         std::fs::write(repo.join("a.txt"), "collides\n").unwrap();
         let mut app = app_on(&repo);
-        open_for(&mut app, &WorktreeId("w1".into()));
+        open_for(&mut app, &w1());
         type_text(&mut app, "feat");
         key(&mut app, KeyCode::Enter);
         key(&mut app, KeyCode::Char('c'));
@@ -2107,7 +2775,7 @@ mod tests {
         let repo = repo(&dir);
         std::fs::write(repo.join("a.txt"), "collides\n").unwrap();
         let mut app = app_on(&repo);
-        open_for(&mut app, &WorktreeId("w1".into()));
+        open_for(&mut app, &w1());
         type_text(&mut app, "feat");
         key(&mut app, KeyCode::Enter);
         key(&mut app, KeyCode::Char('b'));
@@ -2120,21 +2788,161 @@ mod tests {
         assert_eq!(head(&repo), "main");
     }
 
+    /// One switch per checkout: a running one reopens as the working modal,
+    /// `Enter` can't start a second, and the answer to a hidden modal lands
+    /// in the footer — including a dirty checkout, which has to be said.
+    #[test]
+    fn a_running_switch_blocks_a_second_and_its_hidden_answer_lands_in_the_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(&dir);
+        let mut app = app_on(&repo);
+        let job = Job {
+            request: 7,
+            target: local("feature"),
+            carry: Carry::Ask,
+            files: Vec::new(),
+        };
+        app.branch_switch.switching.insert(w1(), job);
+        app.branch_switch.requests = 7;
+
+        open_for(&mut app, &w1());
+        assert!(matches!(view(&app).stage, Stage::Working(ref j) if j.request == 7));
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(view(&app).stage, Stage::Working(_)),
+            "Enter is inert"
+        );
+
+        view_mut(&mut app).stage = Stage::Pick;
+        type_text(&mut app, "feat");
+        key(&mut app, KeyCode::Enter);
+        let status = view(&app).status.clone().unwrap();
+        assert!(status.text.contains("already running"), "{status:?}");
+        assert_eq!(head(&repo), "main");
+
+        let running = app.branch_switch.switching[&w1()].clone();
+        view_mut(&mut app).stage = Stage::Working(running);
+        key(&mut app, KeyCode::Esc);
+        assert!(app.overlay.is_none(), "Esc hides the working modal");
+
+        // A stale answer is nobody's.
+        land_answer(
+            &mut app,
+            Answer::Switched {
+                worktree: w1(),
+                request: 3,
+                outcome: Outcome::Failed("stale".into()),
+            },
+        );
+        assert!(app.branch_switch.switching.contains_key(&w1()));
+
+        land_answer(
+            &mut app,
+            Answer::Switched {
+                worktree: w1(),
+                request: 7,
+                outcome: Outcome::Dirty(changes(&repo).unwrap()),
+            },
+        );
+        assert!(app.branch_switch.switching.is_empty());
+        assert!(
+            app.flash
+                .as_deref()
+                .unwrap()
+                .starts_with("not switched: main has 0"),
+            "{:?}",
+            app.flash
+        );
+    }
+
+    #[test]
+    fn a_cached_listing_takes_current_from_the_tree_and_the_cursor_goes_home_until_moved() {
+        let mut app = app_on(Path::new("/nonexistent-nebula-branch-switch"));
+        let mut main = local("main");
+        main.current = true;
+        let rows = vec![main, local("feature"), local("other")];
+        app.branch_switch.lists.insert(w1(), rows.clone());
+        app.tree.worktrees[0].branch = "feature".into();
+        open_for(&mut app, &w1());
+        let v = view(&app);
+        let current: Vec<&str> = v
+            .branches
+            .iter()
+            .filter(|b| b.current)
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(current, ["feature"], "an agent switched it meanwhile");
+        assert_eq!(v.branches[0].name, "feature", "current leads");
+        assert_eq!(v.selected_branch().unwrap().name, "main");
+
+        // Untouched, a landing listing sends the cursor home; moved, it
+        // keeps its branch.
+        let mut v = BranchSwitchView::new(w1(), "/x".into(), "demo".into(), "main".into(), 0);
+        v.set_branches(parse_rows(&["*main", "feature", "other"]));
+        assert_eq!(v.selected_branch().unwrap().name, "feature");
+        v.select(2);
+        v.set_branches(parse_rows(&["*main", "other", "feature"]));
+        assert_eq!(v.selected_branch().unwrap().name, "other");
+    }
+
+    /// Rows from names, `*` marking the current one.
+    fn parse_rows(names: &[&str]) -> Vec<Branch> {
+        names
+            .iter()
+            .map(|n| {
+                let mut b = local(n.trim_start_matches('*'));
+                b.current = n.starts_with('*');
+                b
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_wide_subject_never_pushes_the_tag_and_age_off_the_row() {
+        let th = App::new().theme;
+        let mut branch = remote("origin/修复-login");
+        branch.subject =
+            "✨ 修复登录重定向 ✨ 修复登录重定向 ✨ 修复登录重定向 ✨ 修复登录重定向".into();
+        branch.committed = 100;
+        for width in [90, 60, 40] {
+            let spans = branch_row(&branch, &[], width, 100 + 7200, th);
+            let used: usize = spans.iter().map(|s| s.width()).sum();
+            assert!(used < width, "{used} cells in a {width}-cell row");
+            assert_eq!(spans.last().unwrap().content, "2h ago");
+        }
+    }
+
     #[test]
     fn the_list_draws_rows_tags_and_the_status_line_and_survives_a_tiny_frame() {
         let dir = tempfile::tempdir().unwrap();
         let repo = repo(&dir);
         std::fs::write(repo.join("b.txt"), "edited\n").unwrap();
         let mut app = app_on(&repo);
-        open_for(&mut app, &WorktreeId("w1".into()));
+        open_for(&mut app, &w1());
         let text = screen(&mut app, 120, 30);
         assert!(
             text.contains("Switch branch — demo ⌂ root · on main"),
             "{text}"
         );
-        assert!(text.contains("current"), "{text}");
+        let current = text
+            .lines()
+            .find(|l| l.contains("current"))
+            .unwrap_or_else(|| panic!("no current row: {text}"));
+        assert!(
+            current.contains("current just now │"),
+            "the tag and age end one column short of the frame: {current:?}"
+        );
         assert!(text.contains("feature work"), "subjects show: {text}");
         assert!(text.contains("1 uncommitted change"), "{text}");
+
+        land_answer(
+            &mut app,
+            Answer::Fetched {
+                worktree: w1(),
+                ok: false,
+            },
+        );
+        assert!(screen(&mut app, 120, 30).contains("couldn't reach the remotes"));
         for (w, h) in [(20, 6), (8, 3), (1, 1)] {
             screen(&mut app, w, h);
         }
@@ -2143,7 +2951,7 @@ mod tests {
     #[test]
     fn a_checkout_that_is_not_on_disk_says_so() {
         let mut app = app_on(Path::new("/nonexistent-nebula-branch-switch"));
-        open_for(&mut app, &WorktreeId("w1".into()));
+        open_for(&mut app, &w1());
         let v = view(&app);
         assert!(v.list_error.as_deref().unwrap().contains("not on disk"));
         assert!(screen(&mut app, 100, 24).contains("couldn't list branches"));
