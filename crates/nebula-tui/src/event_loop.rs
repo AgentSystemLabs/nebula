@@ -4463,7 +4463,8 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
                 title: "Reset settings".into(),
                 message: "Every setting goes back to its default: theme, editor, agent \
                           defaults,\ntimeouts, panel visibility, and all hotkey \
-                          bindings.\nYour config.json is rewritten; this can't be undone."
+                          bindings.\nYour config.json is rewritten and config.local.json \
+                          removed;\nthis can't be undone."
                     .into(),
                 action: PendingAction::ResetSettings,
                 area: ratatui::layout::Rect::default(),
@@ -4678,9 +4679,9 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
 }
 
 /// `R` in the settings overlay, confirmed: rewrite config.json from the
-/// defaults, adopt them live (values and hotkeys both), and put the
-/// overlay back where it was so the reset values are the next thing on
-/// screen.
+/// defaults (removing config.local.json), adopt them live (values and
+/// hotkeys both), and put the overlay back where it was so the reset
+/// values are the next thing on screen.
 fn reset_settings(app: &mut App) {
     let result = crate::config::Config::reset_to_defaults();
     reopen_settings(app);

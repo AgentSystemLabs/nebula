@@ -6,10 +6,14 @@
 //! A plain JSON list in the DATA DIR beside `config.json`, in list order.
 //! A missing or malformed file reads as empty — like the SSH HOSTS FILE it
 //! is a convenience store, never load-bearing. Writes go through a temp
-//! file + rename so a crash mid-write cannot truncate the list.
+//! file + rename so a crash mid-write cannot truncate the list. The list is
+//! read entry by entry, and a save keeps what this build can't read — a
+//! preset for a harness a newer nebula added, a field it has no name for —
+//! so an older nebula sharing the file never deletes a newer one's presets.
 
 use nebula_core::AgentKind;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,7 +73,7 @@ pub fn save(presets: &[AgentPreset]) -> std::io::Result<()> {
     save_to(&store_path(), presets)
 }
 
-fn store_path() -> PathBuf {
+pub(crate) fn store_path() -> PathBuf {
     #[cfg(test)]
     {
         if let Some(path) = PRESETS_PATH_OVERRIDE.with(|p| p.borrow().clone()) {
@@ -80,22 +84,50 @@ fn store_path() -> PathBuf {
 }
 
 fn load_from(path: &Path) -> Vec<AgentPreset> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    nebula_core::settings::read_list(path).0
 }
 
+/// The `name` a raw preset entry carries, as the file spells it.
+pub(crate) fn entry_name(entry: &Value) -> Option<&str> {
+    entry.get("name")?.as_str()
+}
+
+/// Write `presets` in order. Each keeps the fields its stored entry (same
+/// name) had that this build doesn't know, and every stored entry this build
+/// can't read goes after them unless a preset now holds its name.
 fn save_to(store: &Path, presets: &[AgentPreset]) -> std::io::Result<()> {
-    if let Some(parent) = store.parent() {
-        std::fs::create_dir_all(parent)?;
+    let stored = nebula_core::settings::read_array(store)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let named = |name: &str| {
+        stored
+            .iter()
+            .find(|entry| entry_name(entry).is_some_and(|n| n.eq_ignore_ascii_case(name)))
+    };
+    let mut entries = Vec::with_capacity(presets.len());
+    for preset in presets {
+        let Value::Object(known) = serde_json::to_value(preset)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?
+        else {
+            unreachable!("a preset serializes to a JSON object");
+        };
+        let mut entry = named(&preset.name)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        entry.extend(known);
+        entries.push(Value::Object(entry));
     }
-    let mut bytes = serde_json::to_vec_pretty(presets)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    bytes.push(b'\n');
-    let tmp = store.with_extension("json.tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, store)
+    for entry in &stored {
+        let unreadable = serde_json::from_value::<AgentPreset>(entry.clone()).is_err();
+        let taken = entry_name(entry)
+            .is_some_and(|n| presets.iter().any(|p| p.name.eq_ignore_ascii_case(n)));
+        if unreadable && !taken {
+            entries.push(entry.clone());
+        }
+    }
+    nebula_core::settings::write_json(store, &Value::Array(entries))
 }
 
 #[cfg(test)]
@@ -164,6 +196,35 @@ mod tests {
         // A rewrite replaces, never appends.
         save_to(&path, &presets[1..]).unwrap();
         assert_eq!(load_from(&path), presets[1..].to_vec());
+    }
+
+    /// A preset for a harness this build has never heard of — a newer
+    /// nebula's — survives a save, and so does a field this build doesn't know.
+    #[test]
+    fn a_save_keeps_what_a_newer_nebula_wrote() {
+        let (_dir, path) = store();
+        std::fs::write(
+            &path,
+            r#"[
+                {"name": "reviewer", "kind": "codex", "pinned": true},
+                {"name": "future", "kind": "antigravity", "model": "x"}
+            ]"#,
+        )
+        .unwrap();
+        let mut presets = load_from(&path);
+        assert_eq!(presets.len(), 1, "only the readable preset lists");
+        presets[0].prefix = "Be strict.".into();
+        presets.push(preset("scratch", AgentKind::Claude));
+        save_to(&path, &presets).unwrap();
+
+        let saved: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let names: Vec<&str> = saved.iter().filter_map(entry_name).collect();
+        assert_eq!(names, ["reviewer", "scratch", "future"]);
+        assert_eq!(saved[0]["pinned"], true);
+        assert_eq!(saved[0]["prefix"], "Be strict.");
+        assert_eq!(saved[2]["kind"], "antigravity");
+        assert_eq!(load_from(&path).len(), 2);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Oldest entries fall off past this — the picker stays one screen tall.
-const MAX_HOSTS: usize = 20;
+pub(crate) const MAX_HOSTS: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostEntry {
@@ -91,7 +91,7 @@ pub fn ago_label(delta_ms: i64) -> String {
     }
 }
 
-fn store_path() -> PathBuf {
+pub(crate) fn store_path() -> PathBuf {
     #[cfg(test)]
     {
         if let Some(path) = HOSTS_PATH_OVERRIDE.with(|p| p.borrow().clone()) {
@@ -101,11 +101,9 @@ fn store_path() -> PathBuf {
     nebula_core::paths::data_dir().join("ssh_hosts.json")
 }
 
+/// Entry by entry, so one unreadable entry costs only itself.
 fn load_from(path: &Path) -> Vec<HostEntry> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    nebula_core::settings::read_list(path).0
 }
 
 fn record_at(store: &Path, host: &str, path: Option<&str>, now_ms: i64) -> std::io::Result<()> {
@@ -130,13 +128,9 @@ fn remove_at(store: &Path, entry: &HostEntry) -> std::io::Result<()> {
 }
 
 fn save_to(store: &Path, hosts: &[HostEntry]) -> std::io::Result<()> {
-    if let Some(parent) = store.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut bytes = serde_json::to_vec_pretty(hosts)
+    let value = serde_json::to_value(hosts)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    bytes.push(b'\n');
-    std::fs::write(store, bytes)
+    nebula_core::settings::write_json(store, &value)
 }
 
 #[cfg(test)]
@@ -220,6 +214,15 @@ mod tests {
         let left = load_from(&path);
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].path, None, "the dir-less twin survives");
+    }
+
+    #[test]
+    fn an_unreadable_entry_costs_only_itself() {
+        let (_dir, path) = store();
+        std::fs::write(&path, r#"[{"host": 7}, {"host": "ok@box"}]"#).unwrap();
+        let hosts = load_from(&path);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].host, "ok@box");
     }
 
     #[test]

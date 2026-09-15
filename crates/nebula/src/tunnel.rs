@@ -27,7 +27,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::browser;
-use crate::ssh::{install_prelude, shell_single_quote};
+use crate::ssh::{export_settings_bundle, install_prelude, shell_single_quote};
 
 /// Both ends of the tunnel are loopback: the local listener ssh binds, and
 /// the address on the remote that ssh connects the other end to.
@@ -58,7 +58,8 @@ macro_rules! reuse_existing_ttyd {
 }
 
 /// Runs under `sh -c` on the remote: $1 = install URL, $2 = port to serve on,
-/// $3 = start dir (optional; defaults to the remote $HOME). Same quoting
+/// $3 = start dir (optional, may be empty; defaults to the remote $HOME), $4 =
+/// the settings bundle (optional; see [`export_settings_bundle!`]). Same quoting
 /// rules as [`crate::ssh`] — no single quotes, backslashes, or newlines.
 ///
 /// stdout is dropped because the remote `nebula browser` addresses a user
@@ -90,6 +91,7 @@ const REMOTE_SCRIPT: &str = concat!(
     "echo \"nebula tunnel: the nebula on this host is too old to tunnel into; ",
     "reach it with nebula ssh and run nebula upgrade there\" >&2; exit 1; }; ",
     "cd -- \"${3:-$HOME}\" || exit 1; ",
+    export_settings_bundle!("4"),
     "exec nebula browser --no-open --port \"$2\" >/dev/null"
 );
 
@@ -107,6 +109,9 @@ pub struct TunnelOpts {
     /// port, so the two numbers match unless something on the remote is
     /// already sitting on it.
     pub remote_port: Option<u16>,
+    /// Send this machine's settings along, as `nebula ssh` does; false for
+    /// `--no-sync-config`.
+    pub sync_config: bool,
 }
 
 pub fn run_tunnel(opts: TunnelOpts) -> Result<()> {
@@ -175,7 +180,16 @@ fn resolve_local_port(requested: Option<u16>) -> Result<u16> {
 }
 
 fn spawn_ssh(opts: &TunnelOpts, local: u16, remote: u16) -> Result<Child> {
-    let cmd = remote_command(&crate::upgrade::install_url(), remote, opts.path.as_deref());
+    let bundle = opts
+        .sync_config
+        .then(nebula_tui::bundle::for_remote)
+        .flatten();
+    let cmd = remote_command(
+        &crate::upgrade::install_url(),
+        remote,
+        opts.path.as_deref(),
+        bundle.as_deref(),
+    );
     Command::new("ssh")
         // Force a pty (`-tt`, not `-t`) so Ctrl+C here becomes SIGINT on the
         // remote nebula and its ttyd, and hanging up kills them rather than
@@ -208,16 +222,26 @@ fn forward_spec(local: u16, remote: u16) -> String {
     format!("127.0.0.1:{local}:127.0.0.1:{remote}")
 }
 
-fn remote_command(install_url: &str, port: u16, path: Option<&str>) -> String {
+fn remote_command(
+    install_url: &str,
+    port: u16,
+    path: Option<&str>,
+    bundle: Option<&str>,
+) -> String {
     let mut cmd = format!(
         "sh -c '{}' nebula-tunnel {} {}",
         REMOTE_SCRIPT,
         shell_single_quote(install_url),
         port
     );
-    if let Some(path) = path {
+    // A bundle is `$4`, so an absent start dir still takes its place, empty.
+    if path.is_some() || bundle.is_some() {
         cmd.push(' ');
-        cmd.push_str(&shell_single_quote(path));
+        cmd.push_str(&shell_single_quote(path.unwrap_or("")));
+    }
+    if let Some(bundle) = bundle {
+        cmd.push(' ');
+        cmd.push_str(&shell_single_quote(bundle));
     }
     cmd
 }
@@ -306,6 +330,7 @@ mod tests {
             path: None,
             port: None,
             remote_port: None,
+            sync_config: true,
         }
     }
 
@@ -322,7 +347,7 @@ mod tests {
     /// there, and an `xdg-open` that blocks would hang the tunnel.
     #[test]
     fn the_remote_serves_without_opening_anything() {
-        let cmd = remote_command(URL, 7681, None);
+        let cmd = remote_command(URL, 7681, None, None);
         assert!(cmd.contains("nebula browser --no-open --port"), "{cmd}");
         assert!(cmd.ends_with("7681"), "{cmd}");
     }
@@ -345,22 +370,38 @@ mod tests {
     /// rather than left to `nebula browser`'s free-port fallback.
     #[test]
     fn the_port_reaches_the_script_as_a_parameter() {
-        let cmd = remote_command(URL, 9123, None);
+        let cmd = remote_command(URL, 9123, None, None);
         assert!(cmd.contains("nebula-tunnel 'https://example.com/install.sh' 9123"));
         assert!(REMOTE_SCRIPT.contains("--port \"$2\""));
+    }
+
+    /// The settings bundle is the last parameter, exported just before the
+    /// served nebula starts — after the reuse branch, which starts nothing.
+    #[test]
+    fn a_bundle_rides_after_the_start_dir() {
+        let cmd = remote_command(URL, 7681, None, Some("eyJ4IjoxfQ=="));
+        assert!(cmd.ends_with("7681 '' 'eyJ4IjoxfQ=='"), "{cmd}");
+        let export = REMOTE_SCRIPT
+            .find(&format!(
+                "export {}=\"$4\"",
+                nebula_core::env::IMPORT_BUNDLE
+            ))
+            .expect("exports the bundle");
+        let start = REMOTE_SCRIPT.find("exec nebula browser").unwrap();
+        assert!(export < start, "{REMOTE_SCRIPT}");
     }
 
     #[test]
     fn no_path_defaults_to_remote_home() {
         assert!(REMOTE_SCRIPT.contains("${3:-$HOME}"));
-        assert!(remote_command(URL, 7681, None).ends_with("7681"));
+        assert!(remote_command(URL, 7681, None, None).ends_with("7681"));
     }
 
     #[test]
     fn a_path_is_quoted_after_the_port() {
-        let cmd = remote_command(URL, 7681, Some("/srv/my repo"));
+        let cmd = remote_command(URL, 7681, Some("/srv/my repo"), None);
         assert!(cmd.ends_with("7681 '/srv/my repo'"), "{cmd}");
-        let cmd = remote_command(URL, 7681, Some("/tmp/it's here"));
+        let cmd = remote_command(URL, 7681, Some("/tmp/it's here"), None);
         assert!(cmd.ends_with("7681 '/tmp/it'\\''s here'"), "{cmd}");
     }
 

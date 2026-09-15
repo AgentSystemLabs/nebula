@@ -19,6 +19,7 @@ nebula worktree [name]      move this session into a worktree           (agents 
 nebula spawn <task>         start another agent session beside it       (agents run this)
 nebula open <file>…         show files in this nebula's file tabs       (agents run this)
 nebula workspace <cmd>      manage workspaces — named groups of projects
+nebula config <cmd>         back up, restore or locate this machine's settings
 nebula browser              serve this TUI in a web browser via ttyd
 nebula ssh <host>           open nebula on a remote host over ssh
 nebula tunnel <host>        open a remote host's nebula in a tab here
@@ -77,12 +78,31 @@ nebula workspace rename <a> <b> # rename a workspace
 nebula workspace delete <name>  # delete an empty workspace
 ```
 
+## Settings
+
+```sh
+nebula config path              # where config.json, config.local.json, agent_presets.json and
+                                # ssh_hosts.json live
+nebula config export [path]     # one JSON file of this machine's settings: stdout, a file, or
+                                # nebula-settings.json inside a folder. Never config.local.json
+nebula config import <source>   # merge a backup in: an export, a bare config.json /
+                                # agent_presets.json / ssh_hosts.json, a folder holding any of
+                                # them, or - for stdin. Keys it sets replace this machine's, keys
+                                # it lacks stay, and config.local.json is never written
+```
+
+See [Configuration](configuration.md#backup-restore-and-other-machines).
+
 ## Other machines, other screens
 
 ```sh
 nebula ssh <host> [dir]   # open nebula on a remote machine over ssh (installs it there if
                           # missing); destinations are remembered for the TUI's HOSTS PICKER
-                          # (`Shift+H`). Needs the OpenSSH client (`ssh`) on PATH here
+                          # (`Shift+H`). Needs the OpenSSH client (`ssh`) on PATH here. This
+                          # machine's config.json and agent presets ride along, and the remote
+                          # nebula merges them into its own settings (its config.local.json
+                          # still wins); --no-sync-config or the ssh_sync_config setting leaves
+                          # them here
 nebula tunnel <host> [dir] [--port N] [--remote-port N]
                           # that host's nebula in a browser tab here, over one ssh tunnel: installs
                           # nebula there if missing, runs `nebula browser` on its loopback, forwards
@@ -94,7 +114,8 @@ nebula tunnel <host> [dir] [--port N] [--remote-port N]
                           # Needs the OpenSSH client (`ssh`) on PATH here and ttyd on the remote;
                           # Ctrl+C takes both ends down. --port is the local end (same rules as
                           # `nebula browser`), --remote-port the far end when something there
-                          # already holds that number
+                          # already holds that number. Settings ride along as they do for
+                          # `nebula ssh` (--no-sync-config leaves them here)
 nebula browser [--port N] [--bind ADDR | --public] [--credential USER:PASSWORD] [--no-open]
                           # serve this TUI in a browser tab via ttyd and open it; needs ttyd on
                           # PATH. With no --port it takes 7681 when that's free and a free port

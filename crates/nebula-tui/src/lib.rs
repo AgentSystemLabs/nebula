@@ -2,6 +2,7 @@ pub mod agent_picker;
 pub mod agent_presets;
 pub mod app;
 pub mod branch_name;
+pub mod bundle;
 pub mod claude_catalogue;
 pub mod completion;
 pub mod config;
@@ -45,6 +46,14 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
         .worker_threads(2)
         .enable_all()
         .build()?)
+}
+
+pub use bundle::ConfigOp;
+
+/// `nebula config path | export | import`: locate, back up and restore this
+/// machine's settings. See [`bundle`].
+pub fn run_config(op: ConfigOp) -> Result<()> {
+    bundle::run(op)
 }
 
 /// Entry point for the TUI client. Terminal setup/teardown lives here so the

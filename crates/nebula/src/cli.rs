@@ -186,6 +186,18 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
+    /// Back up, restore or locate this machine's settings.
+    ///
+    /// Settings live in `config.json` — the portable file an export, an
+    /// import and `nebula ssh` carry — with `config.local.json` over it for
+    /// what only makes sense on this machine, beside `agent_presets.json` and
+    /// `ssh_hosts.json`. An export is one JSON file holding all but the local
+    /// layer; an import merges one in. Changes apply without a restart.
+    #[command(after_help = CONFIG_EXAMPLES)]
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Serve this TUI in a web browser via ttyd.
     ///
     /// Runs ttyd in front of a nebula TUI and opens a tab on it, so a phone or
@@ -232,14 +244,21 @@ pub(crate) enum Command {
     ///
     /// Connects with ssh and runs nebula there, installing it on the remote
     /// first when it is missing, so what you drive is the remote's own daemon
-    /// and sessions. Destinations are remembered for the TUI's host picker
-    /// (`Shift+H`).
+    /// and sessions. This machine's `config.json` and agent presets ride
+    /// along and are merged into the remote's settings, where its own
+    /// `config.local.json` still wins. Destinations are remembered for the
+    /// TUI's host picker (`Shift+H`).
     #[command(after_help = SSH_EXAMPLES)]
     Ssh {
         /// ssh destination, passed verbatim (e.g. user@server).
         host: String,
         /// Remote directory to start in (default: remote $HOME).
         path: Option<String>,
+        /// Leave this machine's settings behind for this connection.
+        ///
+        /// The `ssh_sync_config` setting turns the forward off for good.
+        #[arg(long)]
+        no_sync_config: bool,
     },
     /// Open a remote host's nebula in a browser tab here.
     ///
@@ -267,6 +286,13 @@ pub(crate) enum Command {
         /// Name one when something on the remote already holds that port.
         #[arg(long, value_name = "PORT")]
         remote_port: Option<u16>,
+        /// Leave this machine's settings behind for this connection.
+        ///
+        /// By default `config.json` and the agent presets ride along, as they
+        /// do for `nebula ssh`; the `ssh_sync_config` setting turns that off
+        /// for good.
+        #[arg(long)]
+        no_sync_config: bool,
     },
     /// Install the latest published nebula over this one.
     ///
@@ -348,7 +374,15 @@ Examples:
 const SSH_EXAMPLES: &str = "\
 Examples:
   nebula ssh user@server           open the remote's nebula
-  nebula ssh user@server /srv/app  start in a directory there";
+  nebula ssh user@server /srv/app  start in a directory there
+  nebula ssh user@server --no-sync-config
+                                   keep this machine's settings here";
+
+const CONFIG_EXAMPLES: &str = "\
+Examples:
+  nebula config path               where each settings file lives
+  nebula config export ~/backups   write ~/backups/nebula-settings.json
+  nebula config import ~/backups   merge it back in, here or elsewhere";
 
 const TUNNEL_EXAMPLES: &str = "\
 Examples:
@@ -361,6 +395,46 @@ const UPGRADE_EXAMPLES: &str = "\
 Examples:
   nebula upgrade                   install the latest release
   nebula upgrade --force           do it over a local cargo build";
+
+#[derive(Subcommand)]
+pub(crate) enum ConfigCommand {
+    /// Print where each settings file lives.
+    ///
+    /// `NEBULA_CONFIG_FILE` moves `config.json` alone — into a dotfiles
+    /// checkout, say; `NEBULA_DATA_DIR` moves them all.
+    #[command(after_help = "Example:\n  nebula config path")]
+    Path,
+    /// Write this machine's settings to one JSON file.
+    ///
+    /// Carries `config.json`, the agent presets and the ssh host list, never
+    /// `config.local.json`. Keys and presets this build doesn't know are
+    /// carried as they are, so a newer nebula's settings survive the trip.
+    #[command(
+        after_help = "Examples:\n  nebula config export > nebula-settings.json\n  \
+                            nebula config export ~/backups   writes ~/backups/nebula-settings.json"
+    )]
+    Export {
+        /// File, or existing folder, to write (default: stdout; `-` too).
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+    },
+    /// Merge a settings backup into this machine's settings.
+    ///
+    /// Takes an export, a bare `config.json`, `agent_presets.json` or
+    /// `ssh_hosts.json`, a folder holding any of them, or `-` for stdin. Keys
+    /// the file sets replace this machine's and keys it lacks are left alone;
+    /// presets merge by name and hosts by destination. `config.local.json` is
+    /// never written, and still wins.
+    #[command(
+        after_help = "Examples:\n  nebula config import nebula-settings.json\n  \
+                            nebula config import ~/dotfiles/nebula   a folder holding config.json"
+    )]
+    Import {
+        /// The file, the folder, or `-` for stdin.
+        #[arg(value_name = "SOURCE")]
+        source: String,
+    },
+}
 
 #[derive(Subcommand)]
 pub(crate) enum WorkspaceCommand {

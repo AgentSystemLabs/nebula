@@ -2,29 +2,46 @@
 
 <sub>[← README](../README.md) · [Keys](keys.md) · [Commands](commands.md) · [Sessions](sessions.md) · [Configuration](configuration.md) · [How it works](how-it-works.md)</sub>
 
-CONFIG.JSON is the one settings file, in the DATA DIR beside the SQLITE STORE — hand-editable, and
+CONFIG.JSON is the settings file, in the DATA DIR beside the SQLITE STORE — hand-editable, and
 what the `s` SETTINGS OVERLAY writes:
 
 - **macOS**: `~/Library/Application Support/dev.nebula.nebula/config.json`
 - **Linux**: `~/.local/share/nebula/config.json`
+- `NEBULA_CONFIG_FILE` moves that one file — into a dotfiles checkout, say — and leaves everything
+  else where it is. A save writes through a symlink instead of replacing it, so linking `config.json`
+  into a repo works as well.
 - `NEBULA_DATA_DIR` moves the whole directory, config included (tests, parallel instances).
+- `nebula config path` prints where each settings file is.
 
-Both halves of nebula read that one file. The TUI owns most keys; the DAEMON owns
+CONFIG.LOCAL.JSON, beside it in the DATA DIR, has the same keys and wins over `config.json` one key at
+a time. It is for what only makes sense on this machine — an editor a remote box lacks,
+`prewarm_agents: false` on a small one — and it is never exported, never sent over `nebula ssh`, and
+never written by an import. Create it by hand with just the keys to pin; after that the overlay
+writes a key it holds back into it, so changing that setting here keeps it local, and every other key
+into `config.json`:
+
+```json
+{ "editor": "nano", "prewarm_agents": false }
+```
+
+Both halves of nebula read the two files. The TUI owns most keys; the DAEMON owns
 `git_init_on_create`, `worktree_base_branch`, `session_idle_timeout`, `prewarm_agents` and
-`prewarm_sessions`. Each side deserializes only its own fields and ignores the rest, and both load it
-fresh on every use — so a hand edit applies without restarting either. No key is required: a missing
-file is all defaults, an unknown field is skipped, and a malformed file is logged and ignored rather
-than failing the operation that read it. The overlay patches only the keys it knows and leaves
-everything else in the JSON untouched, so hand-written fields survive a save.
+`prewarm_sessions`. Each side deserializes only its own fields and ignores the rest, and both load
+them fresh on every use — so a hand edit applies without restarting either. No key is required: a
+missing file is all defaults, an unknown field is skipped, a value this build can't read costs only
+that key (it takes its default and stays as stored in the file), and a malformed file is logged and
+ignored rather than failing the operation that read it. The overlay patches only the keys it knows
+and leaves everything else in the JSON untouched, so hand-written fields survive a save. See
+[Compatibility rules](#compatibility-rules) for why.
 
-Files beside it in the DATA DIR: `nebula.db` (the SQLITE STORE), `agent_presets.json` (AGENT
-PRESETS), `cursor_models.json` (the cached `cursor-agent --list-models` answer, refreshed after 24h),
+Files beside it in the DATA DIR: `nebula.db` (the SQLITE STORE), `config.local.json` (above),
+`agent_presets.json` (AGENT PRESETS), `cursor_models.json` (the cached `cursor-agent --list-models` answer, refreshed after 24h),
 `ssh_hosts.json` (the SSH HOSTS FILE), `reviewed.json` (REVIEWED MARKS). All but the database are
 convenience stores: missing or malformed reads as empty.
 
 ## Every setting
 
-Thirty-eight keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
+Forty keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
 exists only in the file, so it is hand-edit-only. Most rows toggle or cycle on `Enter` / `←` / `→`; a
 *typed* row (`worktree_base_branch`) opens a one-line prompt on `Enter` instead, pre-filled with the
 stored value, and an empty answer puts its default back. The Agents tab groups its rows under **Quick
@@ -39,6 +56,7 @@ how the tree is worked; every switch there is off by default.
 | `worktree_base_branch` | string | `""` | General | DAEMON-owned WORKTREE BASE BRANCH: where every new WORKTREE nobody named a base for starts — `n` in the WORKTREES PANEL, a bare `nebula worktree`, the QUICK PROMPT's auto-created one (`nebula worktree --base` always wins). Empty, shown as `auto` in the overlay, is origin's own default branch: `origin/HEAD` freshly fetched, normally `origin/main`. A name — `master`, `develop` — is resolved the way `--base` resolves one: origin is fetched and origin's copy of that branch (`origin/master`) is the start point, untracked, never the checkout's local branch of that name, which is only as new as its last pull; a branch origin lacks that the checkout has locally is used as named. The setting is one name for every project, so a repo with no branch of that name at all does not fail the `n`: it falls back to `origin/HEAD` as if the key were empty, and `daemon.log` says which repo ignored it. A leading `origin/` is dropped (`origin/master` means `master`); a tag or SHA is not a branch and falls back too — name those with `--base`. Typed, not cycled: `Enter` on the row opens a prompt, an empty answer puts `auto` back. |
 | `editor` | string | `"vim"` | General | The EDITOR the FILE FINDER (`f`), TREE BROWSER (`b`), find-in-files (`Shift+F`) and ⌥click launch, invoked as `<editor> +<line> <file>`. The overlay cycles `vim`, `nvim`, `nano`, `emacs`, `hx`; any command passes through verbatim, so a hand edit can name one the picker doesn't. `NEBULA_EDITOR` overrides it for the process. |
 | `close_finder_on_open` | bool | `true` | General | Opening a file closes the FILE FINDER behind the editor modal, so quitting the editor is one Esc instead of two. Off leaves the results underneath. Never touches the TREE BROWSER (its editor is its own preview pane) or ⌥click. |
+| `ssh_sync_config` | bool | `true` | General | SETTINGS SYNC: `nebula ssh` and `nebula tunnel` send this machine's `config.json` and AGENT PRESETS along, and the remote nebula merges them into its own settings before it starts — so a remote is set up the way this machine is on every connect, without reconfiguring it. Its `config.local.json` still wins there, and its projects, sessions and SSH HOSTS FILE stay its own. `--no-sync-config` leaves the settings behind for one connection. See [Backup, restore and other machines](#backup-restore-and-other-machines). |
 | `skip_session_naming` | bool | `false` | Sessions | New AGENTS launch straight from the NEW SESSION PICKER with no task box, taking the generated name and AUTO-TITLE; the first prompt is typed in the CLI instead. The key predates the box, which stands where a name prompt used to. |
 | `confirm_on_archive` | bool | `false` | Sessions | Put a CONFIRM DIALOG in front of archiving a session — `a` and the row menu's **Archive** alike — for when typing aimed at an agent keeps landing on the SESSIONS PANEL and archiving the session under the cursor. Off, archive is the one verb on that panel that skips the dialog `d` goes behind: it is cheap to undo with `u`, and the dialog says so. |
 | `session_idle_timeout` | string | `"5m"` | Sessions | DAEMON-owned IDLE TIMEOUT: how long a session in a WORKTREE no client is viewing goes unwatched before the IDLE REAPER kills its PTY. See the values below. |
@@ -108,8 +126,8 @@ on the next ATTACH or prewarm, and an agent RESUMES its conversation there.
 
 ## What the settings overlay owns
 
-- **Settings live in one JSON file** (`config.json`, beside the database), read fresh on each use by both
-  the daemon and the TUI, so hand edits apply without a restart. `s` opens the settings overlay over the
+- **Settings live in one JSON file** (`config.json`, beside the database, with `config.local.json` over
+  it), read fresh on each use by both the daemon and the TUI, so hand edits apply without a restart. `s` opens the settings overlay over the
   same file: color theme, animations, the FOCUSED PANEL TINT, whether the Workspaces bar,
   PROJECTS PANEL, and WORKTREES PANEL are shown,
   editor, the branch new worktrees start from (`worktree_base_branch`: `auto` for origin's default
@@ -125,13 +143,82 @@ on the next ATTACH or prewarm, and an agent RESUMES its conversation there.
   both), whether new sessions stop to ask for a first
   prompt (`skip_session_naming`), and whether `a` asks before archiving one (`confirm_on_archive`, off unless you turn it
   on). `R` inside the overlay puts every setting — hotkeys included — back to its default, after a
-  confirmation.
+  confirmation, and removes `config.local.json`.
 - **Every panel key is rebindable.** The overlay's Hotkeys tab lists every action and what it answers to,
   and writes overrides into the same file (`"keybindings": {"git_diff": "ctrl+g, g"}`); an empty value
   unbinds. Because nebula is always a guest inside Terminal.app / Ghostty / tmux, the tab says at bind
   time when a chord probably won't survive the trip — `⌘` anything, `^⇧` without the kitty protocol,
   `^←` on stock macOS. `Ctrl+q` is the one exception to all of it: it unlocks a terminal no matter what
   you bind, since unbinding your way out would trap you in the session.
+
+## Backup, restore and other machines
+
+```sh
+nebula config path                  # where each settings file is
+nebula config export ~/backups      # write ~/backups/nebula-settings.json
+nebula config import ~/backups      # merge it back in, here or on a new machine
+```
+
+A SETTINGS BUNDLE is one JSON file holding `config.json`, `agent_presets.json` and `ssh_hosts.json`,
+each exactly as the file has it, under a marker key:
+
+```json
+{
+  "nebula_bundle": 1,
+  "exported_by": "0.27.0",
+  "config": { "theme": "ocean", "keybindings": { "git_diff": "ctrl+g" } },
+  "agent_presets": [{ "name": "reviewer", "kind": "claude", "prefix": "Be strict." }],
+  "ssh_hosts": [{ "host": "me@box", "last_used_ms": 1789400000000 }]
+}
+```
+
+- **Export** writes to stdout, to a file, or to `nebula-settings.json` inside a folder you name. It
+  never carries `config.local.json`, the database, the logs or the PR and model caches.
+- **Import** takes an export, a bare `config.json`, `agent_presets.json` or `ssh_hosts.json`, a folder
+  holding any of them (a dotfiles folder, a copy of an old data dir), or `-` for stdin. It merges
+  rather than replaces: keys the file sets replace this machine's and keys it lacks are left alone,
+  presets merge by name, and hosts merge by destination, keeping the most recent. `config.local.json`
+  is never written, and the summary names any imported key it still overrides. A settings file that
+  exists but can't be read fails the import before anything is written. Changes apply without a
+  restart.
+- **Copying the file works too.** Both halves re-read `config.json` on every use, so a backup copied
+  over it — or to wherever `NEBULA_CONFIG_FILE` points — applies at once, with no import and no
+  restart.
+- **Over ssh** (`ssh_sync_config`, on by default), `nebula ssh` and `nebula tunnel` export
+  `config.json` and the presets into the one ssh command they already run, and the remote nebula
+  imports them before it starts, saying what changed on stderr. Sync is one way: the machine you
+  connect from wins key by key on each connect, so a setting the remote should keep goes in the
+  remote's `config.local.json`. A remote nebula too old to know about the bundle ignores it and starts
+  as before. The bundle travels base64-encoded in the remote command, so that machine's process list
+  shows it while ssh starts. Settings hold no credentials, but a preset's prefix text travels too.
+  A bundle over 64 KiB is not sent (a real one is a few KiB), and the connection goes ahead without
+  it.
+
+### Compatibility rules
+
+Two nebula versions share these files all the time: a remote a few releases behind the machine that
+connects to it, a backup restored into a newer build. Every setting follows these rules so neither
+version breaks the other:
+
+1. **Keys are only ever added.** A released key keeps its name, its type and its meaning. A new
+   meaning gets a new key, and nebula keeps reading and writing the old one for older builds.
+2. **Missing means default; unknown is kept.** A key a file lacks is its default. A key a build
+   doesn't know is ignored when read and written back untouched on save; the overlay's `R` reset is
+   the one thing that drops it.
+3. **One bad value costs one key.** A value a build can't read takes its default in that build, is
+   logged, and stays as stored unless that setting is changed on that machine. Preset and host
+   entries work the same way: one this build can't read, such as a preset for a harness a newer
+   nebula added, is kept through a save rather than deleted.
+4. **Choices fall back when used, not when read.** Values like `theme` and `quick_prompt_kind` stay
+   plain strings, and a name a build doesn't know falls back to the default where it is used.
+5. **Old files are tested.** `crates/nebula-core/fixtures/config-<version>.json` holds every key a
+   release wrote, each set to something other than its default, and the test suite checks that every
+   one still loads as written and survives a save. Each release adds its own fixture.
+
+`config.json` carries no version number. An older build could only refuse a newer file or ignore the
+number, and the keys a file holds already tell a newer build everything it needs. The bundle's
+`nebula_bundle` marks the file and never gates it: sections are only ever added, and a reader leaves
+one it doesn't know alone.
 
 ## Worktree hooks
 
@@ -219,6 +306,7 @@ Knobs worth reaching for by hand:
 |---|---|---|
 | `NEBULA_LOG` | — | `RUST_LOG`-style tracing filter for both the DAEMON and the TUI. |
 | `NEBULA_EDITOR` | — | Editor command the file modals open, ahead of the `editor` setting. |
+| `NEBULA_CONFIG_FILE` | `<DATA DIR>/config.json` | Moves `config.json` alone — into a dotfiles checkout, say — leaving the database, logs and `config.local.json` in the DATA DIR. Give an absolute or `~/` path. The DAEMON reads it from its own environment, so after changing it run `nebula kill` and relaunch. |
 
 Overrides for tests and parallel instances — real, but not things a normal install needs:
 
@@ -235,4 +323,6 @@ Overrides for tests and parallel instances — real, but not things a normal ins
 
 `NEBULA_AGENT_ID`, `NEBULA_API_URL` and `NEBULA_API_TOKEN` are set *by* the DAEMON on every agent
 PTY (and scrubbed from plain terminals) so hooks can reach the HOOK RECEIVER — never something you
-set yourself. For all of these, empty and unset mean the same thing: use the default.
+set yourself. `NEBULA_IMPORT_BUNDLE` is likewise set *by* `nebula ssh` and `nebula tunnel` in the
+remote command: the SETTINGS BUNDLE the remote nebula merges at startup and removes from its
+environment before it starts anything. For all of these, empty and unset mean the same thing: use the default.
