@@ -1518,10 +1518,16 @@ mod tests {
 
     /// Config files earlier releases wrote, every value off its default.
     /// Add one per release; see [`config_files_from_earlier_releases_still_load_every_key`].
-    const CONFIG_FIXTURES: &[(&str, &str)] = &[(
-        "0.26.0",
-        include_str!("../../nebula-core/fixtures/config-0.26.0.json"),
-    )];
+    const CONFIG_FIXTURES: &[(&str, &str)] = &[
+        (
+            "0.26.0",
+            include_str!("../../nebula-core/fixtures/config-0.26.0.json"),
+        ),
+        (
+            "0.27.0",
+            include_str!("../../nebula-core/fixtures/config-0.27.0.json"),
+        ),
+    ];
 
     fn read_json_file(path: &Path) -> serde_json::Value {
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
