@@ -2373,6 +2373,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::GitDiff if app.previewed_pr().is_some() => request_pr_diff(app),
         Action::GitDiff => open_diff_view(app),
         Action::OpenRepo => open_repo_in_browser(app),
+        Action::OpenGhosttyTab => open_ghostty_tab(app),
         // Shift+Enter: the checkout's OPEN COMMAND. Worktrees panel only —
         // on every other panel the shifted Enter has nothing to open.
         Action::OpenWorktree => {
@@ -2592,6 +2593,74 @@ fn open_repo_in_browser(app: &mut App) {
         Ok(url) => app.flash = Some(format!("couldn't open {url}")),
         Err(msg) => app.flash = Some(msg),
     }
+}
+
+/// A new Ghostty tab in the selected worktree's directory (`c`), or in the
+/// project's own clone when it has no worktrees yet. `open -a` hands
+/// Ghostty a folder, which it takes like one dropped on its Dock icon: a tab
+/// in the front window under the default `macos-dock-drop-behavior =
+/// new-tab`. Silent — no flash at all — when there is no Ghostty to hand it
+/// to: off macOS, no Ghostty.app installed, or over ssh, where `open` would
+/// reach the remote machine's screen instead of the one being looked at.
+fn open_ghostty_tab(app: &mut App) {
+    open_ghostty_tab_with(app, ghostty_app());
+}
+
+fn open_ghostty_tab_with(app: &mut App, ghostty: Option<std::path::PathBuf>) {
+    let Some(ghostty) = ghostty.filter(|_| !app.is_remote) else {
+        return;
+    };
+    let dir = app
+        .selected_worktree()
+        .map(|w| w.path.clone())
+        .or_else(|| app.selected_project().map(|p| p.repo_path.clone()));
+    let Some(dir) = dir else {
+        app.flash = Some(SELECT_CONTEXT_FIRST.into());
+        return;
+    };
+    if !dir.is_dir() {
+        app.flash = Some(format!("path missing on disk: {}", dir.display()));
+        return;
+    }
+    app.flash = Some(if open_in_app(&ghostty, &dir) {
+        format!("opened a Ghostty tab in {}", dir.display())
+    } else {
+        format!("couldn't open a Ghostty tab in {}", dir.display())
+    });
+}
+
+/// Ghostty.app where macOS installs put it: `/Applications` for the DMG drag
+/// and Homebrew's cask, `~/Applications` for a per-user drag.
+fn ghostty_app() -> Option<std::path::PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let mut roots = vec![std::path::PathBuf::from("/")];
+    roots.extend(std::env::var_os("HOME").map(std::path::PathBuf::from));
+    ghostty_app_in(&roots)
+}
+
+fn ghostty_app_in(roots: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    roots
+        .iter()
+        .map(|root| root.join("Applications/Ghostty.app"))
+        .find(|bundle| bundle.is_dir())
+}
+
+/// `open -a <bundle> <path>`: whether LaunchServices took the hand-off.
+fn open_in_app(bundle: &std::path::Path, path: &std::path::Path) -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    use std::process::{Command, Stdio};
+    Command::new("open")
+        .arg("-a")
+        .arg(bundle)
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// `r` on the Worktrees panel: start the selected checkout's RUN COMMAND,
@@ -9377,6 +9446,107 @@ mod tests {
                     recent_prompts: Vec::new(),
                 }),
             },
+        );
+    }
+
+    /// One project whose only worktree is checked out at `dir`.
+    fn seed_worktree_at(app: &mut App, dir: &std::path::Path) {
+        use nebula_core::{Entity, Project, ProjectId, Worktree, WorktreeId};
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(Project {
+                    workspace_id: Default::default(),
+                    id: ProjectId("p1".into()),
+                    name: "demo".into(),
+                    repo_path: dir.to_path_buf(),
+                    sort_order: 0,
+                }),
+            },
+        );
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w1".into()),
+                    project_id: ProjectId("p1".into()),
+                    path: dir.to_path_buf(),
+                    branch: "main".into(),
+                    is_main: true,
+                    sort_order: 0,
+                }),
+            },
+        );
+    }
+
+    const GHOSTTY: &str = "/Applications/Ghostty.app";
+
+    #[test]
+    fn ghostty_tab_opens_in_the_selected_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        app.is_remote = false;
+        seed_worktree_at(&mut app, dir.path());
+        app.flash = None;
+        open_ghostty_tab_with(&mut app, Some(GHOSTTY.into()));
+        assert_eq!(
+            app.flash,
+            Some(format!("opened a Ghostty tab in {}", dir.path().display()))
+        );
+    }
+
+    #[test]
+    fn ghostty_tab_is_silent_without_ghostty_or_over_ssh() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        app.is_remote = false;
+        seed_worktree_at(&mut app, dir.path());
+        app.flash = None;
+        open_ghostty_tab_with(&mut app, None);
+        assert_eq!(app.flash, None, "no Ghostty.app: not a word");
+
+        let mut empty = App::new();
+        empty.flash = None;
+        open_ghostty_tab_with(&mut empty, None);
+        assert_eq!(empty.flash, None, "nor a select-first nudge");
+
+        app.is_remote = true;
+        open_ghostty_tab_with(&mut app, Some(GHOSTTY.into()));
+        assert_eq!(app.flash, None, "over ssh the tab would open elsewhere");
+    }
+
+    #[test]
+    fn ghostty_tab_names_a_checkout_gone_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        let mut app = App::new();
+        app.is_remote = false;
+        seed_worktree_at(&mut app, &gone);
+        app.flash = None;
+        open_ghostty_tab_with(&mut app, Some(GHOSTTY.into()));
+        assert_eq!(
+            app.flash,
+            Some(format!("path missing on disk: {}", gone.display()))
+        );
+    }
+
+    #[test]
+    fn ghostty_app_is_found_in_either_applications_folder() {
+        let system = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let roots = [system.path().to_path_buf(), home.path().to_path_buf()];
+        assert_eq!(ghostty_app_in(&roots), None);
+
+        let user_app = home.path().join("Applications/Ghostty.app");
+        std::fs::create_dir_all(&user_app).unwrap();
+        assert_eq!(ghostty_app_in(&roots), Some(user_app));
+
+        let system_app = system.path().join("Applications/Ghostty.app");
+        std::fs::create_dir_all(&system_app).unwrap();
+        assert_eq!(
+            ghostty_app_in(&roots),
+            Some(system_app),
+            "/Applications wins"
         );
     }
 

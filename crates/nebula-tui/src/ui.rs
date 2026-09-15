@@ -700,7 +700,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[OpenWorktree]), "fire .nebula.json \"open\""),
                         (Act(&[HalfPageDown, HalfPageUp]), "half a panel down / up"),
                         (Act(&[GitDiff]), "git diff (^r: mark reviewed ✓)"),
-                        (Act(&[OpenRepo]), "open the repo on GitHub"),
+                        (
+                            Act(&[OpenRepo, OpenGhosttyTab]),
+                            "repo on GitHub / Ghostty tab",
+                        ),
                         (Act(&[RefreshPullRequests]), "refresh pull requests now"),
                         (Act(&[Issues]), "github issues: prompt / preset on one"),
                         (Act(&[SwitchBranch]), "switch the ⌂ root checkout's branch"),
