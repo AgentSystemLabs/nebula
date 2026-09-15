@@ -2603,7 +2603,7 @@ fn open_repo_in_browser(app: &mut App) {
     }
 }
 
-/// A new Ghostty tab in the selected worktree's directory (`c`), or in the
+/// A new Ghostty tab in the selected worktree's directory (`Shift+C`), or in the
 /// project's own clone when it has no worktrees yet. `open -a` hands
 /// Ghostty a folder, which it takes like one dropped on its Dock icon: a tab
 /// in the front window under the default `macos-dock-drop-behavior =

@@ -70,7 +70,7 @@ pub enum Action {
     New,
     GitDiff,
     OpenRepo,
-    /// `c`: a new Ghostty tab in the selected worktree's directory —
+    /// `Shift+C`: a new Ghostty tab in the selected worktree's directory —
     /// a silent no-op on a machine without Ghostty.
     OpenGhosttyTab,
     /// `Shift+R`: ask GitHub for the pull requests again now, past every
@@ -316,7 +316,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         hint: "Open a new Ghostty tab in the selected worktree's directory; does nothing without Ghostty.app",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
-        defaults: &["c"],
+        defaults: &["shift+c"],
     },
     ActionSpec {
         action: Action::RefreshPullRequests,
