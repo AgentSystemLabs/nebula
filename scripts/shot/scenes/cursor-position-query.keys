@@ -1,0 +1,6 @@
+# t opens a plain shell terminal; the probe (see the .setup.sh) asks for the cursor position the way
+# crossterm's cursor::position() does and prints what came back — the call a crossterm app like muse
+# makes on startup (#66).
+t
+./cursor-probe
+Enter

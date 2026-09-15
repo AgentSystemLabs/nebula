@@ -7,6 +7,11 @@
 //! Also answers DA1 (`CSI c`) — the common detection recipe is "send the
 //! kitty query then DA1, protocol is supported iff the kitty reply arrives
 //! before the DA1 reply", which needs a DA1 reply to terminate promptly.
+//!
+//! And the DSR queries: device status (`CSI 5 n`) is always OK, while a
+//! cursor position report (`CSI 6 n`) needs a screen, so the scanner only
+//! marks where in the chunk it was asked and the pump answers it from
+//! `pty::cursor`. Replies stay in query order either way.
 
 use super::ESC;
 
@@ -18,10 +23,30 @@ const MAX_PARAMS: usize = 16;
 /// What the pump should do in response to scanned output.
 #[derive(Debug, Default, PartialEq)]
 pub struct ScanActions {
-    /// Bytes to write to the child's stdin (query/DA1 replies).
-    pub reply: Vec<u8>,
+    /// Replies owed to the child's stdin, in the order it asked — detection
+    /// recipes key on which reply arrives first.
+    pub replies: Vec<Reply>,
     /// Set when the effective flags changed; broadcast to attached clients.
     pub flags_changed: Option<u8>,
+}
+
+/// A reply to one query; adjacent byte replies are merged.
+#[derive(Debug, PartialEq)]
+pub enum Reply {
+    /// Known from the scanner alone: kitty flags, DA1, device status.
+    Bytes(Vec<u8>),
+    /// A cursor position report on the screen as it stood `at` bytes into
+    /// the fed chunk, just past the query. The pump fills it in.
+    CursorPosition { at: usize },
+}
+
+impl ScanActions {
+    fn reply_bytes(&mut self, bytes: &[u8]) {
+        match self.replies.last_mut() {
+            Some(Reply::Bytes(pending)) => pending.extend_from_slice(bytes),
+            _ => self.replies.push(Reply::Bytes(bytes.to_vec())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,8 +91,8 @@ impl KittyScanner {
     pub fn feed(&mut self, data: &[u8]) -> ScanActions {
         let mut actions = ScanActions::default();
         let before = self.flags();
-        for &b in data {
-            self.step(b, &mut actions);
+        for (i, &b) in data.iter().enumerate() {
+            self.step(b, i + 1, &mut actions);
         }
         let after = self.flags();
         if after != before {
@@ -76,7 +101,8 @@ impl KittyScanner {
         actions
     }
 
-    fn step(&mut self, b: u8, actions: &mut ScanActions) {
+    /// `end` is the offset in the fed chunk just past `b`.
+    fn step(&mut self, b: u8, end: usize, actions: &mut ScanActions) {
         match self.state {
             State::Ground => {
                 if b == ESC {
@@ -103,7 +129,7 @@ impl KittyScanner {
                 0x20..=0x2F => self.state = State::Csi { poisoned: true },
                 0x40..=0x7E => {
                     if !poisoned {
-                        self.dispatch(b, actions);
+                        self.dispatch(b, end, actions);
                     }
                     self.state = State::Ground;
                 }
@@ -113,15 +139,13 @@ impl KittyScanner {
         }
     }
 
-    fn dispatch(&mut self, final_byte: u8, actions: &mut ScanActions) {
+    fn dispatch(&mut self, final_byte: u8, end: usize, actions: &mut ScanActions) {
         let params = std::mem::take(&mut self.params);
         match final_byte {
             b'u' => match params.split_first() {
                 // CSI ? u — "do you speak kitty?" Reply with current flags.
                 Some((b'?', [])) => {
-                    actions
-                        .reply
-                        .extend_from_slice(format!("\x1b[?{}u", self.flags()).as_bytes());
+                    actions.reply_bytes(format!("\x1b[?{}u", self.flags()).as_bytes());
                 }
                 // CSI > flags u — push (flags default 0).
                 Some((b'>', rest)) => {
@@ -164,8 +188,12 @@ impl KittyScanner {
             },
             // DA1 (CSI c / CSI 0 c): claim VT102 so detection loops terminate.
             b'c' if params.is_empty() || params == [b'0'] => {
-                actions.reply.extend_from_slice(b"\x1b[?6c");
+                actions.reply_bytes(b"\x1b[?6c");
             }
+            // DSR 5 (device status): always OK.
+            b'n' if params == [b'5'] => actions.reply_bytes(b"\x1b[0n"),
+            // DSR 6 (cursor position): the pump reads it off a screen.
+            b'n' if params == [b'6'] => actions.replies.push(Reply::CursorPosition { at: end }),
             _ => {}
         }
     }
@@ -182,14 +210,18 @@ fn parse_num(bytes: &[u8]) -> Option<u32> {
 mod tests {
     use super::*;
 
+    fn bytes(reply: &[u8]) -> Vec<Reply> {
+        vec![Reply::Bytes(reply.to_vec())]
+    }
+
     #[test]
     fn query_gets_reply_with_current_flags() {
         let mut s = KittyScanner::new();
         let a = s.feed(b"\x1b[?u");
-        assert_eq!(a.reply, b"\x1b[?0u");
+        assert_eq!(a.replies, bytes(b"\x1b[?0u"));
         s.feed(b"\x1b[>5u");
         let a = s.feed(b"\x1b[?u");
-        assert_eq!(a.reply, b"\x1b[?5u");
+        assert_eq!(a.replies, bytes(b"\x1b[?5u"));
     }
 
     #[test]
@@ -239,9 +271,36 @@ mod tests {
     #[test]
     fn da1_gets_vt102_reply() {
         let mut s = KittyScanner::new();
-        assert_eq!(s.feed(b"\x1b[c").reply, b"\x1b[?6c");
-        assert_eq!(s.feed(b"\x1b[0c").reply, b"\x1b[?6c");
+        assert_eq!(s.feed(b"\x1b[c").replies, bytes(b"\x1b[?6c"));
+        assert_eq!(s.feed(b"\x1b[0c").replies, bytes(b"\x1b[?6c"));
         // DA2 / DA-with-args are not answered.
         assert_eq!(s.feed(b"\x1b[>c"), ScanActions::default());
+    }
+
+    #[test]
+    fn device_status_is_ok() {
+        let mut s = KittyScanner::new();
+        assert_eq!(s.feed(b"\x1b[5n").replies, bytes(b"\x1b[0n"));
+        // DEC's private form is not answered.
+        assert_eq!(s.feed(b"\x1b[?6n"), ScanActions::default());
+    }
+
+    #[test]
+    fn cursor_position_is_left_to_the_pump_in_query_order() {
+        let mut s = KittyScanner::new();
+        // `at` points just past the query's final byte, and the report keeps
+        // its place between the byte replies around it.
+        let a = s.feed(b"\x1b[?u\x1b[cab\x1b[6ncd\x1b[c");
+        assert_eq!(
+            a.replies,
+            [
+                Reply::Bytes(b"\x1b[?0u\x1b[?6c".to_vec()),
+                Reply::CursorPosition { at: 13 },
+                Reply::Bytes(b"\x1b[?6c".to_vec()),
+            ]
+        );
+        // Split across chunks, `at` is into the chunk that finished it.
+        assert_eq!(s.feed(b"\x1b["), ScanActions::default());
+        assert_eq!(s.feed(b"6n").replies, [Reply::CursorPosition { at: 2 }]);
     }
 }
