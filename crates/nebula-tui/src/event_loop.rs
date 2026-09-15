@@ -303,6 +303,11 @@ async fn main_loop(
     let (issues_tx, mut issues_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::issues::IssuesAnswer>();
     app.issues_tx = Some(issues_tx);
+    // The BRANCH SWITCHER's git — the listing, the changed-file count,
+    // the background fetch and the switch itself — lands here too.
+    let (branch_tx, mut branch_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::branch_switch::Answer>();
+    app.branch_switch.tx = Some(branch_tx);
     // A newer nebula published on GitHub, probed off the loop at start and
     // then on a slow beat (`update_check::interval`; the e2e tests turn it
     // off). Only a newer version ever arrives, so the footer's indicator,
@@ -540,6 +545,11 @@ async fn main_loop(
             answer = issues_rx.recv() => {
                 if let Some(answer) = answer {
                     crate::issues::land_answer(&mut app, answer);
+                }
+            }
+            answer = branch_rx.recv() => {
+                if let Some(answer) = answer {
+                    crate::branch_switch::land_answer(&mut app, answer);
                 }
             }
         }
@@ -1853,6 +1863,12 @@ fn paste_into_overlay(app: &mut App, text: &str) -> bool {
                 crate::git_diff::load_selected_diff(view);
             }
         }
+        // The query, or the commit message while that is being typed.
+        Overlay::BranchSwitch(view) => {
+            if !crate::branch_switch::paste(view, text) {
+                return false;
+            }
+        }
         // Only types while its add/edit input is open.
         Overlay::Hosts(view) => match &mut view.input {
             Some(input) => input.insert_str(text),
@@ -2111,6 +2127,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::AgentPresets => crate::preset_overlays::open_agent_presets(app),
         Action::QuickPrompt => crate::quick_prompt::open_quick_prompt(app),
         Action::Issues => crate::issues::open_issues(app),
+        Action::SwitchBranch => crate::branch_switch::open_branch_switch(app),
         // Ctrl+→ still reaches the terminal pane (the counterpart of the
         // Ctrl+← escape hatch).
         Action::FocusTerminal => {
@@ -2258,11 +2275,26 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 let id = app.tree.active_workspace.clone();
                 open_prompt(app, PromptKind::RenameWorkspace { id });
             }
-            Focus::Worktrees | Focus::Terminal => {}
+            // Nothing on the Worktrees panel is renamed, so `r` is RUN
+            // there: the checkout's `.nebula.json` RUN COMMAND, started or
+            // stopped. The KEY COMBO DISPLAY says which, not "Rename".
+            Focus::Worktrees => {
+                let running = app
+                    .selected_worktree()
+                    .is_some_and(|w| app.worktree_running(&w.id));
+                let does = if running {
+                    "Stop the run"
+                } else {
+                    "Run worktree"
+                };
+                crate::key_combo::note(app, &[chord], Some(does));
+                toggle_run(app, out);
+            }
+            Focus::Terminal => {}
         },
-        // Its own key rather than a meaning `r` takes on where nothing can
-        // be renamed: the selection it acts on is the selected project and
-        // worktree, which every panel has, so it is not scoped to a row.
+        // Its own key rather than another meaning for `r`: the selection it
+        // acts on is the selected project and worktree, which every panel
+        // has, so it is not scoped to a row.
         Action::RefreshPullRequests => refresh_pull_requests(app),
         Action::Archive => {
             if app.focus == Focus::Sessions {
@@ -2341,6 +2373,13 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::GitDiff if app.previewed_pr().is_some() => request_pr_diff(app),
         Action::GitDiff => open_diff_view(app),
         Action::OpenRepo => open_repo_in_browser(app),
+        // Shift+Enter: the checkout's OPEN COMMAND. Worktrees panel only —
+        // on every other panel the shifted Enter has nothing to open.
+        Action::OpenWorktree => {
+            if app.focus == Focus::Worktrees {
+                open_selected_worktree(app);
+            }
+        }
         // AddProject adds a project from ANY panel — unlike New it never
         // changes meaning with focus, matching the "open a repo" instinct.
         Action::AddProject => open_prompt(app, PromptKind::AddProject),
@@ -2553,6 +2592,120 @@ fn open_repo_in_browser(app: &mut App) {
         Ok(url) => app.flash = Some(format!("couldn't open {url}")),
         Err(msg) => app.flash = Some(msg),
     }
+}
+
+/// `r` on the Worktrees panel: start the selected checkout's RUN COMMAND,
+/// or stop it when it is already up.
+fn toggle_run(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if app.selected_worktree_pr().is_some() {
+        app.flash = Some("a pull request has no checkout to run — pick a worktree".into());
+        return;
+    }
+    let Some(w) = app.selected_worktree().cloned() else {
+        app.flash = Some(SELECT_CONTEXT_FIRST.into());
+        return;
+    };
+    toggle_run_in(app, &w, out);
+}
+
+/// Ask the DAEMON to start `worktree`'s run, or to stop it while it runs.
+fn toggle_run_in(app: &mut App, worktree: &nebula_core::Worktree, out: &mut Vec<ClientRequest>) {
+    if app.is_placeholder_worktree(&worktree.id) {
+        app.flash = Some(WORKTREE_STILL_CREATING.into());
+        return;
+    }
+    let start = !app.worktree_running(&worktree.id);
+    let intent = PendingIntent::RunToggled {
+        branch: worktree.branch.clone(),
+        started: start,
+    };
+    let id = worktree.id.clone();
+    send_with(app, out, intent, |req_id| {
+        if start {
+            ClientRequest::StartRun {
+                req_id,
+                worktree: id,
+            }
+        } else {
+            ClientRequest::StopRun {
+                req_id,
+                worktree: id,
+            }
+        }
+    });
+}
+
+/// `Shift+Enter` on the Worktrees panel: fire the selected checkout's OPEN
+/// COMMAND.
+fn open_selected_worktree(app: &mut App) {
+    if app.selected_worktree_pr().is_some() {
+        app.flash = Some("a pull request has no checkout to open — pick a worktree".into());
+        return;
+    }
+    let Some(w) = app.selected_worktree().cloned() else {
+        app.flash = Some(SELECT_CONTEXT_FIRST.into());
+        return;
+    };
+    open_worktree(app, &w);
+}
+
+/// Run `worktree`'s `.nebula.json` OPEN COMMAND once and say so. The TUI
+/// runs it, not the DAEMON: it opens a browser or an editor on the machine
+/// the user is sitting at.
+fn open_worktree(app: &mut App, worktree: &nebula_core::Worktree) {
+    let main = app
+        .tree
+        .projects
+        .iter()
+        .find(|p| p.id == worktree.project_id)
+        .map_or_else(|| worktree.path.clone(), |p| p.repo_path.clone());
+    let command = match nebula_core::project_file::command(
+        &worktree.path,
+        &main,
+        nebula_core::project_file::ProjectCommand::Open,
+    ) {
+        Ok(command) => command,
+        Err(msg) => {
+            app.flash = Some(msg);
+            return;
+        }
+    };
+    app.flash = Some(match spawn_open_command(&command, &worktree.path) {
+        Ok(()) => format!("↗ {command}"),
+        Err(e) => format!("couldn't run {command}: {e}"),
+    });
+}
+
+/// Start an OPEN COMMAND through `$SHELL -c` in `cwd`, kept off the TUI's
+/// screen: no stdin, output discarded (a stray byte on the TUI's terminal
+/// tears the frame), a process group of its own, reaped on a thread. A
+/// failure to start is the caller's to show; a non-zero exit only logs,
+/// since by then `open` has handed the URL over or said why not.
+fn spawn_open_command(command: &str, cwd: &std::path::Path) -> std::io::Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let mut child = Command::new(shell)
+        .arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    let command = command.to_string();
+    std::thread::spawn(move || match child.wait() {
+        Ok(status) if !status.success() => {
+            tracing::warn!(%command, %status, "open command failed");
+        }
+        Err(err) => tracing::warn!(%command, %err, "open command not reaped"),
+        Ok(_) => {}
+    });
+    Ok(())
 }
 
 /// The selected worktree's checkout — path and branch — for the modals that
@@ -3701,6 +3854,36 @@ fn refresh_workspace_picker(app: &mut App) {
     reopen_workspace_picker(app, hover);
 }
 
+/// A checkout row's context menu in the Worktrees panel — the same rows
+/// from `m` as from a right-click.
+fn worktree_menu_items(app: &App, w: &nebula_core::Worktree) -> Vec<MenuItem> {
+    let run = if app.worktree_running(&w.id) {
+        "Stop run"
+    } else {
+        "Run"
+    };
+    let mut items = vec![
+        MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
+        MenuItem::new("New terminal", MenuAction::NewTerminal(w.id.clone())),
+        MenuItem::new(run, MenuAction::ToggleRun(w.id.clone())),
+        MenuItem::new("Open", MenuAction::OpenWorktree(w.id.clone())),
+    ];
+    // The ROOT WORKTREE moves between branches; a linked worktree, named
+    // for its branch, is deleted instead.
+    if w.is_main {
+        items.push(MenuItem::new(
+            "Switch branch…",
+            MenuAction::SwitchBranch(w.id.clone()),
+        ));
+    } else {
+        items.push(MenuItem::destructive(
+            "Delete worktree",
+            MenuAction::DeleteWorktree(w.id.clone()),
+        ));
+    }
+    items
+}
+
 fn open_context_menu_for_selection(app: &mut App) {
     let at = KEYBOARD_MENU_ANCHOR;
     match app.focus {
@@ -3730,17 +3913,8 @@ fn open_context_menu_for_selection(app: &mut App) {
             if let Some(pr) = app.selected_worktree_pr().cloned() {
                 let items = pr_row_menu_items(app, &pr);
                 open_menu(app, items, at);
-            } else if let Some(w) = app.selected_worktree() {
-                let mut items = vec![
-                    MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
-                    MenuItem::new("New terminal", MenuAction::NewTerminal(w.id.clone())),
-                ];
-                if !w.is_main {
-                    items.push(MenuItem::destructive(
-                        "Delete worktree",
-                        MenuAction::DeleteWorktree(w.id.clone()),
-                    ));
-                }
+            } else if let Some(w) = app.selected_worktree().cloned() {
+                let items = worktree_menu_items(app, &w);
                 open_menu(app, items, at);
             }
         }
@@ -3853,6 +4027,7 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
         Overlay::AgentPresets(_) => crate::preset_overlays::handle_list_key(app, key),
         Overlay::AgentPresetEditor(_) => crate::preset_overlays::handle_editor_key(app, key),
         Overlay::Issues(_) => crate::issues::handle_key(app, key),
+        Overlay::BranchSwitch(_) => crate::branch_switch::handle_key(app, key),
         Overlay::Menu(menu) => match key.code {
             // Type-ahead in the MODEL / EFFORT submenus: letters narrow the
             // rows (so ↑/↓ move there, not j/k), Backspace widens, and Esc
@@ -5425,6 +5600,16 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 delete_link(app, &row);
             }
         }
+        MenuAction::ToggleRun(id) => {
+            if let Some(w) = app.tree.worktrees.iter().find(|w| w.id == id).cloned() {
+                toggle_run_in(app, &w, out);
+            }
+        }
+        MenuAction::OpenWorktree(id) => {
+            if let Some(w) = app.tree.worktrees.iter().find(|w| w.id == id).cloned() {
+                open_worktree(app, &w);
+            }
+        }
         MenuAction::DeleteWorktree(id) => {
             if app.is_placeholder_worktree(&id) {
                 app.flash = Some(WORKTREE_STILL_CREATING.into());
@@ -5437,6 +5622,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 }));
             }
         }
+        MenuAction::SwitchBranch(id) => crate::branch_switch::open_for(app, &id),
         MenuAction::AddProject => open_prompt(app, PromptKind::AddProject),
         MenuAction::RenameProject(id) => open_prompt(app, PromptKind::RenameProject { id }),
         MenuAction::OpenWorkspace(id) => {
@@ -7275,6 +7461,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         crate::issues::handle_mouse(app, mouse, mouse_pos);
         return;
     }
+    if matches!(&app.overlay, Some(Overlay::BranchSwitch(_))) {
+        crate::branch_switch::handle_mouse(app, mouse, mouse_pos);
+        return;
+    }
     // Hosts picker: the wheel moves the selection, a click on a row connects
     // (the context-menu convention — rows are actions, not editable items);
     // everything else inside the box is swallowed.
@@ -7790,17 +7980,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     if let Some(pr) = app.selected_worktree_pr().cloned() {
                         let items = pr_row_menu_items(app, &pr);
                         open_menu(app, items, at);
-                    } else if let Some(w) = app.selected_worktree() {
-                        let mut items = vec![
-                            MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
-                            MenuItem::new("New terminal", MenuAction::NewTerminal(w.id.clone())),
-                        ];
-                        if !w.is_main {
-                            items.push(MenuItem::destructive(
-                                "Delete worktree",
-                                MenuAction::DeleteWorktree(w.id.clone()),
-                            ));
-                        }
+                    } else if let Some(w) = app.selected_worktree().cloned() {
+                        let items = worktree_menu_items(app, &w);
                         open_menu(app, items, at);
                     }
                 }
@@ -8050,6 +8231,38 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 ) => attach_created(app, id, focus, placeholder, out),
                 (Some(PendingIntent::ReopenPromptOnError { note, .. }), _) => {
                     app.flash = Some(note);
+                }
+                (
+                    Some(PendingIntent::RunToggled {
+                        branch,
+                        started: true,
+                    }),
+                    created,
+                ) => {
+                    // The reply usually beats the broadcast upsert, so the
+                    // row naming the command may not be in the tree yet:
+                    // then the flash names it when the row lands.
+                    match created {
+                        Some(EntityId::Terminal(id)) => match run_command_of(app, &id) {
+                            Some(command) => {
+                                app.flash = Some(format!("▶ running {command} in {branch}"));
+                            }
+                            None => {
+                                app.flash = Some(format!("▶ running in {branch}"));
+                                app.run_flash_when_seen = Some((id, branch));
+                            }
+                        },
+                        _ => app.flash = Some(format!("▶ running in {branch}")),
+                    }
+                }
+                (
+                    Some(PendingIntent::RunToggled {
+                        branch,
+                        started: false,
+                    }),
+                    _,
+                ) => {
+                    app.flash = Some(format!("■ stopped the run in {branch}"));
                 }
                 (Some(PendingIntent::SelectCreatedProject), Some(EntityId::Project(id))) => {
                     // Its upsert usually lands just before this Ack; if not,
@@ -8336,9 +8549,33 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
                 app.select_when_seen = Some(SessionRef::Agent(id));
             }
         }
-        Entity::Terminal(t) => upsert_by(&mut app.tree.terminals, t, |x, y| x.id == y.id),
+        Entity::Terminal(t) => {
+            let id = t.id.clone();
+            upsert_by(&mut app.tree.terminals, t, |x, y| x.id == y.id);
+            if app
+                .run_flash_when_seen
+                .as_ref()
+                .is_some_and(|(want, _)| *want == id)
+            {
+                if let (Some(command), Some((_, branch))) =
+                    (run_command_of(app, &id), app.run_flash_when_seen.take())
+                {
+                    app.flash = Some(format!("▶ running {command} in {branch}"));
+                }
+            }
+        }
         Entity::Link(l) => upsert_by(&mut app.tree.links, l, |x, y| x.id == y.id),
     }
+}
+
+/// The command a RUN TERMINAL in the tree runs; None for a plain shell or
+/// a row not seen yet.
+fn run_command_of(app: &App, id: &TerminalId) -> Option<String> {
+    app.tree
+        .terminals
+        .iter()
+        .find(|t| &t.id == id)
+        .and_then(|t| t.run_command.clone())
 }
 
 /// Replace the first entry of `list` that `same` pairs with `item`, or
@@ -12469,9 +12706,15 @@ diff --git a/src/c.rs b/src/c.rs
         press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
         assert!(
             !app.open_prs_lookup_due(&pid) && !app.pr_refresh_requested,
-            "plain r is rename, and refreshes nothing"
+            "plain r runs the checkout, and refreshes nothing"
+        );
+        assert!(
+            out.iter()
+                .all(|r| matches!(r, ClientRequest::StartRun { .. })),
+            "{out:?}"
         );
         assert!(app.overlay.is_none() && app.flash.is_none());
+        out.clear();
 
         // Another checkout of the project, resting on the sweep's beat.
         let other = add_worktree(&mut app, "w2", "/tmp/demo-w2");
@@ -15078,9 +15321,136 @@ diff --git a/src/c.rs b/src/c.rs
                     name: name.into(),
                     sort_order: 0,
                     alive: true,
+                    run_command: None,
                 }),
             },
         );
+    }
+
+    /// `r` on the Worktrees panel runs the checkout — nothing is renamed
+    /// there — the Ack names what is running, and `r` again stops it.
+    #[test]
+    fn r_on_a_worktree_starts_its_run_and_again_stops_it() {
+        use nebula_core::{Entity, TerminalId, TerminalTab, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
+        let req_id = out
+            .iter()
+            .find_map(|r| match r {
+                ClientRequest::StartRun { req_id, worktree } if worktree.0 == "w1" => Some(*req_id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("r sends StartRun: {out:?}"));
+        assert!(app.overlay.is_none(), "no rename prompt on a worktree");
+        assert!(!app.worktree_running(&WorktreeId("w1".into())));
+
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Terminal(TerminalTab {
+                    id: TerminalId("run1".into()),
+                    worktree_id: WorktreeId("w1".into()),
+                    name: "run".into(),
+                    sort_order: 0,
+                    alive: true,
+                    run_command: Some("npm run dev".into()),
+                }),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(EntityId::Terminal(TerminalId("run1".into()))),
+            },
+        );
+        assert_eq!(app.flash.as_deref(), Some("▶ running npm run dev in main"));
+        assert!(app.worktree_running(&WorktreeId("w1".into())));
+        assert_eq!(app.run_flash_when_seen, None);
+
+        out.clear();
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
+        assert!(
+            out.iter().any(
+                |r| matches!(r, ClientRequest::StopRun { worktree, .. } if worktree.0 == "w1")
+            ),
+            "r on a running worktree stops it: {out:?}"
+        );
+    }
+
+    /// The DAEMON's reply to `StartRun` usually reaches the TUI before the
+    /// broadcast upsert of the terminal it started: the flash names the
+    /// branch at once and the command when the row lands.
+    #[test]
+    fn a_run_ack_ahead_of_its_terminal_names_the_command_when_it_lands() {
+        use nebula_core::{Entity, TerminalTab, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
+        let req_id = out
+            .iter()
+            .find_map(|r| match r {
+                ClientRequest::StartRun { req_id, .. } => Some(*req_id),
+                _ => None,
+            })
+            .expect("r sends StartRun");
+        hse(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(EntityId::Terminal(TerminalId("run1".into()))),
+            },
+        );
+        assert_eq!(app.flash.as_deref(), Some("▶ running in main"));
+
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Terminal(TerminalTab {
+                    id: TerminalId("run1".into()),
+                    worktree_id: WorktreeId("w1".into()),
+                    name: "run".into(),
+                    sort_order: 0,
+                    alive: true,
+                    run_command: Some("bun dev".into()),
+                }),
+            },
+        );
+        assert_eq!(app.flash.as_deref(), Some("▶ running bun dev in main"));
+        assert_eq!(app.run_flash_when_seen, None, "spent");
+    }
+
+    /// `Shift+Enter` on a worktree fires `.nebula.json`'s `open` — and says
+    /// what to add when there is none, without Enter's drill-in.
+    #[test]
+    fn shift_enter_on_a_worktree_fires_its_open_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, dir.path());
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
+        assert!(
+            app.flash
+                .as_deref()
+                .is_some_and(|f| f.contains("no .nebula.json")),
+            "{:?}",
+            app.flash
+        );
+        assert_eq!(app.focus, Focus::Worktrees, "not Enter's drill-in");
+
+        std::fs::write(
+            dir.path().join(".nebula.json"),
+            r#"{"open": "open http://localhost:3000"}"#,
+        )
+        .unwrap();
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
+        assert_eq!(app.flash.as_deref(), Some("↗ open http://localhost:3000"));
     }
 
     #[test]
@@ -18605,6 +18975,146 @@ diff --git a/src/c.rs b/src/c.rs
             app.focus,
             Focus::Sessions,
             "arrow navigation works from an exited pane"
+        );
+    }
+
+    // ---- branch switcher ----
+
+    /// A linked worktree beside `seed_tree`'s root, on its own branch.
+    fn seed_linked_worktree(app: &mut App) {
+        use nebula_core::{Entity, ProjectId, Worktree, WorktreeId};
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w2".into()),
+                    project_id: ProjectId("p1".into()),
+                    path: "/tmp/demo-worktrees/feature".into(),
+                    branch: "feature".into(),
+                    is_main: false,
+                    sort_order: 0,
+                }),
+            },
+        );
+    }
+
+    fn branch_switch_target(app: &App) -> Option<WorktreeId> {
+        match &app.overlay {
+            Some(Overlay::BranchSwitch(view)) => Some(view.worktree.clone()),
+            _ => None,
+        }
+    }
+
+    /// `c` moves the ROOT WORKTREE and nothing else: from its own row, from
+    /// the Projects panel whatever the Worktrees cursor is on, and never
+    /// from a linked worktree's row, which stays on the branch it was cut
+    /// for.
+    #[test]
+    fn c_opens_the_branch_switcher_on_the_root_and_refuses_a_linked_worktree() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        seed_tree(&mut app);
+        seed_linked_worktree(&mut app);
+        let root = WorktreeId("w1".into());
+        let mains: Vec<bool> = app.visible_worktrees().iter().map(|w| w.is_main).collect();
+        assert_eq!(mains, [true, false], "the root row leads");
+
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 1;
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "{:?}", app.overlay);
+        assert!(
+            app.flash
+                .as_deref()
+                .is_some_and(|f| f.contains("root checkout")),
+            "{:?}",
+            app.flash
+        );
+
+        app.focus = Focus::Projects;
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            branch_switch_target(&app),
+            Some(root.clone()),
+            "the Projects panel means the project's root"
+        );
+        app.overlay = None;
+
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 0;
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE, &mut out);
+        assert_eq!(branch_switch_target(&app), Some(root));
+    }
+
+    /// The root row's menu is where the mouse finds the switcher, in the
+    /// seat a linked worktree's Delete takes.
+    #[test]
+    fn the_root_rows_menu_offers_switch_branch_and_a_worktree_row_offers_delete() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        seed_tree(&mut app);
+        seed_linked_worktree(&mut app);
+        app.focus = Focus::Worktrees;
+        let labels = |app: &App| match &app.overlay {
+            Some(Overlay::Menu(menu)) => menu
+                .items
+                .iter()
+                .map(|i| i.label.clone())
+                .collect::<Vec<_>>(),
+            other => panic!("no menu: {other:?}"),
+        };
+
+        app.sel_worktree = 1;
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE, &mut out);
+        let linked = labels(&app);
+        assert!(linked.iter().any(|l| l == "Delete worktree"), "{linked:?}");
+        assert!(!linked.iter().any(|l| l == "Switch branch…"), "{linked:?}");
+        app.overlay = None;
+
+        app.sel_worktree = 0;
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE, &mut out);
+        let root = labels(&app);
+        assert!(!root.iter().any(|l| l == "Delete worktree"), "{root:?}");
+        let at = root
+            .iter()
+            .position(|l| l == "Switch branch…")
+            .expect("the root row offers it");
+        if let Some(Overlay::Menu(menu)) = &mut app.overlay {
+            menu.hover = at;
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(branch_switch_target(&app), Some(WorktreeId("w1".into())));
+    }
+
+    /// Through the real key path — the KEYMAP's `c`, a query typed into the
+    /// modal (so `f`, `e` and `a` feed the filter instead of firing their
+    /// panel hotkeys), `Enter` — a real root checkout moves and its row
+    /// follows before the DAEMON's sync has said a word.
+    #[test]
+    fn the_branch_switcher_moves_a_real_root_through_the_key_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        run_git(&repo, &["branch", "feature"]);
+        let mut app = App::new();
+        let mut out = Vec::new();
+        seed_repo_tree(&mut app, &repo);
+        app.focus = Focus::Worktrees;
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE, &mut out);
+        for c in "feat".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "{:?}", app.overlay);
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "feature");
+        assert_eq!(
+            app.selected_worktree().map(|w| w.branch.as_str()),
+            Some("feature")
         );
     }
 
@@ -27047,6 +27557,14 @@ diff --git a/src/c.rs b/src/c.rs
                 None,
             ),
             (
+                "BranchSwitch",
+                |app| {
+                    seed_tree(app);
+                    press(app, KeyCode::Char('c'), KeyModifiers::NONE, &mut Vec::new());
+                },
+                None,
+            ),
+            (
                 "Hosts",
                 |app| {
                     app.overlay = Some(Overlay::Hosts(crate::app::HostsView::new(vec![
@@ -27217,6 +27735,7 @@ diff --git a/src/c.rs b/src/c.rs
             Overlay::AgentPresets(_) => "AgentPresets",
             Overlay::AgentPresetEditor(_) => "AgentPresetEditor",
             Overlay::Issues(_) => "Issues",
+            Overlay::BranchSwitch(_) => "BranchSwitch",
         }
     }
 
@@ -27245,7 +27764,7 @@ diff --git a/src/c.rs b/src/c.rs
             let mut unique = seen.clone();
             unique.dedup();
             assert_eq!(unique, seen, "two rows for the same variant");
-            assert_eq!(seen.len(), 16, "a variant came or went: {seen:?}");
+            assert_eq!(seen.len(), 17, "a variant came or went: {seen:?}");
         });
     }
 

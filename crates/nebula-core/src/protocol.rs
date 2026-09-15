@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 39;
+pub const PROTOCOL_VERSION: u32 = 40;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -324,6 +324,24 @@ pub enum ClientRequest {
     CloseTerminal {
         req_id: u64,
         id: TerminalId,
+    },
+    /// `r` on a worktree: start the project's RUN COMMAND — the `run` of
+    /// the `.nebula.json` in that checkout, else the main checkout's, read
+    /// fresh — in the worktree's RUN TERMINAL, a login shell running that
+    /// line and nothing else. An exited run's row is reused; a run still
+    /// going is left alone and named in the reply, so a second client's
+    /// press never starts a second one. Answered with
+    /// `Ack { created: Some(EntityId::Terminal(..)) }`; no file or no
+    /// command is an Error saying what to add.
+    StartRun {
+        req_id: u64,
+        worktree: WorktreeId,
+    },
+    /// `r` again: kill the worktree's RUN TERMINAL and drop its row.
+    /// Nothing running is not an error.
+    StopRun {
+        req_id: u64,
+        worktree: WorktreeId,
     },
 
     /// Fire-and-forget opaque TUI blob (last selection etc.).
