@@ -74,6 +74,9 @@ pub enum HitTarget {
     /// logical (0 Projects, 1 Worktrees, 2 Sessions), so hidden panels keep
     /// their remembered widths without owning a boundary.
     Splitter(usize),
+    /// The small collapse button in a sidebar panel's header row (right
+    /// end). A click hides that panel, the same as its `Shift+` hotkey.
+    CollapsePanel(Focus),
 }
 
 /// Default widths of the Projects / Worktrees / Sessions panels. Sessions
@@ -88,6 +91,15 @@ pub const DEFAULT_PANEL_WIDTHS: [u16; 3] = [20, 22, 32];
 pub const WORKSPACES_BAR_H: u16 = 4;
 /// A panel can't be dragged narrower than this.
 pub const MIN_PANEL_W: u16 = 10;
+/// Height of the hidden workspaces bar: one rail row carrying an expand
+/// chevron at the same right-end column the bar's collapse chevron sits
+/// in. Clickable across the whole row.
+pub const COLLAPSED_BAR_H: u16 = 1;
+/// Width of a collapsed sidebar panel's rail: the column rule itself,
+/// with the expand chevron drawn over it on the header row. Clickable
+/// along its whole height. The panel's remembered width is untouched
+/// while it is a rail, so expanding restores it.
+pub const COLLAPSED_RAIL_W: u16 = 1;
 /// The terminal pane always keeps at least this much width.
 pub const MIN_TERM_W: u16 = 20;
 
@@ -2207,10 +2219,17 @@ pub struct App {
     /// setting, which both `Shift+W` and the Appearance tab write — this
     /// field is the live copy, the config file is where it persists.
     pub show_workspaces: bool,
-    /// Projects panel hidden; mirrors CONFIG.JSON's `hide_projects`.
+    /// Projects panel collapsed to a rail; mirrors CONFIG.JSON's
+    /// `hide_projects` (the key predates rails and keeps its name so
+    /// existing configs carry over: `true` used to hide the panel
+    /// outright, now it collapses it).
     pub hide_projects: bool,
-    /// Worktrees panel hidden; mirrors CONFIG.JSON's `hide_worktrees`.
+    /// Worktrees panel collapsed to a rail; mirrors CONFIG.JSON's
+    /// `hide_worktrees` (same rename history as `hide_projects`).
     pub hide_worktrees: bool,
+    /// Sessions panel collapsed to a rail; mirrors CONFIG.JSON's
+    /// `hide_sessions`.
+    pub hide_sessions: bool,
     /// Draft pull requests left out of the PROJECT OPEN PRS GROUP and the
     /// `/` PALETTE; mirrors CONFIG.JSON's `hide_draft_prs` (Settings →
     /// Appearance, or the Worktrees panel menu). Read on every look at
@@ -2559,6 +2578,7 @@ impl App {
             show_workspaces: true,
             hide_projects: false,
             hide_worktrees: false,
+            hide_sessions: false,
             hide_draft_prs: false,
             hide_root_worktree: false,
             recent_prompts: 0,
@@ -2743,34 +2763,77 @@ impl App {
         (self.splash_epoch.elapsed().as_millis() / SWEEP_FRAME.as_millis()) as usize
     }
 
-    /// Rows the Workspaces bar takes off the top of the body when it's
-    /// shown, nothing when hidden. Every screen-y computation for the
-    /// panels below it starts here.
+    /// Rows the Workspaces bar takes off the top of the body: the full
+    /// bar when shown, a one-row rail with an expand chevron when hidden
+    /// (like the side panels' rails, so the bar never vanishes without a
+    /// way back). Every screen-y computation for the panels below it
+    /// starts here.
     pub fn workspaces_bar_h(&self) -> u16 {
         if self.show_workspaces {
             WORKSPACES_BAR_H
         } else {
-            0
+            COLLAPSED_BAR_H
         }
     }
 
-    /// Visible sidebar indices, left to right. Sessions is always present.
+    /// Sidebar indices occupying body columns, left to right. Collapsed
+    /// panels stay in the row as rails, so every panel is always present;
+    /// the terminal pane takes whatever width is left.
     pub fn visible_panel_indices(&self) -> Vec<usize> {
         (0..3).filter(|idx| self.panel_visible(*idx)).collect()
     }
 
     pub fn panel_visible(&self, idx: usize) -> bool {
+        matches!(idx, 0 | 1 | 2)
+    }
+
+    /// Expanded sidebar indices: collapsed panels (rails) hold no rows,
+    /// own no splitter, and take no part in width normalization.
+    pub fn expanded_panel_indices(&self) -> Vec<usize> {
+        (0..3).filter(|idx| self.panel_expanded(*idx)).collect()
+    }
+
+    pub fn panel_expanded(&self, idx: usize) -> bool {
         match idx {
             0 => !self.hide_projects,
             1 => !self.hide_worktrees,
-            2 => true,
+            2 => !self.hide_sessions,
             _ => false,
         }
     }
 
-    /// Every visible sidebar owns the draggable boundary on its right.
+    /// Width a panel draws at: its remembered width expanded, the fixed
+    /// rail width collapsed.
+    pub fn panel_draw_width(&self, idx: usize) -> u16 {
+        if self.panel_expanded(idx) {
+            self.panel_widths[idx]
+        } else {
+            COLLAPSED_RAIL_W
+        }
+    }
+
+    /// True when at least one sidebar panel is expanded past its rail.
+    pub fn any_panel_expanded(&self) -> bool {
+        (0..3).any(|idx| self.panel_expanded(idx))
+    }
+
+    /// Whether a collapse target currently shows its content: an expanded
+    /// panel, or the shown workspaces bar. A rail click expands, a header
+    /// chevron click collapses.
+    pub fn collapse_target_open(&self, focus: Focus) -> bool {
+        match focus {
+            Focus::Workspaces => self.show_workspaces,
+            Focus::Projects => !self.hide_projects,
+            Focus::Worktrees => !self.hide_worktrees,
+            Focus::Sessions => !self.hide_sessions,
+            Focus::Terminal => false,
+        }
+    }
+
+    /// Every expanded sidebar owns the draggable boundary on its right.
+    /// Rails are fixed width and own none.
     pub fn splitter_indices(&self) -> Vec<usize> {
-        self.visible_panel_indices()
+        self.expanded_panel_indices()
     }
 
     /// Screen x of splitter `idx` — the column where the panel to its right
@@ -2779,15 +2842,17 @@ impl App {
         self.visible_panel_indices()
             .into_iter()
             .filter(|visible| *visible <= idx)
-            .map(|visible| self.panel_widths[visible])
+            .map(|visible| self.panel_draw_width(visible))
             .sum()
     }
 
     /// Move splitter `idx` so its boundary lands at `boundary_x`, clamped so
     /// the panel keeps `MIN_PANEL_W` and the terminal pane keeps `MIN_TERM_W`.
+    /// Rails are fixed width: dragging at one does nothing, and neighbors
+    /// measure past them at rail width.
     pub fn set_splitter(&mut self, idx: usize, boundary_x: i32, body_w: u16) {
         let want = boundary_x.max(0) as u16;
-        if !self.panel_visible(idx) {
+        if !self.panel_expanded(idx) {
             return;
         }
         let visible = self.visible_panel_indices();
@@ -2795,13 +2860,13 @@ impl App {
             .iter()
             .copied()
             .filter(|visible| *visible < idx)
-            .map(|visible| self.panel_widths[visible])
+            .map(|visible| self.panel_draw_width(visible))
             .sum();
         let fixed_right: u16 = visible
             .iter()
             .copied()
             .filter(|visible| *visible > idx)
-            .map(|visible| self.panel_widths[visible])
+            .map(|visible| self.panel_draw_width(visible))
             .sum();
         let max = body_w.saturating_sub(left + fixed_right + MIN_TERM_W);
         if max < MIN_PANEL_W {
@@ -2815,10 +2880,14 @@ impl App {
     /// `MIN_TERM_W` whenever the screen allows it at all. The Workspaces bar
     /// spans the full width above them, so it costs the panels nothing here.
     pub fn normalize_panel_widths(&mut self, body_w: u16) {
-        let budget = body_w.saturating_sub(MIN_TERM_W);
-        let visible = self.visible_panel_indices();
-        for i in visible.iter().rev().copied() {
-            let others: u16 = visible
+        let rails: u16 = (0..3)
+            .filter(|i| !self.panel_expanded(*i))
+            .map(|_| COLLAPSED_RAIL_W)
+            .sum();
+        let budget = body_w.saturating_sub(MIN_TERM_W + rails);
+        let expanded = self.expanded_panel_indices();
+        for i in expanded.iter().rev().copied() {
+            let others: u16 = expanded
                 .iter()
                 .copied()
                 .filter(|j| *j != i)
@@ -3522,14 +3591,17 @@ impl App {
         project_unseen(&self.tree, project_id)
     }
 
-    /// First visible sidebar under the Workspaces bar.
+    /// First visible sidebar under the Workspaces bar. With every panel
+    /// hidden there is no sidebar to land on, so the terminal takes it.
     pub fn first_sidebar_focus(&self) -> Focus {
         if !self.hide_projects {
             Focus::Projects
         } else if !self.hide_worktrees {
             Focus::Worktrees
-        } else {
+        } else if !self.hide_sessions {
             Focus::Sessions
+        } else {
+            Focus::Terminal
         }
     }
 
@@ -3538,7 +3610,8 @@ impl App {
             Focus::Workspaces => self.show_workspaces,
             Focus::Projects => !self.hide_projects,
             Focus::Worktrees => !self.hide_worktrees,
-            Focus::Sessions | Focus::Terminal => true,
+            Focus::Sessions => !self.hide_sessions,
+            Focus::Terminal => true,
         }
     }
 

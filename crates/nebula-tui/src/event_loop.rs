@@ -2167,6 +2167,33 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             set_hide_worktrees(app, !app.hide_worktrees);
             save_panel_visibility(app);
         }
+        Action::ToggleSessions => {
+            set_hide_sessions(app, !app.hide_sessions);
+            save_panel_visibility(app);
+        }
+        // One keystroke for every panel: collapsing parks a cursor left
+        // on a panel or the bar in the terminal; expanding leaves focus
+        // alone (the panels come back under the cursor's remembered rows).
+        Action::ToggleSidebars => {
+            if app.any_panel_expanded() || app.show_workspaces {
+                set_hide_projects(app, true);
+                set_hide_worktrees(app, true);
+                set_hide_sessions(app, true);
+                set_show_workspaces(app, false);
+                if !app.focus_visible(app.focus) {
+                    app.focus = Focus::Terminal;
+                }
+                app.flash = Some("panels collapsed".into());
+            } else {
+                app.collapsed = false;
+                set_hide_projects(app, false);
+                set_hide_worktrees(app, false);
+                set_hide_sessions(app, false);
+                set_show_workspaces(app, true);
+                app.flash = Some("panels expanded".into());
+            }
+            save_panel_visibility(app);
+        }
         // The Workspaces bar is a horizontal strip: ↑ has nowhere left to
         // go and ←/→ walk the tabs. j/↓ is the way back down, and like h/l
         // at the ends of the row it is a double tap — one press stays put
@@ -4919,6 +4946,7 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     set_show_workspaces(app, cfg.show_workspaces);
     set_hide_projects(app, cfg.hide_projects);
     set_hide_worktrees(app, cfg.hide_worktrees);
+    set_hide_sessions(app, cfg.hide_sessions);
     set_hide_root_worktree(app, cfg.hide_root_worktree);
     set_hide_draft_prs(app, cfg.hide_draft_prs);
     app.recent_prompts = cfg.recent_prompts_shown();
@@ -5002,6 +5030,29 @@ fn set_hide_worktrees(app: &mut App, hidden: bool) {
     if hidden && app.focus == Focus::Worktrees {
         app.focus = app.next_visible_focus(Focus::Worktrees);
     }
+}
+
+fn set_hide_sessions(app: &mut App, hidden: bool) {
+    app.hide_sessions = hidden;
+    if hidden && app.focus == Focus::Sessions {
+        app.focus = app.next_visible_focus(Focus::Sessions);
+    }
+}
+
+/// Flip one collapse target from its header chevron or rail: an expanded
+/// panel collapses to its rail, a rail expands back to its remembered
+/// width, and the workspaces bar hides or shows. The choice persists the
+/// way the `Shift+` hotkeys persist theirs; expanding again is the
+/// panel's own hotkey, named in the footer's restore hint.
+fn toggle_panel(app: &mut App, focus: Focus) {
+    match focus {
+        Focus::Projects => set_hide_projects(app, !app.hide_projects),
+        Focus::Worktrees => set_hide_worktrees(app, !app.hide_worktrees),
+        Focus::Sessions => set_hide_sessions(app, !app.hide_sessions),
+        Focus::Workspaces => set_show_workspaces(app, !app.show_workspaces),
+        Focus::Terminal => return,
+    }
+    save_panel_visibility(app);
 }
 
 /// Show or hide the ROOT WORKTREE row (Settings → Experimental). The row
@@ -5099,6 +5150,8 @@ fn save_panel_visibility(app: &mut App) {
     let mut cfg = crate::config::Config::load();
     cfg.hide_projects = app.hide_projects;
     cfg.hide_worktrees = app.hide_worktrees;
+    cfg.hide_sessions = app.hide_sessions;
+    cfg.show_workspaces = app.show_workspaces;
     if let Err(err) = cfg.save() {
         app.flash = Some(format!("couldn't save settings: {err}"));
     }
@@ -7874,6 +7927,15 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 Some(HitTarget::OpenPrsHeader) => {
                     app.focus = Focus::Worktrees;
                     toggle_open_prs(app, out);
+                }
+                Some(HitTarget::CollapsePanel(focus)) => {
+                    // The header chevron collapses its panel and the rail
+                    // expands it; a cursor parked on a panel being
+                    // collapsed follows the hotkey rule off it.
+                    if app.collapse_target_open(focus) {
+                        app.focus = focus;
+                    }
+                    toggle_panel(app, focus);
                 }
                 Some(HitTarget::PanelBg(focus)) => {
                     // Empty projects list: left click opens the obvious
@@ -24468,8 +24530,12 @@ diff --git a/src/c.rs b/src/c.rs
             let text = buffer_text(&terminal);
             let lines: Vec<&str> = text.lines().collect();
             assert!(
-                lines[1].starts_with("   DEFAULT"),
-                "hidden: the projects column takes the top row, under the \
+                lines[0].contains("▼"),
+                "hidden: the rail keeps the top row:\n{text}"
+            );
+            assert!(
+                lines[2].starts_with("   DEFAULT"),
+                "hidden: the projects column sits under the rail, under the \
                  open workspace's name:\n{text}"
             );
             assert!(!text.contains("WORKSPACES"), "{text}");
@@ -24859,9 +24925,10 @@ diff --git a/src/c.rs b/src/c.rs
             "80 columns of budget fit them all"
         );
 
-        // Hiding the bar changes nothing horizontal.
+        // Hiding the bar changes nothing horizontal: it collapses to a
+        // one-row rail rather than vanishing.
         app.show_workspaces = false;
-        assert_eq!(app.workspaces_bar_h(), 0);
+        assert_eq!(app.workspaces_bar_h(), crate::app::COLLAPSED_BAR_H);
         assert_eq!(app.splitter_indices(), vec![0, 1, 2]);
         assert_eq!(app.splitter_x(0), 20);
     }
@@ -25125,6 +25192,142 @@ diff --git a/src/c.rs b/src/c.rs
     }
 
     #[test]
+    fn shift_s_hides_the_sessions_panel_and_persists() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let mut out = Vec::new();
+
+            app.focus = Focus::Sessions;
+            press(&mut app, KeyCode::Char('S'), KeyModifiers::SHIFT, &mut out);
+            assert!(!app.hide_projects);
+            assert!(!app.hide_worktrees);
+            assert!(app.hide_sessions);
+            assert_eq!(app.focus, Focus::Terminal);
+            let saved = crate::config::Config::load();
+            assert!(saved.hide_sessions);
+
+            let mut next = App::new();
+            apply_config(&mut next, &saved);
+            assert!(next.hide_sessions);
+            assert!(!next.panel_expanded(2));
+            assert_eq!(next.expanded_panel_indices(), vec![0, 1]);
+            assert_eq!(next.panel_draw_width(2), crate::app::COLLAPSED_RAIL_W);
+
+            press(&mut app, KeyCode::Char('S'), KeyModifiers::SHIFT, &mut out);
+            assert!(!app.hide_sessions);
+            assert_eq!(app.focus, Focus::Terminal, "showing does not steal focus");
+        });
+    }
+
+    #[test]
+    fn ctrl_b_collapses_every_panel_and_brings_them_back() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let mut out = Vec::new();
+
+            app.focus = Focus::Worktrees;
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL, &mut out);
+            assert!(app.hide_projects);
+            assert!(app.hide_worktrees);
+            assert!(app.hide_sessions);
+            assert!(!app.show_workspaces, "the bar collapses too");
+            assert_eq!(app.focus, Focus::Terminal);
+            let saved = crate::config::Config::load();
+            assert!(saved.hide_sessions);
+            assert!(!saved.show_workspaces);
+
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL, &mut out);
+            assert!(!app.hide_projects);
+            assert!(!app.hide_worktrees);
+            assert!(!app.hide_sessions);
+            assert!(app.show_workspaces);
+            assert_eq!(app.focus, Focus::Terminal, "expanding does not steal focus");
+
+            // The tmux-safe chord does the same collapse.
+            press(&mut app, KeyCode::Char('Z'), KeyModifiers::SHIFT, &mut out);
+            assert!(app.hide_projects);
+            assert!(app.hide_worktrees);
+            assert!(app.hide_sessions);
+            assert!(!app.show_workspaces);
+        });
+    }
+
+    #[test]
+    fn every_panel_header_carries_a_collapse_button() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            seed_default_workspace(&mut app);
+            let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            for focus in [
+                Focus::Workspaces,
+                Focus::Projects,
+                Focus::Worktrees,
+                Focus::Sessions,
+            ] {
+                assert!(
+                    app.hits.iter().any(|(_, h)| *h == HitTarget::CollapsePanel(focus)),
+                    "missing collapse button for {focus:?}"
+                );
+            }
+
+            // Toggling from the rail collapses to a rail that still
+            // carries its expand target, while the title leaves the screen.
+            toggle_panel(&mut app, Focus::Worktrees);
+            assert!(app.hide_worktrees);
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(!text.contains("WORKTREES"), "{text}");
+            assert!(
+                app.hits
+                    .iter()
+                    .any(|(_, h)| *h == HitTarget::CollapsePanel(Focus::Worktrees)),
+                "rail keeps its expand target"
+            );
+
+            // And back: the remembered width is untouched by the round trip.
+            let widths = app.panel_widths;
+            toggle_panel(&mut app, Focus::Worktrees);
+            assert!(!app.hide_worktrees);
+            assert_eq!(app.panel_widths, widths);
+        });
+    }
+
+    #[test]
+    fn collapsing_the_workspaces_bar_leaves_a_rail_way_back() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            seed_default_workspace(&mut app);
+            let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+
+            toggle_panel(&mut app, Focus::Workspaces);
+            assert!(!app.show_workspaces);
+            assert_eq!(app.workspaces_bar_h(), crate::app::COLLAPSED_BAR_H);
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(!text.contains("WORKSPACES"), "{text}");
+            assert!(text.contains("▼"), "rail chevron: {text}");
+            assert!(
+                app.hits
+                    .iter()
+                    .any(|(_, h)| *h == HitTarget::CollapsePanel(Focus::Workspaces)),
+                "rail keeps its expand target"
+            );
+
+            toggle_panel(&mut app, Focus::Workspaces);
+            assert!(app.show_workspaces);
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("WORKSPACES"), "{text}");
+        });
+    }
+
+    #[test]
     fn focus_walk_skips_hidden_panels() {
         let mut app = App::new();
         let mut out = Vec::new();
@@ -25170,7 +25373,11 @@ diff --git a/src/c.rs b/src/c.rs
         let projects_hidden = buffer_text(&terminal);
         assert!(!projects_hidden.contains("PROJECTS"), "{projects_hidden}");
         assert!(projects_hidden.contains("WORKTREES"), "{projects_hidden}");
-        assert_eq!(app.term_area.x, widths[1] + widths[2] + 1);
+        assert!(projects_hidden.contains("▶"), "collapsed rail: {projects_hidden}");
+        assert_eq!(
+            app.term_area.x,
+            crate::app::COLLAPSED_RAIL_W + widths[1] + widths[2] + 1
+        );
         assert_eq!(app.splitter_indices(), vec![1, 2]);
         assert_eq!(app.focus, Focus::Worktrees);
 
@@ -25182,7 +25389,10 @@ diff --git a/src/c.rs b/src/c.rs
         assert!(both_hidden.contains("SESSIONS"), "{both_hidden}");
         assert!(both_hidden.contains("⇧P: show projects"), "{both_hidden}");
         assert!(both_hidden.contains("⇧B: show worktrees"), "{both_hidden}");
-        assert_eq!(app.term_area.x, widths[2] + 1);
+        assert_eq!(
+            app.term_area.x,
+            2 * crate::app::COLLAPSED_RAIL_W + widths[2] + 1
+        );
         assert_eq!(app.splitter_indices(), vec![2]);
         assert_eq!(app.panel_widths, widths, "hidden widths stay remembered");
         assert_eq!(app.focus, Focus::Sessions);

@@ -169,9 +169,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     app.body_area = body;
     app.normalize_panel_widths(body.width);
-    // The Workspaces bar (Shift+W) runs across the top of the body — zero
-    // rows tall when hidden; the three panels and the terminal pane take
-    // the full width of whatever is left under it.
+    // The Workspaces bar (Shift+W) runs across the top of the body (a
+    // one-row rail with an expand chevron when hidden); the three panels
+    // and the terminal pane take the full width of whatever is left
+    // under it.
     let [workspaces_a, panels_a] = Layout::vertical([
         Constraint::Length(app.workspaces_bar_h()),
         Constraint::Min(0),
@@ -180,7 +181,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let visible_panels = app.visible_panel_indices();
     let constraints = visible_panels
         .iter()
-        .map(|idx| Constraint::Length(app.panel_widths[*idx]))
+        .map(|idx| Constraint::Length(app.panel_draw_width(*idx)))
         .chain(std::iter::once(Constraint::Min(crate::app::MIN_TERM_W)));
     let areas = panels_a.layout_vec(&Layout::horizontal(constraints));
     let mut panel_areas: [Option<Rect>; 3] = [None; 3];
@@ -207,6 +208,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     if app.show_workspaces {
         draw_workspaces_bar(f, app, workspaces_a);
+    } else {
+        draw_collapsed_bar(f, app, workspaces_a);
     }
     if let Some(area) = panel_areas[0] {
         draw_projects(f, app, area);
@@ -214,11 +217,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if let Some(area) = panel_areas[1] {
         draw_worktrees(f, app, area);
     }
-    draw_sessions(
-        f,
-        app,
-        panel_areas[2].expect("Sessions panel is always visible"),
-    );
+    if let Some(area) = panel_areas[2] {
+        draw_sessions(f, app, area);
+    }
     draw_terminal(f, app, term_a);
     draw_splitter_grips(f.buffer_mut(), app, panels_a);
     // Focus cue (`focus_tint` setting, on by default): the focused
@@ -759,8 +760,12 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             "workspace switcher / workspaces bar",
                         ),
                         (
-                            Act(&[ToggleProjects, ToggleWorktrees]),
-                            "show / hide Projects / Worktrees",
+                            Act(&[ToggleProjects, ToggleWorktrees, ToggleSessions]),
+                            "collapse / expand Projects / Worktrees / Sessions",
+                        ),
+                        (
+                            Act(&[ToggleSidebars]),
+                            "collapse every panel / bring them back",
                         ),
                         (Lit("⌘1-9 / 1-9"), "open that workspace tab"),
                         (Act(&[Hosts]), "ssh hosts: connect (a: new, d: del)"),
@@ -2542,6 +2547,10 @@ fn render_button<'a>(
 /// uppercase header row, one blank spacer, then the list area (returned).
 /// The header carries the focus signal — accent when focused, muted
 /// otherwise — so the chrome itself can stay quiet.
+/// Header rows narrower than this keep title only: the collapse button
+/// would collide with the title text.
+const COLLAPSE_MIN_W: u16 = 16;
+
 fn draw_column(
     f: &mut Frame,
     area: Rect,
@@ -2549,12 +2558,38 @@ fn draw_column(
     count: Option<usize>,
     focused: bool,
     th: Theme,
+    collapse: Focus,
+    collapsed: bool,
+    hits: &mut Vec<(Rect, HitTarget)>,
 ) -> Rect {
     let block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(Style::default().fg(th.edge));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    if collapsed {
+        // The rail is the column rule itself: the block above drew the
+        // right border into this one cell, and the expand chevron goes
+        // over it on the header row (row 1, under the blank spacer).
+        // Clickable along the whole strip; the remembered width is
+        // untouched, so expanding restores the panel exactly.
+        if area.height > 1 {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled("▶", Style::default().fg(th.dim)))),
+                Rect {
+                    x: area.x,
+                    y: area.y + 1,
+                    width: 1,
+                    height: 1,
+                },
+            );
+        }
+        hits.push((area, HitTarget::CollapsePanel(collapse)));
+        return Rect {
+            height: 0,
+            ..inner
+        };
+    }
     let header_style = if focused {
         Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
     } else {
@@ -2571,6 +2606,23 @@ fn draw_column(
             spans.push(Span::styled(format!(" · {n}"), Style::default().fg(th.dim)));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), r);
+        // Per-panel collapse button at the header row's right end: a
+        // quiet chevron that hides the panel on click. The panel's own
+        // `Shift+` hotkey (named in the footer's restore hint) brings it
+        // back, as does the all-sidebars toggle.
+        if r.width >= COLLAPSE_MIN_W {
+            let glyph = Rect {
+                x: r.x + r.width.saturating_sub(3),
+                y: r.y,
+                width: 2,
+                height: 1,
+            };
+            f.render_widget(
+                Paragraph::new(Span::styled("◀", Style::default().fg(th.dim))),
+                glyph,
+            );
+            hits.push((glyph, HitTarget::CollapsePanel(collapse)));
+        }
     }
     // One extra column of right padding so row text never touches the
     // column rule.
@@ -2717,6 +2769,44 @@ fn render_pill_body(
 /// header crowded against its rule. That rule — the bar's last row — closes
 /// it off from the panels, broken under the open tab, so that tab reads as
 /// attached to what's below it.
+/// One-row rail for the hidden workspaces bar: an expand chevron at the
+/// same right-end column the bar's collapse chevron sits in, clickable
+/// across the whole row. The side panels collapse to rails the same way,
+/// so no collapse ever leaves its panel without a way back.
+fn draw_collapsed_bar(f: &mut Frame, app: &mut App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let th = app.theme;
+    // The rail reads as a collapsed bar (not an empty row): the same
+    // rule the expanded bar closes itself off with, carrying the expand
+    // chevron at its right end.
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(th.edge),
+        ))),
+        Rect {
+            y: area.y,
+            height: 1,
+            ..area
+        },
+    );
+    let chevron_x = (area.x + area.width).saturating_sub(1);
+    if area.width >= 8 && chevron_x > area.x {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled("▼", Style::default().fg(th.dim)))),
+            Rect {
+                x: chevron_x,
+                y: area.y,
+                width: 1,
+                height: 1,
+            },
+        );
+    }
+    app.hits.push((area, HitTarget::CollapsePanel(Focus::Workspaces)));
+}
+
 fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Workspaces;
@@ -2771,6 +2861,7 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // cells they land on.
     let tabs_x = area.x + label_w + TAB_GAP;
     if app.tree.workspaces.is_empty() {
+        push_bar_collapse_chevron(f, app, area, row_y, th);
         app.hits
             .push((shrink_b(area), HitTarget::PanelBg(Focus::Workspaces)));
         if tabs_x < area.x + area.width {
@@ -2855,10 +2946,11 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     // Horizontal scroll: drop leading tabs until the open one fits. The
-    // last column is reserved for the `›` overflow mark, so a tab is never
-    // half-drawn under it. Stride is the tab plus the gap that follows it,
-    // which over-counts the last one by `TAB_SEP` — slack, not a bug.
-    let right = (area.x + area.width).saturating_sub(1);
+    // last two columns are reserved: the `›` overflow mark, so a tab is
+    // never half-drawn under it, and the bar's collapse chevron past that.
+    // Stride is the tab plus the gap that follows it, which over-counts
+    // the last one by `TAB_SEP` (slack, not a bug).
+    let right = (area.x + area.width).saturating_sub(2);
     let budget = right.saturating_sub(tabs_x);
     let active_i = active.unwrap_or(0);
     let stride = |t: &(Vec<Span<'static>>, u16, Color)| t.1 + TAB_SEP;
@@ -2952,9 +3044,39 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
     if drawn < tabs.len() {
         mark(f, right, "›");
     }
+    // The bar's collapse chevron in the very last column: hides the bar
+    // on click, like `Shift+W`. Registered ahead of the background so it
+    // wins the cell.
+    push_bar_collapse_chevron(f, app, area, row_y, th);
     // Last, so every tab wins the cells it covers.
     app.hits
         .push((shrink_b(area), HitTarget::PanelBg(Focus::Workspaces)));
+}
+
+/// Collapse chevron for the workspaces bar: last column of the tab row.
+/// Shared by the empty and tabbed branches so the bar always offers it.
+fn push_bar_collapse_chevron(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    row_y: u16,
+    th: Theme,
+) {
+    let chevron_x = (area.x + area.width).saturating_sub(1);
+    if area.width < 8 || chevron_x <= area.x {
+        return;
+    }
+    let cell = Rect {
+        x: chevron_x,
+        y: row_y,
+        width: 1,
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled("◀", Style::default().fg(th.dim)))),
+        cell,
+    );
+    app.hits.push((cell, HitTarget::CollapsePanel(Focus::Workspaces)));
 }
 
 /// Per-row display data of the Projects panel, pre-collected to end the
@@ -3005,7 +3127,17 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
             .saturating_sub(ROW_GUTTER.len() + 1 + count.map_or(0, |n| 3 + n.to_string().len()));
         truncate(&app.tree.active_workspace_name().to_uppercase(), room)
     };
-    let inner = draw_column(f, area, &title, count, focused, th);
+    let inner = draw_column(
+        f,
+        area,
+        &title,
+        count,
+        focused,
+        th,
+        Focus::Projects,
+        app.hide_projects,
+        &mut app.hits,
+    );
 
     if !app.tree.has_visible_projects() {
         f.render_widget(
@@ -3136,7 +3268,17 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     // over a list of two checkouts.
     let wt_count = app.visible_worktrees().len();
     let count = Some(wt_count).filter(|n| *n > 0);
-    let inner = draw_column(f, area, "WORKTREES", count, focused, th);
+    let inner = draw_column(
+        f,
+        area,
+        "WORKTREES",
+        count,
+        focused,
+        th,
+        Focus::Worktrees,
+        app.hide_worktrees,
+        &mut app.hits,
+    );
     // The page Ctrl+d / Ctrl+u jump by half of: how many pills the column
     // has room for this frame (group headers and quiet rows not billed —
     // "about half a panel" is the promise, not an exact line count).
@@ -3532,7 +3674,17 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         .filter(|r| r.as_link().is_none())
         .count();
     let count = Some(visible).filter(|n| *n > 0);
-    let inner = draw_column(f, area, "SESSIONS", count, focused, th);
+    let inner = draw_column(
+        f,
+        area,
+        "SESSIONS",
+        count,
+        focused,
+        th,
+        Focus::Sessions,
+        app.hide_sessions,
+        &mut app.hits,
+    );
     // The page Ctrl+d / Ctrl+u jump by half of: how many pills the column
     // has room for this frame. Group headers and RECENT PROMPTS lines are
     // not billed, as the Worktrees column's headers aren't — "about half
@@ -4725,6 +4877,9 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             }
             if app.hide_worktrees {
                 restore.push(hint(Action::ToggleWorktrees, "worktrees"));
+            }
+            if app.hide_sessions {
+                restore.push(hint(Action::ToggleSessions, "sessions"));
             }
             if !restore.is_empty() {
                 text = format!("{}  {text}", restore.join("  "));

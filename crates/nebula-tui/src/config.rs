@@ -223,6 +223,7 @@ pub enum SettingKind {
     ShowWorkspaces,
     HideProjects,
     HideWorktrees,
+    HideSessions,
     HideDraftPrs,
     QuickPromptKind,
     QuickPromptFocus,
@@ -376,13 +377,19 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             SettingSpec {
                 kind: SettingKind::HideProjects,
                 label: "Projects panel",
-                hint: "Show or hide the Projects panel (Shift+P toggles)",
+                hint: "Collapse or expand the Projects panel (Shift+P toggles)",
                 group: "",
             },
             SettingSpec {
                 kind: SettingKind::HideWorktrees,
                 label: "Worktrees panel",
-                hint: "Show or hide the Worktrees panel (Shift+B toggles)",
+                hint: "Collapse or expand the Worktrees panel (Shift+B toggles)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::HideSessions,
+                label: "Sessions panel",
+                hint: "Collapse or expand the Sessions panel (Shift+S toggles)",
                 group: "",
             },
             SettingSpec {
@@ -762,13 +769,18 @@ pub struct Config {
     /// closed browser tab can't lose the choice the way the daemon's
     /// save-on-quit UI blob would.
     pub show_workspaces: bool,
-    /// Hide the Projects panel and give its width to the terminal pane.
-    /// False by default so configs written before this key keep the current
-    /// three-panel layout.
+    /// Collapse the Projects panel to a rail and give its width to the
+    /// terminal pane. False by default so configs written before this key
+    /// keep the current three-panel layout.
     pub hide_projects: bool,
-    /// Hide the Worktrees panel and give its width to the terminal pane.
-    /// Independent from `hide_projects`; Sessions always remains visible.
+    /// Collapse the Worktrees panel to a rail and give its width to the
+    /// terminal pane. Independent from `hide_projects` and `hide_sessions`.
     pub hide_worktrees: bool,
+    /// Collapse the Sessions panel to a rail and give its width to the
+    /// terminal pane. Independent from `hide_projects` and `hide_worktrees`.
+    /// False by default so configs written before this key keep the
+    /// current three-panel layout.
+    pub hide_sessions: bool,
     /// Leave draft pull requests out of the PROJECT OPEN PRS GROUP and the
     /// `/` PALETTE's pull-request rows, so browsing what's open shows only
     /// the rows asking for a reviewer. A view filter, not a fetch filter:
@@ -884,6 +896,7 @@ impl Default for Config {
             show_workspaces: true,
             hide_projects: false,
             hide_worktrees: false,
+            hide_sessions: false,
             hide_draft_prs: false,
             hide_root_worktree: false,
             recent_prompts: false,
@@ -1124,6 +1137,7 @@ impl Config {
             SettingKind::ShowWorkspaces => on_off(self.show_workspaces).into(),
             SettingKind::HideProjects => shown_hidden(self.hide_projects).into(),
             SettingKind::HideWorktrees => shown_hidden(self.hide_worktrees).into(),
+            SettingKind::HideSessions => shown_hidden(self.hide_sessions).into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
             SettingKind::HideRootWorktree => on_off(self.hide_root_worktree).into(),
             SettingKind::RecentPrompts => on_off(self.recent_prompts).into(),
@@ -1220,6 +1234,9 @@ impl Config {
             }
             SettingKind::HideWorktrees => {
                 self.hide_worktrees = !self.hide_worktrees;
+            }
+            SettingKind::HideSessions => {
+                self.hide_sessions = !self.hide_sessions;
             }
             SettingKind::HideDraftPrs => {
                 self.hide_draft_prs = !self.hide_draft_prs;
