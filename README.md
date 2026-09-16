@@ -55,6 +55,24 @@ dot on a collapsed PROJECT tells you exactly where to look without opening anyth
 | **`/` finds anything, anywhere** | The PALETTE spans every WORKSPACE, not just the open one. Before you type it sorts by attention: NEEDS FEEDBACK first, then RUNNING, then UNSEEN — so `/` `Enter` is the fastest way back to whatever needs you, and `]` / `[` cycle that same attention order with no modal at all, one session per press, workspaces included. Open pull requests are rows too: `Enter` on one lands on its PR ROW with the PR PREVIEW reading it, `Ctrl+o` hands it to the browser. |
 | **It follows you to other machines** | `nebula ssh <host>` opens nebula there, installing it if missing. `nebula tunnel <host>` puts that machine's TUI in a browser tab over a single ssh tunnel. Your settings and agent presets go along, and `nebula config export` / `import` back them up. |
 
+## Supported harnesses
+
+Five CLIs work out of the box, each with its own Agents tab section and model/effort rows. Install
+the CLI, pick it in the `n` picker, done. A CLI missing from PATH still shows in the picker; the
+DAEMON re-checks through the login shell at launch.
+
+| | Harness | CLI | Install |
+|---|---|---|---|
+| <img src="https://www.google.com/s2/favicons?domain=claude.com&sz=128" width="24" height="24" alt="Claude"> | [Claude](https://code.claude.com/docs/en/setup) | `claude` | `curl -fsSL https://claude.ai/install.sh \| bash` |
+| <img src="https://www.google.com/s2/favicons?domain=openai.com&sz=128" width="24" height="24" alt="Codex"> | [Codex](https://github.com/openai/codex) | `codex` | `npm i -g @openai/codex` |
+| <img src="https://www.google.com/s2/favicons?domain=cursor.com&sz=128" width="24" height="24" alt="Cursor"> | [Cursor](https://cursor.com/install) | `cursor-agent` | `curl -fsSL https://cursor.com/install \| bash` |
+| <img src="https://www.google.com/s2/favicons?domain=pi.dev&sz=128" width="24" height="24" alt="Pi"> | [Pi](https://pi.dev) | `pi` | `curl -fsSL https://pi.dev/install.sh \| sh` |
+| <img src="https://www.google.com/s2/favicons?domain=meta.com&sz=128" width="24" height="24" alt="Muse"> | [Muse](https://developer.meta.com/ai/lp/muse-code) | `muse` | `curl -fsSL https://dev.meta.ai/install.sh \| bash` |
+
+Muse has no managed hooks yet, so its sessions stay process-based until a hook dialect is mapped.
+Grok is not compiled in but runs today as a config-only entry; see "Teach nebula a new agent CLI"
+below.
+
 ## Install
 
 macOS or Linux — the same command installs and updates:
