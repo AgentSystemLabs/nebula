@@ -1444,7 +1444,7 @@ impl Daemon {
 
     /// Uncached `command -v` through the user's login shell; caches the answer.
     async fn probe_cli(&self, program: &str) -> bool {
-        let check = format!("command -v '{}' >/dev/null 2>&1", program);
+        let check = cli_probe_line(program);
         let mut probe = tokio::process::Command::new(user_shell());
         probe
             .args(LOGIN_SHELL_ARGS)
@@ -3315,6 +3315,16 @@ fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
+/// The login-shell line [`Daemon::probe_cli`] runs to ask whether
+/// `program` resolves. The word is single-quoted through [`shell_quote`]:
+/// a `harnesses` entry in config.json can name any string, and pasted in
+/// bare a quote would close the word and run the rest as a command — at
+/// daemon boot, since [`Daemon::warm_cli_probes`] asks for every entry.
+/// Built-in names come out exactly as they always did (`'claude'`).
+fn cli_probe_line(program: &str) -> String {
+    format!("command -v {} >/dev/null 2>&1", shell_quote(program))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4121,6 +4131,38 @@ mod tests {
     /// ahead of the command itself.
     const PANE_ENV: &str =
         "unset NO_COLOR FORCE_COLOR; export TERM=xterm-256color COLORTERM=truecolor;";
+
+    #[test]
+    fn cli_probe_line_looks_the_program_up_verbatim() {
+        // Built-ins read exactly as before the registry.
+        assert_eq!(
+            cli_probe_line("claude"),
+            "command -v 'claude' >/dev/null 2>&1"
+        );
+        assert_eq!(
+            cli_probe_line("cursor-agent"),
+            "command -v 'cursor-agent' >/dev/null 2>&1"
+        );
+        // A config-named program is any string. A quote in it stays
+        // inside the word instead of closing it and opening a command.
+        let hostile = "x'; echo INJECTED; echo '";
+        let line = cli_probe_line(hostile);
+        assert_eq!(
+            line,
+            "command -v 'x'\\''; echo INJECTED; echo '\\''' >/dev/null 2>&1"
+        );
+        // And a real shell agrees: the lookup fails quietly, nothing runs.
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", &line])
+            .output()
+            .expect("/bin/sh");
+        assert!(!out.status.success(), "no such program");
+        assert!(
+            out.stdout.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
 
     #[test]
     fn login_shell_wrap_quotes_args_and_leaves_the_command_word_bare() {
