@@ -342,19 +342,26 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // extra column so the affordance is visible before hovering.
             let any_submenu = menu.items.iter().any(|i| i.action.submenu().is_some());
             // The workspace switcher carries its key verbs in the bottom
-            // border; the modal widens to fit.
+            // border; the modal widens to fit. Session pickers add the
+            // `?` jump to the hovered harness's Agents section.
+            let agent_jump = menu.hovered_agent_kind().is_some();
             let hint = if menu.is_workspace_picker() {
                 Some(" n: new  r: rename  d: delete ")
             } else if menu.filter.is_some() {
-                Some(" type to filter  ↑↓: move  Backspace  Esc: back ")
-            } else {
-                menu.hovered_claude_cloud().map(|cloud| {
-                    if cloud {
-                        " Tab: cloud on "
-                    } else {
-                        " Tab: cloud off "
-                    }
+                Some(if agent_jump {
+                    " type to filter  ?: settings  ↑↓: move  Backspace  Esc: back "
+                } else {
+                    " type to filter  ↑↓: move  Backspace  Esc: back "
                 })
+            } else {
+                match menu.hovered_claude_cloud() {
+                    Some(cloud) => Some(if cloud {
+                        " Tab: cloud on   s/?: settings "
+                    } else {
+                        " Tab: cloud off   s/?: settings "
+                    }),
+                    None => agent_jump.then_some(" s/?: settings "),
+                }
             };
             let width = (label_w + 4 + if any_submenu { 2 } else { 0 })
                 .max(title_width + 2)
@@ -896,9 +903,30 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         )));
                     }
                     crate::config::SettingsRow::Setting(i) => {
-                        let spec = crate::config::setting_at(tab, *i)
-                            .expect("settings_rows indexes this tab's settings");
-                        let value = cfg.value_label(spec.kind);
+                        // The Agents tab resolves its harness rows through
+                        // the registry; every other values tab reads its
+                        // static spec.
+                        let (label, value) = if tab == crate::config::agents_tab() {
+                            match crate::config::AGENTS_HEAD.get(*i) {
+                                Some(spec) => (
+                                    spec.label.to_string(),
+                                    cfg.value_label(spec.kind),
+                                ),
+                                None => {
+                                    let (id, field) = cfg.agent_row(*i).expect(
+                                        "settings_rows indexes the Agents tab's harness rows",
+                                    );
+                                    (
+                                        field.label().to_string(),
+                                        cfg.agent_value(&id, field),
+                                    )
+                                }
+                            }
+                        } else {
+                            let spec = crate::config::setting_at(tab, *i)
+                                .expect("settings_rows indexes this tab's settings");
+                            (spec.label.to_string(), cfg.value_label(spec.kind))
+                        };
                         let selected = *i == view.selected && !view.on_tabs;
                         let mut label_style = Style::default();
                         let mut value_style = Style::default().fg(th.accent);
@@ -907,7 +935,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             value_style = value_style.bg(th.sel_bg).add_modifier(Modifier::BOLD);
                         }
                         lines.push(Line::from(vec![
-                            Span::styled(format!("   {:<28}", spec.label), label_style),
+                            Span::styled(format!("   {:<28}", label), label_style),
                             Span::styled(format!("[{value}]"), value_style),
                         ]));
                     }
@@ -3928,7 +3956,10 @@ fn draw_session_row(
                 // opens the session's page rather than a local CLI.
                 (" cloud".to_string(), Style::default().fg(th.dim))
             } else {
-                (format!(" {}", a.kind.as_str()), Style::default().fg(th.dim))
+                (
+                    format!(" {}", crate::agent_picker::session_harness_badge(a)),
+                    Style::default().fg(th.dim),
+                )
             };
             // How long since this session last did anything, sat between
             // the name and the harness. The list is sorted on this stamp,
@@ -5487,6 +5518,7 @@ mod tests {
                 "wt".to_string(),
             )),
             kind: nebula_core::AgentKind::Claude,
+            custom: None,
             model: None,
             effort: None,
             preset: None,
@@ -6015,6 +6047,7 @@ mod tests {
                 unseen: false,
                 status_changed_at: 0,
                 kind: nebula_core::AgentKind::Claude,
+                custom_harness: None,
                 model: None,
                 effort: None,
                 session_id: None,

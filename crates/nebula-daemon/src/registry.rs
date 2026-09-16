@@ -76,6 +76,9 @@ pub(crate) struct CreateAgentSpec {
     pub worktree: WorktreeId,
     pub name: String,
     pub kind: AgentKind,
+    /// Registry id of the custom harness, when `kind` is
+    /// [`AgentKind::Custom`].
+    pub custom_harness: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub auto_title: bool,
@@ -135,7 +138,7 @@ pub struct Daemon {
     prewarmed: Mutex<HashMap<(WorktreeId, AgentKind), PrewarmEntry>>,
     /// Cached `command -v` results per CLI so a missing binary doesn't get
     /// re-probed (login shell spawn) on every prewarm request.
-    cli_probes: Mutex<HashMap<AgentKind, (bool, Instant)>>,
+    cli_probes: Mutex<HashMap<String, (bool, Instant)>>,
     /// How many client connections are attached per session — a session
     /// with attachments (and its whole worktree) is "in view" and exempt
     /// from idle reaping.
@@ -1052,6 +1055,7 @@ impl Daemon {
             worktree: worktree_id,
             name,
             kind,
+            custom_harness,
             model,
             effort,
             auto_title,
@@ -1091,6 +1095,12 @@ impl Daemon {
             Some(url) => Some(crate::pr_scope::validate_issue_url(&url)?),
             None => None,
         };
+        // Every harness resolves against the current registry before
+        // anything spawns: a missing or broken entry refuses the create
+        // with its reason, and a deleted entry breaks respawns the same
+        // way at boot.
+        let harness = resolve_harness(kind, custom_harness.as_deref())?;
+        let program = harness.program.trim().to_string();
         let worktree = self
             .store
             .get_worktree(&worktree_id)?
@@ -1110,8 +1120,8 @@ impl Daemon {
         // the CLI runs. Without this, a missing CLI still "succeeds" — the
         // login shell prints `command not found` into a PTY that dies at
         // once, leaving a dead row that looks identical to a fresh one.
-        if adopted.is_none() && !self.cli_available_for_create(kind).await {
-            bail!("{}", cli_missing_message(kind));
+        if adopted.is_none() && !self.cli_available_for_create(&program).await {
+            bail!("{}", cli_missing_message(&program));
         }
         let agent = Agent {
             id: adopted
@@ -1129,6 +1139,11 @@ impl Daemon {
             archived_at: 0,
             unseen: false,
             kind,
+            custom_harness: custom_harness
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
             model,
             effort,
             session_id: None,
@@ -1200,6 +1215,12 @@ impl Daemon {
         if !crate::config::Config::load().prewarm_agents {
             return Ok(());
         }
+        if kind == AgentKind::Custom {
+            // No warm spares for custom harnesses: the pool is keyed by
+            // kind alone and a spare booted for one entry must never be
+            // adopted by another. Custom creates stay cold.
+            return Ok(());
+        }
         let Some(worktree) = self.store.get_worktree(worktree_id)? else {
             return Ok(());
         };
@@ -1224,7 +1245,7 @@ impl Daemon {
         if let Some(old) = stale {
             self.kill_session(&SessionRef::Agent(old.agent_id));
         }
-        if !self.cli_available(kind).await {
+        if !self.cli_available(kind.cli_program()).await {
             tracing::debug!(kind = kind.as_str(), "prewarm skipped: CLI not installed");
             return Ok(());
         }
@@ -1237,6 +1258,7 @@ impl Daemon {
             archived_at: 0,
             unseen: false,
             kind,
+            custom_harness: None,
             model: model.clone(),
             effort: effort.clone(),
             session_id: None,
@@ -1371,11 +1393,12 @@ impl Daemon {
         }
     }
 
-    /// Is the kind's CLI on the user's PATH (as their login shell sees it)?
-    /// Cached: hits for an hour, misses for a minute so a just-installed CLI
-    /// gets picked up quickly. Probe trouble (timeout, spawn error) fails
-    /// open — a doomed warm spawn is still graceful.
-    async fn cli_available(&self, kind: AgentKind) -> bool {
+    /// Is the harness's CLI on the user's PATH (as their login shell sees
+    /// it)? Cached by program: hits for an hour, misses for a minute so a
+    /// just-installed CLI gets picked up quickly. Probe trouble (timeout,
+    /// spawn error) fails open — a doomed warm spawn is still graceful.
+    /// Custom harnesses pass their entry's program; built-ins their CLI.
+    async fn cli_available(&self, program: &str) -> bool {
         if std::env::var(env::AGENT_CMD).is_ok() {
             return true; // test override is spawned verbatim
         }
@@ -1383,21 +1406,31 @@ impl Daemon {
         const FAIL_TTL: Duration = Duration::from_secs(60);
         {
             let probes = self.cli_probes.lock().unwrap();
-            if let Some((ok, at)) = probes.get(&kind) {
+            if let Some((ok, at)) = probes.get(program) {
                 if at.elapsed() < if *ok { OK_TTL } else { FAIL_TTL } {
                     return *ok;
                 }
             }
         }
-        self.probe_cli(kind).await
+        self.probe_cli(program).await
     }
 
-    /// Fill the availability cache for every kind at boot, off the request
-    /// loop. Without it the first CreateAgent of a session pays a full
-    /// login-shell probe (~1s with a heavy ~/.zshrc) before it can answer.
+    /// Fill the availability cache for every harness at boot, off the
+    /// request loop. Without it the first CreateAgent of a session pays a
+    /// full login-shell probe (~1s with a heavy ~/.zshrc) before it can
+    /// answer. Custom entries resolve against the current config; a bare
+    /// `Custom` kind never reaches the probe — it has no program.
     pub async fn warm_cli_probes(self: &Arc<Self>) {
-        for kind in AgentKind::ALL {
-            self.cli_available(kind).await;
+        // One probe per launchable program in the effective registry, so
+        // a repointed program warms the binary that actually launches.
+        let mut programs = Vec::new();
+        for entry in harness_registry() {
+            if entry.problem().is_none() && !programs.contains(&entry.program) {
+                programs.push(entry.program.clone());
+            }
+        }
+        for program in programs {
+            self.cli_available(program.trim()).await;
         }
     }
 
@@ -1405,13 +1438,13 @@ impl Daemon {
     /// A cached *hit* is trusted; a cached *miss* is re-probed, so someone who
     /// installs the CLI and immediately retries isn't told for another minute
     /// that it's missing. Misses are rare, so this costs nothing in practice.
-    async fn cli_available_for_create(&self, kind: AgentKind) -> bool {
-        self.cli_available(kind).await || self.probe_cli(kind).await
+    async fn cli_available_for_create(&self, program: &str) -> bool {
+        self.cli_available(program).await || self.probe_cli(program).await
     }
 
     /// Uncached `command -v` through the user's login shell; caches the answer.
-    async fn probe_cli(&self, kind: AgentKind) -> bool {
-        let check = format!("command -v '{}' >/dev/null 2>&1", kind.cli_program());
+    async fn probe_cli(&self, program: &str) -> bool {
+        let check = cli_probe_line(program);
         let mut probe = tokio::process::Command::new(user_shell());
         probe
             .args(LOGIN_SHELL_ARGS)
@@ -1438,7 +1471,7 @@ impl Daemon {
                 self.cli_probes
                     .lock()
                     .unwrap()
-                    .insert(kind, (ok, Instant::now()));
+                    .insert(program.to_string(), (ok, Instant::now()));
                 ok
             }
             _ => true,
@@ -1627,7 +1660,12 @@ impl Daemon {
         tracing::info!(agent = %id, to = %target.branch, "relocating session into its worktree");
         self.kill_session(&sref);
         self.last_cwd.lock().unwrap().remove(id);
-        let prompt = relocation_prompt(agent.kind, &target);
+        // A row whose entry went missing since still relocates; the boot
+        // itself refuses with the entry's reason, so the notice degrades
+        // to none rather than failing the move.
+        let prompt = resolve_harness(agent.kind, agent.custom_harness.as_deref())
+            .map(|harness| relocation_prompt(harness.relocation_prompt, &target))
+            .unwrap_or(None);
         if let Err(e) = self.spawn_agent_session_with(
             &agent,
             &target,
@@ -2278,26 +2316,37 @@ impl Daemon {
         // Whatever spawns this agent, it runs in `worktree` from here: a
         // relocation still pending for it has been overtaken.
         self.pending_moves.lock().unwrap().remove(&agent.id);
+        // Every row resolves its registry descriptor once, up front: a row
+        // whose entry was deleted or broken since refuses the boot with
+        // its reason rather than launching the wrong CLI, and the same
+        // descriptor picks the hook dialect below.
+        let harness = resolve_harness(agent.kind, agent.custom_harness.as_deref())?;
         // Managed status hooks; a failure here degrades to "no status
-        // updates", never blocks the spawn.
-        let install_result = match agent.kind {
-            AgentKind::Claude => hooks::installer::install_claude_hooks(&worktree.path),
+        // updates", never blocks the spawn. The dialect is data: a custom
+        // harness naming one reports status, prompts and permission waits
+        // exactly like that harness, and a harness with none runs
+        // hookless (process-based status until a dialect is mapped).
+        let install_result = match harness.hook_dialect() {
+            Some(AgentKind::Claude) => hooks::installer::install_claude_hooks(&worktree.path),
             // Codex's hooks live in its home, not the worktree, so one
             // trust approval covers every worktree (see installer docs);
             // any per-worktree copy an older nebula left is pruned.
-            AgentKind::Codex => {
+            Some(AgentKind::Codex) => {
                 hooks::installer::install_codex_hooks(&hooks::installer::codex_home())
                     .and_then(|()| hooks::installer::prune_codex_worktree_hooks(&worktree.path))
             }
             // Cursor also gets the managed auto-title project rule — its
             // hook dialect has no context-injection channel.
-            AgentKind::Cursor => hooks::installer::install_cursor_hooks(&worktree.path)
+            Some(AgentKind::Cursor) => hooks::installer::install_cursor_hooks(&worktree.path)
                 .and_then(|()| hooks::installer::install_cursor_title_rule(&worktree.path)),
             // Pi runs TypeScript extensions, not shell hooks: one managed
             // extension in its global agent dir (loaded without the trust
             // prompt a worktree-local `.pi/extensions/` would raise) serves
             // every worktree.
-            AgentKind::Pi => hooks::pi_extension::install(&hooks::pi_extension::pi_agent_dir()),
+            Some(AgentKind::Pi) => {
+                hooks::pi_extension::install(&hooks::pi_extension::pi_agent_dir())
+            }
+            _ => Ok(()),
         };
         if let Err(e) = install_result {
             tracing::warn!(error = %e, cwd = %worktree.path.display(), "hook install failed");
@@ -2362,20 +2411,21 @@ impl Daemon {
         });
         let rule = crate::pr_scope::combined_rule(scope.as_ref(), issue_scope.as_ref());
         let prompts = crate::pr_scope::launch_prompts(
-            agent.kind,
+            harness.system.append_flag.is_some(),
             agent.session_id.is_some(),
             rule.as_deref(),
             initial_prompt,
         );
         let (program, args, resumed) = match cloud_task {
             Some(task) => claude_cloud_spawn_command(
+                &harness,
                 task,
                 agent.model.as_deref(),
                 agent.effort.as_deref(),
                 cmd_override.as_deref(),
             ),
             None => agent_spawn_command_with(
-                agent.kind,
+                &harness,
                 agent.session_id.as_deref(),
                 Some(&worktree.path),
                 agent.model.as_deref(),
@@ -2760,7 +2810,8 @@ fn claude_transcript_exists(roots: &[PathBuf], session_id: &str) -> Option<bool>
 ///
 /// The plain shape, as every restart/resume spawns it: booted in
 /// `TEST_CWD`, no initial prompt, guidance on. Tests assert against this;
-/// the daemon calls the full form.
+/// the daemon calls the full form. The descriptor resolves from a pinned
+/// registry so tests never touch the user's config.
 #[cfg(test)]
 fn agent_spawn_command(
     kind: AgentKind,
@@ -2769,8 +2820,10 @@ fn agent_spawn_command(
     effort: Option<&str>,
     cmd_override: Option<&str>,
 ) -> (String, Vec<String>, bool) {
+    let all = test_registry();
+    let harness = test_harness(&all, kind);
     agent_spawn_command_with(
-        kind,
+        &harness,
         session_id,
         Some(Path::new(TEST_CWD)),
         model,
@@ -2780,6 +2833,34 @@ fn agent_spawn_command(
         None,
         true,
     )
+}
+
+/// A pinned registry for spawn tests: the compiled-in rows, no overrides,
+/// no legacy entries — what a fresh install launches.
+#[cfg(test)]
+fn test_registry() -> Vec<nebula_core::harness::HarnessDescriptor> {
+    harness_registry_in(
+        &std::collections::BTreeMap::new(),
+        &[],
+    )
+}
+
+/// The pinned descriptor `kind` launches as in spawn tests.
+#[cfg(test)]
+fn test_harness(
+    all: &[nebula_core::harness::HarnessDescriptor],
+    kind: AgentKind,
+) -> nebula_core::harness::HarnessDescriptor {
+    resolve_harness_in(kind, None, all).expect("built-ins resolve from a pinned registry")
+}
+
+/// The pinned descriptor for a legacy custom entry in spawn tests.
+#[cfg(test)]
+fn test_custom_harness(
+    all: &[nebula_core::harness::HarnessDescriptor],
+    id: &str,
+) -> nebula_core::harness::HarnessDescriptor {
+    resolve_harness_in(AgentKind::Custom, Some(id), all).expect("the pinned entry resolves")
 }
 
 /// What nebula appends to Claude's system prompt: how to take a "do this
@@ -2811,27 +2892,29 @@ command fails, report the error and carry on in the current checkout.";
 /// and `pi --session-id <sid> "<prompt>"`. Whether `cursor-agent --resume
 /// <id> [prompt...]` submits one is not, so a relocated cursor session
 /// resumes silent and waits for the user.
-fn relocation_prompt(kind: AgentKind, worktree: &Worktree) -> Option<String> {
-    match kind {
-        AgentKind::Claude | AgentKind::Codex | AgentKind::Pi => Some(format!(
+fn relocation_prompt(relocate: bool, worktree: &Worktree) -> Option<String> {
+    relocate.then(|| {
+        format!(
             "[nebula] This session now runs inside the worktree `{}` at {} — your working \
              directory is that checkout. Continue the user's most recent request there.",
             worktree.branch,
             worktree.path.display()
-        )),
-        AgentKind::Cursor => None,
-    }
+        )
+    })
 }
 
 /// The checkout the test wrapper boots every spawn in.
 #[cfg(test)]
 const TEST_CWD: &str = "/nebula-test/p-feat";
 
-// Nine positional knobs are two over clippy's line; the callers are the two
-// thin wrappers above and the tests, so a builder would only add ceremony.
+// Nine positional knobs are two over clippy's line; the callers are the
+// two thin wrappers above and the tests, so a builder would only add
+// ceremony. Every behavior comes off `harness` — the registry descriptor
+// the launch resolved — never off the kind: a repointed program, a renamed
+// flag or a whole new CLI flows through here with no new arms.
 #[allow(clippy::too_many_arguments)]
 fn agent_spawn_command_with(
-    kind: AgentKind,
+    harness: &nebula_core::harness::HarnessDescriptor,
     session_id: Option<&str>,
     cwd: Option<&Path>,
     model: Option<&str>,
@@ -2844,91 +2927,95 @@ fn agent_spawn_command_with(
     if let Some(cmd) = cmd_override {
         let mut parts = cmd.split_whitespace().map(String::from).collect::<Vec<_>>();
         if parts.is_empty() {
-            parts.push(kind.cli_program().into());
+            parts.push(harness.program.trim().to_string());
         }
         let program = parts.remove(0);
         return (program, parts, false);
     }
-    let program = kind.cli_program().to_string();
-    let (mut args, resumed) = match (kind, session_id) {
-        (AgentKind::Claude, Some(sid)) => (vec!["--resume".to_string(), sid.to_string()], true),
-        (AgentKind::Codex, Some(sid)) => {
-            let mut args = vec!["resume".to_string(), sid.to_string()];
-            if let Some(cwd) = cwd {
-                args.extend(["--cd".to_string(), cwd.to_string_lossy().into_owned()]);
+    let program = harness.program.trim().to_string();
+    // Resume: a flag (`--resume <id>`), a positional subcommand
+    // (`resume <id>`, with `--cd`), or nothing — a stored id with no
+    // resume mapping is ignored and the CLI boots fresh.
+    let (mut args, resumed) = match (&harness.resume.flag, &harness.resume.subcommand, session_id) {
+        (Some(flag), _, Some(sid)) => (vec![flag.clone(), sid.to_string()], true),
+        (None, Some(subcommand), Some(sid)) => {
+            let mut args = vec![subcommand.clone(), sid.to_string()];
+            if harness.resume.cd {
+                if let Some(cwd) = cwd {
+                    args.extend(["--cd".to_string(), cwd.to_string_lossy().into_owned()]);
+                }
             }
             (args, true)
         }
-        (AgentKind::Cursor, Some(sid)) => (vec!["--resume".to_string(), sid.to_string()], true),
-        (AgentKind::Pi, Some(sid)) => (vec!["--session-id".to_string(), sid.to_string()], true),
-        (_, None) => (Vec::new(), false),
+        _ => (Vec::new(), false),
     };
-    match kind {
-        AgentKind::Codex => args.push("--yolo".to_string()),
-        AgentKind::Cursor => args.push("--force".to_string()),
-        AgentKind::Claude | AgentKind::Pi => {}
+    if let Some(flag) = harness.permissions_flag.as_deref() {
+        args.push(flag.to_string());
     }
-    // Claude, codex and pi spell the model flag the same way, and it
-    // follows the skip-permissions flag (`codex --yolo --model …`). Cursor
-    // composes its own below: family and effort become one id.
-    if let (Some(m), AgentKind::Claude | AgentKind::Codex | AgentKind::Pi) = (model, kind) {
-        args.extend(["--model".to_string(), m.to_string()]);
+    // The model rides its flag — composed with the effort into one id for
+    // Cursor's family-suffix shape (`claude-opus-5` + `high`: the TUI only
+    // sends an effort the family ships; an effort without a family has
+    // nothing to hang off and is dropped).
+    if let (Some(m), Some(flag)) = (model, harness.model.flag.as_deref()) {
+        let id = match (harness.compose_model_effort, effort) {
+            (true, Some(e)) => format!("{m}-{e}"),
+            _ => m.to_string(),
+        };
+        args.extend([flag.to_string(), id]);
     }
-    match kind {
-        AgentKind::Claude => {
-            if let Some(e) = effort {
-                args.extend(["--effort".to_string(), e.to_string()]);
-            }
-            push_system_prompt(&mut args, guidance, additional_system_prompt);
-            if let Some(p) = initial_prompt {
-                args.push(p.to_string());
-            }
-        }
-        AgentKind::Pi => {
-            // pi's reasoning knob is `--thinking <off|minimal|…|max>`.
-            if let Some(e) = effort {
-                args.extend(["--thinking".to_string(), e.to_string()]);
-            }
-            push_system_prompt(&mut args, guidance, additional_system_prompt);
-            // `pi [options] [--] [@files...] [messages...]` — trailing.
-            if let Some(p) = initial_prompt {
-                args.push(p.to_string());
+    // The effort rides its flag, Codex's `-c key=value` pair, or nothing
+    // (composed above, or unmapped and dropped like before).
+    if let Some(e) = effort {
+        if !harness.compose_model_effort {
+            if let Some(flag) = harness.effort.flag.as_deref() {
+                args.extend([flag.to_string(), e.to_string()]);
+            } else if let (Some(flag), Some(key)) = (
+                harness.effort.config_flag.as_deref(),
+                harness.effort.config_key.as_deref(),
+            ) {
+                args.extend([flag.to_string(), format!("{key}={e}")]);
             }
         }
-        AgentKind::Codex => {
-            if let Some(e) = effort {
-                args.extend(["-c".to_string(), format!("model_reasoning_effort={e}")]);
-            }
-            // `codex [OPTIONS] [PROMPT]` — the trailing positional.
-            if let Some(p) = initial_prompt {
-                args.push(p.to_string());
-            }
+    }
+    // Guidance (worktree rules, then the PR scope) rides the
+    // system-prompt flag where one is mapped, folds into the first prompt
+    // where prepend is, and is dropped where neither is.
+    let mut initial_prompt = initial_prompt.map(str::to_string);
+    if let Some(flag) = harness.system.append_flag.as_deref() {
+        push_system_prompt(&mut args, flag, guidance, additional_system_prompt);
+    } else if harness.system.prepend_to_first_prompt {
+        let mut first = Vec::new();
+        if guidance {
+            first.push(CLAUDE_WORKTREE_GUIDANCE.to_string());
+            first.push(crate::sibling::CLAUDE_SPAWN_GUIDANCE.to_string());
+            first.push(crate::open_files::CLAUDE_OPEN_GUIDANCE.to_string());
         }
-        AgentKind::Cursor => {
-            // `--model <family>-<effort>`: the TUI keeps the family and the
-            // effort suffix apart (`claude-opus-5` + `high`) and only sends
-            // an effort the family ships; an effort without a family has
-            // nothing to hang off and is dropped.
-            if let Some(m) = model {
-                let id = match effort {
-                    Some(e) => format!("{m}-{e}"),
-                    None => m.to_string(),
-                };
-                args.extend(["--model".to_string(), id]);
-            }
-            // `cursor-agent [options] [prompt...]` — the trailing positional.
-            if let Some(p) = initial_prompt {
-                args.push(p.to_string());
-            }
+        if let Some(prompt) = additional_system_prompt {
+            first.push(prompt.to_string());
         }
+        if !first.is_empty() {
+            let head = first.join("\n\n");
+            initial_prompt = Some(match initial_prompt {
+                Some(task) => format!("{head}\n\n{task}"),
+                None => head,
+            });
+        }
+    }
+    // The starting prompt rides trailing, like every CLI's positional.
+    if let Some(p) = initial_prompt {
+        args.push(p);
     }
     (program, args, resumed)
 }
 
-/// One `--append-system-prompt` carrying nebula's guidance (worktree, spawn,
-/// then open) and whatever else the launch adds (the PR scope), for the CLIs
-/// that take the flag — Claude and pi.
-fn push_system_prompt(args: &mut Vec<String>, guidance: bool, additional: Option<&str>) {
+/// One system-prompt flag carrying nebula's guidance (worktree, spawn,
+/// then open) and whatever else the launch adds (the PR scope).
+fn push_system_prompt(
+    args: &mut Vec<String>,
+    flag: &str,
+    guidance: bool,
+    additional: Option<&str>,
+) {
     let mut system_prompt = Vec::new();
     if guidance {
         system_prompt.push(CLAUDE_WORKTREE_GUIDANCE);
@@ -2939,10 +3026,7 @@ fn push_system_prompt(args: &mut Vec<String>, guidance: bool, additional: Option
         system_prompt.push(prompt);
     }
     if !system_prompt.is_empty() {
-        args.extend([
-            "--append-system-prompt".to_string(),
-            system_prompt.join("\n\n"),
-        ]);
+        args.extend([flag.to_string(), system_prompt.join("\n\n")]);
     }
 }
 
@@ -3002,21 +3086,14 @@ fn validate_cloud_text(raw: &str, what: &str) -> Result<String> {
 /// (`--cloud=<task>`): the flag takes an *optional* value, so a separate
 /// argv item that starts with `--` would be parsed as another Claude flag.
 fn claude_cloud_spawn_command(
+    harness: &nebula_core::harness::HarnessDescriptor,
     task: &str,
     model: Option<&str>,
     effort: Option<&str>,
     cmd_override: Option<&str>,
 ) -> (String, Vec<String>, bool) {
     let (program, mut args, resumed) = agent_spawn_command_with(
-        AgentKind::Claude,
-        None,
-        None,
-        model,
-        effort,
-        cmd_override,
-        None,
-        None,
-        false,
+        harness, None, None, model, effort, cmd_override, None, None, false,
     );
     if cmd_override.is_none() {
         args.insert(0, format!("--cloud={task}"));
@@ -3110,11 +3187,54 @@ fn user_shell() -> String {
 /// the daemon runs with its own inherited PATH), agent CLIs are spawned
 /// through the user's login shell, so a fresh install is picked up on the
 /// next try with no daemon restart.
-fn cli_missing_message(kind: AgentKind) -> String {
-    format!(
-        "{} was not found on your PATH — install it, then try again.",
-        kind.cli_program()
-    )
+fn cli_missing_message(program: &str) -> String {
+    format!("{program} was not found on your PATH — install it, then try again.")
+}
+
+/// The effective harness registry from the current config: the
+/// compiled-in known harnesses with the `harnesses` map applied, then the
+/// legacy `custom_harnesses` list, then map-only new ids. Every launch,
+/// resume and hook install resolves through here, so a config edit (not a
+/// rebuild) is what adds a CLI.
+fn harness_registry() -> Vec<nebula_core::harness::HarnessDescriptor> {
+    let config = crate::config::Config::load();
+    harness_registry_in(&config.harnesses, &config.custom_harnesses)
+}
+
+/// [`harness_registry`] against an explicit config, so tests can pin the
+/// registry without touching the user's files.
+fn harness_registry_in(
+    overrides: &std::collections::BTreeMap<String, nebula_core::harness::HarnessOverride>,
+    customs: &[nebula_core::harness::CustomHarness],
+) -> Vec<nebula_core::harness::HarnessDescriptor> {
+    nebula_core::harness::registry(overrides, customs)
+}
+
+/// The descriptor a launch or row runs as: built-ins by kind, customs by
+/// registry id. A missing id, or a broken entry, refuses the caller with
+/// its reason before anything spawns. An `enabled` switch gates the
+/// picker, never an existing row — a harness switched off after its
+/// sessions were created keeps running them.
+fn resolve_harness(
+    kind: AgentKind,
+    id: Option<&str>,
+) -> Result<nebula_core::harness::HarnessDescriptor> {
+    resolve_harness_in(kind, id, &harness_registry())
+}
+
+/// [`resolve_harness`] against an explicit registry, so tests can pin
+/// entries without touching the user's config.
+fn resolve_harness_in(
+    kind: AgentKind,
+    id: Option<&str>,
+    all: &[nebula_core::harness::HarnessDescriptor],
+) -> Result<nebula_core::harness::HarnessDescriptor> {
+    if kind == AgentKind::Custom && id.map(str::trim).filter(|id| !id.is_empty()).is_none() {
+        bail!("custom harness launch is missing its registry id");
+    }
+    nebula_core::harness::resolve(all, kind, id)
+        .map(|descriptor| descriptor.clone())
+        .map_err(anyhow::Error::msg)
 }
 
 /// Wrap `program args…` in a login + interactive shell (`$SHELL -l -i -c
@@ -3195,17 +3315,27 @@ fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
+/// The login-shell line [`Daemon::probe_cli`] runs to ask whether
+/// `program` resolves. The word is single-quoted through [`shell_quote`]:
+/// a `harnesses` entry in config.json can name any string, and pasted in
+/// bare a quote would close the word and run the rest as a command — at
+/// daemon boot, since [`Daemon::warm_cli_probes`] asks for every entry.
+/// Built-in names come out exactly as they always did (`'claude'`).
+fn cli_probe_line(program: &str) -> String {
+    format!("command -v {} >/dev/null 2>&1", shell_quote(program))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Claude argv: `args`, then nebula's appended guidance (worktree and
     /// spawn, one `--append-system-prompt`).
-    fn guided(args: &[&str]) -> Vec<String> {
+    fn guided(flag: &str, args: &[&str]) -> Vec<String> {
         args.iter()
             .map(|s| s.to_string())
             .chain([
-                "--append-system-prompt".to_string(),
+                flag.to_string(),
                 [
                     CLAUDE_WORKTREE_GUIDANCE,
                     crate::sibling::CLAUDE_SPAWN_GUIDANCE,
@@ -3245,7 +3375,7 @@ mod tests {
         // Fresh sessions: bare CLI (Claude plus its system-prompt guidance).
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, None, None, None, None),
-            ("claude".into(), guided(&[]), false)
+            ("claude".into(), guided("--append-system-prompt", &[]), false)
         );
         // Codex/cursor always run in skip-permissions mode.
         assert_eq!(
@@ -3261,18 +3391,28 @@ mod tests {
         // Claude (it has the system-prompt flag).
         assert_eq!(
             agent_spawn_command(AgentKind::Pi, None, None, None, None),
-            ("pi".into(), guided(&[]), false)
+            ("pi".into(), guided("--append-system-prompt", &[]), false)
         );
         // Pi resumes by exact id — one that is missing is created, so a
         // relocated session's new cwd never dies on a stale id.
         assert_eq!(
             agent_spawn_command(AgentKind::Pi, Some("sid-4"), None, None, None),
-            ("pi".into(), guided(&["--session-id", "sid-4"]), true)
+            ("pi".into(), guided("--append-system-prompt", &["--session-id", "sid-4"]), true)
+        );
+        // Muse boots bare and fresh: no resume flag is mapped yet, so a
+        // stored session id is ignored rather than sent.
+        assert_eq!(
+            agent_spawn_command(AgentKind::Muse, None, None, None, None),
+            ("muse".into(), vec![], false)
+        );
+        assert_eq!(
+            agent_spawn_command(AgentKind::Muse, Some("sid-9"), None, None, None),
+            ("muse".into(), vec![], false)
         );
         // Claude resumes with a flag; codex with a subcommand (order matters).
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, Some("sid-1"), None, None, None),
-            ("claude".into(), guided(&["--resume", "sid-1"]), true)
+            ("claude".into(), guided("--append-system-prompt", &["--resume", "sid-1"]), true)
         );
         // Skip-permissions flags trail the resume args. A codex resume is
         // told its checkout (`--cd`): without it codex reopens the session
@@ -3328,13 +3468,13 @@ mod tests {
             agent_spawn_command(AgentKind::Claude, None, Some("opus"), Some("high"), None),
             (
                 "claude".into(),
-                guided(&["--model", "opus", "--effort", "high"]),
+                guided("--append-system-prompt", &["--model", "opus", "--effort", "high"]),
                 false
             )
         );
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, None, None, Some("max"), None),
-            ("claude".into(), guided(&["--effort", "max"]), false)
+            ("claude".into(), guided("--append-system-prompt", &["--effort", "max"]), false)
         );
         // Codex takes --model plus a config override for effort, after --yolo.
         assert_eq!(
@@ -3357,13 +3497,23 @@ mod tests {
             agent_spawn_command(AgentKind::Pi, None, Some("sonnet"), Some("high"), None),
             (
                 "pi".into(),
-                guided(&["--model", "sonnet", "--thinking", "high"]),
+                guided("--append-system-prompt", &["--model", "sonnet", "--thinking", "high"]),
                 false
             )
         );
         assert_eq!(
             agent_spawn_command(AgentKind::Pi, None, None, Some("off"), None),
-            ("pi".into(), guided(&["--thinking", "off"]), false)
+            ("pi".into(), guided("--append-system-prompt", &["--thinking", "off"]), false)
+        );
+        // Muse takes `--model` verbatim and no effort flag yet: effort is
+        // dropped, never sent.
+        assert_eq!(
+            agent_spawn_command(AgentKind::Muse, None, Some("spark"), Some("high"), None),
+            (
+                "muse".into(),
+                vec!["--model".to_string(), "spark".to_string()],
+                false
+            )
         );
         // Resume keeps the model/effort flags (a fallback fresh spawn needs
         // them, and the CLIs accept them alongside resume).
@@ -3371,7 +3521,7 @@ mod tests {
             agent_spawn_command(AgentKind::Claude, Some("sid"), Some("sonnet"), None, None),
             (
                 "claude".into(),
-                guided(&["--resume", "sid", "--model", "sonnet"]),
+                guided("--append-system-prompt", &["--resume", "sid", "--model", "sonnet"]),
                 true
             )
         );
@@ -3422,10 +3572,229 @@ mod tests {
     }
 
     #[test]
+    fn custom_spawn_uses_entry_program_and_model_flag() {
+        // Custom entries launch with their own program and model flag; a
+        // stored session id is ignored (fresh boot) and effort is dropped.
+        let agy = nebula_core::harness::CustomHarness {
+            id: "agy".into(),
+            label: "Agy".into(),
+            program: "agy".into(),
+            enabled: true,
+            model: "default".into(),
+            model_flag: "--model".into(),
+            hooks: None,
+        };
+        let all = harness_registry_in(&std::collections::BTreeMap::new(), &[agy.clone()]);
+        let harness = test_custom_harness(&all, "agy");
+        let (program, args, resumed) = agent_spawn_command_with(
+            &harness,
+            Some("sid-1"),
+            Some(Path::new(TEST_CWD)),
+            Some("big-1"),
+            Some("high"),
+            None,
+            Some("do it"),
+            None,
+            true,
+        );
+        assert_eq!(program, "agy");
+        assert_eq!(args, vec!["--model", "big-1", "do it"]);
+        assert!(!resumed);
+        // A custom model flag spelling is honored verbatim.
+        let gemini = nebula_core::harness::CustomHarness {
+            model_flag: "-m".into(),
+            ..agy.clone()
+        };
+        let all = harness_registry_in(&std::collections::BTreeMap::new(), &[gemini]);
+        let harness = test_custom_harness(&all, "agy");
+        let (_, args, _) = agent_spawn_command_with(
+            &harness,
+            None,
+            Some(Path::new(TEST_CWD)),
+            Some("flash"),
+            None,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert_eq!(args, vec!["-m", "flash"]);
+    }
+
+    #[test]
+    fn custom_spawn_honors_map_deltas_for_resume_and_hooks() {
+        // A legacy entry gains a resume flag and an effort flag purely
+        // through the `harnesses` map — no code change, no new shape.
+        use nebula_core::harness::{Clearable, HarnessOverride};
+        let agy = nebula_core::harness::CustomHarness {
+            id: "agy".into(),
+            label: "Agy".into(),
+            program: "agy".into(),
+            enabled: true,
+            model: "default".into(),
+            model_flag: "--model".into(),
+            hooks: None,
+        };
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert(
+            "agy".into(),
+            HarnessOverride {
+                resume_flag: Clearable::Set("--resume".into()),
+                effort_flag: Clearable::Set("--effort".into()),
+                effort_offered: Some(true),
+                hooks: Clearable::Set("claude".into()),
+                ..HarnessOverride::default()
+            },
+        );
+        let all = harness_registry_in(&overrides, &[agy]);
+        let harness = test_custom_harness(&all, "agy");
+        assert_eq!(
+            harness.hook_dialect(),
+            Some(AgentKind::Claude),
+            "the dialect installs Claude hooks for a third-party CLI"
+        );
+        let (program, args, resumed) = agent_spawn_command_with(
+            &harness,
+            Some("sid-1"),
+            Some(Path::new(TEST_CWD)),
+            Some("big-1"),
+            Some("high"),
+            None,
+            Some("do it"),
+            None,
+            true,
+        );
+        assert_eq!(program, "agy");
+        assert_eq!(
+            args,
+            vec!["--resume", "sid-1", "--model", "big-1", "--effort", "high", "do it"]
+        );
+        assert!(resumed);
+    }
+
+    /// A third-party CLI with every row mapped — shaped like xAI's
+    /// `grok` (`--model`, `--reasoning-effort`, `--resume <id>`,
+    /// `--rules` appending to the system prompt, trailing prompt) —
+    /// spawns, resumes and carries guidance with config alone.
+    #[test]
+    fn third_party_harness_with_all_rows_mapped_spawns_and_resumes() {
+        use nebula_core::harness::{Clearable, HarnessOverride};
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert(
+            "grok".into(),
+            HarnessOverride {
+                program: Clearable::Set("grok".into()),
+                model_flag: Clearable::Set("--model".into()),
+                effort_flag: Clearable::Set("--reasoning-effort".into()),
+                effort_offered: Some(true),
+                resume_flag: Clearable::Set("--resume".into()),
+                system_append_flag: Clearable::Set("--rules".into()),
+                ..HarnessOverride::default()
+            },
+        );
+        let all = harness_registry_in(&overrides, &[]);
+        let grok = test_custom_harness(&all, "grok");
+        assert_eq!(grok.problem(), None);
+
+        // Fresh boot: model, effort, guidance and prompt in order, no
+        // permissions flag the entry never named.
+        let (program, args, resumed) = agent_spawn_command_with(
+            &grok,
+            None,
+            Some(Path::new(TEST_CWD)),
+            Some("grok-code"),
+            Some("high"),
+            None,
+            Some("fix auth"),
+            None,
+            true,
+        );
+        assert_eq!(program, "grok");
+        assert!(!resumed);
+        let mut expected = vec![
+            "--model".to_string(),
+            "grok-code".to_string(),
+            "--reasoning-effort".to_string(),
+            "high".to_string(),
+        ];
+        expected.append(&mut guided("--rules", &[]));
+        expected.push("fix auth".into());
+        assert_eq!(args, expected);
+
+        // Resume: the stored id rides the mapped flag.
+        let (_, args, resumed) = agent_spawn_command_with(
+            &grok,
+            Some("sid-9"),
+            Some(Path::new(TEST_CWD)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(resumed);
+        assert_eq!(args, vec!["--resume", "sid-9"]);
+    }
+
+    #[test]
+    fn harness_resolve_names_missing_unknown_and_broken_entries() {
+        use nebula_core::harness::CustomHarness;
+        let agy = CustomHarness {
+            id: "agy".into(),
+            label: String::new(),
+            program: "agy".into(),
+            enabled: true,
+            model: "default".into(),
+            model_flag: "--model".into(),
+            hooks: None,
+        };
+        let all = harness_registry_in(&std::collections::BTreeMap::new(), &[agy.clone()]);
+        // Built-ins resolve by kind, whatever the id says.
+        assert_eq!(
+            resolve_harness_in(AgentKind::Claude, None, &all)
+                .unwrap()
+                .program,
+            "claude"
+        );
+        // Custom without an id, or with an unknown one, refuses.
+        let err = resolve_harness_in(AgentKind::Custom, None, &all).unwrap_err();
+        assert!(err.to_string().contains("registry id"), "{err}");
+        let err = resolve_harness_in(AgentKind::Custom, Some("gone"), &all).unwrap_err();
+        assert!(err.to_string().contains("no longer defined"), "{err}");
+        // A broken entry refuses with its reason, never launches.
+        let broken = CustomHarness {
+            program: String::new(),
+            ..agy.clone()
+        };
+        let all = harness_registry_in(&std::collections::BTreeMap::new(), &[broken]);
+        let err = resolve_harness_in(AgentKind::Custom, Some("agy"), &all).unwrap_err();
+        assert!(err.to_string().contains("no program"), "{err}");
+        // The usable entry resolves, disabled or not: a harness switched
+        // off after its sessions were created keeps running them.
+        let off = CustomHarness {
+            enabled: false,
+            ..agy.clone()
+        };
+        let all = harness_registry_in(&std::collections::BTreeMap::new(), &[off]);
+        assert_eq!(
+            resolve_harness_in(AgentKind::Custom, Some("agy"), &all)
+                .unwrap()
+                .program,
+            "agy"
+        );
+    }
+
+    #[test]
     fn spawn_command_initial_prompt_is_the_trailing_positional_argument() {
+        let all = test_registry();
+        let claude = test_harness(&all, AgentKind::Claude);
+        let codex = test_harness(&all, AgentKind::Codex);
+        let cursor = test_harness(&all, AgentKind::Cursor);
+        let pi = test_harness(&all, AgentKind::Pi);
         // The relocation notice trails everything, guidance included.
         let (_, args, resumed) = agent_spawn_command_with(
-            AgentKind::Claude,
+            &claude,
             Some("sid"),
             Some(Path::new(TEST_CWD)),
             Some("opus"),
@@ -3436,13 +3805,13 @@ mod tests {
             true,
         );
         assert!(resumed);
-        let mut expected = guided(&["--resume", "sid", "--model", "opus"]);
+        let mut expected = guided("--append-system-prompt", &["--resume", "sid", "--model", "opus"]);
         expected.push("carry on".into());
         assert_eq!(args, expected);
         // Codex and cursor take it as their trailing positional too.
         assert_eq!(
             agent_spawn_command_with(
-                AgentKind::Codex,
+                &codex,
                 Some("sid"),
                 Some(Path::new(TEST_CWD)),
                 None,
@@ -3450,14 +3819,14 @@ mod tests {
                 None,
                 Some("carry on"),
                 None,
-                true
+                true,
             )
             .1,
             vec!["resume", "sid", "--cd", TEST_CWD, "--yolo", "carry on"]
         );
         assert_eq!(
             agent_spawn_command_with(
-                AgentKind::Cursor,
+                &cursor,
                 Some("sid"),
                 Some(Path::new(TEST_CWD)),
                 None,
@@ -3465,18 +3834,18 @@ mod tests {
                 None,
                 Some("carry on"),
                 None,
-                true
+                true,
             )
             .1,
             vec!["--resume", "sid", "--force", "carry on"]
         );
         // A fresh spawn with a starting prompt (an AGENT PRESET launch):
         // model, effort and system prompt all precede it.
-        let mut expected = guided(&["--model", "opus", "--effort", "high"]);
+        let mut expected = guided("--append-system-prompt", &["--model", "opus", "--effort", "high"]);
         expected.push("fix auth".into());
         assert_eq!(
             agent_spawn_command_with(
-                AgentKind::Claude,
+                &claude,
                 None,
                 Some(Path::new(TEST_CWD)),
                 Some("opus"),
@@ -3484,14 +3853,14 @@ mod tests {
                 None,
                 Some("fix auth"),
                 None,
-                true
+                true,
             )
             .1,
             expected
         );
         assert_eq!(
             agent_spawn_command_with(
-                AgentKind::Codex,
+                &codex,
                 None,
                 Some(Path::new(TEST_CWD)),
                 Some("gpt-5.5"),
@@ -3499,7 +3868,7 @@ mod tests {
                 None,
                 Some("fix auth"),
                 None,
-                true
+                true,
             )
             .1,
             vec![
@@ -3513,7 +3882,7 @@ mod tests {
         );
         assert_eq!(
             agent_spawn_command_with(
-                AgentKind::Cursor,
+                &cursor,
                 None,
                 Some(Path::new(TEST_CWD)),
                 None,
@@ -3521,18 +3890,18 @@ mod tests {
                 None,
                 Some("fix auth"),
                 None,
-                true
+                true,
             )
             .1,
             vec!["--force", "fix auth"]
         );
         // Pi: the prompt trails the resume id and the guidance, as pi's
         // `[messages...]` positional.
-        let mut expected = guided(&["--session-id", "sid"]);
+        let mut expected = guided("--append-system-prompt", &["--session-id", "sid"]);
         expected.push("carry on".into());
         assert_eq!(
             agent_spawn_command_with(
-                AgentKind::Pi,
+                &pi,
                 Some("sid"),
                 Some(Path::new(TEST_CWD)),
                 None,
@@ -3540,7 +3909,7 @@ mod tests {
                 None,
                 Some("carry on"),
                 None,
-                true
+                true,
             )
             .1,
             expected
@@ -3548,7 +3917,7 @@ mod tests {
         // An override is verbatim: no guidance, no prompt.
         assert_eq!(
             agent_spawn_command_with(
-                AgentKind::Claude,
+                &claude,
                 None,
                 Some(Path::new(TEST_CWD)),
                 None,
@@ -3556,7 +3925,7 @@ mod tests {
                 Some("/bin/sh -i"),
                 Some("carry on"),
                 None,
-                true
+                true,
             ),
             ("/bin/sh".into(), vec!["-i".to_string()], false)
         );
@@ -3577,19 +3946,25 @@ mod tests {
             is_main: false,
             sort_order: 0,
         };
+        let all = test_registry();
         for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Pi] {
-            let prompt = relocation_prompt(kind, &feat).unwrap_or_else(|| panic!("{kind:?}"));
+            let harness = test_harness(&all, kind);
+            assert!(harness.relocation_prompt, "{kind:?} maps the notice");
+            let prompt = relocation_prompt(harness.relocation_prompt, &feat)
+                .unwrap_or_else(|| panic!("{kind:?}"));
             assert!(prompt.contains("`feat`"), "{kind:?}: {prompt}");
             assert!(prompt.contains("/nebula-test/p-feat"), "{kind:?}: {prompt}");
             assert!(prompt.contains("Continue the user's most recent request"));
         }
-        assert_eq!(relocation_prompt(AgentKind::Cursor, &feat), None);
+        let cursor = test_harness(&all, AgentKind::Cursor);
+        assert_eq!(relocation_prompt(cursor.relocation_prompt, &feat), None);
 
         // And the codex respawn it feeds: resumed, re-rooted in the
         // worktree, and opening on the notice.
-        let notice = relocation_prompt(AgentKind::Codex, &feat).unwrap();
+        let codex = test_harness(&all, AgentKind::Codex);
+        let notice = relocation_prompt(codex.relocation_prompt, &feat).unwrap();
         let (program, args, resumed) = agent_spawn_command_with(
-            AgentKind::Codex,
+            &codex,
             Some("sid"),
             Some(&feat.path),
             None,
@@ -3623,8 +3998,10 @@ mod tests {
             branch: "fix",
             root: Some(Path::new("/w/nebula")),
         });
+        let all = test_registry();
+        let claude = test_harness(&all, AgentKind::Claude);
         let (_, args, resumed) = agent_spawn_command_with(
-            AgentKind::Claude,
+            &claude,
             Some("sid"),
             Some(Path::new(TEST_CWD)),
             None,
@@ -3651,8 +4028,11 @@ mod tests {
 
     #[test]
     fn spawn_command_claude_cloud_passes_the_task_as_one_argument() {
+        let all = test_registry();
+        let claude = test_harness(&all, AgentKind::Claude);
         assert_eq!(
             claude_cloud_spawn_command(
+                &claude,
                 "Fix auth\nRun tests; don't stop",
                 Some("opus"),
                 Some("high"),
@@ -3671,12 +4051,13 @@ mod tests {
             )
         );
         assert_eq!(
-            claude_cloud_spawn_command("--dangerously-skip-permissions", None, None, None).1,
+            claude_cloud_spawn_command(&claude, "--dangerously-skip-permissions", None, None, None)
+                .1,
             vec!["--cloud=--dangerously-skip-permissions"]
         );
         // Overrides (tests) stay verbatim — no cloud flag at all.
         assert_eq!(
-            claude_cloud_spawn_command("task", None, None, Some("/bin/true")).1,
+            claude_cloud_spawn_command(&claude, "task", None, None, Some("/bin/true")).1,
             Vec::<String>::new()
         );
     }
@@ -3750,6 +4131,38 @@ mod tests {
     /// ahead of the command itself.
     const PANE_ENV: &str =
         "unset NO_COLOR FORCE_COLOR; export TERM=xterm-256color COLORTERM=truecolor;";
+
+    #[test]
+    fn cli_probe_line_looks_the_program_up_verbatim() {
+        // Built-ins read exactly as before the registry.
+        assert_eq!(
+            cli_probe_line("claude"),
+            "command -v 'claude' >/dev/null 2>&1"
+        );
+        assert_eq!(
+            cli_probe_line("cursor-agent"),
+            "command -v 'cursor-agent' >/dev/null 2>&1"
+        );
+        // A config-named program is any string. A quote in it stays
+        // inside the word instead of closing it and opening a command.
+        let hostile = "x'; echo INJECTED; echo '";
+        let line = cli_probe_line(hostile);
+        assert_eq!(
+            line,
+            "command -v 'x'\\''; echo INJECTED; echo '\\''' >/dev/null 2>&1"
+        );
+        // And a real shell agrees: the lookup fails quietly, nothing runs.
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", &line])
+            .output()
+            .expect("/bin/sh");
+        assert!(!out.status.success(), "no such program");
+        assert!(
+            out.stdout.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
 
     #[test]
     fn login_shell_wrap_quotes_args_and_leaves_the_command_word_bare() {
@@ -4030,6 +4443,7 @@ mod tests {
                 worktree: worktree.clone(),
                 name: "cloud".into(),
                 kind: AgentKind::Claude,
+                custom_harness: None,
                 model: None,
                 effort: None,
                 auto_title: false,
@@ -4047,6 +4461,7 @@ mod tests {
                 worktree: worktree.clone(),
                 name: "cloud".into(),
                 kind: AgentKind::Claude,
+                custom_harness: None,
                 model: None,
                 effort: None,
                 auto_title: false,
@@ -4064,6 +4479,7 @@ mod tests {
                 worktree: worktree.clone(),
                 name: "cloud".into(),
                 kind: AgentKind::Claude,
+                custom_harness: None,
                 model: None,
                 effort: None,
                 auto_title: false,
@@ -4081,6 +4497,7 @@ mod tests {
                 worktree,
                 name: "cloud".into(),
                 kind: AgentKind::Codex,
+                custom_harness: None,
                 model: None,
                 effort: None,
                 auto_title: false,
@@ -4101,6 +4518,7 @@ mod tests {
             worktree: WorktreeId("unused".into()),
             name: "pr".into(),
             kind,
+            custom_harness: None,
             model: None,
             effort: None,
             auto_title: false,
@@ -4110,6 +4528,12 @@ mod tests {
             issue_url: None,
         };
         for kind in AgentKind::ALL {
+            if kind == AgentKind::Custom {
+                // Without a registry id the custom refusal comes first.
+                let err = daemon.create_agent(spec(kind, None)).await.unwrap_err();
+                assert!(err.to_string().contains("registry id"), "{err}");
+                continue;
+            }
             // Validation passes for every harness; the missing worktree is
             // what stops this spec, one check later.
             let err = daemon.create_agent(spec(kind, None)).await.unwrap_err();
@@ -4197,6 +4621,7 @@ mod tests {
                 project: project.clone(),
                 name: "pr".into(),
                 kind: AgentKind::Claude,
+                custom_harness: None,
                 model: None,
                 effort: None,
                 auto_title: false,
@@ -4218,6 +4643,7 @@ mod tests {
             worktree: WorktreeId("unused".into()),
             name: "issue".into(),
             kind,
+            custom_harness: None,
             model: None,
             effort: None,
             auto_title: true,
@@ -4227,6 +4653,11 @@ mod tests {
             issue_url: Some("https://github.com/o/r/issues/15".into()),
         };
         for kind in AgentKind::ALL {
+            if kind == AgentKind::Custom {
+                let err = daemon.create_agent(spec(kind, None)).await.unwrap_err();
+                assert!(err.to_string().contains("registry id"), "{err}");
+                continue;
+            }
             let err = daemon.create_agent(spec(kind, None)).await.unwrap_err();
             assert!(
                 err.to_string().contains("worktree not found"),
@@ -4256,6 +4687,7 @@ mod tests {
             worktree: WorktreeId("unused".into()),
             name: "preset".into(),
             kind,
+            custom_harness: None,
             model: None,
             effort: None,
             auto_title: true,
@@ -4372,6 +4804,7 @@ mod tests {
                 archived_at: 0,
                 unseen: false,
                 kind: AgentKind::Claude,
+                custom_harness: None,
                 model: None,
                 effort: None,
                 session_id: session_id.map(str::to_string),
@@ -4556,6 +4989,7 @@ mod tests {
                     archived_at: 0,
                     unseen: false,
                     kind: AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -5313,14 +5747,21 @@ mod tests {
     fn cli_missing_message_names_the_binary_not_the_kind() {
         // Cursor ships its agent as `cursor-agent`; naming the kind would
         // send the user off to install the wrong thing.
-        assert!(cli_missing_message(AgentKind::Cursor).starts_with("cursor-agent was not found"));
-        assert!(cli_missing_message(AgentKind::Claude).starts_with("claude was not found"));
-        assert!(cli_missing_message(AgentKind::Codex).starts_with("codex was not found"));
-        assert!(cli_missing_message(AgentKind::Pi).starts_with("pi was not found"));
+        assert!(
+            cli_missing_message(AgentKind::Cursor.cli_program())
+                .starts_with("cursor-agent was not found")
+        );
+        assert!(cli_missing_message(AgentKind::Claude.cli_program()).starts_with("claude was not found"));
+        assert!(cli_missing_message(AgentKind::Codex.cli_program()).starts_with("codex was not found"));
+        assert!(cli_missing_message(AgentKind::Pi.cli_program()).starts_with("pi was not found"));
+        assert!(cli_missing_message("agy").starts_with("agy was not found"));
         // No "restart nebula": agent CLIs are spawned through the user's
         // login shell, so a fresh install is picked up on the next try.
         for kind in AgentKind::ALL {
-            let msg = cli_missing_message(kind);
+            if kind == AgentKind::Custom {
+                continue; // no static program; resolved through the registry
+            }
+            let msg = cli_missing_message(kind.cli_program());
             assert!(msg.contains("try again"), "{msg}");
             assert!(!msg.contains("restart"), "{msg}");
         }

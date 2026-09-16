@@ -32,7 +32,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
-use crate::config::{CLAUDE_MODELS, DEFAULT_CHOICE};
+use crate::config::DEFAULT_CHOICE;
+
+/// The built-in Claude model aliases, [`DEFAULT_CHOICE`] first: what the
+/// pickers offer when neither CONFIG.JSON's `claude_models` nor Claude
+/// Code's own `availableModels` allowlist names anything.
+pub const CLAUDE_MODELS: &[&str] = &[DEFAULT_CHOICE, "fable", "opus", "sonnet", "haiku"];
 
 /// The settings key Claude Code reads its allowlist from.
 const AVAILABLE_MODELS_KEY: &str = "availableModels";

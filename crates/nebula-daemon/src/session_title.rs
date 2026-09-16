@@ -140,16 +140,41 @@ pub struct TitleState {
     pub claude_title: Option<String>,
     pub auto_title_pending: bool,
     pub kind: AgentKind,
+    /// Registry id when `kind` is [`AgentKind::Custom`]; lets the hook
+    /// reply treat rows on the Claude dialect like Claude itself.
+    pub custom_harness: Option<String>,
 }
 
 impl TitleState {
+    /// Whether this row's harness speaks the Claude hook dialect: builtin
+    /// Claude, or a custom entry naming it. Reads the current registry for
+    /// custom rows; unknown or broken ids read as no dialect. Built-in
+    /// Claude never consults it (its replies only exist while its hooks
+    /// are installed).
+    pub fn claude_like(&self) -> bool {
+        match self.kind {
+            AgentKind::Claude => true,
+            AgentKind::Custom => {
+                let config = crate::config::Config::load();
+                let all = nebula_core::harness::registry(
+                    &config.harnesses,
+                    &config.custom_harnesses,
+                );
+                nebula_core::harness::resolve(&all, self.kind, self.custom_harness.as_deref())
+                    .map(|descriptor| descriptor.claude_like())
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
     /// The title the `UserPromptSubmit` reply should hand Claude: the
     /// row's name when it is user- or AUTO-TITLE-set and not what Claude
     /// already holds. `None` while the AUTO-TITLE is still pending (the
     /// instruction rides that reply instead), for a default name, when the
-    /// two agree, and for every non-Claude harness.
+    /// two agree, and for every harness outside the Claude dialect.
     pub fn to_push(&self) -> Option<&str> {
-        if self.kind != AgentKind::Claude
+        if !self.claude_like()
             || self.auto_title_pending
             || is_default_agent_name(&self.name)
             || self.claude_title.as_deref() == Some(self.name.as_str())
@@ -360,6 +385,7 @@ mod tests {
                     archived_at: 0,
                     unseen: false,
                     kind: AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -452,6 +478,7 @@ mod tests {
             claude_title: claude.map(str::to_string),
             auto_title_pending: pending,
             kind,
+            custom_harness: None,
         };
         let claude = AgentKind::Claude;
         assert_eq!(

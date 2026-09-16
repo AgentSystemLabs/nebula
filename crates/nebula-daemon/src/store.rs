@@ -263,6 +263,11 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE terminals ADD COLUMN run_command TEXT;
     ",
+    // 27: the custom harness registry id for `AgentKind::Custom` rows.
+    // Nullable: every built-in harness reads its kind column alone.
+    "
+    ALTER TABLE agents ADD COLUMN custom_harness TEXT;
+    ",
 ];
 
 pub struct Store {
@@ -551,8 +556,8 @@ impl Store {
         issue_url: Option<&str>,
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id, pr_url, issue_url)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, unseen, cloud_session_id, pr_url, issue_url, custom_harness)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 a.id.as_str(),
                 a.worktree_id.as_str(),
@@ -572,6 +577,7 @@ impl Store {
                 a.cloud_session_id,
                 pr_url,
                 issue_url,
+                a.custom_harness,
             ],
         )?;
         Ok(())
@@ -697,7 +703,7 @@ impl Store {
     pub fn agent_title_state(&self, id: &AgentId) -> Result<Option<TitleState>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT name, claude_title, auto_title_pending, kind FROM agents WHERE id = ?1",
+            "SELECT name, claude_title, auto_title_pending, kind, custom_harness FROM agents WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.as_str()])?;
         match rows.next()? {
@@ -705,7 +711,8 @@ impl Store {
                 name: row.get(0)?,
                 claude_title: row.get(1)?,
                 auto_title_pending: row.get::<_, i64>(2)? != 0,
-                kind: AgentKind::parse(&row.get::<_, String>(3)?).unwrap_or_default(),
+                kind: parse_agent_kind(&row.get::<_, String>(3)?),
+                custom_harness: row.get(4)?,
             })),
             None => Ok(None),
         }
@@ -1066,7 +1073,7 @@ const PROJECT_COLUMNS: &str = "id, name, repo_path, sort_order, workspace_id";
 const WORKTREE_COLUMNS: &str = "id, project_id, path, branch, is_main, sort_order";
 const AGENT_COLUMNS: &str = "id, worktree_id, name, status, archived, kind, \
                              claude_session_id, sort_order, status_changed_at, model, effort, \
-                             archived_at, unseen, cloud_session_id, recent_prompts";
+                             archived_at, unseen, cloud_session_id, recent_prompts, custom_harness";
 const TERMINAL_COLUMNS: &str = "id, worktree_id, name, sort_order, run_command";
 const LINK_COLUMNS: &str = "id, worktree_id, url, sort_order";
 
@@ -1110,7 +1117,7 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<Agent> {
         name: r.get(2)?,
         status: AgentStatus::parse(&r.get::<_, String>(3)?).unwrap_or(AgentStatus::Fresh),
         archived: r.get::<_, i64>(4)? != 0,
-        kind: AgentKind::parse(&r.get::<_, String>(5)?).unwrap_or_default(),
+        kind: parse_agent_kind(&r.get::<_, String>(5)?),
         session_id: r.get(6)?,
         sort_order: r.get(7)?,
         status_changed_at: r.get(8)?,
@@ -1121,7 +1128,20 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<Agent> {
         cloud_session_id: r.get(13)?,
         alive: false,
         recent_prompts: parse_prompts(r.get::<_, Option<String>>(14)?.as_deref()),
+        custom_harness: r.get(15)?,
     })
+}
+
+/// A stored kind string back into its kind. Bare `"custom"` never parses
+/// through [`AgentKind::parse`] (a custom harness is meaningless without
+/// its registry id), so the row mappers name it here instead; anything
+/// else unknown reads as the default rather than failing the row load.
+fn parse_agent_kind(raw: &str) -> AgentKind {
+    if raw.trim() == AgentKind::Custom.as_str() {
+        AgentKind::Custom
+    } else {
+        AgentKind::parse(raw).unwrap_or_default()
+    }
 }
 
 /// The `recent_prompts` column: NULL is the empty history, and a column
@@ -1186,6 +1206,7 @@ mod tests {
             archived_at: 0,
             unseen: false,
             kind: AgentKind::Claude,
+            custom_harness: None,
             model: Some("opus".into()),
             effort: Some("high".into()),
             session_id: Some("sess-123".into()),
@@ -1208,6 +1229,7 @@ mod tests {
             archived_at: 0,
             unseen: false,
             kind: AgentKind::Codex,
+            custom_harness: None,
             model: None,
             effort: None,
             session_id: None,
@@ -1227,6 +1249,7 @@ mod tests {
             archived_at: 0,
             unseen: false,
             kind: AgentKind::Cursor,
+            custom_harness: None,
             model: None,
             effort: None,
             session_id: None,
@@ -1247,6 +1270,7 @@ mod tests {
             archived_at: 0,
             unseen: false,
             kind: AgentKind::Claude,
+            custom_harness: None,
             model: None,
             effort: None,
             session_id: None,
@@ -1269,11 +1293,40 @@ mod tests {
         assert_eq!(agents[0].session_id.as_deref(), Some("sess-123"));
         assert_eq!(agents[0].model.as_deref(), Some("opus"));
         assert_eq!(agents[0].effort.as_deref(), Some("high"));
+        assert_eq!(agents[0].custom_harness, None, "built-ins store no id");
         assert_eq!(
             store.agent_pr_url(&agents[0].id).unwrap().as_deref(),
             Some(pr_url)
         );
         assert_eq!(store.agent_pr_url(&agents[1].id).unwrap(), None);
+
+        // A Custom row round-trips its registry id beside the kind, so
+        // respawns find the same entry (migration 27).
+        let custom = Agent {
+            id: AgentId::generate(),
+            worktree_id: worktree.id.clone(),
+            name: "agy-1".into(),
+            status: AgentStatus::Fresh,
+            archived: false,
+            archived_at: 0,
+            unseen: false,
+            kind: AgentKind::Custom,
+            custom_harness: Some("agy".into()),
+            model: Some("big-1".into()),
+            effort: None,
+            session_id: None,
+            cloud_session_id: None,
+            sort_order: 0,
+            status_changed_at: 0,
+            alive: false,
+            recent_prompts: Vec::new(),
+        };
+        store.insert_agent(&custom).unwrap();
+        let (_, _, reloaded, _) = store.load_tree().unwrap();
+        let back = reloaded.iter().find(|a| a.id == custom.id).unwrap();
+        assert_eq!(back.kind, AgentKind::Custom);
+        assert_eq!(back.custom_harness.as_deref(), Some("agy"));
+        assert_eq!(back.model.as_deref(), Some("big-1"));
         assert_eq!(agents[1].kind, AgentKind::Codex);
         assert_eq!(agents[1].model, None);
         assert_eq!(agents[2].kind, AgentKind::Cursor);
@@ -1729,6 +1782,7 @@ mod tests {
             archived_at: 0,
             unseen: false,
             kind: AgentKind::Claude,
+            custom_harness: None,
             model: None,
             effort: None,
             session_id: None,
@@ -1816,6 +1870,7 @@ mod tests {
                     archived_at: 0,
                     unseen: false,
                     kind: AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -1945,6 +2000,7 @@ mod tests {
                     archived_at: 0,
                     unseen: false,
                     kind: AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -2010,6 +2066,7 @@ mod tests {
                 archived_at: 0,
                 unseen: false,
                 kind: AgentKind::Claude,
+                custom_harness: None,
                 model: None,
                 effort: None,
                 session_id: None,
@@ -2109,6 +2166,7 @@ mod tests {
                 archived_at: 0,
                 unseen: false,
                 kind: AgentKind::Claude,
+                custom_harness: None,
                 model: None,
                 effort: None,
                 session_id: None,

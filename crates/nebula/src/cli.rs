@@ -61,13 +61,16 @@ Examples:
 
 Run `nebula <command> --help` for a command's flags and examples.";
 
-/// `--kind` for `nebula spawn`: one of the agent CLIs nebula runs.
+/// `--kind` for `nebula spawn`: one of the agent CLIs nebula runs. A bare
+/// `custom` is never accepted: custom harnesses carry a registry id the
+/// flag cannot name, so they launch from the TUI picker and presets.
 fn parse_agent_kind(s: &str) -> Result<nebula_core::AgentKind, String> {
     nebula_core::AgentKind::parse(s).ok_or_else(|| {
         format!(
-            "unknown harness `{s}` — expected one of {}",
+            "unknown harness `{s}` — expected one of {} (custom harnesses launch from the TUI)",
             nebula_core::AgentKind::ALL
                 .iter()
+                .filter(|k| **k != nebula_core::AgentKind::Custom)
                 .map(|k| k.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -442,6 +445,13 @@ pub(crate) enum ConfigCommand {
         #[arg(value_name = "SOURCE")]
         source: String,
     },
+    /// Print the effective harness registry: every harness nebula knows —
+    /// the built-ins, `custom_harnesses` entries and `harnesses` map ids —
+    /// with the program, flags, resume shape, hook dialect and defaults a
+    /// launch actually uses. Copy a row into config.json `harnesses` to
+    /// override it.
+    #[command(after_help = "Example:\n  nebula config harnesses")]
+    Harnesses,
 }
 
 #[derive(Subcommand)]

@@ -2,6 +2,7 @@ pub mod codec;
 pub mod crashlog;
 pub mod entities;
 pub mod env;
+pub mod harness;
 pub mod host;
 pub mod ids;
 pub mod mem;
@@ -11,5 +12,6 @@ pub mod protocol;
 pub mod settings;
 
 pub use entities::*;
+pub use harness::*;
 pub use ids::*;
 pub use protocol::*;

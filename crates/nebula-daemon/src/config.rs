@@ -6,6 +6,7 @@
 //! value this build can't read costs only its own key.
 
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -38,6 +39,17 @@ pub struct Config {
     /// with no such branch at all — the default again, with a warning in
     /// the daemon log. Read through [`Config::worktree_base_branch`].
     pub worktree_base_branch: String,
+    /// User-defined harnesses from the `custom_harnesses` key, shared with
+    /// the TUI's picker. The daemon resolves programs, model flags and
+    /// respawns from this list; entries that fail validation are refused
+    /// at create time with the reason, never launched.
+    pub custom_harnesses: Vec<nebula_core::harness::CustomHarness>,
+    /// Per-harness deltas over the compiled-in registry (`harnesses` in
+    /// config.json): repoint a program, rename a flag, switch a harness
+    /// off, or define a whole new CLI. Merged by
+    /// [`nebula_core::harness::registry`]; a broken entry refuses its
+    /// launches with the reason, never the whole daemon.
+    pub harnesses: BTreeMap<String, nebula_core::harness::HarnessOverride>,
 }
 
 impl Default for Config {
@@ -48,6 +60,8 @@ impl Default for Config {
             prewarm_sessions: true,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT.into(),
             worktree_base_branch: String::new(),
+            custom_harnesses: Vec::new(),
+            harnesses: BTreeMap::new(),
         }
     }
 }

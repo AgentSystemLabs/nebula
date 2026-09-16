@@ -83,7 +83,7 @@
   sweep leave that terminal alone, and a run that exits on its own keeps its PTY, so an attach replays
   the ending instead of respawning — a command starts only on the keypress. `Shift+Enter` (or `Shift+O`) runs `open`
   once, from the TUI. See [Configuration](configuration.md#the-project-file-nebulajson).
-- **Agents boot `claude`, `codex`, `cursor-agent`, or `pi`.** Creating an agent (`n`) first asks which CLI to
+- **Agents boot `claude`, `codex`, `cursor-agent`, `pi`, `muse`, or a custom registry program.** Creating an agent (`n`) first asks which CLI to
   run, then spawns it in the worktree. Claude's picker can also dispatch a one-shot Cloud task as
   `claude --cloud <task>`; because Claude accepts that description as a process argument, don't put
   secrets in the Cloud task. That CLI prints the new session's id and exits, and the DAEMON reads the
@@ -92,12 +92,12 @@
   Restored agents resume with `claude --resume <session-id>` /
   `codex resume <session-id>` / `cursor-agent --resume <session-id>` (falling back to a fresh session
   when the old one is gone) / `pi --session-id <session-id>` (which creates a missing id instead of
-  dying). A session's id is saved only once a turn has run in it — the CLI writes the transcript a
+  dying); `muse` always boots fresh (no resume flag mapped yet). A session's id is saved only once a turn has run in it — the CLI writes the transcript a
   resume reads on the first prompt — so a CLI booted and never used resumes as nothing. Claude
   ids are checked against the transcripts on disk before the spawn, and one with none boots fresh;
   any resume that exits with an error within 10 s of its spawn is respawned fresh, unless its Claude
   transcript is still there (then the id is kept, and the pane shows why the CLI quit). An AGENT created from a PROJECT OPEN PRS row also receives the PR URL and a PR-only
-  work rule — Claude and Pi through `--append-system-prompt` on every spawn, Codex and Cursor as the first prompt of
+  work rule — Claude and Pi through `--append-system-prompt` on every spawn, Codex, Cursor and Muse as the first prompt of
   their cold spawn (their transcripts carry it through a resume); nebula persists that URL. An AGENT
   launched from the ISSUES MODAL (`i`) carries the GitHub issue's URL the same way — persisted with
   the row, rebuilt into an issue-context rule on every spawn and resume — so the harness knows which
@@ -196,15 +196,15 @@
   worktree, opening with a note saying where it now runs, so the conversation carries on there without
   you typing anything. Claude learns the rule from a short `--append-system-prompt` nebula passes at
   spawn, plus a `Bash(nebula worktree:*)` permission so the command never prompts; Pi gets the same
-  appended prompt and reopens on the same note. Codex and Cursor have no system-prompt flag to learn
+  appended prompt and reopens on the same note. Codex, Cursor and Muse have no system-prompt flag to learn
   the rule from, but run the same command when you ask. Codex then reopens on the same note —
   `codex resume <id> --cd <worktree> "<note>"`, the `--cd` because Codex otherwise reopens a resumed
   session in the directory its transcript recorded, the old checkout. Cursor resumes silent and waits
-  for your next prompt. The restart is the only way there: an agent CLI can't `cd` out of the
+  for your next prompt; Muse reboots fresh with no note (no resume flag mapped). The restart is the only way there: an agent CLI can't `cd` out of the
   directory it was started in.
 - **Ask the agent for another session and it starts one.** Tell a Claude session "start a new nebula
   session that fixes the login redirect" and it runs `nebula spawn "<task>"`: the daemon starts a second
-  agent beside it — same worktree, same harness, model and effort unless `--kind claude|codex|cursor|pi`
+  agent beside it — same worktree, same harness, model and effort unless `--kind claude|codex|cursor|pi|muse`
   names another — opening on that task as its first prompt, so it is working before you look. The new
   row appears in the sessions list on its own (default name, so it titles itself), and the session you
   asked from is untouched: no restart, no focus change. Claude learns this from the same appended system

@@ -11,7 +11,7 @@ use crate::app::{App, ContextMenu, MenuAction, MenuItem, Overlay};
 use crate::config::Config;
 use crate::pull_request::{OpenPr, PrLaunch};
 use crate::quick_prompt::QuickReturn;
-use nebula_core::{AgentKind, WorktreeId};
+use nebula_core::{Agent, AgentKind, WorktreeId};
 
 /// Shown instead of a picker when a hand-edited config has switched every
 /// harness off (the AGENTS TAB refuses to turn off the last one).
@@ -29,7 +29,7 @@ pub(crate) struct KindPicker {
     /// The QUICK PROMPT box owed back (its `Tab` picker).
     pub quick: Option<Box<QuickReturn>>,
     /// The row to start on; the first row when None or not offered.
-    pub hover: Option<AgentKind>,
+    pub hover: Option<HarnessRow>,
 }
 
 impl KindPicker {
@@ -68,42 +68,59 @@ impl KindPicker {
             title: back.launch.picker_title(),
             worktree,
             pr: None,
-            hover: Some(back.launch.kind),
+            hover: Some(HarnessRow {
+                kind: back.launch.kind,
+                custom: back.launch.custom.clone(),
+            }),
             quick: Some(Box::new(back)),
         }
     }
 }
 
-/// The harnesses still enabled on the AGENTS TAB, or None — with the FLASH
-/// set — when a hand-edited config disabled them all. An empty
-/// `ContextMenu` panics on Enter and `j`, so no caller opens one.
-pub(crate) fn enabled_kinds_or_flash(app: &mut App) -> Option<Vec<AgentKind>> {
-    let kinds = Config::load().enabled_kinds();
-    if kinds.is_empty() {
+/// One launch row: a built-in kind, or a custom registry entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HarnessRow {
+    pub kind: AgentKind,
+    /// Registry id when `kind` is [`AgentKind::Custom`].
+    pub custom: Option<String>,
+}
+
+/// The harnesses the pickers offer — enabled built-ins plus usable custom
+/// entries — or None, with the FLASH set, when a hand-edited config left
+/// nothing to offer. An empty `ContextMenu` panics on Enter and `j`, so no
+/// caller opens one.
+pub(crate) fn enabled_harnesses_or_flash(app: &mut App) -> Option<Vec<HarnessRow>> {
+    let rows: Vec<HarnessRow> = Config::load()
+        .offered_harnesses()
+        .into_iter()
+        .map(|(kind, custom)| HarnessRow { kind, custom })
+        .collect();
+    if rows.is_empty() {
         app.flash = Some(NO_HARNESS_FLASH.into());
         return None;
     }
-    Some(kinds)
+    Some(rows)
 }
 
 /// One `NewAgentOfKind` row per harness, labelled by `label`, every row
 /// carrying the same launch context (`→` on any of them drills into that
-/// kind's MODEL / EFFORT submenus with the context intact).
+/// kind's MODEL submenu with the context intact; customs offer no EFFORT
+/// submenu — see `effort_choices`).
 pub(crate) fn kind_rows(
-    kinds: &[AgentKind],
+    rows: &[HarnessRow],
     worktree: &WorktreeId,
     pr: Option<&PrLaunch>,
     quick: Option<&QuickReturn>,
-    label: impl Fn(AgentKind) -> String,
+    label: impl Fn(AgentKind, Option<&str>) -> String,
 ) -> Vec<MenuItem> {
-    kinds
-        .iter()
-        .map(|&kind| {
+    rows.iter()
+        .map(|row| {
             MenuItem::new(
-                label(kind),
+                label(row.kind, row.custom.as_deref()),
                 MenuAction::NewAgentOfKind {
                     worktree: worktree.clone(),
-                    kind,
+                    kind: row.kind,
+                    custom: row.custom.clone(),
                     model: None,
                     effort: None,
                     cloud: false,
@@ -115,9 +132,24 @@ pub(crate) fn kind_rows(
         .collect()
 }
 
+/// The label a picker row shows: the registry entry's label for a known
+/// id (falling back to the id when it carries none), the kind name
+/// otherwise — including a custom id the registry no longer names.
+pub(crate) fn harness_label(kind: AgentKind, custom: Option<&str>) -> String {
+    let cfg = Config::load();
+    match (kind, custom) {
+        (AgentKind::Custom, Some(id))
+            if cfg.harness_registry().iter().any(|entry| entry.id == id) =>
+        {
+            cfg.effective_harness_by_id(id).display_label().to_string()
+        }
+        _ => kind_label(kind).to_string(),
+    }
+}
+
 /// Open `picker` as the OVERLAY, or FLASH when no harness is enabled.
 pub(crate) fn open_kind_picker(app: &mut App, picker: KindPicker) {
-    let Some(kinds) = enabled_kinds_or_flash(app) else {
+    let Some(rows) = enabled_harnesses_or_flash(app) else {
         return;
     };
     let KindPicker {
@@ -128,11 +160,13 @@ pub(crate) fn open_kind_picker(app: &mut App, picker: KindPicker) {
         hover,
     } = picker;
     let hover = hover
-        .and_then(|wanted| kinds.iter().position(|kind| *kind == wanted))
+        .and_then(|wanted| {
+            rows.iter().position(|row| {
+                row.kind == wanted.kind && row.custom.as_deref() == wanted.custom.as_deref()
+            })
+        })
         .unwrap_or(0);
-    let items = kind_rows(&kinds, &worktree, pr.as_ref(), quick.as_deref(), |kind| {
-        kind_label(kind).to_string()
-    });
+    let items = kind_rows(&rows, &worktree, pr.as_ref(), quick.as_deref(), harness_label);
     app.overlay = Some(Overlay::Menu(ContextMenu {
         title: Some(title),
         items,
@@ -149,10 +183,27 @@ pub(crate) fn open_kind_picker(app: &mut App, picker: KindPicker) {
 /// harness, and none (no FLASH: the menu's other verbs still apply) when
 /// every harness is off.
 pub(crate) fn pr_session_menu_rows(worktree: WorktreeId, pr: &OpenPr) -> Vec<MenuItem> {
-    let kinds = Config::load().enabled_kinds();
-    kind_rows(&kinds, &worktree, Some(&PrLaunch::of(pr)), None, |kind| {
-        format!("New {} session", kind_label(kind))
+    let rows: Vec<HarnessRow> = Config::load()
+        .offered_harnesses()
+        .into_iter()
+        .map(|(kind, custom)| HarnessRow { kind, custom })
+        .collect();
+    kind_rows(&rows, &worktree, Some(&PrLaunch::of(pr)), None, |kind, custom| {
+        format!("New {} session", harness_label(kind, custom))
     })
+}
+
+/// The harness badge a session row wears: the built-in name, or the
+/// custom entry's label (the id when the entry is gone, the kind name
+/// when the row somehow names none).
+pub(crate) fn session_harness_badge(agent: &Agent) -> String {
+    match (agent.kind, agent.custom_harness.as_deref()) {
+        (AgentKind::Custom, Some(id)) => Config::load()
+            .effective_harness_by_id(id)
+            .display_label()
+            .to_string(),
+        _ => agent.kind.as_str().to_string(),
+    }
 }
 
 pub(crate) fn kind_label(kind: AgentKind) -> &'static str {
@@ -161,6 +212,10 @@ pub(crate) fn kind_label(kind: AgentKind) -> &'static str {
         AgentKind::Codex => "Codex",
         AgentKind::Cursor => "Cursor",
         AgentKind::Pi => "Pi",
+        AgentKind::Muse => "Muse",
+        // Custom rows label through `harness_label` (the entry's own
+        // label); this is only the fallback when its entry is gone.
+        AgentKind::Custom => "Custom",
     }
 }
 
@@ -196,36 +251,43 @@ mod tests {
         menu.items.iter().map(|item| item.label.as_str()).collect()
     }
 
-    /// Every row is the same launch context under a different kind, so a
-    /// submenu drilled from any row keeps that context.
+    /// Every row is the same launch context under a different harness, so
+    /// a submenu drilled from any row keeps that context — including the
+    /// custom registry id.
     #[test]
     fn kind_rows_carry_the_launch_context_into_every_row() {
         let worktree = WorktreeId("w1".into());
         let pr = PrLaunch::of(&open_pr());
-        let rows = kind_rows(&AgentKind::ALL, &worktree, Some(&pr), None, |kind| {
-            format!("New {} session", kind_label(kind))
-        });
-        let names: Vec<&str> = rows.iter().map(|row| row.label.as_str()).collect();
-        let expected: Vec<String> = AgentKind::ALL
-            .iter()
-            .map(|kind| format!("New {} session", kind_label(*kind)))
+        let harness_rows: Vec<HarnessRow> = AgentKind::ALL
+            .into_iter()
+            .filter(|kind| *kind != AgentKind::Custom)
+            .map(|kind| HarnessRow { kind, custom: None })
+            .chain([HarnessRow {
+                kind: AgentKind::Custom,
+                custom: Some("agy".into()),
+            }])
             .collect();
-        assert_eq!(names, expected);
-        assert!(names.contains(&"New Codex session"));
-        for (row, expected) in rows.iter().zip(AgentKind::ALL) {
+        let rows = kind_rows(&harness_rows, &worktree, Some(&pr), None, |kind, custom| {
+            format!("New {} session", harness_label(kind, custom))
+        });
+        assert!(rows.iter().any(|row| row.label == "New Codex session"));
+        assert!(rows.iter().any(|row| row.label == "New Custom session"));
+        for (row, expected) in rows.iter().zip(harness_rows.iter()) {
             assert!(
                 matches!(
                     &row.action,
                     MenuAction::NewAgentOfKind {
                         worktree,
                         kind,
+                        custom,
                         model: None,
                         effort: None,
                         cloud: false,
                         pr: Some(pr),
                         quick: None,
                     } if worktree.as_str() == "w1"
-                        && *kind == expected
+                        && *kind == expected.kind
+                        && custom.as_deref() == expected.custom.as_deref()
                         && pr.url == PR_URL
                         && pr.head == PR_HEAD
                 ),
@@ -235,6 +297,81 @@ mod tests {
         }
     }
 
+    /// Custom entries ride after the built-ins under their own labels;
+    /// disabled, invalid and (under the hide switch) missing ones stay
+    /// out, and their rows carry the registry id into the launch.
+    #[test]
+    fn picker_lists_usable_custom_entries_after_the_builtins() {
+        let json = r#"{"custom_harnesses": [
+            {"id": "agy", "label": "Agy", "program": "agy"},
+            {"id": "off", "label": "Off", "program": "off", "enabled": false},
+            {"id": "broken", "label": "Broken", "program": ""}
+        ]}"#;
+        pinned(json, || {
+            let worktree = WorktreeId("w1".into());
+            let mut app = App::new();
+            open_kind_picker(&mut app, KindPicker::new_session(worktree));
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("{:?}", app.overlay);
+            };
+            let names = labels(menu);
+            assert_eq!(names.last(), Some(&"Agy"));
+            assert!(!names.contains(&"Off"), "{names:?}");
+            assert!(!names.contains(&"Broken"), "{names:?}");
+            let agy = menu.items.iter().find(|item| item.label == "Agy").unwrap();
+            assert!(matches!(
+                &agy.action,
+                MenuAction::NewAgentOfKind {
+                    kind: AgentKind::Custom,
+                    custom: Some(id),
+                    ..
+                } if id == "agy"
+            ));
+            assert_eq!(agy.action.submenu(), Some(SubmenuKind::Models));
+        });
+    }
+
+    /// The Agents tab's per-entry Enabled row is the toggle now: flip
+    /// it, save, and the picker drops the entry until it flips back.
+    #[test]
+    fn agents_tab_toggles_custom_entries_off_the_picker() {
+        use crate::config::{HarnessField, locate_agent};
+        let json = r#"{"custom_harnesses": [
+            {"id": "agy", "label": "Agy", "program": "agy"}
+        ]}"#;
+        pinned(json, || {
+            let worktree = WorktreeId("w1".into());
+            let mut app = App::new();
+            open_kind_picker(&mut app, KindPicker::new_session(worktree.clone()));
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("{:?}", app.overlay);
+            };
+            assert!(labels(menu).contains(&"Agy"));
+
+            let mut cfg = Config::load();
+            let (tab, row) = locate_agent("agy", HarnessField::Enabled).unwrap();
+            cfg.cycle(tab, row, 0);
+            cfg.save().unwrap();
+
+            open_kind_picker(&mut app, KindPicker::new_session(worktree));
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("{:?}", app.overlay);
+            };
+            assert!(!labels(menu).contains(&"Agy"), "{:?}", labels(menu));
+
+            let mut cfg = Config::load();
+            let (tab, row) = locate_agent("agy", HarnessField::Enabled).unwrap();
+            cfg.cycle(tab, row, 0);
+            cfg.save().unwrap();
+            assert!(
+                Config::load()
+                    .offered_harnesses()
+                    .contains(&(AgentKind::Custom, Some("agy".into()))),
+                "flipping back re-offers the entry"
+            );
+        });
+    }
+
     /// The three surfaces differ only in title, context and starting row;
     /// a harness switched off on the AGENTS TAB is missing from all of them.
     #[test]
@@ -242,10 +379,12 @@ mod tests {
         pinned(r#"{"codex_enabled": false}"#, || {
             let worktree = WorktreeId("w1".into());
             let mut app = App::new();
-            // Every harness but the one switched off, in the ALL order.
+            // Every built-in harness but the one switched off, in the ALL
+            // order. A bare Custom kind is never offered (entries come
+            // from the registry), and the pinned config defines none.
             let offered: Vec<&str> = AgentKind::ALL
                 .iter()
-                .filter(|kind| **kind != AgentKind::Codex)
+                .filter(|kind| **kind != AgentKind::Codex && **kind != AgentKind::Custom)
                 .map(|kind| kind_label(*kind))
                 .collect();
             assert!(offered.starts_with(&["Claude", "Cursor"]), "{offered:?}");
@@ -277,6 +416,7 @@ mod tests {
                 launch: QuickLaunch {
                     target: crate::quick_prompt::QuickTarget::Worktree(worktree.clone()),
                     kind: AgentKind::Cursor,
+                    custom: None,
                     model: None,
                     effort: None,
                     preset: None,
@@ -313,7 +453,7 @@ mod tests {
     #[test]
     fn no_harness_flashes_the_picker_and_empties_the_menu_rows() {
         pinned(
-            r#"{"claude_enabled": false, "codex_enabled": false, "cursor_enabled": false, "pi_enabled": false}"#,
+            r#"{"claude_enabled": false, "codex_enabled": false, "cursor_enabled": false, "pi_enabled": false, "muse_enabled": false}"#,
             || {
                 let worktree = WorktreeId("w1".into());
                 let mut app = App::new();

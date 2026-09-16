@@ -119,6 +119,10 @@ pub enum ClientRequest {
         worktree: WorktreeId,
         name: String,
         kind: AgentKind,
+        /// Registry id of the custom harness, when `kind` is
+        /// [`AgentKind::Custom`]. Persisted with the row like `model`.
+        #[serde(default)]
+        custom_harness: Option<String>,
         /// Model the CLI launches with; None = the CLI's own default.
         model: Option<String>,
         /// Reasoning effort the CLI launches with; None = the CLI's own default.
@@ -166,6 +170,10 @@ pub enum ClientRequest {
         project: ProjectId,
         name: String,
         kind: AgentKind,
+        /// Registry id of the custom harness, when `kind` is
+        /// [`AgentKind::Custom`]. Persisted with the row like `model`.
+        #[serde(default)]
+        custom_harness: Option<String>,
         /// Model the CLI launches with; None = the CLI's own default.
         model: Option<String>,
         /// Reasoning effort the CLI launches with; None = default.

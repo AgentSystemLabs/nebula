@@ -3652,6 +3652,7 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
     let MenuAction::NewAgentOfKind {
         worktree,
         kind,
+        custom,
         model,
         cloud,
         pr,
@@ -3667,19 +3668,22 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
     // already set to launch with.
     let from_box = quick
         .as_ref()
-        .filter(|q| q.launch.kind == *kind)
+        .filter(|q| q.launch.kind == *kind && q.launch.custom.as_deref() == custom.as_deref())
         .map(|q| &q.launch);
     let (title, choices, configured) = match sub {
         SubmenuKind::Models => (
-            format!("{} model", kind_label(*kind)),
-            crate::config::model_choices(*kind),
+            format!(
+                "{} model",
+                crate::agent_picker::harness_label(*kind, custom.as_deref())
+            ),
+            crate::config::model_choices(*kind, custom.as_deref()),
             from_box
                 .and_then(|l| l.model.clone())
                 .or_else(|| cfg.default_model(*kind)),
         ),
         SubmenuKind::Efforts => (
             format!("{} effort", kind_label(*kind)),
-            crate::config::effort_choices(*kind, model.as_deref()),
+            crate::config::effort_choices(*kind, model.as_deref(), custom.as_deref()),
             from_box
                 .and_then(|l| l.effort.clone())
                 .or_else(|| cfg.default_effort(*kind)),
@@ -3698,6 +3702,7 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
                 MenuAction::NewAgentOfKind {
                     worktree: worktree.clone(),
                     kind: *kind,
+                    custom: custom.clone(),
                     model: match sub {
                         SubmenuKind::Models => Some((*choice).to_string()),
                         SubmenuKind::Efforts => model.clone(),
@@ -4133,6 +4138,23 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
         Overlay::Issues(_) => crate::issues::handle_key(app, key),
         Overlay::BranchSwitch(_) => crate::branch_switch::handle_key(app, key),
         Overlay::Menu(menu) => match key.code {
+            // `?` (and `s` where no filter eats letters) on a row that
+            // starts a session jumps to that harness's Agents section,
+            // where its defaults live. Ahead of type-ahead on purpose:
+            // `?` is a jump on these rows, never a filter letter (no row
+            // contains one); `s` only jumps without a filter, since in
+            // the model/effort submenus it narrows the list. `s` keeps
+            // its global meaning — settings — so the picker agrees with
+            // the panels.
+            KeyCode::Char(c)
+                if (c == '?' || (c == 's' && menu.filter.is_none()))
+                    && menu.hovered_agent_kind().is_some() =>
+            {
+                let (kind, custom) = menu
+                    .hovered_agent_kind()
+                    .expect("the guard checked the hovered row");
+                open_harness_settings(app, kind, custom);
+            }
             // Type-ahead in the MODEL / EFFORT submenus: letters narrow the
             // rows (so ↑/↓ move there, not j/k), Backspace widens, and Esc
             // clears the text before it backs out. A letter no row matches
@@ -4922,9 +4944,10 @@ fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i32) {
     }
     let mut cfg = crate::config::Config::load();
     cfg.cycle(tab, index, delta);
-    if cfg.enabled_kinds().is_empty() {
+    if nebula_core::harness::usable(&cfg.harness_registry()).is_empty() {
         // Refuse the last harness here, where the user is looking, rather
-        // than leave `n` with nothing to offer later.
+        // than leave `n` with nothing to offer later. Custom registry
+        // entries count: with one offered, the built-ins may all go off.
         if let Some(view) = settings_mut(app) {
             view.warn("keep at least one harness enabled");
         }
@@ -4986,6 +5009,30 @@ fn open_settings(app: &mut App) {
         app.forget_settings_focus();
     }
     reopen_settings(app);
+}
+
+/// Swap a session picker for the settings overlay parked on that
+/// harness's Agents section, cursor on its Enabled row. The remembered
+/// tab and row update too, so an Esc-then-`s` lands back where `?` left.
+fn open_harness_settings(app: &mut App, kind: AgentKind, custom: Option<String>) {
+    use crate::config::{agents_tab, locate_agent, HarnessField};
+    let id = match kind {
+        AgentKind::Custom => custom.unwrap_or_default(),
+        _ => kind.as_str().to_string(),
+    };
+    let tab = agents_tab();
+    app.settings_tab = tab;
+    if let Some((_, row)) = locate_agent(&id, HarnessField::Enabled) {
+        if let Some(slot) = app.settings_selected.get_mut(tab) {
+            *slot = row;
+        }
+    }
+    app.settings_on_tabs = false;
+    app.overlay = Some(Overlay::Settings(SettingsView::new(
+        tab,
+        app.settings_row(tab),
+        false,
+    )));
 }
 
 /// Put the settings overlay back up on its remembered tab and row, no
@@ -5314,6 +5361,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
         PromptKind::NewPrAgent {
             worktree,
             kind,
+            custom,
             model,
             effort,
             pr,
@@ -5322,6 +5370,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             AgentLaunchDraft {
                 worktree,
                 kind,
+                custom,
                 model,
                 effort,
                 name: value,
@@ -5345,6 +5394,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             AgentLaunchDraft {
                 worktree,
                 kind: AgentKind::Claude,
+                custom: None,
                 model,
                 effort,
                 name,
@@ -5367,17 +5417,41 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             // exactly as the NEW SESSION PICKER's rows do.
             let cfg = crate::config::Config::load();
             let kind = preset.kind;
-            let model = preset.model.clone().or_else(|| cfg.default_model(kind));
-            let effort = crate::config::fit_effort(
-                kind,
-                model.as_deref(),
-                preset.effort.clone().or_else(|| cfg.default_effort(kind)),
-            );
+            let custom = preset.custom_harness.clone();
+            let (model, effort) = match kind {
+                AgentKind::Custom => {
+                    let descriptor = cfg.effective_harness(kind, custom.as_deref());
+                    let model = preset.model.clone().or_else(|| {
+                        descriptor.default_model().map(str::to_string)
+                    });
+                    let effort = crate::config::fit_effort(
+                        kind,
+                        model.as_deref(),
+                        preset
+                            .effort
+                            .clone()
+                            .or_else(|| descriptor.default_effort().map(str::to_string)),
+                        custom.as_deref(),
+                    );
+                    (model, effort)
+                }
+                _ => {
+                    let model = preset.model.clone().or_else(|| cfg.default_model(kind));
+                    let effort = crate::config::fit_effort(
+                        kind,
+                        model.as_deref(),
+                        preset.effort.clone().or_else(|| cfg.default_effort(kind)),
+                        None,
+                    );
+                    (model, effort)
+                }
+            };
             create_agent(
                 app,
                 AgentLaunchDraft {
                     worktree: worktree.clone(),
                     kind,
+                    custom,
                     model,
                     effort,
                     name: String::new(),
@@ -5627,6 +5701,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::NewAgentOfKind {
             worktree,
             kind,
+            custom,
             model,
             effort,
             cloud,
@@ -5644,6 +5719,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 let launch = crate::quick_prompt::QuickLaunch::of_kind(
                     back.launch.target.clone(),
                     kind,
+                    custom.clone(),
                     model.filter(|m| m != "default"),
                     effort.filter(|e| e != "default"),
                     &crate::config::Config::load(),
@@ -5663,13 +5739,15 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 Some(c) if c == "default" => configured,
                 some => some,
             };
-            let model = resolve(model, cfg.default_model(kind));
+            let harness = cfg.effective_harness(kind, custom.as_deref());
+            let model = resolve(model, harness.default_model().map(str::to_string));
             // A Cursor effort only counts for the family it belongs to: a
             // stale setting behind a freshly picked model drops to none.
             let effort = crate::config::fit_effort(
                 kind,
                 model.as_deref(),
-                resolve(effort, cfg.default_effort(kind)),
+                resolve(effort, harness.default_effort().map(str::to_string)),
+                custom.as_deref(),
             );
             // A Claude Cloud launch has its own task box, and nothing to
             // name first.
@@ -5695,6 +5773,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     AgentLaunchDraft {
                         worktree,
                         kind,
+                        custom: custom.clone(),
                         model,
                         effort,
                         name: String::new(),
@@ -5720,6 +5799,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     PromptKind::NewPrAgent {
                         worktree,
                         kind,
+                        custom: custom.clone(),
                         model,
                         effort,
                         pr,
@@ -5732,7 +5812,15 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             // with none. Nothing is warmed while the user types — a launch
             // carrying a STARTING PROMPT can adopt no WARM SPARE, and one
             // sent empty adopts the standing default-spec slot as it is.
-            crate::quick_prompt::open_for_new_session(app, worktree, kind, model, effort, &cfg);
+            crate::quick_prompt::open_for_new_session(
+                app,
+                worktree,
+                kind,
+                custom.clone(),
+                model,
+                effort,
+                &cfg,
+            );
         }
         MenuAction::NewWorktree(project) => open_new_worktree_prompt(app, project),
         MenuAction::OpenLink(url) => open_link(app, &url, out),
@@ -6783,6 +6871,8 @@ fn fire_pending_prewarm(app: &mut App, out: &mut Vec<ClientRequest>) {
 struct AgentLaunchDraft {
     worktree: WorktreeId,
     kind: AgentKind,
+    /// Registry id when `kind` is [`AgentKind::Custom`].
+    custom: Option<String>,
     model: Option<String>,
     effort: Option<String>,
     name: String,
@@ -6828,6 +6918,7 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
     let AgentLaunchDraft {
         worktree,
         kind,
+        custom,
         model,
         effort,
         name,
@@ -6879,6 +6970,7 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
                     project.clone(),
                     pr.head.clone(),
                     kind,
+                    custom.clone(),
                     model.clone(),
                     effort.clone(),
                     out,
@@ -6945,6 +7037,7 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
                 project,
                 name,
                 kind,
+                custom_harness: custom.clone(),
                 model,
                 effort,
                 auto_title,
@@ -6957,6 +7050,7 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
             worktree: worktree.clone(),
             name,
             kind,
+            custom_harness: custom.clone(),
             model,
             effort,
             auto_title,
@@ -9094,6 +9188,7 @@ mod tests {
                     archived_at: 0,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -9714,6 +9809,7 @@ mod tests {
                     archived_at: 0,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -10917,6 +11013,7 @@ mod tests {
                         archived_at: 100 - n,
                         unseen: false,
                         kind: nebula_core::AgentKind::Claude,
+                        custom_harness: None,
                         model: None,
                         effort: None,
                         session_id: None,
@@ -11160,6 +11257,7 @@ mod tests {
                         &p.kind,
                         PromptKind::NewPrAgent {
                             kind: AgentKind::Codex,
+                            custom: None,
                             pr,
                             ..
                         } if pr.url == "https://github.com/o/r/pull/7"
@@ -11185,6 +11283,7 @@ mod tests {
                         project,
                         name,
                         kind: AgentKind::Codex,
+                        custom_harness: None,
                         pr_url,
                         head,
                         ..
@@ -14132,6 +14231,7 @@ diff --git a/src/c.rs b/src/c.rs
                         archived_at: 0,
                         unseen: false,
                         kind,
+                        custom_harness: None,
                         model: None,
                         effort: None,
                         session_id: None,
@@ -14192,6 +14292,7 @@ diff --git a/src/c.rs b/src/c.rs
                     archived_at: 0,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -14245,6 +14346,7 @@ diff --git a/src/c.rs b/src/c.rs
                 archived_at: 0,
                 unseen: false,
                 kind: nebula_core::AgentKind::Claude,
+                custom_harness: None,
                 model: None,
                 effort: None,
                 session_id: None,
@@ -14324,6 +14426,7 @@ diff --git a/src/c.rs b/src/c.rs
                     archived_at: 0,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -14388,6 +14491,7 @@ diff --git a/src/c.rs b/src/c.rs
                     archived_at: 0,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -14454,6 +14558,7 @@ diff --git a/src/c.rs b/src/c.rs
                     archived_at: 0,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -14827,8 +14932,8 @@ diff --git a/src/c.rs b/src/c.rs
             assert_eq!(menu.title.as_deref(), Some("New session"));
             assert_eq!(
                 menu.items.len(),
-                AgentKind::ALL.len(),
-                "one row per harness, no Terminal row: NEW TERMINAL (`t`) already covers it"
+                AgentKind::ALL.len() - 1,
+                "one row per harness, no Terminal row: NEW TERMINAL (`t`) already covers it.                  A bare Custom kind never lists (entries come from the registry, empty here)"
             );
             assert_eq!(menu.items[0].label, "Claude");
             assert_eq!(menu.items[1].label, "Codex");
@@ -14871,6 +14976,7 @@ diff --git a/src/c.rs b/src/c.rs
                 ClientRequest::CreateAgent {
                     name,
                     kind: AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     auto_title: true,
@@ -14917,6 +15023,7 @@ diff --git a/src/c.rs b/src/c.rs
                     [ClientRequest::CreateAgent {
                         worktree: w,
                         kind: AgentKind::Claude,
+                        custom_harness: None,
                         model: None,
                         effort: None,
                         auto_title: true,
@@ -14946,6 +15053,7 @@ diff --git a/src/c.rs b/src/c.rs
                         name: "agent-2".into(),
                         status: AgentStatus::Fresh,
                         kind: AgentKind::Claude,
+                        custom_harness: None,
                         sort_order: 1,
                         ..template
                     }),
@@ -14981,6 +15089,7 @@ diff --git a/src/c.rs b/src/c.rs
                 &menu.items[0].action,
                 MenuAction::NewAgentOfKind {
                     kind: AgentKind::Claude,
+                    custom: None,
                     cloud: true,
                     ..
                 }
@@ -15019,6 +15128,7 @@ diff --git a/src/c.rs b/src/c.rs
                 out.as_slice(),
                 [ClientRequest::CreateAgent {
                     kind: AgentKind::Claude,
+                    custom_harness: None,
                     cloud_prompt: Some(task),
                     auto_title: true,
                     ..
@@ -15174,6 +15284,7 @@ diff --git a/src/c.rs b/src/c.rs
                 ClientRequest::CreateAgent {
                     name,
                     kind: AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     auto_title: true,
@@ -15235,6 +15346,7 @@ diff --git a/src/c.rs b/src/c.rs
                 &out[0],
                 ClientRequest::CreateAgent {
                     kind: AgentKind::Claude,
+                    custom_harness: None,
                     model: Some(m),
                     auto_title: true,
                     ..
@@ -15268,7 +15380,10 @@ diff --git a/src/c.rs b/src/c.rs
                 panic!("expected model submenu, got {:?}", app.overlay);
             };
             assert_eq!(menu.title.as_deref(), Some("Claude model"));
-            assert_eq!(menu.items.len(), crate::config::CLAUDE_MODELS.len());
+            assert_eq!(
+                menu.items.len(),
+                crate::config::model_choices(AgentKind::Claude, None).len()
+            );
             assert_eq!(menu.items[0].label, "default ✓");
             assert_eq!(menu.items[2].label, "opus");
             assert_eq!(menu.hover, 0);
@@ -15284,7 +15399,10 @@ diff --git a/src/c.rs b/src/c.rs
                 panic!("expected effort submenu, got {:?}", app.overlay);
             };
             assert_eq!(menu.title.as_deref(), Some("Claude effort"));
-            assert_eq!(menu.items.len(), crate::config::CLAUDE_EFFORTS.len());
+            assert_eq!(
+                menu.items.len(),
+                crate::config::effort_choices(AgentKind::Claude, Some("opus"), None).len()
+            );
             assert!(matches!(
                 &menu.items[3].action,
                 MenuAction::NewAgentOfKind { kind: AgentKind::Claude, model: Some(m), effort: Some(e), .. }
@@ -15313,6 +15431,126 @@ diff --git a/src/c.rs b/src/c.rs
                     .any(|r| matches!(r, ClientRequest::CreateAgent { .. })),
                 "browsing submenus must not create anything"
             );
+        })
+    }
+
+    /// `?` on a New session row swaps the picker for settings parked on
+    /// that harness's Agents section; `?` in a model submenu lands on
+    /// the same section. Esc, then `s`, comes back where `?` left.
+    #[test]
+    fn question_mark_jumps_from_picker_to_harness_settings() {
+        use crate::config::{agents_tab, locate_agent, HarnessField};
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            // Down to Codex, `?`: settings on the Agents tab, cursor on
+            // Codex's Enabled row.
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Settings(view)) = &app.overlay else {
+                panic!("expected settings, got {:?}", app.overlay);
+            };
+            let (tab, row) = locate_agent("codex", HarnessField::Enabled).unwrap();
+            assert_eq!(tab, agents_tab());
+            assert_eq!(view.tab, tab);
+            assert_eq!(view.selected, row);
+            assert!(!view.on_tabs);
+
+            // Esc, then `s`: back where `?` left.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Settings(view)) = &app.overlay else {
+                panic!("expected settings, got {:?}", app.overlay);
+            };
+            assert_eq!((view.tab, view.selected), (tab, row));
+
+            // `?` inside a model submenu lands on the same section.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Settings(view)) = &app.overlay else {
+                panic!("expected settings, got {:?}", app.overlay);
+            };
+            let (tab, row) = locate_agent("claude", HarnessField::Enabled).unwrap();
+            assert_eq!((view.tab, view.selected), (tab, row));
+        })
+    }
+
+    /// `s` jumps like `?` on the filter-less picker, but types in the
+    /// model submenu, where it narrows the list instead.
+    #[test]
+    fn s_jumps_on_the_picker_and_types_in_submenus() {
+        use crate::config::{agents_tab, locate_agent, HarnessField};
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Settings(view)) = &app.overlay else {
+                panic!("expected settings, got {:?}", app.overlay);
+            };
+            let (tab, row) = locate_agent("codex", HarnessField::Enabled).unwrap();
+            assert_eq!(tab, agents_tab());
+            assert_eq!((view.tab, view.selected), (tab, row));
+
+            // In a model submenu `s` is a filter letter, not a jump.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(app.overlay, Some(Overlay::Menu(_))),
+                "`s` narrows instead of jumping"
+            );
+            assert!(
+                !out.iter()
+                    .any(|r| matches!(r, ClientRequest::CreateAgent { .. })),
+                "filtering must not create anything"
+            );
+        })
+    }
+
+    /// `?` on a menu with no session rows is ignored, and the kind
+    /// picker names the jump in its footer.
+    #[test]
+    fn question_mark_ignores_menus_without_session_rows() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+
+            app.overlay = Some(Overlay::Menu(ContextMenu {
+                title: Some("test".into()),
+                items: vec![MenuItem::new("x", MenuAction::ToggleArchived)],
+                at: None,
+                hover: 0,
+                area: ratatui::layout::Rect::default(),
+                parent: None,
+                filter: None,
+            }));
+            press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(app.overlay, Some(Overlay::Menu(_))),
+                "`?` leaves other menus alone"
+            );
+
+            // The New session picker itself advertises the jump.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("s/?: settings"), "footer names it:\n{text}");
         })
     }
 
@@ -15355,6 +15593,7 @@ diff --git a/src/c.rs b/src/c.rs
                 out.last(),
                 Some(ClientRequest::CreateAgent {
                     kind: AgentKind::Codex,
+                    custom_harness: None,
                     model: Some(m),
                     effort: Some(e),
                     ..
@@ -15439,6 +15678,7 @@ diff --git a/src/c.rs b/src/c.rs
                 out.last(),
                 Some(ClientRequest::CreateAgent {
                     kind: AgentKind::Codex,
+                    custom_harness: None,
                     ..
                 })
             ));
@@ -15474,6 +15714,7 @@ diff --git a/src/c.rs b/src/c.rs
                 out.last(),
                 Some(ClientRequest::CreateAgent {
                     kind: AgentKind::Cursor,
+                    custom_harness: None,
                     ..
                 })
             ));
@@ -15497,7 +15738,7 @@ diff --git a/src/c.rs b/src/c.rs
             let labels: Vec<&str> = menu.items.iter().map(|item| item.label.as_str()).collect();
             assert_eq!(
                 labels,
-                ["Claude", "Cursor", "Pi"],
+                ["Claude", "Cursor", "Pi", "Muse"],
                 "Codex is absent, not greyed"
             );
 
@@ -15514,7 +15755,7 @@ diff --git a/src/c.rs b/src/c.rs
     #[test]
     fn picker_with_every_harness_disabled_flashes_instead_of_opening() {
         with_config_json(
-            r#"{"claude_enabled": false, "codex_enabled": false, "cursor_enabled": false, "pi_enabled": false}"#,
+            r#"{"claude_enabled": false, "codex_enabled": false, "cursor_enabled": false, "pi_enabled": false, "muse_enabled": false}"#,
             || {
                 let mut app = App::new();
                 seed_tree(&mut app);
@@ -15555,7 +15796,11 @@ diff --git a/src/c.rs b/src/c.rs
                 !labels.contains(&"Claude") && labels.contains(&"Codex"),
                 "Claude is absent, not greyed: {labels:?}"
             );
-            assert_eq!(labels.len(), AgentKind::ALL.len() - 1);
+            assert_eq!(
+                labels.len(),
+                AgentKind::ALL.len() - 2,
+                "minus Codex, minus the bare Custom kind, which never lists"
+            );
             assert!(app.flash.is_none(), "got {:?}", app.flash);
 
             app.overlay = None;
@@ -15605,7 +15850,7 @@ diff --git a/src/c.rs b/src/c.rs
     #[test]
     fn every_harness_disabled_flashes_instead_of_a_pr_session_picker() {
         with_config_json(
-            r#"{"claude_enabled": false, "codex_enabled": false, "cursor_enabled": false, "pi_enabled": false}"#,
+            r#"{"claude_enabled": false, "codex_enabled": false, "cursor_enabled": false, "pi_enabled": false, "muse_enabled": false}"#,
             || {
                 let mut app = App::new();
                 seed_tree(&mut app);
@@ -15664,14 +15909,15 @@ diff --git a/src/c.rs b/src/c.rs
 
     #[test]
     fn agents_tab_toggles_a_harness_and_refuses_the_last_one() {
-        use crate::config::{locate, SettingKind};
+        use crate::config::{locate_agent, HarnessField};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         crate::config::with_config_path(path.clone(), || {
-            let (tab, claude_row) = locate(SettingKind::ClaudeEnabled).unwrap();
-            let (_, codex_row) = locate(SettingKind::CodexEnabled).unwrap();
-            let (_, cursor_row) = locate(SettingKind::CursorEnabled).unwrap();
-            let (_, pi_row) = locate(SettingKind::PiEnabled).unwrap();
+            let (tab, claude_row) = locate_agent("claude", HarnessField::Enabled).unwrap();
+            let (_, codex_row) = locate_agent("codex", HarnessField::Enabled).unwrap();
+            let (_, cursor_row) = locate_agent("cursor", HarnessField::Enabled).unwrap();
+            let (_, pi_row) = locate_agent("pi", HarnessField::Enabled).unwrap();
+            let (_, muse_row) = locate_agent("muse", HarnessField::Enabled).unwrap();
             let mut app = App::new();
             let mut out = Vec::new();
             open_settings_on(&mut app, tab, &mut out);
@@ -15700,9 +15946,15 @@ diff --git a/src/c.rs b/src/c.rs
                 press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
             }
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(!crate::config::Config::load().pi_enabled);
+
+            for _ in pi_row..muse_row {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             let cfg = crate::config::Config::load();
-            assert!(cfg.pi_enabled, "the last harness cannot be switched off");
-            assert_eq!(cfg.enabled_kinds(), vec![AgentKind::Pi]);
+            assert!(cfg.muse_enabled, "the last harness cannot be switched off");
+            assert_eq!(cfg.enabled_kinds(), vec![AgentKind::Muse]);
             let (text, level) = settings_view(&app).notice.clone().expect("a warning");
             assert!(matches!(level, crate::app::NoticeLevel::Warn));
             assert!(text.contains("at least one harness"), "{text}");
@@ -16582,6 +16834,7 @@ diff --git a/src/c.rs b/src/c.rs
                 archived_at: 0,
                 unseen: false,
                 kind: nebula_core::AgentKind::Claude,
+                custom_harness: None,
                 model: None,
                 effort: None,
                 session_id: None,
@@ -16669,6 +16922,7 @@ diff --git a/src/c.rs b/src/c.rs
                     archived_at: 0,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -17026,6 +17280,7 @@ diff --git a/src/c.rs b/src/c.rs
             unseen: false,
             archived_at,
             kind: nebula_core::AgentKind::Claude,
+            custom_harness: None,
             model: None,
             effort: None,
             session_id: None,
@@ -18374,6 +18629,7 @@ diff --git a/src/c.rs b/src/c.rs
             archived_at: 0,
             unseen: false,
             kind: nebula_core::AgentKind::Claude,
+            custom_harness: None,
             model: None,
             effort: None,
             session_id: None,
@@ -18669,6 +18925,7 @@ diff --git a/src/c.rs b/src/c.rs
             archived_at: 0,
             unseen: false,
             kind: nebula_core::AgentKind::Claude,
+            custom_harness: None,
             model: None,
             effort: None,
             session_id: None,
@@ -19280,6 +19537,7 @@ diff --git a/src/c.rs b/src/c.rs
                     archived_at: 0,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -20407,6 +20665,7 @@ diff --git a/src/c.rs b/src/c.rs
                     archived_at: 0,
                     unseen: false,
                     kind: nebula_core::AgentKind::Codex,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -20430,6 +20689,7 @@ diff --git a/src/c.rs b/src/c.rs
                     archived_at: 0,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -20660,6 +20920,7 @@ diff --git a/src/c.rs b/src/c.rs
             archived_at: 0,
             unseen,
             kind: nebula_core::AgentKind::Claude,
+            custom_harness: None,
             model: None,
             effort: None,
             session_id: None,
@@ -21124,6 +21385,7 @@ diff --git a/src/c.rs b/src/c.rs
                     archived_at: 0,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -21543,9 +21805,10 @@ diff --git a/src/c.rs b/src/c.rs
 
     #[test]
     fn agents_tab_renders_its_harness_groups() {
+        use crate::config::{HarnessField, locate_agent};
         let mut app = App::new();
         let mut out = Vec::new();
-        let (agents, _) = crate::config::locate(crate::config::SettingKind::ClaudeEnabled).unwrap();
+        let (agents, _) = locate_agent("claude", HarnessField::Enabled).unwrap();
         open_settings_on(&mut app, agents, &mut out);
         // Tall enough for every row, so nothing scrolls off.
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
@@ -21559,6 +21822,7 @@ diff --git a/src/c.rs b/src/c.rs
             "Quick prompt",
             "Agent",
             "Focus",
+            "Hide missing CLIs",
             "Claude",
             "Enabled",
             "Model",
@@ -21582,12 +21846,12 @@ diff --git a/src/c.rs b/src/c.rs
             "the old flat labels are gone:\n{text}"
         );
 
-        // Headers and blanks are not rows the cursor can land on: two ↓
-        // from the first row reach the third setting, not a header.
+        // Headers and blanks are not rows the cursor can land on: three ↓
+        // from the first row reach Claude's Enabled row, not a header.
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-        let (_, claude_enabled) =
-            crate::config::locate(crate::config::SettingKind::ClaudeEnabled).unwrap();
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        let (_, claude_enabled) = locate_agent("claude", HarnessField::Enabled).unwrap();
         assert_eq!(settings_view(&app).selected, claude_enabled);
 
         // Nor can a click land on one: the "Codex" header is a dead cell.
@@ -23238,6 +23502,7 @@ diff --git a/src/c.rs b/src/c.rs
                         archived_at: 0,
                         unseen: false,
                         kind: nebula_core::AgentKind::Claude,
+                        custom_harness: None,
                         model: None,
                         effort: None,
                         session_id: None,
@@ -23309,6 +23574,7 @@ diff --git a/src/c.rs b/src/c.rs
             archived_at: 0,
             unseen: false,
             kind: nebula_core::AgentKind::Claude,
+            custom_harness: None,
             model: None,
             effort: None,
             session_id: None,
@@ -23954,6 +24220,7 @@ diff --git a/src/c.rs b/src/c.rs
                     archived_at: 0,
                     unseen: false,
                     kind: AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -24150,6 +24417,7 @@ diff --git a/src/c.rs b/src/c.rs
                     archived_at: 0,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -24244,6 +24512,7 @@ diff --git a/src/c.rs b/src/c.rs
                     archived_at: 0,
                     unseen: false,
                     kind: nebula_core::AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -24274,6 +24543,7 @@ diff --git a/src/c.rs b/src/c.rs
                     archived_at: 0,
                     unseen: true,
                     kind: nebula_core::AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -24350,6 +24620,7 @@ diff --git a/src/c.rs b/src/c.rs
                     archived_at: 0,
                     unseen: false,
                     kind: AgentKind::Claude,
+                    custom_harness: None,
                     model: None,
                     effort: None,
                     session_id: None,
@@ -25970,6 +26241,7 @@ diff --git a/src/c.rs b/src/c.rs
                     AgentPreset {
                         name: "reviewer".into(),
                         kind: AgentKind::Claude,
+                        custom_harness: None,
                         model: Some("opus".into()),
                         effort: Some("high".into()),
                         prefix: "Be strict.".into(),
@@ -25979,6 +26251,7 @@ diff --git a/src/c.rs b/src/c.rs
                     AgentPreset {
                         name: "scratch".into(),
                         kind: AgentKind::Codex,
+                        custom_harness: None,
                         model: Some("gpt-5.5".into()),
                         effort: None,
                         prefix: String::new(),
@@ -26293,6 +26566,7 @@ diff --git a/src/c.rs b/src/c.rs
                     [ClientRequest::CreateAgent {
                         worktree: w,
                         kind: AgentKind::Claude,
+                        custom_harness: None,
                         model: Some(model),
                         effort: Some(effort),
                         auto_title: true,
@@ -26375,6 +26649,7 @@ diff --git a/src/c.rs b/src/c.rs
                     [ClientRequest::CreateAgent {
                         worktree: w,
                         kind: AgentKind::Codex,
+                        custom_harness: None,
                         starting_prompt: None,
                         ..
                     }] if *w == worktree
@@ -26392,6 +26667,7 @@ diff --git a/src/c.rs b/src/c.rs
                     out.as_slice(),
                     [ClientRequest::CreateAgent {
                         kind: AgentKind::Claude,
+                        custom_harness: None,
                         starting_prompt: Some(text),
                         ..
                     }] if text == "Be strict.\n\nRun the tests."
@@ -26451,6 +26727,7 @@ diff --git a/src/c.rs b/src/c.rs
                     [ClientRequest::CreateAgent {
                         worktree: w,
                         kind: AgentKind::Claude,
+                        custom_harness: None,
                         model: Some(model),
                         starting_prompt: Some(text),
                         ..
@@ -26525,6 +26802,7 @@ diff --git a/src/c.rs b/src/c.rs
                         [ClientRequest::CreateAgent {
                             worktree: w,
                             kind: AgentKind::Codex,
+                            custom_harness: None,
                             model: Some(model),
                             effort: Some(effort),
                             auto_title: true,
@@ -26753,6 +27031,7 @@ diff --git a/src/c.rs b/src/c.rs
                     [ClientRequest::CreateAgent {
                         worktree,
                         kind: AgentKind::Codex,
+                        custom_harness: None,
                         auto_title: true,
                         cloud_prompt: None,
                         starting_prompt: Some(text),
@@ -26876,6 +27155,7 @@ diff --git a/src/c.rs b/src/c.rs
                         archived_at: 0,
                         unseen: false,
                         kind: nebula_core::AgentKind::Codex,
+                        custom_harness: None,
                         model: None,
                         effort: None,
                         session_id: None,
@@ -26978,6 +27258,7 @@ diff --git a/src/c.rs b/src/c.rs
                     [ClientRequest::CreateAgent {
                         worktree: w,
                         kind: AgentKind::Codex,
+                        custom_harness: None,
                         model: Some(m),
                         starting_prompt: Some(text),
                         ..
@@ -27069,6 +27350,7 @@ diff --git a/src/c.rs b/src/c.rs
                     out.as_slice(),
                     [ClientRequest::CreateAgent {
                         kind: AgentKind::Claude,
+                        custom_harness: None,
                         model: Some(model),
                         effort: Some(effort),
                         starting_prompt: Some(text),
@@ -27097,6 +27379,7 @@ diff --git a/src/c.rs b/src/c.rs
                     out,
                     [ClientRequest::CreateAgent {
                         kind: AgentKind::Claude,
+                        custom_harness: None,
                         starting_prompt: Some(text),
                         ..
                     }] if text == "Be strict.\n\nRun the tests."
@@ -27842,7 +28125,7 @@ diff --git a/src/c.rs b/src/c.rs
             assert_eq!(menu.title.as_deref(), Some("Cursor model"));
             assert_eq!(
                 menu.items.len(),
-                crate::config::model_choices(AgentKind::Cursor).len()
+                crate::config::model_choices(AgentKind::Cursor, None).len()
             );
             assert_eq!(menu.items[0].label, "default ✓");
             assert_eq!(menu.items[1].label, "auto");

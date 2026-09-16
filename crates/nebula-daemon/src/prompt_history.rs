@@ -168,6 +168,7 @@ mod tests {
                 archived_at: 0,
                 unseen: false,
                 kind: AgentKind::Claude,
+                custom_harness: None,
                 model: None,
                 effort: None,
                 session_id: None,

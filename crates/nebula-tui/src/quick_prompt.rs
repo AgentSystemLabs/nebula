@@ -61,6 +61,8 @@ pub enum QuickOrigin {
 pub struct QuickLaunch {
     pub target: QuickTarget,
     pub kind: AgentKind,
+    /// Registry id when `kind` is [`AgentKind::Custom`].
+    pub custom: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     /// The AGENT PRESET `Shift+Tab` picked: its prefix and postfix wrap
@@ -98,6 +100,7 @@ impl QuickLaunch {
         Self::of_kind(
             target,
             kind,
+            None,
             cfg.default_model(kind),
             cfg.default_effort(kind),
             cfg,
@@ -110,19 +113,25 @@ impl QuickLaunch {
     pub fn of_kind(
         target: QuickTarget,
         kind: AgentKind,
+        custom: Option<String>,
         model: Option<String>,
         effort: Option<String>,
         cfg: &Config,
     ) -> Self {
-        let model = model.or_else(|| cfg.default_model(kind));
+        // Defaults resolve from the registry descriptor: its own model
+        // default, and its effort default fitted to the model.
+        let descriptor = cfg.effective_harness(kind, custom.as_deref());
+        let model = model.or_else(|| descriptor.default_model().map(str::to_string));
         let effort = fit_effort(
             kind,
             model.as_deref(),
-            effort.or_else(|| cfg.default_effort(kind)),
+            effort.or_else(|| descriptor.default_effort().map(str::to_string)),
+            custom.as_deref(),
         );
         Self {
             target,
             kind,
+            custom,
             model,
             effort,
             preset: None,
@@ -172,6 +181,7 @@ impl QuickLaunch {
         let mut launch = Self::of_kind(
             target,
             preset.kind,
+            preset.custom_harness.clone(),
             preset.model.clone(),
             preset.effort.clone(),
             cfg,
@@ -198,7 +208,11 @@ impl QuickLaunch {
     /// `Quick prompt · issue #15 · reviewer (claude · opus)` — and, for
     /// the NEW SESSION PICKER's box, `New session (claude · opus · high)`.
     pub fn title(&self) -> String {
-        let opts: Vec<&str> = std::iter::once(self.kind.as_str())
+        let harness = self
+            .custom
+            .as_deref()
+            .unwrap_or_else(|| self.kind.as_str());
+        let opts: Vec<&str> = std::iter::once(harness)
             .chain(self.model.as_deref())
             .chain(self.effort.as_deref())
             .collect();
@@ -314,12 +328,14 @@ pub(crate) fn open_for_new_session(
     app: &mut App,
     worktree: WorktreeId,
     kind: AgentKind,
+    custom: Option<String>,
     model: Option<String>,
     effort: Option<String>,
     cfg: &Config,
 ) {
-    let launch = QuickLaunch::of_kind(QuickTarget::Worktree(worktree), kind, model, effort, cfg)
-        .with_origin(QuickOrigin::NewSession);
+    let launch =
+        QuickLaunch::of_kind(QuickTarget::Worktree(worktree), kind, custom, model, effort, cfg)
+            .with_origin(QuickOrigin::NewSession);
     crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch));
 }
 
@@ -479,6 +495,7 @@ mod tests {
         AgentPreset {
             name: name.into(),
             kind,
+            custom_harness: None,
             model: None,
             effort: None,
             prefix: String::new(),
@@ -536,12 +553,13 @@ mod tests {
             codex_effort: "high".into(),
             ..Config::default()
         };
-        let launch = QuickLaunch::of_kind(worktree(), AgentKind::Codex, None, None, &cfg);
+        let launch = QuickLaunch::of_kind(worktree(), AgentKind::Codex, None, None, None, &cfg);
         assert_eq!(launch.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(launch.effort.as_deref(), Some("high"));
         let launch = QuickLaunch::of_kind(
             worktree(),
             AgentKind::Codex,
+            None,
             Some("gpt-5.1-codex".into()),
             Some("low".into()),
             &cfg,
@@ -584,6 +602,7 @@ mod tests {
         let plain = QuickLaunch::of_kind(
             worktree(),
             AgentKind::Claude,
+            None,
             Some("opus".into()),
             Some("high".into()),
             &cfg,
@@ -623,7 +642,7 @@ mod tests {
             number: 15,
             title: "Fix login redirect".into(),
         };
-        let plain = QuickLaunch::of_kind(worktree(), AgentKind::Claude, None, None, &cfg)
+        let plain = QuickLaunch::of_kind(worktree(), AgentKind::Claude, None, None, None, &cfg)
             .with_issue(Some(issue.clone()));
         assert_eq!(plain.title(), "Quick prompt · issue #15 (claude)");
         assert_eq!(
@@ -649,7 +668,7 @@ mod tests {
             "reviewer — sent as the first prompt (empty = fix the issue)"
         );
         assert!(wrapped.default_task().is_some());
-        let none = QuickLaunch::of_kind(worktree(), AgentKind::Claude, None, None, &cfg);
+        let none = QuickLaunch::of_kind(worktree(), AgentKind::Claude, None, None, None, &cfg);
         assert_eq!(none.default_task(), None, "an empty ordinary box cancels");
     }
 
@@ -661,6 +680,7 @@ mod tests {
         let fresh = QuickLaunch::of_kind(
             new_worktree("yellow-fox-jumps"),
             AgentKind::Claude,
+            None,
             Some("opus".into()),
             None,
             &cfg,
@@ -688,7 +708,7 @@ mod tests {
     #[test]
     fn the_new_session_box_is_titled_for_the_picker_and_launches_empty() {
         let cfg = Config::default();
-        let hotkey = QuickLaunch::of_kind(worktree(), AgentKind::Claude, None, None, &cfg);
+        let hotkey = QuickLaunch::of_kind(worktree(), AgentKind::Claude, None, None, None, &cfg);
         assert_eq!(hotkey.origin, QuickOrigin::Hotkey);
         assert_eq!(hotkey.title(), "Quick prompt (claude)");
         assert_eq!(hotkey.label(), "what should the agent do?");
@@ -701,6 +721,7 @@ mod tests {
         let picked = QuickLaunch::of_kind(
             worktree(),
             AgentKind::Claude,
+            None,
             Some("opus".into()),
             Some("high".into()),
             &cfg,

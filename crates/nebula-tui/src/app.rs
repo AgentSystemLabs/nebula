@@ -178,6 +178,10 @@ pub enum MenuAction {
     NewAgentOfKind {
         worktree: WorktreeId,
         kind: AgentKind,
+        /// Registry id when `kind` is [`AgentKind::Custom`]; None for
+        /// built-ins. Carried through the MODEL submenu, the QUICK PROMPT
+        /// box and the launch draft into `CreateAgent::custom_harness`.
+        custom: Option<String>,
         model: Option<String>,
         effort: Option<String>,
         /// One-shot launch modifier for Claude. The task itself is collected
@@ -256,17 +260,19 @@ impl MenuAction {
         match self {
             MenuAction::NewAgentOfKind {
                 kind,
+                custom,
                 model,
                 effort,
                 ..
             } => {
-                if crate::config::model_choices(*kind).is_empty() {
+                if crate::config::model_choices(*kind, custom.as_deref()).is_empty() {
                     return None;
                 }
                 match (model, effort) {
                     (None, None) => Some(SubmenuKind::Models),
                     (Some(m), None)
-                        if !crate::config::effort_choices(*kind, Some(m)).is_empty() =>
+                        if !crate::config::effort_choices(*kind, Some(m), custom.as_deref())
+                            .is_empty() =>
                     {
                         Some(SubmenuKind::Efforts)
                     }
@@ -412,9 +418,21 @@ impl ContextMenu {
         match &self.items.get(self.hover)?.action {
             MenuAction::NewAgentOfKind {
                 kind: AgentKind::Claude,
+                custom: None,
                 cloud,
                 ..
             } => Some(*cloud),
+            _ => None,
+        }
+    }
+
+    /// The harnessed launch under the cursor, if the hovered row starts
+    /// one: the New session picker, its PR sibling, the quick prompt
+    /// picker, and their model/effort submenus all carry it. Gates the
+    /// `?` jump to agent settings.
+    pub fn hovered_agent_kind(&self) -> Option<(AgentKind, Option<String>)> {
+        match &self.items.get(self.hover)?.action {
+            MenuAction::NewAgentOfKind { kind, custom, .. } => Some((*kind, custom.clone())),
             _ => None,
         }
     }
@@ -517,6 +535,8 @@ pub enum PromptKind {
     NewPrAgent {
         worktree: WorktreeId,
         kind: AgentKind,
+        /// Registry id when `kind` is [`AgentKind::Custom`].
+        custom: Option<String>,
         /// Resolved launch options (picker choice or configured default);
         /// None = the CLI's own default.
         model: Option<String>,
@@ -3888,6 +3908,7 @@ mod tests {
             unseen: false,
             status_changed_at: 0,
             kind: AgentKind::Claude,
+            custom_harness: None,
             model: None,
             effort: None,
             session_id: None,
