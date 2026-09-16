@@ -165,6 +165,45 @@ reports — a turn you cancelled with `Esc` — the PROGRESS SCANNER reads the C
 escapes straight off the PTY, a signal that survives the cancel and stays busy while a permission prompt
 is open.
 
+## Teach nebula a new agent CLI
+
+The five built-ins are just rows in a table, and the table is open. One block in `config.json` adds
+a CLI everywhere at once: the `n` picker, the `e` presets, spawn, resume, and the Agents tab, which
+grows it a section to tune without hand-editing.
+
+```json
+{
+  "harnesses": {
+    "mycli": {
+      "program": "mycli",
+      "model_flag": "--model",
+      "model_default": "large",
+      "hooks": "claude"
+    }
+  }
+}
+```
+
+`program` is the only required row: the binary nebula launches, resolved on PATH through your login
+shell. A new id starts enabled, takes the id as its label, boots fresh every launch (no resume), and
+hides the Effort row until you map effort. `nebula config harnesses` prints the effective rows to copy
+from, and a block that stops making sense refuses its launches with the reason while everything else
+keeps working. Ids use lowercase letters, digits and hyphens, and must not collide with a built-in.
+
+`hooks` names a built-in dialect, not your own scripts: `claude`, `codex`, `cursor` or `pi`. At spawn
+nebula installs that dialect's MANAGED HOOKS for the session (the same `.claude/settings.local.json`,
+`.cursor/hooks.json`, `~/.codex/hooks.json` or pi extension the built-in gets), so a CLI that speaks
+that protocol reports status, prompts and permission waits exactly like the real thing. A
+Claude-compatible CLI with `"hooks": "claude"` even gets title sync and auto-title. Leave `hooks` out
+and the sessions stay process-based: running while the PTY is live, never red. Either way your own
+hooks are preserved (nebula's entries are tagged `_nebulaManaged`) and the merge is rebuilt every
+spawn.
+
+One boundary to know: `nebula ssh` syncs `config.json` to the remote, but exec-capable harness keys
+never travel with it: each machine runs only the programs its own files name. Full row reference
+(resume styles, effort mapping, system-prompt passing, clearing a row with `null`): [Configuration](docs/configuration.md),
+"The harness registry".
+
 ## Documentation
 
 | | |
