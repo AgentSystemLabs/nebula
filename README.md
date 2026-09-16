@@ -55,6 +55,22 @@ dot on a collapsed PROJECT tells you exactly where to look without opening anyth
 | **`/` finds anything, anywhere** | The PALETTE spans every WORKSPACE, not just the open one. Before you type it sorts by attention: NEEDS FEEDBACK first, then RUNNING, then UNSEEN — so `/` `Enter` is the fastest way back to whatever needs you, and `]` / `[` cycle that same attention order with no modal at all, one session per press, workspaces included. Open pull requests are rows too: `Enter` on one lands on its PR ROW with the PR PREVIEW reading it, `Ctrl+o` hands it to the browser. |
 | **It follows you to other machines** | `nebula ssh <host>` opens nebula there, installing it if missing. `nebula tunnel <host>` puts that machine's TUI in a browser tab over a single ssh tunnel. Your settings and agent presets go along, and `nebula config export` / `import` back them up. |
 
+## Supported harnesses
+
+Five CLIs work out of the box, each with its own Agents tab section and model/effort rows. A
+sixth, Grok, needs one config block (see "Teach nebula a new agent CLI" below). Install the CLI,
+pick it in the `n` picker, done. A CLI missing from PATH still shows in the picker; the DAEMON
+re-checks through the login shell at launch.
+
+| | Harness | CLI | Install |
+|---|---|---|---|
+| <img src="https://www.google.com/s2/favicons?domain=claude.com&sz=128" width="24" height="24" alt="Claude"> | [Claude](https://code.claude.com/docs/en/setup) | `claude` | `curl -fsSL https://claude.ai/install.sh \| bash` |
+| <img src="https://www.google.com/s2/favicons?domain=openai.com&sz=128" width="24" height="24" alt="Codex"> | [Codex](https://github.com/openai/codex) | `codex` | `npm i -g @openai/codex` |
+| <img src="https://www.google.com/s2/favicons?domain=cursor.com&sz=128" width="24" height="24" alt="Cursor"> | [Cursor](https://cursor.com/install) | `cursor-agent` | `curl -fsSL https://cursor.com/install \| bash` |
+| <img src="https://www.google.com/s2/favicons?domain=pi.dev&sz=128" width="24" height="24" alt="Pi"> | [Pi](https://pi.dev) | `pi` | `curl -fsSL https://pi.dev/install.sh \| sh` |
+| <img src="https://www.google.com/s2/favicons?domain=meta.com&sz=128" width="24" height="24" alt="Muse"> | [Muse](https://developer.meta.com/ai/lp/muse-code) | `muse` | `curl -fsSL https://dev.meta.ai/install.sh \| bash` |
+| <img src="https://www.google.com/s2/favicons?domain=x.ai&sz=128" width="24" height="24" alt="Grok"> | [Grok](https://github.com/xai-org/grok-build) | `grok` | `curl -fsSL https://x.ai/cli/install.sh \| bash` |
+
 ## Install
 
 macOS or Linux — the same command installs and updates:
@@ -164,6 +180,45 @@ so it gets one managed extension at `~/.pi/agent/extensions/nebula.ts` that post
 reports — a turn you cancelled with `Esc` — the PROGRESS SCANNER reads the CLI's own OSC 9;4 progress
 escapes straight off the PTY, a signal that survives the cancel and stays busy while a permission prompt
 is open.
+
+## Teach nebula a new agent CLI
+
+The five built-ins are just rows in a table, and the table is open. One block in `config.json` adds
+a CLI everywhere at once: the `n` picker, the `e` presets, spawn, resume, and the Agents tab, which
+grows it a section to tune without hand-editing.
+
+```json
+{
+  "harnesses": {
+    "mycli": {
+      "program": "mycli",
+      "model_flag": "--model",
+      "model_default": "large",
+      "hooks": "claude"
+    }
+  }
+}
+```
+
+`program` is the only required row: the binary nebula launches, resolved on PATH through your login
+shell. A new id starts enabled, takes the id as its label, boots fresh every launch (no resume), and
+hides the Effort row until you map effort. `nebula config harnesses` prints the effective rows to copy
+from, and a block that stops making sense refuses its launches with the reason while everything else
+keeps working. Ids use lowercase letters, digits and hyphens, and must not collide with a built-in.
+
+`hooks` names a built-in dialect, not your own scripts: `claude`, `codex`, `cursor` or `pi`. At spawn
+nebula installs that dialect's MANAGED HOOKS for the session (the same `.claude/settings.local.json`,
+`.cursor/hooks.json`, `~/.codex/hooks.json` or pi extension the built-in gets), so a CLI that speaks
+that protocol reports status, prompts and permission waits exactly like the real thing. A
+Claude-compatible CLI with `"hooks": "claude"` even gets title sync and auto-title. Leave `hooks` out
+and the sessions stay process-based: running while the PTY is live, never red. Either way your own
+hooks are preserved (nebula's entries are tagged `_nebulaManaged`) and the merge is rebuilt every
+spawn.
+
+One boundary to know: `nebula ssh` syncs `config.json` to the remote, but exec-capable harness keys
+never travel with it: each machine runs only the programs its own files name. Full row reference
+(resume styles, effort mapping, system-prompt passing, clearing a row with `null`): [Configuration](docs/configuration.md),
+"The harness registry".
 
 ## Documentation
 
