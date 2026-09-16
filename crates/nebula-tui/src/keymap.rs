@@ -76,8 +76,12 @@ pub enum Action {
     /// `Shift+R`: ask GitHub for the pull requests again now, past every
     /// timer — the open list, the worktree's PR, the one the pane is reading.
     RefreshPullRequests,
+    /// `y`: reply — the COMMENT BOX on the pull request under the cursor,
+    /// posted to GitHub with `gh pr comment` on Enter.
+    CommentPullRequest,
     /// `i`: the ISSUES MODAL — the project's open GitHub issues, read in
-    /// place, with a QUICK PROMPT or an AGENT PRESET launched on one.
+    /// place, commented on, with a QUICK PROMPT or an AGENT PRESET launched
+    /// on one.
     Issues,
     /// `c`: the BRANCH SWITCHER — move the project's ROOT WORKTREE onto
     /// another branch, asking what to do with uncommitted changes.
@@ -332,6 +336,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         defaults: &["shift+r"],
     },
     ActionSpec {
+        action: Action::CommentPullRequest,
+        id: "comment_pull_request",
+        label: "Comment on pull request",
+        hint: "On a pull request row, open a box to type a comment and post it on that PR through gh",
+        group: "PROJECTS & WORKTREES",
+        scope: Scope::Global,
+        defaults: &["y"],
+    },
+    ActionSpec {
         action: Action::Issues,
         id: "issues",
         label: "GitHub issues",
@@ -435,7 +448,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::AgentPresets,
         id: "agent_presets",
         label: "Agent presets",
-        hint: "Saved launch presets (CLI, model, effort, prefix/postfix); Enter asks for an optional task, or skips it",
+        hint: "Saved launch presets (CLI, model, effort, prefix/postfix); Enter asks for an optional task, or skips it; on an open PR row, a PR session in that branch's worktree",
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["e"],

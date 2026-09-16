@@ -8,15 +8,34 @@
 //! Codex / Cursor cold spawn's first prompt — so the agent knows which
 //! issue the session is for before it reads the first word of the task.
 //!
+//! `c` leaves a comment on the issue instead: a multi-row box (the task
+//! prompts' shape) whose Enter posts the text as you with
+//! `gh issue comment`, off the loop, and puts the modal back on its row —
+//! the pane says the comment is on its way, and the conversation is read
+//! again once it has landed. A post `gh` refused brings the box back with
+//! the text, so nothing typed is lost.
+//!
+//! `E` edits the issue itself, in place: the reading pane becomes a form
+//! on its title and description ([`IssueEditor`]), and Enter sends both
+//! as one `gh issue edit` off the loop. The form holds until GitHub
+//! answers, so a refusal shows `gh`'s reason over text that is still
+//! there; a save that took lands on the row at once, and the list is
+//! re-asked underneath so the row is GitHub's copy.
+//!
 //! Like the pull requests, the issues are the TUI's own business: one
-//! `gh issue list` per project when the modal opens (and on `r`), one
+//! `gh issue list` per project — asked in the background once the cursor
+//! has rested on the project ([`schedule_prefetch`]), re-asked on a slow
+//! beat while it stays selected ([`refresh_selected`]), and again when the
+//! modal opens on a list older than [`FRESH`] (or on `r`) — and one
 //! `gh issue view` for the comments of the row the cursor rests on, both
 //! off the loop with the answer landing on `App::issues_tx`. A `gh` that is
 //! missing, unauthenticated, or pointed at a repo with no remote is an
-//! ordinary "couldn't ask", said in the pane rather than flashed. Nothing
-//! is written to disk: the list is a modal's worth of rows, re-asked each
-//! time it opens, and kept in memory so reopening paints at once while the
-//! fresh answer lands underneath.
+//! ordinary "couldn't ask", said in the pane rather than flashed, and
+//! backed off like the open pull requests' list so a machine without `gh`
+//! is not asked every beat. Nothing is written to disk: the list is a
+//! modal's worth of rows kept in memory, so `i` paints the prefetched rows
+//! at once instead of an empty modal while the first answer lands, and a
+//! reopen paints the last list while the fresh one lands underneath.
 
 use std::path::{Path, PathBuf};
 
@@ -25,17 +44,19 @@ use nebula_core::ProjectId;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use serde::{Deserialize, Serialize};
 
 use crate::app::{clamp_selection, window_start, App, Overlay};
-use crate::pr_preview::{fit, wrap};
+use crate::markdown::{self, Breaks};
+use crate::pr_preview::fit;
 use crate::quick_prompt::{QuickLaunch, QuickReturn, QuickTarget};
+use crate::text_input::TextInput;
 use crate::theme::Theme;
 use crate::ui::{
-    centered_rect_pct, empty_list_row, panel_block, render_row, row_rect, truncate,
-    SPLIT_MODAL_PCT, SPLIT_PANE_LAYOUT_MIN,
+    centered_rect_pct, empty_list_row, input_spans, multiline_input_lines, panel_block, render_row,
+    row_rect, truncate, SPLIT_MODAL_PCT, SPLIT_PANE_LAYOUT_MIN,
 };
 
 /// How long a lookup may run before we give up on it — the PR lookups'
@@ -48,6 +69,24 @@ pub const LIST_LIMIT: usize = 100;
 /// How long the cursor rests on a row before its comments are fetched, so
 /// walking the list with `j` fetches only the rows actually paused on.
 const DETAIL_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+/// How long the cursor rests on a project before its open issues are asked
+/// for in the background — the session prewarm's debounce, for the same
+/// reason: walking the project list with j/k must not spawn a `gh` per row
+/// passed, only one for the row the cursor settles on.
+const PREFETCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+/// The beat a selected project's list is re-asked on once it has proved it
+/// has open issues, so the rows `i` paints are never older than this while
+/// the project stays selected.
+pub(crate) const REFRESH: std::time::Duration = std::time::Duration::from_secs(2 * 60);
+/// The backoff after an empty or failed answer: doubling from the floor to
+/// the ceiling, so a repo with nothing open (or a machine with no `gh`)
+/// settles at the ceiling instead of being asked every beat.
+pub(crate) const RECHECK_MIN: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const RECHECK_MAX: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// A list younger than this is what opening the modal shows, with no second
+/// ask: the prefetch that landed as the cursor settled *is* the answer `i`
+/// was waiting for. `r` asks regardless.
+pub(crate) const FRESH: std::time::Duration = std::time::Duration::from_secs(30);
 /// Left inset of the reading pane's text.
 const INDENT: &str = " ";
 /// Narrowest the body wraps to; below this a word per line reads worse
@@ -72,8 +111,9 @@ pub struct Issue {
     pub created_at: String,
     pub updated_at: String,
     pub labels: Vec<String>,
-    /// The description, verbatim markdown, rendered as plain wrapped text
-    /// like a pull request's.
+    /// The description, verbatim markdown; the reading pane renders it
+    /// (the MARKDOWN module) with GitHub's comment rule that a newline is
+    /// a line break, like a pull request's.
     pub body: String,
 }
 
@@ -147,6 +187,17 @@ pub struct IssueList {
     pub at: std::time::Instant,
 }
 
+/// When a project's list is next owed in the background, and why: the
+/// steady [`REFRESH`] once the repo has proved it has issues (`backoff`
+/// `None`), or the doubling step an empty or failed answer left it on —
+/// the open pull requests' shape, kept apart from [`IssueList`] because a
+/// failed first ask arms a beat without landing a list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IssuesBeat {
+    pub due: std::time::Instant,
+    pub backoff: Option<std::time::Duration>,
+}
+
 /// What a debounced comments fetch needs: which issue, and the checkout to
 /// run `gh` from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,13 +218,30 @@ pub enum IssuesAnswer {
         url: String,
         detail: Option<IssueDetail>,
     },
+    /// `gh issue comment` finished; `posted` false is "couldn't post". The
+    /// box's state rides along so a refusal can bring it back with the
+    /// text, on the modal's row.
+    Comment {
+        view: IssuesView,
+        issue: IssueRef,
+        text: String,
+        posted: bool,
+    },
+    /// `gh issue edit` finished: the text GitHub now holds, or why it
+    /// refused — the first line `gh` printed.
+    Edited {
+        project: ProjectId,
+        url: String,
+        number: u64,
+        outcome: Result<IssueText, String>,
+    },
 }
 
 /// The modal's own state. The rows live on the [`App`] (`issues`, keyed by
 /// project) so a fetch that lands after the modal closed still paints the
 /// next open; this holds only the cursor, the reading pane's scroll, and
 /// the rects the mouse hit-tests against.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuesView {
     pub project: ProjectId,
     /// The project's row name, for the list's title.
@@ -193,6 +261,11 @@ pub struct IssuesView {
     /// The list rows and the reading pane, for wheel and click routing.
     pub list_area: Rect,
     pub body_area: Rect,
+    /// `E`: the reading pane turned into the editor for the row under the
+    /// cursor, until Enter has saved or Esc has dropped it. Boxed: the
+    /// view rides a `Comment` answer, and two text fields would make that
+    /// variant several times the others' size.
+    pub editor: Option<Box<IssueEditor>>,
 }
 
 impl IssuesView {
@@ -208,6 +281,7 @@ impl IssuesView {
             area: Rect::default(),
             list_area: Rect::default(),
             body_area: Rect::default(),
+            editor: None,
         }
     }
 
@@ -222,6 +296,112 @@ impl IssuesView {
 
     pub fn scroll_by(&mut self, delta: i32) {
         self.scroll = crate::app::scrolled_by(self.scroll, delta, self.max_scroll());
+    }
+}
+
+/// Which of the editor's two fields has the caret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditField {
+    Title,
+    Body,
+}
+
+impl EditField {
+    /// Tab order, wrapping — two fields, so the other one.
+    pub fn next(self) -> EditField {
+        match self {
+            EditField::Title => EditField::Body,
+            EditField::Body => EditField::Title,
+        }
+    }
+}
+
+/// An issue's title and description as GitHub holds them: what the editor
+/// opens on, what a save sends, and what lands back on the row once
+/// GitHub has taken it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueText {
+    pub title: String,
+    pub body: String,
+}
+
+/// `E` in the modal: the reading pane as a form for the issue under the
+/// cursor — the title on one line, the description in a box under it —
+/// that `Enter` sends to GitHub as one `gh issue edit`. It lives on the
+/// [`IssuesView`] rather than as an overlay of its own: the list stays up
+/// on the left, and Esc puts the reading pane back with nothing to
+/// rebuild. The keys are the PRESET EDITOR's: Tab / ↑↓ between the fields,
+/// Shift+Enter / Ctrl+J for a line in the description, Enter to save.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueEditor {
+    pub url: String,
+    pub number: u64,
+    pub title: TextInput,
+    pub body: TextInput,
+    pub field: EditField,
+    /// What the form opened on: an unchanged Enter closes without a call.
+    pub original: IssueText,
+    /// `gh issue edit` is in flight: the form holds every key but Esc
+    /// until the answer lands, so the text is still there if GitHub says
+    /// no.
+    pub saving: bool,
+    /// Why the last Enter went nowhere — a blank title, `gh`'s complaint —
+    /// shown on the frame until the next edit.
+    pub notice: Option<String>,
+    /// The title row and the description box, written back during draw
+    /// so a click can move the caret between them.
+    pub title_area: Rect,
+    pub body_area: Rect,
+}
+
+impl IssueEditor {
+    /// The form prefilled from the row, caret at the end of the title.
+    pub fn new(issue: &Issue) -> Self {
+        Self {
+            url: issue.url.clone(),
+            number: issue.number,
+            title: TextInput::with_text(issue.title.clone()),
+            body: TextInput::with_text(issue.body.clone()),
+            field: EditField::Title,
+            original: IssueText {
+                title: issue.title.clone(),
+                body: issue.body.clone(),
+            },
+            saving: false,
+            notice: None,
+            title_area: Rect::default(),
+            body_area: Rect::default(),
+        }
+    }
+
+    /// What Enter would send: the title trimmed, the description as typed.
+    pub fn text(&self) -> IssueText {
+        IssueText {
+            title: self.title.trim().to_string(),
+            body: self.body.as_str().to_string(),
+        }
+    }
+
+    /// Whether Enter has anything to send.
+    pub fn is_changed(&self) -> bool {
+        self.text() != self.original
+    }
+
+    /// The field under the caret.
+    pub fn field_mut(&mut self) -> &mut TextInput {
+        match self.field {
+            EditField::Title => &mut self.title,
+            EditField::Body => &mut self.body,
+        }
+    }
+
+    /// Shift+Enter / Ctrl+J: a hard line in the description; on the title
+    /// — one line by nature — the caret steps down into the description.
+    pub fn newline(&mut self) {
+        match self.field {
+            EditField::Body => self.body.insert_char('\n'),
+            EditField::Title => self.field = EditField::Body,
+        }
     }
 }
 
@@ -270,6 +450,119 @@ pub async fn detail(dir: &Path, number: u64) -> Option<IssueDetail> {
     let number = number.to_string();
     let out = gh(dir, &["issue", "view", &number, "--json", "url,comments"]).await?;
     parse_detail(&out)
+}
+
+/// Post `body` as a comment on issue `number`, as the `gh` user. The body
+/// goes down stdin (`--body-file -`), never argv: a comment can be long,
+/// and one opening with `-` must not read as a flag. True when `gh` exited
+/// clean; anything else — no `gh`, not logged in, a network that stalled
+/// past [`TIMEOUT`] — is "couldn't post". A `gh` still running at the
+/// timeout is killed with the future, not left behind.
+pub async fn comment(dir: &Path, number: u64, body: &str) -> bool {
+    comment_via("gh", dir, number, body).await
+}
+
+/// [`comment`] through `program`: `gh` in the app, a script on disk in the
+/// tests, since the real thing would post.
+async fn comment_via(
+    program: impl AsRef<std::ffi::OsStr>,
+    dir: &Path,
+    number: u64,
+    body: &str,
+) -> bool {
+    use tokio::io::AsyncWriteExt;
+    let number = number.to_string();
+    let mut child = match tokio::process::Command::new(program)
+        .args(["issue", "comment", &number, "--body-file", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .current_dir(dir)
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        return false;
+    };
+    let body = body.to_string();
+    let feed = async move {
+        stdin.write_all(body.as_bytes()).await?;
+        stdin.shutdown().await
+    };
+    // Feed and wait together: a `gh` that exits before reading (bad auth)
+    // would otherwise leave the write blocked on a closed pipe.
+    let run = async {
+        let (_, status) = tokio::join!(feed, child.wait());
+        status.map(|s| s.success()).unwrap_or(false)
+    };
+    tokio::time::timeout(TIMEOUT, run).await.unwrap_or(false)
+}
+
+/// Send one issue a new title and description, as the `gh` user. Unlike
+/// the reads this wants `gh`'s complaint, not just its silence: the first
+/// line it printed is what the form shows when GitHub refuses. The
+/// description goes down stdin (`--body-file -`) as a comment's does; the
+/// title rides argv as `--title=…`, one token, so one opening with `-`
+/// can't read as a flag either.
+pub async fn edit(dir: &Path, number: u64, text: &IssueText) -> Result<(), String> {
+    edit_via("gh", dir, number, text).await
+}
+
+/// [`edit`] through `program`: `gh` in the app, a script on disk in the
+/// tests, since the real thing would edit.
+async fn edit_via(
+    program: impl AsRef<std::ffi::OsStr>,
+    dir: &Path,
+    number: u64,
+    text: &IssueText,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    let number = number.to_string();
+    let title = format!("--title={}", text.title);
+    let mut child = tokio::process::Command::new(program)
+        .args(["issue", "edit", &number, &title, "--body-file", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .current_dir(dir)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("couldn't run gh: {e}"))?;
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err("couldn't feed gh".into());
+    };
+    let body = text.body.clone();
+    let feed = async move {
+        stdin.write_all(body.as_bytes()).await?;
+        stdin.shutdown().await
+    };
+    // Feed and wait together, as a comment does: a `gh` that exits before
+    // reading (bad auth) would otherwise leave the write blocked on a
+    // closed pipe.
+    let run = async {
+        let (_, out) = tokio::join!(feed, child.wait_with_output());
+        match out {
+            Ok(out) if out.status.success() => Ok(()),
+            Ok(out) => Err(complaint(&out.stderr)),
+            Err(e) => Err(format!("gh failed: {e}")),
+        }
+    };
+    tokio::time::timeout(TIMEOUT, run)
+        .await
+        .unwrap_or_else(|_| Err("gh timed out".into()))
+}
+
+/// The first line `gh` printed that says anything, as a shell would have
+/// shown it; a silent refusal gets a stock one.
+fn complaint(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map_or_else(|| "gh refused the edit".to_string(), str::to_string)
 }
 
 fn str_at(v: &serde_json::Value, key: &str) -> String {
@@ -372,7 +665,11 @@ pub(crate) fn open_issues(app: &mut App) {
     );
     view.selected = clamp_selection(0, list_len(app, &project.id));
     app.overlay = Some(Overlay::Issues(view));
-    request_list(app, project.id, project.repo_path);
+    // A list the prefetch landed moments ago is the answer; an older one
+    // paints now while a fresh copy lands underneath.
+    if !is_fresh(app, &project.id) {
+        request_list(app, project.id, project.repo_path);
+    }
     schedule_detail(app);
     app.dirty = true;
 }
@@ -381,15 +678,27 @@ fn list_len(app: &App, project: &ProjectId) -> usize {
     app.issues.get(project).map_or(0, |l| l.list.len())
 }
 
+/// Put the modal back as it was — the box a comment was typed in stood in
+/// for it — on the same row, clamped in case the list moved underneath,
+/// with the row's comments asked for as landing on it would.
+pub(crate) fn reopen(app: &mut App, mut view: IssuesView) {
+    view.selected = clamp_selection(view.selected as i64, list_len(app, &view.project));
+    app.overlay = Some(Overlay::Issues(view));
+    schedule_detail(app);
+    app.dirty = true;
+}
+
 /// Ask `gh` for the project's open issues, off the loop. Skipped while
 /// one is in flight — a repaint must never stack `gh` processes. A repo
-/// that isn't on disk is a miss noted without spending a process. Without
-/// the loop's sender installed (the unit tests) nothing is asked.
+/// that isn't on disk is a miss noted without spending a process, and
+/// left to the backoff — the checkout can come back. Without the loop's
+/// sender installed (the unit tests) nothing is asked.
 fn request_list(app: &mut App, project: ProjectId, dir: PathBuf) {
     if app.issues_inflight.contains(&project) {
         return;
     }
     if !dir.is_dir() {
+        arm_beat(app, &project, false);
         app.issues_failed.insert(project);
         return;
     }
@@ -401,6 +710,94 @@ fn request_list(app: &mut App, project: ProjectId, dir: PathBuf) {
         let list = list(&dir).await;
         let _ = tx.send(IssuesAnswer::List { project, list });
     });
+}
+
+// ---- prefetching ----
+
+/// Arm the debounced background ask for the selected project's open
+/// issues; the loop fires it once the cursor has rested there
+/// ([`PREFETCH_DEBOUNCE`]). Run wherever the selected project changes —
+/// the project switch, the startup restore — so `i` finds the rows there.
+pub(crate) fn schedule_prefetch(app: &mut App) {
+    app.pending_issues_prefetch = app
+        .selected_project()
+        .map(|p| (p.id.clone(), std::time::Instant::now() + PREFETCH_DEBOUNCE));
+}
+
+/// The debounce elapsed: ask for the project the cursor settled on, when
+/// it is still the selected one and its beat says so. Disarms first, so a
+/// `gh` that never answers can't re-fire on every loop turn.
+pub(crate) fn fire_prefetch(app: &mut App) {
+    let Some((project, _)) = app.pending_issues_prefetch.take() else {
+        return;
+    };
+    if app.selected_project().is_some_and(|p| p.id == project) {
+        ask_selected_if_due(app);
+    }
+}
+
+/// The git tick: re-ask the selected project's list once its beat has
+/// passed — the steady [`REFRESH`] while it has issues, the backoff while
+/// it hasn't — and ask for a project never asked about at all, so a
+/// selection that landed without a project switch (the first project
+/// added, the tree arriving) is prefetched too.
+pub(crate) fn refresh_selected(app: &mut App) {
+    ask_selected_if_due(app);
+}
+
+fn ask_selected_if_due(app: &mut App) {
+    let Some((project, dir)) = app
+        .selected_project()
+        .map(|p| (p.id.clone(), p.repo_path.clone()))
+    else {
+        return;
+    };
+    if prefetch_due(app, &project) {
+        request_list(app, project, dir);
+    }
+}
+
+/// Whether the background should ask for this project now: not while an
+/// answer is in flight, not before the timer the last answer armed, and
+/// always for a project never asked about.
+pub(crate) fn prefetch_due(app: &App, project: &ProjectId) -> bool {
+    if app.issues_inflight.contains(project) {
+        return false;
+    }
+    match app.issues_due.get(project) {
+        Some(beat) => std::time::Instant::now() >= beat.due,
+        None => true,
+    }
+}
+
+/// A list that landed within [`FRESH`]: the modal opens on it as it is.
+fn is_fresh(app: &App, project: &ProjectId) -> bool {
+    app.issues
+        .get(project)
+        .is_some_and(|l| l.at.elapsed() < FRESH)
+}
+
+/// Arm the next background ask after an answer: the steady beat when the
+/// repo has open issues, a doubling backoff otherwise — from the floor
+/// when the last answer had rows, so one flaky call after a good one
+/// costs thirty seconds, not a doubled steady beat.
+fn arm_beat(app: &mut App, project: &ProjectId, found: bool) {
+    let (step, backoff) = if found {
+        (REFRESH, None)
+    } else {
+        let step = match app.issues_due.get(project).and_then(|b| b.backoff) {
+            Some(prev) => (prev * 2).min(RECHECK_MAX),
+            None => RECHECK_MIN,
+        };
+        (step, Some(step))
+    };
+    app.issues_due.insert(
+        project.clone(),
+        IssuesBeat {
+            due: std::time::Instant::now() + step,
+            backoff,
+        },
+    );
 }
 
 /// Arm (or disarm) the debounced comments fetch for the row under the
@@ -451,13 +848,15 @@ pub(crate) fn lookup_detail(app: &mut App) {
 /// A `gh` answer landed. A list replaces the project's rows — keeping the
 /// cursor on the issue it was on, by URL, so a refresh that retired a row
 /// above it does not slide the selection — and a failed list keeps the
-/// last good one, or says so when there is none. Comments replace whatever
-/// the pane showed for the URL; a failed fetch is remembered so the pane
-/// says so instead of spinning.
+/// last good one, or says so when there is none; either way the next
+/// background ask is armed off it. Comments replace whatever the pane
+/// showed for the URL; a failed fetch is remembered so the pane says so
+/// instead of spinning.
 pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
     match answer {
         IssuesAnswer::List { project, list } => {
             app.issues_inflight.remove(&project);
+            arm_beat(app, &project, list.as_ref().is_some_and(|l| !l.is_empty()));
             match list {
                 Some(list) => {
                     let cursor_url = match &app.overlay {
@@ -508,8 +907,155 @@ pub(crate) fn land_answer(app: &mut App, answer: IssuesAnswer) {
                 }
             }
         }
+        IssuesAnswer::Comment {
+            view,
+            issue,
+            text,
+            posted,
+        } => {
+            app.issue_comment_inflight.remove(&issue.url);
+            if posted {
+                // The conversation the pane has is one comment short now:
+                // forget it, and the cursor resting on the row reads it
+                // again, with the new comment in.
+                app.issue_detail.remove(&issue.url);
+                app.issue_detail_failed.remove(&issue.url);
+                app.flash = Some(format!("comment posted on #{}", issue.number));
+                schedule_detail(app);
+            } else {
+                app.flash = Some(format!(
+                    "couldn't post the comment on #{} — is gh logged in?",
+                    issue.number
+                ));
+                // The box comes back with the text for a retry — unless
+                // something else has been opened over the modal meanwhile,
+                // which the flash must not interrupt.
+                if matches!(&app.overlay, None | Some(Overlay::Issues(_))) {
+                    bring_box_back(app, view, issue, text);
+                }
+            }
+        }
+        IssuesAnswer::Edited {
+            project,
+            url,
+            number,
+            outcome,
+        } => match outcome {
+            Ok(text) => {
+                // The row the pane reads from carries the new text at
+                // once; the refresh underneath makes it GitHub's copy.
+                if let Some(row) = app
+                    .issues
+                    .get_mut(&project)
+                    .and_then(|l| l.list.iter_mut().find(|i| i.url == url))
+                {
+                    row.title = text.title;
+                    row.body = text.body;
+                }
+                if let Some(Overlay::Issues(view)) = &mut app.overlay {
+                    if view
+                        .editor
+                        .as_ref()
+                        .is_some_and(|e| e.saving && e.url == url)
+                    {
+                        view.editor = None;
+                    }
+                }
+                app.flash = Some(format!("issue #{number} updated"));
+                if let Some(dir) = app
+                    .tree
+                    .projects
+                    .iter()
+                    .find(|p| p.id == project)
+                    .map(|p| p.repo_path.clone())
+                {
+                    request_list(app, project, dir);
+                }
+            }
+            Err(why) => {
+                // The form that sent it shows why and keeps the text; one
+                // that has since gone gets the footer.
+                let mut told = false;
+                if let Some(Overlay::Issues(view)) = &mut app.overlay {
+                    if let Some(editor) = &mut view.editor {
+                        if editor.saving && editor.url == url {
+                            editor.saving = false;
+                            editor.notice = Some(why.clone());
+                            told = true;
+                        }
+                    }
+                }
+                if !told {
+                    app.flash = Some(format!("couldn't update issue #{number}: {why}"));
+                }
+            }
+        },
     }
     app.dirty = true;
+}
+
+// ---- commenting ----
+
+/// `c`: the comment box for the issue under the cursor. The box replaces
+/// the modal; Enter posts and comes back to it, Esc just comes back.
+fn open_comment_for_selected(app: &mut App) {
+    let Some(Overlay::Issues(view)) = &app.overlay else {
+        return;
+    };
+    let view = view.clone();
+    let Some((issue, _)) = selected_issue(app) else {
+        app.flash = Some("no issue selected".into());
+        return;
+    };
+    crate::event_loop::open_prompt(
+        app,
+        crate::app::PromptKind::IssueComment {
+            view,
+            issue: issue.launch_ref(),
+        },
+    );
+}
+
+/// The comment box again, with `text` typed back in.
+fn bring_box_back(app: &mut App, view: IssuesView, issue: IssueRef, text: String) {
+    crate::event_loop::reopen_prompt_with(
+        app,
+        crate::app::PromptKind::IssueComment { view, issue },
+        text,
+    );
+}
+
+/// Enter in the comment box: the modal comes back on its row at once and
+/// the comment goes to GitHub off the loop — the pane says it is on its
+/// way until [`land_answer`] hears back. A checkout that isn't on disk
+/// can't run `gh`: the box comes back with the text and says so. Without
+/// the loop's sender installed (the unit tests) nothing is posted.
+pub(crate) fn post_comment(app: &mut App, view: IssuesView, issue: IssueRef, text: String) {
+    let dir = view.dir.clone();
+    if !dir.is_dir() {
+        app.flash = Some(format!(
+            "couldn't post the comment on #{}: the checkout isn't on disk",
+            issue.number
+        ));
+        bring_box_back(app, view, issue, text);
+        return;
+    }
+    reopen(app, view.clone());
+    let Some(tx) = app.issues_tx.clone() else {
+        return;
+    };
+    app.issue_comment_inflight.insert(issue.url.clone());
+    app.flash = Some(format!("posting a comment on #{}…", issue.number));
+    let number = issue.number;
+    tokio::spawn(async move {
+        let posted = comment(&dir, number, &text).await;
+        let _ = tx.send(IssuesAnswer::Comment {
+            view,
+            issue,
+            text,
+            posted,
+        });
+    });
 }
 
 /// `r` in the modal: ask for the list again now, and the selected issue's
@@ -562,6 +1108,134 @@ fn select(app: &mut App, index: i64) {
     }
     schedule_detail(app);
     app.dirty = true;
+}
+
+// ---- editing ----
+
+/// `E`: turn the reading pane into the editor for the issue under the
+/// cursor, prefilled from the row. A list with no rows has nothing to
+/// edit, and says so where the launch keys do.
+fn open_editor(app: &mut App) {
+    let Some((issue, _)) = selected_issue(app) else {
+        app.flash = Some("no issue selected".into());
+        return;
+    };
+    if let Some(Overlay::Issues(view)) = &mut app.overlay {
+        view.editor = Some(Box::new(IssueEditor::new(&issue)));
+    }
+}
+
+/// Enter in the editor: a blank title is refused on the spot, an
+/// unchanged form closes without a call, and anything else goes to
+/// `gh issue edit` off the loop with the form held until the answer
+/// lands. Without the loop's sender installed (the unit tests) nothing
+/// is sent and the form stays as it is.
+fn save_editor(app: &mut App) {
+    let Some(Overlay::Issues(view)) = &mut app.overlay else {
+        return;
+    };
+    let (project, dir) = (view.project.clone(), view.dir.clone());
+    let Some(editor) = &mut view.editor else {
+        return;
+    };
+    if editor.saving {
+        return;
+    }
+    let text = editor.text();
+    if text.title.is_empty() {
+        editor.notice = Some("the issue needs a title".into());
+        return;
+    }
+    if text == editor.original {
+        view.editor = None;
+        app.flash = Some("issue unchanged".into());
+        return;
+    }
+    if !dir.is_dir() {
+        editor.notice = Some("the checkout isn't on disk — gh has nowhere to run".into());
+        return;
+    }
+    let Some(tx) = app.issues_tx.clone() else {
+        return;
+    };
+    editor.saving = true;
+    editor.notice = None;
+    let (url, number) = (editor.url.clone(), editor.number);
+    tokio::spawn(async move {
+        let outcome = edit(&dir, number, &text).await.map(|()| text);
+        let _ = tx.send(IssuesAnswer::Edited {
+            project,
+            url,
+            number,
+            outcome,
+        });
+    });
+}
+
+/// Keys while the editor is up: the form's own first — Tab / ↑↓ between
+/// the two fields, Shift+Enter / Ctrl+J for a line in the description,
+/// Enter to save, Esc to put the reading pane back unsaved — then the
+/// field's LINE EDITOR keys. A save in flight holds every key but Esc.
+fn handle_editor_key(app: &mut App, key: KeyEvent) {
+    let Some(Overlay::Issues(view)) = &mut app.overlay else {
+        return;
+    };
+    let Some(editor) = &mut view.editor else {
+        return;
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let mut save = false;
+    match key.code {
+        KeyCode::Esc => view.editor = None,
+        _ if editor.saving => {}
+        KeyCode::Tab | KeyCode::BackTab => editor.field = editor.field.next(),
+        KeyCode::Down => editor.field = EditField::Body,
+        KeyCode::Up => editor.field = EditField::Title,
+        // A hard line in the description, as in the task editor; asked
+        // for on the title, which has no second line, it steps down into
+        // the description rather than saving under the user.
+        KeyCode::Char('j') if ctrl => editor.newline(),
+        KeyCode::Enter if shift => editor.newline(),
+        KeyCode::Enter => save = true,
+        _ => {
+            if editor.field_mut().handle_key(&key).changed() {
+                editor.notice = None;
+            }
+        }
+    }
+    if save {
+        save_editor(app);
+    }
+    app.dirty = true;
+}
+
+/// A bracketed paste while the editor is up lands in the field under the
+/// caret — lines kept in the description, flattened in the title. False
+/// when nothing is typing, so the paste falls through as before.
+pub(crate) fn paste(view: &mut IssuesView, text: &str) -> bool {
+    let Some(editor) = &mut view.editor else {
+        return false;
+    };
+    if editor.saving {
+        return true;
+    }
+    editor.notice = None;
+    match editor.field {
+        EditField::Title => editor.title.insert_str(text),
+        EditField::Body => editor.body.insert_multiline_str(text),
+    }
+    true
+}
+
+/// The footer's key line for the modal: the form's keys while it is up,
+/// the reader's otherwise.
+pub(crate) fn footer_hint(view: &IssuesView) -> &'static str {
+    if view.editor.is_some() {
+        "Tab/↑↓: field  ⇧Enter/^J: newline  Enter: save to GitHub  Esc: cancel edit"
+    } else {
+        "↑/↓: issue  PgUp/PgDn ^d/^u: read  Enter/p: prompt an agent  e: preset  E: edit  c: comment  o: browser  r: refresh  Esc: close"
+    }
 }
 
 // ---- launching ----
@@ -630,8 +1304,13 @@ fn open_preset_for_selected(app: &mut App) {
 
 // ---- keys and mouse ----
 
-/// Keys in the ISSUES MODAL.
+/// Keys in the ISSUES MODAL. While the editor is up they are all its
+/// ([`handle_editor_key`]).
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
+    if matches!(&app.overlay, Some(Overlay::Issues(v)) if v.editor.is_some()) {
+        handle_editor_key(app, key);
+        return;
+    }
     let Some(Overlay::Issues(view)) = &mut app.overlay else {
         return;
     };
@@ -658,7 +1337,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Home => view.scroll = 0,
         KeyCode::End => view.scroll = view.max_scroll(),
         KeyCode::Enter | KeyCode::Char('p') => open_prompt_for_selected(app),
+        // `E` in most terminals, a shifted `e` under the kitty protocol.
+        KeyCode::Char('E') => open_editor(app),
+        KeyCode::Char('e') if shift => open_editor(app),
         KeyCode::Char('e') => open_preset_for_selected(app),
+        KeyCode::Char('c') => open_comment_for_selected(app),
         KeyCode::Char('o') => {
             if let Some((issue, _)) = selected_issue(app) {
                 if !crate::event_loop::open_url(&issue.url) {
@@ -676,7 +1359,25 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
 /// scrolls the reading pane over it, a click on a row selects it (a launch
 /// is `Enter`, not a click — the row is something to read first), and a
 /// click outside closes (`overlay_close`); everything else is swallowed.
+/// While the editor is up a click moves the caret between its two fields
+/// and nothing else — the list and the wheel would drop the draft under
+/// the user; Esc is the way out.
 pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent, mouse_pos: Position) {
+    if let Some(Overlay::Issues(IssuesView {
+        editor: Some(editor),
+        ..
+    })) = &mut app.overlay
+    {
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            if editor.title_area.contains(mouse_pos) {
+                editor.field = EditField::Title;
+            } else if editor.body_area.contains(mouse_pos) {
+                editor.field = EditField::Body;
+            }
+        }
+        app.dirty = true;
+        return;
+    }
     let Some(Overlay::Issues(view)) = &mut app.overlay else {
         return;
     };
@@ -703,11 +1404,13 @@ pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent, mouse_pos: Position
 // ---- drawing ----
 
 /// The reading pane as styled lines: headline, state row, description,
-/// then the conversation once it has landed.
+/// then the conversation once it has landed — and, while a comment of
+/// yours is on its way to it, a line saying so.
 pub fn lines(
     issue: &Issue,
     detail: Option<&IssueDetail>,
     comments_failed: bool,
+    posting: bool,
     width: usize,
     th: Theme,
 ) -> Vec<Line<'static>> {
@@ -758,9 +1461,10 @@ pub fn lines(
             dim,
         )));
     } else {
-        for row in wrap(issue.body.trim_end(), body_w) {
-            out.push(Line::from(Span::styled(format!("{INDENT}{row}"), muted)));
-        }
+        out.extend(markdown::indent(
+            markdown::render(issue.body.trim_end(), body_w, Breaks::Hard, muted, th),
+            INDENT,
+        ));
     }
 
     out.push(Line::from(""));
@@ -794,9 +1498,16 @@ pub fn lines(
                     head.push(Span::styled(format!(" · {at}"), dim));
                 }
                 out.push(fit(head, width));
-                for row in wrap(c.body.trim_end(), body_w.saturating_sub(2)) {
-                    out.push(Line::from(Span::styled(format!("{INDENT}  {row}"), muted)));
-                }
+                out.extend(markdown::indent(
+                    markdown::render(
+                        c.body.trim_end(),
+                        body_w.saturating_sub(2),
+                        Breaks::Hard,
+                        muted,
+                        th,
+                    ),
+                    &format!("{INDENT}  "),
+                ));
             }
         }
         None if comments_failed => {
@@ -811,6 +1522,13 @@ pub fn lines(
                 dim,
             )));
         }
+    }
+    if posting {
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled(
+            format!("{INDENT}── posting your comment… ──"),
+            dim,
+        )));
     }
     out
 }
@@ -844,9 +1562,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
         rows.len(),
         if inflight { ", refreshing…" } else { "" }
     );
-    let block = panel_block(&title, true, th).title_bottom(
+    let block = panel_block(&title, view.editor.is_none(), th).title_bottom(
         Line::from(Span::styled(
-            " Enter/p: prompt  e: preset  o: browser  r: refresh ",
+            " Enter/p: prompt  e: preset  E: edit  c: comment  o: browser  r: refresh ",
             Style::default().fg(th.dim),
         ))
         .left_aligned(),
@@ -888,7 +1606,22 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
             spans.push(Span::raw(" ".repeat(budget - used - opened_w)));
             spans.push(Span::styled(opened, Style::default().fg(th.dim)));
         }
-        render_row(f, row_area, spans, i == selected, true, th);
+        render_row(f, row_area, spans, i == selected, view.editor.is_none(), th);
+    }
+
+    // ---- right: the editor, while it is up ----
+    if let Some(editor) = &view.editor {
+        let (title_area, body_area) = draw_editor(f, body_a, editor, th);
+        if let Some(Overlay::Issues(v)) = &mut app.overlay {
+            v.area = area;
+            v.list_area = list_inner;
+            v.selected = selected;
+            if let Some(e) = &mut v.editor {
+                e.title_area = title_area;
+                e.body_area = body_area;
+            }
+        }
+        return;
     }
 
     // ---- right: the reading pane ----
@@ -903,6 +1636,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
             issue,
             app.issue_detail.get(&issue.url),
             app.issue_detail_failed.contains(&issue.url),
+            app.issue_comment_inflight.contains(&issue.url),
             body_a.width.saturating_sub(2) as usize,
             th,
         ),
@@ -936,6 +1670,97 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
         v.selected = selected;
         v.scroll = scroll;
     }
+}
+
+/// The reading pane as the form: the title on the first row, the
+/// description in a box under it, the frame's foot saying what Enter will
+/// do — or why the last one did nothing, or that GitHub is being asked.
+/// Returns the title row and the description box for click-to-focus.
+fn draw_editor(f: &mut Frame, area: Rect, editor: &IssueEditor, th: Theme) -> (Rect, Rect) {
+    let title = format!("Edit issue #{}", editor.number);
+    let (foot, style) = match (&editor.notice, editor.saving) {
+        (Some(notice), _) => (format!(" {notice} "), Style::default().fg(th.err)),
+        (None, true) => (" saving… ".to_string(), Style::default().fg(th.warn)),
+        (None, false) if area.width >= 60 => (
+            " Tab: field  ⇧Enter: newline  Enter: save  Esc: cancel ".to_string(),
+            Style::default().fg(th.dim),
+        ),
+        (None, false) => (
+            " Enter: save  Esc: cancel ".to_string(),
+            Style::default().fg(th.dim),
+        ),
+    };
+    let block = panel_block(&title, true, th)
+        .title_bottom(Line::from(Span::styled(foot, style)).left_aligned());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Row 0: the title, a one-line field.
+    let mut title_area = Rect::default();
+    if let Some(row) = row_rect(inner, 0) {
+        title_area = row;
+        let focused = editor.field == EditField::Title;
+        let label = format!("{INDENT}Title  ");
+        let label_style = if focused {
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.muted)
+        };
+        let budget = (row.width as usize).saturating_sub(label.chars().count() + 1);
+        let mut spans = vec![Span::styled(label, label_style)];
+        if focused {
+            spans.extend(input_spans(&editor.title, budget, th.accent, th));
+        } else if editor.title.trim().is_empty() {
+            spans.push(Span::styled("(required)", Style::default().fg(th.dim)));
+        } else {
+            spans.push(Span::raw(truncate(editor.title.as_str(), budget)));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), row);
+    }
+
+    // The description box, taking the rest of the pane.
+    let box_area = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(1),
+        width: inner.width,
+        height: inner.height.saturating_sub(1),
+    };
+    let mut body_area = Rect::default();
+    if box_area.height >= 3 && box_area.width >= 4 {
+        body_area = box_area;
+        let focused = editor.field == EditField::Body;
+        let border = if focused { th.accent } else { th.dim };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border))
+            .title(Span::styled(" Description ", Style::default().fg(border)));
+        let box_inner = block.inner(box_area);
+        f.render_widget(block, box_area);
+        if focused {
+            let (lines, caret_row) =
+                multiline_input_lines(&editor.body, box_inner.width as usize, th.accent, th);
+            let visible = box_inner.height.max(1) as usize;
+            let max_start = lines.len().saturating_sub(visible);
+            let start = caret_row.saturating_sub(visible / 2).min(max_start);
+            let shown: Vec<Line> = lines.into_iter().skip(start).take(visible).collect();
+            f.render_widget(Paragraph::new(shown), box_inner);
+        } else if editor.body.trim().is_empty() {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "(no description)",
+                    Style::default().fg(th.dim),
+                )),
+                box_inner,
+            );
+        } else {
+            f.render_widget(
+                Paragraph::new(editor.body.as_str().to_string()).wrap(Wrap { trim: false }),
+                box_inner,
+            );
+        }
+    }
+    (title_area, body_area)
 }
 
 #[cfg(test)]
@@ -1038,7 +1863,7 @@ mod tests {
     #[test]
     fn the_pane_leads_with_the_headline_then_body_then_comments() {
         let i = issue(15, "Fix login redirect");
-        let waiting = text(&lines(&i, None, false, 60, Theme::default()));
+        let waiting = text(&lines(&i, None, false, false, 60, Theme::default()));
         assert!(waiting.starts_with(" #15 Fix login redirect"), "{waiting}");
         assert!(
             waiting.contains("open · webdevcody · 2026-09-10"),
@@ -1048,7 +1873,7 @@ mod tests {
         assert!(waiting.contains("Login bounces back to /."), "{waiting}");
         assert!(waiting.contains("reading the comments…"), "{waiting}");
 
-        let failed = text(&lines(&i, None, true, 60, Theme::default()));
+        let failed = text(&lines(&i, None, true, false, 60, Theme::default()));
         assert!(failed.contains("couldn't read the comments"), "{failed}");
 
         let detail = IssueDetail {
@@ -1059,7 +1884,14 @@ mod tests {
                 body: "same here".into(),
             }],
         };
-        let read = text(&lines(&i, Some(&detail), false, 60, Theme::default()));
+        let read = text(&lines(
+            &i,
+            Some(&detail),
+            false,
+            false,
+            60,
+            Theme::default(),
+        ));
         assert!(read.contains("── 1 comment ──"), "{read}");
         assert!(read.contains("kate · 2026-09-11"), "{read}");
         assert!(read.contains("same here"), "{read}");
@@ -1067,8 +1899,225 @@ mod tests {
             url: i.url.clone(),
             comments: vec![],
         };
-        let none = text(&lines(&i, Some(&quiet), false, 60, Theme::default()));
+        let none = text(&lines(&i, Some(&quiet), false, false, 60, Theme::default()));
         assert!(none.contains("── no comments ──"), "{none}");
+    }
+
+    /// The body reaches `gh` whole, down stdin — `--body-file -`, so a
+    /// comment longer than a pipe buffer, or one opening with `-`, arrives
+    /// as typed — and a `gh` that quits without reading it (bad auth) is a
+    /// clean "couldn't post", not a write stuck on a closed pipe. So is a
+    /// `gh` that isn't there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_comment_body_goes_down_stdin_and_a_refusal_is_a_miss() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, sh: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{sh}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let records = script(
+            "gh",
+            "printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args\"\ncat > \"$(dirname \"$0\")/body\"",
+        );
+        let body = format!("-- starts like a flag\n{}", "x".repeat(200_000));
+        assert!(comment_via(&records, dir.path(), 15, &body).await);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("args")).unwrap(),
+            "issue\ncomment\n15\n--body-file\n-\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("body")).unwrap(),
+            body
+        );
+
+        let refuses = script("gh-refuses", "exit 1");
+        assert!(!comment_via(&refuses, dir.path(), 15, &body).await);
+        let missing = dir.path().join("gh-missing");
+        assert!(!comment_via(&missing, dir.path(), 15, "hi").await);
+    }
+
+    /// While a comment of yours is on its way the pane says so, under
+    /// whatever the conversation shows.
+    #[test]
+    fn the_pane_says_when_a_comment_is_posting() {
+        let i = issue(15, "Fix login redirect");
+        let quiet = IssueDetail {
+            url: i.url.clone(),
+            comments: vec![],
+        };
+        let posting = text(&lines(&i, Some(&quiet), false, true, 60, Theme::default()));
+        assert!(posting.contains("── no comments ──"), "{posting}");
+        assert!(
+            posting.ends_with("── posting your comment… ──"),
+            "{posting}"
+        );
+        let idle = text(&lines(&i, Some(&quiet), false, false, 60, Theme::default()));
+        assert!(!idle.contains("posting"), "{idle}");
+    }
+
+    /// `c` opens the comment box for the issue under the cursor, carrying
+    /// the modal so Esc and Enter can put it back on the row; with no rows
+    /// it says so and stays.
+    #[test]
+    fn c_opens_the_comment_box_for_the_selected_issue() {
+        let mut app = App::new();
+        let project = ProjectId("p1".into());
+        app.overlay = Some(Overlay::Issues(IssuesView::new(
+            project.clone(),
+            "demo".into(),
+            "/tmp/demo".into(),
+        )));
+        let c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        handle_key(&mut app, c);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Issues(_))),
+            "no rows: the modal stays"
+        );
+        assert_eq!(app.flash.as_deref(), Some("no issue selected"));
+        land_answer(
+            &mut app,
+            IssuesAnswer::List {
+                project: project.clone(),
+                list: Some(vec![issue(15, "a"), issue(14, "Fix login redirect")]),
+            },
+        );
+        select(&mut app, 1);
+        handle_key(&mut app, c);
+        let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+            panic!("c should open the comment box, got {:?}", app.overlay);
+        };
+        assert!(prompt.is_multiline(), "a comment is rarely one line");
+        assert_eq!(prompt.title, "Comment on issue #14 · Fix login redirect");
+        assert!(
+            prompt.label.contains("gh issue comment"),
+            "{}",
+            prompt.label
+        );
+        let crate::app::PromptKind::IssueComment { view, issue } = &prompt.kind else {
+            panic!("{:?}", prompt.kind);
+        };
+        assert_eq!(view.selected, 1, "the row the box came from");
+        assert_eq!(issue.number, 14);
+    }
+
+    /// Enter posts off the loop and puts the modal back on its row; a
+    /// checkout that isn't on disk can't run `gh`, so the box comes back
+    /// with the text instead of losing it.
+    #[test]
+    fn posting_puts_the_modal_back_and_a_missing_checkout_returns_the_box() {
+        let mut app = App::new();
+        let project = ProjectId("p1".into());
+        land_answer(
+            &mut app,
+            IssuesAnswer::List {
+                project: project.clone(),
+                list: Some(vec![issue(15, "a"), issue(14, "b")]),
+            },
+        );
+        let mut view = IssuesView::new(project.clone(), "demo".into(), std::env::temp_dir());
+        view.selected = 1;
+        let fourteen = issue(14, "b").launch_ref();
+        post_comment(&mut app, view.clone(), fourteen.clone(), "lgtm".into());
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Issues(v)) if v.selected == 1),
+            "the modal is back on its row: {:?}",
+            app.overlay
+        );
+        // No sender installed: nothing was posted, nothing is in flight.
+        assert!(app.issue_comment_inflight.is_empty());
+
+        view.dir = "/nonexistent/nebula-issue-comment".into();
+        post_comment(&mut app, view, fourteen, "lgtm".into());
+        let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+            panic!("the box should come back, got {:?}", app.overlay);
+        };
+        assert_eq!(prompt.input.as_str(), "lgtm");
+        assert!(matches!(
+            prompt.kind,
+            crate::app::PromptKind::IssueComment { .. }
+        ));
+        assert!(
+            app.flash.as_deref().unwrap().contains("isn't on disk"),
+            "{:?}",
+            app.flash
+        );
+    }
+
+    /// A posted comment forgets the conversation the pane had — one
+    /// comment short now — so the row reads it again; a refused post
+    /// brings the box back with the text, unless something else is up.
+    #[test]
+    fn a_comment_answer_rereads_the_conversation_or_brings_the_box_back() {
+        let mut app = App::new();
+        let project = ProjectId("p1".into());
+        let view = IssuesView::new(project.clone(), "demo".into(), "/tmp/demo".into());
+        app.overlay = Some(Overlay::Issues(view.clone()));
+        land_answer(
+            &mut app,
+            IssuesAnswer::List {
+                project: project.clone(),
+                list: Some(vec![issue(15, "a")]),
+            },
+        );
+        let fifteen = issue(15, "a");
+        land_answer(
+            &mut app,
+            IssuesAnswer::Detail {
+                url: fifteen.url.clone(),
+                detail: Some(IssueDetail {
+                    url: fifteen.url.clone(),
+                    comments: vec![],
+                }),
+            },
+        );
+        app.pending_issue_detail = None;
+        let answer = |posted: bool| IssuesAnswer::Comment {
+            view: view.clone(),
+            issue: fifteen.launch_ref(),
+            text: "lgtm".into(),
+            posted,
+        };
+
+        app.issue_comment_inflight.insert(fifteen.url.clone());
+        land_answer(&mut app, answer(true));
+        assert!(!app.issue_comment_inflight.contains(&fifteen.url));
+        assert!(
+            !app.issue_detail.contains_key(&fifteen.url),
+            "the conversation is one comment short: forgotten"
+        );
+        assert!(
+            app.pending_issue_detail.is_some(),
+            "…and asked for again as the cursor rests"
+        );
+        assert_eq!(app.flash.as_deref(), Some("comment posted on #15"));
+        assert!(matches!(&app.overlay, Some(Overlay::Issues(_))));
+
+        app.issue_comment_inflight.insert(fifteen.url.clone());
+        land_answer(&mut app, answer(false));
+        assert!(!app.issue_comment_inflight.contains(&fifteen.url));
+        let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+            panic!("a refused post brings the box back, got {:?}", app.overlay);
+        };
+        assert_eq!(prompt.input.as_str(), "lgtm");
+        assert!(matches!(
+            prompt.kind,
+            crate::app::PromptKind::IssueComment { .. }
+        ));
+        assert!(
+            app.flash.as_deref().unwrap().contains("couldn't post"),
+            "{:?}",
+            app.flash
+        );
+
+        // Something else up over the modal: the flash says, the box stays away.
+        app.overlay = Some(Overlay::Help(Default::default()));
+        land_answer(&mut app, answer(false));
+        assert!(matches!(&app.overlay, Some(Overlay::Help(_))));
+        assert!(app.flash.as_deref().unwrap().contains("couldn't post"));
     }
 
     #[test]
@@ -1090,7 +2139,7 @@ mod tests {
             }],
         };
         for w in [24usize, 40, 80] {
-            for line in lines(&i, Some(&detail), false, w, Theme::default()) {
+            for line in lines(&i, Some(&detail), false, false, w, Theme::default()) {
                 let len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
                 assert!(len <= w, "width {w}: {len} cols in {line:?}");
             }
@@ -1149,6 +2198,115 @@ mod tests {
         assert!(app.issues_failed.contains(&other));
     }
 
+    fn seed_project(app: &mut App, id: &str, dir: &str) -> ProjectId {
+        let project = ProjectId(id.into());
+        app.tree.projects.push(nebula_core::Project {
+            id: project.clone(),
+            name: id.into(),
+            workspace_id: Default::default(),
+            repo_path: dir.into(),
+            sort_order: 0,
+        });
+        project
+    }
+
+    /// Landing on a project arms the debounced prefetch for it, and firing
+    /// it asks: a checkout that isn't on disk is a miss noted without a
+    /// process, and the beat that miss arms keeps the tick from asking
+    /// again at once.
+    #[test]
+    fn the_prefetch_arms_for_the_selected_project_and_fires_once() {
+        let mut app = App::new();
+        let project = seed_project(&mut app, "p1", "/nonexistent/nebula-issues-prefetch");
+        assert!(prefetch_due(&app, &project), "never asked: due");
+        schedule_prefetch(&mut app);
+        let (armed, _) = app.pending_issues_prefetch.clone().expect("armed");
+        assert_eq!(armed, project);
+        assert!(app.issues_prefetch_delay().is_some());
+        fire_prefetch(&mut app);
+        assert!(
+            app.pending_issues_prefetch.is_none(),
+            "fires once, then disarms"
+        );
+        assert!(
+            app.issues_failed.contains(&project),
+            "not on disk: a miss without a process"
+        );
+        assert!(!prefetch_due(&app, &project), "the miss armed the backoff");
+        assert_eq!(app.issues_due[&project].backoff, Some(RECHECK_MIN));
+        // The tick asks nothing while the beat holds.
+        app.issues_failed.clear();
+        refresh_selected(&mut app);
+        assert!(app.issues_failed.is_empty());
+        // An empty workspace arms nothing.
+        let mut empty = App::new();
+        schedule_prefetch(&mut empty);
+        assert!(empty.pending_issues_prefetch.is_none());
+        assert!(empty.issues_prefetch_delay().is_none());
+    }
+
+    /// The beat: a list with rows settles on `REFRESH`, an empty or failed
+    /// answer backs off by doubling to the ceiling, and rows again reset
+    /// it — and nothing is due while an answer is in flight.
+    #[test]
+    fn the_beat_settles_on_refresh_and_backs_off_while_empty() {
+        let mut app = App::new();
+        let project = ProjectId("p1".into());
+        fn land(app: &mut App, project: &ProjectId, list: Option<Vec<Issue>>) {
+            app.issues_inflight.insert(project.clone());
+            land_answer(
+                app,
+                IssuesAnswer::List {
+                    project: project.clone(),
+                    list,
+                },
+            );
+        }
+        let before = std::time::Instant::now();
+        land(&mut app, &project, Some(vec![issue(15, "a")]));
+        let beat = app.issues_due[&project];
+        assert_eq!(beat.backoff, None);
+        assert!(beat.due >= before + REFRESH, "steady beat");
+        assert!(!prefetch_due(&app, &project));
+
+        land(&mut app, &project, Some(vec![]));
+        assert_eq!(app.issues_due[&project].backoff, Some(RECHECK_MIN));
+        land(&mut app, &project, None);
+        assert_eq!(app.issues_due[&project].backoff, Some(RECHECK_MIN * 2));
+        for _ in 0..10 {
+            land(&mut app, &project, None);
+        }
+        assert_eq!(app.issues_due[&project].backoff, Some(RECHECK_MAX));
+        land(&mut app, &project, Some(vec![issue(15, "a")]));
+        assert_eq!(app.issues_due[&project].backoff, None);
+
+        app.issues_due.get_mut(&project).unwrap().due = std::time::Instant::now();
+        assert!(prefetch_due(&app, &project), "the timer ran out");
+        app.issues_inflight.insert(project.clone());
+        assert!(!prefetch_due(&app, &project), "never while in flight");
+    }
+
+    /// The modal opens on a list that landed within `FRESH` without asking
+    /// again; an older one is re-asked while its rows paint.
+    #[test]
+    fn a_list_that_just_landed_is_fresh_and_an_old_one_is_not() {
+        let mut app = App::new();
+        let project = ProjectId("p1".into());
+        assert!(!is_fresh(&app, &project), "nothing landed");
+        land_answer(
+            &mut app,
+            IssuesAnswer::List {
+                project: project.clone(),
+                list: Some(vec![]),
+            },
+        );
+        assert!(is_fresh(&app, &project), "an empty answer is an answer");
+        app.issues.get_mut(&project).unwrap().at = std::time::Instant::now()
+            .checked_sub(FRESH + std::time::Duration::from_secs(1))
+            .expect("the clock has run longer than FRESH");
+        assert!(!is_fresh(&app, &project));
+    }
+
     /// Comments land keyed by URL, and a miss is remembered so the pane
     /// says so instead of re-asking on every turn.
     #[test]
@@ -1176,5 +2334,326 @@ mod tests {
             },
         );
         assert!(app.issue_detail.contains_key(&url));
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    fn modal_with(rows: Vec<Issue>) -> (App, ProjectId) {
+        let mut app = App::new();
+        let project = ProjectId("p1".into());
+        app.overlay = Some(Overlay::Issues(IssuesView::new(
+            project.clone(),
+            "demo".into(),
+            "/tmp/demo".into(),
+        )));
+        land_answer(
+            &mut app,
+            IssuesAnswer::List {
+                project: project.clone(),
+                list: Some(rows),
+            },
+        );
+        (app, project)
+    }
+
+    fn editor(app: &App) -> Option<&IssueEditor> {
+        match &app.overlay {
+            Some(Overlay::Issues(v)) => v.editor.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn editor_mut(app: &mut App) -> &mut IssueEditor {
+        match &mut app.overlay {
+            Some(Overlay::Issues(v)) => v.editor.as_deref_mut().expect("editing"),
+            other => panic!("no issues modal: {other:?}"),
+        }
+    }
+
+    /// `E` turns the pane into a form prefilled from the row, caret on
+    /// the title; Esc puts the pane back with the draft dropped and the
+    /// modal still up. An empty list has nothing to edit.
+    #[test]
+    fn shift_e_opens_the_editor_on_the_row_and_esc_drops_the_draft() {
+        let (mut app, project) = modal_with(vec![issue(15, "Fix login redirect")]);
+        handle_key(&mut app, key(KeyCode::Char('E'), KeyModifiers::SHIFT));
+        let e = editor(&app).expect("editing");
+        assert_eq!(e.title.as_str(), "Fix login redirect");
+        assert_eq!(e.body.as_str(), "Login bounces back to /.");
+        assert_eq!(e.field, EditField::Title);
+        assert!(!e.is_changed());
+        handle_key(&mut app, key(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert!(editor(&app).unwrap().is_changed());
+        handle_key(&mut app, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(editor(&app).is_none(), "back to the reading pane");
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Issues(_))),
+            "the modal stays up"
+        );
+        assert_eq!(
+            app.issues[&project].list[0].title, "Fix login redirect",
+            "nothing sent"
+        );
+        // A shifted `e` under the kitty protocol is the same key; a plain
+        // one is still the preset picker, not the editor.
+        handle_key(&mut app, key(KeyCode::Char('e'), KeyModifiers::SHIFT));
+        assert!(editor(&app).is_some());
+        let (mut empty, _) = modal_with(vec![]);
+        handle_key(&mut empty, key(KeyCode::Char('E'), KeyModifiers::SHIFT));
+        assert!(editor(&empty).is_none());
+        assert_eq!(empty.flash.as_deref(), Some("no issue selected"));
+    }
+
+    /// Tab and ↑/↓ move the caret between the two fields, Shift+Enter and
+    /// Ctrl+J break a line in the description — and step into it from the
+    /// title, which has no second line — and a paste keeps its lines in
+    /// the description while the title flattens them.
+    #[test]
+    fn the_editor_fields_take_the_form_keys() {
+        let (mut app, _) = modal_with(vec![issue(15, "Fix login redirect")]);
+        handle_key(&mut app, key(KeyCode::Char('E'), KeyModifiers::SHIFT));
+        handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::SHIFT));
+        let e = editor(&app).expect("a line break on the title is not a save");
+        assert_eq!(e.title.as_str(), "Fix login redirect", "no line in a title");
+        assert_eq!(e.field, EditField::Body, "it steps into the description");
+        handle_key(&mut app, key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(editor(&app).unwrap().field, EditField::Title);
+        handle_key(&mut app, key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(editor(&app).unwrap().field, EditField::Body);
+        handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::SHIFT));
+        handle_key(&mut app, key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert_eq!(
+            editor(&app).unwrap().body.as_str(),
+            "Login bounces back to /.\n\n"
+        );
+        handle_key(&mut app, key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(editor(&app).unwrap().field, EditField::Title);
+        handle_key(&mut app, key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(editor(&app).unwrap().field, EditField::Body);
+        handle_key(&mut app, key(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(editor(&app).unwrap().field, EditField::Title);
+
+        let Some(Overlay::Issues(view)) = &mut app.overlay else {
+            unreachable!()
+        };
+        assert!(paste(view, "a\nb"));
+        assert_eq!(
+            view.editor.as_ref().unwrap().title.as_str(),
+            "Fix login redirecta b"
+        );
+        view.editor.as_mut().unwrap().field = EditField::Body;
+        assert!(paste(view, "c\r\nd"));
+        assert!(view.editor.as_ref().unwrap().body.ends_with("c\nd"));
+        view.editor = None;
+        assert!(!paste(view, "x"), "nothing typing: the paste falls through");
+    }
+
+    /// Enter refuses a blank title on the spot, closes an unchanged form
+    /// without a call, and — without the loop's sender — leaves a changed
+    /// one where it is.
+    #[test]
+    fn enter_validates_before_it_saves() {
+        let (mut app, _) = modal_with(vec![issue(15, "Fix login redirect")]);
+        handle_key(&mut app, key(KeyCode::Char('E'), KeyModifiers::SHIFT));
+        handle_key(&mut app, key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(editor(&app).unwrap().title.as_str(), "");
+        handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::NONE));
+        let e = editor(&app).expect("refused, still editing");
+        assert_eq!(e.notice.as_deref(), Some("the issue needs a title"));
+        assert!(!e.saving);
+        // Typing clears the notice.
+        handle_key(&mut app, key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(editor(&app).unwrap().notice.is_none());
+        // Back to the original text: nothing to send.
+        editor_mut(&mut app).title.set_text("Fix login redirect");
+        handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(editor(&app).is_none(), "an unchanged form just closes");
+        assert_eq!(app.flash.as_deref(), Some("issue unchanged"));
+        // A changed one with no sender installed stays put, unsent.
+        handle_key(&mut app, key(KeyCode::Char('E'), KeyModifiers::SHIFT));
+        handle_key(&mut app, key(KeyCode::Char('!'), KeyModifiers::NONE));
+        handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::NONE));
+        let e = editor(&app).expect("still editing");
+        assert!(!e.saving);
+        assert_eq!(e.title.as_str(), "Fix login redirect!");
+    }
+
+    /// A save that GitHub took lands on the row and closes the form; one
+    /// it refused keeps the form and its text, with the reason on it. A
+    /// form opened since the send is not the one the answer is for.
+    #[test]
+    fn an_edit_landing_updates_the_row_or_keeps_the_form() {
+        let (mut app, project) = modal_with(vec![issue(15, "Fix login redirect")]);
+        let url = "https://github.com/o/r/issues/15".to_string();
+        handle_key(&mut app, key(KeyCode::Char('E'), KeyModifiers::SHIFT));
+        let e = editor_mut(&mut app);
+        e.title.set_text("Fix the login redirect");
+        e.saving = true;
+        // Keys wait on the answer; Esc would not.
+        handle_key(&mut app, key(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert_eq!(
+            editor(&app).unwrap().title.as_str(),
+            "Fix the login redirect"
+        );
+        land_answer(
+            &mut app,
+            IssuesAnswer::Edited {
+                project: project.clone(),
+                url: url.clone(),
+                number: 15,
+                outcome: Err("HTTP 403: forbidden".into()),
+            },
+        );
+        let e = editor(&app).expect("the form stays");
+        assert!(!e.saving);
+        assert_eq!(e.notice.as_deref(), Some("HTTP 403: forbidden"));
+        assert_eq!(
+            e.title.as_str(),
+            "Fix the login redirect",
+            "the text is kept"
+        );
+        assert_eq!(app.issues[&project].list[0].title, "Fix login redirect");
+
+        editor_mut(&mut app).saving = true;
+        land_answer(
+            &mut app,
+            IssuesAnswer::Edited {
+                project: project.clone(),
+                url: url.clone(),
+                number: 15,
+                outcome: Ok(IssueText {
+                    title: "Fix the login redirect".into(),
+                    body: "Bounces to /.".into(),
+                }),
+            },
+        );
+        assert!(editor(&app).is_none(), "saved: the reading pane is back");
+        let row = &app.issues[&project].list[0];
+        assert_eq!(row.title, "Fix the login redirect");
+        assert_eq!(row.body, "Bounces to /.");
+        assert_eq!(app.flash.as_deref(), Some("issue #15 updated"));
+
+        // A form reopened meanwhile is left alone by a late answer.
+        handle_key(&mut app, key(KeyCode::Char('E'), KeyModifiers::SHIFT));
+        land_answer(
+            &mut app,
+            IssuesAnswer::Edited {
+                project: project.clone(),
+                url,
+                number: 15,
+                outcome: Err("late".into()),
+            },
+        );
+        let e = editor(&app).expect("still editing");
+        assert!(e.notice.is_none());
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("couldn't update issue #15: late")
+        );
+    }
+
+    /// The title rides argv as one `--title=` token and the description
+    /// goes down stdin, however long and whatever it starts with; `gh`'s
+    /// first stderr line is the refusal's reason, a silent one gets a
+    /// stock reason, and a `gh` that isn't there says so.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_edit_sends_the_title_on_argv_and_the_body_down_stdin() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, sh: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{sh}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let records = script(
+            "gh",
+            "printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args\"\ncat > \"$(dirname \"$0\")/body\"",
+        );
+        let text = IssueText {
+            title: "-- starts like a flag".into(),
+            body: format!("-- so does this\n{}", "x".repeat(200_000)),
+        };
+        assert_eq!(edit_via(&records, dir.path(), 15, &text).await, Ok(()));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("args")).unwrap(),
+            "issue\nedit\n15\n--title=-- starts like a flag\n--body-file\n-\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("body")).unwrap(),
+            text.body
+        );
+
+        let refuses = script(
+            "gh-refuses",
+            "echo >&2\necho '  GraphQL: Resource not accessible' >&2\nexit 1",
+        );
+        assert_eq!(
+            edit_via(&refuses, dir.path(), 15, &text).await,
+            Err("GraphQL: Resource not accessible".into())
+        );
+        let silent = script("gh-silent", "exit 1");
+        assert_eq!(
+            edit_via(&silent, dir.path(), 15, &text).await,
+            Err("gh refused the edit".into())
+        );
+        let missing = dir.path().join("gh-missing");
+        let why = edit_via(&missing, dir.path(), 15, &text).await.unwrap_err();
+        assert!(why.starts_with("couldn't run gh"), "{why}");
+    }
+
+    fn screen(app: &mut App, w: u16, h: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| {
+            let Some(Overlay::Issues(v)) = app.overlay.clone() else {
+                panic!("no issues modal");
+            };
+            draw(f, app, &v, app.theme);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The form paints in the reading pane's place — the list still on
+    /// the left — and the frame's foot carries the keys, the in-flight
+    /// state, or the notice.
+    #[test]
+    fn the_editor_paints_in_the_reading_pane() {
+        let (mut app, _) = modal_with(vec![issue(15, "Fix login redirect")]);
+        let read = screen(&mut app, 100, 30);
+        assert!(read.contains("Issue #15"), "{read}");
+        assert!(!read.contains("Edit issue"), "{read}");
+        handle_key(&mut app, key(KeyCode::Char('E'), KeyModifiers::SHIFT));
+        let form = screen(&mut app, 100, 30);
+        assert!(form.contains("Edit issue #15"), "{form}");
+        assert!(form.contains("Title  Fix login redirect"), "{form}");
+        assert!(form.contains(" Description "), "{form}");
+        assert!(form.contains("Login bounces back to /."), "{form}");
+        assert!(form.contains("#15 Fix login"), "the list stays: {form}");
+        assert!(form.contains("Enter: save"), "{form}");
+        let e = editor(&app).unwrap();
+        assert!(
+            e.title_area.width > 0 && e.body_area.height > 0,
+            "rects written back"
+        );
+        editor_mut(&mut app).saving = true;
+        assert!(screen(&mut app, 100, 30).contains("saving…"));
+        let e = editor_mut(&mut app);
+        e.saving = false;
+        e.notice = Some("the issue needs a title".into());
+        assert!(screen(&mut app, 100, 30).contains("the issue needs a title"));
     }
 }

@@ -183,6 +183,14 @@ pub enum ClientRequest {
         /// The pull request's head branch (`gh`'s `headRefName`): the
         /// branch the PR SESSION's worktree is checked out on.
         head: String,
+        /// The CLI's positional first prompt — an AGENT PRESET picked on
+        /// the OPEN PRS row composes one, under `CreateAgent`'s rules for
+        /// `starting_prompt`. It rides beside the PR rule, which stays
+        /// Claude's appended system prompt (or the opening of a Codex /
+        /// Cursor cold spawn's first prompt). None: the CLI's own input
+        /// is the first prompt. Request-only, never persisted.
+        #[serde(default)]
+        starting_prompt: Option<String>,
     },
     /// Fire-and-forget: pre-spawn an agent CLI for this (worktree, kind) so
     /// the next CreateAgent adopts an already-booted session. Sent the

@@ -41,13 +41,16 @@ convenience stores: missing or malformed reads as empty.
 
 ## Every setting
 
-Forty-five keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
+Forty-eight keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
 exists only in the file, so it is hand-edit-only. Most rows toggle or cycle on `Enter` / `←` / `→`; a
 *typed* row (`worktree_base_branch`) opens a one-line prompt on `Enter` instead, pre-filled with the
 stored value, and an empty answer puts its default back. The Agents tab groups its rows under **Quick
 prompt**, **Claude**, **Codex**, **Cursor**, **Pi** and **Muse** headers, so a harness's rows read `Enabled` / `Model` /
-`Effort` under its name rather than repeating it. The **Experimental** tab holds behaviors that change
-how the tree is worked; every switch there is off by default.
+`Effort` under its name rather than repeating it. The **Project** tab is the one tab whose rows are
+not nebula's but one project's: the project selected in the PROJECTS PANEL, named with its path on
+the tab's first line, and each row there reads and writes that project's own entry under `projects`
+— so the same row shows a different value on the next project over. The **Experimental** tab holds
+behaviors that change how the tree is worked; every switch there is off by default.
 
 | Key | Type | Default | Overlay | What it does |
 |---|---|---|---|---|
@@ -62,14 +65,16 @@ how the tree is worked; every switch there is off by default.
 | `session_idle_timeout` | string | `"5m"` | Sessions | DAEMON-owned IDLE TIMEOUT: how long a session in a WORKTREE no client is viewing goes unwatched before the IDLE REAPER kills its PTY. See the values below. |
 | `done_sound` | string | `"Glass"` | Sessions | The DONE SOUND rung when a turn reaches FINISHED: `off`, `bell` (the terminal BEL — silent in Ghostty unless its `bell-features` include `audio`), or a macOS system sound from `/System/Library/Sounds` played with `afplay` (`Glass`, `Ping`, `Pop`, `Hero`, …). Over `nebula ssh` and off macOS it is always the bell. |
 | `feedback_sound` | string | `"Sosumi"` | Sessions | The FEEDBACK SOUND rung when a turn stops at NEEDS FEEDBACK — a permission prompt or a question — with the same values and fallbacks as `done_sound`, and a different default so red and green sound different from the next room. It never rings for the session whose pane you are locked into typing at while the terminal window has focus: that prompt is already under your hands. The one switch for the DESKTOP NOTIFICATION too: while the terminal window is in the background (from the focus reports nebula asks the terminal for — tmux needs `focus-events on`), each session that goes red is also named in a desktop notification (`osascript` on macOS, `notify-send` on Linux; never over `nebula ssh`, where the desktop is the wrong machine's; a notifier that is missing or fails is a debug line, not an error). `off` silences the sound and the notification together. |
-| `theme` | string | `"default"` | Appearance | The THEME: `default`, `ocean`, `forest`, `rose`, `amber`. An unknown name falls back to `default`. |
+| `theme` | string | `"default"` | Appearance | The THEME: `default`, `ocean`, `forest`, `rose`, `amber`, `lavender`, `coral`, `slate`, `sand`, `mono`. An unknown name falls back to `default`. |
 | `animations` | bool | `true` | Appearance | Master switch for the STATUS SWEEP and the SPLASH's motion. Off trades them for fewer repaints on a constrained machine. |
 | `focus_tint` | bool | `true` | Appearance | The FOCUSED PANEL TINT: a faint accent wash behind whichever panel keys land in. Off leaves every cell on the terminal's own background, so a transparency or image configured in the terminal shows through the whole window instead of stopping at the focused panel. |
 | `show_workspaces` | bool | `true` | Appearance | Whether the WORKSPACES BAR is drawn across the top. `Shift+W` writes the key as it toggles, so a hidden bar stays hidden across restarts. |
 | `hide_projects` | bool | `false` | Appearance | Hide the PROJECTS PANEL and give its width to the TERMINAL PANE (`Shift+P`). |
 | `hide_worktrees` | bool | `false` | Appearance | Hide the WORKTREES PANEL (`Shift+B`), independently of `hide_projects`. |
+| `hide_sessions` | bool | `false` | Appearance | Hide the SESSIONS PANEL (`Shift+S`), independently of the other two. Whatever this says, the panel folds to a bare rule while the Worktrees cursor rests on a PROJECT OPEN PRS row (a pull request has no sessions to list) and opens again on the next checkout; that fold never writes the key. |
 | `hide_draft_prs` | bool | `false` | Appearance | Leave draft pull requests out of the PROJECT OPEN PRS GROUP and the PALETTE's (`/`) pull-request rows, so browsing what's open shows only the rows asking for a reviewer; the group's header then counts `9/12` — listed over open. A view filter, not a fetch filter: `gh pr list` still fetches the drafts and the PR CACHE still holds them, so `shown` brings them back at once and a draft marked ready joins the rows on the refresh that says so. Worktrees, their sessions and a checkout's own PR ROW in the SESSIONS PANEL are never hidden. The Worktrees panel's right-click menu flips it too (**Hide draft PRs** / **Show draft PRs**). |
-| `hide_root_worktree` | bool | `false` | Experimental | Leave the ROOT WORKTREE row out of the WORKTREES PANEL, so nothing launched from that panel lands in the shared checkout. The root's sessions keep running and stay reachable from the PALETTE (`/`). Not what makes `p` on that panel cut a fresh WORKTREE — a random `<adj>-<noun>-<verb>` branch off the freshly fetched `origin/HEAD`, or the `worktree_base_branch` above, the agent started in it and the cursor moved onto the new row — that is the panel's own behaviour, on or off. |
+| `projects` | object | `{}` | Project | PROJECT SETTINGS: one entry per project set up differently from the rest, keyed by the project's repo path exactly as the DAEMON stores it, holding that project's rows from the **Project** tab. The one row so far is `hide_root_worktree`: leave *that project's* ROOT WORKTREE row out of the WORKTREES PANEL, so nothing launched from the panel lands in its shared checkout — `{"projects": {"/Users/me/src/app": {"hide_root_worktree": true}}}`. The root's sessions keep running and stay reachable from the PALETTE (`/`). Not what makes `p` on that panel cut a fresh WORKTREE — a random `<adj>-<noun>-<verb>` branch off the freshly fetched `origin/HEAD`, or the `worktree_base_branch` above, the agent started in it and the cursor moved onto the new row — that is the panel's own behaviour, on or off. The tab edits the selected project and names it on its first line; with no project in the tree its rows read `n/a`. A project with no entry gets the fallback (`hide_root_worktree` below), and an entry that only repeats the fallback is dropped on save, so the map names only the projects that differ; a key inside an entry this build doesn't know is carried through a save. To the file's rules the map is one key: a value in it this build can't read costs the whole map, not one project. |
+| `hide_root_worktree` | bool | `false` | — | What every project without a `projects` entry gets for **Hide root worktree** — the key the switch lived under while it was one setting for every project (Settings → Experimental, through 0.27). Still read, and written back unchanged, so a file that set it keeps hiding the root in every project until a project's own row says otherwise, and an older build sharing the file still finds its key; no tab edits it any more. |
 | `recent_prompts` | bool | `false` | Experimental | RECENT PROMPTS: list the last few prompts typed into each session under its row in the SESSIONS PANEL — the text the `UserPromptSubmit` hook carried, condensed to one line — oldest first so the bottom line is the latest ask, each with a dim `30m ago` pinned right; a click on any line lands on its session. Every harness reports its prompt (Claude, Codex and Cursor in the hook payload, Pi through its managed extension). Prompts nebula composes itself — a PR SESSION's scope, the note a `nebula worktree` relocation reopens on — are left out, and archived rows list none. Off, the rows are the single pills they always were. See [Sessions](sessions.md#recent-prompts). |
 | `recent_prompts_count` | integer | `3` | Experimental | How many of those prompts to list while `recent_prompts` is on. The overlay cycles `1` to `5`; a hand edit is clamped to the ten the DAEMON keeps per session (`0` reads as `1`, `50` as `10`). |
 | `show_key_combos` | bool | `false` | Experimental | The KEY COMBO DISPLAY: each key pressed in the panels spelled at the bottom left of the screen — the blank row above the FOOTER — with what it did, `j - Move down`, `^d - Half page down`, `h h - Workspaces` for a double tap, so anyone watching a screen share picks the shortcuts up as they are used; vim's `showcmd`. An unbound key shows bare, so a watcher sees it did nothing. Each press replaces the last and clears itself three seconds on. What never shows: keys typed into a LOCKED PANE (they are the agent's — a password at a prompt in there stays off the screen; only the unlock hatch shows, `^q - Unlock terminal input`), and text typed into an overlay's field — inside a modal only `Esc`, `Enter`, `Tab`, the arrows and `^`/`⌥` chords show, bare. See [Keys](keys.md#chips-and-readouts). |
@@ -96,10 +101,10 @@ how the tree is worked; every switch there is off by default.
 | `harnesses` | object | `{}` | Agents | The harness registry: per-harness deltas over the compiled-in known harnesses (Claude, Codex, Cursor, Pi, Muse), and whole new third-party CLIs. The Agents tab grows one section per entry — Enabled, Model, and Effort rows while the harness offers effort — and the `n` picker, `e` presets, spawn, resume and hooks all read the merged rows. A hand edit that breaks one entry refuses its launches with the reason, never the whole file. Run `nebula config harnesses` to print the effective rows to copy from. |
 | `keybindings` | object | `{}` | Hotkeys | KEYMAP overrides, keyed by action id, valued with a comma-separated chord list: `{"git_diff": "ctrl+g, g"}`. An empty string deliberately unbinds; unknown ids are ignored. Only rows that differ from the defaults are written. |
 | `prewarm_agents` | bool | `true` | Sessions | DAEMON-owned PREWARM POOL: keep one booted agent CLI standing by in the selected WORKTREE, so creating a session there adopts it and feels instant. **Costs one idle CLI process per warm slot** (150–300 MB each, up to 15 minutes), and that spare is a real session as far as the CLI is concerned — Claude's own `/list-agents` lists it beside the sessions you made, named after the directory (`my-repo-3f`), and the memory modal (`Shift+M`) groups it under **warm spares**. Off drains the pool on the DAEMON's next sweep (within 30 s). |
-| `prewarm_sessions` | bool | `true` | Sessions | DAEMON-owned SESSION PREWARM: boot a WORKTREE's dead sessions when your selection rests on it, so attaching shows an already-booted screen instead of a booting shell. **Costs idle shell/CLI processes for sessions you may never open.** Off stops booting them; sessions already up stay until the IDLE REAPER takes them. |
+| `prewarm_sessions` | bool | `true` | Sessions | DAEMON-owned SESSION PREWARM: boot a WORKTREE's dead sessions when your selection rests on it, so attaching shows an already-booted screen instead of a booting shell. **Costs idle shell/CLI processes for sessions you may never open.** Off — for a machine with less memory to spare — landing on a worktree boots nothing: a session forks only when your cursor lands on its row or you attach to it, one at a time; sessions already up stay until the IDLE REAPER takes them. |
 
-`hide_projects` and `hide_worktrees` default to `false`. Set either to `true` to start with that panel
-hidden; the SESSIONS PANEL always remains visible.
+`hide_projects`, `hide_worktrees` and `hide_sessions` default to `false`. Set any of them to `true` to
+start with that panel collapsed to its rail.
 
 ### Prewarming
 
@@ -158,8 +163,10 @@ The overlay cycles `off`, `1m`, `5m`, `15m`, `30m`, `1h`, but the DAEMON parses 
 value falls back to the 5m default, *not* to off — a typo makes reaping ordinary, not absent.
 
 The IDLE REAPER sweeps every 15s and only takes sessions in WORKTREES no client is viewing. RUNNING
-and NEEDS FEEDBACK agents, and terminals with a command running, are spared. A reaped session revives
-on the next ATTACH or prewarm, and an agent RESUMES its conversation there.
+and NEEDS FEEDBACK agents, agents whose backgrounded tool call is still running (a Claude
+`run_in_background` Bash call or Monitor watch, a Codex shell command — the idle clock restarts when
+that job ends), and terminals with a command running, are spared. A reaped session revives on the
+next ATTACH or prewarm, and an agent RESUMES its conversation there.
 
 ## What the settings overlay owns
 
@@ -170,7 +177,8 @@ on the next ATTACH or prewarm, and an agent RESUMES its conversation there.
   editor, the branch new worktrees start from (`worktree_base_branch`: `auto` for origin's default
   branch, or a name such as `master`, typed into a prompt that `Enter` opens on the row), which
   agent CLIs the new-session menu offers (at least one stays on) and their default model
-  and reasoning effort, the idle timeout, whether a warm spare and a worktree's dead sessions are
+  and reasoning effort, the selected project's own settings on the **Project** tab (`projects`,
+  keyed by repo path — whether its root worktree row is hidden), the idle timeout, whether a warm spare and a worktree's dead sessions are
   pre-booted (`prewarm_agents`, `prewarm_sessions`), the done sound (`done_sound`: a ding
   when a turn finishes — a macOS system sound such as `Glass`, the default; `bell` for the terminal
   bell, which Ghostty keeps silent unless its `bell-features` include `audio`; or `off`. Over

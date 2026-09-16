@@ -441,6 +441,34 @@ impl Highlighter {
         }
     }
 
+    /// Pick the language from a fenced code block's info string (`rust`,
+    /// `js`, `console`, `dockerfile`); a name nothing here knows gets the
+    /// plain highlighter, the same as an unknown extension.
+    pub fn for_lang(info: &str) -> Self {
+        let lang = info
+            .split([',', ' ', '{'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let ext = match lang.as_str() {
+            "rust" => "rs",
+            "javascript" => "js",
+            "typescript" => "ts",
+            "python" => "py",
+            "golang" => "go",
+            "shell" | "console" | "bash" | "zsh" | "fish" => "sh",
+            "ruby" => "rb",
+            "yaml" => "yml",
+            "c++" | "cpp" => "cpp",
+            "objective-c" | "objc" => "m",
+            "kotlin" => "kt",
+            "dockerfile" | "docker" => return Self::for_path("dockerfile"),
+            "makefile" | "make" => return Self::for_path("makefile"),
+            other => other,
+        };
+        Self::for_path(&format!("fence.{ext}"))
+    }
+
     /// No language: every line is one plain-text run.
     pub fn plain() -> Self {
         Self {

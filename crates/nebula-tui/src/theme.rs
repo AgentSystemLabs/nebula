@@ -13,7 +13,9 @@ use ratatui::style::Color;
 
 /// Names the settings overlay cycles through; `by_name` accepts them
 /// case-insensitively and falls back to the first entry.
-pub const THEMES: &[&str] = &["default", "ocean", "forest", "rose", "amber"];
+pub const THEMES: &[&str] = &[
+    "default", "ocean", "forest", "rose", "amber", "lavender", "coral", "slate", "sand", "mono",
+];
 
 /// Semantic color roles for the whole TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +142,51 @@ impl Theme {
                 focus_tint: Color::Rgb(37, 32, 22),
                 ..base
             },
+            "lavender" => Self {
+                accent: Color::Indexed(147),  // periwinkle
+                special: Color::Indexed(176), // orchid
+                // The done violet would vanish into a periwinkle accent, so
+                // done goes turquoise here, as in rose.
+                done: Color::Indexed(45),
+                focus_tint: Color::Rgb(30, 28, 38),
+                ..base
+            },
+            "coral" => Self {
+                accent: Color::Indexed(209), // coral
+                // The cooled-off complement, the way default pairs cyan with
+                // magenta: a terminated session in a warm preset reads as
+                // gone cold rather than as a faded needs-feedback red.
+                special: Color::Indexed(73), // cadet teal
+                focus_tint: Color::Rgb(38, 28, 26),
+                ..base
+            },
+            "slate" => Self {
+                accent: Color::Indexed(110), // dusty sky blue
+                special: Color::Indexed(67), // steel blue
+                focus_tint: Color::Rgb(27, 30, 36),
+                ..base
+            },
+            "sand" => Self {
+                accent: Color::Indexed(180),  // tan
+                special: Color::Indexed(137), // bronze
+                focus_tint: Color::Rgb(36, 32, 27),
+                ..base
+            },
+            "mono" => Self {
+                // Grayscale chrome for a terminal whose own palette is
+                // colorful enough: the frame, titles and cursors go white
+                // and gray, and only the statuses keep their color.
+                accent: Color::White,
+                // A step under the accent, so a white-on-white match
+                // highlight still stands out from the text around it.
+                text: Color::Indexed(252),
+                // And a step under that, so unfocused titles still read as
+                // secondary next to the text.
+                muted: Color::Indexed(247),
+                special: Color::Indexed(245),
+                focus_tint: Color::Rgb(30, 30, 30),
+                ..base
+            },
             _ => base,
         }
     }
@@ -172,6 +219,23 @@ mod tests {
             assert_ne!(th.done, th.err, "{name}: done reads as needs-feedback");
             assert_ne!(th.done, th.special, "{name}: done reads as terminated");
             assert_ne!(th.done, th.dim, "{name}: done reads as fresh");
+        }
+    }
+
+    /// The accent has to stand out from the text it highlights, and the
+    /// text from the muted tier under it, in every preset — including the
+    /// grayscale one, which is the preset that moves those roles.
+    #[test]
+    fn accent_text_and_muted_stay_three_tiers_in_every_preset() {
+        for name in THEMES {
+            let th = Theme::by_name(name);
+            assert_ne!(th.accent, th.text, "{name}: a match highlight vanishes");
+            assert_ne!(th.text, th.muted, "{name}: secondary text reads as primary");
+            assert_ne!(th.muted, th.dim, "{name}: secondary text reads as a hint");
+            assert_ne!(
+                th.accent, th.muted,
+                "{name}: an unfocused title reads as focused"
+            );
         }
     }
 

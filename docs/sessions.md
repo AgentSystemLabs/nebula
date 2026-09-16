@@ -90,6 +90,14 @@ live in `agent_presets.json` beside `config.json`. The form's Harness row lists 
 by id alongside the built-ins — a preset on one launches with the entry's program and defaults, and
 refuses with the reason when its entry is switched off or gone.
 
+On an open pull request's row in the Worktrees column (the project's `OPEN PRS` group), `e` is a
+picker instead of the manager: the preset you pick launches a PR SESSION on that pull request. The
+box comes back with the preset applied and the PR in its title, and `Enter` starts the agent in the
+project's worktree on the PR's head branch — reused when one is already checked out on it, cut by
+the daemon otherwise — with the PR link and its work rule in the system prompt and the preset's
+`prefix + task + postfix` as the first prompt, so the agent is already working on the PR when the
+pane opens. A `skip`-task preset launches straight from the picker.
+
 ## RECENT PROMPTS
 
 An experimental read on what each session was last asked to do. Turn on **Recent prompts** under
@@ -129,19 +137,42 @@ whatever list was already on screen; one flaky round trip is no reason to blank 
 beat is also how rows retire: merge or close a pull request and it stops coming back, so it leaves the
 list on its own, and the one under your cursor goes the moment GitHub says it's merged. Rest the cursor
 on one and the right-hand pane reads it to you — description, stats and the whole conversation — without
-leaving nebula; `g` opens its diff in the same viewer your worktree diffs use, `Enter` or a double-click
+leaving nebula; `g` opens its diff in the same viewer your worktree diffs use, `y` opens a COMMENT BOX
+whose `Enter` posts what you typed on the pull request through `gh pr comment` (the pane re-reads the
+conversation once it lands, and a post `gh` refused brings the box back with your text), `Enter` or a double-click
 opens it in the browser, and `/` finds it by title. Press `n` — or choose **New Claude session**, **New
 Codex session**, **New Cursor session**, **New Pi session** or **New Muse session** from `m` / right-click — to start a SESSION on any enabled
-harness in the PROJECT's ROOT WORKTREE, through the same MODEL / EFFORT submenus as the NEW SESSION
+harness in a checkout of the pull request's head branch — the project's worktree already on that
+branch, or one the DAEMON cuts for it — through the same MODEL / EFFORT submenus as the NEW SESSION
 PICKER, with a rule that limits all work to that PR and includes its URL: Claude and Pi get it as an appended
 system prompt, Codex, Cursor and Muse as their first prompt. The URL is kept with the AGENT, so RESUME
-reapplies the same scope. Only the row you actually stop on is fetched.
+reapplies the same scope. Only the row you actually stop on is fetched. While the cursor rests on a
+pull request the Sessions column folds to its bare rule — a pull request has no checkout, so it has
+no sessions to list, and the pane reading it takes the width — and opens again on the next checkout.
+That fold is the row's, not yours: `Shift+S` (`hide_sessions`) is neither read nor written by it, so a
+Sessions panel you collapsed stays a rail on the checkout too, chevron and all.
+
+That checkout lists under its pull request. A worktree on an open pull request's head branch — the
+one a PR SESSION or a PR-scoped AGENT PRESET works in, or one you cut with `n` and later opened a pull
+request from — is not among the plain checkouts above the group but directly beneath the pull
+request's row, stepped in behind a `└` that runs into its status dot, so the checkout and the pull
+request it is for read as one thing and there is no guessing which worktree a review is happening
+in. It is still a worktree row: the cursor on it has that checkout's sessions in the Sessions panel
+(its own PR ROW among them), `n` starts a session there, `d` deletes it, and the pull request itself
+is the row above. A PR SESSION's stand-in checkout goes up in the same place, so nothing jumps when
+the DAEMON's real row replaces it. The ROOT WORKTREE never nests, whatever branch it is on, and a
+branch two open pull requests share nests under the first listed. Only a pull request on screen
+takes its checkout: fold the group, or keep the draft it is out with **Hide draft PRs**, and the
+checkout is a plain row again — hiding pull requests never hides work you have. The cursor follows
+its checkout through every one of those moves, and through the `gh pr list` answer that first lists
+the pull request (the checkout moves under it) or retires it (the checkout moves back out).
 
 The group folds. Click its header — or pick **Show/hide open PRs** from the panel's right-click
 menu — and the list drops to the one line `▸ OPEN PRS · 12`, the triangle turned sideways and the
 count still honest, because `gh pr list` keeps its beat behind the fold; open, the header reads
 `▾ OPEN PRS · 12` over the rows. Folding away the row the cursor is on lands it on the last checkout
-and brings that checkout's session back into the pane, `↑/↓` then stop at the checkouts, and `/`
+and brings that checkout's session back into the pane, a checkout that sat under its pull request
+rejoins the plain rows with the cursor still on it, `↑/↓` then stop at the checkouts, and `/`
 still finds every pull request either way. Stepping `↓` off the last checkout into a folded group
 opens it onto its first pull request rather than stopping at the header. The fold is remembered
 across restarts, like the ARCHIVED toggle.
@@ -161,13 +192,35 @@ the nearest row left, as a fold does. The choice is remembered across restarts.
 
 `i` from any panel lists the selected PROJECT's open GitHub issues — `gh issue list`, newest first,
 pull requests left out — down the left of a modal, and reads the one under the cursor on the right:
-number and title, who opened it and when, its labels, the description as plain wrapped text, and,
+number and title, who opened it and when, its labels, the description rendered as markdown (a newline
+is a line break, as GitHub shows a comment), and,
 once the cursor has rested on the row for a moment, its comments (`gh issue view`, one call per issue
 you actually stop on, remembered for the session). `o` opens the issue in the browser and `r` asks
 GitHub again; a machine with no `gh`, or one that is not logged in, gets a line saying so in the pane
-rather than an empty modal. The rows are kept for the session, so reopening the modal paints at
-once while the fresh list lands underneath — and the cursor stays on the issue it was on, by URL,
-when a refresh retires a row above it.
+rather than an empty modal. The list is asked for before you press `i`: once the cursor has rested
+on a project for a moment its open issues are fetched in the background, and re-fetched every couple
+of minutes while the project stays selected (backing off when the repo has none, or `gh` can't
+answer), so the modal opens on rows instead of an empty pane. A list that landed in the last thirty
+seconds is what you see; an older one paints while the fresh list lands underneath — and the cursor
+stays on the issue it was on, by URL, when a refresh retires a row above it.
+
+`c` leaves a comment on the issue under the cursor without leaving the modal for long: a multi-row
+box (the task prompts' shape, `Shift+Enter` for a newline) whose `Enter` posts the text as you —
+`gh issue comment`, so it appears under your GitHub login — and puts the modal back on the row at
+once, the pane saying the comment is on its way until GitHub answers; then the conversation is read
+again with it in. `Esc`, or an empty box, puts the modal back without posting, and a post `gh`
+refused (not logged in, no network) brings the box back with your text so nothing is lost.
+
+`E` edits the issue itself without leaving the modal at all: the reading pane becomes a form on
+the row's title and description — `Tab`, `↑`/`↓` or a click move between the two fields, and the
+description takes `Shift+Enter` (or `Ctrl+J`) for a line break, as every multi-row box does.
+`Enter` sends both to GitHub as one `gh issue edit` (the title on the command line, the description
+on its stdin) and holds the form, its foot saying `saving…`, until GitHub answers: the row and the
+pane then carry the new text at once, the list is asked for again underneath, and the footer says
+`issue #15 updated`. `Esc` drops the draft and puts the reading pane back. An unchanged form closes
+without a call, a blank title is refused on the spot, and a save GitHub refuses — not logged in, no
+push access to the repo — keeps the form up with `gh`'s own reason on its frame and your text
+intact, so nothing typed is lost. Labels, assignees and milestones stay GitHub's to edit.
 
 Two keys put an agent on the issue. `Enter` (or `p`) opens the QUICK PROMPT for it — the same box
 `p` opens anywhere, titled `Quick prompt · issue #15 (claude · opus)`, launching the `Agent` row's

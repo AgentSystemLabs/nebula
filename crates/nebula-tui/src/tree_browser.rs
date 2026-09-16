@@ -6,6 +6,7 @@ use crate::app::{
     clamp_files_width, clamp_selection, max_scroll, scrolled_by, window_start, DEFAULT_DIFF_FILES_W,
 };
 use crate::git_diff::cap_lines;
+use crate::markdown::{self, Rendered};
 use crate::syntax::{Highlighter, TokenKind};
 use crate::text_input::TextInput;
 use ratatui::layout::Rect;
@@ -80,6 +81,14 @@ pub struct TreeBrowser {
     /// Whether `preview` is real file contents — the case that earns a
     /// line-number gutter. False for directory listings and placeholders.
     pub preview_is_file: bool,
+    /// The selected file is markdown: Ctrl+r chooses between the rendered
+    /// page and the source.
+    pub markdown: bool,
+    /// Show markdown as the rendered page rather than the source.
+    pub pretty: bool,
+    /// The page flowed for the last drawn width, written back during draw
+    /// (see [`Rendered`]).
+    pub rendered: Option<Rendered>,
     /// Top visible preview line.
     pub scroll: u16,
     /// Inner height of the preview pane, written back during draw (the
@@ -122,6 +131,9 @@ impl TreeBrowser {
             preview_lines: Vec::new(),
             preview_line_count: 0,
             preview_is_file: false,
+            markdown: false,
+            pretty: true,
+            rendered: None,
             scroll: 0,
             view_height: 0,
             list_area: Rect::default(),
@@ -380,9 +392,27 @@ impl TreeBrowser {
             None => Highlighter::plain(),
         };
         self.preview_is_file = highlight_path.is_some();
+        self.markdown = highlight_path
+            .as_deref()
+            .is_some_and(markdown::is_markdown_path);
+        self.rendered = None;
         self.preview_lines = text.lines().map(|l| hl.line(l)).collect();
         self.preview_line_count = self.preview_lines.len();
         self.preview = text;
+    }
+
+    /// The preview is the rendered markdown page rather than the source.
+    pub fn renders_markdown(&self) -> bool {
+        self.markdown && self.pretty
+    }
+
+    /// Ctrl+r: the other view of a markdown file (the FILE TABS' `m`).
+    pub fn toggle_pretty(&mut self) {
+        self.pretty = !self.pretty;
+        self.rendered = None;
+        if !self.pretty {
+            self.preview_line_count = self.preview_lines.len();
+        }
     }
 }
 

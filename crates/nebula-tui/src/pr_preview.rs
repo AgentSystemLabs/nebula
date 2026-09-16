@@ -8,12 +8,14 @@
 //! renderer that wrapped at draw time could not tell the scroller how far
 //! down it is allowed to go.
 //!
-//! The body is markdown, and it is rendered as **plain wrapped text on
-//! purpose**. nebula is not a markdown viewer; interpreting someone's fenced
-//! code block or table would mangle it more often than it would help. The
-//! one concession is that hard line breaks are honored, because a PR
-//! description written as a list reads as a list.
+//! The body is markdown and is rendered as markdown (the MARKDOWN module):
+//! headings, lists, fenced code, tables and links laid out the way GitHub
+//! shows them, under GitHub's comment rule that a newline is a line break,
+//! because a description written as a list reads as a list. The headline
+//! rows above it are the pane's own, and [`wrap`] stays for the plain
+//! text the panels wrap elsewhere.
 
+use crate::markdown::{self, Breaks};
 use crate::pull_request::{PrComment, PrDetail, Standing, STATE_OPEN};
 use crate::theme::Theme;
 use ratatui::style::{Modifier, Style};
@@ -180,9 +182,10 @@ pub fn lines(detail: &PrDetail, width: usize, th: Theme) -> Vec<Line<'static>> {
             dim,
         )));
     } else {
-        for row in wrap(detail.body.trim_end(), body_w) {
-            out.push(Line::from(Span::styled(format!("{INDENT}{row}"), muted)));
-        }
+        out.extend(markdown::indent(
+            markdown::render(detail.body.trim_end(), body_w, Breaks::Hard, muted, th),
+            INDENT,
+        ));
     }
 
     // ---- conversation ----
@@ -207,7 +210,7 @@ pub fn lines(detail: &PrDetail, width: usize, th: Theme) -> Vec<Line<'static>> {
     out
 }
 
-/// One comment: an attribution row, then its wrapped body.
+/// One comment: an attribution row, then its body rendered as markdown.
 fn comment_lines(c: &PrComment, width: usize, body_w: usize, th: Theme) -> Vec<Line<'static>> {
     let dim = Style::default().fg(th.dim);
     let mut head = vec![Span::styled(
@@ -234,12 +237,16 @@ fn comment_lines(c: &PrComment, width: usize, body_w: usize, th: Theme) -> Vec<L
     if c.body.trim().is_empty() {
         return out;
     }
-    for row in wrap(c.body.trim_end(), body_w.saturating_sub(2)) {
-        out.push(Line::from(Span::styled(
-            format!("{INDENT}  {row}"),
+    out.extend(markdown::indent(
+        markdown::render(
+            c.body.trim_end(),
+            body_w.saturating_sub(2),
+            Breaks::Hard,
             Style::default().fg(th.muted),
-        )));
-    }
+            th,
+        ),
+        &format!("{INDENT}  "),
+    ));
     out
 }
 

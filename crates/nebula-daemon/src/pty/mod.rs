@@ -51,55 +51,112 @@ fn pty_size(cols: u16, rows: u16) -> PtySize {
     }
 }
 
-/// Every process group with a member in `root`'s subtree, `root`'s own
-/// first (it leads its PTY session, so that group is its pid, and it is
-/// named even when the `ps` sweep fails). An interactive shell running the
-/// agent as a job puts it in a group of its own; SIGKILLing the leader's
-/// group alone would miss it. Taken while the tree is intact — see `kill`.
-fn process_groups_under(root: u32) -> Vec<u32> {
-    let table = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,pgid="])
+/// The live process table, one process per line, as `ps -axo
+/// pid=,ppid=,pgid=,stat=` prints it; None when `ps` itself fails.
+fn ps_table() -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,pgid=,stat="])
         .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-    process_groups_in_table(&table, root)
+        .ok()?;
+    String::from_utf8(out.stdout).ok()
 }
 
-/// Pure core of [`process_groups_under`]: `table` is `ps -axo
-/// pid=,ppid=,pgid=` output, one process per line.
-fn process_groups_in_table(table: &str, root: u32) -> Vec<u32> {
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut group_of: HashMap<u32, u32> = HashMap::new();
-    for line in table.lines() {
-        let mut cols = line.split_whitespace();
-        let (Some(pid), Some(ppid), Some(pgid)) = (
-            cols.next().and_then(|s| s.parse::<u32>().ok()),
-            cols.next().and_then(|s| s.parse::<u32>().ok()),
-            cols.next().and_then(|s| s.parse::<u32>().ok()),
-        ) else {
-            continue;
-        };
-        children.entry(ppid).or_default().push(pid);
-        group_of.insert(pid, pgid);
+/// One process as the `ps` sweep reports it.
+struct ProcRow {
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+    /// The `s` flag of `stat`: the process leads a session of its own, so
+    /// something called `setsid` to cut it loose from its terminal.
+    session_leader: bool,
+}
+
+/// Parse [`ps_table`] output. A row without a `stat` column parses too (as
+/// no session leader), so a bare `pid ppid pgid` table works.
+fn parse_ps_table(table: &str) -> Vec<ProcRow> {
+    table
+        .lines()
+        .filter_map(|line| {
+            let mut cols = line.split_whitespace();
+            let pid = cols.next()?.parse().ok()?;
+            let ppid = cols.next()?.parse().ok()?;
+            let pgid = cols.next()?.parse().ok()?;
+            let session_leader = cols.next().is_some_and(|stat| stat.contains('s'));
+            Some(ProcRow {
+                pid,
+                ppid,
+                pgid,
+                session_leader,
+            })
+        })
+        .collect()
+}
+
+/// `root`'s subtree — children, grandchildren, and on down — without
+/// `root` itself.
+fn descendants(rows: &[ProcRow], root: u32) -> Vec<&ProcRow> {
+    let mut children: HashMap<u32, Vec<&ProcRow>> = HashMap::new();
+    for row in rows {
+        children.entry(row.ppid).or_default().push(row);
     }
-    let mut groups = vec![root];
+    let mut found = Vec::new();
     let mut stack = vec![root];
     let mut seen = HashSet::new();
     while let Some(pid) = stack.pop() {
         if !seen.insert(pid) {
             continue;
         }
-        if let Some(&pgid) = group_of.get(&pid) {
-            if !groups.contains(&pgid) {
-                groups.push(pgid);
-            }
+        if let Some(kids) = children.remove(&pid) {
+            stack.extend(kids.iter().map(|kid| kid.pid));
+            found.extend(kids);
         }
-        if let Some(kids) = children.get(&pid) {
-            stack.extend(kids);
+    }
+    found
+}
+
+/// Every process group with a member in `root`'s subtree, `root`'s own
+/// first (it leads its PTY session, so that group is its pid, and it is
+/// named even when the `ps` sweep fails). An interactive shell running the
+/// agent as a job puts it in a group of its own; SIGKILLing the leader's
+/// group alone would miss it. Taken while the tree is intact — see `kill`.
+fn process_groups_under(root: u32) -> Vec<u32> {
+    process_groups_in_table(&ps_table().unwrap_or_default(), root)
+}
+
+/// Pure core of [`process_groups_under`] over a [`ps_table`].
+fn process_groups_in_table(table: &str, root: u32) -> Vec<u32> {
+    let rows = parse_ps_table(table);
+    let mut groups = vec![root];
+    let own = rows.iter().filter(|row| row.pid == root);
+    for row in own.chain(descendants(&rows, root)) {
+        if !groups.contains(&row.pgid) {
+            groups.push(row.pgid);
         }
     }
     groups
+}
+
+/// Is a job the agent cut loose from its terminal still running under
+/// `root` — a descendant leading a session of its own? That is how Claude
+/// Code runs a backgrounded Bash call or a Monitor watch and how Codex runs
+/// a shell command: work that outlives the turn which started it, and that
+/// the hook-fed status machine therefore no longer sees. The helpers an
+/// agent keeps inside its own session — MCP servers, `caffeinate`, Codex's
+/// code-mode host — are not counted, so an idle agent still reads as idle.
+/// A failed `ps` counts as busy: never kill what can't be inspected.
+pub(crate) fn detached_job_under(root: u32) -> bool {
+    match ps_table() {
+        Some(table) => detached_job_in_table(&table, root),
+        None => true,
+    }
+}
+
+/// Pure core of [`detached_job_under`] over a [`ps_table`].
+fn detached_job_in_table(table: &str, root: u32) -> bool {
+    let rows = parse_ps_table(table);
+    descendants(&rows, root)
+        .iter()
+        .any(|row| row.session_leader)
 }
 
 /// Broadcast to attached clients (and, later, the status machine).
@@ -723,5 +780,45 @@ mod tests {
         assert_eq!(process_groups_in_table(table, 20), vec![20, 21]);
         // A failed sweep still names the leader's own group.
         assert_eq!(process_groups_in_table("", 20), vec![20]);
+    }
+
+    /// The reaper's "still working?" question is whether anything under the
+    /// agent leads a session of its own: a backgrounded Bash call does
+    /// (Claude spawns it detached), an MCP server or a shell job does not.
+    #[test]
+    fn detached_job_is_a_session_leader_below_the_agent() {
+        // Agent 20 leads its PTY session and is its foreground job (`+`).
+        // Its MCP server 21 shares that group; 22 is a helper in a group of
+        // its own but the same session (Codex's code-mode host). 30 is
+        // another session entirely, 99 unrelated.
+        let idle = "\
+ 20    10    20  Ss+
+ 21    20    20  S+
+ 22    20    22  S
+ 30    10    30  Ss+
+ 99     1    99  S
+";
+        assert!(!detached_job_in_table(idle, 20));
+        // A backgrounded Bash call: shell 23 started its own session (`s`)
+        // and runs sleep 24 inside it.
+        let busy = format!("{idle} 23    20    23  Ss\n 24    23    23  S\n");
+        assert!(detached_job_in_table(&busy, 20));
+        // Under a login shell that forked the agent as a job: 20 is bash,
+        // 21 the agent in a group of its own but not a session of its own,
+        // 25 its detached Bash call.
+        let wrapped = "\
+ 20    10    20  Ss
+ 21    20    21  S+
+ 25    21    25  Ss
+";
+        assert!(detached_job_in_table(wrapped, 20));
+        assert!(!detached_job_in_table(
+            " 20    10    20  Ss\n 21    20    21  S+\n",
+            20
+        ));
+        // Another session's job, a missing root, an empty sweep: no work.
+        assert!(!detached_job_in_table(idle, 30));
+        assert!(!detached_job_in_table(idle, 40));
+        assert!(!detached_job_in_table("", 20));
     }
 }

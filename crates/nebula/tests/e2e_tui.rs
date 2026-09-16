@@ -778,6 +778,154 @@ fn tui_pull_request_row_leads_the_pull_requests_group() {
     tui.wait_for_text("can't be deleted");
 }
 
+/// The ISSUES MODAL opens on rows fetched before `i` is ever pressed. A stub
+/// `gh` on PATH answers `issue list` with one issue and records each call:
+/// the record appears with no key sent — selecting the project is what
+/// asks — and the modal then opens on that answer without a second ask.
+#[test]
+fn tui_issues_are_prefetched_before_the_modal_opens() {
+    let stub_bin = tempfile::tempdir().unwrap();
+    let calls = stub_bin.path().join("issue-list-calls");
+    let gh = stub_bin.path().join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "case \"$1 $2\" in\n",
+                "  'issue list') echo x >> '{calls}'; printf '%s' '[{{\"number\":15,",
+                "\"title\":\"Fix login redirect\",\"url\":\"https://github.com/o/r/issues/15\",",
+                "\"author\":{{\"login\":\"webdevcody\"}},\"createdAt\":\"2026-09-10T12:00:00Z\",",
+                "\"updatedAt\":\"2026-09-11T12:00:00Z\",\"labels\":[],\"body\":\"Login bounces.\"}}]' ;;\n",
+                "  'issue view') printf '%s' '{{\"url\":\"https://github.com/o/r/issues/15\",\"comments\":[]}}' ;;\n",
+                "  *) exit 1 ;;\n",
+                "esac\n",
+            ),
+            calls = calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        stub_bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let mut tui = TuiHarness::spawn_with_env(&[("PATH", path)]);
+    let repo = tui.make_repo("issues-proj");
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "issues-proj");
+    tui.wait_for_text("⌂ root");
+
+    // No `i` yet: the list is asked for because the project is selected.
+    let deadline = Instant::now() + WAIT;
+    while !calls.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "gh issue list never ran in the background\n--- screen ---\n{}",
+            tui.screen_text()
+        );
+        std::thread::sleep(POLL_STEP);
+    }
+
+    // The modal opens on the prefetched row — and spends no second process
+    // on a list that just landed (or is still landing).
+    tui.send(b"i");
+    tui.wait_for_text("Issues — issues-proj (1)");
+    tui.wait_for_text("#15 Fix login redirect");
+    let asks = std::fs::read_to_string(&calls).unwrap().lines().count();
+    assert_eq!(asks, 1, "opening on a fresh list asks GitHub again");
+    tui.send(ESC);
+    tui.wait_for_gone("Issues — issues-proj");
+}
+
+/// `E` in the ISSUES MODAL edits the issue in place: the reading pane
+/// becomes a form on the row's title and description, and Enter sends both
+/// as one `gh issue edit` — the title on argv, the description on stdin —
+/// then puts the reading pane back on the new text. A stub `gh` on PATH
+/// answers the list and records the edit it is sent.
+#[test]
+fn tui_issues_modal_edits_the_issue_in_place() {
+    // A stub `gh` that answers the list from what the last edit sent it,
+    // as GitHub would, and records each edit it is sent.
+    let stub_bin = tempfile::tempdir().unwrap();
+    let edits = stub_bin.path().join("calls");
+    let gh = stub_bin.path().join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "dir='{dir}'\n",
+                "case \"$1 $2\" in\n",
+                "  'issue list')\n",
+                "    title='Fix login redirect'; body='Login bounces.'\n",
+                "    [ -f \"$dir/title\" ] && title=$(cat \"$dir/title\")\n",
+                "    [ -f \"$dir/body\" ] && body=$(cat \"$dir/body\")\n",
+                "    printf '[{{\"number\":15,\"title\":\"%s\",\"url\":\"https://github.com/o/r/issues/15\",",
+                "\"author\":{{\"login\":\"webdevcody\"}},\"createdAt\":\"2026-09-10T12:00:00Z\",",
+                "\"updatedAt\":\"2026-09-11T12:00:00Z\",\"labels\":[],\"body\":\"%s\"}}]' \"$title\" \"$body\" ;;\n",
+                "  'issue view') printf '%s' '{{\"url\":\"https://github.com/o/r/issues/15\",\"comments\":[]}}' ;;\n",
+                "  'issue edit')\n",
+                "    echo \"argv: $*\" >> \"$dir/calls\"\n",
+                "    printf '%s' \"${{4#--title=}}\" > \"$dir/title\"\n",
+                "    cat > \"$dir/body\"\n",
+                "    printf 'stdin: ' >> \"$dir/calls\"; cat \"$dir/body\" >> \"$dir/calls\"; echo >> \"$dir/calls\" ;;\n",
+                "  *) exit 1 ;;\n",
+                "esac\n",
+            ),
+            dir = stub_bin.path().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        stub_bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let mut tui = TuiHarness::spawn_with_env(&[("PATH", path)]);
+    let repo = tui.make_repo("issues-proj");
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "issues-proj");
+    tui.wait_for_text("⌂ root");
+    tui.send(b"i");
+    tui.wait_for_text("#15 Fix login redirect");
+
+    // The form opens on the row's text, caret at the end of the title.
+    tui.send(b"E");
+    tui.wait_for_text("Edit issue #15");
+    tui.wait_for_text("Title  Fix login redirect");
+    tui.send(b"!");
+    tui.wait_for_text("Fix login redirect!");
+    tui.send(TAB);
+    tui.send(b" Again.");
+    tui.wait_for_text("Login bounces. Again.");
+
+    // Enter sends the edit and the pane comes back on the new text.
+    tui.send(ENTER);
+    tui.wait_for_text("issue #15 updated");
+    tui.wait_for_gone("Edit issue #15");
+    tui.wait_for_text("#15 Fix login redirect!");
+    let sent = std::fs::read_to_string(&edits).unwrap();
+    assert!(
+        sent.contains("argv: issue edit 15 --title=Fix login redirect! --body-file -"),
+        "{sent}"
+    );
+    assert!(sent.contains("stdin: Login bounces. Again."), "{sent}");
+
+    // Esc from the form drops the draft and keeps the modal.
+    tui.send(b"E");
+    tui.wait_for_text("Edit issue #15");
+    tui.send(ESC);
+    tui.wait_for_gone("Edit issue #15");
+    tui.wait_for_text("Issues — issues-proj");
+    tui.send(ESC);
+    tui.wait_for_gone("Issues — issues-proj");
+}
+
 #[test]
 fn tui_git_diff_modal() {
     let mut tui = TuiHarness::spawn();

@@ -1,14 +1,14 @@
 //! The main TUI loop: terminal setup/teardown, message routing, update logic.
 
 use crate::agent_picker::{self, kind_label, KindPicker};
-use crate::app::PrDiffAnswer;
 use crate::app::{
-    clamp_selection, App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView,
-    FileFinder, Focus, GrepView, HelpView, HitTarget, LinkRow, MenuAction, MenuFilter, MenuItem,
-    MetricsView, Overlay, Palette, PaletteTarget, PendingAction, PendingIntent, PointerShape,
-    PromptDialog, PromptKind, RowKey, SessionRow, SettingsView, SplitterDrag, SubmenuKind,
-    TermSelection, WorktreeRollback,
+    clamp_selection, AgentLaunchDraft, App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu,
+    DiffView, FileFinder, Focus, GrepView, HelpView, HitTarget, LinkRow, MenuAction, MenuFilter,
+    MenuItem, MetricsView, Overlay, Palette, PaletteTarget, PendingAction, PendingIntent,
+    PointerShape, PromptDialog, PromptKind, RowKey, SessionRow, SettingsView, SplitterDrag,
+    SubmenuKind, TermSelection, WorktreeRollback,
 };
+use crate::app::{PrCommentAnswer, PrDiffAnswer};
 use crate::pull_request::Lookup;
 use crate::text_input::TextInput;
 use crate::tree_browser::TreeBrowser;
@@ -297,6 +297,11 @@ async fn main_loop(
     // refreshes the one already open on the cached copy.
     let (prdiff_tx, mut prdiff_rx) = tokio::sync::mpsc::unbounded_channel::<PrDiffAnswer>();
     app.pr_diff_tx = Some(prdiff_tx);
+    // A finished `gh pr comment`, which flashes its outcome when it lands
+    // — and re-reads the pull request so the pane shows what was said.
+    let (prcomment_tx, mut prcomment_rx) =
+        tokio::sync::mpsc::unbounded_channel::<PrCommentAnswer>();
+    app.pr_comment_tx = Some(prcomment_tx);
     // The ISSUES MODAL's `gh issue list` / `gh issue view` answers, on the
     // same footing: the modal's own handlers start the fetch, the loop
     // lands it.
@@ -367,6 +372,9 @@ async fn main_loop(
                 sweep_pull_request(&mut app, &pr_tx);
                 lookup_open_prs(&mut app, &prs_tx, &mut out);
                 sweep_open_prs(&mut app, &prs_tx, &mut out);
+                // The selected project's open issues, on the same beat, so
+                // `i` paints rows that are at most a couple of minutes old.
+                crate::issues::refresh_selected(&mut app);
                 // Whatever the answers above changed since the last tick
                 // goes to disk, off the loop; the next launch paints from it.
                 if let Some((cache, store, live)) = crate::pr_cache::take_flush(&mut app) {
@@ -448,6 +456,14 @@ async fn main_loop(
                 if app.pending_prewarm.is_some() =>
             {
                 fire_pending_prewarm(&mut app, &mut out);
+            }
+            // The project selection rested past the debounce: ask GitHub
+            // for its open issues in the background, so `i` paints the
+            // rows at once instead of an empty modal.
+            _ = tokio::time::sleep(app.issues_prefetch_delay().unwrap_or_default()),
+                if app.pending_issues_prefetch.is_some() =>
+            {
+                crate::issues::fire_prefetch(&mut app);
             }
             // Standing keep-warm: periodically re-assert the selected
             // worktree's warm default-spec Claude session so the daemon's
@@ -534,6 +550,11 @@ async fn main_loop(
             answer = prdiff_rx.recv() => {
                 if let Some(answer) = answer {
                     land_pr_diff(&mut app, answer);
+                }
+            }
+            answer = prcomment_rx.recv() => {
+                if let Some(answer) = answer {
+                    land_pr_comment(&mut app, answer);
                 }
             }
             // The ISSUES MODAL's hover debounce: the cursor has rested on
@@ -940,6 +961,10 @@ fn note_open_prs_answer(
     // changes. A refresh that retires a merged PR must not slide the
     // selection onto whatever row inherits its index.
     let cursor = app.selected_worktree_pr().cloned();
+    // And which checkout: the answer can move one under a pull request
+    // just opened from its branch (or back out, once that merges), and
+    // the cursor goes with it — a checkout is never lost to a re-list.
+    let checkout = app.selected_worktree().map(|w| w.id.clone());
     app.open_prs_inflight.remove(&project);
     let previous = app.open_prs.get(&project);
     let found = list.as_ref().is_some_and(|l| !l.is_empty());
@@ -986,6 +1011,7 @@ fn note_open_prs_answer(
     );
     forget_retired_prs(app);
     reconcile_open_pr_cursor(app, cursor, out);
+    follow_checkout(app, checkout.as_ref());
     // An open `/` palette lists these rows too: a pull request marked
     // ready for review (or turned back into a draft) since the last answer
     // must change its word there as well, and one merged since must leave.
@@ -1041,17 +1067,12 @@ fn reconcile_open_pr_cursor(
     let Some(was) = was else {
         return;
     };
-    let checkouts = app.visible_worktrees().len();
-    match app
-        .visible_open_prs()
-        .iter()
-        .position(|pr| pr.url == was.url)
-    {
+    match app.open_pr_row_of(&was.url) {
         // Same pull request, possibly at a new index. Nothing is re-armed:
         // `schedule_pr_detail` zeroes `pr_preview_scroll`, and a refresh
         // landing every minute must not yank a reader back to the top of a
         // conversation they're halfway down.
-        Some(i) => app.sel_worktree = checkouts + i,
+        Some(i) => app.sel_worktree = i,
         None => {
             let rows = app.worktree_row_count();
             if app.sel_worktree >= rows {
@@ -1242,6 +1263,115 @@ fn land_pr_detail(
         }
         None => {
             app.pr_detail_failed.insert(url);
+        }
+    }
+    app.dirty = true;
+}
+
+/// `y` on a pull request row — a PROJECT OPEN PRS GROUP row or the
+/// Sessions panel's PR ROW — or **Comment…** from either row's menu: the
+/// COMMENT BOX, a multi-row task box titled with the row, whose Enter
+/// posts the text on that pull request through `gh pr comment`
+/// (`post_pr_comment`). Off a pull request row the key only says what it
+/// wants. A draft a refused post handed back while another modal was up
+/// (`pr_comment_drafts`) fills the box, so the refusal cost nothing typed.
+fn open_pr_comment(app: &mut App) {
+    let Some(pr) = app.previewed_pr() else {
+        app.flash = Some("move onto a pull request row to comment on it".into());
+        app.dirty = true;
+        return;
+    };
+    let draft = app.pr_comment_drafts.remove(&pr.url).unwrap_or_default();
+    reopen_prompt_with(
+        app,
+        PromptKind::PrComment {
+            number: pr.number,
+            url: pr.url,
+            label: pr.label,
+        },
+        draft,
+    );
+}
+
+/// Enter in the COMMENT BOX: post `body` on pull request `number` off the
+/// loop, as the `gh` user, from the selected project's checkout — `gh pr
+/// comment` resolves the number from any checkout of the repo, as the
+/// detail fetch does — and say it is on its way. The outcome lands in
+/// `land_pr_comment`. A post that cannot even start — one already running
+/// on this pull request, no checkout on disk — says why and hands the box
+/// straight back with its text.
+fn post_pr_comment(app: &mut App, number: u64, url: String, label: String, body: String) {
+    let dir = app.selected_project().map(|p| p.repo_path.clone());
+    let refused = if app.pr_comment_inflight.contains(&url) {
+        Some(format!("still posting the last comment on #{number}…"))
+    } else {
+        match &dir {
+            Some(dir) if !dir.is_dir() => {
+                Some(format!("repo path missing on disk: {}", dir.display()))
+            }
+            None => Some("no project selected to post from".into()),
+            // Never in the running TUI: the loop installs the channel at
+            // startup. Handing the box back beats losing the text.
+            Some(_) if app.pr_comment_tx.is_none() => Some("not ready to post yet".into()),
+            Some(_) => None,
+        }
+    };
+    if let Some(why) = refused {
+        app.flash = Some(why);
+        reopen_prompt_with(app, PromptKind::PrComment { number, url, label }, body);
+        app.dirty = true;
+        return;
+    }
+    let (Some(dir), Some(tx)) = (dir, app.pr_comment_tx.clone()) else {
+        return;
+    };
+    app.pr_comment_inflight.insert(url.clone());
+    app.flash = Some(format!("posting a comment on #{number}…"));
+    app.dirty = true;
+    tokio::spawn(async move {
+        let result = crate::pull_request::comment(&dir, number, &body).await;
+        let _ = tx.send(PrCommentAnswer {
+            number,
+            url,
+            label,
+            body,
+            result,
+        });
+    });
+}
+
+/// A `gh pr comment` landed. Posted: say so, and read the pull request
+/// again so the pane's conversation carries the new comment — in place
+/// when the pane is still on it (`refetch_pr_detail`, which keeps the
+/// reader's scroll), and on the next visit otherwise (`pr_detail_stale`).
+/// Refused: say why, in `gh`'s words, and put the box back with the text
+/// — at once when nothing else is on screen, and otherwise the next `y`
+/// on that pull request starts from it, so no refusal costs what was
+/// typed.
+fn land_pr_comment(app: &mut App, answer: PrCommentAnswer) {
+    let PrCommentAnswer {
+        number,
+        url,
+        label,
+        body,
+        result,
+    } = answer;
+    app.pr_comment_inflight.remove(&url);
+    match result {
+        Ok(_) => {
+            app.flash = Some(format!("comment posted on #{number}"));
+            app.pr_detail_stale.insert(url.clone());
+            if app.previewed_pr().is_some_and(|pr| pr.url == url) {
+                refetch_pr_detail(app);
+            }
+        }
+        Err(why) => {
+            app.flash = Some(format!("couldn't post the comment on #{number}: {why}"));
+            if app.overlay.is_none() {
+                reopen_prompt_with(app, PromptKind::PrComment { number, url, label }, body);
+            } else {
+                app.pr_comment_drafts.insert(url, body);
+            }
         }
     }
     app.dirty = true;
@@ -1655,11 +1785,7 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
         }
     }
     if let Some(wid) = &state.worktree {
-        if let Some(i) = app
-            .visible_worktrees()
-            .iter()
-            .position(|w| w.id.as_str() == wid)
-        {
+        if let Some(i) = app.worktree_row_of(&WorktreeId(wid.clone())) {
             app.sel_worktree = i;
         }
     }
@@ -1866,6 +1992,12 @@ fn paste_into_overlay(app: &mut App, text: &str) -> bool {
         // The query, or the commit message while that is being typed.
         Overlay::BranchSwitch(view) => {
             if !crate::branch_switch::paste(view, text) {
+                return false;
+            }
+        }
+        // The ISSUE EDITOR's field under the caret, while it is up.
+        Overlay::Issues(view) => {
+            if !crate::issues::paste(view, text) {
                 return false;
             }
         }
@@ -2399,6 +2531,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // source.
         Action::GitDiff if app.previewed_pr().is_some() => request_pr_diff(app),
         Action::GitDiff => open_diff_view(app),
+        Action::CommentPullRequest => open_pr_comment(app),
         Action::OpenRepo => open_repo_in_browser(app),
         Action::OpenGhosttyTab => open_ghostty_tab(app),
         // Shift+Enter: the checkout's OPEN COMMAND. Worktrees panel only —
@@ -2529,6 +2662,11 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
             "message for the cloud agent".into(),
             String::new(),
         ),
+        PromptKind::PrComment { label, .. } => (
+            format!("Comment on {label}").into(),
+            "posted on the pull request as you, through gh — markdown".into(),
+            String::new(),
+        ),
         PromptKind::RenameAgent { id } => {
             let current = app
                 .tree
@@ -2590,6 +2728,26 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
             (title.into(), label.into(), cfg.text_value(*kind))
         }
 
+        PromptKind::IssueComment { issue, .. } => {
+            let title = if issue.title.trim().is_empty() {
+                format!("Comment on issue #{}", issue.number)
+            } else {
+                format!(
+                    "Comment on issue #{} · {}",
+                    issue.number,
+                    crate::ui::truncate(issue.title.trim(), 40)
+                )
+            };
+            (
+                title.into(),
+                format!(
+                    "what do you want to say on #{}? (posted as you, with gh issue comment)",
+                    issue.number
+                )
+                .into(),
+                String::new(),
+            )
+        }
         PromptKind::EditLink { id } => {
             let current = app
                 .tree
@@ -3013,6 +3171,26 @@ pub(crate) fn spawn_editor_modal(
 /// inside the modal terminal. With `close_finder_on_open` the finder closes
 /// as the editor opens, so quitting the editor is a single Esc; with it off
 /// the finder stays open underneath and quitting lands back on the results.
+/// Enter in the finder: a markdown file is read first — the FILE TABS'
+/// rendered page takes the finder's place, and Enter there is the editor
+/// — since a `.md` is usually opened to be read; anything else goes
+/// straight to the editor modal.
+fn open_selected_file(app: &mut App) {
+    let Some(Overlay::Files(finder)) = &app.overlay else {
+        return;
+    };
+    let Some(path) = finder.selected_path().map(str::to_string) else {
+        return;
+    };
+    if crate::markdown::is_markdown_path(&path) {
+        let root = finder.root.clone();
+        let file = root.join(&path);
+        crate::file_tabs::open(app, root, vec![file]);
+        return;
+    }
+    open_selected_file_in_editor(app);
+}
+
 fn open_selected_file_in_editor(app: &mut App) {
     let Some(Overlay::Files(finder)) = &app.overlay else {
         return;
@@ -3074,7 +3252,10 @@ pub(crate) fn vim_size_guess(app: &App) -> (u16, u16) {
 
 /// ⌥click on a file path in the terminal pane: resolve it against the
 /// attached session's worktree and open it in the editor modal at the
-/// referenced line.
+/// referenced line — or, for a markdown file, read it first in the FILE
+/// TABS (the rendered page; Enter there is the editor), since a `.md` an
+/// agent points at is there to be read. The line, if any, is the source's
+/// and the page has no row for it.
 fn open_file_link(app: &mut App, path: &str, line: Option<u64>) {
     let Some(root) = attached_worktree_root(app) else {
         app.flash = Some("no worktree for this session".into());
@@ -3084,6 +3265,12 @@ fn open_file_link(app: &mut App, path: &str, line: Option<u64>) {
         app.flash = Some(format!("file not found: {path}"));
         return;
     };
+    if crate::markdown::is_markdown_path(&file) {
+        // `join` leaves an absolute (`~/`-expanded) path as it is.
+        let file = root.join(&file);
+        crate::file_tabs::open(app, root, vec![file]);
+        return;
+    }
     let editor = crate::config::Config::load().editor_command();
     let size = vim_size_guess(app);
     spawn_editor_modal(app, &editor, &root, &file, line.unwrap_or(1), size);
@@ -3210,7 +3397,12 @@ fn toggle_archived(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// session the cursor is no longer on.
 fn toggle_open_prs(app: &mut App, out: &mut Vec<ClientRequest>) {
     let on_pr = app.selected_worktree_pr().is_some();
+    // A checkout under a pull request rejoins the plain rows when the
+    // group folds, and leaves them again when it opens: the cursor keeps
+    // the checkout, wherever the fold puts it.
+    let checkout = app.selected_worktree().map(|w| w.id.clone());
     app.open_prs_collapsed = !app.open_prs_collapsed;
+    follow_checkout(app, checkout.as_ref());
     if on_pr {
         app.sel_worktree = app.worktree_row_count().saturating_sub(1);
         if app.selected_worktree().is_some() {
@@ -3223,6 +3415,22 @@ fn toggle_open_prs(app: &mut App, out: &mut Vec<ClientRequest>) {
         schedule_pr_detail(app);
     }
     app.dirty = true;
+}
+
+/// Re-seat the Worktrees cursor on checkout `id` after the rows regrouped
+/// under it — a fold, a draft toggle, a fresh `gh pr list` answer — each
+/// of which can move a checkout under its pull request's row or back out
+/// among the plain ones (`App::worktree_rows`). The pane needs nothing:
+/// the worktree under the cursor is the one it was showing. A cursor
+/// that was not on a checkout, or whose checkout is no longer a row, is
+/// left for the caller's own landing.
+fn follow_checkout(app: &mut App, id: Option<&WorktreeId>) {
+    if let Some(i) = id.and_then(|id| app.worktree_row_of(id)) {
+        if app.sel_worktree != i {
+            app.sel_worktree = i;
+            app.dirty = true;
+        }
+    }
 }
 
 /// Shift+T: create a shell terminal whose pwd is the selection's checkout —
@@ -3246,7 +3454,10 @@ fn create_terminal(app: &mut App, worktree: WorktreeId, out: &mut Vec<ClientRequ
     send_with(
         app,
         out,
-        PendingIntent::AttachCreated { focus: true },
+        PendingIntent::AttachCreated {
+            focus: true,
+            placeholder: None,
+        },
         |req_id| ClientRequest::CreateTerminal {
             req_id,
             worktree,
@@ -3510,6 +3721,7 @@ fn menu_items_for_link(row: &LinkRow) -> Vec<MenuItem> {
     )];
     if row.pull_request().is_some() {
         items.push(MenuItem::new("View diff", MenuAction::ViewPrDiff));
+        items.push(MenuItem::new("Comment…", MenuAction::CommentPullRequest));
     }
     if let Some(id) = row.id() {
         items.push(MenuItem::new("Edit URL", MenuAction::EditLink(id.clone())));
@@ -3639,6 +3851,7 @@ fn pr_row_menu_items(app: &App, pr: &crate::pull_request::OpenPr) -> Vec<MenuIte
     items.extend([
         MenuItem::new("Open in browser", MenuAction::OpenLink(pr.url.clone())),
         MenuItem::new("View diff", MenuAction::ViewPrDiff),
+        MenuItem::new("Comment…", MenuAction::CommentPullRequest),
     ]);
     items
 }
@@ -4243,9 +4456,17 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 // A typed setting's prompt stood in for the overlay: Esc
                 // keeps the old value and puts the overlay back on its row.
                 let back_to_settings = matches!(prompt.kind, PromptKind::SettingText { .. });
+                // The comment box stood in for the ISSUES MODAL: Esc puts
+                // the modal back on its row, the comment unposted.
+                let back_to_issues = match &prompt.kind {
+                    PromptKind::IssueComment { view, .. } => Some(view.clone()),
+                    _ => None,
+                };
                 app.overlay = None;
                 if back_to_settings {
                     reopen_settings(app);
+                } else if let Some(view) = back_to_issues {
+                    crate::issues::reopen(app, view);
                 } else if let Some((worktree, name)) = back_to_presets {
                     let index = crate::agent_presets::load()
                         .iter()
@@ -4504,8 +4725,9 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 KeyCode::Char('n') if ctrl => finder.select(finder.selected as i64 + 1),
                 KeyCode::Char('p') if ctrl => finder.select(finder.selected as i64 - 1),
                 // Enter opens the selected file in the editor modal, which
-                // closes the finder unless `close_finder_on_open` is off.
-                KeyCode::Enter => open_selected_file_in_editor(app),
+                // closes the finder unless `close_finder_on_open` is off —
+                // or, for a markdown file, reads it first in the FILE TABS.
+                KeyCode::Enter => open_selected_file(app),
                 // Ctrl+y copies the selected path (relative to the worktree
                 // root) to the clipboard — ready to paste into an agent.
                 KeyCode::Char('y') if ctrl => {
@@ -4601,6 +4823,10 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                         copy_and_flash(app, &path, &label);
                     }
                 }
+                // Ctrl+r flips a markdown file between its rendered page
+                // and its source (the FILE TABS' `m`, which the filter
+                // would type here); on any other file it is the filter's.
+                KeyCode::Char('r') if ctrl && view.markdown => view.toggle_pretty(),
                 // Everything else feeds the always-on fuzzy filter, which
                 // edits like a terminal line (see text_input).
                 _ => {
@@ -4763,9 +4989,9 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
             app.overlay = Some(Overlay::Confirm(ConfirmDialog {
                 title: "Reset settings".into(),
                 message: "Every setting goes back to its default: theme, editor, agent \
-                          defaults,\ntimeouts, panel visibility, and all hotkey \
-                          bindings.\nYour config.json is rewritten and config.local.json \
-                          removed;\nthis can't be undone."
+                          defaults,\ntimeouts, panel visibility, every project's settings, \
+                          and all hotkey\nbindings. Your config.json is rewritten and \
+                          config.local.json removed;\nthis can't be undone."
                     .into(),
                 action: PendingAction::ResetSettings,
                 area: ratatui::layout::Rect::default(),
@@ -4941,6 +5167,23 @@ fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i32) {
             }
             return;
         }
+        if spec.kind.is_project() {
+            // A PROJECT TAB row edits the selected project's entry. With
+            // no project to edit — an empty tree — say so rather than
+            // toggle nothing.
+            let Some(path) = app.selected_project().map(|p| p.repo_path.clone()) else {
+                if let Some(view) = settings_mut(app) {
+                    view.warn("no project selected — this tab edits the one under the cursor");
+                }
+                return;
+            };
+            let mut cfg = crate::config::Config::load();
+            cfg.cycle_project(&path, spec.kind);
+            if save_config(app, &cfg) {
+                apply_config(app, &cfg);
+            }
+            return;
+        }
     }
     let mut cfg = crate::config::Config::load();
     cfg.cycle(tab, index, delta);
@@ -4970,7 +5213,7 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     set_hide_projects(app, cfg.hide_projects);
     set_hide_worktrees(app, cfg.hide_worktrees);
     set_hide_sessions(app, cfg.hide_sessions);
-    set_hide_root_worktree(app, cfg.hide_root_worktree);
+    set_projects_config(app, cfg.projects.clone(), cfg.project_fallback());
     set_hide_draft_prs(app, cfg.hide_draft_prs);
     app.recent_prompts = cfg.recent_prompts_shown();
     app.show_key_combos = cfg.show_key_combos;
@@ -5102,30 +5345,33 @@ fn toggle_panel(app: &mut App, focus: Focus) {
     save_panel_visibility(app);
 }
 
-/// Show or hide the ROOT WORKTREE row (Settings → Experimental). The row
-/// sits at the top, so every other index shifts by one either way: the
-/// cursor follows the worktree (or OPEN PRS row) it was on by identity,
-/// as `reconcile_selection` does after any list change, and a cursor on
-/// the root itself lands on the first row left. The pane catches up on
-/// the next move, as it does after any re-sort.
-fn set_hide_root_worktree(app: &mut App, hidden: bool) {
-    if app.hide_root_worktree == hidden {
-        return;
-    }
+/// Adopt CONFIG.JSON's PROJECT SETTINGS (Settings → Project): every
+/// project's entry and the fallback for the rest. The one row so far,
+/// **Hide root worktree**, shows or hides the selected project's ROOT
+/// WORKTREE row; it sits at the top, so when it flips every other index
+/// shifts by one: the cursor follows the worktree (or OPEN PRS row) it
+/// was on by identity, as `reconcile_selection` does after any list
+/// change, and a cursor on the root itself lands on the first row left.
+/// The pane catches up on the next move, as it does after any re-sort.
+/// Another project's flip changes nothing on screen until that project
+/// is selected, when `visible_worktrees` reads its entry.
+fn set_projects_config(
+    app: &mut App,
+    projects: std::collections::BTreeMap<std::path::PathBuf, crate::config::ProjectSettings>,
+    fallback: crate::config::ProjectSettings,
+) {
+    let was_hidden = app.selected_root_hidden();
     let worktree = app.selected_worktree().map(|w| w.id.clone());
     let pr = app.selected_worktree_pr().map(|pr| pr.url.clone());
-    app.hide_root_worktree = hidden;
-    let index = {
-        let rows = app.visible_worktrees();
-        match (&worktree, &pr) {
-            (Some(id), _) => rows.iter().position(|w| &w.id == id),
-            (None, Some(url)) => app
-                .visible_open_prs()
-                .iter()
-                .position(|p| &p.url == url)
-                .map(|i| i + rows.len()),
-            (None, None) => None,
-        }
+    app.projects_config = projects;
+    app.project_fallback = fallback;
+    if app.selected_root_hidden() == was_hidden {
+        return;
+    }
+    let index = match (&worktree, &pr) {
+        (Some(id), _) => app.worktree_row_of(id),
+        (None, Some(url)) => app.open_pr_row_of(url),
+        (None, None) => None,
     };
     let last = app.worktree_row_count().saturating_sub(1);
     app.sel_worktree = index.unwrap_or(app.sel_worktree).min(last);
@@ -5147,19 +5393,19 @@ fn set_hide_draft_prs(app: &mut App, hidden: bool) -> bool {
         return false;
     }
     let was = app.selected_worktree_pr().cloned();
+    let checkout = app.selected_worktree().map(|w| w.id.clone());
     app.hide_draft_prs = hidden;
     app.dirty = true;
     refresh_palette(app);
+    // A checkout on a draft's branch nests under it while the draft is
+    // listed and is a plain row while it is not: either way it stays
+    // under the cursor.
+    follow_checkout(app, checkout.as_ref());
     let Some(was) = was else {
         return false;
     };
-    let checkouts = app.visible_worktrees().len();
-    if let Some(i) = app
-        .visible_open_prs()
-        .iter()
-        .position(|pr| pr.url == was.url)
-    {
-        app.sel_worktree = checkouts + i;
+    if let Some(i) = app.open_pr_row_of(&was.url) {
+        app.sel_worktree = i;
         return false;
     }
     let last = app.worktree_row_count().saturating_sub(1);
@@ -5237,6 +5483,11 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             // a half-finished launch: it falls through to the generic
             // empty-input cancel below instead of holding the box open.
             PromptKind::QuickPrompt(_) => (None, "prompt"),
+            // An empty comment is a change of mind too.
+            PromptKind::PrComment { .. } => (None, "comment"),
+            // An empty comment box likewise: the cancel below puts the
+            // ISSUES MODAL back.
+            PromptKind::IssueComment { .. } => (None, "comment"),
             _ => (Some("Claude Cloud needs a task"), "Claude Cloud task"),
         };
         let error = if let Some(needs) = needs.filter(|_| value.is_empty()) {
@@ -5292,6 +5543,10 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
         _ => false,
     };
     if value.is_empty() && !empty_is_a_default {
+        // An empty comment box goes back to the modal it stood in for.
+        if let PromptKind::IssueComment { view, .. } = &prompt.kind {
+            crate::issues::reopen(app, view.clone());
+        }
         app.flash = Some("cancelled: empty input".into());
         return;
     }
@@ -5349,6 +5604,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                         suggestion,
                     },
                     text: value,
+                    launch: None,
                 },
                 |req_id| ClientRequest::CreateWorktree {
                     req_id,
@@ -5471,6 +5727,9 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             );
         }
         PromptKind::QuickPrompt(launch) => quick_launch::submit(app, launch, value, out),
+        PromptKind::PrComment { number, url, label } => {
+            post_pr_comment(app, number, url, label, value)
+        }
         PromptKind::CloudMessage { id } => {
             let intent = PendingIntent::ReopenPromptOnError {
                 kind: PromptKind::CloudMessage { id: id.clone() },
@@ -5544,6 +5803,9 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             }
         }
 
+        PromptKind::IssueComment { view, issue } => {
+            crate::issues::post_comment(app, view, issue, value);
+        }
         PromptKind::EditLink { id } => {
             send(app, out, |req_id| ClientRequest::UpdateLink {
                 req_id,
@@ -5726,6 +5988,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     &crate::config::Config::load(),
                 )
                 .with_issue(back.launch.issue.clone())
+                .with_pr(back.launch.pr.clone())
                 .with_origin(back.launch.origin);
                 crate::quick_prompt::reopen(app, launch, &back.text);
                 return;
@@ -5790,8 +6053,9 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 );
                 return;
             }
-            // A PR SESSION still asks for a name: `CreatePrAgent` carries
-            // no STARTING PROMPT, so there is no box to put in its place.
+            // A PR SESSION from this picker still asks for a name; the
+            // box is the preset route's (`e` on the OPEN PRS row), which
+            // sends its text as the `CreatePrAgent`'s STARTING PROMPT.
             // Nothing is warmed for it either — an unscoped warm CLI
             // cannot be adopted for a PR launch.
             if let Some(pr) = pr {
@@ -5826,6 +6090,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::NewWorktree(project) => open_new_worktree_prompt(app, project),
         MenuAction::OpenLink(url) => open_link(app, &url, out),
         MenuAction::ViewPrDiff => request_pr_diff(app),
+        MenuAction::CommentPullRequest => open_pr_comment(app),
         MenuAction::EditLink(id) => open_prompt(app, PromptKind::EditLink { id }),
         MenuAction::DeleteLink(id) => {
             if let Some(row) = app
@@ -5974,10 +6239,11 @@ fn restore_workspace_project(app: &mut App) {
 fn restore_context(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.sel_worktree = 0;
     schedule_open_prs_lookup(app);
+    crate::issues::schedule_prefetch(app);
     schedule_pr_detail(app);
     if let Some(pid) = app.selected_project().map(|p| p.id.clone()) {
         if let Some(wid) = app.last_worktree_for_project.get(&pid).cloned() {
-            if let Some(i) = app.visible_worktrees().iter().position(|w| w.id == wid) {
+            if let Some(i) = app.worktree_row_of(&wid) {
                 app.sel_worktree = i;
             }
         }
@@ -6078,7 +6344,7 @@ fn select_worktree_by_id(
     id: &nebula_core::WorktreeId,
     out: &mut Vec<ClientRequest>,
 ) -> bool {
-    let Some(index) = app.visible_worktrees().iter().position(|w| &w.id == id) else {
+    let Some(index) = app.worktree_row_of(id) else {
         return false;
     };
     if app.sel_worktree != index {
@@ -6229,9 +6495,7 @@ fn jump_to_target_inner(
                 .find(|w| w.id == id)
                 .map(|w| w.project_id.clone())
                 .is_some_and(|pid| select_project_row_by_id(app, &pid));
-            let index = found
-                .then(|| app.visible_worktrees().iter().position(|w| w.id == id))
-                .flatten();
+            let index = found.then(|| app.worktree_row_of(&id)).flatten();
             let Some(index) = index else {
                 app.flash = Some("worktree no longer exists".into());
                 return;
@@ -6256,11 +6520,7 @@ fn jump_to_target_inner(
                     .is_some_and(|pid| select_project_row_by_id(app, &pid))
             });
             let wt_index = found
-                .then(|| {
-                    app.visible_worktrees()
-                        .iter()
-                        .position(|w| Some(&w.id) == worktree.as_ref())
-                })
+                .then(|| worktree.as_ref().and_then(|wid| app.worktree_row_of(wid)))
                 .flatten();
             let Some(wt_index) = wt_index else {
                 app.flash = Some(SESSION_GONE.into());
@@ -6314,15 +6574,13 @@ fn jump_to_target_inner(
                 app.open_prs_collapsed = false;
                 app.dirty = true;
             }
-            let checkouts = app.visible_worktrees().len();
-            let Some(index) = app.visible_open_prs().iter().position(|pr| pr.url == url) else {
+            let Some(row) = app.open_pr_row_of(&url) else {
                 app.flash = Some(PR_GONE.into());
                 return;
             };
             // Re-picking the row the cursor is already on keeps the
             // reader's scroll; a move re-arms the detail fetch as any
             // cursor move onto the row does.
-            let row = checkouts + index;
             if app.sel_worktree != row {
                 select_worktree_row(app, row, out);
             }
@@ -6361,11 +6619,7 @@ fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
             .is_some_and(|pid| select_project_row_by_id(app, &pid))
     });
     let wt_index = found
-        .then(|| {
-            app.visible_worktrees()
-                .iter()
-                .position(|w| Some(&w.id) == worktree.as_ref())
-        })
+        .then(|| worktree.as_ref().and_then(|wid| app.worktree_row_of(wid)))
         .flatten();
     let Some(wt_index) = wt_index else {
         app.flash = Some(SESSION_GONE.into());
@@ -6471,7 +6725,15 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
             {
                 app.open_prs_collapsed = false;
                 app.dirty = true;
-                select_worktree_row(app, checkouts, out);
+                // The first pull request's row, once the group is open —
+                // a checkout that just moved under one leaves the plain
+                // rows, so it is not simply the old count.
+                let first = app
+                    .worktree_rows()
+                    .iter()
+                    .position(|row| row.open_pr().is_some())
+                    .unwrap_or(checkouts);
+                select_worktree_row(app, first, out);
                 return;
             }
             (checkouts, app.sel_worktree)
@@ -6862,45 +7124,6 @@ fn fire_pending_prewarm(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.next_keepwarm = Some(std::time::Instant::now() + KEEPWARM_REFRESH);
 }
 
-/// Ask the daemon for a new agent session and attach it once the Ack lands.
-/// An empty `name` takes the generated default (agent-1, …) and opts the
-/// session into agent-driven auto-titling (`nebula rename` on the first
-/// prompt) — what every launch from the NEW SESSION box and the QUICK
-/// PROMPT does, and what the `skip_session_naming` setting does without
-/// asking. A typed name (a PR SESSION's prompt) is the user's choice and
-/// stays.
-struct AgentLaunchDraft {
-    worktree: WorktreeId,
-    kind: AgentKind,
-    /// Registry id when `kind` is [`AgentKind::Custom`].
-    custom: Option<String>,
-    model: Option<String>,
-    effort: Option<String>,
-    name: String,
-    cloud_prompt: Option<String>,
-    /// An AGENT PRESET launch's composed first prompt (see
-    /// `ClientRequest::CreateAgent::starting_prompt`).
-    starting_prompt: Option<String>,
-    /// The prompt (and its typed text) to bring back should the daemon
-    /// refuse the create — so a rejected preset task is not lost.
-    reopen_on_error: Option<(PromptKind, String)>,
-    /// OPEN PRS launch context: this launch is a PR SESSION, scoped to that
-    /// pull request and run in a checkout of its head branch.
-    pr: Option<crate::pull_request::PrLaunch>,
-    /// ISSUES MODAL launch context: this launch is an ISSUE SESSION, and
-    /// the DAEMON persists the URL as the row's context (see
-    /// `ClientRequest::CreateAgent::issue_url`).
-    issue_url: Option<String>,
-    /// Enter and lock the TERMINAL PANE once the create is acked. True for
-    /// every launch the user walked a picker to reach; the QUICK PROMPT
-    /// passes the `quick_prompt_focus` SETTING, which is off by default.
-    focus_pane: bool,
-    /// The stand-in session row already on screen for this create (a
-    /// QUICK PROMPT into a worktree that did not exist): the Ack turns it
-    /// into the created row, an Error drops it.
-    placeholder: Option<AgentId>,
-}
-
 /// Flashed at a launch, a delete or a terminal aimed at a QUICK PROMPT
 /// stand-in checkout the DAEMON has not cut yet.
 const WORKTREE_STILL_CREATING: &str = "worktree is still being created";
@@ -6916,6 +7139,14 @@ fn project_of_worktree(app: &App, worktree: &WorktreeId) -> Option<ProjectId> {
 }
 
 fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequest>) {
+    // A stand-in checkout is not a place the DAEMON knows. A launch that
+    // made it (a QUICK PROMPT's, a PR SESSION's) follows on its own Ack;
+    // one fired into the NEW WORKTREE modal's row waits on that Ack
+    // instead of being refused.
+    if app.is_placeholder_worktree(&draft.worktree) {
+        placeholder::defer_launch(app, draft, out);
+        return;
+    }
     let AgentLaunchDraft {
         worktree,
         kind,
@@ -6931,12 +7162,6 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
         focus_pane,
         placeholder,
     } = draft;
-    // A QUICK PROMPT stand-in checkout is not a place the DAEMON knows;
-    // the launch that made it follows on its own Ack.
-    if app.is_placeholder_worktree(&worktree) {
-        app.flash = Some(WORKTREE_STILL_CREATING.into());
-        return;
-    }
     // A PR SESSION is addressed to the PROJECT, not to a checkout: the
     // DAEMON runs it in the PR head branch's own worktree, creating that
     // checkout the first time. `worktree` here only names which project.
@@ -7018,9 +7243,12 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
             },
             task: task.clone(),
             focus: focus_pane,
-            placeholder: None,
+            placeholder,
         },
-        (None, None, None) => PendingIntent::AttachCreated { focus: focus_pane },
+        (None, None, None) => PendingIntent::AttachCreated {
+            focus: focus_pane,
+            placeholder,
+        },
     };
     let auto_title = name.is_empty();
     let name = match (auto_title, stand_in_name) {
@@ -7044,6 +7272,7 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
                 auto_title,
                 pr_url: pr.url,
                 head: pr.head,
+                starting_prompt,
             }
         }
         None => ClientRequest::CreateAgent {
@@ -8391,6 +8620,9 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // Boot the restored worktree's sessions right away — the first
             // thing the user does after launch is walk into one of them.
             schedule_prewarm(app);
+            // And ask for the restored project's open issues, so an `i`
+            // straight after launch has rows to paint.
+            crate::issues::schedule_prefetch(app);
             // The cursor came back on the session the user left on; bring
             // its terminal back with it, exactly as landing on the row would.
             // No debounce: a boot restores one remembered session once, so
@@ -8515,8 +8747,8 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         }
         ServerEvent::Ack { req_id, created } => {
             match (app.pending.remove(&req_id), created) {
-                (Some(PendingIntent::AttachCreated { focus }), Some(id)) => {
-                    attach_created(app, id, focus, None, out);
+                (Some(PendingIntent::AttachCreated { focus, placeholder }), Some(id)) => {
+                    attach_created(app, id, focus, placeholder, out);
                 }
                 (
                     Some(PendingIntent::AttachCreatedWithCloudRetry {
@@ -8586,17 +8818,28 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     }
                 }
                 (
-                    Some(PendingIntent::SelectCreatedWorktree { placeholder, .. }),
+                    Some(PendingIntent::SelectCreatedWorktree {
+                        placeholder,
+                        launch,
+                        ..
+                    }),
                     Some(EntityId::Worktree(id)),
                 ) => {
                     // The cursor and FOCUS landed on the stand-in when
                     // Enter was pressed; a cursor the user moved since
                     // stays where they put it. The prewarm that landing
                     // armed was skipped as the checkout was not on disk —
-                    // it is now.
+                    // it is now. A modal opened on the stand-in (`e`, the
+                    // task box behind it) is readdressed to the real row
+                    // inside `resolve_worktree`.
                     placeholder::resolve_worktree(app, &placeholder, &id);
                     if app.selected_worktree().is_some_and(|w| w.id == id) {
                         schedule_prewarm(app);
+                    }
+                    // A launch fired into the stand-in while the DAEMON
+                    // worked goes out now, into the checkout it cut.
+                    if let Some(draft) = launch {
+                        placeholder::replay_launch(app, *draft, &id, out);
                     }
                 }
                 (
@@ -8771,7 +9014,13 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     focus,
                     prompt,
                     text,
+                    launch,
                 }) => {
+                    // A launch waiting on the checkout goes down with it:
+                    // its stand-in session row, and the pane showing it.
+                    if let Some(agent) = launch.and_then(|draft| draft.placeholder) {
+                        placeholder::discard_agent(app, &agent, out);
+                    }
                     if placeholder::discard_worktree(app, &placeholder, out) {
                         app.focus = focus;
                     }
@@ -8782,6 +9031,13 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 Some(PendingIntent::AttachCreatedPrSession { placeholder, .. }) => {
                     placeholder::discard_pr(app, &placeholder, out);
                 }
+                // A launch that waited on the NEW WORKTREE modal's checkout
+                // and was refused once it went out: its stand-in row goes,
+                // the checkout is real and stays.
+                Some(PendingIntent::AttachCreated {
+                    placeholder: Some(stand_in),
+                    ..
+                }) => placeholder::discard_agent(app, &stand_in, out),
                 _ => {}
             }
             app.flash = Some(message);
@@ -8828,7 +9084,7 @@ fn attach_created(
 }
 
 /// A refused request's prompt comes back with what was typed in it.
-fn reopen_prompt_with(app: &mut App, kind: PromptKind, text: String) {
+pub(crate) fn reopen_prompt_with(app: &mut App, kind: PromptKind, text: String) {
     open_prompt(app, kind);
     if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
         prompt.input.set_text(text);
@@ -9099,7 +9355,7 @@ fn reconcile_selection_inner(
     }
     if let Some(wid) = &before.worktree {
         if app.selected_worktree().map(|w| w.id.clone()).as_ref() != Some(wid) {
-            match app.visible_worktrees().iter().position(|w| &w.id == wid) {
+            match app.worktree_row_of(wid) {
                 Some(i) => app.sel_worktree = i,
                 None => {
                     restore_session(app, out);
@@ -10874,6 +11130,171 @@ mod tests {
         assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(9));
     }
 
+    /// A checkout on an open pull request's head branch — the one a PR
+    /// SESSION works in — lists under that pull request's row, not among
+    /// the plain checkouts above the group, so the checkout and the pull
+    /// request it is for read as one thing. It is still a worktree row:
+    /// the cursor on it has that worktree and no pull request. The ROOT
+    /// WORKTREE never nests, and a pull request off screen — the group
+    /// folded, or a draft `hide_draft_prs` keeps out — takes no checkout
+    /// with it: the row is plain again rather than gone.
+    #[test]
+    fn a_checkout_on_a_pull_requests_head_branch_nests_under_its_row() {
+        use crate::app::WorktreeRow;
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 / w1(main) / a1
+        seed_feat_worktree(&mut app, "w2", "pr-7-head");
+        seed_feat_worktree(&mut app, "w3", "feat");
+        seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Number the lines")]);
+        let rows = |app: &App| -> Vec<String> {
+            app.worktree_rows()
+                .iter()
+                .map(|r| match r {
+                    WorktreeRow::Checkout(w) => w.branch.clone(),
+                    WorktreeRow::Pr(pr) => format!("#{}", pr.number),
+                    WorktreeRow::PrCheckout { worktree, pr } => {
+                        format!("#{} └ {}", pr.number, worktree.branch)
+                    }
+                })
+                .collect()
+        };
+        assert_eq!(rows(&app), ["main", "feat", "#7", "#7 └ pr-7-head", "#9"]);
+        assert_eq!(app.worktree_row_count(), 5);
+
+        app.sel_worktree = 2;
+        assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+        assert!(app.selected_worktree().is_none(), "a pull request row");
+        app.sel_worktree = 3;
+        assert_eq!(
+            app.selected_worktree().map(|w| w.id.0.clone()),
+            Some("w2".into()),
+            "the row under it is the checkout"
+        );
+        assert!(
+            app.selected_worktree_pr().is_none(),
+            "…and not the pull request"
+        );
+        assert_eq!(app.worktree_row_of(&WorktreeId("w2".into())), Some(3));
+        assert_eq!(app.open_pr_row_of(&pr_url(7)), Some(2));
+
+        // Folded, the pull requests are off screen and the checkout is a
+        // plain row again — nothing you have is hidden by hiding them.
+        app.open_prs_collapsed = true;
+        assert_eq!(rows(&app), ["main", "pr-7-head", "feat"]);
+        app.open_prs_collapsed = false;
+
+        // A draft kept out by the setting takes no checkout with it either.
+        let pid = app.selected_project().expect("a project").id.clone();
+        app.open_prs.get_mut(&pid).unwrap().list[0].is_draft = true;
+        app.hide_draft_prs = true;
+        assert_eq!(rows(&app), ["main", "pr-7-head", "feat", "#9"]);
+        app.hide_draft_prs = false;
+        assert_eq!(rows(&app), ["main", "feat", "#7", "#7 └ pr-7-head", "#9"]);
+
+        // The ROOT WORKTREE never nests, whatever branch it is on.
+        app.open_prs.get_mut(&pid).unwrap().list[1].head = "main".into();
+        assert_eq!(rows(&app), ["main", "feat", "#7", "#7 └ pr-7-head", "#9"]);
+    }
+
+    /// The cursor keeps its checkout as the rows regroup around it: the
+    /// `gh pr list` answer that first lists a pull request moves the
+    /// checkout on its branch under it; a fold puts it back among the
+    /// plain rows and an unfold takes it under again; hiding a draft frees
+    /// its checkout and showing it takes it back; and the answer that
+    /// retires the pull request frees it for good. None of these lands
+    /// the cursor on some other row.
+    #[test]
+    fn the_cursor_follows_a_checkout_that_moves_under_or_out_from_under_its_pull_request() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_feat_worktree(&mut app, "w2", "pr-7-head");
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        let w2 = WorktreeId("w2".into());
+        let on_w2 = |app: &App| app.selected_worktree().map(|w| w.id.clone()) == Some(w2.clone());
+        app.sel_worktree = 1;
+        assert!(on_w2(&app));
+        let pid = app.selected_project().expect("a project").id.clone();
+        let listed = vec![crate::pull_request::OpenPr {
+            number: 7,
+            title: "Attach links".into(),
+            url: pr_url(7),
+            is_draft: false,
+            head: "pr-7-head".into(),
+        }];
+
+        // The list lands: the checkout moves under #7, the cursor with it.
+        note_open_prs_answer(&mut app, pid.clone(), Some(listed), &mut out);
+        assert_eq!(app.worktree_row_of(&w2), Some(2));
+        assert_eq!(app.sel_worktree, 2);
+        assert!(on_w2(&app));
+
+        // Folding frees it; unfolding nests it again.
+        toggle_open_prs(&mut app, &mut out);
+        assert!(app.open_prs_collapsed);
+        assert_eq!(app.sel_worktree, 1);
+        assert!(on_w2(&app));
+        toggle_open_prs(&mut app, &mut out);
+        assert_eq!(app.sel_worktree, 2);
+        assert!(on_w2(&app));
+
+        // A draft hidden by the setting frees its checkout; shown, it
+        // takes it back.
+        app.open_prs.get_mut(&pid).unwrap().list[0].is_draft = true;
+        assert!(
+            !set_hide_draft_prs(&mut app, true),
+            "the cursor never left a checkout"
+        );
+        assert_eq!(app.sel_worktree, 1);
+        assert!(on_w2(&app));
+        set_hide_draft_prs(&mut app, false);
+        assert_eq!(app.sel_worktree, 2);
+        assert!(on_w2(&app));
+
+        // The pull request merges: the next answer lists it no more, and
+        // the checkout is a plain row, still under the cursor.
+        note_open_prs_answer(&mut app, pid, Some(Vec::new()), &mut out);
+        assert_eq!(app.worktree_row_count(), 2);
+        assert_eq!(app.sel_worktree, 1);
+        assert!(on_w2(&app));
+    }
+
+    /// Stepping ↓ off the last plain checkout into a folded group opens it
+    /// onto its first pull request. That row is no longer "one past the
+    /// checkouts" once the checkout on its branch has moved under it, so
+    /// the landing is looked up rather than counted — and the next ↓ is
+    /// the checkout beneath.
+    #[test]
+    fn stepping_into_a_folded_group_lands_on_the_pull_request_over_its_checkout() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_feat_worktree(&mut app, "w2", "pr-7-head");
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        app.open_prs_collapsed = true;
+        app.focus = Focus::Worktrees;
+        // The checkout is a plain row while the group is folded: the last.
+        app.sel_worktree = 1;
+        assert_eq!(
+            app.selected_worktree().map(|w| w.branch.as_str()),
+            Some("pr-7-head")
+        );
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert!(!app.open_prs_collapsed, "↓ opened the group");
+        assert_eq!(app.sel_worktree, 1);
+        assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.sel_worktree, 2);
+        assert_eq!(
+            app.selected_worktree().map(|w| w.branch.as_str()),
+            Some("pr-7-head"),
+            "then the checkout under it"
+        );
+        assert!(app.selected_worktree_pr().is_none());
+    }
+
     /// Enter on an open-PR row hands it to the browser and stays put — and
     /// walking into the group must not detach the session on screen: a pull
     /// request has no sessions of its own, so the pane keeps the checkout's.
@@ -11316,7 +11737,11 @@ mod tests {
                 .collect();
             let sessions = expected.len();
             assert!(expected.contains(&"New Codex session".to_string()));
-            expected.extend(["Open in browser".to_string(), "View diff".to_string()]);
+            expected.extend([
+                "Open in browser".to_string(),
+                "View diff".to_string(),
+                "Comment…".to_string(),
+            ]);
             open_context_menu_for_selection(&mut app);
             let Some(Overlay::Menu(menu)) = &app.overlay else {
                 panic!("expected the OPEN PRS context menu, got {:?}", app.overlay);
@@ -12620,6 +13045,209 @@ mod tests {
             !items.iter().any(|i| i.label == "Delete"),
             "still not the user's row: {items:?}"
         );
+    }
+
+    /// `y` on a pull request row — the PROJECT OPEN PRS GROUP's or the
+    /// Sessions panel's PR ROW — opens the COMMENT BOX: a multi-row task
+    /// box titled with the row, carrying the pull request Enter will post
+    /// to. Off a pull request row the key only says what it wants, and
+    /// both rows' menus offer the same box as **Comment…**.
+    #[test]
+    fn y_on_a_pull_request_row_opens_the_comment_box() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 1;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+            panic!("expected the COMMENT BOX, got {:?}", app.overlay);
+        };
+        assert!(
+            prompt.is_multiline(),
+            "a comment is a task box, not a one-liner"
+        );
+        assert_eq!(prompt.title, "Comment on #7 Attach links");
+        assert!(
+            matches!(&prompt.kind, PromptKind::PrComment { number: 7, url, .. } if *url == pr_url(7)),
+            "{:?}",
+            prompt.kind
+        );
+        assert!(out.is_empty(), "opening the box sends the daemon nothing");
+
+        // The row's menu offers the same box.
+        app.overlay = None;
+        let pr = app.all_open_prs()[0].clone();
+        let items = pr_row_menu_items(&app, &pr);
+        assert!(
+            items
+                .iter()
+                .any(|i| i.label == "Comment…" && i.action == MenuAction::CommentPullRequest),
+            "{items:?}"
+        );
+        run_menu_action(&mut app, MenuAction::CommentPullRequest, &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Prompt(p))
+                if matches!(&p.kind, PromptKind::PrComment { number: 7, .. })),
+            "{:?}",
+            app.overlay
+        );
+
+        // The Sessions panel's PR ROW opens it too, and so does its menu.
+        app.overlay = None;
+        app.sel_worktree = 0;
+        seed_branch_pr(&mut app, 9, "Fix login");
+        app.focus = Focus::Sessions;
+        app.sel_session = sessions_pr_row(&app);
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Prompt(p))
+                if matches!(&p.kind, PromptKind::PrComment { number: 9, .. })),
+            "{:?}",
+            app.overlay
+        );
+        let items = menu_items_for_link(&app.selected_link().expect("the PR ROW"));
+        assert!(items.iter().any(|i| i.label == "Comment…"), "{items:?}");
+
+        // Off a pull request row there is nothing to comment on.
+        app.overlay = None;
+        let pr_row = sessions_pr_row(&app);
+        app.sel_session = (0..app.visible_session_rows().len())
+            .find(|i| *i != pr_row)
+            .expect("an agent row");
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "{:?}", app.overlay);
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("move onto a pull request row to comment on it")
+        );
+    }
+
+    /// Enter in the COMMENT BOX hands the text to `gh` off the loop, and
+    /// what lands decides the rest. A post that cannot start — the
+    /// checkout is not on disk, one is already running on this pull
+    /// request — hands the box straight back with the text; a refusal
+    /// from `gh` does the same in its words, or keeps the text for the
+    /// next box when another modal is up; a success says so and re-reads
+    /// the pull request so the pane shows the comment, the reader's place
+    /// kept. An empty box is a change of mind.
+    #[test]
+    fn the_comment_box_posts_on_enter_and_never_loses_the_text() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 1;
+        app.tree.projects[0].repo_path = "/nonexistent/nebula-demo".into();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.pr_comment_tx = Some(tx);
+        let mut out = Vec::new();
+        let answer = |body: &str, result: Result<String, String>| PrCommentAnswer {
+            number: 7,
+            url: pr_url(7),
+            label: "#7 Attach links".into(),
+            body: body.into(),
+            result,
+        };
+
+        // Nothing typed: the box closes and nothing is posted.
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "{:?}", app.overlay);
+        assert_eq!(app.flash.as_deref(), Some("cancelled: empty input"));
+
+        // Shift+Enter breaks a line; Enter posts — here from a checkout
+        // that is not on disk, so the box comes back with the text.
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        type_text(&mut app, "Looks good", &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
+        type_text(&mut app, "to me", &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+            panic!("expected the box back, got {:?}", app.overlay);
+        };
+        assert_eq!(prompt.input.as_str(), "Looks good\nto me");
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("repo path missing on disk: /nonexistent/nebula-demo")
+        );
+        assert!(app.pr_comment_inflight.is_empty(), "nothing started");
+        assert!(rx.try_recv().is_err(), "nothing posted");
+
+        // One already on its way to this pull request: wait, text kept.
+        app.pr_comment_inflight.insert(pr_url(7));
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Prompt(p)) if p.input.as_str() == "Looks good\nto me"),
+            "{:?}",
+            app.overlay
+        );
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("still posting the last comment on #7…")
+        );
+        app.pr_comment_inflight.clear();
+        app.overlay = None;
+
+        // A refusal lands in gh's words and the box comes back with the text.
+        land_pr_comment(&mut app, answer("Looks good", Err("not logged in".into())));
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("couldn't post the comment on #7: not logged in")
+        );
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Prompt(p))
+                if p.input.as_str() == "Looks good" && p.title == "Comment on #7 Attach links"),
+            "{:?}",
+            app.overlay
+        );
+
+        // Landing under another modal leaves it up and keeps the text for
+        // the next box on this pull request.
+        app.overlay = Some(Overlay::Help(HelpView::default()));
+        land_pr_comment(&mut app, answer("Second try", Err("no network".into())));
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Help(_))),
+            "{:?}",
+            app.overlay
+        );
+        app.overlay = None;
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Prompt(p)) if p.input.as_str() == "Second try"),
+            "{:?}",
+            app.overlay
+        );
+        app.overlay = None;
+        assert!(app.pr_comment_drafts.is_empty(), "the draft was consumed");
+
+        // Posted: the pane re-reads the pull request it is on, in place.
+        app.pr_detail.insert(pr_url(7), a_detail(7, "body", vec![]));
+        app.pending_pr_detail = None;
+        app.pr_preview_scroll = 3;
+        land_pr_comment(
+            &mut app,
+            answer("Looks good", Ok(format!("{}#issuecomment-1", pr_url(7)))),
+        );
+        assert_eq!(app.flash.as_deref(), Some("comment posted on #7"));
+        assert!(
+            app.pending_pr_detail
+                .as_ref()
+                .is_some_and(|(p, _)| p.url == pr_url(7)),
+            "the conversation is asked for again: {:?}",
+            app.pending_pr_detail
+        );
+        assert_eq!(app.pr_preview_scroll, 3, "the reader's place is kept");
+        assert!(app.overlay.is_none());
+
+        // Posted on a pull request the pane has since left: stale, so the
+        // next visit reads it afresh.
+        app.sel_worktree = 0;
+        app.pending_pr_detail = None;
+        land_pr_comment(&mut app, answer("Looks good", Ok(String::new())));
+        assert!(app.pending_pr_detail.is_none());
+        assert!(app.pr_detail_stale.contains(&pr_url(7)));
     }
 
     /// PgDn/PgUp/Home/End page the preview, clamped to its real length —
@@ -15813,7 +16441,7 @@ diff --git a/src/c.rs b/src/c.rs
             assert!(
                 !labels.contains(&"New Claude session")
                     && labels.contains(&"New Codex session")
-                    && labels.ends_with(&["Open in browser", "View diff"]),
+                    && labels.ends_with(&["Open in browser", "View diff", "Comment…"]),
                 "{labels:?}"
             );
 
@@ -15872,7 +16500,7 @@ diff --git a/src/c.rs b/src/c.rs
                     panic!("expected the OPEN PRS context menu, got {:?}", app.overlay);
                 };
                 let labels: Vec<&str> = menu.items.iter().map(|item| item.label.as_str()).collect();
-                assert_eq!(labels, ["Open in browser", "View diff"]);
+                assert_eq!(labels, ["Open in browser", "View diff", "Comment…"]);
             },
         );
     }
@@ -22763,6 +23391,71 @@ diff --git a/src/c.rs b/src/c.rs
         });
     }
 
+    /// Enter on a markdown file reads it first: the FILE TABS take the
+    /// finder's place with the rendered page, and Enter there is the
+    /// editor. The same rule serves a `.md` ⌥clicked in the pane.
+    #[test]
+    fn a_markdown_file_from_the_finder_or_a_clicked_path_is_read_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        std::fs::write(repo.join("notes.md"), "# Notes\n\n- one\n").unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.vim_tx = Some(tx);
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE, &mut out);
+        for c in ['n', 'o', 't'] {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(finder(&app).selected_path(), Some("notes.md"));
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.vim.is_none(), "no editor yet");
+        let Some(Overlay::FileTabs(tabs)) = &app.overlay else {
+            panic!("expected the file tabs, got {:?}", app.overlay);
+        };
+        assert_eq!(tabs.tabs.len(), 1);
+        assert_eq!(tabs.tabs[0].label, "notes.md");
+        assert!(tabs.renders_markdown(), "the rendered page, not the source");
+        assert_eq!(tabs.preview_text, "# Notes\n\n- one");
+
+        // Enter in the tabs is the editor, embedded under the strip. A
+        // shell stands in for vim.
+        if let Some(Overlay::FileTabs(t)) = &mut app.overlay {
+            t.editor = "/bin/sh".into();
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let vim = app.vim.as_ref().expect("enter edits");
+        assert!(vim.embedded, "the editor takes the preview pane");
+        assert!(
+            matches!(&app.overlay, Some(Overlay::FileTabs(_))),
+            "the tabs stay underneath"
+        );
+
+        // A clicked path takes the same route; a code file still goes
+        // straight to the editor.
+        app.vim = None;
+        app.overlay = None;
+        open_file_link(&mut app, "notes.md", Some(3));
+        let Some(Overlay::FileTabs(tabs)) = &app.overlay else {
+            panic!("expected the file tabs, got {:?}", app.overlay);
+        };
+        assert_eq!(tabs.tabs[0].label, "notes.md");
+        assert!(tabs.renders_markdown());
+        assert!(app.vim.is_none());
+        app.overlay = None;
+        with_config_json(r#"{"editor": "/bin/sh"}"#, || {
+            open_file_link(&mut app, "a.txt", Some(1));
+        });
+        assert!(app.overlay.is_none(), "no tabs for a text file");
+        assert_eq!(
+            app.vim.as_ref().map(|v| v.title.as_str()),
+            Some("a.txt:1"),
+            "the editor, at the line"
+        );
+    }
+
     #[test]
     fn close_finder_on_open_leaves_only_the_editor_modal() {
         let dir = tempfile::tempdir().unwrap();
@@ -22918,6 +23611,78 @@ diff --git a/src/c.rs b/src/c.rs
             .iter()
             .map(|r| v.nodes[r.node].path.clone())
             .collect()
+    }
+
+    /// A markdown file previews as the rendered page — a bullet, no `#`,
+    /// the scroller counting rendered rows — and Ctrl+r flips it to the
+    /// numbered source and back. On any other file Ctrl+r is nothing: the
+    /// filter ignores it, and the choice made on the markdown file holds.
+    #[test]
+    fn ctrl_r_flips_a_markdown_preview_between_the_page_and_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        std::fs::write(repo.join("notes.md"), "# Notes\n\n- one\n").unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.vim_tx = Some(tx);
+        let mut out = Vec::new();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
+        for c in ['n', 'o', 't'] {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(tree_view(&app).selected_node().unwrap().path, "notes.md");
+        assert!(
+            tree_view(&app).renders_markdown(),
+            "markdown opens rendered"
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("• one"), "the page:\n{text}");
+        assert!(!text.contains("# Notes"), "no heading marker:\n{text}");
+        let view = tree_view(&app);
+        assert_eq!(
+            view.preview_line_count, 4,
+            "heading, rule, blank, bullet — the rendered rows"
+        );
+        assert!(view.rendered.is_some(), "the flowed page is kept");
+
+        press(
+            &mut app,
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        assert!(!tree_view(&app).renders_markdown());
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains(" 1 # Notes"), "the source, numbered:\n{text}");
+        assert_eq!(tree_view(&app).preview_line_count, 3, "the source lines");
+
+        // Off markdown, Ctrl+r reaches the filter, which ignores it.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        for c in ['a', '.', 't'] {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(tree_view(&app).selected_node().unwrap().path, "a.txt");
+        assert!(!tree_view(&app).markdown);
+        press(
+            &mut app,
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        assert_eq!(tree_view(&app).filter.as_str(), "a.t", "not typed");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        for c in ['n', 'o', 't'] {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        assert!(
+            !tree_view(&app).renders_markdown(),
+            "the source stays chosen across files"
+        );
     }
 
     #[test]
@@ -25492,6 +26257,168 @@ diff --git a/src/c.rs b/src/c.rs
         });
     }
 
+    /// A pull request row has no checkout and so no sessions: while the
+    /// Worktrees cursor rests on one the Sessions column folds to its
+    /// bare rule and the pane takes the width, with `hide_sessions` —
+    /// the user's own preference — untouched and unsaved. There is no
+    /// chevron on that rule and nothing under it to click: the column
+    /// opens itself again on the next checkout.
+    #[test]
+    fn sessions_panel_folds_to_a_rule_under_a_pull_request_row() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app); // p1 / w1(main) / a1
+            seed_default_workspace(&mut app);
+            seed_open_prs(&mut app, &[(7, "Attach links")]);
+            let mut out = Vec::new();
+            let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+
+            app.focus = Focus::Worktrees;
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            assert!(buffer_text(&terminal).contains("SESSIONS"));
+            assert!(app.panel_expanded(2));
+            let widths = app.panel_widths;
+
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+            assert!(app.sessions_collapsed());
+            assert!(!app.panel_expanded(2));
+            assert_eq!(app.expanded_panel_indices(), vec![0, 1]);
+            assert_eq!(app.panel_draw_width(2), crate::app::COLLAPSED_RAIL_W);
+            assert!(!app.hide_sessions, "the preference is untouched");
+            assert!(
+                !crate::config::Config::load().hide_sessions,
+                "and nothing is written"
+            );
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(!text.contains("SESSIONS"), "{text}");
+            assert!(
+                !app.hits
+                    .iter()
+                    .any(|(_, h)| *h == HitTarget::CollapsePanel(Focus::Sessions)),
+                "nothing to expand: the rule carries no click target"
+            );
+            // The column after the Worktrees rule is the sessions rule
+            // itself, and it carries no expand chevron.
+            let x = app.splitter_x(1);
+            let y = app.body_area.y + app.workspaces_bar_h() + 1;
+            let cell = terminal.backend().buffer().cell((x, y)).unwrap();
+            assert_ne!(cell.symbol(), "▶", "no chevron at ({x}, {y}):\n{text}");
+            assert_eq!(
+                app.term_area.x,
+                widths[0] + widths[1] + crate::app::COLLAPSED_RAIL_W + 1,
+                "the pane takes the released width"
+            );
+
+            press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+            assert!(app.selected_worktree().is_some());
+            assert!(app.panel_expanded(2));
+            assert_eq!(app.panel_widths, widths, "the remembered width survives");
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            assert!(buffer_text(&terminal).contains("SESSIONS"));
+        });
+    }
+
+    /// A Sessions panel collapsed by hand is the user's choice: it stays a
+    /// rail — chevron, click target and all — on the pull request row and
+    /// on the checkout after it. `Shift+S` on the pull request row flips
+    /// the preference as it does anywhere; what the eye sees changes on
+    /// the next checkout.
+    #[test]
+    fn a_sessions_panel_hidden_by_hand_stays_a_rail_on_every_row() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            seed_default_workspace(&mut app);
+            seed_open_prs(&mut app, &[(7, "Attach links")]);
+            let mut out = Vec::new();
+            let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+            let rail_target = |app: &App| {
+                app.hits
+                    .iter()
+                    .any(|(_, h)| *h == HitTarget::CollapsePanel(Focus::Sessions))
+            };
+
+            app.focus = Focus::Worktrees;
+            press(&mut app, KeyCode::Char('S'), KeyModifiers::SHIFT, &mut out);
+            assert!(app.hide_sessions);
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            assert!(rail_target(&app), "the rail expands on click");
+
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            assert!(app.selected_worktree_pr().is_some());
+            assert!(app.hide_sessions);
+            assert!(!app.panel_expanded(2));
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            assert!(rail_target(&app), "still the user's rail on a pull request");
+
+            press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+            assert!(app.selected_worktree().is_some());
+            assert!(
+                app.hide_sessions,
+                "the checkout does not reopen a hidden panel"
+            );
+            assert!(!app.panel_expanded(2));
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            assert!(!buffer_text(&terminal).contains("SESSIONS"));
+
+            // Shown again from the pull request row: the preference flips
+            // and persists, the column stays folded until a checkout.
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('S'), KeyModifiers::SHIFT, &mut out);
+            assert!(!app.hide_sessions);
+            assert!(!crate::config::Config::load().hide_sessions);
+            assert!(!app.panel_expanded(2), "a pull request row keeps it folded");
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            assert!(!rail_target(&app), "and it is the bare rule now");
+            press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+            assert!(app.panel_expanded(2));
+        });
+    }
+
+    /// The fold a pull request row causes has no keypress to move focus
+    /// off the panel, so the frame does: a Sessions focus whose checkout
+    /// went away under it — the cursor re-seated on the pull request
+    /// beside it — lands on the Worktrees cursor, and the Tab walk from
+    /// there skips the folded column for the pane, as it skips a hidden
+    /// one. With no column open to the left, the pane takes it.
+    #[test]
+    fn focus_leaves_a_sessions_panel_the_cursor_folded() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_default_workspace(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        let mut out = Vec::new();
+        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+
+        app.focus = Focus::Sessions;
+        app.sel_worktree = 1; // re-seated onto the pull request, no key pressed
+        assert!(!app.focus_visible(Focus::Sessions));
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.focus, Focus::Worktrees);
+
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.focus, Focus::Terminal, "Tab skips the folded column");
+        press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
+        assert_eq!(app.focus, Focus::Worktrees, "and so does the way back");
+
+        app.hide_projects = true;
+        app.hide_worktrees = true;
+        app.show_workspaces = false;
+        app.focus = Focus::Sessions;
+        app.settle_focus();
+        assert_eq!(app.focus, Focus::Terminal);
+
+        // Back on a checkout the panel is open, and focus is left alone.
+        app.hide_projects = false;
+        app.hide_worktrees = false;
+        app.sel_worktree = 0;
+        app.focus = Focus::Sessions;
+        app.settle_focus();
+        assert_eq!(app.focus, Focus::Sessions);
+    }
+
     #[test]
     fn ctrl_b_collapses_every_panel_and_brings_them_back() {
         with_default_config(|| {
@@ -26247,7 +27174,7 @@ diff --git a/src/c.rs b/src/c.rs
     /// Route the preset store at a temp file (and the config at a default
     /// one) and pre-seed two presets: "reviewer" (claude · opus · high,
     /// wrapped) then "scratch" (codex · gpt-5.5, bare).
-    fn with_seeded_presets(f: impl FnOnce()) {
+    pub(super) fn with_seeded_presets(f: impl FnOnce()) {
         use crate::agent_presets::AgentPreset;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent_presets.json");
@@ -26297,6 +27224,276 @@ diff --git a/src/c.rs b/src/c.rs
         for c in text.chars() {
             press(app, KeyCode::Char(c), KeyModifiers::NONE, out);
         }
+    }
+
+    /// `e` on a PROJECT OPEN PRS GROUP row is the preset picker for a PR
+    /// SESSION: the pick hands the QUICK PROMPT back titled for the PR,
+    /// `Ctrl+N` in it is refused (the DAEMON picks the checkout), and
+    /// Enter sends one `CreatePrAgent` — the PR's URL and head branch,
+    /// the preset's harness / model / effort, and prefix + task + postfix
+    /// as its STARTING PROMPT — with the stand-in rows up for the checkout
+    /// the DAEMON is about to cut. A checkout already on the head branch
+    /// stages nothing: the DAEMON reuses it. A `skip`-task preset launches
+    /// from the picker at once.
+    #[test]
+    fn e_on_an_open_pr_row_picks_a_preset_and_launches_a_pr_session_on_it() {
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            seed_open_prs(&mut app, &[(7, "Attach links")]);
+            app.focus = Focus::Worktrees;
+            app.sel_worktree = 1;
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresets(view)) = &app.overlay else {
+                panic!(
+                    "e on a PR row opens the preset picker, got {:?}",
+                    app.overlay
+                );
+            };
+            assert!(
+                view.is_picker(),
+                "pick-only: presets are managed in Sessions"
+            );
+            let back = view.quick.as_ref().expect("is_picker");
+            assert_eq!(back.launch.pr.as_ref().map(|pr| pr.number), Some(7));
+            assert_eq!(
+                back.launch.target,
+                crate::quick_prompt::QuickTarget::Worktree(WorktreeId("w1".into())),
+                "the ROOT WORKTREE names the project the create goes to"
+            );
+            assert!(out.is_empty(), "nothing is sent for a pick: {out:?}");
+
+            // Enter on "reviewer": the box, for the PR and the preset.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("the pick hands the box back, got {:?}", app.overlay);
+            };
+            assert_eq!(
+                prompt.title,
+                "Quick prompt · PR #7 · reviewer (claude · opus · high)"
+            );
+
+            // Ctrl+N has nothing to flip: the checkout is the DAEMON's.
+            press(
+                &mut app,
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert_eq!(
+                app.flash.as_deref(),
+                Some("quick prompt: a PR session runs in the pull request's own checkout")
+            );
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(prompt))
+                        if matches!(&prompt.kind, PromptKind::QuickPrompt(launch) if launch.pr.is_some())
+                ),
+                "the box stays up, for the PR: {:?}",
+                app.overlay
+            );
+
+            type_text(&mut app, "Fix auth", &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            let creates: Vec<&ClientRequest> = out
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r,
+                        ClientRequest::CreatePrAgent { .. } | ClientRequest::CreateAgent { .. }
+                    )
+                })
+                .collect();
+            assert!(
+                matches!(
+                    creates.as_slice(),
+                    [ClientRequest::CreatePrAgent {
+                        project,
+                        kind: AgentKind::Claude,
+                        model: Some(model),
+                        effort: Some(effort),
+                        auto_title: true,
+                        pr_url,
+                        head,
+                        starting_prompt: Some(text),
+                        ..
+                    }] if project.as_str() == "p1"
+                        && model == "opus"
+                        && effort == "high"
+                        && pr_url == "https://github.com/o/r/pull/7"
+                        && head == "pr-7-head"
+                        && text == "Be strict.\n\nFix auth\n\nRun the tests."
+                ),
+                "one PR create with the sandwiched prompt: {out:?}"
+            );
+            assert!(
+                out.iter()
+                    .all(|r| !matches!(r, ClientRequest::PrewarmAgent { .. })),
+                "an unscoped warm CLI must not start for a PR SESSION: {out:?}"
+            );
+            // No checkout on the head branch yet: the stand-in rows are up
+            // for the one the DAEMON is cutting.
+            assert!(
+                app.tree
+                    .worktrees
+                    .iter()
+                    .any(|w| w.branch == "pr-7-head" && app.is_placeholder_worktree(&w.id)),
+                "{:?}",
+                app.tree.worktrees
+            );
+            out.clear();
+
+            // A checkout already on the head branch is reused: nothing is
+            // staged, and the create goes out the same.
+            let mut app = App::new();
+            seed_tree(&mut app);
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: nebula_core::Entity::Worktree(nebula_core::Worktree {
+                        id: WorktreeId("w7".into()),
+                        project_id: nebula_core::ProjectId("p1".into()),
+                        path: "/tmp/demo-worktrees/pr-7-head".into(),
+                        branch: "pr-7-head".into(),
+                        is_main: false,
+                        sort_order: 1,
+                    }),
+                },
+            );
+            seed_open_prs(&mut app, &[(7, "Attach links")]);
+            app.focus = Focus::Worktrees;
+            // The checkout on the head branch lists under the pull
+            // request, so the pull request's row is looked up, not counted.
+            app.sel_worktree = app.open_pr_row_of(&pr_url(7)).expect("#7 is a row");
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+            let rows = app.tree.worktrees.len();
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            type_text(&mut app, "Fix auth", &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert_eq!(
+                app.tree.worktrees.len(),
+                rows,
+                "no stand-in for a reused checkout"
+            );
+            assert!(
+                out.iter().any(|r| matches!(
+                    r,
+                    ClientRequest::CreatePrAgent { head, starting_prompt: Some(_), .. }
+                        if head == "pr-7-head"
+                )),
+                "{out:?}"
+            );
+            out.clear();
+
+            // A `skip`-task preset launches from the picker at once, on
+            // its prefix and postfix alone.
+            let mut presets = crate::agent_presets::load();
+            presets.push(crate::agent_presets::AgentPreset {
+                name: "ship".into(),
+                kind: AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                prefix: "Commit and push.".into(),
+                postfix: String::new(),
+                skip_task: true,
+            });
+            crate::agent_presets::save(&presets).unwrap();
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                app.overlay.is_none(),
+                "no box for a skip preset: {:?}",
+                app.overlay
+            );
+            assert!(
+                out.iter().any(|r| matches!(
+                    r,
+                    ClientRequest::CreatePrAgent { head, starting_prompt: Some(text), .. }
+                        if head == "pr-7-head" && text == "Commit and push."
+                )),
+                "{out:?}"
+            );
+        });
+    }
+
+    /// The ISSUES MODAL's comment box round-trips: Esc puts the modal back
+    /// on its row with nothing posted, an empty Enter does the same, and
+    /// Enter with text hands it to `gh` — here a checkout that isn't on
+    /// disk, so the box comes back with the text instead.
+    #[test]
+    fn the_issue_comment_box_comes_back_to_the_modal_on_its_row() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        let project = nebula_core::ProjectId("p1".into());
+        app.overlay = Some(Overlay::Issues(crate::issues::IssuesView::new(
+            project.clone(),
+            "demo".into(),
+            "/nonexistent/nebula-issue-comment-box".into(),
+        )));
+        let issue = |number: u64| crate::issues::Issue {
+            number,
+            url: format!("https://github.com/o/r/issues/{number}"),
+            title: format!("issue {number}"),
+            author: "webdevcody".into(),
+            created_at: "2026-09-10T12:00:00Z".into(),
+            updated_at: "2026-09-11T12:00:00Z".into(),
+            labels: vec![],
+            body: String::new(),
+        };
+        crate::issues::land_answer(
+            &mut app,
+            crate::issues::IssuesAnswer::List {
+                project,
+                list: Some(vec![issue(15), issue(14)]),
+            },
+        );
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        let on_row =
+            |app: &App| matches!(&app.overlay, Some(Overlay::Issues(v)) if v.selected == 1);
+        assert!(on_row(&app));
+
+        // Esc: back, nothing posted.
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE, &mut out);
+        assert!(matches!(&app.overlay, Some(Overlay::Prompt(p)) if p.title.contains("#14")));
+        type_text(&mut app, "never mind", &mut out);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(on_row(&app), "Esc puts the modal back: {:?}", app.overlay);
+
+        // An empty Enter: the same.
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(on_row(&app), "an empty box is a cancel: {:?}", app.overlay);
+        assert_eq!(app.flash.as_deref(), Some("cancelled: empty input"));
+
+        // Enter with text: posted — or, off a checkout that isn't on disk,
+        // the box comes back with the text, newline and all.
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE, &mut out);
+        type_text(&mut app, "on it", &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
+        type_text(&mut app, "today", &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+            panic!(
+                "the box should come back with the text, got {:?}",
+                app.overlay
+            );
+        };
+        assert_eq!(prompt.input.as_str(), "on it\ntoday");
+        assert!(
+            app.flash.as_deref().unwrap().contains("isn't on disk"),
+            "{:?}",
+            app.flash
+        );
+        assert!(out.is_empty(), "nothing goes to the daemon: {out:?}");
     }
 
     #[test]
@@ -26882,39 +28079,87 @@ diff --git a/src/c.rs b/src/c.rs
             .collect()
     }
 
-    /// Settings → Experimental → Hide root worktree: the ⌂ row leaves the
+    /// Hide (or show) the seeded `/tmp/demo` project's ROOT WORKTREE row
+    /// the way its PROJECT SETTING would, without going through the file.
+    pub(super) fn hide_root(app: &mut App, hidden: bool) {
+        app.projects_config.insert(
+            "/tmp/demo".into(),
+            crate::config::ProjectSettings {
+                hide_root_worktree: hidden,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Settings → Project → Hide root worktree: the ⌂ row leaves the
     /// WORKTREES PANEL (the checkout and its sessions stay in the tree), the
     /// cursor keeps naming the same branch across both toggle directions
     /// even though every index shifts by one, a cursor on the root itself
     /// lands on the first row left, and switching it off brings the row back.
+    /// It is one project's switch: the other project keeps its root row,
+    /// and the old global key is what a project without an entry reads.
     #[test]
     fn hide_root_worktree_drops_the_root_row_from_the_worktrees_panel() {
+        use crate::config::SettingKind;
+        use nebula_core::{Entity, Project, ProjectId, Worktree, WorktreeId};
+        use std::path::Path;
         with_default_config(|| {
             let mut app = App::new();
             seed_tree(&mut app);
             seed_feat_worktree(&mut app, "w2", "feat");
             seed_feat_worktree(&mut app, "w3", "feat-2");
+            // A second project, with a root checkout of its own.
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Project(Project {
+                        workspace_id: Default::default(),
+                        id: ProjectId("p2".into()),
+                        name: "other".into(),
+                        repo_path: "/tmp/other".into(),
+                        sort_order: 1,
+                    }),
+                },
+            );
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(Worktree {
+                        id: WorktreeId("w9".into()),
+                        project_id: ProjectId("p2".into()),
+                        path: "/tmp/other".into(),
+                        branch: "main".into(),
+                        is_main: true,
+                        sort_order: 0,
+                    }),
+                },
+            );
+            app.sel_project = 0;
             assert_eq!(worktree_branches(&app), ["main", "feat", "feat-2"]);
             let selected = |app: &App| app.selected_worktree().map(|w| w.branch.clone());
 
-            let mut cfg = crate::config::Config {
-                hide_root_worktree: true,
-                ..Default::default()
-            };
+            let mut cfg = crate::config::Config::default();
+            cfg.cycle_project(Path::new("/tmp/demo"), SettingKind::HideRootWorktree);
             app.sel_worktree = 1;
             assert_eq!(selected(&app).as_deref(), Some("feat"));
             apply_config(&mut app, &cfg);
-            assert!(app.hide_root_worktree);
+            assert!(app.selected_root_hidden());
             assert_eq!(worktree_branches(&app), ["feat", "feat-2"]);
             assert_eq!(
                 selected(&app).as_deref(),
                 Some("feat"),
                 "follows the row, not the index"
             );
-            assert_eq!(app.tree.worktrees.len(), 3, "hidden, not gone");
+            assert_eq!(app.tree.worktrees.len(), 4, "hidden, not gone");
             assert_eq!(app.tree.agents.len(), 1, "its session is still there");
 
-            cfg.hide_root_worktree = false;
+            // The other project is untouched: its root row stays.
+            app.sel_project = 1;
+            assert!(!app.selected_root_hidden());
+            assert_eq!(worktree_branches(&app), ["main"]);
+            app.sel_project = 0;
+
+            cfg.cycle_project(Path::new("/tmp/demo"), SettingKind::HideRootWorktree);
             apply_config(&mut app, &cfg);
             assert_eq!(worktree_branches(&app), ["main", "feat", "feat-2"]);
             assert_eq!(
@@ -26926,9 +28171,125 @@ diff --git a/src/c.rs b/src/c.rs
             // A cursor on the root itself has nowhere to follow: the first
             // row left, not an index past the end.
             app.sel_worktree = 0;
-            cfg.hide_root_worktree = true;
+            cfg.cycle_project(Path::new("/tmp/demo"), SettingKind::HideRootWorktree);
             apply_config(&mut app, &cfg);
             assert_eq!(selected(&app).as_deref(), Some("feat"));
+
+            // The key the switch lived under while it was global is the
+            // fallback: with it set, a project with no entry hides its
+            // root too.
+            let cfg = crate::config::Config {
+                hide_root_worktree: true,
+                ..Default::default()
+            };
+            apply_config(&mut app, &cfg);
+            assert_eq!(worktree_branches(&app), ["feat", "feat-2"]);
+            app.sel_project = 1;
+            assert_eq!(worktree_branches(&app), [] as [&str; 0]);
+        });
+    }
+
+    /// The PROJECT TAB in the overlay: it names the selected project on
+    /// its first line, Enter on **Hide root worktree** writes that
+    /// project's entry into `projects` (nothing else in the file moves),
+    /// the panel drops the ⌂ row at once, and the tab on another project
+    /// reads that project's own value. With no project in the tree the
+    /// row only says so.
+    #[test]
+    fn the_project_tab_edits_the_selected_projects_entry() {
+        use crate::config::SettingKind;
+        use nebula_core::{Entity, Project, ProjectId};
+        let draw_to_string = |app: &mut App, w: u16, h: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| ui::draw(f, app)).unwrap();
+            buffer_text(&terminal)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        crate::config::with_config_path(path.clone(), || {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            seed_feat_worktree(&mut app, "w2", "feat");
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Project(Project {
+                        workspace_id: Default::default(),
+                        id: ProjectId("p2".into()),
+                        name: "other".into(),
+                        repo_path: "/tmp/other".into(),
+                        sort_order: 1,
+                    }),
+                },
+            );
+            app.sel_project = 0;
+            let tab = crate::config::project_tab();
+            let (_, row) = crate::config::locate(SettingKind::HideRootWorktree).unwrap();
+            let open_on_row = |app: &mut App, out: &mut Vec<ClientRequest>| {
+                press(app, KeyCode::Char('s'), KeyModifiers::NONE, out);
+                let digit = char::from_digit(tab as u32 + 1, 10).unwrap();
+                press(app, KeyCode::Char(digit), KeyModifiers::NONE, out);
+                press(app, KeyCode::Down, KeyModifiers::NONE, out);
+                let view = settings(app).expect("settings open");
+                assert_eq!(view.tab, tab);
+                assert_eq!(view.selected, row);
+                assert!(!view.on_tabs);
+            };
+
+            open_on_row(&mut app, &mut out);
+            let screen = draw_to_string(&mut app, 100, 40);
+            assert!(screen.contains("Project"), "{screen}");
+            assert!(screen.contains("demo"), "names the project: {screen}");
+            assert!(screen.contains("/tmp/demo"), "and where it is: {screen}");
+            assert!(screen.contains("Hide root worktree"), "{screen}");
+            assert_eq!(worktree_branches(&app), ["main", "feat"]);
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let saved: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                saved["projects"],
+                serde_json::json!({ "/tmp/demo": { "hide_root_worktree": true } })
+            );
+            assert_eq!(
+                saved.get("hide_root_worktree"),
+                Some(&serde_json::json!(false)),
+                "the old global key is not what the row writes"
+            );
+            assert_eq!(worktree_branches(&app), ["feat"], "applied live");
+            let screen = draw_to_string(&mut app, 100, 40);
+            assert!(screen.contains("[on]"), "{screen}");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+            // The other project reads its own (unset) value.
+            app.sel_project = 1;
+            open_on_row(&mut app, &mut out);
+            let screen = draw_to_string(&mut app, 100, 40);
+            assert!(screen.contains("other"), "{screen}");
+            assert!(screen.contains("/tmp/other"), "{screen}");
+            assert!(screen.contains("[off]"), "{screen}");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+            // No project at all: nothing to write, and the row says why.
+            let mut app = App::new();
+            open_on_row(&mut app, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let view = settings(&app).unwrap();
+            assert!(
+                matches!(&view.notice, Some((text, _)) if text.contains("no project selected")),
+                "{:?}",
+                view.notice
+            );
+            let screen = draw_to_string(&mut app, 100, 40);
+            assert!(screen.contains("[n/a]"), "{screen}");
+            let saved: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                saved["projects"],
+                serde_json::json!({ "/tmp/demo": { "hide_root_worktree": true } }),
+                "untouched"
+            );
         });
     }
 
@@ -27116,7 +28477,7 @@ diff --git a/src/c.rs b/src/c.rs
                 target
             };
             for hidden in [false, true] {
-                app.hide_root_worktree = hidden;
+                hide_root(&mut app, hidden);
                 app.focus = Focus::Worktrees;
                 app.sel_worktree = 0;
                 assert!(
@@ -27691,7 +29052,7 @@ diff --git a/src/c.rs b/src/c.rs
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
 
             // The root hidden and no other checkout: nothing to flip to.
-            app.hide_root_worktree = true;
+            hide_root(&mut app, true);
             assert!(app.selected_worktree().is_none());
             press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
             assert!(paste_into_overlay(&mut app, "Fix auth"));

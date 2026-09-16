@@ -398,6 +398,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     auto_title,
                     pr_url,
                     head,
+                    starting_prompt,
                 } => {
                     let result = daemon
                         .create_pr_agent(CreatePrAgentSpec {
@@ -410,6 +411,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             auto_title,
                             pr_url: pr_url.clone(),
                             head,
+                            starting_prompt,
                         })
                         .await;
                     match &result {

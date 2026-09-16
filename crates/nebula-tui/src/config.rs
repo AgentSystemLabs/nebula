@@ -291,7 +291,10 @@ pub struct SettingSpec {
     pub group: &'static str,
 }
 
-/// What a tab shows. Ordinary tabs are a list of value settings; the
+/// What a tab shows. Ordinary tabs are a list of value settings. The
+/// Project tab is a list too, but its rows are one project's — the one
+/// selected in the PROJECTS PANEL, named on the tab's first line — and
+/// read and write that project's entry instead of a top-level key. The
 /// Hotkeys tab is generated from [`crate::keymap::ACTIONS`] instead, so a
 /// new action shows up there without being declared twice — and the Agents
 /// tab is generated from the harness registry, so a new CLI shows up
@@ -299,6 +302,7 @@ pub struct SettingSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabBody {
     Values(&'static [SettingSpec]),
+    Project(&'static [SettingSpec]),
     Hotkeys,
     Agents,
 }
@@ -396,6 +400,15 @@ impl SettingKind {
     /// [`Config::set_text`] is what writes it.
     pub fn is_text(self) -> bool {
         matches!(self, SettingKind::WorktreeBaseBranch)
+    }
+
+    /// A row on the PROJECT TAB: its value is the focused project's, kept
+    /// in that project's `projects` entry rather than at the top level of
+    /// the file. [`Config::cycle`] leaves such a row alone;
+    /// [`Config::cycle_project`] is what writes it, and
+    /// [`ProjectSettings::value_label`] what reads it.
+    pub fn is_project(self) -> bool {
+        matches!(self, SettingKind::HideRootWorktree)
     }
 }
 
@@ -552,18 +565,25 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
         title: "Agents",
         body: TabBody::Agents,
     },
+    // Settings that belong to one project rather than to nebula. The tab
+    // edits the selected project's entry in `projects` and names that
+    // project on its first line, so a row here never reads as a switch
+    // for every project at once.
+    SettingsTab {
+        title: "Project",
+        body: TabBody::Project(&[SettingSpec {
+            kind: SettingKind::HideRootWorktree,
+            label: "Hide root worktree",
+            hint: "Drop this project's ⌂ root row so nothing launched from Worktrees lands in its shared checkout",
+            group: "",
+        }]),
+    },
     // Behaviors that change how the tree is worked, off by default until
     // they have earned a tab of their own. Before Hotkeys, which stays
     // last for the reason above.
     SettingsTab {
         title: "Experimental",
         body: TabBody::Values(&[
-            SettingSpec {
-                kind: SettingKind::HideRootWorktree,
-                label: "Hide root worktree",
-                hint: "Drop the ⌂ root row so nothing launched from Worktrees lands in the shared checkout",
-                group: "",
-            },
             SettingSpec {
                 kind: SettingKind::RecentPrompts,
                 label: "Recent prompts",
@@ -606,6 +626,14 @@ pub fn agents_tab() -> usize {
         .expect("SETTINGS_TABS declares an Agents tab")
 }
 
+/// Index of the Project tab, whose rows are the selected project's.
+pub fn project_tab() -> usize {
+    SETTINGS_TABS
+        .iter()
+        .position(|t| matches!(t.body, TabBody::Project(_)))
+        .expect("SETTINGS_TABS declares a Project tab")
+}
+
 pub fn tab_count() -> usize {
     SETTINGS_TABS.len()
 }
@@ -615,7 +643,7 @@ pub fn tab_count() -> usize {
 /// [`Config::agent_rows`]). Empty for the Hotkeys tab.
 pub fn tab_settings(tab: usize) -> &'static [SettingSpec] {
     match SETTINGS_TABS.get(tab).map(|t| t.body) {
-        Some(TabBody::Values(settings)) => settings,
+        Some(TabBody::Values(settings) | TabBody::Project(settings)) => settings,
         Some(TabBody::Agents) => AGENTS_HEAD,
         _ => &[],
     }
@@ -625,7 +653,7 @@ pub fn tab_settings(tab: usize) -> &'static [SettingSpec] {
 /// registry, so a new CLI grows it without a code change.
 pub fn tab_len(tab: usize) -> usize {
     match SETTINGS_TABS.get(tab).map(|t| t.body) {
-        Some(TabBody::Values(settings)) => settings.len(),
+        Some(TabBody::Values(settings) | TabBody::Project(settings)) => settings.len(),
         Some(TabBody::Hotkeys) => crate::keymap::ACTIONS.len(),
         Some(TabBody::Agents) => AGENTS_HEAD.len() + Config::load().agent_rows().len(),
         None => 0,
@@ -648,7 +676,9 @@ pub fn setting_at(tab: usize, index: usize) -> Option<&'static SettingSpec> {
 pub fn locate(kind: SettingKind) -> Option<(usize, usize)> {
     SETTINGS_TABS.iter().enumerate().find_map(|(t, tab)| {
         match tab.body {
-            TabBody::Values(settings) => settings.iter().position(|s| s.kind == kind),
+            TabBody::Values(settings) | TabBody::Project(settings) => {
+                settings.iter().position(|s| s.kind == kind)
+            }
             TabBody::Agents => AGENTS_HEAD.iter().position(|s| s.kind == kind),
             TabBody::Hotkeys => None,
         }
@@ -690,7 +720,7 @@ pub fn all_settings() -> impl Iterator<Item = (usize, usize, &'static SettingSpe
 /// The Agents tab reads the registry for its harness rows.
 pub fn hint_at(tab: usize, index: usize) -> String {
     match SETTINGS_TABS.get(tab).map(|t| t.body) {
-        Some(TabBody::Values(settings)) => settings
+        Some(TabBody::Values(settings) | TabBody::Project(settings)) => settings
             .get(index)
             .map(|s| s.hint)
             .unwrap_or("")
@@ -710,6 +740,10 @@ pub fn hint_at(tab: usize, index: usize) -> String {
 pub enum SettingsRow {
     Blank,
     Header(String),
+    /// The Project tab's first line: the selected project's name and repo
+    /// path, which the renderer reads off the app — the row map is static
+    /// and only knows there is such a line. Not selectable.
+    Project,
     /// Label + value line for the value setting at this tab-local index.
     Setting(usize),
     /// Label + chord list for `keymap::ACTIONS[index]`.
@@ -733,6 +767,14 @@ pub fn settings_rows(tab: usize) -> Vec<SettingsRow> {
             settings.iter().map(|s| s.group.to_string()),
             SettingsRow::Setting,
         ),
+        Some(TabBody::Project(settings)) => {
+            let mut rows = vec![SettingsRow::Project];
+            rows.extend(grouped(
+                settings.iter().map(|s| s.group.to_string()),
+                SettingsRow::Setting,
+            ));
+            rows
+        }
         Some(TabBody::Hotkeys) => grouped(
             crate::keymap::ACTIONS.iter().map(|s| s.group.to_string()),
             SettingsRow::Hotkey,
@@ -900,12 +942,24 @@ pub struct Config {
     /// the SESSIONS PANEL — those describe work you have, not work you are
     /// browsing. Off by default: a config predating the key hides nothing.
     pub hide_draft_prs: bool,
-    /// Experimental: leave the ROOT WORKTREE row out of the WORKTREES
-    /// PANEL, so nothing launched there lands in the shared checkout. (A
-    /// `p` on that panel cuts a fresh worktree with this on or off — that
-    /// is the panel's doing, not this switch's.) Off by default: the root
-    /// row is where most people start.
+    /// What every project without a `projects` entry gets for **Hide root
+    /// worktree** — the key the setting lived under while it was one
+    /// switch for every project (Settings → Experimental, through 0.27).
+    /// Still read and written back, so a file that set it keeps hiding
+    /// the root everywhere until a project's own row says otherwise, and
+    /// an older build sharing the file still sees its key; no tab edits
+    /// it any more. See [`Config::project_fallback`].
     pub hide_root_worktree: bool,
+    /// PROJECT SETTINGS: one [`ProjectSettings`] per project set up
+    /// differently from the rest, keyed by the project's repo path as the
+    /// DAEMON stores it — what the Settings → Project tab edits for the
+    /// selected project. A project with no entry reads as
+    /// [`Config::project_fallback`], and an entry that says nothing the
+    /// fallback doesn't is dropped on save ([`Config::set_project`]), so
+    /// the map names only the projects that differ. One key to the file's
+    /// rules: a value in here this build can't read costs the whole map,
+    /// not one project.
+    pub projects: BTreeMap<PathBuf, ProjectSettings>,
     /// Experimental: list each session's RECENT PROMPTS — the last few
     /// things typed into it, as the daemon captured them off the
     /// `UserPromptSubmit` hook — under its row in the SESSIONS PANEL,
@@ -1009,6 +1063,45 @@ pub struct Config {
     pub skipped: BTreeSet<String>,
 }
 
+/// One project's own settings — the PROJECT TAB's rows — kept under the
+/// project's repo path in [`Config::projects`]. Read through
+/// [`Config::project`], which supplies the fallback for a project with no
+/// entry; written through [`Config::set_project`].
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ProjectSettings {
+    /// Leave this project's ROOT WORKTREE row out of the WORKTREES PANEL,
+    /// so nothing launched there lands in its shared checkout. The root's
+    /// sessions keep running and the PALETTE still finds them. (A `p` on
+    /// that panel cuts a fresh worktree with this on or off — that is the
+    /// panel's doing, not this switch's.)
+    pub hide_root_worktree: bool,
+    /// Keys in the entry this build doesn't know — a newer nebula's, most
+    /// likely — carried through a save untouched, as the file's top-level
+    /// keys are. An entry holding one is never dropped as "all default".
+    #[serde(flatten)]
+    pub other: BTreeMap<String, serde_json::Value>,
+}
+
+impl ProjectSettings {
+    /// The overlay's label for a PROJECT TAB row ([`SettingKind::is_project`]);
+    /// empty for a row that is not one.
+    pub fn value_label(&self, kind: SettingKind) -> String {
+        match kind {
+            SettingKind::HideRootWorktree => on_off(self.hide_root_worktree).into(),
+            _ => String::new(),
+        }
+    }
+
+    /// Activate a PROJECT TAB row. The one so far is a toggle, so ←, → and
+    /// Enter all flip it; a row that is not a project row is left alone.
+    pub fn cycle(&mut self, kind: SettingKind) {
+        if kind == SettingKind::HideRootWorktree {
+            self.hide_root_worktree = !self.hide_root_worktree;
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -1034,6 +1127,7 @@ impl Default for Config {
             hide_sessions: false,
             hide_draft_prs: false,
             hide_root_worktree: false,
+            projects: BTreeMap::new(),
             recent_prompts: false,
             recent_prompts_count: DEFAULT_RECENT_PROMPTS_COUNT,
             show_key_combos: false,
@@ -1681,6 +1775,49 @@ impl Config {
         crate::keymap::Keymap::from_overrides(&self.keybindings)
     }
 
+    /// The settings of the project checked out at `repo_path`: its
+    /// `projects` entry, else what every project without one gets
+    /// ([`Config::project_fallback`]).
+    pub fn project(&self, repo_path: &Path) -> ProjectSettings {
+        self.projects
+            .get(repo_path)
+            .cloned()
+            .unwrap_or_else(|| self.project_fallback())
+    }
+
+    /// What a project with no entry of its own reads as: the top-level
+    /// `hide_root_worktree`, the key the setting had while it applied to
+    /// every project at once, so a file written then keeps its meaning.
+    pub fn project_fallback(&self) -> ProjectSettings {
+        ProjectSettings {
+            hide_root_worktree: self.hide_root_worktree,
+            ..Default::default()
+        }
+    }
+
+    /// Store `settings` as the entry of the project at `repo_path`. An
+    /// entry that says nothing the fallback doesn't is dropped rather than
+    /// written, so `projects` names only the projects set up differently
+    /// — and a project turned back to match the rest leaves no trace.
+    pub fn set_project(&mut self, repo_path: &Path, settings: ProjectSettings) {
+        if settings == self.project_fallback() {
+            self.projects.remove(repo_path);
+        } else {
+            self.projects.insert(repo_path.to_path_buf(), settings);
+        }
+    }
+
+    /// Activate a PROJECT TAB row for the project at `repo_path` — what
+    /// [`Config::cycle`] is for every other row.
+    pub fn cycle_project(&mut self, repo_path: &Path, kind: SettingKind) {
+        let mut settings = self.project(repo_path);
+        settings.cycle(kind);
+        self.set_project(repo_path, settings);
+    }
+
+    /// The overlay's label for `kind`. A PROJECT TAB row read here shows
+    /// the fallback — the overlay reads the selected project's through
+    /// [`Config::project`] instead.
     pub fn value_label(&self, kind: SettingKind) -> String {
         match kind {
             SettingKind::PaletteEnterAttaches => on_off(self.palette_enter_attaches).into(),
@@ -1707,7 +1844,7 @@ impl Config {
             SettingKind::HideWorktrees => shown_hidden(self.hide_worktrees).into(),
             SettingKind::HideSessions => shown_hidden(self.hide_sessions).into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
-            SettingKind::HideRootWorktree => on_off(self.hide_root_worktree).into(),
+            SettingKind::HideRootWorktree => self.project_fallback().value_label(kind),
             SettingKind::RecentPrompts => on_off(self.recent_prompts).into(),
             SettingKind::ShowKeyCombos => on_off(self.show_key_combos).into(),
             SettingKind::RecentPromptsCount => self
@@ -1722,9 +1859,10 @@ impl Config {
 
     /// `delta == 0` means activate (toggle a bool, cycle a choice forward).
     /// Non-zero delta cycles a choice; bools still toggle. `index` is
-    /// tab-local — the Hotkeys tab has no cyclable values and no-ops here.
-    /// The Agents tab resolves its head rows statically and its harness
-    /// rows through the registry.
+    /// tab-local — the Hotkeys tab has no cyclable values and no-ops here,
+    /// and so does a PROJECT TAB row, which [`Config::cycle_project`]
+    /// flips for one project. The Agents tab resolves its head rows
+    /// statically and its harness rows through the registry.
     pub fn cycle(&mut self, tab: usize, index: usize, delta: i32) {
         if tab == agents_tab() {
             if let Some(spec) = AGENTS_HEAD.get(index) {
@@ -1808,9 +1946,8 @@ impl Config {
             SettingKind::HideDraftPrs => {
                 self.hide_draft_prs = !self.hide_draft_prs;
             }
-            SettingKind::HideRootWorktree => {
-                self.hide_root_worktree = !self.hide_root_worktree;
-            }
+            // One project's, not the file's: see `cycle_project`.
+            SettingKind::HideRootWorktree => {}
             SettingKind::RecentPrompts => {
                 self.recent_prompts = !self.recent_prompts;
             }
@@ -2810,32 +2947,162 @@ mod tests {
         assert!(!cfg.quick_prompt_focus);
     }
 
-    /// The Experimental tab's first row: off by default, a plain toggle,
-    /// persisted under its own key, and unknown to a config written
-    /// before it (which reads as off).
+    /// **Hide root worktree** is the PROJECT TAB's row: off for every
+    /// project by default, flipped for one project at a time through
+    /// `cycle_project`, stored under that project's repo path in
+    /// `projects` — and only while it differs from what the rest get, so
+    /// flipping it back leaves no entry behind. `Config::cycle` on the
+    /// row, which has no project to speak of, changes nothing.
     #[test]
-    fn hide_root_worktree_is_off_by_default_on_the_experimental_tab_and_persists() {
+    fn hide_root_worktree_is_a_project_setting_kept_per_repo_path() {
+        let demo = Path::new("/tmp/demo");
+        let other = Path::new("/tmp/other");
         let mut cfg = Config::default();
-        assert!(
-            !cfg.hide_root_worktree,
-            "the root row is where most people start"
-        );
-        assert_eq!(cfg.value_label(SettingKind::HideRootWorktree), "off");
+        assert!(!cfg.project(demo).hide_root_worktree, "off out of the box");
+        assert!(cfg.projects.is_empty());
 
         let (tab, row) = locate(SettingKind::HideRootWorktree).unwrap();
-        assert_eq!(SETTINGS_TABS[tab].title, "Experimental");
-        assert_eq!(tab + 1, hotkeys_tab(), "Hotkeys stays last");
+        assert_eq!(SETTINGS_TABS[tab].title, "Project");
+        assert_eq!(tab, project_tab());
+        assert!(SettingKind::HideRootWorktree.is_project());
         cfg.cycle(tab, row, 0);
-        assert!(cfg.hide_root_worktree);
-        assert_eq!(cfg.value_label(SettingKind::HideRootWorktree), "on");
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap(),
+            serde_json::to_value(Config::default()).unwrap(),
+            "no project named: nothing to flip"
+        );
 
+        cfg.cycle_project(demo, SettingKind::HideRootWorktree);
+        assert!(cfg.project(demo).hide_root_worktree);
+        assert_eq!(
+            cfg.project(demo).value_label(SettingKind::HideRootWorktree),
+            "on"
+        );
+        assert!(
+            !cfg.project(other).hide_root_worktree,
+            "one project's, not every project's"
+        );
+        assert_eq!(
+            cfg.project(other)
+                .value_label(SettingKind::HideRootWorktree),
+            "off"
+        );
+        assert!(
+            !cfg.hide_root_worktree,
+            "the old global key is not what was written"
+        );
+        assert_eq!(cfg.projects.keys().collect::<Vec<_>>(), [demo]);
+
+        // Persisted under the project's path, as its own object.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         cfg.save_to(&path).unwrap();
-        assert!(load_from(&path).hide_root_worktree);
+        assert_eq!(
+            read_json_file(&path)["projects"],
+            serde_json::json!({ "/tmp/demo": { "hide_root_worktree": true } })
+        );
+        let loaded = load_from(&path);
+        assert!(loaded.project(demo).hide_root_worktree);
+        assert!(!loaded.project(other).hide_root_worktree);
 
+        // Back to what the rest get: the entry goes, not just its value.
+        cfg.cycle_project(demo, SettingKind::HideRootWorktree);
+        assert!(!cfg.project(demo).hide_root_worktree);
+        assert!(cfg.projects.is_empty(), "an all-default entry is dropped");
+        cfg.save_to(&path).unwrap();
+        assert_eq!(read_json_file(&path)["projects"], serde_json::json!({}));
+
+        // A config predating the key has no entries.
         let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert!(!cfg.hide_root_worktree);
+        assert!(cfg.projects.is_empty());
+    }
+
+    /// The top-level `hide_root_worktree` a 0.27 file set keeps its
+    /// meaning as the fallback: every project without an entry hides its
+    /// root, a project's own row can still say `off` (and that entry is
+    /// kept, since it differs from the fallback), and the key itself is
+    /// written back unchanged for the older builds that read it. Keys in
+    /// an entry this build doesn't know ride through a save too.
+    #[test]
+    fn the_old_global_key_is_the_fallback_every_project_without_an_entry_gets() {
+        let demo = Path::new("/tmp/demo");
+        let other = Path::new("/tmp/other");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "hide_root_worktree": true,
+              "projects": {
+                "/tmp/other": { "hide_root_worktree": false, "future_row": "x" }
+              }
+            }"#,
+        )
+        .unwrap();
+        let mut cfg = load_from(&path);
+        assert!(cfg.skipped.is_empty(), "{:?}", cfg.skipped);
+        assert!(cfg.hide_root_worktree);
+        assert!(
+            cfg.project(demo).hide_root_worktree,
+            "no entry: the fallback"
+        );
+        assert_eq!(
+            cfg.value_label(SettingKind::HideRootWorktree),
+            "on",
+            "the fallback's label"
+        );
+        assert!(!cfg.project(other).hide_root_worktree, "its own row wins");
+        assert_eq!(
+            cfg.project(other).other.get("future_row"),
+            Some(&serde_json::json!("x"))
+        );
+
+        // Turning demo off writes an entry, since off now differs from
+        // the fallback; turning other on makes it match the fallback —
+        // but its unknown key keeps the entry from being dropped.
+        cfg.cycle_project(demo, SettingKind::HideRootWorktree);
+        cfg.cycle_project(other, SettingKind::HideRootWorktree);
+        assert!(!cfg.project(demo).hide_root_worktree);
+        assert!(cfg.project(other).hide_root_worktree);
+        cfg.save_to(&path).unwrap();
+        let saved = read_json_file(&path);
+        assert_eq!(
+            saved["hide_root_worktree"], true,
+            "written back for older builds"
+        );
+        assert_eq!(
+            saved["projects"],
+            serde_json::json!({
+                "/tmp/demo": { "hide_root_worktree": false },
+                "/tmp/other": { "hide_root_worktree": true, "future_row": "x" }
+            })
+        );
+    }
+
+    /// The Project tab: one line naming the project, then its rows, every
+    /// one of them a project row — and no project row anywhere else.
+    #[test]
+    fn the_project_tab_names_the_project_then_lists_its_rows() {
+        let tab = project_tab();
+        assert_eq!(SETTINGS_TABS[tab].title, "Project");
+        assert!(tab < hotkeys_tab());
+        let rows = settings_rows(tab);
+        assert_eq!(rows[0], SettingsRow::Project);
+        assert_eq!(
+            rows[1..],
+            (0..tab_len(tab))
+                .map(SettingsRow::Setting)
+                .collect::<Vec<_>>()[..]
+        );
+        for (t, _, spec) in all_settings() {
+            assert_eq!(
+                spec.kind.is_project(),
+                t == tab,
+                "{:?} sits on {}",
+                spec.kind,
+                SETTINGS_TABS[t].title
+            );
+        }
     }
 
     /// The KEY COMBO DISPLAY: an Experimental switch, off by default, a
@@ -3490,7 +3757,7 @@ mod tests {
                     .filter(|row| matches!(row, SettingsRow::Header(_)))
                     .count();
                 match tab.body {
-                    TabBody::Values(settings) => {
+                    TabBody::Values(settings) | TabBody::Project(settings) => {
                         let grouped = settings.iter().any(|s| !s.group.is_empty());
                         assert_eq!(headers > 0, grouped, "{}", tab.title);
                     }
@@ -3529,7 +3796,7 @@ mod tests {
                             .push(label);
                     }
                     SettingsRow::Blank => assert!(!sections.is_empty(), "no leading blank"),
-                    SettingsRow::Hotkey(_) => unreachable!(),
+                    SettingsRow::Project | SettingsRow::Hotkey(_) => unreachable!(),
                 }
             }
             assert_eq!(

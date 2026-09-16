@@ -20,6 +20,8 @@ vt100 = "0.16"
 portable-pty = "0.9"
 futures = "0.3"
 base64 = "0.22"
+pulldown-cmark = { version = "0.13", default-features = false }
+unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

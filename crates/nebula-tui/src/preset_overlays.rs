@@ -1,6 +1,8 @@
-//! The AGENT PRESETS overlays: the list `e` opens in the SESSIONS PANEL and
-//! the PRESET EDITOR form behind its `a` / `e` — their state, keys, mouse
-//! and drawing. The presets themselves (and their file) are
+//! The AGENT PRESETS overlays: the list `e` opens in the SESSIONS PANEL
+//! (and, as a picker, on a PROJECT OPEN PRS GROUP row of the WORKTREES
+//! PANEL — a PR SESSION on that pull request, through the QUICK PROMPT)
+//! and the PRESET EDITOR form behind its `a` / `e` — their state, keys,
+//! mouse and drawing. The presets themselves (and their file) are
 //! `crate::agent_presets`; the task prompt a launch opens is an ordinary
 //! multi-line `PromptDialog` (`PromptKind::AgentPresetTask`) — sent on at
 //! once, empty, for a `skip_task` preset (`event_loop::submit_prompt_now`)
@@ -460,13 +462,23 @@ impl AgentPresetEditor {
 }
 
 /// `e` in the SESSIONS PANEL: the AGENT PRESETS list for the selected
-/// WORKTREE — the one a launch lands in. Anywhere else the key just says
-/// where it works, since without a worktree there is nothing to launch into.
+/// WORKTREE — the one a launch lands in. On a PROJECT OPEN PRS GROUP row
+/// of the WORKTREES PANEL it is the same list as a picker for a PR
+/// SESSION on that pull request (`quick_prompt::open_preset_picker_for_pr`).
+/// Anywhere else the key just says where it works, since without a
+/// worktree or a pull request there is nothing to launch into.
 pub(crate) fn open_agent_presets(app: &mut App) {
+    if app.focus == Focus::Worktrees && app.selected_worktree_pr().is_some() {
+        crate::quick_prompt::open_preset_picker_for_pr(app);
+        return;
+    }
     let worktree = match (app.focus, app.selected_worktree()) {
         (Focus::Sessions, Some(w)) => w.id.clone(),
         _ => {
-            app.flash = Some("agent presets: select a worktree in the Sessions panel first".into());
+            app.flash = Some(
+                "agent presets: select a worktree in the Sessions panel, or an open PR in the Worktrees panel"
+                    .into(),
+            );
             return;
         }
     };
@@ -619,6 +631,7 @@ fn apply_preset_to_quick_prompt(
     let launch_now = preset.skip_task && back.text.trim().is_empty();
     let launch = crate::quick_prompt::QuickLaunch::of_preset(back.launch.target, preset, &cfg)
         .with_issue(back.launch.issue)
+        .with_pr(back.launch.pr)
         .with_origin(back.launch.origin);
     if launch_now {
         crate::event_loop::submit_prompt_now(app, PromptKind::QuickPrompt(launch), out);

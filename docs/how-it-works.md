@@ -211,7 +211,8 @@
   prompt as the worktree rule, plus a `Bash(nebula spawn:*)` permission.
 - **Ask the agent to show you a file and it opens in nebula.** Say "open it" or "show me the examples"
   and the session runs `nebula open <file>…`; every TUI attached to the daemon raises its file tabs on
-  them — a modal with one tab per file, the focused one previewed with syntax highlighting, `Enter`
+  them — a modal with one tab per file, the focused one previewed with syntax highlighting (a
+  markdown file as a rendered page), `Enter`
   editing it in place — so the agent puts the file in front of you instead of pasting it into the
   reply. Only when you ask: the appended prompt forbids opening anything unprompted, so an agent that
   wants you to look at its work names the path and waits. And text only: the CLI resolves the paths
@@ -226,8 +227,10 @@
   before you ask for one, and pre-boot a worktree's dead sessions while your selection rests on it, so attaching
   lands on a booted screen instead of a booting shell. To bound what that costs, idle PTYs in worktrees
   no client is watching are killed after `session_idle_timeout` (5m by default) — working agents, ones
-  waiting on you, and terminals with a command running are all spared, and a reaped agent
-  revives on the next attach with its conversation resumed. Until then its row's STATUS DOT is gray,
+  waiting on you, ones whose backgrounded tool call is still running (Claude's `run_in_background`
+  Bash or Monitor, a Codex shell command; the clock restarts when it ends), and terminals with a
+  command running are all spared, and a reaped agent revives on the next attach with its
+  conversation resumed. Until then its row's STATUS DOT is gray,
   whatever its last status was — a cold session shows what it last did, not what it is doing. Both halves of the PREWARM POOL are
   switchable — `prewarm_agents` and `prewarm_sessions`, `true` by default, on the SETTINGS OVERLAY's
   Sessions tab or by hand in CONFIG.JSON (see [Configuration](configuration.md)); switching the pool
@@ -256,7 +259,7 @@ attachment is currently unavailable; previously saved links remain visible so th
 discard data.
 
 This is the one part of nebula the TUI asks for itself rather than the DAEMON: every `gh pr view`,
-`gh pr list` and `gh pr diff` — and the ISSUES MODAL's `gh issue list` and `gh issue view` — is spawned by the client, which is why the lookups stop the moment you
+`gh pr list` and `gh pr diff` — and the ISSUES MODAL's `gh issue list`, `gh issue view` and `gh issue comment` — is spawned by the client, which is why the lookups stop the moment you
 quit, and why a machine with no `gh` — or one that is unauthenticated, or pointed at a checkout with no
 remote — just shows no rows instead of an error. Only the selected project is ever asked about: its
 selected worktree's PR ROW and its PROJECT OPEN PRS GROUP on every tick, one process each, and its other

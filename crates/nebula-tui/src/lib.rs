@@ -20,6 +20,7 @@ pub mod key_combo;
 pub mod keymap;
 pub mod keys;
 pub mod links;
+pub mod markdown;
 pub mod overlay_close;
 pub mod palette;
 pub mod pr_cache;

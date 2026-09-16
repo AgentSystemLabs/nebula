@@ -431,6 +431,7 @@ mod tests {
                     effort: None,
                     preset: None,
                     issue: None,
+                    pr: None,
                     origin: crate::quick_prompt::QuickOrigin::Hotkey,
                 },
                 text: "typed so far".into(),

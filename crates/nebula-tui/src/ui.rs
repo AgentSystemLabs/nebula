@@ -1,7 +1,9 @@
 //! View layer: draws the visible panels + terminal pane + footer, and
 //! records hit regions for mouse interaction.
 
-use crate::app::{App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, SessionRow};
+use crate::app::{
+    App, ConnState, Focus, HitTarget, Overlay, PaletteTarget, SessionRow, WorktreeRow,
+};
 use crate::git_diff::{classify_diff_line, DiffLineKind};
 use crate::keymap::Action;
 use crate::text_input::TextInput;
@@ -47,6 +49,27 @@ fn task_prompt_hint(kind: &crate::app::PromptKind, width: u16) -> &'static str {
             " Esc · ^J · ↵ "
         };
     }
+    // A comment posts rather than launches, and Esc goes back to the
+    // ISSUES MODAL rather than cancelling into the panels.
+    if matches!(kind, crate::app::PromptKind::IssueComment { .. }) {
+        return if width >= 53 {
+            " Enter: post · Shift+Enter/^J: newline · Esc: back "
+        } else if width >= 38 {
+            " Enter post · ^J newline · Esc back "
+        } else {
+            " Esc · ^J · Enter "
+        };
+    }
+    // The COMMENT BOX posts rather than launches, and has no picker.
+    if matches!(kind, crate::app::PromptKind::PrComment { .. }) {
+        return if width >= 55 {
+            " Enter: post · Shift+Enter/^J: newline · Esc: cancel "
+        } else if width >= 40 {
+            " Enter post · ^J newline · Esc cancel "
+        } else {
+            " Esc · ^J · Enter "
+        };
+    }
     if width >= 57 {
         " Enter: launch · Shift+Enter/^J: newline · Esc: cancel "
     } else if width >= 42 {
@@ -63,17 +86,31 @@ fn task_prompt_hint(kind: &crate::app::PromptKind, width: u16) -> &'static str {
 /// with the `[ ] new worktree ^N` toggle pinned right. On, it is the
 /// loudest row in the box: a filled NEW WORKTREE chip, the branch Enter
 /// will cut beside it in bold, and the toggle ticked, all in the green
-/// the frame has turned. The right half is dropped whole before the left
-/// is cut short.
+/// the frame has turned. A PR SESSION's box names the pull request and
+/// its head branch instead — the checkout the DAEMON reuses or cuts —
+/// with no toggle, there being nothing to flip. The right half is dropped
+/// whole before the left is cut short.
 fn quick_target_line(
     app: &App,
     launch: &crate::quick_prompt::QuickLaunch,
     width: u16,
     th: Theme,
 ) -> Line<'static> {
-    let branch =
-        crate::quick_prompt::target_branch(app, launch).unwrap_or_else(|| "(worktree gone)".into());
-    let (left, right) = if launch.is_new_worktree() {
+    let branch = match &launch.pr {
+        Some(pr) => pr.head.clone(),
+        None => crate::quick_prompt::target_branch(app, launch)
+            .unwrap_or_else(|| "(worktree gone)".into()),
+    };
+    let (left, right) = if let Some(pr) = &launch.pr {
+        let dim = Style::default().fg(th.dim);
+        (
+            vec![
+                Span::styled(format!("PR #{} · worktree: ", pr.number), dim),
+                Span::styled(branch, Style::default().fg(th.muted)),
+            ],
+            vec![Span::styled("reused or cut on Enter ", dim)],
+        )
+    } else if launch.is_new_worktree() {
         let chip = Style::default()
             .fg(th.on_accent)
             .bg(th.ok)
@@ -169,6 +206,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     app.body_area = body;
     app.normalize_panel_widths(body.width);
+    // A Sessions focus the cursor's own move has folded out from under
+    // (see `App::settle_focus`) steps off the rail before the columns are
+    // laid out, so the tint and the keys land on an open column.
+    app.settle_focus();
     // The Workspaces bar (Shift+W) runs across the top of the body (a
     // one-row rail with an expand chevron when hidden); the three panels
     // and the terminal pane take the full width of whatever is left
@@ -717,7 +758,11 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             "repo on GitHub / Ghostty tab",
                         ),
                         (Act(&[RefreshPullRequests]), "refresh pull requests now"),
-                        (Act(&[Issues]), "github issues: prompt / preset on one"),
+                        (
+                            Act(&[CommentPullRequest]),
+                            "comment on the pull request row",
+                        ),
+                        (Act(&[Issues]), "github issues: prompt / preset / edit one"),
                         (Act(&[SwitchBranch]), "switch the ⌂ root checkout's branch"),
                         (Act(&[Delete, DeleteAll]), "delete one / delete all"),
                     ],
@@ -862,6 +907,13 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             let cfg = crate::config::Config::load();
             let tab = view.tab;
             let rows = crate::config::settings_rows(tab);
+            // The Project tab's rows are the selected project's: its
+            // name and path head the tab, and its entry is what the
+            // values read. No project (an empty tree) leaves them n/a.
+            let project = app
+                .selected_project()
+                .map(|p| (p.name.clone(), p.repo_path.clone()));
+            let project_settings = project.as_ref().map(|(_, path)| cfg.project(path));
             // Rows the modal spends on anything but settings: the tab
             // strip and its rule above the body, and a blank + hint +
             // keys + config path below it.
@@ -902,10 +954,28 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
                         )));
                     }
+                    crate::config::SettingsRow::Project => match &project {
+                        Some((name, path)) => {
+                            let name = format!(" {name}");
+                            let room = (inner.width as usize).saturating_sub(name.chars().count());
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    name,
+                                    Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(truncate(&format!("  {}", path.display()), room), dim),
+                            ]));
+                        }
+                        None => lines.push(Line::from(Span::styled(
+                            " no project selected — these rows are the selected project's",
+                            Style::default().fg(th.warn),
+                        ))),
+                    },
                     crate::config::SettingsRow::Setting(i) => {
                         // The Agents tab resolves its harness rows through
                         // the registry; every other values tab reads its
-                        // static spec.
+                        // static spec, and a PROJECT TAB row reads the
+                        // selected project's entry.
                         let (label, value) = if tab == crate::config::agents_tab() {
                             match crate::config::AGENTS_HEAD.get(*i) {
                                 Some(spec) => (spec.label.to_string(), cfg.value_label(spec.kind)),
@@ -919,7 +989,15 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         } else {
                             let spec = crate::config::setting_at(tab, *i)
                                 .expect("settings_rows indexes this tab's settings");
-                            (spec.label.to_string(), cfg.value_label(spec.kind))
+                            let value = if spec.kind.is_project() {
+                                project_settings
+                                    .as_ref()
+                                    .map(|s| s.value_label(spec.kind))
+                                    .unwrap_or_else(|| "n/a".into())
+                            } else {
+                                cfg.value_label(spec.kind)
+                            };
+                            (spec.label.to_string(), value)
                         };
                         let selected = *i == view.selected && !view.on_tabs;
                         let mut label_style = Style::default();
@@ -1768,7 +1846,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
         }
         Overlay::Issues(view) => crate::issues::draw(f, app, &view, th),
         Overlay::BranchSwitch(view) => crate::branch_switch::draw(f, app, &view, th),
-        Overlay::FileTabs(view) => {
+        Overlay::FileTabs(mut view) => {
             // The TREE BROWSER's footprint: the editor Enter opens wants the
             // room, and the preview is a whole file.
             let area = centered_rect_pct(f.area(), SPLIT_MODAL_PCT.0, SPLIT_MODAL_PCT.1);
@@ -1800,21 +1878,45 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 width: inner.width,
                 height: inner.height.saturating_sub(3),
             };
-            let max_scroll = view
-                .preview_line_count
+            let editing = app.vim.as_ref().is_some_and(|v| v.embedded);
+            // A markdown tab shows the rendered page — flowed for this
+            // width, kept on the view between draws — unless `m` asked
+            // for the source. No gutter: rendered rows aren't source lines.
+            let rendered = (view.renders_markdown() && !editing).then(|| {
+                crate::markdown::Rendered::for_width(
+                    view.rendered.take(),
+                    &view.preview_text,
+                    body.width,
+                    crate::markdown::Breaks::Reflow,
+                    th,
+                )
+            });
+            let line_count = match &rendered {
+                Some(r) => r.lines.len(),
+                None => view.preview_lines.len(),
+            };
+            let max_scroll = line_count
                 .saturating_sub(body.height as usize)
                 .min(u16::MAX as usize) as u16;
             let scroll = view.scroll.min(max_scroll);
-            let editing = app.vim.as_ref().is_some_and(|v| v.embedded);
             if !editing && body.height > 0 {
-                let lines = preview_window(
-                    &view.preview_lines,
-                    view.preview_line_count,
-                    view.preview_is_file,
-                    scroll,
-                    body,
-                    th,
-                );
+                let lines = match &rendered {
+                    Some(r) => r
+                        .lines
+                        .iter()
+                        .skip(scroll as usize)
+                        .take(body.height as usize)
+                        .cloned()
+                        .collect(),
+                    None => preview_window(
+                        &view.preview_lines,
+                        line_count,
+                        view.preview_is_file,
+                        scroll,
+                        body,
+                        th,
+                    ),
+                };
                 f.render_widget(Paragraph::new(lines), body);
             }
 
@@ -1834,16 +1936,21 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             // Write-back (draw works on a clone): hit rects for the mouse,
             // the pane for the embedded editor, the page size for paging,
-            // the scroll re-clamped so resizes never strand the view.
+            // the scroll re-clamped so resizes never strand the view, the
+            // shown line count and the flowed page for the next draw.
             if let Some(Overlay::FileTabs(v)) = &mut app.overlay {
                 v.area = area;
                 v.tab_hits = hits;
                 v.body_area = body;
                 v.view_height = body.height;
                 v.scroll = scroll;
+                v.preview_line_count = line_count;
+                if rendered.is_some() {
+                    v.rendered = rendered;
+                }
             }
         }
-        Overlay::Tree(view) => {
+        Overlay::Tree(mut view) => {
             let area = centered_rect_pct(f.area(), SPLIT_MODAL_PCT.0, SPLIT_MODAL_PCT.1);
             f.render_widget(Clear, area);
             // Cap first, floor second: on a tiny screen the tree keeps its
@@ -1928,13 +2035,29 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             };
             let mut block = panel_block(&title, true, th);
             let preview_inner = block.inner(preview_a);
-            let max_scroll =
-                (view.preview_line_count as u16).saturating_sub(preview_inner.height.max(1));
+            // A markdown file shows the rendered page (the FILE TABS'
+            // rule), flowed for this width and kept between draws, unless
+            // Ctrl+r asked for the source.
+            let rendered = (view.renders_markdown() && !editing).then(|| {
+                crate::markdown::Rendered::for_width(
+                    view.rendered.take(),
+                    &view.preview,
+                    preview_inner.width,
+                    crate::markdown::Breaks::Reflow,
+                    th,
+                )
+            });
+            let line_count = match &rendered {
+                Some(r) => r.lines.len(),
+                None => view.preview_lines.len(),
+            };
+            let max_scroll = (line_count.min(u16::MAX as usize) as u16)
+                .saturating_sub(preview_inner.height.max(1));
             let scroll = view.scroll.min(max_scroll);
             if !editing && max_scroll > 0 {
                 block = block.title_bottom(
                     Line::from(Span::styled(
-                        format!(" {}/{} ", scroll + 1, view.preview_line_count),
+                        format!(" {}/{} ", scroll + 1, line_count),
                         Style::default().fg(th.dim),
                     ))
                     .right_aligned(),
@@ -1944,16 +2067,26 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if !editing {
                 // Line-number gutter, for real file contents only —
                 // directory listings and placeholders have no lines to
-                // number. Dropped entirely when the pane is too narrow to
-                // leave room for the code itself.
-                let lines = preview_window(
-                    &view.preview_lines,
-                    view.preview_line_count,
-                    view.preview_is_file,
-                    scroll,
-                    preview_inner,
-                    th,
-                );
+                // number, and a rendered page's rows aren't source lines.
+                // Dropped entirely when the pane is too narrow to leave
+                // room for the code itself.
+                let lines = match &rendered {
+                    Some(r) => r
+                        .lines
+                        .iter()
+                        .skip(scroll as usize)
+                        .take(preview_inner.height as usize)
+                        .cloned()
+                        .collect(),
+                    None => preview_window(
+                        &view.preview_lines,
+                        line_count,
+                        view.preview_is_file,
+                        scroll,
+                        preview_inner,
+                        th,
+                    ),
+                };
                 f.render_widget(Paragraph::new(lines), preview_inner);
             }
 
@@ -1963,6 +2096,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if let Some(Overlay::Tree(v)) = &mut app.overlay {
                 v.view_height = preview_inner.height;
                 v.scroll = scroll;
+                v.preview_line_count = line_count;
+                if rendered.is_some() {
+                    v.rendered = rendered;
+                }
                 v.list_area = list_inner;
                 v.preview_area = preview_inner;
                 v.area = area;
@@ -1989,19 +2126,31 @@ fn key_hint(app: &App, action: crate::keymap::Action) -> String {
 /// is — the strip, the preview, or the editor drawn over it.
 fn file_tabs_keys_hint(view: &crate::file_tabs::FileTabsView, editing: bool) -> String {
     let editor = editor_name(&view.editor);
+    let md = markdown_toggle_hint("m", view.markdown, view.pretty);
     if editing {
         format!(
             "{editor} has the keys  Ctrl+q: back to the tabs (kills {editor}; :q keeps the file)"
         )
     } else if view.on_tabs {
         format!(
-            "←/→ or Tab: switch  1-9: jump  ↓: preview  Enter: edit in {editor}  Esc / Ctrl+q: close"
+            "←/→ or Tab: switch  1-9: jump  ↓: preview  Enter: edit in {editor}{md}  \
+             Esc / Ctrl+q: close"
         )
     } else {
         format!(
-            "j/k: scroll  Ctrl+d/u: half page  ↑ off the top: tabs  Enter: edit in {editor}  \
+            "j/k: scroll  Ctrl+d/u: half page  ↑ off the top: tabs  Enter: edit in {editor}{md}  \
              Esc / Ctrl+q: back to the tabs"
         )
+    }
+}
+
+/// The hint segment for a markdown preview's toggle, naming the view the
+/// key switches *to*; nothing at all for a file that isn't markdown.
+fn markdown_toggle_hint(key: &str, markdown: bool, pretty: bool) -> String {
+    match (markdown, pretty) {
+        (true, true) => format!("  {key}: source"),
+        (true, false) => format!("  {key}: rendered"),
+        (false, _) => String::new(),
     }
 }
 
@@ -2383,6 +2532,12 @@ const MIN_NAME_W: usize = 8;
 /// ago label (worktree) or the harness name (session) takes on a real
 /// row.
 pub(crate) const PENDING_WORKTREE_BADGE: &str = " creating";
+/// What a checkout nested under its pull request's row is stepped in
+/// behind (`App::worktree_rows`): the child connector, running straight
+/// into the row's own STATUS DOT as into a node — one cell, so a
+/// nine-letter branch still keeps its ` creating` badge in the default
+/// twenty-two-cell column.
+pub(crate) const NESTED_WORKTREE_INDENT: &str = "└";
 pub(crate) const PENDING_SESSION_BADGE: &str = " starting";
 
 fn ago_badge(status_changed_at: i64) -> String {
@@ -2577,6 +2732,31 @@ fn render_button<'a>(
 /// would collide with the title text.
 const COLLAPSE_MIN_W: u16 = 16;
 
+/// How a sidebar column stands this frame: open at its remembered width,
+/// folded to a RAIL — the column rule with an expand chevron, hidden by
+/// its `Shift+` hotkey or header chevron and clickable back open — or
+/// folded to a bare RULE with no chevron and no click target, for a
+/// column that has nothing to expand into while it stands: the Sessions
+/// column under a pull request row (`App::sessions_collapsed`), which
+/// opens itself again the moment the cursor steps onto a checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fold {
+    Open,
+    Rail,
+    Rule,
+}
+
+impl Fold {
+    /// The fold of a column that only ever hides by hand.
+    fn hidden(hidden: bool) -> Self {
+        if hidden {
+            Fold::Rail
+        } else {
+            Fold::Open
+        }
+    }
+}
+
 fn draw_column(
     f: &mut Frame,
     area: Rect,
@@ -2585,7 +2765,7 @@ fn draw_column(
     focused: bool,
     th: Theme,
     collapse: Focus,
-    collapsed: bool,
+    fold: Fold,
     hits: &mut Vec<(Rect, HitTarget)>,
 ) -> Rect {
     let block = Block::default()
@@ -2593,7 +2773,14 @@ fn draw_column(
         .border_style(Style::default().fg(th.edge));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    if collapsed {
+    if fold == Fold::Rule {
+        // The rule alone: the column folded of its own accord and opens
+        // the same way, so there is no chevron to click and no target
+        // under it — a click there would only write a preference the
+        // user did not set.
+        return Rect { height: 0, ..inner };
+    }
+    if fold == Fold::Rail {
         // The rail is the column rule itself: the block above drew the
         // right border into this one cell, and the expand chevron goes
         // over it on the header row (row 1, under the blank spacer).
@@ -3154,7 +3341,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
         focused,
         th,
         Focus::Projects,
-        app.hide_projects,
+        Fold::hidden(app.hide_projects),
         &mut app.hits,
     );
 
@@ -3264,8 +3451,15 @@ enum WorktreeEntry {
     /// The OPEN PRS group header — the panel's one group header, in
     /// whichever form the fold is in. A click target.
     PrHeader(String),
-    /// Index into `visible_worktree_rows()`.
+    /// Index into [`App::worktree_rows`].
     Row(usize),
+}
+
+/// What one `WorktreeEntry::Row` draws: a checkout — plain, or nested
+/// under the pull request row above it — or a pull request.
+enum PanelRow {
+    Checkout { data: WorktreeRowData, nested: bool },
+    Pr(crate::pull_request::OpenPr),
 }
 
 impl WorktreeEntry {
@@ -3295,7 +3489,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         focused,
         th,
         Focus::Worktrees,
-        app.hide_worktrees,
+        Fold::hidden(app.hide_worktrees),
         &mut app.hits,
     );
     // The page Ctrl+d / Ctrl+u jump by half of: how many pills the column
@@ -3303,32 +3497,49 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     // "about half a panel" is the promise, not an exact line count).
     app.worktrees_view_rows = (inner.height / PILL_H) as usize;
 
-    let worktrees: Vec<WorktreeRowData> = app
-        .visible_worktrees()
-        .iter()
-        .map(|w| {
-            (
-                w.branch.clone(),
-                w.is_main,
-                app.worktree_rollup(&w.id),
-                app.worktree_unseen(&w.id),
-                app.worktree_recency(&w.id).stamped,
-                app.is_placeholder_worktree(&w.id),
-                app.worktree_wears_merge(&w.id),
-                app.worktree_running(&w.id),
-            )
+    let row_data = |app: &App, w: &nebula_core::Worktree| -> WorktreeRowData {
+        (
+            w.branch.clone(),
+            w.is_main,
+            app.worktree_rollup(&w.id),
+            app.worktree_unseen(&w.id),
+            app.worktree_recency(&w.id).stamped,
+            app.is_placeholder_worktree(&w.id),
+            app.worktree_wears_merge(&w.id),
+            app.worktree_running(&w.id),
+        )
+    };
+    // The rows in cursor order: the plain checkouts, then each open pull
+    // request over the checkout on its head branch, when there is one.
+    let rows: Vec<PanelRow> = app
+        .worktree_rows()
+        .into_iter()
+        .map(|row| match row {
+            WorktreeRow::Checkout(w) => PanelRow::Checkout {
+                data: row_data(app, w),
+                nested: false,
+            },
+            WorktreeRow::PrCheckout { worktree, .. } => PanelRow::Checkout {
+                data: row_data(app, worktree),
+                nested: true,
+            },
+            WorktreeRow::Pr(pr) => PanelRow::Pr(pr.clone()),
         })
         .collect();
-    let prs: Vec<crate::pull_request::OpenPr> =
-        app.visible_open_prs().into_iter().cloned().collect();
+    // The plain checkouts lead the list; everything after them belongs to
+    // the OPEN PRS group — pull requests and the checkouts under them.
+    let plain = rows
+        .iter()
+        .take_while(|r| matches!(r, PanelRow::Checkout { .. }))
+        .count();
     // The header counts what the group lists — the whole answer, or the
     // rows left once `hide_draft_prs` has kept the drafts out — even while
-    // the group is folded and `prs`, the rows actually on screen, is
-    // empty. The drafts kept out are owned up to beside it, so a pull
-    // request that is not where it was reads as a setting, not a loss.
+    // the group is folded and the pull requests are off screen. The drafts
+    // kept out are owned up to beside it, so a pull request that is not
+    // where it was reads as a setting, not a loss.
     let pr_total = app.listed_open_prs().len();
     let drafts_hidden = app.hidden_draft_prs();
-    if worktrees.is_empty() && pr_total == 0 && drafts_hidden == 0 {
+    if wt_count == 0 && pr_total == 0 && drafts_hidden == 0 {
         if app.tree.has_visible_projects() {
             f.render_widget(
                 Paragraph::new(hint_line(&[("n", " starts a worktree")], th)),
@@ -3355,12 +3566,13 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         layout.push((*vrow, e));
         *vrow += h;
     };
-    for i in 0..worktrees.len() {
+    for (i, row) in rows.iter().take(plain).enumerate() {
         layout.push((vrow, WorktreeEntry::Row(i)));
         vrow += PILL_H as usize;
-        // An extra quiet row separates the main checkout from the true
-        // worktrees below.
-        if worktrees[i].1 && worktrees.len() > 1 {
+        // An extra quiet row separates the main checkout from the plain
+        // worktrees below it.
+        let is_main = matches!(row, PanelRow::Checkout { data, .. } if data.1);
+        if is_main && plain > 1 {
             vrow += 1;
         }
     }
@@ -3387,8 +3599,11 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         // header is the whole group and its count says what it hides.
         let fold = if app.open_prs_collapsed { "▸" } else { "▾" };
         header(&mut layout, &mut vrow, format!("{fold} OPEN PRS · {count}"));
-        for i in 0..prs.len() {
-            layout.push((vrow, WorktreeEntry::Row(worktrees.len() + i)));
+        // A checkout under its pull request stacks straight onto the
+        // pull request's pill, no quiet row between: the two are one
+        // thing, and the indent says which is under which.
+        for i in plain..rows.len() {
+            layout.push((vrow, WorktreeEntry::Row(i)));
             vrow += PILL_H as usize;
         }
     }
@@ -3446,7 +3661,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             break;
         }
         let hit_h = pill_hit_height(*top, layout.get(pos + 1).map(|(t, _)| *t));
-        match entry {
+        let i = match entry {
             WorktreeEntry::PrHeader(text) => {
                 // Both forms are click targets: a click folds or unfolds
                 // the group, like the ARCHIVED header in Sessions.
@@ -3454,10 +3669,13 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     f.render_widget(Paragraph::new(Span::styled(format!(" {text}"), dim)), r);
                     app.hits.push((r, HitTarget::OpenPrsHeader));
                 }
+                continue;
             }
-            WorktreeEntry::Row(i) if *i < worktrees.len() => {
-                let (branch, is_main, roll, unseen, stamped, pending, merged, running) =
-                    &worktrees[*i];
+            WorktreeEntry::Row(i) => *i,
+        };
+        match &rows[i] {
+            PanelRow::Checkout { data, nested } => {
+                let (branch, is_main, roll, unseen, stamped, pending, merged, running) = data;
                 let (badges, badge_len) = row_badges(*unseen, th);
                 // A stand-in checkout (QUICK PROMPT, git still cutting
                 // it) reads as not-there-yet: hollow dot, no sweep, and
@@ -3470,10 +3688,16 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     (false, false) => RowState::Sessions(*roll),
                 };
                 let ramp = state.ramp(th, app.animations);
+                // A checkout under its pull request is stepped in behind
+                // a `└` that runs into its dot, the way a child row is
+                // anywhere: the row above is the pull request it is the
+                // checkout of.
+                let indent = nested.then_some(NESTED_WORKTREE_INDENT);
+                let indent_len = indent.map_or(0, |s| s.chars().count());
                 // 3, not 2: the dot's two cells plus the pill marker
                 // `render_pill` prepends — bill them here or the trailing
                 // badge is what falls off the end of a twenty-cell column.
-                let free = (inner.width as usize).saturating_sub(3 + badge_len);
+                let free = (inner.width as usize).saturating_sub(3 + badge_len + indent_len);
                 let run = running.then(|| {
                     let wide = branch.chars().count() + RUN_BADGE.chars().count();
                     if wide <= free {
@@ -3511,7 +3735,11 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     None
                 };
                 let max = free - root.map_or(0, |r| r.chars().count());
-                let mut spans = vec![state.dot(*unseen > 0, th)];
+                let mut spans = Vec::new();
+                if let Some(indent) = indent {
+                    spans.push(Span::styled(indent, dim));
+                }
+                spans.push(state.dot(*unseen > 0, th));
                 spans.extend(status_name_spans(
                     truncate(branch, max),
                     Style::default(),
@@ -3538,16 +3766,16 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     inner,
                     y,
                     spans,
-                    *i == app.sel_worktree,
+                    i == app.sel_worktree,
                     focused,
                     th,
                     state.color(*unseen > 0, th),
                 );
                 if let Some(hit) = rows_rect_at(inner, y, hit_h) {
-                    app.hits.push((hit, HitTarget::Worktree(*i)));
+                    app.hits.push((hit, HitTarget::Worktree(i)));
                 }
             }
-            WorktreeEntry::Row(i) => {
+            PanelRow::Pr(pr) => {
                 // A pull request reads like the Sessions panel's link rows —
                 // the arrow says "leaves nebula". The group header already
                 // says these are open, so only a draft earns a badge; in a
@@ -3555,7 +3783,6 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 // A draft is also dimmed end to end (`pr_row::look`) and
                 // sits below every finished pull request, so it reads as
                 // "not ready" from across the room.
-                let pr = &prs[*i - worktrees.len()];
                 let look = crate::pr_row::look(pr.standing(), th);
                 let badge = pr
                     .is_draft
@@ -3567,13 +3794,13 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     inner,
                     y,
                     spans,
-                    *i == app.sel_worktree,
+                    i == app.sel_worktree,
                     focused,
                     th,
                     look.rail,
                 );
                 if let Some(hit) = rows_rect_at(inner, y, hit_h) {
-                    app.hits.push((hit, HitTarget::Worktree(*i)));
+                    app.hits.push((hit, HitTarget::Worktree(i)));
                 }
             }
         }
@@ -3693,6 +3920,16 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         .filter(|r| r.as_link().is_none())
         .count();
     let count = Some(visible).filter(|n| *n > 0);
+    // Hidden by hand, the column is a rail with its chevron whatever row
+    // the Worktrees cursor is on; open by hand but under a pull request
+    // row, it folds to the bare rule — nothing to list, nothing to click.
+    let fold = if app.hide_sessions {
+        Fold::Rail
+    } else if app.sessions_collapsed() {
+        Fold::Rule
+    } else {
+        Fold::Open
+    };
     let inner = draw_column(
         f,
         area,
@@ -3701,7 +3938,7 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         focused,
         th,
         Focus::Sessions,
-        app.hide_sessions,
+        fold,
         &mut app.hits,
     );
     // The page Ctrl+d / Ctrl+u jump by half of: how many pills the column
@@ -4657,16 +4894,29 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             file_tabs_keys_hint(view, app.vim.as_ref().is_some_and(|v| v.embedded)),
             Style::default().fg(th.dim),
         )
-    } else if matches!(&app.overlay, Some(Overlay::Tree(_))) {
+    } else if let Some(Overlay::Tree(view)) = &app.overlay {
+        let md = markdown_toggle_hint("Ctrl+r", view.markdown, view.pretty);
         Span::styled(
-            "type: filter  ↑/↓: move  ←/→: fold  Enter: open/edit  ⇧↑/↓: scroll  Ctrl+u: clear filter  Esc: clear/close",
+            format!(
+                "type: filter  ↑/↓: move  ←/→: fold  Enter: open/edit  ⇧↑/↓: scroll{md}  \
+                 Ctrl+u: clear filter  Esc: clear/close"
+            ),
             Style::default().fg(th.dim),
         )
     } else if let Some(Overlay::Files(view)) = &app.overlay {
+        // A markdown selection is read first (the FILE TABS); the hint
+        // says so rather than promising the editor.
+        let enter = if view
+            .selected_path()
+            .is_some_and(crate::markdown::is_markdown_path)
+        {
+            "Enter: preview".to_string()
+        } else {
+            format!("Enter: edit in {}", editor_name(&view.editor))
+        };
         Span::styled(
             format!(
-                "type: search  ↑/↓: move  Enter: edit in {}  Ctrl+y: copy path  Ctrl+u: clear  Esc: clear/close",
-                editor_name(&view.editor)
+                "type: search  ↑/↓: move  {enter}  Ctrl+y: copy path  Ctrl+u: clear  Esc: clear/close"
             ),
             Style::default().fg(th.dim),
         )
@@ -4707,9 +4957,9 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             "Tab/↑↓: next field  ←/→: cycle  Shift+Enter/^J: newline  Enter: save  Esc: back to list",
             Style::default().fg(th.dim),
         )
-    } else if matches!(&app.overlay, Some(Overlay::Issues(_))) {
+    } else if let Some(Overlay::Issues(view)) = &app.overlay {
         Span::styled(
-            "↑/↓: issue  PgUp/PgDn ^d/^u: read  Enter/p: prompt an agent  e: preset  o: browser  r: refresh  Esc: close",
+            crate::issues::footer_hint(view),
             Style::default().fg(th.dim),
         )
     } else if let Some(Overlay::BranchSwitch(view)) = &app.overlay {
@@ -4806,8 +5056,9 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             // An open-PR row answers to a different set of verbs than a
             // checkout does, so the hint follows the cursor into the group.
             Focus::Worktrees if app.selected_worktree_pr().is_some() => format!(
-                "{}: new session  {}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: refresh  {}: search  {}: menu  {}: help",
+                "{}: new session  {}: preset  {}: open in browser  {}: diff  PgUp/PgDn: scroll  {}: refresh  {}: search  {}: menu  {}: help",
                 k(Action::New),
+                k(Action::AgentPresets),
                 k(Action::Activate),
                 k(Action::GitDiff),
                 k(Action::RefreshPullRequests),
@@ -5053,7 +5304,7 @@ fn footer_usage(app: &App) -> Option<String> {
 
 /// Style for one syntax-highlight token kind of the tree-browser preview
 /// (classification lives in syntax.rs, the `classify_diff_line` split).
-fn token_style(kind: crate::syntax::TokenKind, th: Theme) -> Style {
+pub(crate) fn token_style(kind: crate::syntax::TokenKind, th: Theme) -> Style {
     use crate::syntax::TokenKind;
     match kind {
         TokenKind::Keyword => Style::default().fg(th.special),
@@ -5510,13 +5761,31 @@ mod tests {
             effort: None,
             preset: None,
             issue: None,
+            pr: None,
             origin: crate::quick_prompt::QuickOrigin::Hotkey,
         });
         let cloud = PromptKind::CloudMessage {
             id: nebula_core::AgentId::from("a".to_string()),
         };
+        let comment = PromptKind::IssueComment {
+            view: crate::issues::IssuesView::new(
+                nebula_core::ProjectId("p".into()),
+                "p".into(),
+                "/tmp/p".into(),
+            ),
+            issue: crate::issues::IssueRef {
+                url: "https://github.com/o/r/issues/1".into(),
+                number: 1,
+                title: "t".into(),
+            },
+        };
+        let pr_comment = PromptKind::PrComment {
+            number: 7,
+            url: "https://github.com/o/r/pull/7".into(),
+            label: "#7 Attach links".into(),
+        };
         for width in 20..=TASK_PROMPT_SIZE.0 {
-            for kind in [&quick, &cloud] {
+            for kind in [&quick, &cloud, &comment, &pr_comment] {
                 let hint = task_prompt_hint(kind, width);
                 assert!(
                     hint.chars().count() <= width.saturating_sub(2) as usize,
@@ -5533,6 +5802,15 @@ mod tests {
             "{full}"
         );
         assert!(!task_prompt_hint(&cloud, TASK_PROMPT_SIZE.0).contains("Tab"));
+        // The COMMENT BOX posts rather than launches, and offers no picker.
+        let post = task_prompt_hint(&pr_comment, TASK_PROMPT_SIZE.0);
+        assert!(
+            post.contains("post") && !post.contains("launch") && !post.contains("Tab"),
+            "{post}"
+        );
+        // A comment posts, and Esc goes back to the modal.
+        let posts = task_prompt_hint(&comment, TASK_PROMPT_SIZE.0);
+        assert!(posts.contains("post") && posts.contains("back"), "{posts}");
     }
 
     #[test]
@@ -6055,6 +6333,83 @@ mod tests {
             });
         }
         app
+    }
+
+    /// A checkout on an open pull request's head branch draws under that
+    /// pull request's row — stacked straight onto it, stepped in behind a
+    /// `└` that runs into its STATUS DOT — not among the plain checkouts
+    /// above the group, so the checkout a PR SESSION works in and the
+    /// pull request it is for read as one thing. A click on it lands on
+    /// the checkout's own row: it is a worktree, not the pull request.
+    #[test]
+    fn a_checkout_under_its_pull_request_draws_indented_beneath_it() {
+        let mut app = hit_test_app(&["main", "feat"], &[], &[]);
+        let pid = app.tree.projects[0].id.clone();
+        let now = std::time::Instant::now();
+        app.open_prs.insert(
+            pid,
+            crate::app::OpenPrs {
+                list: vec![crate::pull_request::OpenPr {
+                    number: 7,
+                    title: "Attach links".into(),
+                    url: "https://github.com/o/r/pull/7".into(),
+                    is_draft: false,
+                    head: "feat".into(),
+                }],
+                at: now,
+                due: now,
+                step: std::time::Duration::from_secs(15),
+            },
+        );
+        app.focus = Focus::Worktrees;
+        let area = Rect::new(0, 0, 30, 14);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 14)).unwrap();
+        terminal
+            .draw(|f| draw_worktrees(f, &mut app, area))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let lines: Vec<String> = (0..14)
+            .map(|y| {
+                (0..30)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        let row_at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} on screen:\n{}", lines.join("\n")))
+        };
+        let pr = row_at("#7 Attach links");
+        let feat = row_at("feat");
+        assert!(
+            row_at("main") < row_at("OPEN PRS"),
+            "the root stays above the group"
+        );
+        assert!(pr < feat, "the checkout is under its pull request");
+        assert_eq!(
+            feat,
+            pr + PILL_H as usize,
+            "stacked straight onto it, no quiet row between:\n{}",
+            lines.join("\n")
+        );
+        assert!(lines[feat].contains("└○ feat"), "{:?}", lines[feat]);
+        assert!(
+            !lines[row_at("main")].contains('└'),
+            "a plain row has no connector"
+        );
+
+        // Row 1 is the pull request, row 2 the checkout under it.
+        assert_eq!(app.hit_at(1, pr as u16), Some(HitTarget::Worktree(1)));
+        assert_eq!(app.hit_at(1, feat as u16), Some(HitTarget::Worktree(2)));
+        app.sel_worktree = 2;
+        assert_eq!(
+            app.selected_worktree().map(|w| w.branch.as_str()),
+            Some("feat")
+        );
+        assert!(app.selected_worktree_pr().is_none());
     }
 
     /// Pills are 3-row cells on a 2-row stride, so a pill's bottom pad is

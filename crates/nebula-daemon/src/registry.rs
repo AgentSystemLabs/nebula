@@ -422,7 +422,9 @@ impl Daemon {
     /// attached session; in-view sessions get their stamps refreshed
     /// instead, so the full timeout starts only when the user leaves.
     /// Spared regardless of age: agents that are running or waiting on
-    /// feedback, terminals with a command running, and prewarm-pool sessions
+    /// feedback, agents with a backgrounded tool call still running (a job
+    /// detached from their terminal — see `pty::detached_job_under`),
+    /// terminals with a command running, and prewarm-pool sessions
     /// (`reap_prewarmed` owns those). A reaped session revives on the next
     /// attach or prewarm; agents resume their conversation.
     pub fn reap_idle_sessions(self: &Arc<Self>) {
@@ -462,10 +464,28 @@ impl Daemon {
             }
             let spared = match &sref {
                 SessionRef::Agent(id) => match self.store.get_agent(id).ok().flatten() {
-                    Some(agent) => matches!(
-                        agent.status,
-                        AgentStatus::Running | AgentStatus::NeedsFeedback
-                    ),
+                    Some(agent)
+                        if matches!(
+                            agent.status,
+                            AgentStatus::Running | AgentStatus::NeedsFeedback
+                        ) =>
+                    {
+                        true
+                    }
+                    // A backgrounded tool call — Claude's `run_in_background`
+                    // Bash, its Monitor watch, a Codex shell command —
+                    // outlives the turn that started it, and the hook-fed
+                    // status machine read that turn's Stop as Finished. The
+                    // process tree still knows (#78). Restamped rather than
+                    // just skipped: the job ending is the moment the agent
+                    // wakes to read its result, so the clock starts there.
+                    Some(_) => {
+                        let busy = agent_has_detached_job(&session);
+                        if busy {
+                            self.touch_session(&sref);
+                        }
+                        busy
+                    }
                     // Row vanished mid-sweep: its delete kills the PTY anyway.
                     None => true,
                 },
@@ -3130,6 +3150,16 @@ fn canonical_or_raw(path: &Path) -> std::path::PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Does this agent still have a backgrounded tool call running — a job it
+/// cut loose from its terminal, which the turn that started it has already
+/// left behind? An unknown child pid counts as busy, as for terminals.
+fn agent_has_detached_job(session: &PtySession) -> bool {
+    match session.child_pid {
+        Some(pid) => crate::pty::detached_job_under(pid),
+        None => true,
+    }
+}
+
 /// Does this terminal's shell have any child processes (a command or job
 /// still running)? An unknown child pid or a failed probe counts as busy —
 /// never kill what can't be inspected.
@@ -4667,10 +4697,31 @@ mod tests {
                 auto_title: false,
                 pr_url: "https://github.com/o/r/pull/7".into(),
                 head: "--force".into(),
+                starting_prompt: None,
             })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not a branch name"), "{err}");
+
+        // A preset's composed prompt rides the same create, and is held to
+        // `CreateAgent`'s rules once the checkout is found: it reaches the
+        // agent create, where the NUL is refused.
+        let err = daemon
+            .create_pr_agent(crate::pr_scope::CreatePrAgentSpec {
+                project: project.clone(),
+                name: "pr".into(),
+                kind: AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                auto_title: true,
+                pr_url: "https://github.com/o/r/pull/7".into(),
+                head: "feat-x".into(),
+                starting_prompt: Some("fix\0auth".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("NUL"), "{err}");
     }
 
     /// The ISSUE SESSION's URL is checked at the boundary like the PR

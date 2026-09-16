@@ -16,11 +16,15 @@
 //! `PromptDialog` (`PromptKind::QuickPrompt`) drawn by `ui::draw_overlay`,
 //! and the create it ends in goes through `event_loop::create_agent` like
 //! every other session, with the composed text as the STARTING PROMPT
-//! (`event_loop::quick_launch` holds that last step).
+//! (`event_loop::quick_launch` holds that last step). A box opened on a
+//! PROJECT OPEN PRS GROUP row (`e` there, through the preset picker) is
+//! the same box for a PR SESSION: it carries the pull request
+//! ([`QuickLaunch::pr`]) and ends in a `CreatePrAgent` instead.
 
 use crate::agent_presets::AgentPreset;
 use crate::app::{App, Focus, Overlay, PromptKind};
 use crate::config::{fit_effort, Config};
+use crate::pull_request::PrLaunch;
 use crate::text_input::TextInput;
 use nebula_core::{AgentKind, ProjectId, WorktreeId};
 
@@ -76,6 +80,15 @@ pub struct QuickLaunch {
     /// empty. Kept across the box's pickers — the harness and the preset
     /// change what runs, not what it is for.
     pub issue: Option<crate::issues::IssueRef>,
+    /// The pull request this launch is for, when the box was opened from
+    /// a PROJECT OPEN PRS GROUP row (`e` on it): named in the title and
+    /// the target row, and sent to the DAEMON as a PR SESSION
+    /// (`CreatePrAgent`) — it runs in the PROJECT's checkout of the PR's
+    /// head branch, reused when one is there and cut by the DAEMON
+    /// otherwise, never in `target`, which only names the PROJECT (its
+    /// ROOT WORKTREE). Kept across the box's pickers, as the issue is;
+    /// `Ctrl+N` is refused, the checkout being the DAEMON's to pick.
+    pub pr: Option<PrLaunch>,
     /// Which surface opened the box — see [`QuickOrigin`]. Kept across the
     /// box's pickers and its `Ctrl+N`, as the issue is.
     pub origin: QuickOrigin,
@@ -136,8 +149,17 @@ impl QuickLaunch {
             effort,
             preset: None,
             issue: None,
+            pr: None,
             origin: QuickOrigin::Hotkey,
         }
+    }
+
+    /// The same launch, for the pull request `pr` (or for none). What
+    /// every picker's return trip does to the launch it rebuilt, so the
+    /// PR survives a `Tab` or `Shift+Tab` pick as the issue does.
+    pub fn with_pr(mut self, pr: Option<PrLaunch>) -> Self {
+        self.pr = pr;
+        self
     }
 
     /// The same launch, for `issue` (or for nothing, with `None`). What
@@ -190,6 +212,16 @@ impl QuickLaunch {
         launch
     }
 
+    /// The checkout this launch is addressed to, to rewrite when a
+    /// stand-in becomes the real row: None for a launch that cuts its
+    /// own (`QuickTarget::NewWorktree`).
+    pub fn worktree_mut(&mut self) -> Option<&mut WorktreeId> {
+        match &mut self.target {
+            QuickTarget::Worktree(worktree) => Some(worktree),
+            QuickTarget::NewWorktree { .. } => None,
+        }
+    }
+
     /// The STARTING PROMPT this launch sends for `task`: the text itself,
     /// or the preset's prefix + task + postfix.
     pub fn compose(&self, task: &str) -> String {
@@ -205,7 +237,8 @@ impl QuickLaunch {
     /// is never a surprise —
     /// `Quick prompt · reviewer (claude · opus · high)`,
     /// `Quick prompt · new worktree yellow-fox-jumps (claude)`,
-    /// `Quick prompt · issue #15 · reviewer (claude · opus)` — and, for
+    /// `Quick prompt · issue #15 · reviewer (claude · opus)`,
+    /// `Quick prompt · PR #42 · reviewer (claude · opus)` — and, for
     /// the NEW SESSION PICKER's box, `New session (claude · opus · high)`.
     pub fn title(&self) -> String {
         let harness = self.custom.as_deref().unwrap_or_else(|| self.kind.as_str());
@@ -216,6 +249,9 @@ impl QuickLaunch {
         let mut head = vec![self.head().to_string()];
         if let Some(issue) = &self.issue {
             head.push(format!("issue #{}", issue.number));
+        }
+        if let Some(pr) = &self.pr {
+            head.push(format!("PR #{}", pr.number));
         }
         if let Some(preset) = &self.preset {
             head.push(preset.name.clone());
@@ -242,9 +278,10 @@ impl QuickLaunch {
                 "what should the agent do about #{}? (empty = fix the issue)",
                 issue.number
             ),
-            (None, None) => match self.origin {
-                QuickOrigin::Hotkey => "what should the agent do?".into(),
-                QuickOrigin::NewSession => {
+            (None, None) => match (&self.pr, self.origin) {
+                (Some(pr), _) => format!("what should the agent do about PR #{}?", pr.number),
+                (None, QuickOrigin::Hotkey) => "what should the agent do?".into(),
+                (None, QuickOrigin::NewSession) => {
                     "what should the agent do? (empty = start with no prompt)".into()
                 }
             },
@@ -282,8 +319,9 @@ impl QuickLaunch {
 /// The one exception is the WORKTREES PANEL: `p` there means "a fresh
 /// worktree, then this task in it", whatever row the cursor is parked on
 /// (the root, another checkout, an OPEN PRS row) and whether or not the
-/// `hide_root_worktree` SETTING has taken the root row out — the checkout
-/// does not exist yet, so only the PROJECT has to be selected. Its branch
+/// project's **Hide root worktree** setting has taken the root row out —
+/// the checkout does not exist yet, so only the PROJECT has to be
+/// selected. Its branch
 /// is the same random name the `n` prompt would have offered.
 pub(crate) fn open_quick_prompt(app: &mut App) {
     if app.focus == Focus::Worktrees {
@@ -378,9 +416,16 @@ pub(crate) fn reopen(app: &mut App, launch: QuickLaunch, text: &str) {
 /// ISSUE SESSION, one named after the issue (`issue-15-fix-login`); flipping off
 /// needs a real checkout under the cursor (not an OPEN PRS row, not a
 /// stand-in git is still cutting) and says so while keeping the fresh one
-/// otherwise. The box is rebuilt so its title and frame follow the
-/// target, with the typed text and the caret exactly where they were.
+/// otherwise. A PR SESSION's box has nothing to flip: the DAEMON picks
+/// its checkout (the PR head branch's own), so the key only says so. The
+/// box is rebuilt so its title and frame follow the target, with the
+/// typed text and the caret exactly where they were.
 pub(crate) fn toggle_new_worktree(app: &mut App, launch: QuickLaunch, input: TextInput) {
+    if launch.pr.is_some() {
+        app.flash =
+            Some("quick prompt: a PR session runs in the pull request's own checkout".into());
+        return;
+    }
     let target = match &launch.target {
         QuickTarget::NewWorktree { .. } => match app.selected_worktree().map(|w| w.id.clone()) {
             None => Err("quick prompt: no worktree under the cursor — keeping the new one"),
@@ -477,6 +522,42 @@ pub(crate) fn open_preset_picker(app: &mut App, back: QuickReturn) {
     view.selected = selected;
     view.quick = Some(back);
     app.overlay = Some(Overlay::AgentPresets(view));
+}
+
+/// `e` on a PROJECT OPEN PRS GROUP row: the saved AGENT PRESETS as a
+/// picker for a PR SESSION on that pull request. The pick hands the
+/// QUICK PROMPT box back with the preset applied and the PR carried
+/// (`QuickLaunch::pr`) — or, for a `skip`-task preset, launches at once
+/// — and Enter sends a `CreatePrAgent`: the DAEMON runs it in the
+/// PROJECT's checkout of the PR's head branch, reusing one already there
+/// and cutting one otherwise, with the PR URL and its work rule in the
+/// system prompt and the preset's composed text as the first prompt. The
+/// box's target is the PROJECT's ROOT WORKTREE, which only names the
+/// PROJECT the create is addressed to (as the `n` picker's is).
+pub(crate) fn open_preset_picker_for_pr(app: &mut App) {
+    let Some(pr) = app.selected_worktree_pr().map(PrLaunch::of) else {
+        return;
+    };
+    let root = app.selected_project().and_then(|project| {
+        app.tree
+            .worktrees
+            .iter()
+            .find(|w| w.project_id == project.id && w.is_main)
+            .map(|w| w.id.clone())
+    });
+    let Some(root) = root else {
+        app.flash = Some("the project has no ROOT WORKTREE for this PR session".into());
+        return;
+    };
+    let launch =
+        QuickLaunch::from_config(QuickTarget::Worktree(root), &Config::load()).with_pr(Some(pr));
+    open_preset_picker(
+        app,
+        QuickReturn {
+            launch,
+            text: String::new(),
+        },
+    );
 }
 
 #[cfg(test)]
@@ -673,6 +754,44 @@ mod tests {
         assert!(wrapped.default_task().is_some());
         let none = QuickLaunch::of_kind(worktree(), AgentKind::Claude, None, None, None, &cfg);
         assert_eq!(none.default_task(), None, "an empty ordinary box cancels");
+    }
+
+    /// A PR SESSION's box names the pull request, keeps it through a
+    /// preset, and — unlike an issue's — offers no task when sent empty:
+    /// the PR rides the system prompt, the preset's text is the task.
+    #[test]
+    fn a_pr_launch_names_the_pull_request_and_keeps_it_through_a_preset() {
+        let cfg = Config::default();
+        let pr = PrLaunch {
+            url: "https://github.com/o/r/pull/42".into(),
+            head: "fix-login".into(),
+            number: 42,
+        };
+        let plain = QuickLaunch::of_kind(worktree(), AgentKind::Claude, None, None, None, &cfg)
+            .with_pr(Some(pr.clone()));
+        assert_eq!(plain.title(), "Quick prompt · PR #42 (claude)");
+        assert_eq!(plain.label(), "what should the agent do about PR #42?");
+        assert_eq!(plain.default_task(), None);
+        assert!(!plain.launches_empty(), "no preset: an empty box cancels");
+        assert!(!plain.is_new_worktree());
+
+        let wrapped = QuickLaunch::of_preset(
+            worktree(),
+            AgentPreset {
+                prefix: "Be strict.".into(),
+                ..preset("reviewer", AgentKind::Cursor)
+            },
+            &cfg,
+        )
+        .with_pr(Some(pr.clone()));
+        assert_eq!(wrapped.pr.as_ref(), Some(&pr));
+        assert_eq!(wrapped.title(), "Quick prompt · PR #42 · reviewer (cursor)");
+        assert_eq!(
+            wrapped.label(),
+            "reviewer — prefix + your task + postfix (empty = prefix + postfix only)"
+        );
+        assert!(wrapped.launches_empty(), "a preset's task is optional");
+        assert_eq!(wrapped.compose("fix it"), "Be strict.\n\nfix it");
     }
 
     /// A launch into a worktree that does not exist yet says so — and

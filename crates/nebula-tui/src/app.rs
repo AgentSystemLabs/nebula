@@ -8,7 +8,7 @@ use nebula_core::{
     TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
 };
 use ratatui::layout::{Position, Rect};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 /// Frame duration of the status-sweep text animation: the event loop's
@@ -210,6 +210,10 @@ pub enum MenuAction {
     /// no id: the row is the selection, and the fetch reads it back off the
     /// cursor the same way `g` does.
     ViewPrDiff,
+    /// Open the COMMENT BOX on the selected pull request. Like
+    /// `ViewPrDiff`, carries no id: the row is the selection, and `y`
+    /// reads it off the cursor the same way.
+    CommentPullRequest,
     EditLink(LinkId),
     DeleteLink(LinkId),
     DeleteWorktree(WorktreeId),
@@ -527,9 +531,11 @@ pub enum PromptKind {
         /// empty input, so the name offered is the name created.
         suggestion: String,
     },
-    /// The PR SESSION's name prompt — the one launch that still asks for
-    /// a name: `CreatePrAgent` carries no STARTING PROMPT, so the box the
-    /// NEW SESSION PICKER otherwise ends in has nothing to send for it.
+    /// The PR SESSION's name prompt — the one picker walk that still asks
+    /// for a name: the `n` picker on an OPEN PRS row ends here, where the
+    /// NEW SESSION PICKER ends in the QUICK PROMPT box (a preset picked on
+    /// that row with `e` uses the box, and sends its text as the
+    /// `CreatePrAgent`'s STARTING PROMPT).
     /// Enter creates the session; an empty name takes the generated
     /// default and opts into AUTO-TITLE.
     NewPrAgent {
@@ -575,6 +581,18 @@ pub enum PromptKind {
     CloudMessage {
         id: AgentId,
     },
+    /// A comment to post on the pull request under the cursor — a
+    /// PROJECT OPEN PRS GROUP row or the Sessions panel's PR ROW — with
+    /// `gh pr comment` (`y`, or **Comment…** from the row's menu).
+    /// Multi-row like the cloud message: a review note is rarely one
+    /// line, and it is markdown. Carries the pull request the box was
+    /// opened on, so Enter posts where the title said it would.
+    PrComment {
+        number: u64,
+        url: String,
+        /// Row text, `#42 title` — what the box is titled with.
+        label: String,
+    },
     RenameAgent {
         id: AgentId,
     },
@@ -602,6 +620,31 @@ pub enum PromptKind {
     EditLink {
         id: LinkId,
     },
+    /// `c` in the ISSUES MODAL: a comment to post on the issue under the
+    /// cursor, as you, with `gh issue comment`. Multi-row like the tasks —
+    /// a comment is rarely one line. Enter posts it off the loop and puts
+    /// the modal back on its row while the answer lands; Esc, or an empty
+    /// box, puts the modal back without posting.
+    IssueComment {
+        view: crate::issues::IssuesView,
+        issue: crate::issues::IssueRef,
+    },
+}
+
+impl PromptKind {
+    /// The checkout this box is addressed to — the one its Enter launches
+    /// into — to rewrite when a stand-in becomes the real row. None for a
+    /// box that names no checkout, and for a QUICK PROMPT about to cut
+    /// one of its own.
+    pub fn worktree_mut(&mut self) -> Option<&mut WorktreeId> {
+        match self {
+            PromptKind::NewPrAgent { worktree, .. }
+            | PromptKind::ClaudeCloudTask { worktree, .. }
+            | PromptKind::AgentPresetTask { worktree, .. } => Some(worktree),
+            PromptKind::QuickPrompt(launch) => launch.worktree_mut(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -650,15 +693,17 @@ impl PromptDialog {
     }
 
     /// The task prompts — the Claude Cloud launch task, a message to a live
-    /// cloud session, an AGENT PRESET's task and the QUICK PROMPT — are the
-    /// ones with a multi-row editor.
+    /// cloud session, an AGENT PRESET's task and the QUICK PROMPT — and an
+    /// issue comment are the ones with a multi-row editor.
     pub fn is_multiline(&self) -> bool {
         matches!(
             self.kind,
             PromptKind::ClaudeCloudTask { .. }
                 | PromptKind::CloudMessage { .. }
+                | PromptKind::PrComment { .. }
                 | PromptKind::AgentPresetTask { .. }
                 | PromptKind::QuickPrompt { .. }
+                | PromptKind::IssueComment { .. }
         )
     }
 
@@ -1313,6 +1358,53 @@ pub struct PlaceholderRows {
     pub agent: AgentId,
 }
 
+/// A `CreateAgent` (or `CreatePrAgent`) as a launch surface drafts it —
+/// the NEW SESSION PICKER, the QUICK PROMPT, an AGENT PRESET's task box,
+/// the ISSUES MODAL. `event_loop::create_agent` turns it into the request
+/// and the PENDING INTENT that attaches the row; a draft aimed at a
+/// stand-in checkout waits on that checkout's own intent instead
+/// (`PendingIntent::SelectCreatedWorktree::launch`).
+///
+/// An empty `name` takes the generated default (agent-1, …) and opts the
+/// session into agent-driven auto-titling (`nebula rename` on the first
+/// prompt) — what every launch from the NEW SESSION box and the QUICK
+/// PROMPT does, and what the `skip_session_naming` setting does without
+/// asking. A typed name (a PR SESSION's prompt) is the user's choice and
+/// stays.
+#[derive(Debug, Clone)]
+pub struct AgentLaunchDraft {
+    pub worktree: WorktreeId,
+    pub kind: AgentKind,
+    /// Registry id when `kind` is [`AgentKind::Custom`].
+    pub custom: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub name: String,
+    pub cloud_prompt: Option<String>,
+    /// An AGENT PRESET launch's composed first prompt (see
+    /// `ClientRequest::CreateAgent::starting_prompt`).
+    pub starting_prompt: Option<String>,
+    /// The prompt (and its typed text) to bring back should the daemon
+    /// refuse the create — so a rejected preset task is not lost.
+    pub reopen_on_error: Option<(PromptKind, String)>,
+    /// OPEN PRS launch context: this launch is a PR SESSION, scoped to that
+    /// pull request and run in a checkout of its head branch.
+    pub pr: Option<crate::pull_request::PrLaunch>,
+    /// ISSUES MODAL launch context: this launch is an ISSUE SESSION, and
+    /// the DAEMON persists the URL as the row's context (see
+    /// `ClientRequest::CreateAgent::issue_url`).
+    pub issue_url: Option<String>,
+    /// Enter and lock the TERMINAL PANE once the create is acked. True for
+    /// every launch the user walked a picker to reach; the QUICK PROMPT
+    /// passes the `quick_prompt_focus` SETTING, which is off by default.
+    pub focus_pane: bool,
+    /// The stand-in session row already on screen for this create (a
+    /// QUICK PROMPT into a worktree that did not exist, a launch that
+    /// waited on the NEW WORKTREE modal's checkout): the Ack turns it
+    /// into the created row, an Error drops it.
+    pub placeholder: Option<AgentId>,
+}
+
 /// What to do when an Ack (or Error) for this req_id arrives.
 #[derive(Debug, Clone)]
 pub enum PendingIntent {
@@ -1322,6 +1414,10 @@ pub enum PendingIntent {
     /// cursor off whatever panel the create was fired from.
     AttachCreated {
         focus: bool,
+        /// The stand-in session row up for this create — a launch that
+        /// waited on the NEW WORKTREE modal's checkout: the Ack turns it
+        /// into the created row, an Error drops it.
+        placeholder: Option<AgentId>,
     },
     /// Attach on success; on failure, reopen the exact Cloud task so a
     /// transient daemon/CLI error never makes the user retype it.
@@ -1359,6 +1455,13 @@ pub enum PendingIntent {
         focus: Focus,
         prompt: PromptKind,
         text: String,
+        /// A launch fired into the stand-in while the DAEMON was still
+        /// cutting the checkout (`e` on the new row, an AGENT PRESET
+        /// run): its session row is up under the stand-in, and the Ack
+        /// sends the create into the real checkout
+        /// (`placeholder::defer_launch` / `replay_launch`). An Error
+        /// takes that row down with the checkout's.
+        launch: Option<Box<AgentLaunchDraft>>,
     },
     /// A QUICK PROMPT whose target was a worktree that did not exist yet:
     /// the Ack names the checkout the DAEMON cut, the cursor moves onto
@@ -1407,7 +1510,11 @@ impl PendingIntent {
         match self {
             PendingIntent::LaunchInCreatedWorktree { placeholder, .. }
             | PendingIntent::AttachCreatedPrSession { placeholder, .. } => Some(&placeholder.agent),
-            PendingIntent::AttachCreatedWithCloudRetry { placeholder, .. } => placeholder.as_ref(),
+            PendingIntent::AttachCreatedWithCloudRetry { placeholder, .. }
+            | PendingIntent::AttachCreated { placeholder, .. } => placeholder.as_ref(),
+            PendingIntent::SelectCreatedWorktree { launch, .. } => {
+                launch.as_ref().and_then(|draft| draft.placeholder.as_ref())
+            }
             _ => None,
         }
     }
@@ -1535,6 +1642,56 @@ impl SessionRow {
         match self.sref() {
             Some(sref) => RowKey::Session(sref),
             None => RowKey::Link(self.name().to_string()),
+        }
+    }
+}
+
+/// One row of the WORKTREES PANEL, in cursor order — what `sel_worktree`
+/// indexes (see [`App::worktree_rows`]).
+#[derive(Debug, Clone, Copy)]
+pub enum WorktreeRow<'a> {
+    /// A checkout listed on its own: the ROOT WORKTREE, or a branch no
+    /// open pull request on screen is from.
+    Checkout(&'a Worktree),
+    /// A PROJECT OPEN PRS GROUP row.
+    Pr(&'a OpenPr),
+    /// A checkout on an open pull request's head branch — the one a PR
+    /// SESSION launched off that row works in (`CreatePrAgent` cuts or
+    /// reuses it), or one `n` cut on a branch a pull request was later
+    /// opened from — listed under that pull request's row rather than
+    /// among the plain checkouts, so the checkout and the pull request it
+    /// is for read as one thing.
+    PrCheckout {
+        worktree: &'a Worktree,
+        pr: &'a OpenPr,
+    },
+}
+
+impl<'a> WorktreeRow<'a> {
+    /// The checkout the row is, wherever it sits: a plain one, or one
+    /// nested under its pull request. None on a pull request row.
+    pub fn checkout(self) -> Option<&'a Worktree> {
+        match self {
+            WorktreeRow::Checkout(w) | WorktreeRow::PrCheckout { worktree: w, .. } => Some(w),
+            WorktreeRow::Pr(_) => None,
+        }
+    }
+
+    /// The pull request the row *is* — the OPEN PRS row itself, not the
+    /// checkout nested under one: that row is a worktree, with a
+    /// worktree's keys and sessions, and its pull request is one row up.
+    pub fn open_pr(self) -> Option<&'a OpenPr> {
+        match self {
+            WorktreeRow::Pr(pr) => Some(pr),
+            WorktreeRow::Checkout(_) | WorktreeRow::PrCheckout { .. } => None,
+        }
+    }
+
+    /// The pull request a nested checkout sits under.
+    pub fn nested_under(self) -> Option<&'a OpenPr> {
+        match self {
+            WorktreeRow::PrCheckout { pr, .. } => Some(pr),
+            WorktreeRow::Checkout(_) | WorktreeRow::Pr(_) => None,
         }
     }
 }
@@ -2100,6 +2257,19 @@ pub struct PrDiffAnswer {
     pub diff: Option<String>,
 }
 
+/// A finished `gh pr comment`, back on the loop: which pull request (and
+/// the row text that titled its box), the text that was sent — handed
+/// back to the box when the post failed — and what `gh` said: the new
+/// comment's URL, or why it refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrCommentAnswer {
+    pub number: u64,
+    pub url: String,
+    pub label: String,
+    pub body: String,
+    pub result: Result<String, String>,
+}
+
 /// The pull request the TERMINAL PANE is reading instead of a session,
 /// wherever the cursor found it — a PROJECT OPEN PRS GROUP row or the
 /// SESSIONS PANEL's PR ROW. Just enough to fetch, title and scroll it.
@@ -2255,9 +2425,13 @@ pub struct App {
     /// Appearance, or the Worktrees panel menu). Read on every look at
     /// the list (`listed_open_prs`), never applied to what is stored.
     pub hide_draft_prs: bool,
-    /// The ROOT WORKTREE row left out of the Worktrees panel; mirrors
-    /// CONFIG.JSON's `hide_root_worktree` (Settings → Experimental).
-    pub hide_root_worktree: bool,
+    /// PROJECT SETTINGS as the panels read them: each project's own entry
+    /// keyed by repo path, and beside it what a project without one gets;
+    /// mirror CONFIG.JSON's `projects` map and `Config::project_fallback`
+    /// (Settings → Project). Resolved by `project_settings`; the one row
+    /// so far is read through `root_hidden`.
+    pub projects_config: BTreeMap<PathBuf, crate::config::ProjectSettings>,
+    pub project_fallback: crate::config::ProjectSettings,
     /// How many RECENT PROMPTS the SESSIONS PANEL lists under each
     /// session, newest at the bottom; 0 draws none. Mirrors CONFIG.JSON's
     /// `recent_prompts` switch and `recent_prompts_count` (Settings →
@@ -2493,6 +2667,17 @@ pub struct App {
     /// installs it at startup (the `vim_tx` precedent). Key handlers can
     /// therefore start a network fetch without the loop's channels in hand.
     pub pr_diff_tx: Option<tokio::sync::mpsc::UnboundedSender<PrDiffAnswer>>,
+    /// Pull requests (by URL) with a `gh pr comment` still running. A
+    /// second box sent on the same pull request waits for the first to
+    /// land rather than racing it.
+    pub pr_comment_inflight: std::collections::HashSet<String>,
+    /// Comment text a refused post handed back while another modal was
+    /// up, by PR URL: the next COMMENT BOX opened on that pull request
+    /// starts from it, so the refusal cost nothing typed.
+    pub pr_comment_drafts: HashMap<String, String>,
+    /// Where a finished `gh pr comment` lands (`PrCommentAnswer`);
+    /// installed by the loop at startup like `pr_diff_tx`.
+    pub pr_comment_tx: Option<tokio::sync::mpsc::UnboundedSender<PrCommentAnswer>>,
     /// The on-disk memory of every pull-request answer (`pr_cache`), when
     /// this instance has one: the main loop installs the real one at
     /// startup and hydrates from it; the unit tests leave it `None`, so no
@@ -2507,19 +2692,31 @@ pub struct App {
     /// and the answer takes the URL out of here.
     pub pr_detail_stale: std::collections::HashSet<String>,
     /// What `gh issue list` last said about each project's open issues —
-    /// the ISSUES MODAL's rows, kept for the session so reopening paints
-    /// at once while the fresh answer lands. Asked only when the modal
-    /// opens (and on its `r`), never on a beat.
+    /// the ISSUES MODAL's rows, kept for the session. Prefetched in the
+    /// background once the cursor rests on a project and kept fresh on a
+    /// slow beat while it stays selected (`issues::schedule_prefetch`,
+    /// `issues::refresh_selected`), so `i` paints rows at once; the modal
+    /// re-asks on open only past `issues::FRESH`, and on its `r`.
     pub issues: HashMap<ProjectId, crate::issues::IssueList>,
     /// Projects with a list lookup in flight, and ones whose first ask
     /// `gh` couldn't answer (the modal says so rather than spinning).
     pub issues_inflight: std::collections::HashSet<ProjectId>,
     pub issues_failed: std::collections::HashSet<ProjectId>,
+    /// When each project's next background list ask is owed — the steady
+    /// beat once it has issues, a backoff while it hasn't — so the git
+    /// tick spends a `gh` only when one is due.
+    pub issues_due: HashMap<ProjectId, crate::issues::IssuesBeat>,
+    /// The debounced prefetch: the project the cursor landed on and when
+    /// its list is asked for, re-armed on every project switch.
+    pub pending_issues_prefetch: Option<(ProjectId, std::time::Instant)>,
     /// The conversations of the issues the cursor has rested on, keyed by
     /// URL; in flight and failed like the pull requests'.
     pub issue_detail: HashMap<String, crate::issues::IssueDetail>,
     pub issue_detail_inflight: std::collections::HashSet<String>,
     pub issue_detail_failed: std::collections::HashSet<String>,
+    /// Issues with a comment on its way to GitHub (`gh issue comment`),
+    /// by URL, so the reading pane says so until the answer lands.
+    pub issue_comment_inflight: std::collections::HashSet<String>,
     /// Debounced comments fetch: the issue under the cursor and when its
     /// lookup is due, re-armed on every move.
     pub pending_issue_detail: Option<(crate::issues::PendingIssueDetail, std::time::Instant)>,
@@ -2600,7 +2797,8 @@ impl App {
             hide_worktrees: false,
             hide_sessions: false,
             hide_draft_prs: false,
-            hide_root_worktree: false,
+            projects_config: BTreeMap::new(),
+            project_fallback: Default::default(),
             recent_prompts: 0,
             show_key_combos: false,
             key_combo: None,
@@ -2663,15 +2861,21 @@ impl App {
             pr_diff_inflight: None,
             pr_diff_refreshing: std::collections::HashSet::new(),
             pr_diff_tx: None,
+            pr_comment_inflight: std::collections::HashSet::new(),
+            pr_comment_drafts: HashMap::new(),
+            pr_comment_tx: None,
             pr_cache: None,
             pr_cache_dirty: false,
             pr_detail_stale: std::collections::HashSet::new(),
             issues: HashMap::new(),
             issues_inflight: std::collections::HashSet::new(),
             issues_failed: std::collections::HashSet::new(),
+            issues_due: HashMap::new(),
+            pending_issues_prefetch: None,
             issue_detail: HashMap::new(),
             issue_detail_inflight: std::collections::HashSet::new(),
             issue_detail_failed: std::collections::HashSet::new(),
+            issue_comment_inflight: std::collections::HashSet::new(),
             pending_issue_detail: None,
             issues_tx: None,
             branch_switch: Default::default(),
@@ -2817,9 +3021,22 @@ impl App {
         match idx {
             0 => !self.hide_projects,
             1 => !self.hide_worktrees,
-            2 => !self.hide_sessions,
+            2 => !self.sessions_collapsed(),
             _ => false,
         }
+    }
+
+    /// Whether the SESSIONS PANEL stands folded to its rail: hidden with
+    /// `Shift+S` (`hide_sessions`), or — the Worktrees cursor on a PROJECT
+    /// OPEN PRS row — with nothing to list. A pull request row has no
+    /// checkout and so no sessions, and the pane beside it is reading the
+    /// pull request, so the column gives the pane its width for as long
+    /// as the cursor rests there and comes back the moment it steps onto
+    /// a checkout. `hide_sessions` is untouched either way: a panel the
+    /// user collapsed stays a rail on the checkout too, and the fold a
+    /// pull request row causes is never written to CONFIG.JSON.
+    pub fn sessions_collapsed(&self) -> bool {
+        self.hide_sessions || self.selected_worktree_pr().is_some()
     }
 
     /// Width a panel draws at: its remembered width expanded, the fixed
@@ -2845,7 +3062,7 @@ impl App {
             Focus::Workspaces => self.show_workspaces,
             Focus::Projects => !self.hide_projects,
             Focus::Worktrees => !self.hide_worktrees,
-            Focus::Sessions => !self.hide_sessions,
+            Focus::Sessions => !self.sessions_collapsed(),
             Focus::Terminal => false,
         }
     }
@@ -3029,9 +3246,31 @@ impl App {
         self.tree.projects.get(self.selected_project_index()?)
     }
 
+    /// `project`'s own settings (Settings → Project): its entry in
+    /// `projects_config`, else the fallback every project without one gets.
+    pub fn project_settings(&self, project: &Project) -> &crate::config::ProjectSettings {
+        self.projects_config
+            .get(&project.repo_path)
+            .unwrap_or(&self.project_fallback)
+    }
+
+    /// Whether `project`'s ROOT WORKTREE row is left out of the WORKTREES
+    /// PANEL — its **Hide root worktree** project setting.
+    pub fn root_hidden(&self, project: &Project) -> bool {
+        self.project_settings(project).hide_root_worktree
+    }
+
+    /// `root_hidden` for the selected project; false while there is none.
+    pub fn selected_root_hidden(&self) -> bool {
+        self.selected_project().is_some_and(|p| self.root_hidden(p))
+    }
+
+    /// The checkout under the Worktrees cursor — a plain row or one nested
+    /// under its pull request. None while the cursor is on a pull request.
     pub fn selected_worktree(&self) -> Option<&Worktree> {
-        let worktrees = self.visible_worktrees();
-        worktrees.get(self.sel_worktree).copied()
+        self.worktree_rows()
+            .get(self.sel_worktree)
+            .and_then(|row| row.checkout())
     }
 
     /// The cached changed-file count when it belongs to the selected
@@ -3132,8 +3371,7 @@ impl App {
     /// pull-request row — a duplicate would just be the same destination
     /// twice.
     pub fn visible_links(&self) -> Vec<LinkRow> {
-        let worktrees = self.visible_worktrees();
-        let Some(wt) = worktrees.get(self.sel_worktree) else {
+        let Some(wt) = self.selected_worktree() else {
             return vec![];
         };
         let saved: Vec<&Link> = self
@@ -3190,8 +3428,7 @@ impl App {
 
     /// Shell terminals of the selected worktree, in tree order.
     pub fn visible_terminals(&self) -> Vec<TerminalTab> {
-        let worktrees = self.visible_worktrees();
-        let Some(wt) = worktrees.get(self.sel_worktree) else {
+        let Some(wt) = self.selected_worktree() else {
             return vec![];
         };
         self.tree
@@ -3231,15 +3468,17 @@ impl App {
             return vec![];
         };
         let now = now_ms();
-        // With `hide_root_worktree` on the ROOT WORKTREE is not a row: it
-        // is still in the tree (its sessions keep running, the PALETTE
-        // still knows them), it just cannot be selected here, so nothing
-        // launched from this panel ever lands in the shared checkout.
+        // With the project's **Hide root worktree** on, the ROOT WORKTREE
+        // is not a row: it is still in the tree (its sessions keep running,
+        // the PALETTE still knows them), it just cannot be selected here,
+        // so nothing launched from this panel ever lands in the shared
+        // checkout.
+        let hide_root = self.root_hidden(project);
         let mut rows: Vec<&Worktree> = self
             .tree
             .worktrees
             .iter()
-            .filter(|w| w.project_id == project.id && !(self.hide_root_worktree && w.is_main))
+            .filter(|w| w.project_id == project.id && !(hide_root && w.is_main))
             .collect();
         rows.sort_by_key(|w| {
             (
@@ -3310,14 +3549,78 @@ impl App {
         self.listed_open_prs()
     }
 
-    /// How many rows the Worktrees panel has: the project's checkouts, then
-    /// the pull requests still open on its repo. `sel_worktree` indexes that
-    /// combined list, and because the checkouts come first every existing
-    /// "index into `visible_worktrees()`" stays exactly right — a cursor
-    /// parked on a pull request simply has no selected worktree, which is
-    /// the truth about it.
+    /// The Worktrees panel's rows in cursor order — what `sel_worktree`
+    /// indexes: the project's checkouts, then the pull requests still open
+    /// on its repo, each followed by the checkout on its head branch when
+    /// the project has one. A PR SESSION works in a checkout of the pull
+    /// request's head branch (`CreatePrAgent` cuts it, or reuses the one
+    /// already there), and that checkout listed among the plain ones left
+    /// no way to tell which pull request it was for — so it sits under
+    /// the pull request's row instead, indented, and the plain rows above
+    /// are the checkouts that are nobody's PR. The ROOT WORKTREE never
+    /// nests, whatever branch it is on; a branch two open pull requests
+    /// share nests under the first listed. Only a pull request *on
+    /// screen* takes its checkout: with the group folded, or the pull
+    /// request a draft `hide_draft_prs` keeps out, the checkout is a plain
+    /// row again — hiding pull requests must never hide work you have.
+    ///
+    /// A cursor parked on a pull request has no selected worktree, which
+    /// is the truth about it; one on a nested checkout has that worktree
+    /// and no pull request — the row is a worktree, its pull request is
+    /// the row above.
+    pub fn worktree_rows(&self) -> Vec<WorktreeRow<'_>> {
+        let checkouts = self.visible_worktrees();
+        let prs = self.visible_open_prs();
+        // Which listed pull request each checkout nests under, if any.
+        let under: Vec<Option<usize>> = checkouts
+            .iter()
+            .map(|w| {
+                if w.is_main {
+                    return None;
+                }
+                prs.iter().position(|pr| pr.head == w.branch)
+            })
+            .collect();
+        let mut rows: Vec<WorktreeRow<'_>> = checkouts
+            .iter()
+            .zip(&under)
+            .filter(|(_, under)| under.is_none())
+            .map(|(w, _)| WorktreeRow::Checkout(w))
+            .collect();
+        for (i, pr) in prs.iter().enumerate() {
+            rows.push(WorktreeRow::Pr(pr));
+            rows.extend(
+                checkouts
+                    .iter()
+                    .zip(&under)
+                    .filter(|(_, under)| **under == Some(i))
+                    .map(|(w, _)| WorktreeRow::PrCheckout { worktree: w, pr }),
+            );
+        }
+        rows
+    }
+
+    /// How many rows the Worktrees panel has — see [`App::worktree_rows`].
     pub fn worktree_row_count(&self) -> usize {
-        self.visible_worktrees().len() + self.visible_open_prs().len()
+        self.worktree_rows().len()
+    }
+
+    /// The Worktrees row of checkout `id`, wherever it sits — among the
+    /// plain checkouts or under its pull request. None when it is not a
+    /// row of the selected project (or is the hidden ROOT WORKTREE).
+    pub fn worktree_row_of(&self, id: &WorktreeId) -> Option<usize> {
+        self.worktree_rows()
+            .iter()
+            .position(|row| row.checkout().is_some_and(|w| &w.id == id))
+    }
+
+    /// The Worktrees row of the open pull request at `url`: its own row,
+    /// not the checkout nested under it. None while the group is folded
+    /// or the pull request is not listed.
+    pub fn open_pr_row_of(&self, url: &str) -> Option<usize> {
+        self.worktree_rows()
+            .iter()
+            .position(|row| row.open_pr().is_some_and(|pr| pr.url == url))
     }
 
     /// Rows a half-page jump (Ctrl+d / Ctrl+u) moves the Worktrees
@@ -3335,13 +3638,13 @@ impl App {
     }
 
     /// The open pull request under the Worktrees cursor, when it's on one.
-    /// Mutually exclusive with [`App::selected_worktree`] — the checkouts
-    /// occupy the rows below the pull requests.
+    /// Mutually exclusive with [`App::selected_worktree`]: a pull request
+    /// row has no checkout, and a checkout nested under a pull request is
+    /// still a checkout, not the pull request.
     pub fn selected_worktree_pr(&self) -> Option<&OpenPr> {
-        let i = self
-            .sel_worktree
-            .checked_sub(self.visible_worktrees().len())?;
-        self.visible_open_prs().get(i).copied()
+        self.worktree_rows()
+            .get(self.sel_worktree)
+            .and_then(|row| row.open_pr())
     }
 
     /// The pull request the pane should be reading: the PROJECT OPEN PRS
@@ -3404,8 +3707,7 @@ impl App {
     /// interacting now, which keeps them on top however long the turn has
     /// taken.
     pub fn visible_sessions(&self) -> Vec<Agent> {
-        let worktrees = self.visible_worktrees();
-        let Some(wt) = worktrees.get(self.sel_worktree) else {
+        let Some(wt) = self.selected_worktree() else {
             return vec![];
         };
         let now = now_ms();
@@ -3437,8 +3739,7 @@ impl App {
 
     /// (live, archived) agent counts for the selected worktree.
     pub fn session_group_counts(&self) -> (usize, usize) {
-        let worktrees = self.visible_worktrees();
-        let Some(wt) = worktrees.get(self.sel_worktree) else {
+        let Some(wt) = self.selected_worktree() else {
             return (0, 0);
         };
         let live = self
@@ -3514,6 +3815,13 @@ impl App {
     /// The same for the ISSUES MODAL's debounced comments fetch.
     pub fn issue_detail_delay(&self) -> Option<std::time::Duration> {
         let (_, at) = self.pending_issue_detail.as_ref()?;
+        Some(at.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// Delay until the debounced issues prefetch is due, so the loop can
+    /// wake up and fire it. None when nothing is armed.
+    pub fn issues_prefetch_delay(&self) -> Option<std::time::Duration> {
+        let (_, at) = self.pending_issues_prefetch.as_ref()?;
         Some(at.saturating_duration_since(std::time::Instant::now()))
     }
 
@@ -3627,7 +3935,7 @@ impl App {
             Focus::Projects
         } else if !self.hide_worktrees {
             Focus::Worktrees
-        } else if !self.hide_sessions {
+        } else if !self.sessions_collapsed() {
             Focus::Sessions
         } else {
             Focus::Terminal
@@ -3639,9 +3947,30 @@ impl App {
             Focus::Workspaces => self.show_workspaces,
             Focus::Projects => !self.hide_projects,
             Focus::Worktrees => !self.hide_worktrees,
-            Focus::Sessions => !self.hide_sessions,
+            Focus::Sessions => !self.sessions_collapsed(),
             Focus::Terminal => true,
         }
+    }
+
+    /// Step focus off a SESSIONS PANEL that has folded under it. The
+    /// hotkey and the chevron move a cursor off the panel as they fold
+    /// it (`set_hide_sessions`); the fold a pull request row causes has
+    /// no keypress of its own — the checkout under a Sessions cursor is
+    /// deleted, or its row hidden, and the Worktrees cursor lands on the
+    /// pull request beside it — so the frame that finds focus on the rail
+    /// settles it: back onto the nearest column to the left, the way
+    /// `⇧Tab` walks, or on to the pane when no column is open. Nothing
+    /// to do while the panel is open, or focus is elsewhere.
+    pub fn settle_focus(&mut self) {
+        if self.focus != Focus::Sessions || self.focus_visible(Focus::Sessions) {
+            return;
+        }
+        let back = self.previous_visible_focus(Focus::Sessions);
+        self.focus = if back == Focus::Sessions {
+            self.next_visible_focus(Focus::Sessions)
+        } else {
+            back
+        };
     }
 
     fn focus_rank(focus: Focus) -> u8 {

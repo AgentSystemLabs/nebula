@@ -26,13 +26,21 @@
 //! is removed by the very Ack or Error that resolves them, so nothing has
 //! to be kept in sync. Nothing ever reaches the DAEMON under a stand-in
 //! id — `send_attach`, `create_agent`, `create_terminal`, the prewarm,
-//! the delete and the pane's Input all check first.
+//! the delete and the pane's Input all check first. One launch is held
+//! rather than refused: an AGENT PRESET run off the modal's row before
+//! the DAEMON has answered waits on the checkout's own Ack
+//! (`defer_launch`), and a modal opened on a stand-in — the presets
+//! list, its task box — is readdressed to the real row when that Ack
+//! lands (`resolve_worktree`).
 
 use super::{
-    pane_size, reconcile_selection, release_attachment, remove_worktree_rows, restore_context,
-    select_worktree_by_id, selection_snapshot,
+    create_agent, pane_size, reconcile_selection, release_attachment, remove_worktree_rows,
+    restore_context, select_worktree_by_id, selection_snapshot, WORKTREE_STILL_CREATING,
 };
-use crate::app::{now_ms, App, AttachedTerm, PendingIntent, PlaceholderRows};
+use crate::app::{
+    now_ms, AgentLaunchDraft, App, AttachedTerm, ConfirmDialog, Overlay, PendingAction,
+    PendingIntent, PlaceholderRows,
+};
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, ClientRequest, ProjectId, SessionRef, Worktree,
     WorktreeId,
@@ -88,8 +96,27 @@ pub(super) fn stage(
 ) -> PlaceholderRows {
     let focus = app.focus;
     let worktree = stage_worktree(app, project, branch, out);
+    let agent = stage_agent(app, &worktree, kind, custom, model, effort, out);
+    app.focus = focus;
+    PlaceholderRows { worktree, agent }
+}
+
+/// Put the session row up under `worktree` — a `kind` CLI at `model` /
+/// `effort`, named as the create will name it — selected, the pane
+/// showing "starting…" for it; FOCUS stays where it is. `stage`'s second
+/// half, and on its own the row of a launch waiting on the NEW WORKTREE
+/// modal's checkout (`defer_launch`). Returns the id the intent carries.
+pub(super) fn stage_agent(
+    app: &mut App,
+    worktree: &WorktreeId,
+    kind: AgentKind,
+    custom: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    out: &mut Vec<ClientRequest>,
+) -> AgentId {
     // The name the DAEMON will give the real row: `default_session_name`
-    // reads the selected worktree, which is the stand-in now (no
+    // reads the selected worktree, which is the stand-in (no
     // sessions), and `create_agent` takes the name off this row when the
     // create goes out, so the two agree.
     let name = app.default_session_name("agent");
@@ -116,12 +143,9 @@ pub(super) fn stage(
         alive: false,
         recent_prompts: Vec::new(),
     });
-    // That stamp just moved the row to the top: re-seat the cursor on it.
-    if let Some(i) = app
-        .visible_worktrees()
-        .iter()
-        .position(|w| w.id == worktree)
-    {
+    // That stamp just moved the row to the top — or, for a PR SESSION's
+    // stand-in, under its pull request's row: re-seat the cursor on it.
+    if let Some(i) = app.worktree_row_of(worktree) {
         app.sel_worktree = i;
     }
     app.sel_session = 0;
@@ -138,9 +162,8 @@ pub(super) fn stage(
     // "starting session…" is the whole story for now.
     term.booting = true;
     app.term = Some(term);
-    app.focus = focus;
     app.dirty = true;
-    PlaceholderRows { worktree, agent }
+    agent
 }
 
 /// The `CreateWorktree` Ack: `real` is the checkout the DAEMON cut. Its
@@ -172,6 +195,20 @@ pub(super) fn resolve_worktree(app: &mut App, placeholder: &WorktreeId, real: &W
     for wid in app.last_worktree_for_project.values_mut() {
         if wid == placeholder {
             *wid = real.clone();
+        }
+    }
+    // A modal opened on the stand-in — the AGENT PRESETS list `e` put up
+    // on the new row, the task box behind it — is addressed to the real
+    // checkout from here, so its Enter names a checkout the DAEMON has
+    // rather than an id it never had. The prewarm armed on the row too.
+    if let Some(named) = app.overlay.as_mut().and_then(modal_worktree_mut) {
+        if *named == *placeholder {
+            *named = real.clone();
+        }
+    }
+    if let Some((armed, _)) = &mut app.pending_prewarm {
+        if *armed == *placeholder {
+            *armed = real.clone();
         }
     }
     forget_worktree(app, placeholder);
@@ -290,6 +327,17 @@ pub(super) fn discard_worktree(
         .is_some_and(|w| &w.id == placeholder);
     let before = selection_snapshot(app);
     let _ = remove_worktree_rows(app, placeholder);
+    // A modal opened on the stand-in has nothing to launch into now: it
+    // closes with the row. (The NEW WORKTREE modal's refusal puts its
+    // own box back over this.)
+    if app
+        .overlay
+        .as_mut()
+        .and_then(modal_worktree_mut)
+        .is_some_and(|named| *named == *placeholder)
+    {
+        app.overlay = None;
+    }
     app.last_session_for_worktree.remove(placeholder);
     app.last_worktree_for_project
         .retain(|_, wid| wid != placeholder);
@@ -316,6 +364,92 @@ pub(super) fn discard_agent(app: &mut App, placeholder: &AgentId, out: &mut Vec<
     app.dirty = true;
 }
 
+/// A launch fired into a stand-in checkout. Nothing goes to the DAEMON
+/// under an id it has never seen — but a launch into the NEW WORKTREE
+/// modal's row (`e` on the new row, an AGENT PRESET picked, its task
+/// typed, all before the DAEMON's `git worktree add` has finished) is
+/// not lost either: its session row goes up under the stand-in as a
+/// QUICK PROMPT's would, the draft rides the checkout's own PENDING
+/// INTENT, and the Ack that names the real checkout sends it there
+/// (`replay_launch`). Every other launch waits as before, saying so: one
+/// into a QUICK PROMPT's or a PR SESSION's stand-in, whose intent
+/// already carries the launch that made it; a second into the modal's
+/// while one is waiting; a PR SESSION, which is addressed to the PROJECT
+/// and cuts a checkout of its own.
+pub(super) fn defer_launch(
+    app: &mut App,
+    mut draft: AgentLaunchDraft,
+    out: &mut Vec<ClientRequest>,
+) {
+    let slot = app
+        .pending
+        .iter()
+        .find_map(|(req_id, intent)| match intent {
+            PendingIntent::SelectCreatedWorktree {
+                placeholder,
+                launch: None,
+                ..
+            } if *placeholder == draft.worktree => Some(*req_id),
+            _ => None,
+        });
+    let Some(req_id) = slot.filter(|_| draft.pr.is_none()) else {
+        app.flash = Some(WORKTREE_STILL_CREATING.into());
+        return;
+    };
+    let agent = stage_agent(
+        app,
+        &draft.worktree,
+        draft.kind,
+        draft.custom.clone(),
+        draft.model.clone(),
+        draft.effort.clone(),
+        out,
+    );
+    draft.placeholder = Some(agent);
+    if let Some(PendingIntent::SelectCreatedWorktree { launch, .. }) = app.pending.get_mut(&req_id)
+    {
+        *launch = Some(Box::new(draft));
+    }
+}
+
+/// The modal's Ack with a launch waiting on it: the checkout is `real`
+/// now, its stand-in session row moved under it by `resolve_worktree`,
+/// so the draft — and the box it brings back should the DAEMON refuse
+/// the create — is addressed there and goes out as it would have from a
+/// real row.
+pub(super) fn replay_launch(
+    app: &mut App,
+    mut draft: AgentLaunchDraft,
+    real: &WorktreeId,
+    out: &mut Vec<ClientRequest>,
+) {
+    draft.worktree = real.clone();
+    if let Some(named) = draft
+        .reopen_on_error
+        .as_mut()
+        .and_then(|(kind, _)| kind.worktree_mut())
+    {
+        *named = real.clone();
+    }
+    create_agent(app, draft, out);
+}
+
+/// The checkout a modal is addressed to — the one its Enter launches
+/// into, or the AGENT PRESETS list it reopens for. None for a modal that
+/// names no checkout, and for a QUICK PROMPT about to cut one.
+fn modal_worktree_mut(overlay: &mut Overlay) -> Option<&mut WorktreeId> {
+    match overlay {
+        Overlay::Prompt(dialog) => dialog.kind.worktree_mut(),
+        Overlay::AgentPresets(view) => Some(&mut view.worktree),
+        Overlay::AgentPresetEditor(editor) => Some(&mut editor.worktree),
+        Overlay::Confirm(ConfirmDialog {
+            action: PendingAction::DeleteAgentPreset { worktree, .. },
+            ..
+        }) => Some(worktree),
+        _ => None,
+    }
+}
+
 /// A pane showing the stand-in has nothing attached behind it, so it is
 /// blanked here rather than detached: a Detach for a session the DAEMON
 /// never had would be noise.
@@ -339,8 +473,8 @@ fn forget_worktree(app: &mut App, id: &WorktreeId) {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{
-        buffer_text, hse, press, seed_feat_worktree, seed_open_prs, seed_tree, with_default_config,
-        worktree_branches,
+        buffer_text, hide_root, hse, press, seed_feat_worktree, seed_open_prs, seed_tree,
+        with_default_config, with_seeded_presets, worktree_branches,
     };
     use super::super::{fire_pending_prewarm, handle_server_event, paste_into_overlay};
     use crate::app::{App, Focus, Overlay, PendingIntent, PlaceholderRows, PromptKind};
@@ -363,7 +497,7 @@ mod tests {
     fn stage_launch(app: &mut App, out: &mut Vec<ClientRequest>) -> (String, PlaceholderRows, u64) {
         seed_tree(app);
         seed_feat_worktree(app, "w2", "feat");
-        app.hide_root_worktree = true;
+        hide_root(app, true);
         app.focus = Focus::Worktrees;
         app.sel_worktree = 0;
         assert_eq!(
@@ -1087,6 +1221,340 @@ mod tests {
         });
     }
 
+    // ---- an AGENT PRESET run off the modal's stand-in ----
+
+    /// `n`, "feat", Enter, then `e` on the new row and Enter on the
+    /// "reviewer" preset: the task box is open with "Fix auth" typed, and
+    /// the DAEMON has not answered the `CreateWorktree` yet. Returns the
+    /// stand-in id and that request's id.
+    fn type_preset_task(app: &mut App, out: &mut Vec<ClientRequest>) -> (WorktreeId, u64) {
+        let (placeholder, req_id) = stage_modal(app, out);
+        press(app, KeyCode::Char('e'), KeyModifiers::NONE, out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::AgentPresets(view)) if view.worktree == placeholder),
+            "e on the new row opens the list for it: {:?}",
+            app.overlay
+        );
+        press(app, KeyCode::Enter, KeyModifiers::NONE, out);
+        assert!(
+            matches!(
+                &app.overlay,
+                Some(Overlay::Prompt(prompt))
+                    if matches!(&prompt.kind, PromptKind::AgentPresetTask { worktree, preset } if *worktree == placeholder && preset.name == "reviewer")
+            ),
+            "Enter asks for the task: {:?}",
+            app.overlay
+        );
+        assert!(paste_into_overlay(app, "Fix auth"));
+        assert!(out.is_empty(), "{out:?}");
+        (placeholder, req_id)
+    }
+
+    /// The DAEMON's answer to the modal's `CreateWorktree`, in its own
+    /// order: the row's upsert, then the Ack naming it `w2`.
+    fn modal_worktree_created(app: &mut App, req_id: u64, out: &mut Vec<ClientRequest>) {
+        seed_feat_worktree(app, "w2", "feat");
+        handle_server_event(
+            app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(EntityId::Worktree(WorktreeId("w2".into()))),
+            },
+            out,
+        );
+    }
+
+    /// The bug as reported: the checkout lands while the task is being
+    /// typed. The list and the box were opened on the stand-in's id; the
+    /// Ack readdresses the box, so Enter launches into the checkout the
+    /// DAEMON cut — not into an id it never had ("worktree not found").
+    #[test]
+    fn a_task_typed_on_the_stand_in_launches_into_the_real_checkout() {
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            let (placeholder, req_id) = type_preset_task(&mut app, &mut out);
+
+            modal_worktree_created(&mut app, req_id, &mut out);
+            assert!(!app.tree.worktrees.iter().any(|w| w.id == placeholder));
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(prompt))
+                        if matches!(&prompt.kind, PromptKind::AgentPresetTask { worktree, .. } if worktree.0 == "w2")
+                            && prompt.input.as_str() == "Fix auth"
+                ),
+                "the box is addressed to the real checkout, text kept: {:?}",
+                app.overlay
+            );
+            assert!(out.is_empty(), "the Ack sends nothing: {out:?}");
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "launching closes the box");
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [ClientRequest::CreateAgent {
+                        worktree,
+                        starting_prompt: Some(text),
+                        ..
+                    }] if worktree.0 == "w2" && text == "Be strict.\n\nFix auth\n\nRun the tests."
+                ),
+                "one create, in w2: {out:?}"
+            );
+        });
+    }
+
+    /// The same with the list still open when the checkout lands: the
+    /// list is readdressed, and the task box it opens names the real row.
+    #[test]
+    fn a_presets_list_open_on_the_stand_in_follows_it_to_the_real_row() {
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            let (placeholder, req_id) = stage_modal(&mut app, &mut out);
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(&app.overlay, Some(Overlay::AgentPresets(view)) if view.worktree == placeholder),
+                "{:?}",
+                app.overlay
+            );
+
+            modal_worktree_created(&mut app, req_id, &mut out);
+            assert!(
+                matches!(&app.overlay, Some(Overlay::AgentPresets(view)) if view.worktree.0 == "w2"),
+                "{:?}",
+                app.overlay
+            );
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(prompt))
+                        if matches!(&prompt.kind, PromptKind::AgentPresetTask { worktree, .. } if worktree.0 == "w2")
+                ),
+                "{:?}",
+                app.overlay
+            );
+            // An empty task launches on the preset's prefix and postfix.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [ClientRequest::CreateAgent {
+                        worktree,
+                        starting_prompt: Some(_),
+                        ..
+                    }] if worktree.0 == "w2"
+                ),
+                "{out:?}"
+            );
+        });
+    }
+
+    /// Enter on the task before the DAEMON has answered: nothing can go
+    /// out under the stand-in's id, so the launch waits on the checkout's
+    /// own Ack — its session row up under the new checkout meanwhile, the
+    /// pane showing it starting, nothing sent — and goes out into the
+    /// real checkout the moment the Ack names it. A second launch while
+    /// one waits, waits.
+    #[test]
+    fn a_preset_run_before_the_ack_waits_for_the_checkout() {
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            let (placeholder, req_id) = type_preset_task(&mut app, &mut out);
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert!(out.is_empty(), "nothing under a made-up id: {out:?}");
+            assert_ne!(
+                app.flash.as_deref(),
+                Some("worktree is still being created")
+            );
+            let agent = match app.pending.get(&req_id) {
+                Some(PendingIntent::SelectCreatedWorktree {
+                    launch: Some(draft),
+                    ..
+                }) => draft
+                    .placeholder
+                    .clone()
+                    .expect("the waiting launch has its stand-in row"),
+                other => panic!("the launch rides the checkout's intent: {other:?}"),
+            };
+            assert!(app.is_placeholder_agent(&agent));
+            let sessions = app.visible_session_rows();
+            assert_eq!(sessions.len(), 1, "{sessions:?}");
+            assert_eq!(sessions[0].sref(), Some(SessionRef::Agent(agent.clone())));
+            assert!(app.tree.agents.iter().any(|a| a.id == agent
+                && a.worktree_id == placeholder
+                && a.kind == AgentKind::Claude
+                && a.model.as_deref() == Some("opus")));
+            assert_eq!(
+                app.term.as_ref().map(|t| (t.sref.clone(), t.booting)),
+                Some((SessionRef::Agent(agent.clone()), true)),
+                "the pane shows the row starting"
+            );
+            assert_eq!(app.focus, Focus::Sessions);
+
+            // A second launch while the first waits is refused as before.
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert_eq!(
+                app.flash.as_deref(),
+                Some("worktree is still being created")
+            );
+            assert_eq!(app.visible_session_rows().len(), 1, "no second stand-in");
+            assert!(out.is_empty(), "{out:?}");
+
+            modal_worktree_created(&mut app, req_id, &mut out);
+            let create_id = match out.as_slice() {
+                [ClientRequest::CreateAgent {
+                    req_id,
+                    worktree,
+                    name,
+                    kind: AgentKind::Claude,
+                    model: Some(model),
+                    effort: Some(effort),
+                    auto_title: true,
+                    starting_prompt: Some(text),
+                    ..
+                }] if worktree.0 == "w2"
+                    && model == "opus"
+                    && effort == "high"
+                    && text == "Be strict.\n\nFix auth\n\nRun the tests." =>
+                {
+                    assert_eq!(name, "agent-1", "the stand-in is not a taken name");
+                    *req_id
+                }
+                other => panic!("one CreateAgent in w2: {other:?}"),
+            };
+            out.clear();
+            assert!(
+                app.tree
+                    .agents
+                    .iter()
+                    .any(|a| a.id == agent && a.worktree_id.0 == "w2"),
+                "the row moved under the real checkout"
+            );
+            assert!(
+                app.is_placeholder_agent(&agent),
+                "still a stand-in until its own Ack"
+            );
+            assert!(
+                matches!(
+                    app.pending.get(&create_id),
+                    Some(PendingIntent::AttachCreatedWithCloudRetry {
+                        kind: PromptKind::AgentPresetTask { worktree, .. },
+                        placeholder: Some(stand_in),
+                        ..
+                    }) if worktree.0 == "w2" && *stand_in == agent
+                ),
+                "{:?}",
+                app.pending
+            );
+
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(real_agent("a9", "w2")),
+                },
+            );
+            handle_server_event(
+                &mut app,
+                ServerEvent::Ack {
+                    req_id: create_id,
+                    created: Some(EntityId::Agent(AgentId("a9".into()))),
+                },
+                &mut out,
+            );
+            let sessions = app.visible_session_rows();
+            assert_eq!(sessions.len(), 1, "one row, not two: {sessions:?}");
+            assert_eq!(
+                sessions[0].sref(),
+                Some(SessionRef::Agent(AgentId("a9".into())))
+            );
+            assert!(
+                !app.tree.agents.iter().any(|a| a.id == agent),
+                "the stand-in is gone"
+            );
+            assert!(app.pending.is_empty(), "{:?}", app.pending);
+            assert!(
+                out.iter().any(|r| matches!(r, ClientRequest::Attach { session, .. } if session == &SessionRef::Agent(AgentId("a9".into())))),
+                "the real session is attached: {out:?}"
+            );
+            assert_eq!(app.focus, Focus::Terminal, "a preset launch takes the pane");
+            assert!(app.term_locked);
+        });
+    }
+
+    /// The checkout is refused with a launch waiting on it: both stand-in
+    /// rows go, the pane with them, the cursor and FOCUS go back to where
+    /// `n` was pressed, and the NEW WORKTREE box comes back with the name
+    /// — no create ever went out.
+    #[test]
+    fn a_refused_checkout_takes_the_waiting_launch_down_with_it() {
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            let (placeholder, req_id) = type_preset_task(&mut app, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let agent = match app.pending.get(&req_id) {
+                Some(PendingIntent::SelectCreatedWorktree {
+                    launch: Some(draft),
+                    ..
+                }) => draft.placeholder.clone().expect("staged"),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(app.visible_session_rows().len(), 1);
+
+            handle_server_event(
+                &mut app,
+                ServerEvent::Error {
+                    req_id: Some(req_id),
+                    message: "branch exists".into(),
+                },
+                &mut out,
+            );
+            assert_eq!(worktree_branches(&app), ["main"]);
+            assert!(
+                !app.tree
+                    .agents
+                    .iter()
+                    .any(|a| a.id == agent || a.worktree_id == placeholder),
+                "the waiting row went with the checkout"
+            );
+            assert!(app.pending.is_empty(), "{:?}", app.pending);
+            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
+            assert_eq!(app.focus, Focus::Worktrees, "back where n was pressed");
+            assert_eq!(app.flash.as_deref(), Some("branch exists"));
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(prompt))
+                        if matches!(&prompt.kind, PromptKind::NewWorktree { .. })
+                            && prompt.input.as_str() == "feat"
+                ),
+                "{:?}",
+                app.overlay
+            );
+            assert_ne!(
+                app.term.as_ref().map(|t| t.sref.clone()),
+                Some(SessionRef::Agent(agent)),
+                "the pane no longer shows the stand-in"
+            );
+            assert!(
+                !out.iter().any(|r| matches!(
+                    r,
+                    ClientRequest::CreateAgent { .. } | ClientRequest::Input { .. }
+                )),
+                "{out:?}"
+            );
+        });
+    }
+
     // ---- a PR SESSION into a checkout that does not exist yet ----
 
     /// Enter on the OPEN PRS row for #7 — `n` opens the PR SESSION
@@ -1182,11 +1650,25 @@ mod tests {
             assert!(!term.painted, "nothing has come off a PTY");
             assert!(app.attached_sref.is_none(), "nothing is attached behind it");
 
+            // Two cells wider than the default column, so the row reads
+            // whole: at the default width the branch was already giving
+            // its last letter to the ` creating` badge, and the `└` the
+            // stand-in now sits behind, under its pull request, costs one
+            // more — in a column that narrow the badge yields to the
+            // branch like any ago label (`fit_ago`), and the hollow dot
+            // and the pane's "starting…" still say what the row is.
+            app.panel_widths[1] += 2;
             let text = screen(&mut app);
             assert!(text.contains("pr-7-head"), "{text}");
             assert!(text.contains(" creating"), "{text}");
             assert!(text.contains("agent-1 starting"), "{text}");
             assert!(text.contains("starting session…"), "{text}");
+            // The stand-in goes up where the real checkout will list:
+            // under the pull request's row, not among the plain checkouts
+            // — so nothing jumps when the DAEMON's row replaces it.
+            assert_eq!(app.worktree_row_of(&rows.worktree), Some(2));
+            assert_eq!(app.sel_worktree, 2);
+            assert!(text.contains("└○ pr-7-head"), "{text}");
 
             // The landing armed the prewarm; it stops at the stand-in.
             fire_pending_prewarm(&mut app, &mut out);
@@ -1401,7 +1883,14 @@ mod tests {
             seed_feat_worktree(&mut app, "w2", "pr-7-head");
             seed_open_prs(&mut app, &[(7, "Attach links")]);
             app.focus = Focus::Worktrees;
-            app.sel_worktree = 2;
+            // The pull request's row; its checkout is the row under it.
+            app.sel_worktree = 1;
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+            assert_eq!(
+                app.worktree_row_of(&WorktreeId("w2".into())),
+                Some(2),
+                "the checkout on the head branch lists under the pull request"
+            );
             press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
@@ -1434,8 +1923,10 @@ mod tests {
             let mut out = Vec::new();
             let (rows, _) = stage_pr_session(&mut app, "", &mut out);
 
-            // Back on the pull request's row, after the two checkouts.
-            app.sel_worktree = 2;
+            // Back on the pull request's row — the stand-in checkout sits
+            // under it, so the pull request is the row after the root.
+            app.sel_worktree = 1;
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
             press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);

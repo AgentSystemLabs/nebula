@@ -3162,6 +3162,151 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
     wait_for_exit(&mut daemon2);
 }
 
+/// Switched off — `prewarm_sessions: false`, for a machine with less
+/// memory to spare — the same request boots nothing: the worktree the
+/// selection rests on stays cold, and a session forks only when the user
+/// lands on it, whose Attach still revives that one row alone. On by
+/// default, so a fresh install feels instant.
+#[tokio::test]
+async fn prewarm_worktree_sessions_boots_nothing_when_switched_off() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    env.write_config(r#"{"prewarm_sessions": false}"#);
+    let mut daemon = env.spawn_daemon();
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            req_id: 2,
+            worktree: worktree.id.clone(),
+            name: "cold".into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: None,
+            issue_url: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 2).is_some()).await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateTerminal {
+            req_id: 3,
+            worktree: worktree.id.clone(),
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, EVENT_TIMEOUT, |evs| find_ack(evs, 3).is_some()).await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Terminal(term_id)),
+        ..
+    } = find_ack(&events, 3).unwrap()
+    else {
+        panic!("CreateTerminal failed: {events:#?}");
+    };
+    let term_id = term_id.clone();
+
+    // Restart: rows persist, every PTY is dead.
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+    let mut daemon2 = env.spawn_daemon();
+    let mut c2 = connect(&env.sock()).await;
+    handshake(&mut c2).await;
+    write_frame(&mut c2, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    let events = read_events_until(&mut c2, EVENT_TIMEOUT, |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+    let ServerEvent::Snapshot {
+        agents, terminals, ..
+    } = &events[0]
+    else {
+        panic!("expected snapshot");
+    };
+    assert!(agents.iter().all(|a| !a.alive), "agents dead after restart");
+    assert!(
+        terminals.iter().all(|t| !t.alive),
+        "terminals dead after restart"
+    );
+
+    let agent_alive = |evs: &[ServerEvent]| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && a.alive)
+        })
+    };
+    let term_alive = |evs: &[ServerEvent]| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Terminal(t) }
+                if t.id == term_id && t.alive)
+        })
+    };
+
+    // The prewarm the TUI sends as the selection rests on the worktree
+    // boots nothing. A running sweep forks its first session at once (the
+    // stagger sits between boots), so a quiet window is a real absence.
+    write_frame(
+        &mut c2,
+        &ClientRequest::PrewarmWorktreeSessions {
+            worktree: worktree.id.clone(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_for(&mut c2, Duration::from_secs(2)).await;
+    assert!(
+        !agent_alive(&events) && !term_alive(&events),
+        "prewarm switched off must boot nothing: {events:#?}"
+    );
+
+    // Landing on one session still boots that session — and only it.
+    write_frame(
+        &mut c2,
+        &ClientRequest::Attach {
+            session: SessionRef::Agent(agent_id.clone()),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c2, SLOW_TIMEOUT, |evs| agent_alive(evs)).await;
+    assert!(
+        !term_alive(&events),
+        "an explicit attach revives one row, not the worktree: {events:#?}"
+    );
+
+    write_frame(&mut c2, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    wait_for_exit(&mut daemon2);
+}
+
 /// The idle reaper kills sessions in worktrees no client is looking at once
 /// they age past `session_idle_timeout` — but spares terminals with a
 /// command still running, and never touches an attached session no matter
@@ -3315,6 +3460,88 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     assert!(
         !term_reaped(&events),
         "in-view terminal spared: {events:#?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// A finished agent whose backgrounded tool call is still running — a job
+/// it detached from its terminal, the way Claude Code runs a
+/// `run_in_background` Bash call or a Monitor watch — is spared by the idle
+/// reaper until that job ends, and then gets the full timeout over again.
+/// A child the agent keeps inside its own terminal session (an MCP server)
+/// does not count: that agent is reaped on schedule (#78).
+#[tokio::test]
+async fn idle_agent_with_a_detached_job_is_spared_until_it_ends() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    env.write_config(r#"{"session_idle_timeout": "2s"}"#);
+    let mut daemon = env.spawn_daemon_with("/bin/sh", &[(env::IDLE_REAP_MS, "200")]);
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worker = create_agent_get_id(&mut c, &worktree.id, "worker", 2).await;
+    let resident = create_agent_get_id(&mut c, &worktree.id, "resident", 3).await;
+
+    // Each stand-in agent (`/bin/sh`) gets a child, then nobody looks at
+    // either. The worker's is a job in a session of its own, as Claude
+    // spawns a backgrounded Bash call; the resident's is an ordinary child
+    // inside its session, the shape of an MCP server.
+    let started = tokio::time::Instant::now();
+    for (id, line) in [
+        (
+            &worker,
+            "python3 -c 'import subprocess; subprocess.run([\"sleep\", \"5\"], start_new_session=True)'\n",
+        ),
+        (&resident, "sleep 30\n"),
+    ] {
+        let session = SessionRef::Agent(id.clone());
+        write_frame(
+            &mut c,
+            &ClientRequest::Attach {
+                session: session.clone(),
+                from_seq: None,
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .await
+        .unwrap();
+        write_frame(
+            &mut c,
+            &ClientRequest::Input {
+                session: session.clone(),
+                data: line.as_bytes().to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+        write_frame(&mut c, &ClientRequest::Detach { session })
+            .await
+            .unwrap();
+    }
+    let reaped = |evs: &[ServerEvent], id: &nebula_core::AgentId| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if &a.id == id && !a.alive)
+        })
+    };
+
+    // The resident goes after ~2s; the worker's job keeps it alive.
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| reaped(evs, &resident)).await;
+    assert!(
+        !reaped(&events, &worker),
+        "worker spared while its job runs: {events:#?}"
+    );
+
+    // The job ends at ~5s, and the worker goes a full timeout after that —
+    // not on the next sweep: the clock restarted when the job ended.
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| reaped(evs, &worker)).await;
+    assert!(
+        started.elapsed() >= Duration::from_millis(6500),
+        "reaped {:?} after the job started; the timeout restarts when it ends",
+        started.elapsed()
     );
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();

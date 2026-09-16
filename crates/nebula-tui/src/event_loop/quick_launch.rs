@@ -6,7 +6,11 @@
 //! the same `CreateAgent` once the Ack names the checkout: retargeted at
 //! it, the cursor moved onto its row, FOCUS left on the panel `p` was
 //! pressed in. Both rows are on screen from the moment Enter is pressed —
-//! stand-ins (`placeholder`) that the Acks turn into the real rows.
+//! stand-ins (`placeholder`) that the Acks turn into the real rows. A
+//! launch for a pull request (`QuickLaunch::pr` — `e` on an OPEN PRS
+//! row, through the preset picker) is a `CreatePrAgent` instead: the
+//! draft carries the PR and `create_agent` addresses it to the PROJECT,
+//! whose checkout of the PR's head branch the DAEMON finds or cuts.
 
 use super::{
     create_agent, placeholder, schedule_prewarm, select_worktree_by_id, send_with, AgentLaunchDraft,
@@ -127,8 +131,10 @@ fn draft(
         starting_prompt: Some(launch.compose(&text)).filter(|prompt| !prompt.is_empty()),
         // An ISSUE SESSION's context, persisted by the DAEMON with the row.
         issue_url: launch.issue.as_ref().map(|issue| issue.url.clone()),
+        // A PR SESSION's: the create goes to the PROJECT as a
+        // `CreatePrAgent`, and `worktree` only names which.
+        pr: launch.pr.clone(),
         reopen_on_error: Some((PromptKind::QuickPrompt(launch), text)),
-        pr: None,
         focus_pane,
         placeholder,
     }

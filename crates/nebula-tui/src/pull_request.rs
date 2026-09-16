@@ -418,6 +418,9 @@ impl OpenPr {
 pub struct PrLaunch {
     pub url: String,
     pub head: String,
+    /// The pull request's number — what the QUICK PROMPT's title and
+    /// target row call it (`PR #42`).
+    pub number: u64,
 }
 
 impl PrLaunch {
@@ -425,6 +428,7 @@ impl PrLaunch {
         Self {
             url: pr.url.clone(),
             head: pr.head.clone(),
+            number: pr.number,
         }
     }
 }
@@ -663,6 +667,70 @@ pub async fn diff(dir: &Path, number: u64) -> Option<String> {
     .await
 }
 
+/// How long a `gh pr comment` may run. The body is small and the call
+/// is one request, so the metadata budget serves — but the person who
+/// pressed Enter is watching the footer, so it is bounded all the same.
+const COMMENT_TIMEOUT: std::time::Duration = TIMEOUT;
+
+/// What a post that never reached `gh`'s own words flashes: the binary
+/// could not be run, or it ran and stalled past [`COMMENT_TIMEOUT`].
+pub const GH_NOT_RUN: &str = "gh could not be run";
+pub const GH_TIMED_OUT: &str = "gh timed out";
+
+/// Post `body` as an issue comment on pull request `number`, from a
+/// checkout of its repo, as whoever `gh` is logged in as. `Ok` carries the
+/// URL `gh` prints for the new comment; `Err` carries the reason it did
+/// not post — `gh`'s own first line when it ran and refused, or
+/// [`GH_NOT_RUN`] / [`GH_TIMED_OUT`] when it never answered — because "not
+/// logged in" and "no network" are different things to tell the person
+/// still holding the text.
+///
+/// The body crosses on stdin (`--body-file -`) rather than in argv: a
+/// comment is markdown written by a person and may be long, start with a
+/// dash, or hold anything else an argument parser would misread.
+pub async fn comment(dir: &Path, number: u64, body: &str) -> Result<String, String> {
+    use tokio::io::AsyncWriteExt;
+    let number = number.to_string();
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.args(["pr", "comment", &number, "--body-file", "-"])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let run = async {
+        let mut child = cmd.spawn().ok()?;
+        let mut stdin = child.stdin.take()?;
+        // A `gh` that exits before reading the pipe (bad auth, a usage
+        // error) closes its end and the write fails; its stderr says why,
+        // and `wait_with_output` is what reads that.
+        let _ = stdin.write_all(body.as_bytes()).await;
+        drop(stdin);
+        child.wait_with_output().await.ok()
+    };
+    let out = match tokio::time::timeout(COMMENT_TIMEOUT, run).await {
+        Ok(Some(out)) => out,
+        Ok(None) => return Err(GH_NOT_RUN.into()),
+        Err(_) => return Err(GH_TIMED_OUT.into()),
+    };
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(comment_error(&String::from_utf8_lossy(&out.stderr)))
+    }
+}
+
+/// What `gh pr comment` printed when it refused, cut to the one line worth
+/// flashing: its first non-empty line, or [`GH_NOT_RUN`] when it printed
+/// nothing at all.
+pub fn comment_error(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| GH_NOT_RUN.to_string())
+}
+
 /// Cut a unified diff into one chunk per file, in the order git emitted
 /// them: `(path, that file's diff text)`.
 ///
@@ -723,6 +791,19 @@ fn header_path(rest: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a refused `gh pr comment` flashes is its first line — the one
+    /// that says "not logged in" or "could not resolve" — and a `gh` that
+    /// printed nothing gets the fixed "could not be run" line.
+    #[test]
+    fn a_comment_refusal_flashes_ghs_first_line() {
+        assert_eq!(
+            comment_error("\nerror: not logged in to github.com\nTo log in, run: gh auth login\n"),
+            "error: not logged in to github.com"
+        );
+        assert_eq!(comment_error("   \n\n"), GH_NOT_RUN);
+        assert_eq!(comment_error(""), GH_NOT_RUN);
+    }
 
     /// A PR carrying `activity`, for the counting tests.
     fn with_activity(stamps: &[&str]) -> PullRequest {
