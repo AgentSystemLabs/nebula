@@ -908,18 +908,12 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         // static spec.
                         let (label, value) = if tab == crate::config::agents_tab() {
                             match crate::config::AGENTS_HEAD.get(*i) {
-                                Some(spec) => (
-                                    spec.label.to_string(),
-                                    cfg.value_label(spec.kind),
-                                ),
+                                Some(spec) => (spec.label.to_string(), cfg.value_label(spec.kind)),
                                 None => {
                                     let (id, field) = cfg.agent_row(*i).expect(
                                         "settings_rows indexes the Agents tab's harness rows",
                                     );
-                                    (
-                                        field.label().to_string(),
-                                        cfg.agent_value(&id, field),
-                                    )
+                                    (field.label().to_string(), cfg.agent_value(&id, field))
                                 }
                             }
                         } else {
@@ -2617,10 +2611,7 @@ fn draw_column(
             );
         }
         hits.push((area, HitTarget::CollapsePanel(collapse)));
-        return Rect {
-            height: 0,
-            ..inner
-        };
+        return Rect { height: 0, ..inner };
     }
     let header_style = if focused {
         Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
@@ -2836,7 +2827,8 @@ fn draw_collapsed_bar(f: &mut Frame, app: &mut App, area: Rect) {
             },
         );
     }
-    app.hits.push((area, HitTarget::CollapsePanel(Focus::Workspaces)));
+    app.hits
+        .push((area, HitTarget::CollapsePanel(Focus::Workspaces)));
 }
 
 fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
@@ -3087,13 +3079,7 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
 /// Collapse chevron for the workspaces bar: last column of the tab row.
 /// Shared by the empty and tabbed branches so the bar always offers it.
-fn push_bar_collapse_chevron(
-    f: &mut Frame,
-    app: &mut App,
-    area: Rect,
-    row_y: u16,
-    th: Theme,
-) {
+fn push_bar_collapse_chevron(f: &mut Frame, app: &mut App, area: Rect, row_y: u16, th: Theme) {
     let chevron_x = (area.x + area.width).saturating_sub(1);
     if area.width < 8 || chevron_x <= area.x {
         return;
@@ -3108,7 +3094,8 @@ fn push_bar_collapse_chevron(
         Paragraph::new(Line::from(Span::styled("◀", Style::default().fg(th.dim)))),
         cell,
     );
-    app.hits.push((cell, HitTarget::CollapsePanel(Focus::Workspaces)));
+    app.hits
+        .push((cell, HitTarget::CollapsePanel(Focus::Workspaces)));
 }
 
 /// Per-row display data of the Projects panel, pre-collected to end the

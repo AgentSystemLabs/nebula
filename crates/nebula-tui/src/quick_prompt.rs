@@ -208,10 +208,7 @@ impl QuickLaunch {
     /// `Quick prompt · issue #15 · reviewer (claude · opus)` — and, for
     /// the NEW SESSION PICKER's box, `New session (claude · opus · high)`.
     pub fn title(&self) -> String {
-        let harness = self
-            .custom
-            .as_deref()
-            .unwrap_or_else(|| self.kind.as_str());
+        let harness = self.custom.as_deref().unwrap_or_else(|| self.kind.as_str());
         let opts: Vec<&str> = std::iter::once(harness)
             .chain(self.model.as_deref())
             .chain(self.effort.as_deref())
@@ -333,9 +330,15 @@ pub(crate) fn open_for_new_session(
     effort: Option<String>,
     cfg: &Config,
 ) {
-    let launch =
-        QuickLaunch::of_kind(QuickTarget::Worktree(worktree), kind, custom, model, effort, cfg)
-            .with_origin(QuickOrigin::NewSession);
+    let launch = QuickLaunch::of_kind(
+        QuickTarget::Worktree(worktree),
+        kind,
+        custom,
+        model,
+        effort,
+        cfg,
+    )
+    .with_origin(QuickOrigin::NewSession);
     crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch));
 }
 

@@ -2839,10 +2839,7 @@ fn agent_spawn_command(
 /// no legacy entries — what a fresh install launches.
 #[cfg(test)]
 fn test_registry() -> Vec<nebula_core::harness::HarnessDescriptor> {
-    harness_registry_in(
-        &std::collections::BTreeMap::new(),
-        &[],
-    )
+    harness_registry_in(&std::collections::BTreeMap::new(), &[])
 }
 
 /// The pinned descriptor `kind` launches as in spawn tests.
@@ -3093,7 +3090,15 @@ fn claude_cloud_spawn_command(
     cmd_override: Option<&str>,
 ) -> (String, Vec<String>, bool) {
     let (program, mut args, resumed) = agent_spawn_command_with(
-        harness, None, None, model, effort, cmd_override, None, None, false,
+        harness,
+        None,
+        None,
+        model,
+        effort,
+        cmd_override,
+        None,
+        None,
+        false,
     );
     if cmd_override.is_none() {
         args.insert(0, format!("--cloud={task}"));
@@ -3375,7 +3380,11 @@ mod tests {
         // Fresh sessions: bare CLI (Claude plus its system-prompt guidance).
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, None, None, None, None),
-            ("claude".into(), guided("--append-system-prompt", &[]), false)
+            (
+                "claude".into(),
+                guided("--append-system-prompt", &[]),
+                false
+            )
         );
         // Codex/cursor always run in skip-permissions mode.
         assert_eq!(
@@ -3397,7 +3406,11 @@ mod tests {
         // relocated session's new cwd never dies on a stale id.
         assert_eq!(
             agent_spawn_command(AgentKind::Pi, Some("sid-4"), None, None, None),
-            ("pi".into(), guided("--append-system-prompt", &["--session-id", "sid-4"]), true)
+            (
+                "pi".into(),
+                guided("--append-system-prompt", &["--session-id", "sid-4"]),
+                true
+            )
         );
         // Muse boots bare and fresh: no resume flag is mapped yet, so a
         // stored session id is ignored rather than sent.
@@ -3412,7 +3425,11 @@ mod tests {
         // Claude resumes with a flag; codex with a subcommand (order matters).
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, Some("sid-1"), None, None, None),
-            ("claude".into(), guided("--append-system-prompt", &["--resume", "sid-1"]), true)
+            (
+                "claude".into(),
+                guided("--append-system-prompt", &["--resume", "sid-1"]),
+                true
+            )
         );
         // Skip-permissions flags trail the resume args. A codex resume is
         // told its checkout (`--cd`): without it codex reopens the session
@@ -3468,13 +3485,20 @@ mod tests {
             agent_spawn_command(AgentKind::Claude, None, Some("opus"), Some("high"), None),
             (
                 "claude".into(),
-                guided("--append-system-prompt", &["--model", "opus", "--effort", "high"]),
+                guided(
+                    "--append-system-prompt",
+                    &["--model", "opus", "--effort", "high"]
+                ),
                 false
             )
         );
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, None, None, Some("max"), None),
-            ("claude".into(), guided("--append-system-prompt", &["--effort", "max"]), false)
+            (
+                "claude".into(),
+                guided("--append-system-prompt", &["--effort", "max"]),
+                false
+            )
         );
         // Codex takes --model plus a config override for effort, after --yolo.
         assert_eq!(
@@ -3497,13 +3521,20 @@ mod tests {
             agent_spawn_command(AgentKind::Pi, None, Some("sonnet"), Some("high"), None),
             (
                 "pi".into(),
-                guided("--append-system-prompt", &["--model", "sonnet", "--thinking", "high"]),
+                guided(
+                    "--append-system-prompt",
+                    &["--model", "sonnet", "--thinking", "high"]
+                ),
                 false
             )
         );
         assert_eq!(
             agent_spawn_command(AgentKind::Pi, None, None, Some("off"), None),
-            ("pi".into(), guided("--append-system-prompt", &["--thinking", "off"]), false)
+            (
+                "pi".into(),
+                guided("--append-system-prompt", &["--thinking", "off"]),
+                false
+            )
         );
         // Muse takes `--model` verbatim and no effort flag yet: effort is
         // dropped, never sent.
@@ -3521,7 +3552,10 @@ mod tests {
             agent_spawn_command(AgentKind::Claude, Some("sid"), Some("sonnet"), None, None),
             (
                 "claude".into(),
-                guided("--append-system-prompt", &["--resume", "sid", "--model", "sonnet"]),
+                guided(
+                    "--append-system-prompt",
+                    &["--resume", "sid", "--model", "sonnet"]
+                ),
                 true
             )
         );
@@ -3805,7 +3839,10 @@ mod tests {
             true,
         );
         assert!(resumed);
-        let mut expected = guided("--append-system-prompt", &["--resume", "sid", "--model", "opus"]);
+        let mut expected = guided(
+            "--append-system-prompt",
+            &["--resume", "sid", "--model", "opus"],
+        );
         expected.push("carry on".into());
         assert_eq!(args, expected);
         // Codex and cursor take it as their trailing positional too.
@@ -3841,7 +3878,10 @@ mod tests {
         );
         // A fresh spawn with a starting prompt (an AGENT PRESET launch):
         // model, effort and system prompt all precede it.
-        let mut expected = guided("--append-system-prompt", &["--model", "opus", "--effort", "high"]);
+        let mut expected = guided(
+            "--append-system-prompt",
+            &["--model", "opus", "--effort", "high"],
+        );
         expected.push("fix auth".into());
         assert_eq!(
             agent_spawn_command_with(
@@ -5747,12 +5787,13 @@ mod tests {
     fn cli_missing_message_names_the_binary_not_the_kind() {
         // Cursor ships its agent as `cursor-agent`; naming the kind would
         // send the user off to install the wrong thing.
+        assert!(cli_missing_message(AgentKind::Cursor.cli_program())
+            .starts_with("cursor-agent was not found"));
+        assert!(cli_missing_message(AgentKind::Claude.cli_program())
+            .starts_with("claude was not found"));
         assert!(
-            cli_missing_message(AgentKind::Cursor.cli_program())
-                .starts_with("cursor-agent was not found")
+            cli_missing_message(AgentKind::Codex.cli_program()).starts_with("codex was not found")
         );
-        assert!(cli_missing_message(AgentKind::Claude.cli_program()).starts_with("claude was not found"));
-        assert!(cli_missing_message(AgentKind::Codex.cli_program()).starts_with("codex was not found"));
         assert!(cli_missing_message(AgentKind::Pi.cli_program()).starts_with("pi was not found"));
         assert!(cli_missing_message("agy").starts_with("agy was not found"));
         // No "restart nebula": agent CLIs are spawned through the user's

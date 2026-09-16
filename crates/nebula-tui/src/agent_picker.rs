@@ -166,7 +166,13 @@ pub(crate) fn open_kind_picker(app: &mut App, picker: KindPicker) {
             })
         })
         .unwrap_or(0);
-    let items = kind_rows(&rows, &worktree, pr.as_ref(), quick.as_deref(), harness_label);
+    let items = kind_rows(
+        &rows,
+        &worktree,
+        pr.as_ref(),
+        quick.as_deref(),
+        harness_label,
+    );
     app.overlay = Some(Overlay::Menu(ContextMenu {
         title: Some(title),
         items,
@@ -188,9 +194,13 @@ pub(crate) fn pr_session_menu_rows(worktree: WorktreeId, pr: &OpenPr) -> Vec<Men
         .into_iter()
         .map(|(kind, custom)| HarnessRow { kind, custom })
         .collect();
-    kind_rows(&rows, &worktree, Some(&PrLaunch::of(pr)), None, |kind, custom| {
-        format!("New {} session", harness_label(kind, custom))
-    })
+    kind_rows(
+        &rows,
+        &worktree,
+        Some(&PrLaunch::of(pr)),
+        None,
+        |kind, custom| format!("New {} session", harness_label(kind, custom)),
+    )
 }
 
 /// The harness badge a session row wears: the built-in name, or the
@@ -335,7 +345,7 @@ mod tests {
     /// it, save, and the picker drops the entry until it flips back.
     #[test]
     fn agents_tab_toggles_custom_entries_off_the_picker() {
-        use crate::config::{HarnessField, locate_agent};
+        use crate::config::{locate_agent, HarnessField};
         let json = r#"{"custom_harnesses": [
             {"id": "agy", "label": "Agy", "program": "agy"}
         ]}"#;

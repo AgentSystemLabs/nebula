@@ -5421,9 +5421,10 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             let (model, effort) = match kind {
                 AgentKind::Custom => {
                     let descriptor = cfg.effective_harness(kind, custom.as_deref());
-                    let model = preset.model.clone().or_else(|| {
-                        descriptor.default_model().map(str::to_string)
-                    });
+                    let model = preset
+                        .model
+                        .clone()
+                        .or_else(|| descriptor.default_model().map(str::to_string));
                     let effort = crate::config::fit_effort(
                         kind,
                         model.as_deref(),
@@ -21805,7 +21806,7 @@ diff --git a/src/c.rs b/src/c.rs
 
     #[test]
     fn agents_tab_renders_its_harness_groups() {
-        use crate::config::{HarnessField, locate_agent};
+        use crate::config::{locate_agent, HarnessField};
         let mut app = App::new();
         let mut out = Vec::new();
         let (agents, _) = locate_agent("claude", HarnessField::Enabled).unwrap();
@@ -25499,7 +25500,12 @@ diff --git a/src/c.rs b/src/c.rs
             let mut out = Vec::new();
 
             app.focus = Focus::Worktrees;
-            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL, &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
             assert!(app.hide_projects);
             assert!(app.hide_worktrees);
             assert!(app.hide_sessions);
@@ -25509,7 +25515,12 @@ diff --git a/src/c.rs b/src/c.rs
             assert!(saved.hide_sessions);
             assert!(!saved.show_workspaces);
 
-            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL, &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
             assert!(!app.hide_projects);
             assert!(!app.hide_worktrees);
             assert!(!app.hide_sessions);
@@ -25541,7 +25552,9 @@ diff --git a/src/c.rs b/src/c.rs
                 Focus::Sessions,
             ] {
                 assert!(
-                    app.hits.iter().any(|(_, h)| *h == HitTarget::CollapsePanel(focus)),
+                    app.hits
+                        .iter()
+                        .any(|(_, h)| *h == HitTarget::CollapsePanel(focus)),
                     "missing collapse button for {focus:?}"
                 );
             }
@@ -25687,7 +25700,10 @@ diff --git a/src/c.rs b/src/c.rs
         let projects_hidden = buffer_text(&terminal);
         assert!(!projects_hidden.contains("PROJECTS"), "{projects_hidden}");
         assert!(projects_hidden.contains("WORKTREES"), "{projects_hidden}");
-        assert!(projects_hidden.contains("▶"), "collapsed rail: {projects_hidden}");
+        assert!(
+            projects_hidden.contains("▶"),
+            "collapsed rail: {projects_hidden}"
+        );
         assert_eq!(
             app.term_area.x,
             crate::app::COLLAPSED_RAIL_W + widths[1] + widths[2] + 1

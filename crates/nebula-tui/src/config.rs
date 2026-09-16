@@ -11,8 +11,8 @@
 //! key `config.local.json` holds is written back there, never into the
 //! portable file.
 
-use nebula_core::AgentKind;
 use nebula_core::harness::{CustomHarness, HarnessDescriptor};
+use nebula_core::AgentKind;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -112,7 +112,12 @@ pub fn model_choices_in(descriptor: &nebula_core::harness::HarnessDescriptor) ->
             .map(|s| s.to_string())
             .collect(),
         None => headed(
-            descriptor.model.models.iter().map(|entry| entry.id.clone()).collect(),
+            descriptor
+                .model
+                .models
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect(),
         ),
     }
 }
@@ -122,11 +127,7 @@ pub fn model_choices_in(descriptor: &nebula_core::harness::HarnessDescriptor) ->
 /// harness offers no effort. Cursor's list follows the family (`-fast`
 /// variants ride in the effort, `high-fast`); any other harness takes its
 /// static list with any model.
-pub fn effort_choices(
-    kind: AgentKind,
-    model: Option<&str>,
-    custom: Option<&str>,
-) -> Vec<String> {
+pub fn effort_choices(kind: AgentKind, model: Option<&str>, custom: Option<&str>) -> Vec<String> {
     effort_choices_in(&describe(kind, custom), model)
 }
 
@@ -259,7 +260,11 @@ fn describe(kind: AgentKind, custom: Option<&str>) -> nebula_core::harness::Harn
         _ => kind.as_str(),
     };
     let cfg = Config::load();
-    if let Some(descriptor) = cfg.harness_registry().into_iter().find(|entry| entry.id == id) {
+    if let Some(descriptor) = cfg
+        .harness_registry()
+        .into_iter()
+        .find(|entry| entry.id == id)
+    {
         return descriptor;
     }
     nebula_core::harness::CustomHarness {
@@ -685,9 +690,11 @@ pub fn all_settings() -> impl Iterator<Item = (usize, usize, &'static SettingSpe
 /// The Agents tab reads the registry for its harness rows.
 pub fn hint_at(tab: usize, index: usize) -> String {
     match SETTINGS_TABS.get(tab).map(|t| t.body) {
-        Some(TabBody::Values(settings)) => {
-            settings.get(index).map(|s| s.hint).unwrap_or("").to_string()
-        }
+        Some(TabBody::Values(settings)) => settings
+            .get(index)
+            .map(|s| s.hint)
+            .unwrap_or("")
+            .to_string(),
         Some(TabBody::Hotkeys) => crate::keymap::spec_at(index)
             .map(|s| s.hint)
             .unwrap_or("")
@@ -734,9 +741,9 @@ pub fn settings_rows(tab: usize) -> Vec<SettingsRow> {
             let cfg = Config::load();
             let head = AGENTS_HEAD.iter().map(|s| s.group.to_string());
             let rows = cfg.agent_rows();
-            let groups = rows.iter().map(|(id, _)| {
-                cfg.effective_harness_by_id(id).display_label().to_string()
-            });
+            let groups = rows
+                .iter()
+                .map(|(id, _)| cfg.effective_harness_by_id(id).display_label().to_string());
             grouped(head.chain(groups), SettingsRow::Setting)
         }
         None => Vec::new(),
@@ -1212,9 +1219,17 @@ impl Config {
     /// the table, older than the `harnesses` map.
     fn legacy_harness_fields(&self, id: &str) -> (Option<bool>, Option<String>, Option<String>) {
         let (enabled, model, effort) = match id {
-            "claude" => (&self.claude_enabled, &self.claude_model, &self.claude_effort),
+            "claude" => (
+                &self.claude_enabled,
+                &self.claude_model,
+                &self.claude_effort,
+            ),
             "codex" => (&self.codex_enabled, &self.codex_model, &self.codex_effort),
-            "cursor" => (&self.cursor_enabled, &self.cursor_model, &self.cursor_effort),
+            "cursor" => (
+                &self.cursor_enabled,
+                &self.cursor_model,
+                &self.cursor_effort,
+            ),
             "pi" => (&self.pi_enabled, &self.pi_model, &self.pi_effort),
             "muse" => (&self.muse_enabled, &self.muse_model, &self.muse_effort),
             _ => return (None, None, None),
@@ -1246,7 +1261,10 @@ impl Config {
             AgentKind::Custom => custom.unwrap_or_default().trim(),
             _ => kind.as_str(),
         };
-        if let Some(descriptor) = self.harness_registry().into_iter().find(|entry| entry.id == id)
+        if let Some(descriptor) = self
+            .harness_registry()
+            .into_iter()
+            .find(|entry| entry.id == id)
         {
             return descriptor;
         }
@@ -1270,7 +1288,9 @@ impl Config {
         if kind == AgentKind::Custom {
             return None;
         }
-        self.builtin_descriptor(kind).default_model().map(str::to_string)
+        self.builtin_descriptor(kind)
+            .default_model()
+            .map(str::to_string)
     }
 
     /// The configured default effort for new sessions of `kind`;
@@ -1368,7 +1388,10 @@ impl Config {
     /// its own name when the registry no longer names it, so rows
     /// outliving their entry still render.
     pub fn effective_harness_by_id(&self, id: &str) -> HarnessDescriptor {
-        if let Some(descriptor) = self.harness_registry().into_iter().find(|entry| entry.id == id)
+        if let Some(descriptor) = self
+            .harness_registry()
+            .into_iter()
+            .find(|entry| entry.id == id)
         {
             return descriptor;
         }
@@ -1534,7 +1557,11 @@ impl Config {
             self.set_legacy_enabled(id, enabled);
             return;
         }
-        if let Some(entry) = self.custom_harnesses.iter_mut().find(|entry| entry.id == id) {
+        if let Some(entry) = self
+            .custom_harnesses
+            .iter_mut()
+            .find(|entry| entry.id == id)
+        {
             entry.enabled = enabled;
             return;
         }
@@ -1544,7 +1571,12 @@ impl Config {
     /// Write a Model default: the map where it speaks, else the legacy
     /// layer (the built-in model key, the list entry's model).
     fn set_harness_model(&mut self, id: &str, model: String) {
-        if self.harnesses.get(id).and_then(|o| o.model_default.clone()).is_some() {
+        if self
+            .harnesses
+            .get(id)
+            .and_then(|o| o.model_default.clone())
+            .is_some()
+        {
             self.harness_override_mut(id).model_default = Some(model);
             return;
         }
@@ -1552,7 +1584,11 @@ impl Config {
             self.set_legacy_model(id, model);
             return;
         }
-        if let Some(entry) = self.custom_harnesses.iter_mut().find(|entry| entry.id == id) {
+        if let Some(entry) = self
+            .custom_harnesses
+            .iter_mut()
+            .find(|entry| entry.id == id)
+        {
             entry.model = model;
             return;
         }
@@ -1564,7 +1600,11 @@ impl Config {
     /// owns theirs).
     fn set_harness_effort(&mut self, id: &str, effort: String) {
         if nebula_core::harness::builtin(id).is_some()
-            && self.harnesses.get(id).and_then(|o| o.effort_default.clone()).is_none()
+            && self
+                .harnesses
+                .get(id)
+                .and_then(|o| o.effort_default.clone())
+                .is_none()
         {
             self.set_legacy_effort(id, effort);
             return;
@@ -1573,10 +1613,7 @@ impl Config {
     }
 
     /// The `harnesses` map entry for `id`, created when absent.
-    fn harness_override_mut(
-        &mut self,
-        id: &str,
-    ) -> &mut nebula_core::harness::HarnessOverride {
+    fn harness_override_mut(&mut self, id: &str) -> &mut nebula_core::harness::HarnessOverride {
         self.harnesses.entry(id.to_string()).or_default()
     }
 
@@ -3126,7 +3163,9 @@ mod tests {
         );
         assert_eq!(cfg.default_model(AgentKind::Claude), None);
         assert_eq!(cfg.default_model(AgentKind::Codex), None);
-        assert!(cfg.agent_hint("codex", HarnessField::Enabled).contains("broken:"));
+        assert!(cfg
+            .agent_hint("codex", HarnessField::Enabled)
+            .contains("broken:"));
         // The entry still resolves for reads (placeholder-free), while
         // launches refuse it with the reason.
         let codex = cfg.effective_harness_by_id("codex");
@@ -3152,10 +3191,7 @@ mod tests {
         .unwrap();
         let cfg = load_from(&path);
         assert_eq!(cfg.theme, "ocean");
-        assert_eq!(
-            cfg.skipped,
-            BTreeSet::from(["harnesses".to_string()])
-        );
+        assert_eq!(cfg.skipped, BTreeSet::from(["harnesses".to_string()]));
         assert!(cfg.harness_registry().iter().all(|entry| entry.enabled));
     }
 
@@ -3299,9 +3335,7 @@ mod tests {
     #[test]
     fn fit_effort_resolves_cursor_pairs() {
         let cursor = nebula_core::harness::builtin("cursor").unwrap();
-        let fit = |m: Option<&str>, e: Option<&str>| {
-            fit_effort_in(&cursor, m, e.map(String::from))
-        };
+        let fit = |m: Option<&str>, e: Option<&str>| fit_effort_in(&cursor, m, e.map(String::from));
         assert_eq!(fit(None, Some("high")), None, "no family, nothing to join");
         assert_eq!(fit(Some("default"), Some("high")), None);
         assert_eq!(
@@ -3483,11 +3517,10 @@ mod tests {
                     SettingsRow::Setting(i) => {
                         let label = match AGENTS_HEAD.get(i) {
                             Some(spec) => spec.label.to_string(),
-                            None => {
-                                cfg.agent_row(i)
-                                    .map(|(_, field)| field.label().to_string())
-                                    .expect("every Agents row resolves")
-                            }
+                            None => cfg
+                                .agent_row(i)
+                                .map(|(_, field)| field.label().to_string())
+                                .expect("every Agents row resolves"),
                         };
                         sections
                             .last_mut()
@@ -3512,23 +3545,43 @@ mod tests {
                     ),
                     (
                         "Claude".to_string(),
-                        vec!["Enabled".to_string(), "Model".to_string(), "Effort".to_string()]
+                        vec![
+                            "Enabled".to_string(),
+                            "Model".to_string(),
+                            "Effort".to_string()
+                        ]
                     ),
                     (
                         "Codex".to_string(),
-                        vec!["Enabled".to_string(), "Model".to_string(), "Effort".to_string()]
+                        vec![
+                            "Enabled".to_string(),
+                            "Model".to_string(),
+                            "Effort".to_string()
+                        ]
                     ),
                     (
                         "Cursor".to_string(),
-                        vec!["Enabled".to_string(), "Model".to_string(), "Effort".to_string()]
+                        vec![
+                            "Enabled".to_string(),
+                            "Model".to_string(),
+                            "Effort".to_string()
+                        ]
                     ),
                     (
                         "Pi".to_string(),
-                        vec!["Enabled".to_string(), "Model".to_string(), "Effort".to_string()]
+                        vec![
+                            "Enabled".to_string(),
+                            "Model".to_string(),
+                            "Effort".to_string()
+                        ]
                     ),
                     (
                         "Muse".to_string(),
-                        vec!["Enabled".to_string(), "Model".to_string(), "Effort".to_string()]
+                        vec![
+                            "Enabled".to_string(),
+                            "Model".to_string(),
+                            "Effort".to_string()
+                        ]
                     ),
                 ]
             );
@@ -3576,7 +3629,15 @@ mod tests {
                     .collect();
                 assert_eq!(
                     sections,
-                    vec!["Quick prompt", "Claude", "Codex", "Cursor", "Pi", "Muse", "agy"]
+                    vec![
+                        "Quick prompt",
+                        "Claude",
+                        "Codex",
+                        "Cursor",
+                        "Pi",
+                        "Muse",
+                        "agy"
+                    ]
                 );
                 let (_, model_row) =
                     locate_agent("agy", HarnessField::Model).expect("the newcomer locates");
@@ -3602,10 +3663,7 @@ mod tests {
                     "an off-list hand edit steps onto the offered rows"
                 );
                 cfg.cycle(tab, effort_row, 1);
-                assert_eq!(
-                    cfg.harnesses["agy"].effort_default.as_deref(),
-                    Some("low")
-                );
+                assert_eq!(cfg.harnesses["agy"].effort_default.as_deref(), Some("low"));
             });
         });
     }

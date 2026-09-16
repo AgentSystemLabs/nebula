@@ -266,7 +266,10 @@ impl AgentPresetEditor {
             self.model = crate::config::DEFAULT_CHOICE.into();
         }
         self.fit_effort();
-        if !self.field.available(kind, self.custom.as_deref(), &self.model) {
+        if !self
+            .field
+            .available(kind, self.custom.as_deref(), &self.model)
+        {
             self.field = PresetField::Prefix;
         }
     }
@@ -300,18 +303,12 @@ impl AgentPresetEditor {
             PresetField::Kind => crate::config::Config::load()
                 .offered_harnesses()
                 .into_iter()
-                .map(|(kind, custom)| {
-                    custom.unwrap_or_else(|| kind.as_str().to_string())
-                })
+                .map(|(kind, custom)| custom.unwrap_or_else(|| kind.as_str().to_string()))
                 .collect(),
-            PresetField::Model => {
-                crate::config::model_choices(self.kind, self.custom.as_deref())
+            PresetField::Model => crate::config::model_choices(self.kind, self.custom.as_deref()),
+            PresetField::Effort => {
+                crate::config::effort_choices(self.kind, Some(&self.model), self.custom.as_deref())
             }
-            PresetField::Effort => crate::config::effort_choices(
-                self.kind,
-                Some(&self.model),
-                self.custom.as_deref(),
-            ),
             PresetField::Task => vec![TASK_ASK.to_string(), TASK_SKIP.to_string()],
             _ => Vec::new(),
         }
@@ -571,7 +568,10 @@ pub(crate) fn open_agent_preset_task(
     if !crate::config::Config::load().preset_harness_usable(&preset) {
         app.flash = Some(format!(
             "{} is turned off in Settings → Agents",
-            preset.custom_harness.as_deref().unwrap_or(preset.kind.as_str())
+            preset
+                .custom_harness
+                .as_deref()
+                .unwrap_or(preset.kind.as_str())
         ));
         return;
     }
@@ -609,7 +609,10 @@ fn apply_preset_to_quick_prompt(
     if !cfg.preset_harness_usable(&preset) {
         app.flash = Some(format!(
             "{} is turned off in Settings → Agents",
-            preset.custom_harness.as_deref().unwrap_or(preset.kind.as_str())
+            preset
+                .custom_harness
+                .as_deref()
+                .unwrap_or(preset.kind.as_str())
         ));
         return;
     }
@@ -697,21 +700,17 @@ pub(crate) fn handle_editor_key(app: &mut App, key: KeyEvent) {
         // Leaving a choice row drops its type-ahead.
         KeyCode::Tab | KeyCode::Down => {
             editor.filter.clear();
-            editor.field = editor.field.step(
-                editor.kind,
-                editor.custom.as_deref(),
-                &editor.model,
-                1,
-            )
+            editor.field =
+                editor
+                    .field
+                    .step(editor.kind, editor.custom.as_deref(), &editor.model, 1)
         }
         KeyCode::BackTab | KeyCode::Up => {
             editor.filter.clear();
-            editor.field = editor.field.step(
-                editor.kind,
-                editor.custom.as_deref(),
-                &editor.model,
-                -1,
-            )
+            editor.field =
+                editor
+                    .field
+                    .step(editor.kind, editor.custom.as_deref(), &editor.model, -1)
         }
         // A hard line in the prefix / postfix, as in the task editor.
         KeyCode::Char('j') if multiline && ctrl => editor.prefix_or_postfix_newline(),
@@ -892,8 +891,7 @@ pub(crate) fn draw_editor(f: &mut Frame, app: &mut App, editor: &AgentPresetEdit
             break;
         };
         let focused = editor.field == *field;
-        let available =
-            field.available(editor.kind, editor.custom.as_deref(), &editor.model);
+        let available = field.available(editor.kind, editor.custom.as_deref(), &editor.model);
         let label_style = if focused {
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
         } else if available {
