@@ -158,8 +158,10 @@ The overlay cycles `off`, `1m`, `5m`, `15m`, `30m`, `1h`, but the DAEMON parses 
 value falls back to the 5m default, *not* to off — a typo makes reaping ordinary, not absent.
 
 The IDLE REAPER sweeps every 15s and only takes sessions in WORKTREES no client is viewing. RUNNING
-and NEEDS FEEDBACK agents, and terminals with a command running, are spared. A reaped session revives
-on the next ATTACH or prewarm, and an agent RESUMES its conversation there.
+and NEEDS FEEDBACK agents, agents whose backgrounded tool call is still running (a Claude
+`run_in_background` Bash call or Monitor watch, a Codex shell command — the idle clock restarts when
+that job ends), and terminals with a command running, are spared. A reaped session revives on the
+next ATTACH or prewarm, and an agent RESUMES its conversation there.
 
 ## What the settings overlay owns
 

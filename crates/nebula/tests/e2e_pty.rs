@@ -3321,6 +3321,88 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     wait_for_exit(&mut daemon);
 }
 
+/// A finished agent whose backgrounded tool call is still running — a job
+/// it detached from its terminal, the way Claude Code runs a
+/// `run_in_background` Bash call or a Monitor watch — is spared by the idle
+/// reaper until that job ends, and then gets the full timeout over again.
+/// A child the agent keeps inside its own terminal session (an MCP server)
+/// does not count: that agent is reaped on schedule (#78).
+#[tokio::test]
+async fn idle_agent_with_a_detached_job_is_spared_until_it_ends() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    env.write_config(r#"{"session_idle_timeout": "2s"}"#);
+    let mut daemon = env.spawn_daemon_with("/bin/sh", &[(env::IDLE_REAP_MS, "200")]);
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let worker = create_agent_get_id(&mut c, &worktree.id, "worker", 2).await;
+    let resident = create_agent_get_id(&mut c, &worktree.id, "resident", 3).await;
+
+    // Each stand-in agent (`/bin/sh`) gets a child, then nobody looks at
+    // either. The worker's is a job in a session of its own, as Claude
+    // spawns a backgrounded Bash call; the resident's is an ordinary child
+    // inside its session, the shape of an MCP server.
+    let started = tokio::time::Instant::now();
+    for (id, line) in [
+        (
+            &worker,
+            "python3 -c 'import subprocess; subprocess.run([\"sleep\", \"5\"], start_new_session=True)'\n",
+        ),
+        (&resident, "sleep 30\n"),
+    ] {
+        let session = SessionRef::Agent(id.clone());
+        write_frame(
+            &mut c,
+            &ClientRequest::Attach {
+                session: session.clone(),
+                from_seq: None,
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .await
+        .unwrap();
+        write_frame(
+            &mut c,
+            &ClientRequest::Input {
+                session: session.clone(),
+                data: line.as_bytes().to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+        write_frame(&mut c, &ClientRequest::Detach { session })
+            .await
+            .unwrap();
+    }
+    let reaped = |evs: &[ServerEvent], id: &nebula_core::AgentId| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if &a.id == id && !a.alive)
+        })
+    };
+
+    // The resident goes after ~2s; the worker's job keeps it alive.
+    let events = read_events_until(&mut c, SLOW_TIMEOUT, |evs| reaped(evs, &resident)).await;
+    assert!(
+        !reaped(&events, &worker),
+        "worker spared while its job runs: {events:#?}"
+    );
+
+    // The job ends at ~5s, and the worker goes a full timeout after that —
+    // not on the next sweep: the clock restarted when the job ended.
+    read_events_until(&mut c, SLOW_TIMEOUT, |evs| reaped(evs, &worker)).await;
+    assert!(
+        started.elapsed() >= Duration::from_millis(6500),
+        "reaped {:?} after the job started; the timeout restarts when it ends",
+        started.elapsed()
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 fn wait_for_exit(daemon: &mut DaemonProc) {
     let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
     loop {

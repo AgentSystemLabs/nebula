@@ -226,8 +226,10 @@
   before you ask for one, and pre-boot a worktree's dead sessions while your selection rests on it, so attaching
   lands on a booted screen instead of a booting shell. To bound what that costs, idle PTYs in worktrees
   no client is watching are killed after `session_idle_timeout` (5m by default) — working agents, ones
-  waiting on you, and terminals with a command running are all spared, and a reaped agent
-  revives on the next attach with its conversation resumed. Until then its row's STATUS DOT is gray,
+  waiting on you, ones whose backgrounded tool call is still running (Claude's `run_in_background`
+  Bash or Monitor, a Codex shell command; the clock restarts when it ends), and terminals with a
+  command running are all spared, and a reaped agent revives on the next attach with its
+  conversation resumed. Until then its row's STATUS DOT is gray,
   whatever its last status was — a cold session shows what it last did, not what it is doing. Both halves of the PREWARM POOL are
   switchable — `prewarm_agents` and `prewarm_sessions`, `true` by default, on the SETTINGS OVERLAY's
   Sessions tab or by hand in CONFIG.JSON (see [Configuration](configuration.md)); switching the pool
