@@ -76,8 +76,10 @@ its row is yellow while the PTY is live and green when the process ends, and it 
 ## AGENT PRESETS
 
 If you keep starting the same kind of session with the same framing, save it as an **agent preset**:
-`e` in the Sessions column lists them, `a` opens a small form — name, harness, model, effort, an
-optional prefix and postfix, and **Task** (`ask` or `skip`) — and `e` / `d` edit or delete. `Enter` on a
+`e` in the Sessions column — or on a worktree's row in the Worktrees column, which launches into
+that worktree without walking over to its sessions — lists them, `a` opens a small form — name,
+harness, model, effort, an optional prefix and postfix, and **Task** (`ask` or `skip`) — and `e` / `d`
+edit or delete. `Enter` on a
 preset asks for the task in the same wrapped editor, then launches the CLI with `prefix + task + postfix`
 as its very first prompt, so the agent is already working when the pane opens. The task is optional:
 send the box empty and the prefix and postfix go on their own (a preset with neither starts the CLI

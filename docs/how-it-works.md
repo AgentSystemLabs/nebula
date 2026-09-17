@@ -257,9 +257,12 @@ the pull request: once it is merged or closed the row stays, badged `merged` or 
 badged `ready` — ready for review, the state and nothing more — and a draft is dimmed and badged `draft`),
 for as long as the checkout does — a worktree whose PR has shipped is the one
 you are about to archive or delete, and the PR is what you check first. A merged one also takes over the
-checkout's row in the Worktrees panel: purple dot, purple rail, and the branch name sweeping the way a
-running row's does, so the checkout to delete stands out from across the room (a session still running
-or asking there keeps its yellow or red — that is not a checkout to pull out from under it). Rest on that
+checkout's row in the Worktrees panel: purple dot, purple rail and purple branch name, so the checkout to
+delete stands out from across the room (a session still running or asking there keeps its yellow or red —
+that is not a checkout to pull out from under it). The name sweeps the way a running row's does for about
+five seconds after nebula sees the merge land, then holds still in solid purple — nothing about a landed
+checkout is live, so it says so once; one found already merged (last run's cache, a first lookup) never
+sweeps, and a merged checkout left lying around costs an idle nebula no repaints. Rest on that
 row and the pane reads the pull request — description, stats, conversation — exactly as it does for the
 project-wide OPEN PRS rows under the worktrees, which do retire on merge (and which the `hide_draft_prs`
 setting can thin to the non-drafts — this row is never thinned, it is the checkout's own); `g` shows its diff. Manual link

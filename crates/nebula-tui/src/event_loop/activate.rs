@@ -91,6 +91,41 @@ pub(super) fn diff_file(view: &mut DiffView, index: i64) {
     }
 }
 
+/// A row of the DIFF modal's list chosen — a click on it, or Enter on the
+/// cursor's own: the cursor lands there, and a tree directory's row folds
+/// or unfolds as well. On a file's row that is all there is to choose, so
+/// in the flat list this is `diff_file`.
+pub(super) fn diff_row(view: &mut DiffView, index: i64) {
+    let moved = view.select(index);
+    if view.toggle_dir(view.cursor()) || moved {
+        crate::git_diff::load_selected_diff(view);
+    }
+}
+
+/// `→` / `←` in the DIFF modal's tree: open or fold the directory under the
+/// cursor, stepping into an open one or out to the parent's row, and read
+/// whatever the cursor came to rest on.
+pub(super) fn diff_tree_step(view: &mut DiffView, inward: bool) {
+    let moved = if inward {
+        view.expand_selected()
+    } else {
+        view.collapse_selected()
+    };
+    if moved {
+        crate::git_diff::load_selected_diff(view);
+    }
+}
+
+/// `Ctrl+t` in the DIFF modal: the file list's other shape. The cursor
+/// keeps its file, and its place in the diff with it; only a cursor that
+/// had to move — off a directory's row, which the flat list has none of —
+/// reads a diff.
+pub(super) fn diff_tree_toggled(view: &mut DiffView) {
+    if view.toggle_tree() {
+        crate::git_diff::load_selected_diff(view);
+    }
+}
+
 /// The DIFF modal's filter text changed — typed, pasted, or cleared by
 /// Esc: the file list narrows, and when that moved the cursor onto another
 /// file its diff is read.

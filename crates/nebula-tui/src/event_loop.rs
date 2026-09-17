@@ -324,6 +324,8 @@ async fn main_loop(
     let mut next_metrics_poll = tokio::time::Instant::now();
     let mut next_splash_frame = tokio::time::Instant::now();
     let mut next_sweep_frame = tokio::time::Instant::now();
+    // The last sweep tick still had something to animate (see the tick).
+    let mut sweep_was_ticking = false;
     let mut next_ago_refresh = tokio::time::Instant::now() + AGO_REFRESH;
     // The host's runtime modes, re-asked on a slow beat (see host_terminal).
     let mut next_mode_reassert = tokio::time::Instant::now() + MODE_REASSERT;
@@ -414,9 +416,13 @@ async fn main_loop(
             }
             // Status sweep: running / needs-feedback rows shimmer, so keep
             // repainting while any are visible (same pure-function-of-time
-            // model as the splash — a missed tick skips ahead cleanly).
-            _ = tokio::time::sleep_until(next_sweep_frame), if app.status_anim_active() => {
+            // model as the splash — a missed tick skips ahead cleanly). A
+            // ONE-SHOT SWEEP ends on the clock, with no event to repaint
+            // the row it leaves mid-band, so the tick after the last sweep
+            // stops still fires: that frame is the row settling.
+            _ = tokio::time::sleep_until(next_sweep_frame), if app.status_anim_active() || sweep_was_ticking => {
                 app.dirty = true;
+                sweep_was_ticking = app.status_anim_active();
                 next_sweep_frame = tokio::time::Instant::now() + SWEEP_FRAME;
             }
             // "23m ago" labels age on their own with nothing else to
@@ -852,6 +858,21 @@ fn land_pull_request(app: &mut App, worktree: WorktreeId, answer: Lookup) {
         return;
     };
     let changed = app.pull_requests.get(&worktree) != Some(&row);
+    // A merge seen to happen — the last answer was anything but merged, this
+    // one is — starts the row's ONE-SHOT SWEEP. No last answer at all is a
+    // checkout met for the first time: whenever that merged, it wasn't now.
+    let is_merged = |pr: &Option<crate::pull_request::PullRequest>| {
+        pr.as_ref()
+            .is_some_and(|pr| pr.standing() == crate::pull_request::Standing::Merged)
+    };
+    let landed = is_merged(&row)
+        && app
+            .pull_requests
+            .get(&worktree)
+            .is_some_and(|last| !is_merged(last));
+    if landed {
+        app.note_merge_landed(worktree.clone());
+    }
     app.pull_requests.insert(worktree, row);
     app.dirty |= changed;
     app.pr_cache_dirty |= changed;
@@ -1118,15 +1139,27 @@ fn forget_retired_prs(app: &mut App) {
 /// `merged` the moment the pane learns it, not up to fifteen seconds later
 /// — and, on the Sessions panel, its look.
 fn adopt_pr_state(app: &mut App, detail: &crate::pull_request::PrDetail) {
-    for pr in app.pull_requests.values_mut().flatten() {
+    use crate::pull_request::Standing;
+    // Checkouts whose row turns merged right here: the same seen-to-happen
+    // merge `land_pull_request` stamps, learned a beat earlier.
+    let mut landed = Vec::new();
+    for (worktree, pr) in app.pull_requests.iter_mut() {
+        let Some(pr) = pr else { continue };
         if pr.url != detail.url {
             continue;
         }
         if pr.state != detail.state || pr.is_draft != detail.is_draft {
+            let was_merged = pr.standing() == Standing::Merged;
             pr.state = detail.state.clone();
             pr.is_draft = detail.is_draft;
+            if !was_merged && pr.standing() == Standing::Merged {
+                landed.push(worktree.clone());
+            }
             app.dirty = true;
         }
+    }
+    for worktree in landed {
+        app.note_merge_landed(worktree);
     }
 }
 
@@ -1484,19 +1517,13 @@ fn refresh_pr_diff_view(view: &mut DiffView, diff: &str) -> bool {
     if view.prefetched.as_ref() == Some(&fresh) {
         return false;
     }
-    let was_on = view.selected_file().map(|f| f.path.clone());
+    let was_on = view.selected_path().map(str::to_string);
     let scroll = view.scroll;
-    view.files = pr_diff_files(&chunks);
     view.prefetched = Some(fresh);
-    view.recompute_matches();
-    let same = was_on.and_then(|path| {
-        view.matches
-            .iter()
-            .position(|m| view.files[m.file].path == path)
-    });
-    view.selected = same.unwrap_or(0);
+    view.replace_files(pr_diff_files(&chunks));
+    let same = was_on.is_some_and(|path| view.select_path(&path));
     crate::git_diff::load_selected_diff(view);
-    if same.is_some() {
+    if same {
         view.scroll = scroll.min(view.max_scroll());
     }
     true
@@ -1547,6 +1574,9 @@ fn open_pr_diff_view(app: &mut App, number: u64, url: &str, title: String, diff:
     view.prefetched = Some(chunks.into_iter().collect());
     view.pr_url = Some(url.to_string());
     view.files_width = app.diff_files_width;
+    if app.diff_tree {
+        view.toggle_tree();
+    }
     crate::git_diff::load_selected_diff(&mut view);
     app.overlay = Some(Overlay::Diff(view));
     app.flash = None;
@@ -1711,6 +1741,7 @@ fn ui_state_json(app: &App) -> String {
         open_prs_collapsed: app.open_prs_collapsed,
         panel_widths: Some(app.panel_widths),
         diff_files_width: Some(app.diff_files_width),
+        diff_tree: app.diff_tree,
     };
     serde_json::to_string(&state).unwrap_or_else(|_| "{}".into())
 }
@@ -1776,6 +1807,7 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
         // The draw re-caps it to the actual modal width.
         app.diff_files_width = w.clamp(crate::app::MIN_DIFF_FILES_W, MAX_RESTORED_WIDTH);
     }
+    app.diff_tree = state.diff_tree;
     if let Some(pid) = &state.project {
         let row = app
             .project_rows()
@@ -3119,6 +3151,10 @@ fn open_diff_view(app: &mut App) {
     view.head_key = head.unwrap_or_default();
     view.files_width = app.diff_files_width;
     restore_reviewed_marks(&mut view);
+    // After the marks: the tree opens on the first unreviewed file too.
+    if app.diff_tree {
+        view.toggle_tree();
+    }
     crate::git_diff::load_selected_diff(&mut view);
     app.overlay = Some(Overlay::Diff(view));
 }
@@ -4790,10 +4826,26 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                         }
                     }
                 }
+                // Ctrl+t flips the file list between flat paths and the
+                // directory tree (`diff_tree`), the cursor staying on its
+                // file; remembered for the next open, like the list's width.
+                KeyCode::Char('t') if ctrl => {
+                    activate::diff_tree_toggled(view);
+                    app.diff_tree = view.tree.is_some();
+                }
                 KeyCode::Down if shift => view.scroll_by(1),
                 KeyCode::Up if shift => view.scroll_by(-1),
-                KeyCode::Down => activate::diff_file(view, view.selected as i64 + 1),
-                KeyCode::Up => activate::diff_file(view, view.selected as i64 - 1),
+                KeyCode::Down => activate::diff_file(view, view.cursor() as i64 + 1),
+                KeyCode::Up => activate::diff_file(view, view.cursor() as i64 - 1),
+                // The tree folds on the TREE BROWSER's keys: →/← open and
+                // fold a directory (or step in / out to the parent), Enter
+                // flips the one under the cursor. In the flat list all
+                // three stay the filter's.
+                KeyCode::Right if view.tree.is_some() => activate::diff_tree_step(view, true),
+                KeyCode::Left if view.tree.is_some() => activate::diff_tree_step(view, false),
+                KeyCode::Enter if view.tree.is_some() => {
+                    activate::diff_row(view, view.cursor() as i64)
+                }
                 KeyCode::PageDown => view.scroll_by(page),
                 KeyCode::PageUp => view.scroll_by(-page),
                 KeyCode::Home => view.scroll = 0,
@@ -7874,8 +7926,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         return;
     }
     // Diff modal: the wheel scrolls the diff, a click on a file-list row
-    // selects that file, a drag on the files/diff border resizes the file
-    // list; everything else is swallowed.
+    // selects that file (and folds or unfolds a tree directory's), a drag
+    // on the files/diff border resizes the file list; everything else is
+    // swallowed.
     if let Some(Overlay::Diff(view)) = &mut app.overlay {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -7897,9 +7950,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 let area = view.list_area;
                 let first = view.window_start(area.height as usize);
                 if let Some(index) =
-                    crate::list_hit::row_at(area, first, view.matches.len(), mouse_pos)
+                    crate::list_hit::row_at(area, first, view.row_count(), mouse_pos)
                 {
-                    activate::diff_file(view, index as i64);
+                    activate::diff_row(view, index as i64);
                     app.dirty = true;
                 }
             }
@@ -9791,9 +9844,9 @@ mod tests {
     /// The badges: project and worktree rows count their unwatched finishes
     /// as ` n done`, and the session rows being counted say `done` in the
     /// harness slot — all of it gone once the session has been read. Dot
-    /// and count share the `done` violet while the turn is unread; landing
+    /// and count share the `done` blue while the turn is unread; landing
     /// the cursor on the session drops the dot to the plain-success green,
-    /// which is the whole distinction: violet is a job, green is a result.
+    /// which is the whole distinction: blue is a job, green is a result.
     #[test]
     fn unwatched_finishes_badge_the_rows_until_read() {
         use nebula_core::AgentStatus;
@@ -9834,7 +9887,7 @@ mod tests {
         );
         {
             // Unread: the dot wears `done`, not the success green — and
-            // the rows above it roll that up, so they're violet too.
+            // the rows above it roll that up, so they're blue too.
             let (x, y) = find_cell(&terminal, "agent-2");
             let (px, py) = find_cell(&terminal, "demo");
             let buffer = terminal.backend().buffer();
@@ -9943,7 +9996,7 @@ mod tests {
 
         upsert(&mut app, &|a| a.alive = true);
         let (fg, row) = dot(&mut app);
-        assert_eq!(fg, app.theme.done, "warm again: unread violet: {row}");
+        assert_eq!(fg, app.theme.done, "warm again: unread blue: {row}");
 
         upsert(&mut app, &|a| {
             a.alive = false;
@@ -10549,13 +10602,22 @@ mod tests {
         );
     }
 
-    /// A checkout wearing its merged pull request sweeps purple, so it
-    /// keeps the sweep clock running too — while its row is on screen.
-    /// Another project's merged checkout has no row to animate.
+    /// A stamp `ONE_SHOT_SWEEP` and a second old: long enough ago that the
+    /// row it timed has settled.
+    fn settled() -> std::time::Duration {
+        crate::app::ONE_SHOT_SWEEP + Duration::from_secs(1)
+    }
+
+    /// A checkout whose pull request is seen to merge sweeps purple for
+    /// `ONE_SHOT_SWEEP`, so it keeps the sweep clock running that long —
+    /// while its row is on screen — and then stops asking for frames: a
+    /// merged checkout left lying around repaints nothing. Another
+    /// project's merged checkout has no row to animate.
     #[test]
-    fn a_merged_checkout_on_screen_keeps_the_sweep_ticking() {
+    fn a_merge_seen_to_land_keeps_the_sweep_ticking_for_a_few_seconds() {
         let mut app = App::new();
         seed_tree(&mut app);
+        let w1 = nebula_core::WorktreeId("w1".into());
         assert!(
             !app.status_anim_active(),
             "fresh agent, open PR: nothing sweeps"
@@ -10566,10 +10628,27 @@ mod tests {
         let mut merged = a_detail(7, "shipped", vec![]);
         merged.state = "MERGED".into();
         adopt_pr_state(&mut app, &merged);
+        assert!(app.merge_is_fresh(&w1), "open to merged, seen: stamped");
         assert!(app.status_anim_active(), "the merged row sweeps");
         app.animations = false;
         assert!(!app.status_anim_active(), "unless animations are off");
         app.animations = true;
+
+        // The window runs out: the row is still purple, and at rest.
+        let long_ago = std::time::Instant::now()
+            .checked_sub(settled())
+            .expect("uptime past the window");
+        app.merge_landed.insert(w1.clone(), long_ago);
+        assert!(app.worktree_wears_merge(&w1), "still the merged row");
+        assert!(!app.status_anim_active(), "settled: no frames asked for");
+        // Hearing the same state again is not a second merge.
+        adopt_pr_state(&mut app, &merged);
+        assert!(!app.merge_is_fresh(&w1));
+        app.note_merge_landed(w1.clone());
+        assert!(
+            app.status_anim_active(),
+            "fresh again, for the rest of this"
+        );
 
         // Another project selected: the merged checkout is not a row.
         use nebula_core::{Entity, Project, ProjectId};
@@ -13416,6 +13495,256 @@ diff --git a/src/b.rs b/src/b.rs
         assert!(!view.diff.contains("+new"), "chunks don't bleed");
     }
 
+    /// A pull request's diff spread over two directories, one of them a
+    /// chain the tree folds into a single row.
+    const TREE_PR_DIFF: &str = "\
+diff --git a/crates/tui/src/a.rs b/crates/tui/src/a.rs
+--- a/crates/tui/src/a.rs
++++ b/crates/tui/src/a.rs
+@@ -1 +1 @@
+-old
++new-a
+diff --git a/crates/tui/src/b.rs b/crates/tui/src/b.rs
+--- a/crates/tui/src/b.rs
++++ b/crates/tui/src/b.rs
+@@ -1 +1 @@
+-x
++new-b
+diff --git a/docs/keys.md b/docs/keys.md
+--- a/docs/keys.md
++++ b/docs/keys.md
+@@ -1 +1 @@
+-k
++new-keys
+";
+
+    /// An app with the DIFF modal up on [`TREE_PR_DIFF`], flat or as the
+    /// tree per `app.diff_tree` — which `tree` sets before opening.
+    fn pr_diff_app(tree: bool) -> App {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        app.sel_worktree = 1;
+        app.diff_tree = tree;
+        open_pr_diff_view(
+            &mut app,
+            7,
+            &pr_url(7),
+            "#7 Attach links".into(),
+            Some(TREE_PR_DIFF.into()),
+        );
+        app
+    }
+
+    /// The tree list's rows as the panel names them, the cursor's starred.
+    fn diff_tree_rows(app: &App) -> Vec<String> {
+        let tree = diff_view(app).tree.as_ref().expect("the tree list");
+        tree.rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let star = if i == tree.selected { "*" } else { "" };
+                format!("{star}{}", tree.nodes[r.node].name)
+            })
+            .collect()
+    }
+
+    /// `Ctrl+t` folds the pull request's file list into a directory tree
+    /// and back. The reader keeps their file and their place in it both
+    /// ways; a directory's row reads as the list of what changed under it,
+    /// and leaving the tree from one lands on that directory's first file.
+    #[test]
+    fn ctrl_t_flips_the_pr_diff_file_list_between_flat_and_tree() {
+        let mut app = pr_diff_app(false);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert!(diff_view(&app).diff.contains("+new-b"));
+        if let Some(Overlay::Diff(view)) = &mut app.overlay {
+            view.view_height = 2;
+            view.scroll = 3;
+        }
+
+        ctrl(&mut app, 't', &mut out);
+        assert_eq!(
+            diff_tree_rows(&app),
+            ["crates/tui/src", "a.rs", "*b.rs", "docs", "keys.md"],
+            "every directory open, the chain one row, the cursor still on b.rs"
+        );
+        assert!(diff_view(&app).diff.contains("+new-b"));
+        assert_eq!(diff_view(&app).scroll, 3, "same file: the place is kept");
+        assert!(app.diff_tree, "remembered for the next open");
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("▾ crates/tui/src"), "{text}");
+        assert!(text.contains("^t: flat list"), "{text}");
+        assert!(text.contains("←/→: fold"), "{text}");
+
+        // Up onto the directory's row: the pane lists what is under it.
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        let view = diff_view(&app);
+        assert_eq!(view.selected_dir(), Some("crates/tui/src"));
+        assert!(view.selected_file().is_none());
+        assert_eq!(
+            view.diff,
+            "crates/tui/src/ — 2 changed files\n\nM    a.rs\nM    b.rs"
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("#7 Attach links: crates/tui/src/"), "{text}");
+
+        // ← folds it, → opens it again, a second → steps inside.
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE, &mut out);
+        assert_eq!(diff_tree_rows(&app), ["*crates/tui/src", "docs", "keys.md"]);
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            diff_tree_rows(&app),
+            ["crates/tui/src", "*a.rs", "b.rs", "docs", "keys.md"]
+        );
+        assert!(diff_view(&app).diff.contains("+new-a"));
+
+        // Back to the flat list from a directory's row: its first file.
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert_eq!(diff_view(&app).selected_dir(), Some("docs"));
+        ctrl(&mut app, 't', &mut out);
+        let view = diff_view(&app);
+        assert!(view.tree.is_none());
+        assert_eq!(view.selected_file().unwrap().path, "docs/keys.md");
+        assert!(view.diff.contains("+new-keys"), "{}", view.diff);
+        assert!(!app.diff_tree);
+        assert!(out.is_empty(), "the list's shape is nebula's own business");
+    }
+
+    /// INPUT PARITY: Enter on a tree directory's row and a click on it are
+    /// the same choice — the row folds, the cursor rests on it — and a
+    /// click on a file's row is ↓ onto it.
+    #[test]
+    fn a_click_on_a_diff_tree_row_is_enter_on_it() {
+        let mut keyed = pr_diff_app(true);
+        let mut clicked = pr_diff_app(true);
+        let mut out = Vec::new();
+        assert_eq!(
+            diff_tree_rows(&keyed),
+            ["crates/tui/src", "*a.rs", "b.rs", "docs", "keys.md"],
+            "a tree opens on its first file, not on the directory above it"
+        );
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut clicked)).unwrap();
+        let list = diff_view(&clicked).list_area;
+        let click = |app: &mut App, row: u16, out: &mut Vec<ClientRequest>| {
+            handle_mouse(
+                app,
+                mev(
+                    MouseEventKind::Down(MouseButton::Left),
+                    list.x + 8,
+                    list.y + row,
+                ),
+                out,
+            );
+        };
+
+        press(&mut keyed, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        press(&mut keyed, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        click(&mut clicked, 0, &mut out);
+        assert_eq!(
+            diff_tree_rows(&keyed),
+            ["*crates/tui/src", "docs", "keys.md"]
+        );
+        assert_eq!(diff_tree_rows(&clicked), diff_tree_rows(&keyed));
+        assert_eq!(diff_view(&clicked).diff, diff_view(&keyed).diff);
+
+        // A file's row: the cursor lands and its diff is read, nothing folds.
+        press(&mut keyed, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        press(&mut keyed, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        press(&mut keyed, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        click(&mut clicked, 2, &mut out);
+        assert_eq!(
+            diff_tree_rows(&keyed),
+            ["crates/tui/src", "docs", "*keys.md"]
+        );
+        assert_eq!(diff_tree_rows(&clicked), diff_tree_rows(&keyed));
+        assert!(diff_view(&clicked).diff.contains("+new-keys"));
+        assert!(out.is_empty());
+    }
+
+    /// The tree filters the way the TREE BROWSER does — matching files
+    /// under their directories, the cursor parked on the best match — and
+    /// `Ctrl+r` sweeps down the files without stopping on a directory.
+    #[test]
+    fn the_diff_tree_filters_and_sweeps_reviewed_marks() {
+        let mut app = pr_diff_app(true);
+        let mut out = Vec::new();
+        for c in "keys".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(diff_tree_rows(&app), ["docs", "*keys.md"]);
+        assert!(diff_view(&app).diff.contains("+new-keys"));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            diff_tree_rows(&app),
+            ["crates/tui/src", "*a.rs", "b.rs", "docs", "keys.md"],
+            "Esc clears the filter first, and the cursor goes home"
+        );
+
+        ctrl(&mut app, 'r', &mut out);
+        ctrl(&mut app, 'r', &mut out);
+        assert_eq!(
+            diff_tree_rows(&app),
+            ["crates/tui/src", "a.rs", "b.rs", "docs", "*keys.md"],
+            "two marks later the cursor is past `docs`, on the next file"
+        );
+        let view = diff_view(&app);
+        assert!(view.reviewed.contains_key("crates/tui/src/a.rs"));
+        assert!(view.reviewed.contains_key("crates/tui/src/b.rs"));
+        assert!(view.diff.contains("+new-keys"));
+        let tree = view.tree.as_ref().unwrap();
+        let done = tree.reviewed_nodes(&view.files, &view.reviewed);
+        assert!(done[tree.rows[0].node], "a directory read end to end");
+        assert!(!done[tree.rows[3].node]);
+    }
+
+    /// A fresh `gh pr diff` landing under the tree keeps what the reader
+    /// folded and the file they were on; `diff_tree` rides the UI state
+    /// blob, so the next launch opens the modal the way this one left it.
+    #[test]
+    fn the_diff_tree_survives_a_refresh_and_a_relaunch() {
+        let mut app = pr_diff_app(true);
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(
+            diff_tree_rows(&app),
+            ["crates/tui/src", "a.rs", "b.rs", "docs", "*keys.md"]
+        );
+        let Some(Overlay::Diff(view)) = &mut app.overlay else {
+            unreachable!()
+        };
+        view.toggle_dir(0);
+        let fresh = format!(
+            "{TREE_PR_DIFF}diff --git a/docs/new.md b/docs/new.md\n--- /dev/null\n+++ b/docs/new.md\n@@ -0,0 +1 @@\n+n\n"
+        );
+        assert!(refresh_pr_diff_view(view, &fresh));
+        assert_eq!(
+            diff_tree_rows(&app),
+            ["crates/tui/src", "docs", "*keys.md", "new.md"]
+        );
+        assert!(diff_view(&app).diff.contains("+new-keys"));
+
+        let json = ui_state_json(&app);
+        let mut next = App::new();
+        seed_tree(&mut next);
+        restore_ui_state(&mut next, &json);
+        assert!(next.diff_tree);
+        // A blob from before the tree existed keeps the flat list.
+        restore_ui_state(&mut next, "{\"show_archived\":false,\"collapsed\":false}");
+        assert!(!next.diff_tree);
+    }
+
     /// A diff `gh` couldn't fetch flashes and leaves the modal shut, and a
     /// second `g` while one is already in flight doesn't stack a request.
     #[test]
@@ -13472,6 +13801,105 @@ diff --git a/src/b.rs b/src/b.rs
             is_draft: false,
             head: format!("head-{number}"),
         }
+    }
+
+    /// Only a merge seen to happen starts the ONE-SHOT SWEEP: the last
+    /// answer was something other than merged, and this one is. A
+    /// checkout's first answer ever — and the first beat of a row the cache
+    /// hydrated as merged — landed some other day: solid purple, no sweep.
+    #[test]
+    fn only_a_merge_seen_to_happen_is_stamped() {
+        let merged = |number| {
+            let mut pr = cached_pr(number);
+            pr.state = crate::pull_request::STATE_MERGED.into();
+            pr
+        };
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let w1 = nebula_core::WorktreeId("w1".into());
+
+        land_pull_request(&mut app, w1.clone(), Lookup::Found(merged(7)));
+        assert!(app.worktree_wears_merge(&w1));
+        assert!(!app.merge_is_fresh(&w1), "met already merged: not news");
+        land_pull_request(&mut app, w1.clone(), Lookup::Found(merged(7)));
+        assert!(!app.merge_is_fresh(&w1), "nor is hearing it again");
+
+        land_pull_request(&mut app, w1.clone(), Lookup::Found(cached_pr(8)));
+        assert!(!app.merge_is_fresh(&w1), "an open one is no merge");
+        land_pull_request(&mut app, w1.clone(), Lookup::Found(merged(8)));
+        assert!(app.merge_is_fresh(&w1), "open, then merged: seen to land");
+
+        // Opened and landed between two beats of a checkout with no PR.
+        app.merge_landed.clear();
+        land_pull_request(&mut app, w1.clone(), Lookup::Absent);
+        land_pull_request(&mut app, w1.clone(), Lookup::Found(merged(9)));
+        assert!(app.merge_is_fresh(&w1), "no pull request, then merged");
+
+        // A lookup that never reached GitHub says nothing either way.
+        app.merge_landed.clear();
+        land_pull_request(&mut app, w1.clone(), Lookup::Unavailable);
+        assert!(!app.merge_is_fresh(&w1));
+        assert!(app.worktree_wears_merge(&w1), "the row keeps its merge");
+    }
+
+    /// A turn that finishes unread sweeps blue for `ONE_SHOT_SWEEP` on its
+    /// row and on every row that rolls it up, so the sweep clock runs for
+    /// those seconds and no longer. Reading it ends the sweep on the spot;
+    /// an old unread finish, an unstamped one and an archived one never ask
+    /// for a frame.
+    #[test]
+    fn a_fresh_unread_finish_keeps_the_sweep_ticking_for_a_few_seconds() {
+        use nebula_core::{AgentStatus, ProjectId, WorkspaceId, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let (w1, p1) = (WorktreeId("w1".into()), ProjectId("p1".into()));
+        let workspace = WorkspaceId::default();
+        let now = crate::app::now_ms();
+        let finish = |app: &mut App, at: i64| {
+            let a = &mut app.tree.agents[0];
+            a.status = AgentStatus::Finished;
+            a.unseen = true;
+            a.archived = false;
+            a.status_changed_at = at;
+        };
+        let fresh_everywhere = |app: &App| {
+            [
+                app.agent_fresh_done(&app.tree.agents[0]),
+                app.worktree_fresh(&w1),
+                app.project_fresh_done(&p1),
+                app.workspace_fresh_done(&workspace),
+            ]
+        };
+
+        finish(&mut app, now);
+        assert_eq!(fresh_everywhere(&app), [true; 4], "every tier sweeps");
+        assert!(app.status_anim_active());
+        app.animations = false;
+        assert!(!app.status_anim_active(), "unless animations are off");
+        app.animations = true;
+
+        app.tree.agents[0].unseen = false;
+        assert_eq!(fresh_everywhere(&app), [false; 4], "read: over");
+        assert!(!app.status_anim_active());
+
+        finish(&mut app, now - settled().as_millis() as i64);
+        assert_eq!(fresh_everywhere(&app), [false; 4], "settled");
+        assert!(!app.status_anim_active(), "an old unread finish is still");
+
+        finish(&mut app, 0);
+        assert_eq!(fresh_everywhere(&app), [false; 4], "never stamped");
+
+        finish(&mut app, now);
+        app.tree.agents[0].archived = true;
+        assert_eq!(fresh_everywhere(&app), [false; 4], "archived: out of sight");
+        assert!(!app.status_anim_active());
+
+        // A DAEMON clock a little ahead of this one still sweeps — and one
+        // an hour ahead does not sweep for an hour.
+        finish(&mut app, now + 2_000);
+        assert!(app.agent_fresh_done(&app.tree.agents[0]), "small skew");
+        finish(&mut app, now + 3_600_000);
+        assert!(!app.agent_fresh_done(&app.tree.agents[0]), "large skew");
     }
 
     /// A branch lookup that never reached GitHub leaves the row alone — the
@@ -21859,7 +22287,7 @@ diff --git a/src/c.rs b/src/c.rs
     }
 
     /// Landing on an unwatched finish reads it, the way ↑/↓ onto the row
-    /// does: violet to green, the DONE BADGE counts down, the daemon hears.
+    /// does: blue to green, the DONE BADGE counts down, the daemon hears.
     #[test]
     fn next_attention_reads_the_unseen_finish_it_lands_on() {
         use nebula_core::{AgentStatus, ProjectId, WorktreeId};
@@ -28131,7 +28559,8 @@ diff --git a/src/c.rs b/src/c.rs
             let text = buffer_text(&wide);
             assert!(text.contains("e: presets"), "Sessions footer hint:\n{text}");
 
-            // Anywhere but the Sessions panel, `e` only says where it works.
+            // With no worktree under the focused panel's cursor, `e` only
+            // says where it works.
             app.focus = Focus::Projects;
             press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
             assert!(app.overlay.is_none());
@@ -28142,6 +28571,63 @@ diff --git a/src/c.rs b/src/c.rs
                     .contains("Sessions panel"),
                 "flash: {:?}",
                 app.flash
+            );
+        });
+    }
+
+    /// `e` with FOCUS on the WORKTREES PANEL and the cursor on a checkout's
+    /// row is the key it is in the SESSIONS PANEL: the AGENT PRESETS list
+    /// for that WORKTREE, and Enter runs the row in it — the checkout under
+    /// the cursor, not a fresh one (`p` there cuts a worktree; a preset is
+    /// run *on* the row it was reached from).
+    #[test]
+    fn e_on_a_worktree_row_opens_the_presets_and_runs_one_in_that_worktree() {
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Worktrees;
+            let worktree = app.selected_worktree().unwrap().id.clone();
+
+            // The Worktrees hints need a wide footer to show in full.
+            let mut wide = Terminal::new(TestBackend::new(180, 30)).unwrap();
+            wide.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&wide);
+            assert!(
+                text.contains("e: presets"),
+                "Worktrees footer hint:\n{text}"
+            );
+
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresets(view)) = &app.overlay else {
+                panic!(
+                    "e on a worktree row opens the presets list, got {:?} (flash {:?})",
+                    app.overlay, app.flash
+                );
+            };
+            assert_eq!(view.worktree, worktree, "launches land in that worktree");
+            assert!(!view.is_picker(), "the manager, as in the Sessions panel");
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Prompt(prompt)) if prompt.title == "Task for reviewer"),
+                "Enter asks for the task, got {:?}",
+                app.overlay
+            );
+            assert!(paste_into_overlay(&mut app, "Fix auth"));
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "launch closes the prompt");
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [ClientRequest::CreateAgent {
+                        worktree: w,
+                        kind: AgentKind::Claude,
+                        starting_prompt: Some(text),
+                        ..
+                    }] if *w == worktree && text == "Be strict.\n\nFix auth\n\nRun the tests."
+                ),
+                "one create in the worktree under the cursor: {out:?}"
             );
         });
     }

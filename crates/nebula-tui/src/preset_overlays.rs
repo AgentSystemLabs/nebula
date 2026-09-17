@@ -1,4 +1,5 @@
 //! The AGENT PRESETS overlays: the list `e` opens in the SESSIONS PANEL
+//! and on a checkout's row of the WORKTREES PANEL
 //! (and, as a picker, on a PROJECT OPEN PRS GROUP row of the WORKTREES
 //! PANEL — a PR SESSION on that pull request, through the QUICK PROMPT)
 //! and the PRESET EDITOR form behind its `a` / `e` — their state, keys,
@@ -461,9 +462,13 @@ impl AgentPresetEditor {
     }
 }
 
-/// `e` in the SESSIONS PANEL: the AGENT PRESETS list for the selected
-/// WORKTREE — the one a launch lands in. With the Worktrees cursor on a
-/// PROJECT OPEN PRS GROUP row it is the same list as a picker for a PR
+/// `e` in the SESSIONS PANEL, or on a checkout's row of the WORKTREES
+/// PANEL: the AGENT PRESETS list for the selected WORKTREE — the one a
+/// launch lands in. The two panels answer alike because both cursors name
+/// that checkout: the Worktrees one is on it, the Sessions one is inside
+/// it. (`p` in the WORKTREES PANEL cuts a fresh worktree first; a preset
+/// runs in the checkout it was reached from.) With the Worktrees cursor on
+/// a PROJECT OPEN PRS GROUP row it is the same list as a picker for a PR
 /// SESSION on that pull request (`quick_prompt::open_preset_picker_for_pr`)
 /// — from whichever panel has FOCUS, as `p` is: a pull request row has no
 /// worktree and no sessions to manage presets against, so the pull
@@ -477,10 +482,10 @@ pub(crate) fn open_agent_presets(app: &mut App) {
         return;
     }
     let worktree = match (app.focus, app.selected_worktree()) {
-        (Focus::Sessions, Some(w)) => w.id.clone(),
+        (Focus::Sessions | Focus::Worktrees, Some(w)) => w.id.clone(),
         _ => {
             app.flash = Some(
-                "agent presets: select a worktree in the Sessions panel, or an open PR in the Worktrees panel"
+                "agent presets: select a worktree or an open PR in the Worktrees panel, or a worktree's Sessions panel"
                     .into(),
             );
             return;

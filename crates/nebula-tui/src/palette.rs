@@ -70,7 +70,7 @@ pub struct PaletteItem {
     /// palette too. Refreshed by [`Palette::rebuild`] as upserts land.
     pub status: Option<AgentStatus>,
     /// Whether anything under this row finished a turn nobody has read.
-    /// Splits a finished dot green (read) from violet (waiting on you),
+    /// Splits a finished dot green (read) from blue (waiting on you),
     /// exactly as the panel rows do.
     pub unseen: bool,
     /// The attention tier this row sorts into with an empty query, and the

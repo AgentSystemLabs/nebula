@@ -245,7 +245,8 @@ pub fn cap_lines(text: &str, max: usize, already_cut: bool) -> String {
 /// Reload `view.diff` for the currently selected file and reset the scroll.
 /// A view whose diffs were fetched whole (a pull request) reads them out of
 /// `prefetched` instead of shelling out — there is no local commit to ask
-/// git about, and the text is already in hand.
+/// git about, and the text is already in hand. A directory row of the tree
+/// list has no diff of its own: the pane lists what changed under it.
 pub fn load_selected_diff(view: &mut DiffView) {
     let diff = match (view.selected_file(), &view.prefetched) {
         (Some(file), Some(chunks)) => chunks
@@ -253,7 +254,7 @@ pub fn load_selected_diff(view: &mut DiffView) {
             .cloned()
             .unwrap_or_else(|| "(no diff for this file)".to_string()),
         (Some(file), None) => diff_for(&view.root, file, view.head_ok),
-        (None, _) => String::new(),
+        (None, _) => view.dir_summary().unwrap_or_default(),
     };
     view.diff_line_count = diff.lines().count();
     view.diff = diff;
