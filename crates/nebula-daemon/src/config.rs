@@ -188,7 +188,7 @@ mod tests {
     /// earlier release wrote still reads as written.
     #[test]
     fn config_files_from_earlier_releases_still_load_the_daemon_keys() {
-        let raw = include_str!("../../nebula-core/fixtures/config-0.28.0.json");
+        let raw = include_str!("../../nebula-core/fixtures/config-0.29.0.json");
         let obj: serde_json::Map<String, serde_json::Value> = serde_json::from_str(raw).unwrap();
         let (cfg, skipped) = nebula_core::settings::parse_lenient::<Config>(&obj);
         assert!(skipped.is_empty(), "{skipped:?}");
@@ -197,6 +197,11 @@ mod tests {
         assert_eq!(cfg.worktree_base_branch, "develop");
         assert_eq!(cfg.custom_harnesses.len(), 1, "the legacy list reads");
         assert!(cfg.harnesses.contains_key("grok"), "the registry map reads");
+        assert_eq!(
+            cfg.run_command(Path::new("/Users/me/src/app")),
+            Some("npm run dev"),
+            "the project's run command reads"
+        );
     }
 
     #[test]
