@@ -2,7 +2,8 @@
 //! JSON line per input event, per painted frame and per daemon event, so
 //! "does this key feel instant" is a number rather than an impression.
 //!
-//! * `input` — what arrived (`key:g`, `mouse:down`), how long its handler
+//! * `input` — what arrived (`key:char`, `key:C-q`, `mouse:down` — never the
+//!   character typed), how long its handler
 //!   held the loop (`handler_us`), and where that left the app (overlay,
 //!   FOCUS). A handler that shells out to git shows up here.
 //! * `frame` — how long the draw took (`draw_us`), what it showed (overlay
@@ -164,8 +165,14 @@ fn overlay_name(app: &App) -> &'static str {
     }
 }
 
-/// `key:g`, `key:C-d`, `key:S-Tab`, `mouse:down`, `paste`, … — None for
-/// the events nobody waits on (pointer motion, focus reports, releases).
+/// The modifiers that make a character key a command rather than text.
+const CHORD: KeyModifiers = KeyModifiers::CONTROL
+    .union(KeyModifiers::ALT)
+    .union(KeyModifiers::SUPER);
+
+/// `key:char`, `key:C-d`, `key:S-Tab`, `key:Enter`, `mouse:down`, `paste`, …
+/// — None for the events nobody waits on (pointer motion, focus reports,
+/// releases). What was typed is never in it: see the `Char` arm.
 pub fn label(event: &Event) -> Option<String> {
     match event {
         Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
@@ -180,6 +187,11 @@ pub fn label(event: &Event) -> Option<String> {
                 }
             }
             match key.code {
+                // Never the character itself. A plain key is as likely typed
+                // at an agent, a shell or a password prompt as at a panel,
+                // and a log is not where that belongs — the rule the KEY
+                // COMBO DISPLAY keeps. A chord is a command, and is named.
+                KeyCode::Char(_) if !key.modifiers.intersects(CHORD) => s.push_str("char"),
                 KeyCode::Char(c) => s.push(c),
                 KeyCode::BackTab => s.push_str("S-Tab"),
                 other => s.push_str(&format!("{other:?}")),
@@ -210,5 +222,47 @@ pub fn server_name(ev: &nebula_core::protocol::ServerEvent) -> &'static str {
         E::StatusChanged { .. } => "StatusChanged",
         E::Snapshot { .. } => "Snapshot",
         _ => "other",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, mods))
+    }
+
+    /// The probe times keys; it does not record them. A run left on by
+    /// accident must not turn into a keylog of what was typed at an agent.
+    #[test]
+    fn a_typed_character_is_never_in_the_log() {
+        for c in ['a', 'Z', '7', '!', ' '] {
+            for mods in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                assert_eq!(
+                    label(&key(KeyCode::Char(c), mods)).as_deref(),
+                    Some("key:char"),
+                    "{c:?} with {mods:?}"
+                );
+            }
+        }
+    }
+
+    /// Chords and named keys are commands, and say which.
+    #[test]
+    fn chords_and_named_keys_are_named() {
+        assert_eq!(
+            label(&key(KeyCode::Char('q'), KeyModifiers::CONTROL)).as_deref(),
+            Some("key:C-q")
+        );
+        assert_eq!(
+            label(&key(KeyCode::Enter, KeyModifiers::NONE)).as_deref(),
+            Some("key:Enter")
+        );
+        assert_eq!(
+            label(&key(KeyCode::BackTab, KeyModifiers::SHIFT)).as_deref(),
+            Some("key:S-Tab")
+        );
     }
 }
