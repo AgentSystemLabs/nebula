@@ -26,7 +26,8 @@ into `config.json`:
 
 Both halves of nebula read the two files. The TUI owns most keys; the DAEMON owns
 `git_init_on_create`, `worktree_base_branch`, `session_idle_timeout`, `prewarm_agents` and
-`prewarm_sessions`. Each side deserializes only its own fields and ignores the rest, and both load
+`prewarm_sessions`, and reads one key out of each `projects` entry, `run_command`. Each side
+deserializes only its own fields and ignores the rest, and both load
 them fresh on every use — so a hand edit applies without restarting either. No key is required: a
 missing file is all defaults, an unknown field is skipped, a value this build can't read costs only
 that key (it takes its default and stays as stored in the file), and a malformed file is logged and
@@ -43,8 +44,8 @@ convenience stores: missing or malformed reads as empty.
 
 Forty-eight keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
 exists only in the file, so it is hand-edit-only. Most rows toggle or cycle on `Enter` / `←` / `→`; a
-*typed* row (`worktree_base_branch`) opens a one-line prompt on `Enter` instead, pre-filled with the
-stored value, and an empty answer puts its default back. The Agents tab groups its rows under **Quick
+*typed* row (`worktree_base_branch`, the Project tab's **Run command**) opens a one-line prompt on
+`Enter` instead, pre-filled with the stored value, and an empty answer puts its default back. The Agents tab groups its rows under **Quick
 prompt**, **Claude**, **Codex**, **Cursor**, **Pi** and **Muse** headers, so a harness's rows read `Enabled` / `Model` /
 `Effort` under its name rather than repeating it. The **Project** tab is the one tab whose rows are
 not nebula's but one project's: the project selected in the PROJECTS PANEL, named with its path on
@@ -73,7 +74,7 @@ behaviors that change how the tree is worked; every switch there is off by defau
 | `hide_worktrees` | bool | `false` | Appearance | Hide the WORKTREES PANEL (`Shift+B`), independently of `hide_projects`. |
 | `hide_sessions` | bool | `false` | Appearance | Hide the SESSIONS PANEL (`Shift+S`), independently of the other two. Whatever this says, the panel folds to a bare rule while the Worktrees cursor rests on a PROJECT OPEN PRS row (a pull request has no sessions to list) and opens again on the next checkout; that fold never writes the key. |
 | `hide_draft_prs` | bool | `false` | Appearance | Leave draft pull requests out of the PROJECT OPEN PRS GROUP and the PALETTE's (`/`) pull-request rows, so browsing what's open shows only the rows asking for a reviewer; the group's header then counts `9/12` — listed over open. A view filter, not a fetch filter: `gh pr list` still fetches the drafts and the PR CACHE still holds them, so `shown` brings them back at once and a draft marked ready joins the rows on the refresh that says so. Worktrees, their sessions and a checkout's own PR ROW in the SESSIONS PANEL are never hidden. The Worktrees panel's right-click menu flips it too (**Hide draft PRs** / **Show draft PRs**). |
-| `projects` | object | `{}` | Project | PROJECT SETTINGS: one entry per project set up differently from the rest, keyed by the project's repo path exactly as the DAEMON stores it, holding that project's rows from the **Project** tab. The one row so far is `hide_root_worktree`: leave *that project's* ROOT WORKTREE row out of the WORKTREES PANEL, so nothing launched from the panel lands in its shared checkout — `{"projects": {"/Users/me/src/app": {"hide_root_worktree": true}}}`. The root's sessions keep running and stay reachable from the PALETTE (`/`). Not what makes `p` on that panel cut a fresh WORKTREE — a random `<adj>-<noun>-<verb>` branch off the freshly fetched `origin/HEAD`, or the `worktree_base_branch` above, the agent started in it and the cursor moved onto the new row — that is the panel's own behaviour, on or off. The tab edits the selected project and names it on its first line; with no project in the tree its rows read `n/a`. A project with no entry gets the fallback (`hide_root_worktree` below), and an entry that only repeats the fallback is dropped on save, so the map names only the projects that differ; a key inside an entry this build doesn't know is carried through a save. To the file's rules the map is one key: a value in it this build can't read costs the whole map, not one project. |
+| `projects` | object | `{}` | Project | PROJECT SETTINGS: one entry per project set up differently from the rest, keyed by the project's repo path exactly as the DAEMON stores it, holding that project's rows from the **Project** tab — `{"projects": {"/Users/me/src/app": {"run_command": "npm run dev", "open_command": "open http://localhost:3000", "hide_root_worktree": true}}}`. Three rows: **Run command** (`run_command`, string, default `""`) is the RUN COMMAND `r` starts in *that project's* worktrees — the same shell line a `.nebula.json` `run` would carry, and the way to set one without committing a file; while it is set, `r` runs it and never opens the file, and empty (shown as `.nebula.json`) hands the decision back to the checkout's PROJECT FILE, so a project that has one needs nothing here. Typed, not cycled: `Enter` opens a prompt titled with the project, an empty answer puts `.nebula.json` back. The DAEMON reads it fresh at each `r`. **Open command** (`open_command`, string, default `""`) is its twin for the OPEN COMMAND `Shift+Enter` / `Shift+O` fires on that project's worktrees — `open http://localhost:3000`, say — with the same precedence over the file's `open` and the same prompt; the TUI reads it fresh at each press, since it runs on the machine you are sitting at. **Hide root worktree** (`hide_root_worktree`, bool) leaves that project's ROOT WORKTREE row out of the WORKTREES PANEL, so nothing launched from the panel lands in its shared checkout. The root's sessions keep running and stay reachable from the PALETTE (`/`). Not what makes `p` on that panel cut a fresh WORKTREE — a random `<adj>-<noun>-<verb>` branch off the freshly fetched `origin/HEAD`, or the `worktree_base_branch` above, the agent started in it and the cursor moved onto the new row — that is the panel's own behaviour, on or off. The tab edits the selected project and names it on its first line; with no project in the tree its rows read `n/a`. A project with no entry gets the fallback (an empty command, and `hide_root_worktree` below), and an entry that only repeats the fallback is dropped on save, so the map names only the projects that differ; an empty `run_command` or `open_command` is left out of an entry rather than written; a key inside an entry this build doesn't know is carried through a save. To the file's rules the map is one key: a value in it this build can't read costs the whole map, not one project. |
 | `hide_root_worktree` | bool | `false` | — | What every project without a `projects` entry gets for **Hide root worktree** — the key the switch lived under while it was one setting for every project (Settings → Experimental, through 0.27). Still read, and written back unchanged, so a file that set it keeps hiding the root in every project until a project's own row says otherwise, and an older build sharing the file still finds its key; no tab edits it any more. |
 | `recent_prompts` | bool | `false` | Experimental | RECENT PROMPTS: list the last few prompts typed into each session under its row in the SESSIONS PANEL — the text the `UserPromptSubmit` hook carried, condensed to one line — oldest first so the bottom line is the latest ask, each with a dim `30m ago` pinned right; a click on any line lands on its session. Every harness reports its prompt (Claude, Codex and Cursor in the hook payload, Pi through its managed extension). Prompts nebula composes itself — a PR SESSION's scope, the note a `nebula worktree` relocation reopens on — are left out, and archived rows list none. Off, the rows are the single pills they always were. See [Sessions](sessions.md#recent-prompts). |
 | `recent_prompts_count` | integer | `3` | Experimental | How many of those prompts to list while `recent_prompts` is on. The overlay cycles `1` to `5`; a hand edit is clamped to the ten the DAEMON keeps per session (`0` reads as `1`, `50` as `10`). |
@@ -289,11 +290,14 @@ Both keys are optional shell command lines, and both run in the selected worktre
   replays how the run ended, and nothing but `r` runs it again — not an attach, not the prewarm sweep.
   There is one run per worktree: a second client's `r` on a worktree already running never starts
   another.
-- **`open`** — the OPEN COMMAND. `Shift+Enter` on a checkout row fires it once, from the TUI rather than
+- **`open`** — the OPEN COMMAND. `Shift+Enter` on a worktree fires it once, from the TUI rather than
   the DAEMON, since what it opens — a browser tab, an editor — belongs on the machine you are sitting
-  at. It runs through `$SHELL -c` with its output discarded, and nebula does not wait for it.
-  `Shift+Enter` needs the KITTY PROTOCOL (Ghostty, kitty); Terminal.app sends it as a plain `Enter`, so
-  `Shift+O` is bound beside it, and the row's context menu has **Open**.
+  at. It runs through `$SHELL -c` with its output discarded, and nebula does not wait for it. The key
+  answers from any panel: the worktree is the one under the Worktrees cursor.
+  `Shift+Enter` needs the KITTY PROTOCOL (Ghostty, kitty); Terminal.app sends it as a plain `Enter` and
+  tmux flattens it to one, so `Shift+O` and `Alt+Enter` (the `ESC` `CR` a mapped Shift+Enter sends, which
+  tmux passes through) are bound beside it, and the row's context menu has **Open**. See
+  [Keys](keys.md#full-keymap) for teaching Terminal.app the real key.
 
 The file is read fresh at every press, so an edit applies on the next `r` or `Shift+Enter`. Nebula looks
 in the worktree's own checkout first, so a branch can carry commands of its own, and falls back to the
@@ -301,6 +305,14 @@ project's main checkout, so a worktree cut before the file was committed still r
 is the whole answer: a worktree's file with no `open` does not borrow the main checkout's. A missing
 file, a missing key, or JSON that doesn't parse is a one-line footer message saying what to fix; unknown
 keys are ignored.
+
+Both commands have a second home: **Run command** and **Open command** on the SETTINGS OVERLAY's
+Project tab (`s`), which keep them in `config.json` under the project's `projects` entry instead of in
+the repository — for a project you would rather not commit a file to, or one whose commands are yours
+alone. Set, the row is what `r` runs, or `Shift+Enter` opens, in every worktree of that project, and the
+file is not consulted for that command; empty, the file decides as above. They are one project's
+settings, so each project can run and open its own way, and the footer names both places when neither
+has the command. See `projects` in [Every setting](#every-setting).
 
 Unlike the WORKTREE HOOKS below, which nebula runs on its own and so never takes from a checkout,
 nothing in the PROJECT FILE runs until you press its key on that worktree — the same trust as typing the

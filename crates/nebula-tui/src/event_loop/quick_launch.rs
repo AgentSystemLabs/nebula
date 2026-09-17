@@ -68,33 +68,46 @@ pub(super) fn submit(
 }
 
 /// The Ack for that `CreateWorktree`: `worktree` exists now, launch there.
+/// Without `follow` — the user navigated away while the checkout was cut
+/// (`App::left_behind`) — the launch still goes out, but no cursor moves
+/// back onto the row, now or at the session's own Ack.
 pub(super) fn launch_in_created_worktree(
     app: &mut App,
     mut launch: QuickLaunch,
     text: String,
     placeholder: PlaceholderRows,
     worktree: WorktreeId,
+    follow: bool,
     out: &mut Vec<ClientRequest>,
 ) {
     // The stand-in checkout becomes the real one — its session row moves
     // under it — before anything is selected or sent by the real id.
     placeholder::resolve_worktree(app, &placeholder.worktree, &worktree);
-    // The new row is the context every later `p` / `n` runs in, so the
-    // cursor moves onto it — but FOCUS stays on the panel `p` was pressed
-    // in, as every QUICK PROMPT launch leaves it (`quick_prompt_focus`
-    // decides the pane, in `create_agent`'s intent, not here).
-    let focus = app.focus;
-    if !select_worktree_by_id(app, &worktree, out) {
-        app.select_worktree_when_seen = Some(worktree.clone());
+    if follow {
+        // The new row is the context every later `p` / `n` runs in, so the
+        // cursor moves onto it — but FOCUS stays on the panel `p` was
+        // pressed in, as every QUICK PROMPT launch leaves it
+        // (`quick_prompt_focus` decides the pane, in `create_agent`'s
+        // intent, not here).
+        let focus = app.focus;
+        if !select_worktree_by_id(app, &worktree, out) {
+            app.select_worktree_when_seen = Some(worktree.clone());
+        }
+        app.focus = focus;
     }
-    app.focus = focus;
     // The cursor was already on the row, so the select above did not arm
     // the prewarm a fresh landing would have; the checkout is real now.
-    schedule_prewarm(app);
+    // A cursor the user took elsewhere warms nothing here.
+    if app.selected_worktree().is_some_and(|w| w.id == worktree) {
+        schedule_prewarm(app);
+    }
     launch.target = QuickTarget::Worktree(worktree.clone());
     create_agent(
         app,
-        draft(launch, worktree, text, Some(placeholder.agent)),
+        AgentLaunchDraft {
+            follow,
+            ..draft(launch, worktree, text, Some(placeholder.agent))
+        },
         out,
     );
 }
@@ -103,7 +116,7 @@ pub(super) fn launch_in_created_worktree(
 /// row into AUTO-TITLE, so the session names itself from the very prompt
 /// that started it, and the box comes back with the text should the
 /// DAEMON refuse.
-fn draft(
+pub(super) fn draft(
     launch: QuickLaunch,
     worktree: WorktreeId,
     text: String,
@@ -116,14 +129,14 @@ fn draft(
         QuickOrigin::Hotkey => crate::config::Config::load().quick_prompt_focus,
         QuickOrigin::NewSession => true,
     };
-    AgentLaunchDraft {
+    let base = AgentLaunchDraft::new(
         worktree,
-        kind: launch.kind,
+        launch.kind,
+        launch.model.clone(),
+        launch.effort.clone(),
+    );
+    AgentLaunchDraft {
         custom: launch.custom.clone(),
-        model: launch.model.clone(),
-        effort: launch.effort.clone(),
-        name: String::new(),
-        cloud_prompt: None,
         // Sized in `submit_prompt`, with the task — composing cannot fail.
         // An empty box (`launches_empty`) sends a preset's prefix + postfix
         // alone; with nothing to wrap it either, there is no first prompt,
@@ -137,5 +150,6 @@ fn draft(
         reopen_on_error: Some((PromptKind::QuickPrompt(launch), text)),
         focus_pane,
         placeholder,
+        ..base
     }
 }

@@ -28,6 +28,7 @@ use ratatui::Terminal;
 use std::io::{BufWriter, Stdout};
 use std::time::Duration;
 
+mod activate;
 mod alerts;
 mod focus_walk;
 mod host_terminal;
@@ -1893,7 +1894,69 @@ fn draw_frame<B: ratatui::backend::Backend>(
     Ok(())
 }
 
+/// Every key, click and paste comes through here, which makes it the one
+/// place that can tell a manual move from the tree shifting under the
+/// cursors: whatever changed where the user is (`whereabouts`) across the
+/// event, the user did. A create that was in flight before it — seconds,
+/// for a PR SESSION's fetch and `git worktree add` — is left behind: its
+/// Ack puts the row in the list and takes no cursor, pane or FOCUS back
+/// to it. A create the event itself fired is not in the list taken before
+/// it, so the launch that moved the cursor onto its own stand-in rows is
+/// still followed.
 fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientRequest>) {
+    let watch = follows_to_watch(app);
+    dispatch_terminal_event(app, event, out);
+    let Some((before, in_flight)) = watch else {
+        return;
+    };
+    if whereabouts(app) == before {
+        return;
+    }
+    // A follow whose Ack already came, waiting only on the row's upsert.
+    app.select_when_seen = None;
+    app.select_project_when_seen = None;
+    app.select_worktree_when_seen = None;
+    for req_id in in_flight {
+        if app.pending.contains_key(&req_id) {
+            app.left_behind.insert(req_id);
+        }
+    }
+}
+
+/// Where the user is, by id: FOCUS, the open WORKSPACE, and the row under
+/// each cursor.
+#[derive(PartialEq)]
+struct Whereabouts {
+    focus: Focus,
+    workspace: WorkspaceId,
+    selection: SelectionSnapshot,
+}
+
+fn whereabouts(app: &App) -> Whereabouts {
+    Whereabouts {
+        focus: app.focus,
+        workspace: app.tree.active_workspace.clone(),
+        selection: selection_snapshot(app),
+    }
+}
+
+/// Where the user is and the creates still being followed, taken ahead of
+/// an input event. None when nothing is — nearly always — so a mouse
+/// motion does not pay for a snapshot it has no use for.
+fn follows_to_watch(app: &App) -> Option<(Whereabouts, Vec<u64>)> {
+    let in_flight: Vec<u64> = app
+        .pending
+        .iter()
+        .filter(|(req_id, intent)| intent.follows() && !app.left_behind.contains(req_id))
+        .map(|(req_id, _)| *req_id)
+        .collect();
+    let armed = app.select_when_seen.is_some()
+        || app.select_project_when_seen.is_some()
+        || app.select_worktree_when_seen.is_some();
+    (armed || !in_flight.is_empty()).then(|| (whereabouts(app), in_flight))
+}
+
+fn dispatch_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientRequest>) {
     // With the pane holding input, whatever this event turns into is headed
     // for the PTY — and the daemon drops Input for a session it hasn't
     // spawned. A still-debounced attach has to land before the keystroke.
@@ -1985,9 +2048,7 @@ fn paste_into_overlay(app: &mut App, text: &str) -> bool {
         }
         Overlay::Diff(view) => {
             view.filter.insert_str(text);
-            if view.apply_filter() {
-                crate::git_diff::load_selected_diff(view);
-            }
+            activate::diff_filter_changed(view);
         }
         // The query, or the commit message while that is being typed.
         Overlay::BranchSwitch(view) => {
@@ -2283,26 +2344,14 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         },
         // Show/hide the Workspaces bar. Hiding it moves a cursor parked
         // there onto the first visible sidebar.
-        Action::ToggleWorkspaces => {
-            set_show_workspaces(app, !app.show_workspaces);
-            // The hotkey and the settings row edit the same value, so the
-            // choice survives a restart however it was made.
-            let mut cfg = crate::config::Config::load();
-            cfg.show_workspaces = app.show_workspaces;
-            save_config(app, &cfg);
-        }
-        Action::ToggleProjects => {
-            set_hide_projects(app, !app.hide_projects);
-            save_panel_visibility(app);
-        }
-        Action::ToggleWorktrees => {
-            set_hide_worktrees(app, !app.hide_worktrees);
-            save_panel_visibility(app);
-        }
-        Action::ToggleSessions => {
-            set_hide_sessions(app, !app.hide_sessions);
-            save_panel_visibility(app);
-        }
+        // Each is its panel's header chevron and its rail, pressed
+        // (`toggle_panel`): the hotkey, the click and the settings row edit
+        // the same value and write it the same way, so the choice survives
+        // a restart however it was made.
+        Action::ToggleWorkspaces => toggle_panel(app, Focus::Workspaces),
+        Action::ToggleProjects => toggle_panel(app, Focus::Projects),
+        Action::ToggleWorktrees => toggle_panel(app, Focus::Worktrees),
+        Action::ToggleSessions => toggle_panel(app, Focus::Sessions),
         // One keystroke for every panel: collapsing parks a cursor left
         // on a panel or the bar in the terminal; expanding leaves focus
         // alone (the panels come back under the cursor's remembered rows).
@@ -2378,17 +2427,15 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             Focus::Projects => app.focus = app.next_visible_focus(Focus::Projects),
             // An open-PR row leads out of nebula, so Enter hands it to the
             // browser and stays put; a checkout hands focus one column right.
-            Focus::Worktrees => match app.selected_worktree_pr().map(|pr| pr.url.clone()) {
-                Some(url) => open_link(app, &url, out),
-                None => app.focus = Focus::Sessions,
-            },
+            Focus::Worktrees => activate::worktrees_row(app, out),
             Focus::Sessions => attach_selected(app, out),
             // Lock input into an already-focused live pane — or, with the
             // CLOUD SESSION PANEL up, open the session it points at.
-            Focus::Terminal => match app.previewed_cloud() {
-                Some(cloud) => open_link(app, &cloud.url, out),
-                None => enter_terminal_pane(app, out),
-            },
+            Focus::Terminal => {
+                if !activate::cloud_link(app, out) {
+                    enter_terminal_pane(app, out);
+                }
+            }
         },
         // First run (or an empty workspace): with no visible projects every
         // panel is empty and the splash is up — New creates a project no
@@ -2475,10 +2522,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             if app.focus == Focus::Sessions {
                 if let Some(a) = app.selected_session() {
                     if a.archived {
-                        send(app, out, |req_id| ClientRequest::UnarchiveAgent {
-                            req_id,
-                            id: a.id,
-                        });
+                        activate::unarchive(app, a.id, out);
                     }
                 }
             }
@@ -2534,13 +2578,11 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::CommentPullRequest => open_pr_comment(app),
         Action::OpenRepo => open_repo_in_browser(app),
         Action::OpenGhosttyTab => open_ghostty_tab(app),
-        // Shift+Enter: the checkout's OPEN COMMAND. Worktrees panel only —
-        // on every other panel the shifted Enter has nothing to open.
-        Action::OpenWorktree => {
-            if app.focus == Focus::Worktrees {
-                open_selected_worktree(app);
-            }
-        }
+        // Shift+Enter / Shift+O: the selected worktree's OPEN COMMAND, from
+        // any panel — the cursor's worktree is the context wherever the
+        // cursor stands, as it is for `g`, `f` and `b`, so the key is never
+        // quietly dropped on Sessions.
+        Action::OpenWorktree => open_selected_worktree(app),
         // AddProject adds a project from ANY panel — unlike New it never
         // changes meaning with focus, matching the "open a repo" instinct.
         Action::AddProject => open_prompt(app, PromptKind::AddProject),
@@ -2712,20 +2754,42 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
                 .unwrap_or_default();
             ("Rename workspace".into(), "name".into(), current)
         }
-        PromptKind::SettingText { kind } => {
+        PromptKind::SettingText { kind, project } => {
             // Pre-filled with the stored value, not its display label: an
-            // empty row reads `auto` on the overlay but edits as "".
+            // empty row reads `auto` on the overlay but edits as "". A
+            // PROJECT TAB row's is the project's own, and the title names
+            // the project so a command typed here reads as that project's.
             let cfg = crate::config::Config::load();
-            let title = crate::config::spec_for(*kind)
+            let label = crate::config::spec_for(*kind)
                 .map(|s| s.label)
                 .unwrap_or("Setting");
-            let label = match kind {
+            let title = match project.as_deref().and_then(|path| {
+                app.tree
+                    .projects
+                    .iter()
+                    .find(|p| p.repo_path == path)
+                    .map(|p| p.name.clone())
+            }) {
+                Some(name) => format!("{label} · {name}"),
+                None => label.to_string(),
+            };
+            let hint = match kind {
                 crate::config::SettingKind::WorktreeBaseBranch => {
                     "branch new worktrees start from (empty = auto: origin's default branch)"
                 }
+                crate::config::SettingKind::RunCommand => {
+                    "shell line r runs in this project's worktrees (empty = the checkout's .nebula.json \"run\")"
+                }
+                crate::config::SettingKind::OpenCommand => {
+                    "shell line Shift+Enter / Shift+O runs to open a worktree of this project (empty = the checkout's .nebula.json \"open\")"
+                }
                 _ => "value (empty = default)",
             };
-            (title.into(), label.into(), cfg.text_value(*kind))
+            let value = match project {
+                Some(path) => cfg.project_text_value(path, *kind),
+                None => cfg.text_value(*kind),
+            };
+            (title.into(), hint.into(), value)
         }
 
         PromptKind::IssueComment { issue, .. } => {
@@ -2897,8 +2961,7 @@ fn toggle_run_in(app: &mut App, worktree: &nebula_core::Worktree, out: &mut Vec<
     });
 }
 
-/// `Shift+Enter` on the Worktrees panel: fire the selected checkout's OPEN
-/// COMMAND.
+/// `Shift+Enter` / `Shift+O`: fire the selected checkout's OPEN COMMAND.
 fn open_selected_worktree(app: &mut App) {
     if app.selected_worktree_pr().is_some() {
         app.flash = Some("a pull request has no checkout to open — pick a worktree".into());
@@ -2911,9 +2974,16 @@ fn open_selected_worktree(app: &mut App) {
     open_worktree(app, &w);
 }
 
-/// Run `worktree`'s `.nebula.json` OPEN COMMAND once and say so. The TUI
-/// runs it, not the DAEMON: it opens a browser or an editor on the machine
-/// the user is sitting at.
+/// Why `Shift+Enter` has nothing to run, naming both places to put one —
+/// the twin of the DAEMON's line for `r`.
+const NO_OPEN_COMMAND: &str =
+    "no open command for this worktree — set one in Settings (s) → Project, \
+                               or add .nebula.json with {\"open\": \"open http://localhost:3000\"}";
+
+/// Run `worktree`'s OPEN COMMAND once and say so: the project's **Open
+/// command** setting (Settings → Project) when it is set, else the
+/// checkout's `.nebula.json` `open`. The TUI runs it, not the DAEMON: it
+/// opens a browser or an editor on the machine the user is sitting at.
 fn open_worktree(app: &mut App, worktree: &nebula_core::Worktree) {
     let main = app
         .tree
@@ -2921,11 +2991,7 @@ fn open_worktree(app: &mut App, worktree: &nebula_core::Worktree) {
         .iter()
         .find(|p| p.id == worktree.project_id)
         .map_or_else(|| worktree.path.clone(), |p| p.repo_path.clone());
-    let command = match nebula_core::project_file::command(
-        &worktree.path,
-        &main,
-        nebula_core::project_file::ProjectCommand::Open,
-    ) {
+    let command = match open_command_for(&worktree.path, &main) {
         Ok(command) => command,
         Err(msg) => {
             app.flash = Some(msg);
@@ -2936,6 +3002,26 @@ fn open_worktree(app: &mut App, worktree: &nebula_core::Worktree) {
         Ok(()) => format!("↗ {command}"),
         Err(e) => format!("couldn't run {command}: {e}"),
     });
+}
+
+/// The OPEN COMMAND for a checkout, resolved the way the DAEMON resolves
+/// `r`'s: the project's `open_command` setting, read fresh so an edit
+/// applies on the next press, else the PROJECT FILE's `open` — the
+/// worktree's own checkout, then the project's main one. Err is the footer
+/// line: nothing set in either place, or a file that is there and won't
+/// parse.
+fn open_command_for(worktree: &std::path::Path, main: &std::path::Path) -> Result<String, String> {
+    let setting = crate::config::Config::load().project(main).open_command;
+    let setting = setting.trim();
+    if !setting.is_empty() {
+        return Ok(setting.to_string());
+    }
+    nebula_core::project_file::lookup(
+        worktree,
+        main,
+        nebula_core::project_file::ProjectCommand::Open,
+    )?
+    .ok_or_else(|| NO_OPEN_COMMAND.to_string())
 }
 
 /// Start an OPEN COMMAND through `$SHELL -c` in `cwd`, kept off the TUI's
@@ -3492,30 +3578,8 @@ fn open_delete_confirm(app: &mut App) {
             }
         }
         Focus::Worktrees => {
-            if let Some(w) = app.selected_worktree() {
-                if w.is_main {
-                    app.flash = Some("cannot delete the main checkout".into());
-                    return;
-                }
-                if app.is_placeholder_worktree(&w.id) {
-                    app.flash = Some(WORKTREE_STILL_CREATING.into());
-                    return;
-                }
-                let live_here = app
-                    .visible_sessions()
-                    .iter()
-                    .filter(|a| !a.archived)
-                    .count()
-                    + app.visible_terminals().len();
-                app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-                    title: "Delete worktree".into(),
-                    message: format!(
-                        "Delete worktree '{}' from disk? {live_here} session(s) will be killed.",
-                        w.branch
-                    ),
-                    action: PendingAction::DeleteWorktree(w.id.clone()),
-                    area: ratatui::layout::Rect::default(),
-                }));
+            if let Some(id) = app.selected_worktree().map(|w| w.id.clone()) {
+                activate::delete_worktree(app, &id);
             }
         }
         Focus::Sessions => match app.selected_session_row() {
@@ -4206,13 +4270,22 @@ fn worktree_menu_items(app: &App, w: &nebula_core::Worktree) -> Vec<MenuItem> {
     items
 }
 
+/// `m`: the CONTEXT MENU of the row under the focused panel's cursor.
 fn open_context_menu_for_selection(app: &mut App) {
-    let at = KEYBOARD_MENU_ANCHOR;
-    match app.focus {
-        Focus::Workspaces => {
-            let items = workspace_menu(app);
-            open_menu(app, items, at);
-        }
+    if let Some(items) = context_menu_items(app, app.focus) {
+        open_menu(app, items, KEYBOARD_MENU_ANCHOR);
+    }
+}
+
+/// The CONTEXT MENU of the row under `focus`'s cursor — what `m` opens
+/// there, and what a right-click on a row opens once the click has moved
+/// the cursor onto it (`select_clicked_row`). One list per row kind, built
+/// here and nowhere else: the right button used to build the PROJECTS
+/// PANEL's by hand beside `m`'s, and the two had already drifted apart in
+/// how they were put together. None where there is no row to have one.
+fn context_menu_items(app: &App, focus: Focus) -> Option<Vec<MenuItem>> {
+    match focus {
+        Focus::Workspaces => Some(workspace_menu(app)),
         Focus::Projects => {
             let mut items = vec![MenuItem::new("Add project", MenuAction::AddProject)];
             if let Some(p) = app.selected_project() {
@@ -4229,25 +4302,117 @@ fn open_context_menu_for_selection(app: &mut App) {
                     MenuAction::RemoveProject(p.id.clone()),
                 ));
             }
-            open_menu(app, items, at);
+            Some(items)
         }
-        Focus::Worktrees => {
-            if let Some(pr) = app.selected_worktree_pr().cloned() {
-                let items = pr_row_menu_items(app, &pr);
-                open_menu(app, items, at);
-            } else if let Some(w) = app.selected_worktree().cloned() {
-                let items = worktree_menu_items(app, &w);
-                open_menu(app, items, at);
-            }
-        }
-        Focus::Sessions => match app.selected_session_row() {
-            Some(SessionRow::Agent(a)) => open_menu(app, menu_items_for_session(&a), at),
-            Some(SessionRow::Terminal(t)) => open_menu(app, menu_items_for_terminal(&t), at),
-            Some(SessionRow::Link(l)) => open_menu(app, menu_items_for_link(&l), at),
-            None => {}
+        Focus::Worktrees => match app.selected_worktree_pr() {
+            Some(pr) => Some(pr_row_menu_items(app, pr)),
+            None => app.selected_worktree().map(|w| worktree_menu_items(app, w)),
         },
-        Focus::Terminal => {}
+        Focus::Sessions => app.selected_session_row().map(|row| match row {
+            SessionRow::Agent(a) => menu_items_for_session(&a),
+            SessionRow::Terminal(t) => menu_items_for_terminal(&t),
+            SessionRow::Link(l) => menu_items_for_link(&l),
+        }),
+        Focus::Terminal => None,
     }
+}
+
+/// The menu of a panel's empty background — the right button's alone: the
+/// keyboard has no cursor to park there, and reaches every one of these
+/// verbs by its own key (`n`, `A`, the OPEN PRS fold, the draft toggle).
+fn panel_menu_items(app: &App, focus: Focus) -> Vec<MenuItem> {
+    match focus {
+        Focus::Workspaces => vec![MenuItem::new("New workspace", MenuAction::NewWorkspace)],
+        Focus::Projects => vec![MenuItem::new("Add project", MenuAction::AddProject)],
+        Focus::Worktrees => app
+            .selected_project()
+            .map(|p| {
+                let mut items = vec![MenuItem::new(
+                    "New worktree",
+                    MenuAction::NewWorktree(p.id.clone()),
+                )];
+                // Only once there is a group to fold.
+                if !app.listed_open_prs().is_empty() {
+                    items.push(MenuItem::new(
+                        "Show/hide open PRs",
+                        MenuAction::ToggleOpenPrs,
+                    ));
+                }
+                // And drafts to hide — or, once hidden, a way back that
+                // doesn't need the list to still hold one.
+                if app.hide_draft_prs || app.all_open_prs().iter().any(|pr| pr.is_draft) {
+                    let label = if app.hide_draft_prs {
+                        "Show draft PRs"
+                    } else {
+                        "Hide draft PRs"
+                    };
+                    items.push(MenuItem::new(label, MenuAction::ToggleDraftPrs));
+                }
+                items
+            })
+            .unwrap_or_default(),
+        Focus::Sessions => app
+            .selected_worktree()
+            .map(|w| {
+                vec![
+                    MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
+                    MenuItem::new("Show/hide archived", MenuAction::ToggleArchived),
+                ]
+            })
+            .unwrap_or_default(),
+        Focus::Terminal => vec![],
+    }
+}
+
+/// A click landed on a panel row: the cursor goes there exactly as the
+/// arrow keys take it — `switch_workspace`, `select_project_row`,
+/// `select_worktree_row`, `select_session_row`, each with everything a
+/// move entails (the context being left remembered, the one arrived at
+/// restored, the pane brought along) — and the panel takes FOCUS. Either
+/// button: the left goes on to its double-click, the right to the row's
+/// CONTEXT MENU. The right button used to set the cursor fields itself, so
+/// a right-click on another checkout left the pane on the old one's
+/// session under a cursor that had moved away. False for a target that is
+/// not a row.
+fn select_clicked_row(app: &mut App, target: &HitTarget, out: &mut Vec<ClientRequest>) -> bool {
+    match *target {
+        // A workspace row opens that workspace here, as ↑/↓ in the column
+        // do.
+        HitTarget::Workspace(i) => {
+            if let Some(id) = app.tree.workspaces.get(i).map(|w| w.id.clone()) {
+                switch_workspace(app, id, out);
+            }
+            enter_workspaces_bar(app);
+        }
+        HitTarget::Project(i) => {
+            if app.sel_project != i {
+                select_project_row(app, i, out);
+            }
+            app.focus = Focus::Projects;
+        }
+        HitTarget::Worktree(i) => {
+            if app.sel_worktree != i {
+                select_worktree_row(app, i, out);
+            }
+            app.focus = Focus::Worktrees;
+        }
+        HitTarget::Session(i) => {
+            select_session_row(app, i, Duration::ZERO, out);
+            app.focus = Focus::Sessions;
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Move the Sessions cursor to row `i` and show that session in the pane,
+/// without FOCUS or the input lock — what ↑/↓ do on the way past (behind
+/// `debounce`, so a sweep boots nothing) and what a click does at once. An
+/// archived row and a link row are selected and preview nothing
+/// (`preview_inner`).
+fn select_session_row(app: &mut App, i: usize, debounce: Duration, out: &mut Vec<ClientRequest>) {
+    app.sel_session = i;
+    preview_inner(app, debounce, out);
 }
 
 pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
@@ -4280,13 +4445,7 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
             KeyCode::Char('k') | KeyCode::Up => {
                 view.selected = clamp_selection(view.selected as i64 + (-1), view.rows.len());
             }
-            KeyCode::Enter => {
-                // Nebula's own rows (daemon / this UI) carry no session.
-                if let Some(Some(sref)) = view.rows.get(view.selected).cloned() {
-                    app.overlay = None;
-                    open_session(app, sref, out);
-                }
-            }
+            KeyCode::Enter => activate::metrics_row(app, out),
             _ => {}
         },
         Overlay::Hosts(view) => {
@@ -4300,9 +4459,7 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                         // Nothing typed = cancel; otherwise connect exactly
                         // like `nebula ssh host [dir]` would.
                         if let Some(entry) = entry {
-                            app.overlay = None;
-                            app.pending_ssh = Some(entry);
-                            app.should_quit = true;
+                            activate::host(app, entry);
                         }
                     }
                     // Everything else is the line editor's: arrows,
@@ -4329,9 +4486,7 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 // sessions stay up).
                 KeyCode::Enter => {
                     if let Some(entry) = view.hosts.get(view.selected).cloned() {
-                        app.overlay = None;
-                        app.pending_ssh = Some(entry);
-                        app.should_quit = true;
+                        activate::host(app, entry);
                     }
                 }
                 // Forget the entry — no confirm, the next `nebula ssh` to it
@@ -4437,9 +4592,8 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 }
             }
             KeyCode::Enter => {
-                let action = menu.items[menu.hover].action.clone();
-                app.overlay = None;
-                run_menu_action(app, action, out);
+                let hover = menu.hover;
+                activate::menu_row(app, hover, out);
             }
             _ => {}
         },
@@ -4615,9 +4769,7 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 // second Esc closes the modal.
                 KeyCode::Esc if !view.filter.is_empty() => {
                     view.filter.clear();
-                    if view.apply_filter() {
-                        crate::git_diff::load_selected_diff(view);
-                    }
+                    activate::diff_filter_changed(view);
                 }
                 KeyCode::Esc => app.overlay = None,
                 KeyCode::Char('d') if ctrl => view.scroll_by(half),
@@ -4640,16 +4792,8 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 }
                 KeyCode::Down if shift => view.scroll_by(1),
                 KeyCode::Up if shift => view.scroll_by(-1),
-                KeyCode::Down => {
-                    if view.select(view.selected as i64 + 1) {
-                        crate::git_diff::load_selected_diff(view);
-                    }
-                }
-                KeyCode::Up => {
-                    if view.select(view.selected as i64 - 1) {
-                        crate::git_diff::load_selected_diff(view);
-                    }
-                }
+                KeyCode::Down => activate::diff_file(view, view.selected as i64 + 1),
+                KeyCode::Up => activate::diff_file(view, view.selected as i64 - 1),
                 KeyCode::PageDown => view.scroll_by(page),
                 KeyCode::PageUp => view.scroll_by(-page),
                 KeyCode::Home => view.scroll = 0,
@@ -4657,8 +4801,8 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 // Everything else feeds the always-on fuzzy filter, which
                 // edits like a terminal line (see text_input).
                 _ => {
-                    if view.filter.handle_key(&key).changed() && view.apply_filter() {
-                        crate::git_diff::load_selected_diff(view);
+                    if view.filter.handle_key(&key).changed() {
+                        activate::diff_filter_changed(view);
                     }
                 }
             }
@@ -4681,24 +4825,12 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 // Enter picks per the config setting; Ctrl+O always opens
                 // (attach + terminal focus; the browser, for a pull
                 // request), Ctrl+F only focuses the row.
-                KeyCode::Enter => {
-                    if let Some(target) = palette.selected_target().cloned() {
-                        let landing = Landing::for_enter_on(&target, palette.enter_attaches);
-                        app.overlay = None;
-                        jump_to_target(app, target, landing, out);
-                    }
-                }
+                KeyCode::Enter => activate::palette_row(app, None, out),
                 KeyCode::Char('o') if ctrl => {
-                    if let Some(target) = palette.selected_target().cloned() {
-                        app.overlay = None;
-                        jump_to_target(app, target, Landing::Attach, out);
-                    }
+                    activate::palette_row(app, Some(Landing::Attach), out)
                 }
                 KeyCode::Char('f') if ctrl => {
-                    if let Some(target) = palette.selected_target().cloned() {
-                        app.overlay = None;
-                        jump_to_target(app, target, Landing::FocusOnly, out);
-                    }
+                    activate::palette_row(app, Some(Landing::FocusOnly), out)
                 }
                 // Everything else edits the query like a terminal line
                 // (see text_input).
@@ -4905,7 +5037,7 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
         // ↑ off the top row steps onto the tab strip.
         KeyCode::Char('k') | KeyCode::Up if selected == 0 => SettingsCmd::FocusTabs,
         KeyCode::Char('k') | KeyCode::Up => SettingsCmd::Move(selected - 1),
-        KeyCode::Enter | KeyCode::Char(' ') if hotkeys => SettingsCmd::Capture { add: false },
+        KeyCode::Enter | KeyCode::Char(' ') => activate::settings_row_cmd(hotkeys, selected),
         KeyCode::Char('a') | KeyCode::Char('+') if hotkeys => SettingsCmd::Capture { add: true },
         KeyCode::Backspace | KeyCode::Delete if hotkeys => SettingsCmd::ResetHotkey,
         KeyCode::Char('x') if hotkeys => SettingsCmd::ClearHotkey,
@@ -4913,12 +5045,23 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('h') | KeyCode::Left | KeyCode::Char('l') | KeyCode::Right if hotkeys => {
             SettingsCmd::Nudge
         }
-        KeyCode::Enter | KeyCode::Char(' ') => SettingsCmd::Apply(selected, 0),
         KeyCode::Char('l') | KeyCode::Right => SettingsCmd::Apply(selected, 1),
         KeyCode::Char('h') | KeyCode::Left => SettingsCmd::Apply(selected, -1),
         _ => return,
     };
+    run_settings_cmd(app, cmd);
+}
 
+/// Run one SETTINGS OVERLAY command: the one place the overlay's state
+/// changes, whoever asked. Keys map to commands in `handle_settings_key`
+/// and the mouse in `handle_mouse`; neither touches the view itself, so a
+/// click on a tab *is* that tab's key, and a second click on a row *is*
+/// Enter on it (`activate::settings_row_cmd`).
+fn run_settings_cmd(app: &mut App, cmd: SettingsCmd) {
+    let Some(view) = settings(app) else {
+        return;
+    };
+    let (tab, selected) = (view.tab, view.selected);
     match cmd {
         SettingsCmd::Close => close_settings(app),
         SettingsCmd::Tab(next) => {
@@ -5155,28 +5298,39 @@ fn save_config(app: &mut App, cfg: &crate::config::Config) -> bool {
 
 fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i32) {
     if let Some(spec) = crate::config::setting_at(tab, index) {
-        if spec.kind.is_text() {
-            // Enter (and a second click) on a typed row opens its prompt in
-            // the overlay's place; Enter and Esc there both bring the
-            // overlay back (`submit_prompt`, the Esc arm). ←/→ have nothing
-            // to step through — say so instead of no-op'ing.
-            if delta == 0 {
-                open_prompt(app, PromptKind::SettingText { kind: spec.kind });
-            } else if let Some(view) = settings_mut(app) {
-                view.info("Enter: type a value   (empty puts the default back)");
-            }
-            return;
-        }
-        if spec.kind.is_project() {
-            // A PROJECT TAB row edits the selected project's entry. With
-            // no project to edit — an empty tree — say so rather than
-            // toggle nothing.
+        // A PROJECT TAB row edits the selected project's entry. With no
+        // project to edit — an empty tree — say so rather than toggle
+        // nothing or open a prompt with nowhere to write.
+        let project = if spec.kind.is_project() {
             let Some(path) = app.selected_project().map(|p| p.repo_path.clone()) else {
                 if let Some(view) = settings_mut(app) {
                     view.warn("no project selected — this tab edits the one under the cursor");
                 }
                 return;
             };
+            Some(path)
+        } else {
+            None
+        };
+        if spec.kind.is_text() {
+            // Enter (and a second click) on a typed row opens its prompt in
+            // the overlay's place; Enter and Esc there both bring the
+            // overlay back (`submit_prompt`, the Esc arm). ←/→ have nothing
+            // to step through — say so instead of no-op'ing.
+            if delta == 0 {
+                open_prompt(
+                    app,
+                    PromptKind::SettingText {
+                        kind: spec.kind,
+                        project,
+                    },
+                );
+            } else if let Some(view) = settings_mut(app) {
+                view.info("Enter: type a value   (empty puts the default back)");
+            }
+            return;
+        }
+        if let Some(path) = project {
             let mut cfg = crate::config::Config::load();
             cfg.cycle_project(&path, spec.kind);
             if save_config(app, &cfg) {
@@ -5624,19 +5778,10 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
         } => create_agent(
             app,
             AgentLaunchDraft {
-                worktree,
-                kind,
                 custom,
-                model,
-                effort,
                 name: value,
-                cloud_prompt: None,
-                starting_prompt: None,
-                reopen_on_error: None,
                 pr: Some(pr),
-                issue_url: None,
-                focus_pane: true,
-                placeholder: None,
+                ..AgentLaunchDraft::new(worktree, kind, model, effort)
             },
             out,
         ),
@@ -5648,83 +5793,39 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
         } => create_agent(
             app,
             AgentLaunchDraft {
-                worktree,
-                kind: AgentKind::Claude,
-                custom: None,
-                model,
-                effort,
                 name,
                 cloud_prompt: Some(value),
-                starting_prompt: None,
-                reopen_on_error: None,
-                pr: None,
-                issue_url: None,
-                focus_pane: true,
-                placeholder: None,
+                ..AgentLaunchDraft::new(worktree, AgentKind::Claude, model, effort)
             },
             out,
         ),
         PromptKind::AgentPresetTask { worktree, preset } => {
-            // Sized above, with the task — composing cannot fail here. An
-            // empty task on a bare preset composes to nothing: no STARTING
-            // PROMPT, the CLI's own input is the first one.
-            let starting_prompt = Some(preset.compose(&value)).filter(|text| !text.is_empty());
-            // A preset pins a model / effort or follows Settings → Agents,
-            // exactly as the NEW SESSION PICKER's rows do.
-            let cfg = crate::config::Config::load();
-            let kind = preset.kind;
-            let custom = preset.custom_harness.clone();
-            let (model, effort) = match kind {
-                AgentKind::Custom => {
-                    let descriptor = cfg.effective_harness(kind, custom.as_deref());
-                    let model = preset
-                        .model
-                        .clone()
-                        .or_else(|| descriptor.default_model().map(str::to_string));
-                    let effort = crate::config::fit_effort(
-                        kind,
-                        model.as_deref(),
-                        preset
-                            .effort
-                            .clone()
-                            .or_else(|| descriptor.default_effort().map(str::to_string)),
-                        custom.as_deref(),
-                    );
-                    (model, effort)
-                }
-                _ => {
-                    let model = preset.model.clone().or_else(|| cfg.default_model(kind));
-                    let effort = crate::config::fit_effort(
-                        kind,
-                        model.as_deref(),
-                        preset.effort.clone().or_else(|| cfg.default_effort(kind)),
-                        None,
-                    );
-                    (model, effort)
-                }
-            };
-            create_agent(
-                app,
-                AgentLaunchDraft {
-                    worktree: worktree.clone(),
-                    kind,
-                    custom,
-                    model,
-                    effort,
-                    name: String::new(),
-                    cloud_prompt: None,
-                    starting_prompt,
-                    reopen_on_error: Some((
-                        PromptKind::AgentPresetTask { worktree, preset },
-                        value,
-                    )),
-                    pr: None,
-                    issue_url: None,
-                    focus_pane: true,
-                    placeholder: None,
-                },
-                out,
+            // The launch a QUICK PROMPT with this preset on it sends, built
+            // by the same two functions: `QuickLaunch::of_preset` resolves
+            // the harness (a preset pins a model / effort or follows
+            // Settings → Agents) and `quick_launch::draft` composes prefix
+            // + task + postfix — sized above, so composing cannot fail, and
+            // an empty task on a bare preset composes to no STARTING PROMPT
+            // at all. Only what is this box's own is said here: it was
+            // walked to through the presets list, so it takes the pane, and
+            // a refusal brings this box back, not the quick prompt's.
+            let launch = crate::quick_prompt::QuickLaunch::of_preset(
+                crate::quick_prompt::QuickTarget::Worktree(worktree.clone()),
+                preset.clone(),
+                &crate::config::Config::load(),
             );
+            let draft = AgentLaunchDraft {
+                focus_pane: true,
+                reopen_on_error: Some((
+                    PromptKind::AgentPresetTask {
+                        worktree: worktree.clone(),
+                        preset,
+                    },
+                    value.clone(),
+                )),
+                ..quick_launch::draft(launch, worktree, value, None)
+            };
+            create_agent(app, draft, out);
         }
         PromptKind::QuickPrompt(launch) => quick_launch::submit(app, launch, value, out),
         PromptKind::PrComment { number, url, label } => {
@@ -5780,13 +5881,18 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 name: value,
             });
         }
-        PromptKind::SettingText { kind } => {
+        PromptKind::SettingText { kind, project } => {
             // Same path as a toggled row (`apply_setting_at`): write the
             // file, adopt it live, and land back on the overlay — with the
             // row's new value in the notice line so the save is visible
-            // even when the label column is what changed.
+            // even when the label column is what changed. A PROJECT TAB
+            // row's value goes into the entry of the project the prompt
+            // was opened on, and the notice reads that entry back.
             let mut cfg = crate::config::Config::load();
-            cfg.set_text(kind, &value);
+            match &project {
+                Some(path) => cfg.set_project_text(path, kind, &value),
+                None => cfg.set_text(kind, &value),
+            };
             let saved = save_config(app, &cfg);
             if saved {
                 apply_config(app, &cfg);
@@ -5796,7 +5902,10 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 let label = crate::config::spec_for(kind)
                     .map(|s| s.label)
                     .unwrap_or("setting");
-                let shown = cfg.value_label(kind);
+                let shown = match &project {
+                    Some(path) => cfg.project(path).value_label(kind),
+                    None => cfg.value_label(kind),
+                };
                 if let Some(view) = settings_mut(app) {
                     view.info(format!("{label}: {shown}"));
                 }
@@ -5926,11 +6035,7 @@ fn delete_worktree(app: &mut App, id: WorktreeId, out: &mut Vec<ClientRequest>) 
 
 fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientRequest>) {
     match action {
-        MenuAction::Attach(sref) => {
-            attach_now(app, sref, out);
-            app.focus = Focus::Terminal;
-            app.term_locked = true;
-        }
+        MenuAction::Attach(sref) => activate::attach(app, sref, out),
         MenuAction::RestartAgent(id) => {
             send(app, out, |req_id| ClientRequest::RestartAgent {
                 req_id,
@@ -5942,12 +6047,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::ArchiveAgent(id) => {
             archive_agent(app, id, out);
         }
-        MenuAction::UnarchiveAgent(id) => {
-            send(app, out, |req_id| ClientRequest::UnarchiveAgent {
-                req_id,
-                id,
-            });
-        }
+        MenuAction::UnarchiveAgent(id) => activate::unarchive(app, id, out),
         MenuAction::DeleteAgent(id) => {
             if let Some(a) = app.tree.agents.iter().find(|a| a.id == id).cloned() {
                 app.overlay = Some(Overlay::Confirm(confirm_delete_agent(&a.name, id)));
@@ -6035,19 +6135,9 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 create_agent(
                     app,
                     AgentLaunchDraft {
-                        worktree,
-                        kind,
                         custom: custom.clone(),
-                        model,
-                        effort,
-                        name: String::new(),
-                        cloud_prompt: None,
-                        starting_prompt: None,
-                        reopen_on_error: None,
                         pr,
-                        issue_url: None,
-                        focus_pane: true,
-                        placeholder: None,
+                        ..AgentLaunchDraft::new(worktree, kind, model, effort)
                     },
                     out,
                 );
@@ -6111,18 +6201,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 open_worktree(app, &w);
             }
         }
-        MenuAction::DeleteWorktree(id) => {
-            if app.is_placeholder_worktree(&id) {
-                app.flash = Some(WORKTREE_STILL_CREATING.into());
-            } else if let Some(w) = app.tree.worktrees.iter().find(|w| w.id == id).cloned() {
-                app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-                    title: "Delete worktree".into(),
-                    message: format!("Delete worktree '{}' from disk?", w.branch),
-                    action: PendingAction::DeleteWorktree(id),
-                    area: ratatui::layout::Rect::default(),
-                }));
-            }
-        }
+        MenuAction::DeleteWorktree(id) => activate::delete_worktree(app, &id),
         MenuAction::SwitchBranch(id) => crate::branch_switch::open_for(app, &id),
         MenuAction::AddProject => open_prompt(app, PromptKind::AddProject),
         MenuAction::RenameProject(id) => open_prompt(app, PromptKind::RenameProject { id }),
@@ -6759,10 +6838,7 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
         }
         Focus::Projects => select_project_row(app, new, out),
         Focus::Worktrees => select_worktree_row(app, new, out),
-        Focus::Sessions => {
-            app.sel_session = new;
-            preview_selected(app, out);
-        }
+        Focus::Sessions => select_session_row(app, new, ATTACH_DEBOUNCE, out),
         Focus::Terminal => {}
     }
 }
@@ -6843,9 +6919,7 @@ fn attach_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
         open_link(app, &url, out);
         return;
     }
-    attach_now(app, sref, out);
-    app.focus = Focus::Terminal;
-    app.term_locked = true;
+    activate::attach(app, sref, out);
 }
 
 /// The claude.ai page behind `sref`, when it is a Claude Cloud row.
@@ -7161,6 +7235,7 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
         issue_url,
         focus_pane,
         placeholder,
+        follow,
     } = draft;
     // A PR SESSION is addressed to the PROJECT, not to a checkout: the
     // DAEMON runs it in the PR head branch's own worktree, creating that
@@ -7187,6 +7262,12 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
                 .map(|w| w.id.clone());
             let rows = match on_head {
                 Some(id) if app.is_placeholder_worktree(&id) => {
+                    // The box is already closed; a task typed into it
+                    // comes back with the refusal, to send again once the
+                    // checkout is real.
+                    if let Some((kind, text)) = reopen_on_error {
+                        reopen_prompt_with(app, kind, text);
+                    }
                     app.flash = Some(WORKTREE_STILL_CREATING.into());
                     return;
                 }
@@ -7215,6 +7296,7 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
         None => None,
     };
     let pr_rows = pr.as_ref().and_then(|(_, _, rows)| rows.clone());
+    let pr_url = pr.as_ref().map(|(_, pr, _)| pr.url.clone());
     let placeholder = placeholder.or_else(|| pr_rows.as_ref().map(|rows| rows.agent.clone()));
     // A stand-in row was named for this very create when it went up, so
     // the name comes off it — `default_session_name` would count it as
@@ -7224,9 +7306,11 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
         .and_then(|id| app.tree.agents.iter().find(|a| &a.id == id))
         .map(|a| a.name.clone());
     let intent = match (reopen_on_error, &cloud_prompt, pr_rows) {
-        (_, _, Some(rows)) => PendingIntent::AttachCreatedPrSession {
+        (reopen, _, Some(rows)) => PendingIntent::AttachCreatedPrSession {
             focus: focus_pane,
             placeholder: rows,
+            reopen,
+            pr_url: pr_url.clone().unwrap_or_default(),
         },
         (Some((kind, task)), _, None) => PendingIntent::AttachCreatedWithCloudRetry {
             kind,
@@ -7258,7 +7342,13 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
     };
     let cloud = cloud_prompt.is_some();
     let with_first_prompt = starting_prompt.is_some();
-    send_with(app, out, intent, |req_id| match pr {
+    let req_id = app.alloc_req_id(intent);
+    // The second half of a launch the user already navigated away from:
+    // its Ack leaves the cursors where they are, as the first half's did.
+    if !follow {
+        app.left_behind.insert(req_id);
+    }
+    out.push(match pr {
         Some((project, pr, _)) => {
             debug_assert!(!cloud);
             ClientRequest::CreatePrAgent {
@@ -7293,7 +7383,11 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
     // Claude slot; refill it so the next create is instant too. A cloud
     // launch, and any launch carrying a STARTING PROMPT (a preset, the
     // QUICK PROMPT), never touches the slot, so there is nothing to refill.
-    if kind == AgentKind::Claude && !cloud && !with_first_prompt {
+    // Nor does a PR SESSION: the DAEMON adopts no unscoped spare for one,
+    // and `worktree` there is the ROOT WORKTREE, which only names the
+    // project — a refill would boot a Claude in the main checkout for a
+    // launch that never runs there.
+    if kind == AgentKind::Claude && !cloud && !with_first_prompt && pr_url.is_none() {
         out.extend(default_claude_prewarm(worktree));
     }
 }
@@ -7730,13 +7824,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 && mouse.row < area.y + area.height.saturating_sub(1);
             let hit = inside
                 .then(|| (mouse.row - area.y - 1) as usize)
-                .and_then(|index| menu.items.get(index))
-                .map(|item| item.action.clone());
+                .filter(|index| *index < menu.items.len());
             match hit {
-                Some(action) => {
-                    app.overlay = None;
-                    run_menu_action(app, action, out);
-                }
+                // Enter on that row, whichever row the hover was on.
+                Some(index) => activate::menu_row(app, index, out),
                 // A click on the menu's own border or a blank row is inert.
                 None if inside => {}
                 None => {
@@ -7765,15 +7856,15 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let area = prompt.list_area;
-                if area.contains(mouse_pos) {
-                    let i =
-                        prompt.window_start(area.height as usize) + (mouse.row - area.y) as usize;
-                    if i < prompt.dirs.len() {
-                        if prompt.hover == Some(i) {
-                            prompt.dive(i);
-                        } else {
-                            prompt.hover = Some(i);
-                        }
+                let first = prompt.window_start(area.height as usize);
+                if let Some(i) = crate::list_hit::row_at(area, first, prompt.dirs.len(), mouse_pos)
+                {
+                    // A click highlights, as ↓ onto the row does; a second
+                    // click on it steps in, as → does.
+                    if prompt.hover == Some(i) {
+                        prompt.dive(i);
+                    } else {
+                        prompt.hover = Some(i);
                     }
                 }
                 app.dirty = true;
@@ -7804,13 +7895,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     return;
                 }
                 let area = view.list_area;
-                if area.contains(mouse_pos) {
-                    let start = view.window_start(area.height as usize);
-                    let index = start + (mouse.row - area.y) as usize;
-                    if index < view.matches.len() && view.select(index as i64) {
-                        crate::git_diff::load_selected_diff(view);
-                        app.dirty = true;
-                    }
+                let first = view.window_start(area.height as usize);
+                if let Some(index) =
+                    crate::list_hit::row_at(area, first, view.matches.len(), mouse_pos)
+                {
+                    activate::diff_file(view, index as i64);
+                    app.dirty = true;
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -7843,17 +7933,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = palette.list_area;
-                if list.contains(mouse_pos) {
-                    let start = palette.window_start(list.height as usize);
-                    let index = start + (mouse.row - list.y) as usize;
-                    if index < palette.matches.len() {
-                        palette.select(index as i64);
-                        if let Some(target) = palette.selected_target().cloned() {
-                            let landing = Landing::for_enter_on(&target, palette.enter_attaches);
-                            app.overlay = None;
-                            jump_to_target(app, target, landing, out);
-                        }
-                    }
+                let first = palette.window_start(list.height as usize);
+                if let Some(index) =
+                    crate::list_hit::row_at(list, first, palette.matches.len(), mouse_pos)
+                {
+                    palette.select(index as i64);
+                    activate::palette_row(app, None, out);
                 }
                 app.dirty = true;
             }
@@ -7877,13 +7962,16 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = finder.list_area;
-                if list.contains(mouse_pos) {
-                    let start = finder.window_start(list.height as usize);
-                    let index = start + (mouse.row - list.y) as usize;
-                    if index < finder.matches.len() {
-                        finder.select(index as i64);
-                        open_selected_file_in_editor(app);
-                    }
+                let first = finder.window_start(list.height as usize);
+                if let Some(index) =
+                    crate::list_hit::row_at(list, first, finder.matches.len(), mouse_pos)
+                {
+                    finder.select(index as i64);
+                    // Enter on that row — the FILE TABS reader for a
+                    // markdown file, the editor for anything else. The
+                    // click used to call the editor half directly, and so
+                    // missed the reader when Enter learned it.
+                    open_selected_file(app);
                 }
                 app.dirty = true;
             }
@@ -7907,13 +7995,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = view.list_area;
-                if list.contains(mouse_pos) {
-                    let start = view.window_start(list.height as usize);
-                    let index = start + (mouse.row - list.y) as usize;
-                    if index < view.hits.len() {
-                        view.select(index as i64);
-                        open_selected_hit_in_editor(app);
-                    }
+                let first = view.window_start(list.height as usize);
+                if let Some(index) =
+                    crate::list_hit::row_at(list, first, view.hits.len(), mouse_pos)
+                {
+                    view.select(index as i64);
+                    open_selected_hit_in_editor(app);
                 }
                 app.dirty = true;
             }
@@ -7943,13 +8030,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     return;
                 }
                 let list = view.list_area;
-                if list.contains(mouse_pos) {
-                    let start = view.window_start(list.height as usize);
-                    let index = start + (mouse.row - list.y) as usize;
-                    if index < view.rows.len() {
-                        view.select(index as i64);
-                        view.toggle_row(index); // no-op on files / under a filter
-                    }
+                let first = view.window_start(list.height as usize);
+                if let Some(index) =
+                    crate::list_hit::row_at(list, first, view.rows.len(), mouse_pos)
+                {
+                    view.select(index as i64);
+                    view.toggle_row(index); // no-op on files / under a filter
                 }
                 app.dirty = true;
             }
@@ -7995,15 +8081,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let list = view.list_area;
-                if list.contains(mouse_pos) {
-                    let start = view.window_start(list.height as usize);
-                    let index = start + (mouse.row - list.y) as usize;
-                    if let Some(entry) = view.hosts.get(index).cloned() {
-                        view.selected = index;
-                        app.overlay = None;
-                        app.pending_ssh = Some(entry);
-                        app.should_quit = true;
-                    }
+                let first = view.window_start(list.height as usize);
+                if let Some(index) =
+                    crate::list_hit::row_at(list, first, view.hosts.len(), mouse_pos)
+                {
+                    view.selected = index;
+                    let entry = view.hosts[index].clone();
+                    activate::host(app, entry);
                 }
                 app.dirty = true;
             }
@@ -8029,29 +8113,27 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             if view.capture.is_some() {
                 return;
             }
-            let (area, tab, selected, body, first_row) = (
+            let (area, tab, selected, body, first_row, hotkeys) = (
                 view.area,
                 view.tab,
                 view.selected,
                 view.body_area,
                 view.first_row,
+                view.is_hotkeys(),
             );
             let tab_hits = view.tab_hits.clone();
-            // The strip first: its labels are recorded during draw.
+            // The mouse only says which command; `run_settings_cmd` is the
+            // one place the overlay changes, as it is for the keys.
+            // The strip first: its labels are recorded during draw. A
+            // click on one is that tab's digit, with the cursor put in its
+            // list.
             if let Some(next) = tab_hits
                 .iter()
                 .position(|(x0, x1)| mouse.column >= *x0 && mouse.column < *x1)
             {
                 if mouse.row == area.y.saturating_add(1) {
-                    app.settings_tab = next;
-                    let row = app.settings_row(next);
-                    app.remember_settings_focus(false);
-                    if let Some(view) = settings_mut(app) {
-                        view.tab = next;
-                        view.selected = row;
-                        view.on_tabs = false;
-                        view.notice = None;
-                    }
+                    run_settings_cmd(app, SettingsCmd::Tab(next));
+                    run_settings_cmd(app, SettingsCmd::EnterList);
                     app.dirty = true;
                     return;
                 }
@@ -8064,27 +8146,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     .get(row)
                     .and_then(|r| r.index())
                 {
-                    if let Some(view) = settings_mut(app) {
-                        view.selected = index;
-                        view.on_tabs = false;
-                        view.notice = None;
-                    }
-                    app.remember_settings_row(tab, index);
-                    app.remember_settings_focus(false);
+                    // A click moves the cursor there, as j/k would; on the
+                    // row it was already on, it is Enter.
+                    run_settings_cmd(app, SettingsCmd::Move(index));
+                    run_settings_cmd(app, SettingsCmd::EnterList);
                     if selected == index {
-                        if tab == crate::config::hotkeys_tab() {
-                            // Second click on a hotkey row starts a rebind,
-                            // the same as Enter would.
-                            if let Some(view) = settings_mut(app) {
-                                view.capture = Some(crate::app::HotkeyCapture {
-                                    action: index,
-                                    add: false,
-                                    pending: None,
-                                });
-                            }
-                        } else {
-                            apply_setting_at(app, tab, index, 0);
-                        }
+                        run_settings_cmd(app, activate::settings_row_cmd(hotkeys, index));
                     }
                 }
             }
@@ -8096,7 +8163,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     // (a click on the selected row opens it); everything else inside the box
     // is swallowed.
     if let Some(Overlay::Metrics(view)) = &mut app.overlay {
-        let mut open: Option<SessionRef> = None;
+        let mut open = false;
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 view.selected = clamp_selection(view.selected as i64 + (-1), view.rows.len());
@@ -8107,23 +8174,20 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 app.dirty = true;
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                let list = view.list_area;
-                if list.contains(mouse_pos) {
-                    let index = view.scroll + (mouse.row - list.y) as usize;
-                    if index < view.rows.len() {
-                        if view.selected == index {
-                            open = view.rows[index].clone();
-                        }
-                        view.selected = index;
-                    }
+                if let Some(index) =
+                    crate::list_hit::row_at(view.list_area, view.scroll, view.rows.len(), mouse_pos)
+                {
+                    // A click selects; on the row already selected it is
+                    // Enter.
+                    open = view.selected == index;
+                    view.selected = index;
                 }
                 app.dirty = true;
             }
             _ => {}
         }
-        if let Some(sref) = open {
-            app.overlay = None;
-            open_session(app, sref, out);
+        if open {
+            activate::metrics_row(app, out);
         }
         return;
     }
@@ -8186,59 +8250,53 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         grab_offset: app.splitter_x(i) as i32 - mouse.column as i32,
                     });
                 }
-                // A workspace row opens that workspace here, as ↑/↓ in the
-                // column do; the footer's nameplate opens the switcher.
-                Some(HitTarget::Workspace(i)) => {
-                    if let Some(id) = app.tree.workspaces.get(i).map(|w| w.id.clone()) {
-                        switch_workspace(app, id, out);
-                    }
-                    enter_workspaces_bar(app);
-                }
+                // The footer's nameplate opens the switcher.
                 Some(HitTarget::FooterWorkspace) => open_workspace_picker(app),
-                Some(HitTarget::Project(i)) => {
-                    if app.sel_project != i {
-                        select_project_row(app, i, out);
-                    }
-                    app.focus = app.first_sidebar_focus();
+                // A row takes the cursor as the arrow keys would bring it
+                // (`select_clicked_row`); a workspace or a project has
+                // nothing more to a click than that.
+                Some(target @ (HitTarget::Workspace(_) | HitTarget::Project(_))) => {
+                    select_clicked_row(app, &target, out);
                 }
-                Some(HitTarget::Worktree(i)) => {
-                    if app.sel_worktree != i {
-                        select_worktree_row(app, i, out);
-                    }
-                    app.focus = Focus::Worktrees;
-                    // A second click on a pull request opens it — the same
-                    // double-click-to-activate the Sessions panel's link
-                    // rows use, so one stray click never launches a browser.
-                    // Landing anywhere else breaks the chain, or a click
-                    // away and back would read as a double-click.
-                    match app.selected_worktree_pr().map(|pr| pr.url.clone()) {
-                        Some(url) => {
-                            let key = RowKey::Link(url.clone());
+                Some(target @ HitTarget::Worktree(_)) => {
+                    select_clicked_row(app, &target, out);
+                    // A click moves the cursor, as ↑/↓ do; a second click
+                    // on the row is Enter on it (`activate::worktrees_row`)
+                    // — a pull request opens, a checkout hands FOCUS to its
+                    // sessions — the double-click-to-activate the Sessions
+                    // panel's rows use, so one stray click never launches a
+                    // browser. Landing on any other row breaks the chain,
+                    // or a click away and back would read as a
+                    // double-click.
+                    let key = match app.selected_worktree_pr() {
+                        Some(pr) => Some(RowKey::Link(pr.url.clone())),
+                        None => app
+                            .selected_worktree()
+                            .map(|w| RowKey::Worktree(w.id.clone())),
+                    };
+                    match key {
+                        Some(key) => {
                             if is_double_click(&mut app.last_session_click, key) {
-                                open_link(app, &url, out);
+                                activate::worktrees_row(app, out);
                             }
                         }
                         None => app.last_session_click = None,
                     }
                 }
-                Some(HitTarget::Session(i)) => {
-                    app.sel_session = i;
+                Some(target @ HitTarget::Session(_)) => {
+                    // A click selects the row and previews its terminal (no
+                    // focus/lock), as ↑/↓ onto it would; a second click is
+                    // Enter on it — `attach_selected`, which opens a link
+                    // row in the browser. An archived row says why neither
+                    // happens.
+                    select_clicked_row(app, &target, out);
                     match app.selected_session_row() {
                         Some(row) if row.is_archived_agent() => {
-                            app.focus = Focus::Sessions;
                             app.flash = Some(AGENT_ARCHIVED.into());
                         }
                         Some(row) => {
-                            // Double-click attaches (a link row opens in the
-                            // browser).
                             if is_double_click(&mut app.last_session_click, row.click_key()) {
                                 attach_selected(app, out);
-                            } else {
-                                // Single click selects the row and previews its
-                                // terminal (no focus/lock); Enter or a second
-                                // click commits.
-                                app.focus = Focus::Sessions;
-                                preview_selected_now(app, out);
                             }
                         }
                         None => {}
@@ -8270,17 +8328,19 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     }
                 }
                 Some(HitTarget::CloudSessionLink) => {
-                    if let Some(cloud) = app.previewed_cloud() {
-                        open_link(app, &cloud.url, out);
-                    }
+                    activate::cloud_link(app, out);
                 }
                 Some(HitTarget::TerminalPane) => {
-                    // A click into the pane is deliberate — lock input too.
-                    if let Some(t) = &app.term {
-                        app.focus = Focus::Terminal;
-                        if !t.exited {
-                            app.term_locked = true;
-                        }
+                    // A click into the pane is deliberate — it is Enter on
+                    // the pane (`enter_terminal_pane`): FOCUS, the input
+                    // lock for a live session, and a debounced attach sent
+                    // now, since keystrokes are about to need it. The
+                    // click used to set the first two itself and skipped
+                    // the third, so typing right after clicking into a
+                    // session the cursor had just swept onto went to a
+                    // pane the daemon had not been asked for yet.
+                    if let Some(sref) = app.term.as_ref().map(|t| t.sref.clone()) {
+                        enter_terminal_pane(app, out);
                         let cell = pane_cell(app.term_area, mouse.column, mouse.row);
                         let (mode, sgr) = app.child_mouse_mode();
                         if mode != vt100::MouseProtocolMode::None {
@@ -8292,7 +8352,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                             // conversation, and a screen-row copy of ours
                             // took both (#52). ⇧drag still selects through
                             // the terminal.
-                            let sref = t.sref.clone();
                             let button = mouse_modifier_bits(mouse.modifiers);
                             forward_mouse(app, out, sgr, button, false, &mouse);
                             app.term_mouse_grab = Some(sref);
@@ -8471,111 +8530,26 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
         }
         MouseEventKind::Down(MouseButton::Right) => {
+            // The right button is two keys: the cursor moves onto the row
+            // as a left click moves it (`select_clicked_row`), then `m` —
+            // the row's own CONTEXT MENU, from the one builder. A panel's
+            // background has no row and no cursor, so its menu is the
+            // mouse's alone.
             let at = (mouse.column, mouse.row);
             match app.hit_at(mouse.column, mouse.row) {
-                Some(HitTarget::Workspace(i)) => {
-                    if let Some(id) = app.tree.workspaces.get(i).map(|w| w.id.clone()) {
-                        switch_workspace(app, id, out);
-                    }
-                    enter_workspaces_bar(app);
-                    let items = workspace_menu(app);
-                    open_menu(app, items, at);
-                }
-                Some(HitTarget::Project(i)) => {
-                    app.sel_project = i;
-                    app.focus = Focus::Projects;
-                    if let Some(p) = app.selected_project() {
-                        let items = vec![
-                            MenuItem::new("New worktree", MenuAction::NewWorktree(p.id.clone())),
-                            MenuItem::new("Add project", MenuAction::AddProject),
-                            MenuItem::new("Rename", MenuAction::RenameProject(p.id.clone())),
-                            MenuItem::destructive(
-                                "Remove from list",
-                                MenuAction::RemoveProject(p.id.clone()),
-                            ),
-                        ];
-                        open_menu(app, items, at);
-                    }
-                }
-                Some(HitTarget::Worktree(i)) => {
-                    app.sel_worktree = i;
-                    app.sel_session = 0;
-                    app.focus = Focus::Worktrees;
-                    if let Some(pr) = app.selected_worktree_pr().cloned() {
-                        let items = pr_row_menu_items(app, &pr);
-                        open_menu(app, items, at);
-                    } else if let Some(w) = app.selected_worktree().cloned() {
-                        let items = worktree_menu_items(app, &w);
-                        open_menu(app, items, at);
-                    }
-                }
-                Some(HitTarget::Session(i)) => {
-                    app.sel_session = i;
-                    app.focus = Focus::Sessions;
-                    match app.selected_session_row() {
-                        Some(SessionRow::Agent(a)) => {
-                            open_menu(app, menu_items_for_session(&a), at)
-                        }
-                        Some(SessionRow::Terminal(t)) => {
-                            open_menu(app, menu_items_for_terminal(&t), at)
-                        }
-                        Some(SessionRow::Link(l)) => open_menu(app, menu_items_for_link(&l), at),
-                        None => {}
-                    }
-                }
                 Some(HitTarget::PanelBg(focus)) => {
                     app.focus = focus;
-                    let items = match focus {
-                        Focus::Workspaces => {
-                            vec![MenuItem::new("New workspace", MenuAction::NewWorkspace)]
-                        }
-                        Focus::Projects => {
-                            vec![MenuItem::new("Add project", MenuAction::AddProject)]
-                        }
-                        Focus::Worktrees => app
-                            .selected_project()
-                            .map(|p| {
-                                let mut items = vec![MenuItem::new(
-                                    "New worktree",
-                                    MenuAction::NewWorktree(p.id.clone()),
-                                )];
-                                // Only once there is a group to fold.
-                                if !app.listed_open_prs().is_empty() {
-                                    items.push(MenuItem::new(
-                                        "Show/hide open PRs",
-                                        MenuAction::ToggleOpenPrs,
-                                    ));
-                                }
-                                // And drafts to hide — or, once hidden,
-                                // a way back that doesn't need the list
-                                // to still hold one.
-                                if app.hide_draft_prs
-                                    || app.all_open_prs().iter().any(|pr| pr.is_draft)
-                                {
-                                    let label = if app.hide_draft_prs {
-                                        "Show draft PRs"
-                                    } else {
-                                        "Hide draft PRs"
-                                    };
-                                    items.push(MenuItem::new(label, MenuAction::ToggleDraftPrs));
-                                }
-                                items
-                            })
-                            .unwrap_or_default(),
-                        Focus::Sessions => app
-                            .selected_worktree()
-                            .map(|w| {
-                                vec![
-                                    MenuItem::new("New agent", MenuAction::NewAgent(w.id.clone())),
-                                    MenuItem::new("Show/hide archived", MenuAction::ToggleArchived),
-                                ]
-                            })
-                            .unwrap_or_default(),
-                        Focus::Terminal => vec![],
-                    };
+                    let items = panel_menu_items(app, focus);
                     open_menu(app, items, at);
                 }
-                _ => {}
+                Some(target) => {
+                    if select_clicked_row(app, &target, out) {
+                        if let Some(items) = context_menu_items(app, app.focus) {
+                            open_menu(app, items, at);
+                        }
+                    }
+                }
+                None => {}
             }
             app.dirty = true;
         }
@@ -8746,17 +8720,27 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             reconcile_selection_inner(app, before, out);
         }
         ServerEvent::Ack { req_id, created } => {
+            // False for a create the user has navigated away from since
+            // firing it (`App::left_behind`): the rows still become the
+            // real ones, and nothing below moves a cursor, the pane or
+            // FOCUS back to them.
+            let follow = !app.left_behind.remove(&req_id);
             match (app.pending.remove(&req_id), created) {
                 (Some(PendingIntent::AttachCreated { focus, placeholder }), Some(id)) => {
-                    attach_created(app, id, focus, placeholder, out);
+                    attach_created(app, id, focus, placeholder, follow, out);
                 }
                 (
                     Some(PendingIntent::AttachCreatedWithCloudRetry {
                         focus, placeholder, ..
                     }),
                     Some(id),
-                ) => attach_created(app, id, focus, placeholder, out),
-                (Some(PendingIntent::AttachCreatedPrSession { focus, placeholder }), created) => {
+                ) => attach_created(app, id, focus, placeholder, follow, out),
+                (
+                    Some(PendingIntent::AttachCreatedPrSession {
+                        focus, placeholder, ..
+                    }),
+                    created,
+                ) => {
                     match created {
                         Some(EntityId::Agent(real)) => {
                             // The checkout's upsert usually adopted the
@@ -8769,6 +8753,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                                 EntityId::Agent(real),
                                 focus,
                                 Some(placeholder.agent),
+                                follow,
                                 out,
                             );
                         }
@@ -8813,7 +8798,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 (Some(PendingIntent::SelectCreatedProject), Some(EntityId::Project(id))) => {
                     // Its upsert usually lands just before this Ack; if not,
                     // stash the id and select once it does.
-                    if !select_created_project(app, &id, out) {
+                    if follow && !select_created_project(app, &id, out) {
                         app.select_project_when_seen = Some(id);
                     }
                 }
@@ -8838,7 +8823,8 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     }
                     // A launch fired into the stand-in while the DAEMON
                     // worked goes out now, into the checkout it cut.
-                    if let Some(draft) = launch {
+                    if let Some(mut draft) = launch {
+                        draft.follow = follow;
                         placeholder::replay_launch(app, *draft, &id, out);
                     }
                 }
@@ -8855,9 +8841,12 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     text,
                     placeholder,
                     id,
+                    follow,
                     out,
                 ),
-                (Some(PendingIntent::OpenCreatedWorkspace), Some(EntityId::Workspace(id))) => {
+                (Some(PendingIntent::OpenCreatedWorkspace), Some(EntityId::Workspace(id)))
+                    if follow =>
+                {
                     // A workspace created from the WORKSPACE SWITCHER or the
                     // WORKSPACES BAR: show it right away, with the cursor on
                     // the first visible sidebar rather than leave focus on
@@ -8971,6 +8960,9 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // A failed request's intent never gets an Ack; clear it — and if
             // it was an optimistic worktree delete, put the rows back. A
             // failed Cloud launch reopens its populated task editor.
+            if let Some(id) = &req_id {
+                app.left_behind.remove(id);
+            }
             match req_id.and_then(|id| app.pending.remove(&id)) {
                 Some(PendingIntent::DeleteWorktree(rollback)) => {
                     restore_worktree_rows(app, rollback)
@@ -9027,9 +9019,40 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     reopen_prompt_with(app, prompt, text);
                 }
                 // A PR SESSION was refused: its stand-ins go — both rows,
-                // or the session's alone once the checkout was cut.
-                Some(PendingIntent::AttachCreatedPrSession { placeholder, .. }) => {
+                // or the session's alone once the checkout was cut — and
+                // the box it was sent from comes back with its text.
+                Some(PendingIntent::AttachCreatedPrSession {
+                    placeholder,
+                    reopen,
+                    pr_url,
+                    ..
+                }) => {
+                    let on_stand_in = app
+                        .selected_worktree()
+                        .is_some_and(|w| w.id == placeholder.worktree);
                     placeholder::discard_pr(app, &placeholder, out);
+                    // A cursor still on the refused checkout goes back to
+                    // the pull request it was launched from, not to
+                    // wherever `restore_context` falls back to.
+                    if on_stand_in {
+                        if let Some(row) = app.open_pr_row_of(&pr_url) {
+                            if app.sel_worktree != row {
+                                select_worktree_row(app, row, out);
+                            }
+                        }
+                    }
+                    match reopen {
+                        // The refusal lands seconds after Enter: a modal
+                        // opened meanwhile keeps its own text, and this
+                        // box's waits for the next `p` on the pull request.
+                        Some((_, text)) if app.overlay.is_some() => {
+                            if !text.is_empty() {
+                                app.parked_pr_prompt = Some((pr_url, text));
+                            }
+                        }
+                        Some((kind, text)) => reopen_prompt_with(app, kind, text),
+                        None => {}
+                    }
                 }
                 // A launch that waited on the NEW WORKTREE modal's checkout
                 // and was refused once it went out: its stand-in row goes,
@@ -9051,11 +9074,18 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
 /// enters and locks the pane. A QUICK PROMPT's stand-in row, when one was
 /// up for this create, becomes the created row first, so the cursor and
 /// the pane carry over instead of jumping.
+///
+/// Without `follow` — the user navigated away while the DAEMON worked —
+/// the row is in the list and that is all: no cursor, no FOCUS and no
+/// worktree switch goes back to it. A pane still on the stand-in (the
+/// user stepped into it, or onto a pull request, which leaves the pane as
+/// it was) goes on showing that session, now the real one.
 fn attach_created(
     app: &mut App,
     id: EntityId,
     focus: bool,
     placeholder: Option<AgentId>,
+    follow: bool,
     out: &mut Vec<ClientRequest>,
 ) {
     if let (Some(stand_in), EntityId::Agent(real)) = (&placeholder, &id) {
@@ -9069,6 +9099,17 @@ fn attach_created(
     let Some(sref) = sref else {
         return;
     };
+    if !follow {
+        let stand_in_shown = placeholder.is_some_and(|stand_in| {
+            app.term
+                .as_ref()
+                .is_some_and(|t| t.sref == SessionRef::Agent(stand_in))
+        });
+        if stand_in_shown {
+            attach_now(app, sref, out);
+        }
+        return;
+    }
     app.select_when_seen = Some(sref.clone());
     // Its upsert usually lands just before this Ack; land the selection
     // now, or on the upsert otherwise.
@@ -9273,9 +9314,17 @@ fn refresh_palette(app: &mut App) {
 
 /// What each panel cursor pointed at, captured with `selection_snapshot`
 /// before a tree mutation so `reconcile_selection` can compare afterwards.
+#[derive(PartialEq)]
 struct SelectionSnapshot {
     project: Option<nebula_core::ProjectId>,
     worktree: Option<WorktreeId>,
+    /// The OPEN PRS row under the Worktrees cursor, by URL, when it is on
+    /// one (`worktree` is None then). The pull requests list below the
+    /// checkouts, so every checkout that comes or goes shifts them: left
+    /// to its index, the cursor slid onto the next pull request — and a
+    /// launch with no box (`n` under `skip_session_naming`, a `skip`-task
+    /// preset) then ran against a pull request nobody picked.
+    pr: Option<String>,
     session: Option<SessionRef>,
     /// The Sessions panel row the cursor was on, and the group that row
     /// sat in. Following onto an archived row is only right when the
@@ -9310,6 +9359,7 @@ fn selection_snapshot(app: &App) -> SelectionSnapshot {
     SelectionSnapshot {
         project: app.selected_project().map(|p| p.id.clone()),
         worktree: app.selected_worktree().map(|w| w.id.clone()),
+        pr: app.selected_worktree_pr().map(|pr| pr.url.clone()),
         session_index: app.sel_session,
         session_group: row.as_ref().map(session_group),
         session: row.and_then(|r| r.sref()),
@@ -9361,6 +9411,14 @@ fn reconcile_selection_inner(
                     restore_session(app, out);
                     return;
                 }
+            }
+        }
+    } else if let Some(url) = &before.pr {
+        // A pull request that is still listed keeps the cursor; one that
+        // left is followed nowhere, and the cursor stays where it landed.
+        if app.selected_worktree_pr().map(|pr| &pr.url) != Some(url) {
+            if let Some(i) = app.open_pr_row_of(url) {
+                app.sel_worktree = i;
             }
         }
     }
@@ -16753,32 +16811,64 @@ diff --git a/src/c.rs b/src/c.rs
         assert_eq!(app.run_flash_when_seen, None, "spent");
     }
 
-    /// `Shift+Enter` on a worktree fires `.nebula.json`'s `open` — and says
-    /// what to add when there is none, without Enter's drill-in.
+    /// `Shift+Enter` on a worktree fires its OPEN COMMAND — the project's
+    /// **Open command** setting first, else `.nebula.json`'s `open` — and
+    /// with neither says where to put one, without Enter's drill-in. The
+    /// key answers from the Sessions panel too, where the cursor's
+    /// worktree is just as much the context, and `Shift+O` beside it.
     #[test]
     fn shift_enter_on_a_worktree_fires_its_open_command() {
+        use crate::config::SettingKind::OpenCommand;
         let dir = tempfile::tempdir().unwrap();
-        let mut app = App::new();
-        seed_repo_tree(&mut app, dir.path());
-        app.focus = Focus::Worktrees;
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
-        assert!(
-            app.flash
-                .as_deref()
-                .is_some_and(|f| f.contains("no .nebula.json")),
-            "{:?}",
-            app.flash
-        );
-        assert_eq!(app.focus, Focus::Worktrees, "not Enter's drill-in");
+        let config_path = dir.path().join("config.json");
+        crate::config::with_config_path(config_path.clone(), || {
+            let mut app = App::new();
+            seed_repo_tree(&mut app, dir.path());
+            app.focus = Focus::Worktrees;
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
+            let flash = app.flash.clone().unwrap_or_default();
+            assert!(
+                flash.contains("no open command")
+                    && flash.contains("Settings")
+                    && flash.contains(".nebula.json"),
+                "names both places: {flash}"
+            );
+            assert_eq!(app.focus, Focus::Worktrees, "not Enter's drill-in");
 
-        std::fs::write(
-            dir.path().join(".nebula.json"),
-            r#"{"open": "open http://localhost:3000"}"#,
-        )
-        .unwrap();
-        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
-        assert_eq!(app.flash.as_deref(), Some("↗ open http://localhost:3000"));
+            std::fs::write(
+                dir.path().join(".nebula.json"),
+                r#"{"open": "open http://localhost:3000"}"#,
+            )
+            .unwrap();
+            press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
+            assert_eq!(app.flash.as_deref(), Some("↗ open http://localhost:3000"));
+
+            // The setting wins over the file, and is read fresh per press.
+            let mut cfg = crate::config::Config::load();
+            assert!(cfg.set_project_text(dir.path(), OpenCommand, "open http://localhost:5173"));
+            cfg.save_to(&config_path).unwrap();
+            press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
+            assert_eq!(app.flash.as_deref(), Some("↗ open http://localhost:5173"));
+
+            // Sessions panel, Shift+O: the same worktree is under the
+            // cursor, so the same command fires, and focus stays put.
+            app.focus = Focus::Sessions;
+            app.flash = None;
+            press(&mut app, KeyCode::Char('O'), KeyModifiers::SHIFT, &mut out);
+            assert_eq!(app.flash.as_deref(), Some("↗ open http://localhost:5173"));
+            assert_eq!(app.focus, Focus::Sessions);
+            // Alt+Enter — the ESC CR a terminal without the kitty protocol
+            // sends for a mapped Shift+Enter — is the same key.
+            app.flash = None;
+            press(&mut app, KeyCode::Enter, KeyModifiers::ALT, &mut out);
+            assert_eq!(app.flash.as_deref(), Some("↗ open http://localhost:5173"));
+            assert_eq!(app.focus, Focus::Sessions, "still not Enter's drill-in");
+            assert!(
+                out.is_empty(),
+                "opening is the TUI's own doing, never a request"
+            );
+        });
     }
 
     #[test]
@@ -22337,7 +22427,7 @@ diff --git a/src/c.rs b/src/c.rs
             assert_eq!(prompt.title, "Worktree base branch");
             assert_eq!(prompt.input.as_str(), "");
             assert!(
-                matches!(prompt.kind, PromptKind::SettingText { kind } if kind == WorktreeBaseBranch)
+                matches!(prompt.kind, PromptKind::SettingText { kind, .. } if kind == WorktreeBaseBranch)
             );
 
             type_text(&mut app, "master", &mut out);
@@ -27226,6 +27316,502 @@ diff --git a/src/c.rs b/src/c.rs
         }
     }
 
+    /// `p` on a PROJECT OPEN PRS GROUP row is the QUICK PROMPT for a PR
+    /// SESSION on that pull request — the box `e` there hands back, less
+    /// the preset: titled for the PR, its target the PROJECT's ROOT
+    /// WORKTREE (which only names the project the create goes to), and
+    /// Enter sends one `CreatePrAgent` with the typed text as its
+    /// STARTING PROMPT. The checkout of the PR's head branch does not
+    /// exist yet, so its stand-in row goes up the moment Enter is
+    /// pressed — nested under the pull request's row, where the DAEMON's
+    /// real row will list and adopt it — never a random-branch checkout
+    /// the session would have to move onto the pull request itself. From
+    /// any other panel with the Worktrees cursor parked on the pull
+    /// request, `p` opens the same box instead of asking for a worktree.
+    #[test]
+    fn p_on_an_open_pr_row_launches_a_pr_session_with_its_checkout_up_at_once() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            seed_open_prs(&mut app, &[(7, "Attach links")]);
+            app.focus = Focus::Worktrees;
+            app.sel_worktree = 1;
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!(
+                    "p on a PR row opens the quick prompt, got {:?}",
+                    app.overlay
+                );
+            };
+            assert_eq!(prompt.title, "Quick prompt · PR #7 (claude)");
+            let PromptKind::QuickPrompt(launch) = &prompt.kind else {
+                panic!("{:?}", prompt.kind);
+            };
+            assert_eq!(launch.pr.as_ref().map(|pr| pr.number), Some(7));
+            assert_eq!(
+                launch.target,
+                crate::quick_prompt::QuickTarget::Worktree(WorktreeId("w1".into())),
+                "the ROOT WORKTREE names the project the create goes to"
+            );
+            assert!(
+                launch.preset.is_none(),
+                "no preset: the text alone is the prompt"
+            );
+            assert!(out.is_empty(), "opening it sends nothing: {out:?}");
+
+            type_text(&mut app, "Fix auth", &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            let creates: Vec<&ClientRequest> = out
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r,
+                        ClientRequest::CreatePrAgent { .. }
+                            | ClientRequest::CreateAgent { .. }
+                            | ClientRequest::CreateWorktree { .. }
+                    )
+                })
+                .collect();
+            let req_id = match creates.as_slice() {
+                [ClientRequest::CreatePrAgent {
+                    req_id,
+                    project,
+                    kind: AgentKind::Claude,
+                    auto_title: true,
+                    pr_url,
+                    head,
+                    starting_prompt: Some(text),
+                    ..
+                }] if project.as_str() == "p1"
+                    && pr_url == "https://github.com/o/r/pull/7"
+                    && head == "pr-7-head"
+                    && text == "Fix auth" =>
+                {
+                    *req_id
+                }
+                other => panic!("one PR create, no random worktree of its own: {other:?}"),
+            };
+            assert!(
+                out.iter()
+                    .all(|r| !matches!(r, ClientRequest::PrewarmAgent { .. })),
+                "an unscoped warm CLI must not start for a PR SESSION: {out:?}"
+            );
+
+            // The stand-in checkout is up at once — under the pull request.
+            let stand_in = app
+                .tree
+                .worktrees
+                .iter()
+                .find(|w| w.branch == "pr-7-head")
+                .map(|w| w.id.clone())
+                .expect("the head branch's stand-in row");
+            assert!(app.is_placeholder_worktree(&stand_in));
+            assert_eq!(
+                app.worktree_row_of(&stand_in),
+                Some(2),
+                "nested under the pull request's row, not among the plain checkouts"
+            );
+            assert_eq!(app.sel_worktree, 2, "the cursor is on it");
+            assert_eq!(
+                app.focus,
+                Focus::Worktrees,
+                "FOCUS stays where p was pressed"
+            );
+            assert!(
+                matches!(
+                    app.pending.get(&req_id),
+                    Some(PendingIntent::AttachCreatedPrSession { placeholder, .. })
+                        if placeholder.worktree == stand_in
+                ),
+                "{:?}",
+                app.pending.get(&req_id)
+            );
+            app.panel_widths[1] += 2;
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("└○ pr-7-head"), "{text}");
+
+            // The DAEMON's row for the checkout takes the stand-in's place.
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: nebula_core::Entity::Worktree(nebula_core::Worktree {
+                        id: WorktreeId("w7".into()),
+                        project_id: nebula_core::ProjectId("p1".into()),
+                        path: "/tmp/demo-worktrees/pr-7-head".into(),
+                        branch: "pr-7-head".into(),
+                        is_main: false,
+                        sort_order: 1,
+                    }),
+                },
+            );
+            assert!(
+                !app.tree.worktrees.iter().any(|w| w.id == stand_in),
+                "{:?}",
+                app.tree.worktrees
+            );
+            assert_eq!(
+                app.worktree_row_of(&WorktreeId("w7".into())),
+                Some(2),
+                "the real row lists where the stand-in did"
+            );
+
+            // From another panel, the pull request under the Worktrees
+            // cursor is still what p is for — not a flash.
+            let mut app = App::new();
+            seed_tree(&mut app);
+            seed_open_prs(&mut app, &[(7, "Attach links")]);
+            app.sel_worktree = 1;
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(prompt))
+                        if prompt.title == "Quick prompt · PR #7 (claude)"
+                ),
+                "{:?}",
+                app.overlay
+            );
+            assert!(app.flash.is_none(), "{:?}", app.flash);
+            assert!(out.is_empty(), "{out:?}");
+        });
+    }
+
+    /// The launch that landed a PR SESSION in the main checkout: `e` on
+    /// the OPEN PRS row of a contributor's pull request from their fork's
+    /// own `main`, a `skip`-task preset, Enter — no box, no typing. The
+    /// row's checkout branch is the fork's (`givemeurhats/main`, as `gh pr
+    /// list` is parsed), so the ROOT WORKTREE on our `main` is not "the
+    /// checkout already on the head branch": the stand-in rows go up at
+    /// once, nested under the pull request, the create names the fork's
+    /// branch, and nothing is launched into — or staged under — the root.
+    #[test]
+    fn a_skip_preset_on_a_forks_main_cuts_the_prs_own_checkout_not_the_root() {
+        with_seeded_presets(|| {
+            let mut presets = crate::agent_presets::load();
+            presets.push(crate::agent_presets::AgentPreset {
+                name: "review and merge".into(),
+                kind: AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                prefix: "Investigate whether this pull request should be merged.".into(),
+                postfix: String::new(),
+                skip_task: true,
+            });
+            crate::agent_presets::save(&presets).unwrap();
+            let skip_row = presets.len() - 1;
+
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let root = WorktreeId("w1".into());
+            assert!(
+                app.tree
+                    .worktrees
+                    .iter()
+                    .any(|w| w.id == root && w.is_main && w.branch == "main"),
+                "the ROOT WORKTREE is on our main: {:?}",
+                app.tree.worktrees
+            );
+            let list = crate::pull_request::parse_list(
+                r#"[{"number":129,"title":"Prefer PowerShell 7",
+                     "url":"https://github.com/o/r/pull/129","isDraft":false,
+                     "headRefName":"main","isCrossRepository":true,
+                     "headRepositoryOwner":{"login":"givemeurhats"}}]"#,
+            )
+            .expect("parsed");
+            let project = app.selected_project().expect("a project").id.clone();
+            let now = std::time::Instant::now();
+            app.open_prs.insert(
+                project,
+                crate::app::OpenPrs {
+                    list,
+                    at: now,
+                    due: now + OPEN_PRS_REFRESH,
+                    step: OPEN_PRS_REFRESH,
+                },
+            );
+            let url = "https://github.com/o/r/pull/129";
+            app.focus = Focus::Worktrees;
+            app.sel_worktree = app.open_pr_row_of(url).expect("#129 is a row");
+            let pr_row = app.sel_worktree;
+            let agents_under_root = |app: &App| {
+                app.tree
+                    .agents
+                    .iter()
+                    .filter(|a| a.worktree_id == root)
+                    .count()
+            };
+            let before = agents_under_root(&app);
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+            for _ in 0..skip_row {
+                press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                app.overlay.is_none(),
+                "no box for a skip preset: {:?}",
+                app.overlay
+            );
+
+            let creates: Vec<&ClientRequest> = out
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r,
+                        ClientRequest::CreatePrAgent { .. }
+                            | ClientRequest::CreateAgent { .. }
+                            | ClientRequest::CreateWorktree { .. }
+                    )
+                })
+                .collect();
+            assert!(
+                matches!(
+                    creates.as_slice(),
+                    [ClientRequest::CreatePrAgent {
+                        pr_url,
+                        head,
+                        starting_prompt: Some(text),
+                        ..
+                    }] if pr_url == url
+                        && head == "givemeurhats/main"
+                        && text == "Investigate whether this pull request should be merged."
+                ),
+                "one PR create, on the fork's branch: {out:?}"
+            );
+
+            let stand_in = app
+                .tree
+                .worktrees
+                .iter()
+                .find(|w| w.branch == "givemeurhats/main")
+                .map(|w| w.id.clone())
+                .expect("the fork branch's stand-in row");
+            assert!(app.is_placeholder_worktree(&stand_in));
+            assert_eq!(
+                app.worktree_row_of(&stand_in),
+                Some(pr_row + 1),
+                "nested under the pull request's row"
+            );
+            assert_eq!(app.sel_worktree, pr_row + 1, "the cursor is on it");
+            assert_eq!(
+                agents_under_root(&app),
+                before,
+                "nothing is staged under the root"
+            );
+            assert!(
+                app.tree
+                    .agents
+                    .iter()
+                    .any(|a| a.worktree_id == stand_in && app.is_placeholder_agent(&a.id)),
+                "the session's stand-in is under the fork's checkout: {:?}",
+                app.tree.agents
+            );
+        });
+    }
+
+    /// The pull request under the Worktrees cursor is what `e` is for from
+    /// whichever panel has FOCUS — the pane reading it above all, where a
+    /// review preset is reached for — as it is for `p`: a pull request row
+    /// has no worktree and no sessions for the presets list to manage, so
+    /// the key opens the PR SESSION picker rather than saying where it
+    /// works.
+    #[test]
+    fn e_reaches_the_pr_preset_picker_from_any_panel() {
+        with_seeded_presets(|| {
+            for focus in [Focus::Projects, Focus::Sessions, Focus::Terminal] {
+                let mut app = App::new();
+                seed_tree(&mut app);
+                seed_open_prs(&mut app, &[(7, "Attach links")]);
+                app.sel_worktree = 1;
+                app.focus = focus;
+                assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+                let mut out = Vec::new();
+                press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+                let Some(Overlay::AgentPresets(view)) = &app.overlay else {
+                    panic!(
+                        "e from {focus:?} opens the PR preset picker, got {:?} ({:?})",
+                        app.overlay, app.flash
+                    );
+                };
+                let back = view.quick.as_ref().expect("a picker, not the manager");
+                assert_eq!(back.launch.pr.as_ref().map(|pr| pr.number), Some(7));
+                assert!(out.is_empty(), "{out:?}");
+            }
+        });
+    }
+
+    /// A PR SESSION's create is the launch most likely to be refused — the
+    /// DAEMON fetches before it cuts — so a refusal takes the stand-ins
+    /// down, puts the cursor back on the pull request it was launched from
+    /// (not on the ROOT WORKTREE `restore_context` would fall back to) and
+    /// brings the box back with the pull request and the text, as every
+    /// other quick prompt's refusal does. A second launch fired while the
+    /// first one's checkout is still being cut is refused on the spot, and
+    /// keeps its text the same way. A refusal that lands while another
+    /// modal is up never replaces it: the refused text waits for the next
+    /// `p` on that pull request.
+    #[test]
+    fn a_refused_pr_quick_prompt_brings_the_box_back_with_its_text() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            seed_open_prs(&mut app, &[(7, "Attach links")]);
+            app.focus = Focus::Worktrees;
+            app.sel_worktree = 1;
+            let mut out = Vec::new();
+            let box_text = |app: &App| match &app.overlay {
+                Some(Overlay::Prompt(prompt)) => match &prompt.kind {
+                    PromptKind::QuickPrompt(launch) if launch.pr.is_some() => {
+                        Some(prompt.input.as_str().to_string())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            let last_create = |out: &[ClientRequest]| {
+                out.iter()
+                    .rev()
+                    .find_map(|r| match r {
+                        ClientRequest::CreatePrAgent { req_id, .. } => Some(*req_id),
+                        _ => None,
+                    })
+                    .expect("a PR create went out")
+            };
+            let refusal = "could not fetch pull request #7 (pr-7-head) from origin";
+            let refuse = |app: &mut App, req_id: u64| {
+                hse(
+                    app,
+                    ServerEvent::Error {
+                        req_id: Some(req_id),
+                        message: refusal.into(),
+                    },
+                );
+            };
+
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            type_text(&mut app, "Review the auth change", &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert_eq!(worktree_branches(&app), ["main", "pr-7-head"]);
+            assert!(
+                app.selected_worktree().is_some(),
+                "the cursor is on the stand-in"
+            );
+
+            // The DAEMON refuses it: a fetch that failed.
+            refuse(&mut app, last_create(&out));
+            assert_eq!(worktree_branches(&app), ["main"], "the stand-ins are down");
+            assert_eq!(app.flash.as_deref(), Some(refusal));
+            assert_eq!(
+                app.selected_worktree_pr().map(|pr| pr.number),
+                Some(7),
+                "the cursor is back on the pull request, not on the root"
+            );
+            assert_eq!(box_text(&app).as_deref(), Some("Review the auth change"));
+
+            // Sent again as it came back; then a second launch while that
+            // checkout is still being cut.
+            out.clear();
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let second = last_create(&out);
+            app.sel_worktree = app.open_pr_row_of(&pr_url(7)).expect("#7 is a row");
+            out.clear();
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            type_text(&mut app, "And the tests", &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert_eq!(app.flash.as_deref(), Some(WORKTREE_STILL_CREATING));
+            assert_eq!(box_text(&app).as_deref(), Some("And the tests"));
+            assert!(
+                !out.iter()
+                    .any(|r| matches!(r, ClientRequest::CreatePrAgent { .. })),
+                "nothing is sent for it: {out:?}"
+            );
+
+            // The first is refused while that box is still up: the box
+            // keeps its own text, and the refused one waits its turn.
+            refuse(&mut app, second);
+            assert_eq!(app.flash.as_deref(), Some(refusal));
+            assert_eq!(
+                box_text(&app).as_deref(),
+                Some("And the tests"),
+                "a late refusal never replaces the modal that is up"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            app.sel_worktree = app.open_pr_row_of(&pr_url(7)).expect("#7 is a row");
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert_eq!(
+                box_text(&app).as_deref(),
+                Some("Review the auth change"),
+                "the next p on the pull request starts from the refused text"
+            );
+        });
+    }
+
+    /// The pull requests list below the checkouts, so a checkout that comes
+    /// or goes shifts every one of them. The cursor follows its pull
+    /// request by URL, as it follows a checkout by id: left to its index it
+    /// slid onto the next pull request, and a launch with no box — a
+    /// `skip`-task preset, `n` under `skip_session_naming` — then ran
+    /// against a pull request nobody picked. A PR SESSION's create fired
+    /// from the row also boots no warm Claude in the ROOT WORKTREE, which
+    /// only names the project.
+    #[test]
+    fn the_cursor_follows_its_pull_request_when_the_checkouts_above_it_change() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            seed_open_prs(&mut app, &[(7, "Attach links"), (9, "Second")]);
+            app.focus = Focus::Worktrees;
+            app.sel_worktree = app.open_pr_row_of(&pr_url(9)).expect("#9 is a row");
+            assert_eq!(app.selected_worktree_pr().map(|pr| pr.number), Some(9));
+
+            // A sibling session cuts a worktree: one more row above the group.
+            seed_feat_worktree(&mut app, "w2", "feat");
+            assert_eq!(
+                app.selected_worktree_pr().map(|pr| pr.number),
+                Some(9),
+                "still on #9, one row further down"
+            );
+            // And it goes again.
+            hse(
+                &mut app,
+                ServerEvent::EntityRemoved {
+                    id: EntityId::Worktree(WorktreeId("w2".into())),
+                },
+            );
+            assert_eq!(app.selected_worktree_pr().map(|pr| pr.number), Some(9));
+
+            // `n` with no name box: the create goes out at once, for #9,
+            // and nothing is warmed in the root for it.
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                out.iter().any(|r| matches!(
+                    r,
+                    ClientRequest::CreatePrAgent { pr_url: url, .. } if *url == pr_url(9)
+                )),
+                "{out:?}"
+            );
+            assert!(
+                out.iter()
+                    .all(|r| !matches!(r, ClientRequest::PrewarmAgent { .. })),
+                "no warm spare in the root for a PR SESSION: {out:?}"
+            );
+        });
+    }
+
     /// `e` on a PROJECT OPEN PRS GROUP row is the preset picker for a PR
     /// SESSION: the pick hands the QUICK PROMPT back titled for the PR,
     /// `Ctrl+N` in it is refused (the DAEMON picks the checkout), and
@@ -28230,7 +28816,9 @@ diff --git a/src/c.rs b/src/c.rs
                 press(app, KeyCode::Char('s'), KeyModifiers::NONE, out);
                 let digit = char::from_digit(tab as u32 + 1, 10).unwrap();
                 press(app, KeyCode::Char(digit), KeyModifiers::NONE, out);
-                press(app, KeyCode::Down, KeyModifiers::NONE, out);
+                for _ in 0..=row {
+                    press(app, KeyCode::Down, KeyModifiers::NONE, out);
+                }
                 let view = settings(app).expect("settings open");
                 assert_eq!(view.tab, tab);
                 assert_eq!(view.selected, row);
@@ -28293,8 +28881,171 @@ diff --git a/src/c.rs b/src/c.rs
         });
     }
 
+    /// **Run command** on the PROJECT TAB: Enter opens a prompt titled with
+    /// the project, pre-filled with its stored command; Enter there writes
+    /// `run_command` into that project's entry (and nothing else), the
+    /// row reads it back, the tab on another project still reads
+    /// `.nebula.json`; ←/→ only explain themselves; Esc keeps the old
+    /// value; an empty Enter puts the file back and drops the key. With
+    /// no project in the tree, Enter opens nothing and says why.
+    #[test]
+    fn the_project_tab_run_command_is_typed_into_the_selected_projects_entry() {
+        use crate::config::SettingKind::RunCommand;
+        use nebula_core::{Entity, Project, ProjectId};
+        let draw_to_string = |app: &mut App, w: u16, h: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| ui::draw(f, app)).unwrap();
+            buffer_text(&terminal)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let saved = |path: &std::path::Path| -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        crate::config::with_config_path(path.clone(), || {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Project(Project {
+                        workspace_id: Default::default(),
+                        id: ProjectId("p2".into()),
+                        name: "other".into(),
+                        repo_path: "/tmp/other".into(),
+                        sort_order: 1,
+                    }),
+                },
+            );
+            app.sel_project = 0;
+            let tab = crate::config::project_tab();
+            let (_, row) = crate::config::locate(RunCommand).unwrap();
+            let open_on_row = |app: &mut App, out: &mut Vec<ClientRequest>| {
+                press(app, KeyCode::Char('s'), KeyModifiers::NONE, out);
+                let digit = char::from_digit(tab as u32 + 1, 10).unwrap();
+                press(app, KeyCode::Char(digit), KeyModifiers::NONE, out);
+                // Wherever the jump left the cursor — the strip, or the
+                // row the overlay remembered — climb to the strip and
+                // walk down to the row.
+                for _ in 0..crate::config::tab_len(tab) {
+                    press(app, KeyCode::Up, KeyModifiers::NONE, out);
+                }
+                for _ in 0..=row {
+                    press(app, KeyCode::Down, KeyModifiers::NONE, out);
+                }
+                let view = settings(app).expect("settings open");
+                assert_eq!((view.tab, view.selected, view.on_tabs), (tab, row, false));
+            };
+
+            open_on_row(&mut app, &mut out);
+            let screen = draw_to_string(&mut app, 100, 40);
+            assert!(screen.contains("Run command"), "{screen}");
+            assert!(
+                screen.contains("[.nebula.json]"),
+                "unset reads as the file: {screen}"
+            );
+
+            // ←/→: nothing to cycle, the overlay stays and explains.
+            press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
+            let view = settings_view(&app);
+            assert_eq!(view.selected, row);
+            assert!(
+                matches!(&view.notice, Some((t, _)) if t.contains("Enter")),
+                "{:?}",
+                view.notice
+            );
+
+            // Enter: a prompt in the overlay's place, named for the project.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("expected the run command prompt, got {:?}", app.overlay);
+            };
+            assert_eq!(prompt.title, "Run command · demo");
+            assert_eq!(prompt.input.as_str(), "");
+            assert!(matches!(
+                &prompt.kind,
+                PromptKind::SettingText { kind: RunCommand, project: Some(p) }
+                    if p == std::path::Path::new("/tmp/demo")
+            ));
+            type_text(&mut app, "npm run dev", &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(out.is_empty(), "a setting is a file write, not a request");
+            assert_eq!(
+                saved(&path)["projects"],
+                serde_json::json!({
+                    "/tmp/demo": { "hide_root_worktree": false, "run_command": "npm run dev" }
+                })
+            );
+            let view = settings_view(&app);
+            assert_eq!((view.tab, view.selected, view.on_tabs), (tab, row, false));
+            assert!(
+                matches!(&view.notice, Some((t, _)) if t.contains("npm run dev")),
+                "the notice shows the saved value: {:?}",
+                view.notice
+            );
+            let screen = draw_to_string(&mut app, 100, 40);
+            assert!(screen.contains("[npm run dev]"), "{screen}");
+
+            // Reopened, the prompt carries the stored value; Esc keeps it.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("expected the run command prompt, got {:?}", app.overlay);
+            };
+            assert_eq!(prompt.input.as_str(), "npm run dev");
+            type_text(&mut app, " --typo", &mut out);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert_eq!(
+                crate::config::Config::load()
+                    .project(std::path::Path::new("/tmp/demo"))
+                    .run_command,
+                "npm run dev"
+            );
+            let view = settings_view(&app);
+            assert_eq!((view.tab, view.selected), (tab, row));
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+            // The other project reads its own (unset) value.
+            app.sel_project = 1;
+            open_on_row(&mut app, &mut out);
+            let screen = draw_to_string(&mut app, 100, 40);
+            assert!(screen.contains("/tmp/other"), "{screen}");
+            assert!(screen.contains("[.nebula.json]"), "{screen}");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+            // An empty Enter is the way back to the file — the entry goes.
+            app.sel_project = 0;
+            open_on_row(&mut app, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            for _ in 0.."npm run dev".len() {
+                press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert_eq!(saved(&path)["projects"], serde_json::json!({}));
+            let view = settings_view(&app);
+            assert!(
+                matches!(&view.notice, Some((t, _)) if t.contains(".nebula.json")),
+                "back to the file: {:?}",
+                view.notice
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+            // No project at all: no prompt, and the row says why.
+            let mut app = App::new();
+            open_on_row(&mut app, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let view = settings(&app).unwrap();
+            assert!(
+                matches!(&view.notice, Some((text, _)) if text.contains("no project selected")),
+                "{:?}",
+                view.notice
+            );
+            assert_eq!(saved(&path)["projects"], serde_json::json!({}), "untouched");
+        });
+    }
+
     /// `p` on the WORKTREES PANEL is "a fresh worktree, then this task in
-    /// it", whatever row the cursor is on — here the root itself: Enter
+    /// it", whatever checkout the cursor is on — here the root itself: Enter
     /// asks the DAEMON for the checkout (no base — it fetches `origin/HEAD`
     /// itself), the Ack moves the cursor onto the new row and fires the
     /// create there with the typed prompt, and FOCUS stays on the panel
@@ -29164,10 +29915,12 @@ diff --git a/src/c.rs b/src/c.rs
     }
 
     /// The agent has to run somewhere: with no checkout under the cursor
-    /// (an empty tree, or a cursor parked on an OPEN PRS row) `p` says so
-    /// instead of opening a box that cannot launch. On the WORKTREES PANEL
-    /// the checkout is cut on the way, so only a PROJECT is needed — and an
-    /// empty tree has none of those either.
+    /// (an empty tree) `p` says so instead of opening a box that cannot
+    /// launch. On the WORKTREES PANEL the checkout is cut on the way, so
+    /// only a PROJECT is needed — and an empty tree has none of those
+    /// either. (A cursor parked on an OPEN PRS row is not this case: the
+    /// pull request's own checkout is where that box launches —
+    /// `p_on_an_open_pr_row_launches_a_pr_session_with_its_checkout_up_at_once`.)
     #[test]
     fn the_quick_prompt_needs_a_worktree() {
         with_default_config(|| {
@@ -29548,6 +30301,122 @@ diff --git a/src/c.rs b/src/c.rs
         });
     }
 
+    /// A click on a row of the PR SESSION preset picker is Enter on that
+    /// row: the pull request rides the launch. The picker's context
+    /// checkout is the ROOT WORKTREE — it only names the project — and a
+    /// click used to launch the row straight into it: a `skip`-task preset
+    /// clicked on an OPEN PRS row started a plain session in the main
+    /// checkout, no pull request, no checkout cut, nothing nested. The
+    /// delete keys are manage verbs too, and a picker only picks: they
+    /// used to reach the delete confirm, whose exits reopened the list in
+    /// manage mode against the root.
+    #[test]
+    fn a_click_in_the_pr_preset_picker_launches_the_pr_session_not_a_root_session() {
+        with_seeded_presets(|| {
+            let mut presets = crate::agent_presets::load();
+            presets.push(crate::agent_presets::AgentPreset {
+                name: "review and merge".into(),
+                kind: AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                prefix: "Review this pull request.".into(),
+                postfix: String::new(),
+                skip_task: true,
+            });
+            crate::agent_presets::save(&presets).unwrap();
+            let skip_row = (presets.len() - 1) as u16;
+
+            let mut app = App::new();
+            seed_tree(&mut app);
+            seed_open_prs(&mut app, &[(7, "Attach links")]);
+            app.focus = Focus::Worktrees;
+            app.sel_worktree = 1;
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+
+            // The delete keys only say where presets are managed.
+            for key in [KeyCode::Char('x'), KeyCode::Backspace, KeyCode::Delete] {
+                app.flash = None;
+                press(&mut app, key, KeyModifiers::NONE, &mut out);
+                assert!(
+                    matches!(&app.overlay, Some(Overlay::AgentPresets(view)) if view.is_picker()),
+                    "{key:?} leaves the picker up: {:?}",
+                    app.overlay
+                );
+                assert_eq!(
+                    app.flash.as_deref(),
+                    Some("presets are added and edited with e in the Sessions panel")
+                );
+            }
+
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let list = match &app.overlay {
+                Some(Overlay::AgentPresets(view)) => view.list_area,
+                other => panic!("{other:?}"),
+            };
+            click(&mut app, list.x + 1, list.y + skip_row, &mut out);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            let creates: Vec<&ClientRequest> = out
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r,
+                        ClientRequest::CreatePrAgent { .. } | ClientRequest::CreateAgent { .. }
+                    )
+                })
+                .collect();
+            assert!(
+                matches!(
+                    creates.as_slice(),
+                    [ClientRequest::CreatePrAgent {
+                        pr_url,
+                        head,
+                        starting_prompt: Some(text),
+                        ..
+                    }] if pr_url == "https://github.com/o/r/pull/7"
+                        && head == "pr-7-head"
+                        && text == "Review this pull request."
+                ),
+                "a PR create, never a plain one into the root: {out:?}"
+            );
+            let stand_in = app
+                .tree
+                .worktrees
+                .iter()
+                .find(|w| w.branch == "pr-7-head")
+                .map(|w| w.id.clone())
+                .expect("the head branch's stand-in row");
+            assert_eq!(app.worktree_row_of(&stand_in), Some(2), "under the PR");
+
+            // A non-skip row clicked: the box comes back for the PR.
+            let mut app = App::new();
+            seed_tree(&mut app);
+            seed_open_prs(&mut app, &[(7, "Attach links")]);
+            app.focus = Focus::Worktrees;
+            app.sel_worktree = 1;
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let list = match &app.overlay {
+                Some(Overlay::AgentPresets(view)) => view.list_area,
+                other => panic!("{other:?}"),
+            };
+            click(&mut app, list.x + 1, list.y, &mut out);
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(prompt))
+                        if prompt.title == "Quick prompt · PR #7 · reviewer (claude · opus · high)"
+                ),
+                "{:?}",
+                app.overlay
+            );
+            assert!(out.is_empty(), "{out:?}");
+        });
+    }
+
     #[test]
     fn presets_click_row_launches_and_outside_closes() {
         with_seeded_presets(|| {
@@ -29745,6 +30614,574 @@ diff --git a/src/c.rs b/src/c.rs
             mev(MouseEventKind::Down(MouseButton::Left), column, row),
             out,
         );
+    }
+
+    // ---- INPUT PARITY: a row chosen by the pointer is the row chosen by key ----
+    //
+    // `event_loop::activate` is the rule; these are its teeth. Each builds
+    // the same app twice, chooses the same row once with the keyboard and
+    // once with the mouse, and compares everything a user could tell the
+    // two apart by: the modal left on screen, the cursors, FOCUS, the pane,
+    // the flash, and every request sent to the DAEMON.
+
+    /// Everything observable about where an input left the app.
+    fn ui_digest(app: &App, out: &[ClientRequest]) -> String {
+        let overlay = match &app.overlay {
+            None => "none".to_string(),
+            Some(Overlay::Prompt(p)) => format!("prompt[{}|{}]", p.title, p.input.as_str()),
+            Some(Overlay::Menu(m)) => format!(
+                "menu[{:?}|{}]",
+                m.title,
+                m.items
+                    .iter()
+                    .map(|item| item.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            Some(Overlay::FileTabs(t)) => format!(
+                "filetabs[{}]",
+                t.tabs
+                    .iter()
+                    .map(|tab| tab.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            Some(Overlay::Settings(v)) => format!(
+                "settings[tab {} row {} on_tabs {} capture {} notice {:?}]",
+                v.tab,
+                v.selected,
+                v.on_tabs,
+                v.capture.is_some(),
+                v.notice.as_ref().map(|(text, _)| text.as_str())
+            ),
+            Some(other) => format!("{:?}", std::mem::discriminant(other)),
+        };
+        format!(
+            "overlay={overlay} focus={:?} cursors=({},{},{}) pane={:?} locked={} editor={} \
+             flash={:?} quit={} out={out:?}",
+            app.focus,
+            app.sel_project,
+            app.sel_worktree,
+            app.sel_session,
+            app.term.as_ref().map(|t| t.sref.clone()),
+            app.term_locked,
+            app.vim.is_some(),
+            app.flash,
+            app.should_quit,
+        )
+    }
+
+    /// Draw, then press `button` on the first cell registered for `target`.
+    fn click_target(
+        app: &mut App,
+        target: HitTarget,
+        button: MouseButton,
+        out: &mut Vec<ClientRequest>,
+    ) {
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, app)).unwrap();
+        let rect = app
+            .hits
+            .iter()
+            .find(|(_, hit)| *hit == target)
+            .map(|(rect, _)| *rect)
+            .unwrap_or_else(|| panic!("{target:?} is not on screen: {:?}", app.hits));
+        // The middle of the row: its first cell is a splitter's grab zone.
+        let (x, y) = (rect.x + rect.width / 2, rect.y);
+        assert_eq!(app.hit_at(x, y), Some(target), "the click lands on it");
+        handle_mouse(app, mev(MouseEventKind::Down(button), x, y), out);
+    }
+
+    /// The drawn list box of the open modal.
+    fn drawn_list_area(app: &mut App) -> ratatui::layout::Rect {
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, app)).unwrap();
+        match &app.overlay {
+            Some(Overlay::Palette(v)) => v.list_area,
+            Some(Overlay::Files(v)) => v.list_area,
+            Some(Overlay::AgentPresets(v)) => v.list_area,
+            Some(Overlay::Menu(v)) => {
+                // A menu's rows sit inside its border.
+                ratatui::layout::Rect::new(
+                    v.area.x + 1,
+                    v.area.y + 1,
+                    v.area.width.saturating_sub(2),
+                    v.area.height.saturating_sub(2),
+                )
+            }
+            other => panic!("no list to click in {other:?}"),
+        }
+    }
+
+    /// A checkout beside the root, with a session of its own, and the
+    /// cursor left on the root's.
+    fn parity_tree() -> App {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_feat_worktree(&mut app, "w2", "feat");
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a9".into()),
+                    worktree_id: WorktreeId("w2".into()),
+                    name: "feat-agent".into(),
+                    status: AgentStatus::Finished,
+                    archived: false,
+                    archived_at: 0,
+                    unseen: false,
+                    kind: AgentKind::Claude,
+                    custom_harness: None,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    cloud_session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 1,
+                    alive: true,
+                    recent_prompts: Vec::new(),
+                }),
+            },
+        );
+        app.focus = Focus::Worktrees;
+        let root = app
+            .worktree_row_of(&WorktreeId("w1".into()))
+            .expect("the root is a row");
+        let mut out = Vec::new();
+        select_worktree_row(&mut app, root, &mut out);
+        app.sel_worktree = root;
+        app
+    }
+
+    /// A right-click on a row is a left click on it followed by `m`: the
+    /// cursor moves with everything a move entails — the pane follows to
+    /// the checkout's own session — and the menu is `m`'s. The right button
+    /// used to set the cursor fields itself, leaving the pane on the
+    /// session of the checkout the cursor had just left.
+    #[test]
+    fn a_right_click_is_a_left_click_then_m() {
+        with_default_config(|| {
+            for target in ["worktree", "project", "session"] {
+                let hit = |app: &App| match target {
+                    "worktree" => HitTarget::Worktree(
+                        app.worktree_row_of(&WorktreeId("w2".into()))
+                            .expect("feat is a row"),
+                    ),
+                    "project" => HitTarget::Project(0),
+                    _ => HitTarget::Session(0),
+                };
+
+                let mut by_keys = parity_tree();
+                let mut keys_out = Vec::new();
+                let at = hit(&by_keys);
+                click_target(&mut by_keys, at, MouseButton::Left, &mut keys_out);
+                press(
+                    &mut by_keys,
+                    KeyCode::Char('m'),
+                    KeyModifiers::NONE,
+                    &mut keys_out,
+                );
+
+                let mut by_mouse = parity_tree();
+                let mut mouse_out = Vec::new();
+                let at = hit(&by_mouse);
+                click_target(&mut by_mouse, at, MouseButton::Right, &mut mouse_out);
+
+                assert!(
+                    matches!(by_mouse.overlay, Some(Overlay::Menu(_))),
+                    "{target}: {:?}",
+                    by_mouse.overlay
+                );
+                assert_eq!(
+                    ui_digest(&by_mouse, &mouse_out),
+                    ui_digest(&by_keys, &keys_out),
+                    "{target}"
+                );
+            }
+
+            // And the move is a real one: the pane left the root's session
+            // for the checkout's.
+            let mut app = parity_tree();
+            let mut out = Vec::new();
+            let at = HitTarget::Worktree(
+                app.worktree_row_of(&WorktreeId("w2".into()))
+                    .expect("feat is a row"),
+            );
+            click_target(&mut app, at, MouseButton::Right, &mut out);
+            assert_eq!(
+                app.selected_worktree().map(|w| w.branch.as_str()),
+                Some("feat")
+            );
+            assert_eq!(
+                app.term.as_ref().map(|t| t.sref.clone()),
+                Some(SessionRef::Agent(AgentId("a9".into()))),
+                "the pane follows the cursor"
+            );
+        });
+    }
+
+    /// A CONTEXT MENU row is its hotkey: **Delete worktree** is `d` on the
+    /// checkout — the same confirm, which says how many sessions go down
+    /// with it (the menu's own copy had lost that) — **Attach** is Enter on
+    /// the session, **Unarchive** is `u`.
+    #[test]
+    fn a_context_menu_row_is_its_hotkey() {
+        with_default_config(|| {
+            let confirm = |app: &App| match &app.overlay {
+                Some(Overlay::Confirm(c)) => format!("{}|{}|{:?}", c.title, c.message, c.action),
+                other => format!("{other:?}"),
+            };
+            let on_feat = || {
+                let mut app = parity_tree();
+                let mut out = Vec::new();
+                let row = app
+                    .worktree_row_of(&WorktreeId("w2".into()))
+                    .expect("feat is a row");
+                select_worktree_row(&mut app, row, &mut out);
+                app.focus = Focus::Worktrees;
+                app
+            };
+
+            let mut by_key = on_feat();
+            let mut out = Vec::new();
+            press(
+                &mut by_key,
+                KeyCode::Char('d'),
+                KeyModifiers::NONE,
+                &mut out,
+            );
+            let mut by_menu = on_feat();
+            run_menu_action(
+                &mut by_menu,
+                MenuAction::DeleteWorktree(WorktreeId("w2".into())),
+                &mut out,
+            );
+            assert_eq!(confirm(&by_menu), confirm(&by_key));
+            assert!(
+                confirm(&by_menu).contains("1 session(s) will be killed"),
+                "{}",
+                confirm(&by_menu)
+            );
+
+            // The root is never deleted, by either route.
+            let mut by_menu = parity_tree();
+            run_menu_action(
+                &mut by_menu,
+                MenuAction::DeleteWorktree(WorktreeId("w1".into())),
+                &mut out,
+            );
+            assert!(by_menu.overlay.is_none(), "{:?}", by_menu.overlay);
+            assert_eq!(
+                by_menu.flash.as_deref(),
+                Some("cannot delete the main checkout")
+            );
+
+            // Attach: Enter on the row.
+            let on_session = || {
+                let mut app = on_feat();
+                app.focus = Focus::Sessions;
+                app
+            };
+            let mut by_key = on_session();
+            let mut key_out = Vec::new();
+            press(
+                &mut by_key,
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                &mut key_out,
+            );
+            let mut by_menu = on_session();
+            let mut menu_out = Vec::new();
+            run_menu_action(
+                &mut by_menu,
+                MenuAction::Attach(SessionRef::Agent(AgentId("a9".into()))),
+                &mut menu_out,
+            );
+            assert_eq!(ui_digest(&by_menu, &menu_out), ui_digest(&by_key, &key_out));
+        });
+    }
+
+    /// A second click on a Worktrees row is Enter on it — for a checkout,
+    /// FOCUS steps into its sessions — and a second click on a session row
+    /// is Enter on that: the pane, focused and locked.
+    #[test]
+    fn a_double_click_on_a_panel_row_is_enter_on_it() {
+        with_default_config(|| {
+            for target in ["worktree", "session"] {
+                let hit = |app: &App| match target {
+                    "worktree" => HitTarget::Worktree(
+                        app.worktree_row_of(&WorktreeId("w2".into()))
+                            .expect("feat is a row"),
+                    ),
+                    _ => HitTarget::Session(0),
+                };
+
+                let mut by_keys = parity_tree();
+                let mut keys_out = Vec::new();
+                let at = hit(&by_keys);
+                click_target(&mut by_keys, at, MouseButton::Left, &mut keys_out);
+                by_keys.last_session_click = None;
+                press(
+                    &mut by_keys,
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                    &mut keys_out,
+                );
+
+                let mut by_mouse = parity_tree();
+                let mut mouse_out = Vec::new();
+                let at = hit(&by_mouse);
+                click_target(&mut by_mouse, at.clone(), MouseButton::Left, &mut mouse_out);
+                click_target(&mut by_mouse, at, MouseButton::Left, &mut mouse_out);
+
+                assert_eq!(
+                    ui_digest(&by_mouse, &mouse_out),
+                    ui_digest(&by_keys, &keys_out),
+                    "{target}"
+                );
+            }
+        });
+    }
+
+    /// A click into the pane is Enter on it: FOCUS, the input lock, and the
+    /// attach a sweep of the cursor had left waiting on its debounce sent
+    /// at once — keystrokes are about to need it. The click used to skip
+    /// that last part.
+    #[test]
+    fn a_click_into_the_pane_is_enter_on_it() {
+        with_default_config(|| {
+            let sweep = || {
+                let mut app = parity_tree();
+                app.focus = Focus::Sessions;
+                seed_second_agent(&mut app, nebula_core::AgentStatus::Finished);
+                // Reaped: the one kind of session a sweep debounces, since
+                // attaching it boots a CLI.
+                for agent in &mut app.tree.agents {
+                    agent.alive = agent.id != AgentId("a2".into());
+                }
+                let mut out = Vec::new();
+                // ↓ onto the next session: shown, the attach still waiting.
+                press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+                assert!(app.pending_attach.is_some(), "the sweep debounces");
+                out.clear();
+                (app, out)
+            };
+
+            let (mut by_keys, mut keys_out) = sweep();
+            // Drawn, as the clicked one is: the pane's size rides the Attach.
+            let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut by_keys)).unwrap();
+            enter_terminal_pane(&mut by_keys, &mut keys_out);
+
+            let (mut by_mouse, mut mouse_out) = sweep();
+            click_target(
+                &mut by_mouse,
+                HitTarget::TerminalPane,
+                MouseButton::Left,
+                &mut mouse_out,
+            );
+            // The press arms a drag-selection, which a key has no part in.
+            by_mouse.term_selection = None;
+
+            assert!(
+                mouse_out
+                    .iter()
+                    .any(|r| matches!(r, ClientRequest::Attach { .. })),
+                "the waiting attach goes out with the click: {mouse_out:?}"
+            );
+            assert!(by_mouse.pending_attach.is_none());
+            assert_eq!(
+                ui_digest(&by_mouse, &mouse_out),
+                ui_digest(&by_keys, &keys_out)
+            );
+        });
+    }
+
+    /// A click on a row of a picking list is Enter with the cursor on that
+    /// row: the `/` palette, the NEW SESSION PICKER's menu, the AGENT
+    /// PRESETS list in both of its modes.
+    #[test]
+    fn a_click_on_a_list_row_is_enter_on_it() {
+        with_seeded_presets(|| {
+            type Open = fn(&mut App, &mut Vec<ClientRequest>);
+            let palette: Open = |app, out| {
+                press(app, KeyCode::Char('/'), KeyModifiers::NONE, out);
+            };
+            let new_session: Open = |app, out| {
+                app.focus = Focus::Sessions;
+                press(app, KeyCode::Char('n'), KeyModifiers::NONE, out);
+            };
+            let presets: Open = |app, out| {
+                app.focus = Focus::Sessions;
+                press(app, KeyCode::Char('e'), KeyModifiers::NONE, out);
+            };
+            let pr_presets: Open = |app, out| {
+                seed_open_prs(app, &[(7, "Attach links")]);
+                app.focus = Focus::Worktrees;
+                app.sel_worktree = app.open_pr_row_of(&pr_url(7)).expect("#7 is a row");
+                press(app, KeyCode::Char('e'), KeyModifiers::NONE, out);
+            };
+            let surfaces: [(&str, Open); 4] = [
+                ("palette", palette),
+                ("new session picker", new_session),
+                ("presets", presets),
+                ("PR presets", pr_presets),
+            ];
+            for (name, open) in surfaces {
+                for row in 0..2u16 {
+                    let mut by_keys = parity_tree();
+                    let mut keys_out = Vec::new();
+                    open(&mut by_keys, &mut keys_out);
+                    // Drawn, as the clicked one is: the pane's size rides
+                    // every Attach.
+                    drawn_list_area(&mut by_keys);
+                    let down = if name == "palette" {
+                        KeyCode::Down
+                    } else {
+                        KeyCode::Char('j')
+                    };
+                    for _ in 0..row {
+                        press(&mut by_keys, down, KeyModifiers::NONE, &mut keys_out);
+                    }
+                    press(
+                        &mut by_keys,
+                        KeyCode::Enter,
+                        KeyModifiers::NONE,
+                        &mut keys_out,
+                    );
+
+                    let mut by_mouse = parity_tree();
+                    let mut mouse_out = Vec::new();
+                    open(&mut by_mouse, &mut mouse_out);
+                    let list = drawn_list_area(&mut by_mouse);
+                    click(&mut by_mouse, list.x + 1, list.y + row, &mut mouse_out);
+
+                    assert_eq!(
+                        ui_digest(&by_mouse, &mouse_out),
+                        ui_digest(&by_keys, &keys_out),
+                        "{name}, row {row}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// A click on a file finder row is Enter on it — the FILE TABS reader
+    /// for a markdown file. The click used to call the editor directly, and
+    /// so missed the reader when Enter learned it.
+    #[test]
+    fn a_click_on_a_finder_row_is_enter_on_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        std::fs::write(repo.join("notes.md"), "# Notes\n\n- one\n").unwrap();
+        let open = || {
+            let mut app = App::new();
+            seed_repo_tree(&mut app, &repo);
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            app.vim_tx = Some(tx);
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE, &mut out);
+            for c in ['n', 'o', 't'] {
+                press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+            }
+            assert_eq!(finder(&app).selected_path(), Some("notes.md"));
+            (app, out)
+        };
+
+        let (mut by_keys, mut keys_out) = open();
+        press(
+            &mut by_keys,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &mut keys_out,
+        );
+
+        let (mut by_mouse, mut mouse_out) = open();
+        let list = drawn_list_area(&mut by_mouse);
+        click(&mut by_mouse, list.x + 1, list.y, &mut mouse_out);
+
+        assert!(
+            matches!(&by_mouse.overlay, Some(Overlay::FileTabs(_))),
+            "the reader, not the editor: {:?}",
+            by_mouse.overlay
+        );
+        assert!(by_mouse.vim.is_none());
+        assert_eq!(
+            ui_digest(&by_mouse, &mouse_out),
+            ui_digest(&by_keys, &keys_out)
+        );
+    }
+
+    /// A second click on a SETTINGS OVERLAY row is Enter on it, and a click
+    /// on a tab is that tab's digit: the mouse names the keys' own
+    /// commands (`run_settings_cmd`) instead of changing the view itself.
+    #[test]
+    fn a_second_click_on_a_settings_row_is_enter_on_it() {
+        with_default_config(|| {
+            let open = || {
+                let mut app = App::new();
+                seed_tree(&mut app);
+                let mut out = Vec::new();
+                press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+                let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+                terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+                (app, out)
+            };
+            // The first clickable row of the open tab, and its screen line.
+            let row_line = |app: &App| {
+                let view = settings(app).expect("settings are open");
+                let rows = crate::config::settings_rows(view.tab);
+                let line = rows
+                    .iter()
+                    .position(|r| r.index().is_some())
+                    .expect("a tab has a row");
+                let body = view.body_area;
+                (body.x + 1, body.y + (line - view.first_row) as u16)
+            };
+
+            let (mut by_keys, mut keys_out) = open();
+            let (x, y) = row_line(&by_keys);
+            click(&mut by_keys, x, y, &mut keys_out);
+            if settings(&by_keys).is_some_and(|v| v.selected != 0) {
+                panic!("the first row is row 0");
+            }
+            press(
+                &mut by_keys,
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                &mut keys_out,
+            );
+
+            let (mut by_mouse, mut mouse_out) = open();
+            let (x, y) = row_line(&by_mouse);
+            click(&mut by_mouse, x, y, &mut mouse_out);
+            // Already on it after the first click: the second is Enter.
+            click(&mut by_mouse, x, y, &mut mouse_out);
+
+            assert_eq!(
+                ui_digest(&by_mouse, &mouse_out),
+                ui_digest(&by_keys, &keys_out)
+            );
+
+            // A click on the second tab is `2`, with the cursor in its list.
+            let (mut by_keys, mut keys_out) = open();
+            press(
+                &mut by_keys,
+                KeyCode::Char('2'),
+                KeyModifiers::NONE,
+                &mut keys_out,
+            );
+            let (mut by_mouse, mut mouse_out) = open();
+            let (area, hits) = {
+                let view = settings(&by_mouse).unwrap();
+                (view.area, view.tab_hits.clone())
+            };
+            let (x0, _) = hits[1];
+            click(&mut by_mouse, x0, area.y + 1, &mut mouse_out);
+            let tab = |app: &App| settings(app).map(|v| (v.tab, v.selected));
+            assert_eq!(tab(&by_mouse), tab(&by_keys));
+        });
     }
 
     #[test]

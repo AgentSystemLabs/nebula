@@ -76,12 +76,13 @@
   a warning in every client, never a rolled-back create or delete. Per repo in git config rather than in CONFIG.JSON, and never a file inside the
   checkout. See [Configuration](configuration.md#worktree-hooks).
 - **A worktree runs its own project — the PROJECT FILE.** A committed `.nebula.json` names a `run` and
-  an `open` command. `r` on a worktree has the DAEMON start `run` in a RUN TERMINAL — a terminal row
+  an `open` command; the Project tab of the SETTINGS OVERLAY can hold either instead, per project in
+  `config.json`, and wins over the file while it is set. `r` on a worktree has the DAEMON start `run` in a RUN TERMINAL — a terminal row
   that carries its command and spawns `$SHELL -l -i -c '<run>'` instead of an interactive shell — so the
   PTY's life is the worktree's RUNNING state, broadcast as that terminal's `alive` and drawn as the
   row's `▶ running`; `r` again kills the process tree and drops the row. The idle reaper and the prewarm
   sweep leave that terminal alone, and a run that exits on its own keeps its PTY, so an attach replays
-  the ending instead of respawning — a command starts only on the keypress. `Shift+Enter` (or `Shift+O`) runs `open`
+  the ending instead of respawning — a command starts only on the keypress. `Shift+Enter` (or `Shift+O`, from any panel) runs `open`
   once, from the TUI. See [Configuration](configuration.md#the-project-file-nebulajson).
 - **Agents boot `claude`, `codex`, `cursor-agent`, `pi`, `muse`, or a custom registry program.** Creating an agent (`n`) first asks which CLI to
   run, then spawns it in the worktree. Claude's picker can also dispatch a one-shot Cloud task as
@@ -96,7 +97,14 @@
   resume reads on the first prompt — so a CLI booted and never used resumes as nothing. Claude
   ids are checked against the transcripts on disk before the spawn, and one with none boots fresh;
   any resume that exits with an error within 10 s of its spawn is respawned fresh, unless its Claude
-  transcript is still there (then the id is kept, and the pane shows why the CLI quit). An AGENT created from a PROJECT OPEN PRS row also receives the PR URL and a PR-only
+  transcript is still there (then the id is kept, and the pane shows why the CLI quit). A Claude
+  session sent to Claude's own background (`/background`) is the exception to resuming: its worker
+  keeps the pane's `NEBULA_*` env, so hooks — and the forked session id — still land on the same
+  row, but `claude --resume` refuses a session that runs in the background. When Claude holds a job
+  dir for the id (`~/.claude/jobs/<first 8 of the id>/`), the DAEMON asks `claude agents --json`
+  before the spawn, and an id listed as a `background` session opens as `claude attach <id>`
+  instead — the live conversation, which detaching (Ctrl+Z) or archiving the row leaves running. A
+  refused resume the job-dir look missed is asked about the same way and re-opened attached. An AGENT created from a PROJECT OPEN PRS row also receives the PR URL and a PR-only
   work rule — Claude and Pi through `--append-system-prompt` on every spawn, Codex, Cursor and Muse as the first prompt of
   their cold spawn (their transcripts carry it through a resume); nebula persists that URL. An AGENT
   launched from the ISSUES MODAL (`i`) carries the GitHub issue's URL the same way — persisted with

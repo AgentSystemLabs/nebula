@@ -462,13 +462,17 @@ impl AgentPresetEditor {
 }
 
 /// `e` in the SESSIONS PANEL: the AGENT PRESETS list for the selected
-/// WORKTREE — the one a launch lands in. On a PROJECT OPEN PRS GROUP row
-/// of the WORKTREES PANEL it is the same list as a picker for a PR
-/// SESSION on that pull request (`quick_prompt::open_preset_picker_for_pr`).
-/// Anywhere else the key just says where it works, since without a
-/// worktree or a pull request there is nothing to launch into.
+/// WORKTREE — the one a launch lands in. With the Worktrees cursor on a
+/// PROJECT OPEN PRS GROUP row it is the same list as a picker for a PR
+/// SESSION on that pull request (`quick_prompt::open_preset_picker_for_pr`)
+/// — from whichever panel has FOCUS, as `p` is: a pull request row has no
+/// worktree and no sessions to manage presets against, so the pull
+/// request is the only thing the key can be for, and the pane reading it
+/// is where a review preset is most often reached for. Anywhere else the
+/// key just says where it works, since without a worktree or a pull
+/// request there is nothing to launch into.
 pub(crate) fn open_agent_presets(app: &mut App) {
-    if app.focus == Focus::Worktrees && app.selected_worktree_pr().is_some() {
+    if app.selected_worktree_pr().is_some() {
         crate::quick_prompt::open_preset_picker_for_pr(app);
         return;
     }
@@ -659,7 +663,19 @@ pub(crate) fn handle_list_key(app: &mut App, key: KeyEvent, out: &mut Vec<Client
         KeyCode::Char('k') | KeyCode::Up => {
             view.selected = clamp_selection(view.selected as i64 - 1, view.presets.len());
         }
-        KeyCode::Char('a') | KeyCode::Char('n') | KeyCode::Char('e') | KeyCode::Char('d')
+        // Every manage verb, delete's aliases included: a picker only
+        // picks. Left to fall through, `x` / Backspace / Delete opened the
+        // delete confirm, whose both exits reopen the list in manage mode
+        // against the picker's context checkout — for a PR SESSION the
+        // ROOT WORKTREE — with the box, its text and the pull request
+        // gone, so the next Enter launched a plain session into the root.
+        KeyCode::Char('a')
+        | KeyCode::Char('n')
+        | KeyCode::Char('e')
+        | KeyCode::Char('d')
+        | KeyCode::Char('x')
+        | KeyCode::Backspace
+        | KeyCode::Delete
             if view.is_picker() =>
         {
             app.flash = Some("presets are added and edited with e in the Sessions panel".into());
@@ -680,16 +696,28 @@ pub(crate) fn handle_list_key(app: &mut App, key: KeyEvent, out: &mut Vec<Client
             let view = view.clone();
             open_delete_preset_confirm(app, &view);
         }
-        KeyCode::Enter => {
-            let view = view.clone();
-            match view.quick {
-                Some(back) => {
-                    apply_preset_to_quick_prompt(app, &view.presets, view.selected, back, out)
-                }
-                None => open_agent_preset_task(app, &view, out),
-            }
-        }
+        KeyCode::Enter => activate_selected(app, out),
         _ => {}
+    }
+}
+
+/// The selected row is chosen — Enter, or a click on it. In a QUICK PROMPT
+/// picker the row is handed to the box waiting behind the list
+/// (`view.quick`), which keeps that box's target, its text, its issue and
+/// its pull request; in the manager it launches into the list's worktree,
+/// through the preset's task box or past it. The one function both input
+/// handlers call: when the click ran a copy of the manager half whatever
+/// the mode, a click in the PR SESSION picker — whose worktree is the ROOT
+/// WORKTREE, there only to name the project — started a plain session in
+/// the main checkout.
+fn activate_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let Some(Overlay::AgentPresets(view)) = &app.overlay else {
+        return;
+    };
+    let view = view.clone();
+    match view.quick {
+        Some(back) => apply_preset_to_quick_prompt(app, &view.presets, view.selected, back, out),
+        None => open_agent_preset_task(app, &view, out),
     }
 }
 
@@ -755,6 +783,13 @@ pub(crate) fn handle_editor_key(app: &mut App, key: KeyEvent) {
 /// Mouse in the AGENT PRESETS list: the wheel moves the selection, a click
 /// on a row launches it (rows are actions, as in the hosts picker — editing
 /// is `e`), a click outside the modal closes; everything else is swallowed.
+/// A click is Enter on that row, in both modes: in a QUICK PROMPT picker it
+/// hands the row to the box waiting behind the list (`view.quick`), which
+/// keeps that box's target, text, issue and pull request. It used to launch
+/// the row into `view.worktree` whatever the mode — for a PR SESSION picker
+/// that is the ROOT WORKTREE, which only names the project — so a click on
+/// a `skip`-task preset started a plain session in the main checkout, with
+/// no pull request and no checkout cut.
 pub(crate) fn handle_list_mouse(
     app: &mut App,
     mouse: MouseEvent,
@@ -775,14 +810,11 @@ pub(crate) fn handle_list_mouse(
         }
         MouseEventKind::Down(MouseButton::Left) => {
             let list = view.list_area;
-            if list.contains(mouse_pos) {
-                let start = view.window_start(list.height as usize);
-                let index = start + (mouse.row - list.y) as usize;
-                if index < view.presets.len() {
-                    view.selected = index;
-                    let view = view.clone();
-                    open_agent_preset_task(app, &view, out);
-                }
+            let first = view.window_start(list.height as usize);
+            if let Some(index) = crate::list_hit::row_at(list, first, view.presets.len(), mouse_pos)
+            {
+                view.selected = index;
+                activate_selected(app, out);
             }
             app.dirty = true;
         }

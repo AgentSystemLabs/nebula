@@ -96,7 +96,24 @@ box comes back with the preset applied and the PR in its title, and `Enter` star
 project's worktree on the PR's head branch — reused when one is already checked out on it, cut by
 the daemon otherwise — with the PR link and its work rule in the system prompt and the preset's
 `prefix + task + postfix` as the first prompt, so the agent is already working on the PR when the
-pane opens. A `skip`-task preset launches straight from the picker.
+pane opens. A `skip`-task preset launches straight from the picker. `p` on the row is the same launch
+without a preset: the box titled for the PR, your text alone as the first prompt, and the checkout's
+row up under the pull request as soon as you press `Enter` — never a random-branch worktree the
+session would have to move onto the pull request by hand. Both keys work from whichever panel has
+focus while the pull request's row is selected, the pane reading it included.
+
+A contributor's pull request from a fork gets a checkout named for the fork: `givemeurhats/main`,
+`wende/feat/settings-hotkey`. A fork's branch shares nothing with yours but possibly a name — `main`
+above all, which every fork has and your root checkout is on — so under its bare name a PR SESSION on
+a fork's `main` ran in the root checkout, on your code, with nothing cut and nothing nested. Under the
+fork's name it matches no branch of yours: the daemon seeds it from the pull request's own ref
+(`refs/pull/N/head`) and points its upstream there, as `gh pr checkout` does, so `git pull` in the
+checkout follows the contributor's pushes and the checkout's own PR ROW finds the pull request. A
+checkout of a fork's pull request made before this, under the bare branch name, is a plain worktree
+row now; the next PR SESSION cuts the fork-named one.
+
+If the daemon refuses a PR SESSION — the fetch failed offline, the fork is gone — the `creating` rows
+come down and the box you sent it from comes back with your text, as any refused quick prompt does.
 
 ## RECENT PROMPTS
 
@@ -160,8 +177,11 @@ request it is for read as one thing and there is no guessing which worktree a re
 in. It is still a worktree row: the cursor on it has that checkout's sessions in the Sessions panel
 (its own PR ROW among them), `n` starts a session there, `d` deletes it, and the pull request itself
 is the row above. A PR SESSION's stand-in checkout goes up in the same place, so nothing jumps when
-the DAEMON's real row replaces it. The ROOT WORKTREE never nests, whatever branch it is on, and a
-branch two open pull requests share nests under the first listed. Only a pull request on screen
+the DAEMON's real row replaces it. Move away while it is being cut — a key or a click onto another
+row, panel or workspace — and you stay there: the session starts in its row, and neither the cursor
+nor FOCUS is taken back to it (true of every launch, not only a pull request's). The ROOT WORKTREE
+never nests, whatever branch it is on, and a branch two open pull requests share nests under the
+first listed. Only a pull request on screen
 takes its checkout: fold the group, or keep the draft it is out with **Hide draft PRs**, and the
 checkout is a plain row again — hiding pull requests never hides work you have. The cursor follows
 its checkout through every one of those moves, and through the `gh pr list` answer that first lists

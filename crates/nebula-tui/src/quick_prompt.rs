@@ -314,16 +314,31 @@ impl QuickLaunch {
 /// AGENT PRESETS list this does not ask for FOCUS on the SESSIONS PANEL —
 /// the point of a quick prompt is that it works from wherever you are —
 /// but it still needs a checkout to run in, so a PROJECT with no worktree
-/// selected (or a cursor parked on an OPEN PRS row) flashes instead.
+/// selected flashes instead.
 ///
 /// The one exception is the WORKTREES PANEL: `p` there means "a fresh
-/// worktree, then this task in it", whatever row the cursor is parked on
-/// (the root, another checkout, an OPEN PRS row) and whether or not the
+/// worktree, then this task in it", whatever checkout the cursor is
+/// parked on (the root, another checkout) and whether or not the
 /// project's **Hide root worktree** setting has taken the root row out —
 /// the checkout does not exist yet, so only the PROJECT has to be
-/// selected. Its branch
-/// is the same random name the `n` prompt would have offered.
+/// selected. Its branch is the same random name the `n` prompt would
+/// have offered.
+///
+/// A cursor parked on an OPEN PRS row — in that panel or, the row still
+/// selected, from any other — makes the box a PR SESSION's, the one `e`
+/// there hands back less the preset (`open_for_pr`): Enter sends a
+/// `CreatePrAgent`, and the fresh worktree is the pull request's own,
+/// on its head branch, its stand-in row up under the pull request from
+/// the moment Enter is pressed. It used to be the random-branch checkout
+/// above, launched with no PR context at all: the session had to check
+/// the pull request out by hand, and its row only moved under the pull
+/// request once the DAEMON's reconcile noticed the branch — the "slow
+/// nesting" that was really a launch aimed at the wrong place.
 pub(crate) fn open_quick_prompt(app: &mut App) {
+    if app.selected_worktree_pr().is_some() {
+        open_for_pr(app);
+        return;
+    }
     if app.focus == Focus::Worktrees {
         let Some(project) = app.selected_project().map(|p| p.id.clone()) else {
             app.flash = Some("quick prompt: select a project first".into());
@@ -351,6 +366,58 @@ pub(crate) fn open_quick_prompt(app: &mut App) {
 pub(crate) fn open_for(app: &mut App, target: QuickTarget) {
     let launch = QuickLaunch::from_config(target, &Config::load());
     crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch));
+}
+
+/// `p` with the Worktrees cursor on an OPEN PRS row: the box for a PR
+/// SESSION on that pull request, titled for it (`Quick prompt · PR #42`),
+/// its target row naming the PR and its head branch. Enter sends one
+/// `CreatePrAgent` — the typed text its STARTING PROMPT — and, when the
+/// PROJECT has no checkout on the head branch yet, puts the stand-in rows
+/// up at once, nested under the pull request where the DAEMON's real row
+/// will list (`create_agent`, through `placeholder::stage`). Nothing to
+/// open when the project has no ROOT WORKTREE to address it to; the
+/// footer says so.
+fn open_for_pr(app: &mut App) {
+    let Some(launch) = pr_launch(app) else {
+        return;
+    };
+    // The text of a launch the DAEMON refused while another modal was up
+    // (`App::parked_pr_prompt`): this box is where it was headed.
+    let url = launch.pr.as_ref().map(|pr| pr.url.clone());
+    let parked = match app.parked_pr_prompt.take() {
+        Some((for_url, text)) if Some(&for_url) == url.as_ref() => Some(text),
+        other => {
+            app.parked_pr_prompt = other;
+            None
+        }
+    };
+    match parked {
+        Some(text) => reopen(app, launch, &text),
+        None => crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch)),
+    }
+}
+
+/// The launch every PR SESSION box starts from — `p`'s and `e`'s alike:
+/// the `quick_prompt_kind` SETTING's harness, the pull request under the
+/// Worktrees cursor carried as `QuickLaunch::pr`, and the PROJECT's ROOT
+/// WORKTREE as the target, which only names the project the create is
+/// addressed to (as the `n` picker's does) — the DAEMON picks the
+/// checkout, the PR head branch's own. None off a pull request row, and,
+/// with a flash, when the project has no root to address it to.
+fn pr_launch(app: &mut App) -> Option<QuickLaunch> {
+    let pr = app.selected_worktree_pr().map(PrLaunch::of)?;
+    let root = app.selected_project().and_then(|project| {
+        app.tree
+            .worktrees
+            .iter()
+            .find(|w| w.project_id == project.id && w.is_main)
+            .map(|w| w.id.clone())
+    });
+    let Some(root) = root else {
+        app.flash = Some("the project has no ROOT WORKTREE for this PR session".into());
+        return None;
+    };
+    Some(QuickLaunch::from_config(QuickTarget::Worktree(root), &Config::load()).with_pr(Some(pr)))
 }
 
 /// The NEW SESSION PICKER's last step: the box for the harness (and the
@@ -535,22 +602,9 @@ pub(crate) fn open_preset_picker(app: &mut App, back: QuickReturn) {
 /// box's target is the PROJECT's ROOT WORKTREE, which only names the
 /// PROJECT the create is addressed to (as the `n` picker's is).
 pub(crate) fn open_preset_picker_for_pr(app: &mut App) {
-    let Some(pr) = app.selected_worktree_pr().map(PrLaunch::of) else {
+    let Some(launch) = pr_launch(app) else {
         return;
     };
-    let root = app.selected_project().and_then(|project| {
-        app.tree
-            .worktrees
-            .iter()
-            .find(|w| w.project_id == project.id && w.is_main)
-            .map(|w| w.id.clone())
-    });
-    let Some(root) = root else {
-        app.flash = Some("the project has no ROOT WORKTREE for this PR session".into());
-        return;
-    };
-    let launch =
-        QuickLaunch::from_config(QuickTarget::Worktree(root), &Config::load()).with_pr(Some(pr));
     open_preset_picker(
         app,
         QuickReturn {

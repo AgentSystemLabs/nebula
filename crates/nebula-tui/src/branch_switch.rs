@@ -1757,9 +1757,13 @@ pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent, pos: Position) {
         Stage::Pick => {
             if delta != 0 {
                 view.select(view.selected as i64 + delta);
-            } else if click && view.list_area.contains(pos) {
-                let start = window_start(view.selected, view.list_area.height as usize);
-                view.select((start + (pos.y - view.list_area.y) as usize) as i64);
+            } else if click {
+                let first = window_start(view.selected, view.list_area.height as usize);
+                if let Some(index) =
+                    crate::list_hit::row_at(view.list_area, first, view.matches.len(), pos)
+                {
+                    view.select(index as i64);
+                }
             }
         }
         Stage::Dirty {

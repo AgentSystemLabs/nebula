@@ -180,8 +180,13 @@ pub enum ClientRequest {
         effort: Option<String>,
         auto_title: bool,
         pr_url: String,
-        /// The pull request's head branch (`gh`'s `headRefName`): the
-        /// branch the PR SESSION's worktree is checked out on.
+        /// The branch the PR SESSION's worktree is checked out on: the
+        /// pull request's head branch (`gh`'s `headRefName`) for a
+        /// same-repo pull request, and `<owner>/<headRefName>` for a
+        /// fork's — a fork's `main` is not ours, and must match neither
+        /// the ROOT WORKTREE nor a branch on `origin`. The client names
+        /// it; the daemon fetches `origin`'s branch of that name and,
+        /// finding none, seeds it from `refs/pull/N/head`.
         head: String,
         /// The CLI's positional first prompt — an AGENT PRESET picked on
         /// the OPEN PRS row composes one, under `CreateAgent`'s rules for

@@ -156,6 +156,8 @@ const PATH_PROMPT_W: u16 = 72;
 const CONFIRM_MIN_W: u16 = 52;
 /// Widths of the modals whose height follows their content.
 const HELP_W: u16 = 92;
+/// The help overlay's key column: chords past it are dropped whole.
+const HELP_KEY_W: usize = 14;
 const SETTINGS_W: u16 = 84;
 const MEMORY_W: u16 = 74;
 const HOSTS_W: u16 = 64;
@@ -749,8 +751,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "WORKTREES",
                     &[
                         (Act(&[New]), "new worktree (PR row: Claude)"),
-                        (Act(&[Rename]), "run / stop .nebula.json \"run\""),
-                        (Act(&[OpenWorktree]), "fire .nebula.json \"open\""),
+                        (Act(&[Rename]), "run / stop the project's run command"),
+                        (Act(&[OpenWorktree]), "fire its open command"),
                         (Act(&[HalfPageDown, HalfPageUp]), "half a panel down / up"),
                         (Act(&[GitDiff]), "git diff (^r: mark reviewed ✓)"),
                         (
@@ -834,14 +836,34 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             ];
             // What to print in the key column: a literal, or every chord
             // each action currently answers to.
+            // An action bound to more chords than the key column holds —
+            // open's ⇧Enter ⇧O ⌥Enter — loses whole chords off the end
+            // and gains an ellipsis, never a cut mid-chord; the Hotkeys
+            // tab lists every one.
             let keys_of = |k: &HelpKeys| -> String {
                 match k {
                     Lit(s) => (*s).to_string(),
-                    Act(actions) => actions
-                        .iter()
-                        .map(|a| app.keymap.label(*a))
-                        .collect::<Vec<_>>()
-                        .join(" / "),
+                    Act(actions) => {
+                        let full = actions
+                            .iter()
+                            .map(|a| app.keymap.label(*a))
+                            .collect::<Vec<_>>()
+                            .join(" / ");
+                        if actions.len() != 1 || full.chars().count() <= HELP_KEY_W {
+                            return full;
+                        }
+                        let chords: Vec<String> = app
+                            .keymap
+                            .chords(actions[0])
+                            .iter()
+                            .map(|c| c.display().to_string())
+                            .collect();
+                        (1..chords.len())
+                            .rev()
+                            .map(|kept| format!("{} …", chords[..kept].join(" ")))
+                            .find(|shown| shown.chars().count() <= HELP_KEY_W)
+                            .unwrap_or(full)
+                    }
                 }
             };
             // Rows a column needs: each section is a header plus its
@@ -878,12 +900,15 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     )));
                     for (k, v) in *entries {
                         // Rebindable chords vary in width, so the key
-                        // column is padded to a fixed 14 and clipped there
-                        // — an exotic binding can't shove the descriptions
-                        // out of alignment.
-                        let keys = truncate(&keys_of(k), 14);
+                        // column is padded to a fixed width and clipped
+                        // there — an exotic binding can't shove the
+                        // descriptions out of alignment.
+                        let keys = truncate(&keys_of(k), HELP_KEY_W);
                         lines.push(Line::from(vec![
-                            Span::styled(format!(" {keys:<14}"), Style::default().fg(th.accent)),
+                            Span::styled(
+                                format!(" {keys:<width$}", width = HELP_KEY_W),
+                                Style::default().fg(th.accent),
+                            ),
                             Span::styled(
                                 truncate(v, (width as usize).saturating_sub(16)),
                                 Style::default().fg(th.dim),
@@ -1006,9 +1031,12 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                             label_style = label_style.bg(th.sel_bg).add_modifier(Modifier::BOLD);
                             value_style = value_style.bg(th.sel_bg).add_modifier(Modifier::BOLD);
                         }
+                        // A typed command can outrun the column: clip it
+                        // with an ellipsis rather than at the frame.
+                        let room = (inner.width as usize).saturating_sub(3 + 28 + 2);
                         lines.push(Line::from(vec![
                             Span::styled(format!("   {:<28}", label), label_style),
-                            Span::styled(format!("[{value}]"), value_style),
+                            Span::styled(format!("[{}]", truncate(&value, room)), value_style),
                         ]));
                     }
                     crate::config::SettingsRow::Hotkey(i) => {

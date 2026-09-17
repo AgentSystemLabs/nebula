@@ -7,6 +7,7 @@
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -50,6 +51,23 @@ pub struct Config {
     /// [`nebula_core::harness::registry`]; a broken entry refuses its
     /// launches with the reason, never the whole daemon.
     pub harnesses: BTreeMap<String, nebula_core::harness::HarnessOverride>,
+    /// PROJECT SETTINGS: one entry per project set up differently from the
+    /// rest, keyed by the project's repo path as the store holds it. The
+    /// TUI's Project tab owns the map; the daemon reads the one key in it
+    /// that is its to act on, through [`Config::run_command`].
+    pub projects: BTreeMap<PathBuf, ProjectConfig>,
+}
+
+/// One project's entry under `projects` — the rows of the TUI's Project
+/// tab, of which the daemon reads one. The rest (`hide_root_worktree`)
+/// are the TUI's and pass through unread.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ProjectConfig {
+    /// The RUN COMMAND `r` starts in this project's worktrees, typed into
+    /// Settings → Project. Empty means the checkout's `.nebula.json`
+    /// `run`, as before the row existed.
+    pub run_command: String,
 }
 
 impl Default for Config {
@@ -62,6 +80,7 @@ impl Default for Config {
             worktree_base_branch: String::new(),
             custom_harnesses: Vec::new(),
             harnesses: BTreeMap::new(),
+            projects: BTreeMap::new(),
         }
     }
 }
@@ -100,6 +119,16 @@ impl Config {
         let name = self.worktree_base_branch.trim();
         let name = name.strip_prefix("origin/").unwrap_or(name).trim();
         (!name.is_empty()).then_some(name)
+    }
+
+    /// The RUN COMMAND set for the project checked out at `repo_path` in
+    /// Settings → Project, trimmed; None when the project has no entry or
+    /// the row is empty, which means the checkout's `.nebula.json` decides.
+    pub fn run_command(&self, repo_path: &Path) -> Option<&str> {
+        self.projects
+            .get(repo_path)
+            .map(|p| p.run_command.trim())
+            .filter(|c| !c.is_empty())
     }
 }
 
@@ -227,6 +256,36 @@ mod tests {
         assert_eq!(base("origin/"), None);
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.worktree_base_branch(), None);
+    }
+
+    /// The Project tab's `run_command`, under the project's repo path:
+    /// trimmed, blank is unset, and the entry's other rows — the TUI's —
+    /// don't stop the daemon reading it.
+    #[test]
+    fn run_command_is_read_per_project_and_blank_means_the_file() {
+        assert_eq!(Config::default().run_command(Path::new("/tmp/demo")), None);
+        let cfg: Config = serde_json::from_str(
+            r#"{"projects": {
+                "/tmp/demo": { "hide_root_worktree": true, "run_command": "  npm run dev " },
+                "/tmp/blank": { "run_command": "   " },
+                "/tmp/other": { "hide_root_worktree": false, "future_row": 1 }
+            }}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.run_command(Path::new("/tmp/demo")), Some("npm run dev"));
+        assert_eq!(cfg.run_command(Path::new("/tmp/blank")), None);
+        assert_eq!(cfg.run_command(Path::new("/tmp/other")), None);
+        assert_eq!(cfg.run_command(Path::new("/tmp/unknown")), None);
+        // A `projects` this build can't read costs the map, not the rest.
+        let obj = serde_json::json!({
+            "projects": { "/tmp/demo": { "run_command": ["npm", "run", "dev"] } },
+            "worktree_base_branch": "develop",
+        });
+        let (cfg, skipped) =
+            nebula_core::settings::parse_lenient::<Config>(obj.as_object().unwrap());
+        assert_eq!(cfg.run_command(Path::new("/tmp/demo")), None);
+        assert_eq!(cfg.worktree_base_branch, "develop");
+        assert_eq!(skipped.into_iter().collect::<Vec<_>>(), ["projects"]);
     }
 
     #[test]

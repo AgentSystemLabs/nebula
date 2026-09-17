@@ -70,6 +70,9 @@ pub const DEFAULT_CHOICE: &str = "default";
 /// picks origin's default branch itself. Display only — the file holds
 /// `""`, never this word.
 pub const AUTO_CHOICE: &str = "auto";
+/// What the Project tab's **Run command** row shows while it is empty:
+/// the checkout's `.nebula.json` is what `r` reads then.
+pub const PROJECT_FILE_CHOICE: &str = nebula_core::project_file::FILE_NAME;
 
 /// The static model/effort lists live in the core registry table now
 /// ([`nebula_core::harness::builtin`]); what the pickers show is built
@@ -366,6 +369,8 @@ pub enum SettingKind {
     QuickPromptKind,
     QuickPromptFocus,
     HideRootWorktree,
+    RunCommand,
+    OpenCommand,
     RecentPrompts,
     RecentPromptsCount,
     ShowKeyCombos,
@@ -399,16 +404,23 @@ impl SettingKind {
     /// nothing to step through. [`Config::cycle`] leaves such a row alone;
     /// [`Config::set_text`] is what writes it.
     pub fn is_text(self) -> bool {
-        matches!(self, SettingKind::WorktreeBaseBranch)
+        matches!(
+            self,
+            SettingKind::WorktreeBaseBranch | SettingKind::RunCommand | SettingKind::OpenCommand
+        )
     }
 
     /// A row on the PROJECT TAB: its value is the focused project's, kept
     /// in that project's `projects` entry rather than at the top level of
     /// the file. [`Config::cycle`] leaves such a row alone;
-    /// [`Config::cycle_project`] is what writes it, and
+    /// [`Config::cycle_project`] (or [`Config::set_project_text`], for a
+    /// row that is typed as well) is what writes it, and
     /// [`ProjectSettings::value_label`] what reads it.
     pub fn is_project(self) -> bool {
-        matches!(self, SettingKind::HideRootWorktree)
+        matches!(
+            self,
+            SettingKind::HideRootWorktree | SettingKind::RunCommand | SettingKind::OpenCommand
+        )
     }
 }
 
@@ -571,12 +583,26 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
     // for every project at once.
     SettingsTab {
         title: "Project",
-        body: TabBody::Project(&[SettingSpec {
-            kind: SettingKind::HideRootWorktree,
-            label: "Hide root worktree",
-            hint: "Drop this project's ⌂ root row so nothing launched from Worktrees lands in its shared checkout",
-            group: "",
-        }]),
+        body: TabBody::Project(&[
+            SettingSpec {
+                kind: SettingKind::RunCommand,
+                label: "Run command",
+                hint: "Shell line r runs in this project's worktrees (empty = its .nebula.json \"run\")",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::OpenCommand,
+                label: "Open command",
+                hint: "Shell line ⇧Enter / ⇧O runs to open a worktree of this project, e.g. open http://localhost:3000 (empty = its .nebula.json \"open\")",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::HideRootWorktree,
+                label: "Hide root worktree",
+                hint: "Drop this project's ⌂ root row so nothing launched from Worktrees lands in its shared checkout",
+                group: "",
+            },
+        ]),
     },
     // Behaviors that change how the tree is worked, off by default until
     // they have earned a tab of their own. Before Hotkeys, which stays
@@ -1070,6 +1096,24 @@ pub struct Config {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProjectSettings {
+    /// The RUN COMMAND `r` starts in this project's worktrees, typed on
+    /// the Project tab. Empty — the default, shown as `.nebula.json` — is
+    /// the checkout's PROJECT FILE `run`, where the command lived before
+    /// the row existed; set, it wins over the file. The DAEMON reads it
+    /// (`nebula-daemon/src/config.rs`); the TUI only edits it. Left out
+    /// of the file while empty, so an entry written before the row reads
+    /// the same after a save.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub run_command: String,
+    /// The OPEN COMMAND `Shift+Enter` / `Shift+O` fires on this project's
+    /// worktrees, typed on the Project tab — `open http://localhost:3000`,
+    /// say. Empty (shown as `.nebula.json`) is the checkout's PROJECT FILE
+    /// `open`; set, it wins over the file. The TUI both edits and runs it
+    /// (`event_loop::open_worktree`): what it opens belongs on the machine
+    /// the user sits at, never the DAEMON's. Left out of the file while
+    /// empty, like `run_command`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub open_command: String,
     /// Leave this project's ROOT WORKTREE row out of the WORKTREES PANEL,
     /// so nothing launched there lands in its shared checkout. The root's
     /// sessions keep running and the PALETTE still finds them. (A `p` on
@@ -1089,15 +1133,53 @@ impl ProjectSettings {
     pub fn value_label(&self, kind: SettingKind) -> String {
         match kind {
             SettingKind::HideRootWorktree => on_off(self.hide_root_worktree).into(),
+            SettingKind::RunCommand => match self.run_command.trim() {
+                "" => PROJECT_FILE_CHOICE.into(),
+                command => command.to_string(),
+            },
+            SettingKind::OpenCommand => match self.open_command.trim() {
+                "" => PROJECT_FILE_CHOICE.into(),
+                command => command.to_string(),
+            },
             _ => String::new(),
         }
     }
 
-    /// Activate a PROJECT TAB row. The one so far is a toggle, so ←, → and
-    /// Enter all flip it; a row that is not a project row is left alone.
+    /// Activate a PROJECT TAB row. A toggle flips on ←, → and Enter alike;
+    /// a typed row ([`SettingKind::is_text`]) is left alone, since its
+    /// prompt writes it through [`ProjectSettings::set_text`]; so is a row
+    /// that is not a project row.
     pub fn cycle(&mut self, kind: SettingKind) {
         if kind == SettingKind::HideRootWorktree {
             self.hide_root_worktree = !self.hide_root_worktree;
+        }
+    }
+
+    /// The stored text of a typed PROJECT TAB row as its prompt pre-fills
+    /// it — `""` for an unset row, never the `.nebula.json` the overlay
+    /// shows in its place. Empty for a row that is not typed.
+    pub fn text_value(&self, kind: SettingKind) -> String {
+        match kind {
+            SettingKind::RunCommand => self.run_command.clone(),
+            SettingKind::OpenCommand => self.open_command.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// Write a typed value into a typed PROJECT TAB row, trimmed. Empty
+    /// puts the row back on its default. False for a row that is not a
+    /// typed project row — nothing changes.
+    pub fn set_text(&mut self, kind: SettingKind, value: &str) -> bool {
+        match kind {
+            SettingKind::RunCommand => {
+                self.run_command = value.trim().to_string();
+                true
+            }
+            SettingKind::OpenCommand => {
+                self.open_command = value.trim().to_string();
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -1815,6 +1897,24 @@ impl Config {
         self.set_project(repo_path, settings);
     }
 
+    /// The stored text of a typed PROJECT TAB row for the project at
+    /// `repo_path` — what [`Config::text_value`] is for a top-level row.
+    pub fn project_text_value(&self, repo_path: &Path, kind: SettingKind) -> String {
+        self.project(repo_path).text_value(kind)
+    }
+
+    /// Write a typed PROJECT TAB row for the project at `repo_path` — what
+    /// [`Config::set_text`] is for a top-level row. False for a row that
+    /// is not a typed project row.
+    pub fn set_project_text(&mut self, repo_path: &Path, kind: SettingKind, value: &str) -> bool {
+        let mut settings = self.project(repo_path);
+        if !settings.set_text(kind, value) {
+            return false;
+        }
+        self.set_project(repo_path, settings);
+        true
+    }
+
     /// The overlay's label for `kind`. A PROJECT TAB row read here shows
     /// the fallback — the overlay reads the selected project's through
     /// [`Config::project`] instead.
@@ -1844,7 +1944,9 @@ impl Config {
             SettingKind::HideWorktrees => shown_hidden(self.hide_worktrees).into(),
             SettingKind::HideSessions => shown_hidden(self.hide_sessions).into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
-            SettingKind::HideRootWorktree => self.project_fallback().value_label(kind),
+            SettingKind::HideRootWorktree | SettingKind::RunCommand | SettingKind::OpenCommand => {
+                self.project_fallback().value_label(kind)
+            }
             SettingKind::RecentPrompts => on_off(self.recent_prompts).into(),
             SettingKind::ShowKeyCombos => on_off(self.show_key_combos).into(),
             SettingKind::RecentPromptsCount => self
@@ -1947,7 +2049,7 @@ impl Config {
                 self.hide_draft_prs = !self.hide_draft_prs;
             }
             // One project's, not the file's: see `cycle_project`.
-            SettingKind::HideRootWorktree => {}
+            SettingKind::HideRootWorktree | SettingKind::RunCommand | SettingKind::OpenCommand => {}
             SettingKind::RecentPrompts => {
                 self.recent_prompts = !self.recent_prompts;
             }
@@ -3018,6 +3120,158 @@ mod tests {
 
         // A config predating the key has no entries.
         let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.projects.is_empty());
+    }
+
+    /// **Run command** on the Project tab: a typed row (Enter prompts,
+    /// ←/→ and cycle change nothing) kept per repo path as `run_command`,
+    /// shown as `.nebula.json` while empty — the file decides then — and
+    /// left out of the file while empty, so an entry that only sets the
+    /// toggle is written as it always was.
+    #[test]
+    fn run_command_is_a_typed_project_row_kept_per_repo_path() {
+        let demo = Path::new("/tmp/demo");
+        let other = Path::new("/tmp/other");
+        let mut cfg = Config::default();
+        assert!(SettingKind::RunCommand.is_text());
+        assert!(SettingKind::RunCommand.is_project());
+        let (tab, row) = locate(SettingKind::RunCommand).unwrap();
+        assert_eq!(tab, project_tab());
+        assert_eq!(row, 0, "the first row of the tab");
+        assert_eq!(cfg.project(demo).run_command, "");
+        assert_eq!(
+            cfg.project(demo).value_label(SettingKind::RunCommand),
+            PROJECT_FILE_CHOICE
+        );
+        assert_eq!(cfg.value_label(SettingKind::RunCommand), ".nebula.json");
+        assert_eq!(cfg.project_text_value(demo, SettingKind::RunCommand), "");
+
+        // Neither the tab's cycle nor the project's touches a typed row.
+        for delta in [0, 1, -1] {
+            cfg.cycle(tab, row, delta);
+        }
+        cfg.cycle_project(demo, SettingKind::RunCommand);
+        assert!(cfg.projects.is_empty());
+        assert!(
+            !cfg.set_text(SettingKind::RunCommand, "npm run dev"),
+            "not a top-level row"
+        );
+        assert!(
+            !cfg.set_project_text(demo, SettingKind::HideRootWorktree, "on"),
+            "not a typed row"
+        );
+        assert!(cfg.projects.is_empty());
+
+        assert!(cfg.set_project_text(demo, SettingKind::RunCommand, "  npm run dev "));
+        assert_eq!(cfg.project(demo).run_command, "npm run dev", "trimmed");
+        assert_eq!(
+            cfg.project(demo).value_label(SettingKind::RunCommand),
+            "npm run dev"
+        );
+        assert_eq!(
+            cfg.project_text_value(demo, SettingKind::RunCommand),
+            "npm run dev"
+        );
+        assert_eq!(
+            cfg.project(other).value_label(SettingKind::RunCommand),
+            PROJECT_FILE_CHOICE,
+            "one project's, not every project's"
+        );
+        assert!(
+            !cfg.project(demo).hide_root_worktree,
+            "the toggle is untouched"
+        );
+
+        // Persisted in the project's entry beside the toggle; the toggle
+        // alone is still written without the key.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.cycle_project(other, SettingKind::HideRootWorktree);
+        cfg.save_to(&path).unwrap();
+        assert_eq!(
+            read_json_file(&path)["projects"],
+            serde_json::json!({
+                "/tmp/demo": { "hide_root_worktree": false, "run_command": "npm run dev" },
+                "/tmp/other": { "hide_root_worktree": true },
+            })
+        );
+        let loaded = load_from(&path);
+        assert_eq!(loaded.project(demo).run_command, "npm run dev");
+        assert_eq!(loaded.project(other).run_command, "");
+
+        // Empty is the way back to the file — and drops the entry.
+        assert!(cfg.set_project_text(demo, SettingKind::RunCommand, "   "));
+        assert_eq!(cfg.projects.keys().collect::<Vec<_>>(), [other]);
+        cfg.save_to(&path).unwrap();
+        assert_eq!(
+            read_json_file(&path)["projects"],
+            serde_json::json!({ "/tmp/other": { "hide_root_worktree": true } })
+        );
+    }
+
+    /// **Open command** on the Project tab: the same typed per-project row
+    /// as Run command, right under it, kept as `open_command` — what
+    /// `Shift+Enter` / `Shift+O` runs before looking at `.nebula.json`.
+    /// Its own key, so setting it leaves `run_command` alone; empty drops
+    /// it from the entry.
+    #[test]
+    fn open_command_is_a_typed_project_row_under_run_command() {
+        let demo = Path::new("/tmp/demo");
+        let mut cfg = Config::default();
+        assert!(SettingKind::OpenCommand.is_text());
+        assert!(SettingKind::OpenCommand.is_project());
+        let (tab, row) = locate(SettingKind::OpenCommand).unwrap();
+        assert_eq!(tab, project_tab());
+        assert_eq!(
+            row,
+            locate(SettingKind::RunCommand).unwrap().1 + 1,
+            "right under Run command"
+        );
+        assert_eq!(cfg.project(demo).open_command, "");
+        assert_eq!(
+            cfg.project(demo).value_label(SettingKind::OpenCommand),
+            PROJECT_FILE_CHOICE
+        );
+        assert_eq!(cfg.value_label(SettingKind::OpenCommand), ".nebula.json");
+
+        // A typed row: cycling it changes nothing, and the top-level
+        // setter is not its.
+        cfg.cycle_project(demo, SettingKind::OpenCommand);
+        assert!(cfg.projects.is_empty());
+        assert!(!cfg.set_text(SettingKind::OpenCommand, "open x"));
+
+        assert!(cfg.set_project_text(
+            demo,
+            SettingKind::OpenCommand,
+            "  open http://localhost:3000 "
+        ));
+        assert_eq!(
+            cfg.project(demo).open_command,
+            "open http://localhost:3000",
+            "trimmed"
+        );
+        assert_eq!(cfg.project(demo).run_command, "", "run's key is untouched");
+        assert_eq!(
+            cfg.project_text_value(demo, SettingKind::OpenCommand),
+            "open http://localhost:3000"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert_eq!(
+            read_json_file(&path)["projects"],
+            serde_json::json!({
+                "/tmp/demo": { "hide_root_worktree": false, "open_command": "open http://localhost:3000" },
+            })
+        );
+        assert_eq!(
+            load_from(&path).project(demo).open_command,
+            "open http://localhost:3000"
+        );
+
+        // Empty is the way back to the file — and drops the entry.
+        assert!(cfg.set_project_text(demo, SettingKind::OpenCommand, " "));
         assert!(cfg.projects.is_empty());
     }
 

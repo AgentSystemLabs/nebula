@@ -608,8 +608,13 @@ pub enum PromptKind {
     /// Enter on it: the one-line prompt stands in for the overlay while the
     /// value is typed, and both Enter and Esc put the overlay back on the
     /// row it left. An empty value is the row's default, not a cancel.
+    /// `project` is the repo path of the project a PROJECT TAB row
+    /// (`SettingKind::is_project`) was opened on, so the value lands in
+    /// that project's entry even if the selection moves meanwhile; None
+    /// for a top-level row.
     SettingText {
         kind: crate::config::SettingKind,
+        project: Option<std::path::PathBuf>,
     },
     /// Name for a workspace created from the switcher; opened on Ack.
     NewWorkspace,
@@ -1403,6 +1408,46 @@ pub struct AgentLaunchDraft {
     /// waited on the NEW WORKTREE modal's checkout): the Ack turns it
     /// into the created row, an Error drops it.
     pub placeholder: Option<AgentId>,
+    /// Land the cursors, the pane and FOCUS on the created session when
+    /// its Ack arrives. False only for the second half of a two-request
+    /// launch (a checkout cut first, then the session) whose first half
+    /// the user navigated away from: the create is born in
+    /// `App::left_behind`, so the manual move still outranks the follow.
+    pub follow: bool,
+}
+
+impl AgentLaunchDraft {
+    /// A launch of `kind` at `model` / `effort` into `worktree` with
+    /// nothing else said: no name (the row titles itself), no first
+    /// prompt, no pull request or issue behind it, no box to bring back,
+    /// no stand-in row, and the pane taken — what a launch the user walked
+    /// a picker to reach looks like. Every launch surface starts from this
+    /// and names only what is its own (`..AgentLaunchDraft::new(…)`), so a
+    /// field added here has one default instead of one per surface that
+    /// would otherwise have to remember it.
+    pub fn new(
+        worktree: WorktreeId,
+        kind: AgentKind,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Self {
+        Self {
+            worktree,
+            kind,
+            custom: None,
+            model,
+            effort,
+            name: String::new(),
+            cloud_prompt: None,
+            starting_prompt: None,
+            reopen_on_error: None,
+            pr: None,
+            issue_url: None,
+            focus_pane: true,
+            placeholder: None,
+            follow: true,
+        }
+    }
 }
 
 /// What to do when an Ack (or Error) for this req_id arrives.
@@ -1479,10 +1524,23 @@ pub enum PendingIntent {
     /// stand-in checkout row is adopted by the worktree's upsert as it
     /// lands (`placeholder::adopt_worktree`), the session row by the Ack,
     /// which then attaches it like `AttachCreated` — `focus` enters and
-    /// locks the pane. An Error takes down whatever is still a stand-in.
+    /// locks the pane. An Error takes down whatever is still a stand-in
+    /// and, like every other launch out of a box, brings `reopen`'s box
+    /// back with what was typed in it — this create is the one most
+    /// likely to be refused (a fetch offline, a fork since deleted, a
+    /// branch git will not cut), and a review prompt is not retyped
+    /// gladly. None for the `n` picker's name box, which has no task.
     AttachCreatedPrSession {
         focus: bool,
         placeholder: PlaceholderRows,
+        reopen: Option<(PromptKind, String)>,
+        /// The pull request the launch was fired from: where a cursor
+        /// still on the refused stand-in goes back to. The row it left had
+        /// no worktree, so `remember_context` recorded nothing to return
+        /// to, and `restore_context` alone would drop the cursor on the
+        /// ROOT WORKTREE — one `p` away from a session in the main
+        /// checkout.
+        pr_url: String,
     },
     /// Open the workspace this Ack just created (switcher's "New workspace…"
     /// flow: creating from there means you want to be in it).
@@ -1493,6 +1551,24 @@ pub enum PendingIntent {
 }
 
 impl PendingIntent {
+    /// Will this request's Ack move a cursor, the pane or FOCUS onto what
+    /// it created? Those are the follows a manual move cancels
+    /// (`App::left_behind`). The NEW WORKTREE modal's own Ack moves
+    /// nothing — its select happened at Enter — until a launch is waiting
+    /// on it.
+    pub fn follows(&self) -> bool {
+        match self {
+            PendingIntent::AttachCreated { .. }
+            | PendingIntent::AttachCreatedWithCloudRetry { .. }
+            | PendingIntent::AttachCreatedPrSession { .. }
+            | PendingIntent::LaunchInCreatedWorktree { .. }
+            | PendingIntent::SelectCreatedProject
+            | PendingIntent::OpenCreatedWorkspace => true,
+            PendingIntent::SelectCreatedWorktree { launch, .. } => launch.is_some(),
+            _ => false,
+        }
+    }
+
     /// The stand-in worktree row this in-flight request is holding up.
     pub fn placeholder_worktree(&self) -> Option<&WorktreeId> {
         match self {
@@ -1698,11 +1774,12 @@ impl<'a> WorktreeRow<'a> {
 
 /// What a click landed on, for the double-click window. Sessions are their
 /// own reference; a link has none (the pull-request row isn't even stored),
-/// so its URL is the identity.
+/// so its URL is the identity; a checkout is its id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowKey {
     Session(SessionRef),
     Link(String),
+    Worktree(WorktreeId),
 }
 
 /// Aggregate status for a worktree row: red > yellow > green > gray,
@@ -2446,6 +2523,14 @@ pub struct App {
     pub key_combo: Option<crate::key_combo::KeyCombo>,
     pub next_req_id: u64,
     pub pending: HashMap<u64, PendingIntent>,
+    /// In-flight creates — keys of `pending` — the user has navigated away
+    /// from since firing them: a key or a click moved a cursor or FOCUS
+    /// while the DAEMON worked (a PR SESSION's fetch and `git worktree
+    /// add` are seconds). Their Ack still turns the stand-ins into the
+    /// real rows, but leaves the cursors, the pane and FOCUS where the
+    /// user put them — a manual move outranks a selection-follow. Filled
+    /// by `event_loop::handle_terminal_event`, emptied by the Ack or Error.
+    pub left_behind: std::collections::HashSet<u64>,
     /// `nebula --workspace <name>`: the workspace this instance was asked
     /// to open into, held until the first snapshot arrives with the names
     /// to resolve it against. Taken there — it applies once, at boot.
@@ -2476,6 +2561,13 @@ pub struct App {
     /// deadline — armed on every worktree context switch, so walking the
     /// list doesn't boot every CLI it passes.
     pub pending_prewarm: Option<(WorktreeId, std::time::Instant)>,
+    /// A refused PR SESSION's box that could not come back because another
+    /// modal was up when the refusal landed — the DAEMON fetches before it
+    /// refuses, seconds after Enter, so the user has usually moved on. It
+    /// is never put over that modal (whose own text would go); the next
+    /// quick prompt opened on the same pull request starts from it
+    /// instead, as a refused pull request comment does.
+    pub parked_pr_prompt: Option<(String, String)>,
     /// Debounced attach: the session the pane is showing but the daemon has
     /// not been told about yet. Stepping a selection is not a decision to
     /// boot a CLI — and in the Workspaces column every step is a full
@@ -2804,6 +2896,7 @@ impl App {
             key_combo: None,
             next_req_id: 1,
             pending: HashMap::new(),
+            left_behind: std::collections::HashSet::new(),
             startup_workspace: None,
             select_when_seen: None,
             select_project_when_seen: None,
@@ -2813,6 +2906,7 @@ impl App {
             last_session_for_worktree: HashMap::new(),
             last_project_for_workspace: HashMap::new(),
             pending_prewarm: None,
+            parked_pr_prompt: None,
             pending_attach: None,
             attached_sref: None,
             next_keepwarm: None,

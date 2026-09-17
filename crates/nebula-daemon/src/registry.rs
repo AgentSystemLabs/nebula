@@ -1,6 +1,7 @@
 //! The daemon's world: persisted entity tree + live PTY sessions, and the
 //! operations the IPC surface exposes over them.
 
+use crate::claude_bg;
 use crate::git;
 use crate::hooks::{self, HookEnv};
 use crate::pty::{PtyEvent, PtySession, SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
@@ -68,6 +69,11 @@ const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 type FinishedRun = (Arc<PtySession>, Option<i32>);
 /// What a RUN TERMINAL's row is called in the Sessions panel.
 const RUN_TERMINAL_NAME: &str = "run";
+/// `r` on a worktree with nothing to run: the footer line naming both
+/// places a RUN COMMAND can come from.
+const NO_RUN_COMMAND: &str =
+    "no run command for this worktree — set one in Settings (s) → Project, \
+                              or add .nebula.json with {\"run\": \"npm run dev\"}";
 /// Why a RUN TERMINAL with nothing left to replay will not attach — its
 /// run ended before a DAEMON restart, typically.
 const RUN_NOT_RUNNING: &str = "this run has stopped — press r on its worktree to start it again";
@@ -863,6 +869,9 @@ impl Daemon {
     /// WORKTREE only when the branch is checked out there — git allows a
     /// branch in one checkout at a time), or a new one under the WORKTREE
     /// DIR with the branch fetched from `origin` (`git::add_pr_worktree`).
+    /// `head` is the checkout's branch as the client names it: a fork's
+    /// arrives under its owner's name (`givemeurhats/main`), so a
+    /// contributor's `main` never matches the ROOT WORKTREE on ours.
     /// Serialized with the other worktree ops, so two PR SESSIONS launched
     /// together get one checkout, not a race to create it.
     pub(crate) async fn pr_worktree(
@@ -2019,12 +2028,23 @@ impl Daemon {
 
     // ---- run terminals ----
 
-    /// `r` on a worktree: start its RUN COMMAND — `.nebula.json`'s `run`,
-    /// read fresh from the worktree's checkout, else the main checkout's —
-    /// in the worktree's RUN TERMINAL. A run that already exited lends its
-    /// row; one still going is the answer as it stands, so a second
-    /// client's `r` never starts a second server.
+    /// `r` on a worktree: start its RUN COMMAND — the project's
+    /// `run_command` setting (Settings → Project), else `.nebula.json`'s
+    /// `run`, read fresh from the worktree's checkout, else the main
+    /// checkout's — in the worktree's RUN TERMINAL. A run that already
+    /// exited lends its row; one still going is the answer as it stands,
+    /// so a second client's `r` never starts a second server.
     pub fn start_run(self: &Arc<Self>, worktree_id: &WorktreeId) -> Result<EntityId> {
+        self.start_run_with(worktree_id, &crate::config::Config::load())
+    }
+
+    /// [`Daemon::start_run`] against a given config, for the tests that
+    /// can't pin the settings file.
+    pub fn start_run_with(
+        self: &Arc<Self>,
+        worktree_id: &WorktreeId,
+        config: &crate::config::Config,
+    ) -> Result<EntityId> {
         let worktree = self
             .store
             .get_worktree(worktree_id)?
@@ -2042,8 +2062,12 @@ impl Daemon {
             .store
             .get_project(&worktree.project_id)?
             .map_or_else(|| worktree.path.clone(), |p| p.repo_path);
-        let command = project_file::command(&worktree.path, &main, ProjectCommand::Run)
-            .map_err(anyhow::Error::msg)?;
+        let command = match config.run_command(&main) {
+            Some(command) => command.to_string(),
+            None => project_file::lookup(&worktree.path, &main, ProjectCommand::Run)
+                .map_err(anyhow::Error::msg)?
+                .context(NO_RUN_COMMAND)?,
+        };
         let mut term = match existing {
             Some(mut term) => {
                 self.store.set_terminal_run_command(&term.id, &command)?;
@@ -2333,6 +2357,40 @@ impl Daemon {
         cloud_task: Option<&str>,
         initial_prompt: Option<&str>,
     ) -> Result<Arc<PtySession>> {
+        // A session the user sent to Claude's background (`/background`)
+        // can't be resumed, only attached to — see `claude_bg`. The probe
+        // costs a login shell, so it hides behind the one-`stat` hint.
+        let attach = if cloud_task.is_none() && self.claude_job_hint(agent) {
+            self.claude_background_id(agent)
+        } else {
+            None
+        };
+        self.spawn_agent_pty(
+            agent,
+            worktree,
+            cols,
+            rows,
+            cloud_task,
+            initial_prompt,
+            attach.as_deref(),
+        )
+    }
+
+    /// [`Self::spawn_agent_session_with`] past its look for a backgrounded
+    /// Claude session: `attach` is the id `claude attach` takes, and wins
+    /// over a resume of the stored session id — and over `initial_prompt`,
+    /// which `attach` has no way to submit.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_agent_pty(
+        self: &Arc<Self>,
+        agent: &Agent,
+        worktree: &Worktree,
+        cols: u16,
+        rows: u16,
+        cloud_task: Option<&str>,
+        initial_prompt: Option<&str>,
+        attach: Option<&str>,
+    ) -> Result<Arc<PtySession>> {
         // Whatever spawns this agent, it runs in `worktree` from here: a
         // relocation still pending for it has been overtaken.
         self.pending_moves.lock().unwrap().remove(&agent.id);
@@ -2384,6 +2442,7 @@ impl Daemon {
                 if agent.kind == AgentKind::Claude
                     && cloud_task.is_none()
                     && cmd_override.is_none()
+                    && attach.is_none()
                     && claude_transcript_exists(&self.claude_projects_dirs(), sid)
                         == Some(false) =>
             {
@@ -2436,15 +2495,27 @@ impl Daemon {
             rule.as_deref(),
             initial_prompt,
         );
-        let (program, args, resumed) = match cloud_task {
-            Some(task) => claude_cloud_spawn_command(
+        let (program, args, resumed) = match (cloud_task, attach) {
+            (Some(task), _) => claude_cloud_spawn_command(
                 &harness,
                 task,
                 agent.model.as_deref(),
                 agent.effort.as_deref(),
                 cmd_override.as_deref(),
             ),
-            None => agent_spawn_command_with(
+            // Never a watched resume: an attach that dies at once keeps the
+            // row's session id, and the pane keeps the CLI's reason.
+            (None, Some(id)) => {
+                if prompts.initial.is_some() {
+                    tracing::warn!(agent = %agent.id, "backgrounded Claude session — `claude attach` takes no prompt, dropping the initial one");
+                }
+                (
+                    harness.program.trim().to_string(),
+                    claude_bg::attach_args(id),
+                    false,
+                )
+            }
+            (None, None) => agent_spawn_command_with(
                 &harness,
                 agent.session_id.as_deref(),
                 Some(&worktree.path),
@@ -2544,6 +2615,27 @@ impl Daemon {
         if agent.kind == AgentKind::Claude
             && claude_transcript_exists(&self.claude_projects_dirs(), &sid) == Some(true)
         {
+            // One reason Claude refuses a good id: the session runs in its
+            // background daemon now, and only `claude attach` opens it. The
+            // spawn's own look missed it — its job-dir hint is Claude's
+            // private layout, free to move — so this one asks outright.
+            agent.session_id = Some(sid);
+            if let Some(attach) = self.claude_background_id(&agent) {
+                let Ok(Some(worktree)) = self.store.get_worktree(&agent.worktree_id) else {
+                    return;
+                };
+                tracing::info!(agent = %id, attach = %attach, "resume refused for a backgrounded session — attaching");
+                if self
+                    .spawn_agent_pty(&agent, &worktree, cols, rows, None, None, Some(&attach))
+                    .is_ok()
+                {
+                    agent.alive = true;
+                    self.broadcast(ServerEvent::EntityUpserted {
+                        entity: Entity::Agent(agent),
+                    });
+                }
+                return;
+            }
             tracing::info!(agent = %id, "resume failed fast with its transcript intact — keeping the session id");
             return;
         }
@@ -2575,6 +2667,32 @@ impl Daemon {
             }
             _ => None,
         }
+    }
+
+    /// Whether Claude keeps a background job under `agent`'s session id —
+    /// the cheap look that earns [`Self::claude_background_id`] its probe.
+    /// The job dirs sit beside the projects dirs, in the same config dir.
+    fn claude_job_hint(&self, agent: &Agent) -> bool {
+        let Some(sid) = claude_resumable_session(agent) else {
+            return false;
+        };
+        self.claude_projects_dirs()
+            .iter()
+            .filter_map(|projects| projects.parent())
+            .any(|config| claude_bg::job_hint(config, sid))
+    }
+
+    /// The id `claude attach` takes for `agent`'s session, when `claude
+    /// agents --json` lists it as a background session. The listing runs
+    /// through the login shell the agent itself would: the same `claude`,
+    /// the same `CLAUDE_CONFIG_DIR`.
+    fn claude_background_id(&self, agent: &Agent) -> Option<String> {
+        let sid = claude_resumable_session(agent)?;
+        let listing = ["agents".to_string(), "--json".to_string()];
+        let (program, args) = login_shell_wrap(&user_shell(), agent.kind.cli_program(), &listing);
+        let id = claude_bg::probe(&program, &args, sid)?;
+        tracing::info!(agent = %agent.id, session = %sid, attach = %id, "Claude session runs in the background");
+        Some(id)
     }
 
     /// Every Claude projects dir a transcript may sit in: the ones this
@@ -2771,6 +2889,16 @@ fn claude_config_dir() -> Option<PathBuf> {
     env::non_empty("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| env::home_dir().map(|home| home.join(".claude")))
+}
+
+/// The session id a spawn of `agent` would hand `claude --resume` — the
+/// only kind of session Claude can have sent to its background. None under
+/// the `NEBULA_AGENT_CMD` override (tests), which never resumes.
+fn claude_resumable_session(agent: &Agent) -> Option<&str> {
+    if agent.kind != AgentKind::Claude || std::env::var(env::AGENT_CMD).is_ok() {
+        return None;
+    }
+    agent.session_id.as_deref()
 }
 
 /// Whether Claude Code still holds the transcript `claude --resume <id>`
@@ -4423,7 +4551,11 @@ mod tests {
         let (dir, worktree) = run_worktree(&daemon);
 
         let missing = daemon.start_run(&worktree.id).unwrap_err();
-        assert!(missing.to_string().contains("no .nebula.json"), "{missing}");
+        assert!(
+            missing.to_string().contains("Settings (s) → Project")
+                && missing.to_string().contains(".nebula.json"),
+            "names both places: {missing}"
+        );
         assert!(daemon
             .store
             .run_terminals_in(&worktree.id)
@@ -4458,6 +4590,61 @@ mod tests {
             .is_empty());
         // Nothing left to stop is not an error.
         daemon.stop_run(&worktree.id).unwrap();
+    }
+
+    /// The project's `run_command` setting (Settings → Project) is what
+    /// `r` runs when it is set, over whatever `.nebula.json` says; blank,
+    /// the file decides as before; a project's setting is its own; and a
+    /// file that won't parse is still that file's error, not "no command".
+    #[tokio::test]
+    async fn the_project_setting_wins_over_the_project_file() {
+        let daemon = test_daemon();
+        let (dir, worktree) = run_worktree(&daemon);
+        let config =
+            |json: String| -> crate::config::Config { serde_json::from_str(&json).unwrap() };
+        let entry = |path: &Path, run: &str| {
+            config(format!(
+                r#"{{"projects": {{"{}": {{"run_command": "{run}"}}}}}}"#,
+                path.display()
+            ))
+        };
+        let run_with = |cfg: &crate::config::Config| -> String {
+            let EntityId::Terminal(id) = daemon.start_run_with(&worktree.id, cfg).unwrap() else {
+                panic!("a run lives in a terminal");
+            };
+            let command = daemon.store.get_terminal(&id).unwrap().unwrap().run_command;
+            daemon.stop_run(&worktree.id).unwrap();
+            command.unwrap()
+        };
+
+        // No file: the setting is the whole answer.
+        assert_eq!(run_with(&entry(dir.path(), "sleep 31")), "sleep 31");
+        // Both: the setting wins.
+        std::fs::write(dir.path().join(".nebula.json"), r#"{"run": "sleep 30"}"#).unwrap();
+        assert_eq!(run_with(&entry(dir.path(), "sleep 31")), "sleep 31");
+        // Blank, or another project's: the file.
+        assert_eq!(run_with(&entry(dir.path(), "   ")), "sleep 30");
+        assert_eq!(
+            run_with(&entry(Path::new("/tmp/other"), "sleep 31")),
+            "sleep 30"
+        );
+        // Neither: the message names both.
+        std::fs::remove_file(dir.path().join(".nebula.json")).unwrap();
+        let err = daemon
+            .start_run_with(&worktree.id, &entry(dir.path(), ""))
+            .unwrap_err();
+        assert!(err.to_string().contains("Settings (s) → Project"), "{err}");
+        // A broken file is its own complaint, whatever the setting isn't.
+        std::fs::write(dir.path().join(".nebula.json"), "{").unwrap();
+        let err = daemon
+            .start_run_with(&worktree.id, &crate::config::Config::default())
+            .unwrap_err();
+        assert!(err.to_string().contains(".nebula.json:"), "{err}");
+        assert_eq!(
+            run_with(&entry(dir.path(), "sleep 31")),
+            "sleep 31",
+            "and the setting never opens the file"
+        );
     }
 
     /// A run that ends on its own keeps its output for the attach that
@@ -4684,6 +4871,25 @@ mod tests {
             on_main.is_main,
             "a PR whose branch the root has checked out is already there"
         );
+
+        // A fork's `main` is not that branch: the client names its checkout
+        // for the fork's owner, so the root is no match — the contributor's
+        // commit gets a checkout of its own, shared like any other.
+        git_in(&repo, &["commit", "--allow-empty", "-m", "fork work"]);
+        git_in(&repo, &["push", "origin", "HEAD:refs/pull/129/head"]);
+        git_in(&repo, &["reset", "--hard", "origin/main"]);
+        let fork = daemon
+            .pr_worktree(&project, 129, "someone/main")
+            .await
+            .unwrap();
+        assert!(!fork.is_main, "a fork's main is never the ROOT WORKTREE");
+        assert_eq!(fork.branch, "someone/main");
+        assert_eq!(fork.path, git::worktree_dir(&repo, "someone/main"));
+        let again = daemon
+            .pr_worktree(&project, 129, "someone/main")
+            .await
+            .unwrap();
+        assert_eq!(again.id, fork.id, "and later launches share it");
 
         // A bad head never reaches git — it is refused ahead of the lookup.
         let err = daemon

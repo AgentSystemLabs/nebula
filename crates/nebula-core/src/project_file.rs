@@ -106,6 +106,19 @@ pub fn find(worktree: &Path, main: &Path) -> Result<Option<(PathBuf, ProjectFile
     Ok(None)
 }
 
+/// The command line `which` names for a worktree: Ok(None) when there is
+/// no file, or the file leaves the key out or blank, so a caller with a
+/// fallback of its own can take it; Err only for a file that is there and
+/// can't be read. The DAEMON's run path looks here after the project's
+/// own `run_command` setting.
+pub fn lookup(
+    worktree: &Path,
+    main: &Path,
+    which: ProjectCommand,
+) -> Result<Option<String>, String> {
+    Ok(find(worktree, main)?.and_then(|(_, file)| file.command(which).map(str::to_string)))
+}
+
 /// The command line `which` names for a worktree, or the one-line reason
 /// there is none — short enough for the footer flash, and saying what to
 /// add.
@@ -181,6 +194,24 @@ mod tests {
             command(&worktree.0, &main.0, ProjectCommand::Open).unwrap(),
             "open http://localhost:5173"
         );
+    }
+
+    /// `lookup` is `command` without the message: nothing to run is
+    /// Ok(None), for the caller that has somewhere else to look, and only
+    /// a file that is there but unreadable is an error.
+    #[test]
+    fn lookup_reads_none_for_a_missing_file_or_key_and_keeps_the_parse_error() {
+        let empty = TempDir::new();
+        assert_eq!(lookup(&empty.0, &empty.0, ProjectCommand::Run), Ok(None));
+        let blank = TempDir::new().with_file(r#"{"run": "   ", "open": "open x"}"#);
+        assert_eq!(lookup(&blank.0, &blank.0, ProjectCommand::Run), Ok(None));
+        assert_eq!(
+            lookup(&blank.0, &blank.0, ProjectCommand::Open),
+            Ok(Some("open x".into()))
+        );
+        let broken = TempDir::new().with_file("{");
+        let err = lookup(&broken.0, &broken.0, ProjectCommand::Run).unwrap_err();
+        assert!(err.contains(FILE_NAME), "{err}");
     }
 
     #[test]

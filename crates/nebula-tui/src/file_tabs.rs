@@ -290,7 +290,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::End | KeyCode::Char('G') => Cmd::Bottom,
         _ => return,
     };
+    run(app, cmd);
+}
 
+/// Run one FILE TABS command: the one place the modal changes, whether a
+/// key or the mouse asked for it.
+fn run(app: &mut App, cmd: Cmd) {
     match cmd {
         Cmd::Close => app.overlay = None,
         Cmd::Edit => open_in_editor(app),
@@ -320,25 +325,29 @@ pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent, pos: Position) {
     let Some(Overlay::FileTabs(view)) = &mut app.overlay else {
         return;
     };
-    match mouse.kind {
+    // The mouse only names commands — the keys' own (`run`).
+    let cmds: Vec<Cmd> = match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             // The strip is the first inner row, right under the top border.
             if mouse.row == view.area.y.saturating_add(1) {
-                if let Some(i) = view
-                    .tab_hits
+                view.tab_hits
                     .iter()
                     .position(|(x0, x1)| mouse.column >= *x0 && mouse.column < *x1)
-                {
-                    view.select_tab(i as i64);
-                    view.on_tabs = true;
-                }
+                    // That tab's digit, with the cursor parked on the strip.
+                    .map(|i| vec![Cmd::Tab(i as i64), Cmd::ToStrip])
+                    .unwrap_or_default()
             } else if view.body_area.contains(pos) {
-                view.on_tabs = false;
+                vec![Cmd::IntoPreview]
+            } else {
+                Vec::new()
             }
         }
-        MouseEventKind::ScrollDown => view.scroll_by(WHEEL_LINES),
-        MouseEventKind::ScrollUp => view.scroll_by(-WHEEL_LINES),
+        MouseEventKind::ScrollDown => vec![Cmd::Scroll(WHEEL_LINES)],
+        MouseEventKind::ScrollUp => vec![Cmd::Scroll(-WHEEL_LINES)],
         _ => return,
+    };
+    for cmd in cmds {
+        run(app, cmd);
     }
     app.dirty = true;
 }

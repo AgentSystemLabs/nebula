@@ -379,9 +379,14 @@ pub struct OpenPr {
     pub title: String,
     pub url: String,
     pub is_draft: bool,
-    /// The branch the pull request comes from (`gh`'s `headRefName`) — the
-    /// one a PR SESSION's worktree is checked out on, so the row carries it
-    /// even though nothing on screen shows it.
+    /// The local branch the pull request's checkout is on
+    /// ([`checkout_branch`]) — the one a PR SESSION's worktree is cut on,
+    /// the one a checkout has to be on to list under this row, and what
+    /// `CreatePrAgent` carries as `head`. A same-repo pull request's is
+    /// its head branch (`gh`'s `headRefName`); a fork's is
+    /// `<owner>/<headRefName>`, because a fork's branch shares nothing but
+    /// a name with ours — `main` above all, which every fork has and the
+    /// ROOT WORKTREE is on.
     pub head: String,
 }
 
@@ -410,7 +415,8 @@ impl OpenPr {
 
 /// What a PR SESSION launch carries from a PROJECT OPEN PRS GROUP row all
 /// the way to `ClientRequest::CreatePrAgent`: which pull request the work is
-/// scoped to, and the head branch the DAEMON checks its worktree out on.
+/// scoped to, and the branch the DAEMON checks its worktree out on
+/// (`OpenPr::head` — the head branch, under its owner's name for a fork).
 /// The two travel together — a URL without its branch cannot be launched —
 /// so they ride the pickers, the MODEL / EFFORT submenus and the name prompt
 /// as one value.
@@ -465,7 +471,7 @@ pub async fn list(dir: &Path) -> Option<Vec<OpenPr>> {
             "--limit",
             &limit,
             "--json",
-            "number,url,title,isDraft,headRefName",
+            "number,url,title,isDraft,headRefName,isCrossRepository,headRepositoryOwner",
         ],
         TIMEOUT,
     )
@@ -473,11 +479,41 @@ pub async fn list(dir: &Path) -> Option<Vec<OpenPr>> {
     parse_list(&out)
 }
 
+/// The local branch a pull request's checkout is on — [`OpenPr::head`].
+///
+/// A same-repo pull request's is its head branch: the DAEMON fetches it
+/// from `origin` and the checkout tracks it. A fork's head branch is not
+/// ours, whatever it is called, and the name alone cannot tell the two
+/// apart: a contributor's pull request from their fork's `main` matched
+/// the ROOT WORKTREE (on our `main`), so its PR SESSION ran in the main
+/// checkout, on our code, and nothing was cut or nested. So a fork's
+/// checkout is on `<owner>/<headRefName>` — `givemeurhats/main`, the name
+/// `gh pr checkout` gives that same collision — which no branch of ours
+/// has, which `origin` has no branch for (the DAEMON seeds it from
+/// `refs/pull/N/head`), and which says on the row whose code the checkout
+/// holds. A fork that has since been deleted leaves no owner to name:
+/// `pr-<number>/<headRefName>`.
+fn checkout_branch(v: &serde_json::Value) -> String {
+    let head = str_at(v, "headRefName");
+    if head.is_empty() || !bool_at(v, "isCrossRepository") {
+        return head;
+    }
+    let owner = v
+        .get("headRepositoryOwner")
+        .and_then(|owner| owner.get("login"))
+        .and_then(|login| login.as_str())
+        .filter(|login| !login.is_empty());
+    match owner {
+        Some(owner) => format!("{owner}/{head}"),
+        None => format!("pr-{}/{head}", u64_at(v, "number")),
+    }
+}
+
 /// Parse `gh pr list --json …` output — a bare array. Kept separate from
 /// the process call so the shape it expects is testable without a GitHub
 /// account. A row whose url could never be opened is dropped rather than
 /// failing the whole list; a payload that isn't an array at all is a miss.
-fn parse_list(json: &str) -> Option<Vec<OpenPr>> {
+pub(crate) fn parse_list(json: &str) -> Option<Vec<OpenPr>> {
     let rows = serde_json::from_str::<serde_json::Value>(json).ok()?;
     let rows = rows.as_array()?;
     Some(
@@ -489,7 +525,7 @@ fn parse_list(json: &str) -> Option<Vec<OpenPr>> {
                     title: str_at(v, "title"),
                     url,
                     is_draft: bool_at(v, "isDraft"),
-                    head: str_at(v, "headRefName"),
+                    head: checkout_branch(v),
                 })
             })
             .collect(),
@@ -1008,6 +1044,39 @@ mod tests {
             prs[1].head.is_empty(),
             "a row `gh` gave no branch for still lists; only its PR SESSION is refused"
         );
+    }
+
+    /// A fork's head branch is not ours, whatever it is called — `main`
+    /// above all, which the ROOT WORKTREE is on: its checkout is on
+    /// `<owner>/<branch>`, so it matches no branch of ours. A same-repo
+    /// pull request keeps its branch's own name, slashes and all, and a
+    /// fork since deleted is named for the pull request.
+    #[test]
+    fn a_forks_checkout_branch_carries_its_owner() {
+        let prs = parse_list(
+            r#"[
+              {"number":129,"title":"Prefer PowerShell 7","url":"https://github.com/o/r/pull/129","isDraft":false,
+               "headRefName":"main","isCrossRepository":true,"headRepositoryOwner":{"login":"givemeurhats"}},
+              {"number":131,"title":"Settings hotkey","url":"https://github.com/o/r/pull/131","isDraft":false,
+               "headRefName":"feat/settings-open-hotkey","isCrossRepository":true,"headRepositoryOwner":{"login":"wende"}},
+              {"number":139,"title":"Cyrillic","url":"https://github.com/o/r/pull/139","isDraft":false,
+               "headRefName":"dependabot/cargo/serde-2","isCrossRepository":false,"headRepositoryOwner":{"login":"o"}},
+              {"number":140,"title":"Orphan","url":"https://github.com/o/r/pull/140","isDraft":false,
+               "headRefName":"main","isCrossRepository":true,"headRepositoryOwner":null}
+            ]"#,
+        )
+        .expect("parsed");
+        let heads: Vec<&str> = prs.iter().map(|pr| pr.head.as_str()).collect();
+        assert_eq!(
+            heads,
+            [
+                "givemeurhats/main",
+                "wende/feat/settings-open-hotkey",
+                "dependabot/cargo/serde-2",
+                "pr-140/main",
+            ]
+        );
+        assert_eq!(PrLaunch::of(&prs[0]).head, "givemeurhats/main");
     }
 
     /// An empty repo answers with an empty array — a real answer, not a

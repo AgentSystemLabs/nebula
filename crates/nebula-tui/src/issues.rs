@@ -1390,9 +1390,9 @@ pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent, mouse_pos: Position
         MouseEventKind::ScrollDown => select(app, selected + 1),
         MouseEventKind::Down(MouseButton::Left) => {
             let list = view.list_area;
-            if list.contains(mouse_pos) {
-                let start = view.window_start(list.height as usize);
-                let index = start + (mouse.row - list.y) as usize;
+            let first = view.window_start(list.height as usize);
+            let len = app.issues.get(&view.project).map_or(0, |l| l.list.len());
+            if let Some(index) = crate::list_hit::row_at(list, first, len, mouse_pos) {
                 select(app, index as i64);
             }
         }

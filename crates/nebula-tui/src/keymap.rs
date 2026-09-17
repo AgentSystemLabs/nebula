@@ -86,9 +86,15 @@ pub enum Action {
     /// `c`: the BRANCH SWITCHER — move the project's ROOT WORKTREE onto
     /// another branch, asking what to do with uncommitted changes.
     SwitchBranch,
-    /// `Shift+Enter` on a worktree: fire its `.nebula.json` OPEN COMMAND
-    /// (`open http://localhost:3000`, say). Its RUN COMMAND is `r`, which
-    /// takes that meaning on the Worktrees panel, where nothing is renamed.
+    /// `Shift+Enter` / `Shift+O` / `Alt+Enter`, from any panel: fire the
+    /// selected worktree's OPEN COMMAND — the project's **Open command**
+    /// setting, else its `.nebula.json` `open` (`open http://localhost:3000`,
+    /// say). Three chords because only the kitty protocol carries a shifted
+    /// Enter: Terminal.app sends a plain one and tmux flattens it, while
+    /// `ESC CR` — what `/terminal-setup` gives Shift+Enter in VS Code, and
+    /// Option+Enter on a Mac with Option as Meta — gets through both and
+    /// parses as Alt+Enter. Its RUN COMMAND is `r`, which takes that
+    /// meaning on the Worktrees panel, where nothing is renamed.
     OpenWorktree,
     // sessions
     NewTerminal,
@@ -366,10 +372,10 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::OpenWorktree,
         id: "open_worktree",
         label: "Open worktree",
-        hint: "On a worktree, run the \"open\" command from its .nebula.json — e.g. open http://localhost:3000 (⇧Enter needs the kitty protocol; ⇧O arrives everywhere)",
+        hint: "Open the selected worktree: its project's Open command (Settings → Project), else .nebula.json \"open\" — e.g. open http://localhost:3000 (⇧Enter needs the kitty protocol; ⇧O arrives everywhere; ⌥Enter is the ESC CR that VS Code's Shift+Enter setup sends and tmux passes through)",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
-        defaults: &["shift+enter", "shift+o"],
+        defaults: &["shift+enter", "shift+o", "alt+enter"],
     },
     // ---- SESSIONS ----
     ActionSpec {
@@ -385,7 +391,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::Rename,
         id: "rename",
         label: "Rename",
-        hint: "Rename the selected session, or edit a link's URL; on a worktree, start or stop the \"run\" command from its .nebula.json",
+        hint: "Rename the selected session, or edit a link's URL; on a worktree, start or stop its run command (Settings → Project, else .nebula.json \"run\")",
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["r"],
@@ -935,7 +941,7 @@ pub fn host_warning(chord: &KeyChord) -> (Reach, Option<&'static str>) {
     if shift && !ctrl && !alt && chord.code == KeyCode::Enter {
         return (
             Reach::Risky,
-            Some("⇧Enter needs the kitty keyboard protocol — Ghostty/kitty send it, Terminal.app sends a plain Enter"),
+            Some("⇧Enter needs the kitty keyboard protocol — Ghostty/kitty send it, Terminal.app sends a plain Enter and tmux flattens it to one; ⇧O and ⌥Enter arrive everywhere"),
         );
     }
     if ctrl && shift {
@@ -1275,9 +1281,16 @@ mod tests {
         );
         assert_eq!(shift_enter.spec(), "shift+enter");
         assert_eq!(host_warning(&shift_enter).0, Reach::Risky);
-        // …so a stock terminal gets a letter for it too.
+        // …so a stock terminal gets a letter for it too, and the ESC CR a
+        // Shift+Enter mapping (VS Code's /terminal-setup, Option as Meta)
+        // sends — which tmux passes through where it flattens the shifted
+        // Enter — lands on the same action as Alt+Enter.
         assert_eq!(
             map.lookup(Scope::Global, &ev(KeyCode::Char('O'), KeyModifiers::SHIFT)),
+            Some(Action::OpenWorktree)
+        );
+        assert_eq!(
+            map.lookup(Scope::Global, &ev(KeyCode::Enter, KeyModifiers::ALT)),
             Some(Action::OpenWorktree)
         );
     }
