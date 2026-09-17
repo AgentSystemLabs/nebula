@@ -246,6 +246,11 @@ SCROLLBACK RING instead of being discarded, so wheel-up over a codex SESSION has
 Releases: push a `v*` tag (`git tag v0.1.0 && git push --tags`) and CI builds mac (arm/intel) and linux (x64/arm64, static musl) binaries and
 attaches them to a GitHub release — which is what `install.sh` downloads.
 
+Pull requests: a branch pushed to this repository gets an automated Claude code review on its PR, as
+inline comments. A PR from a fork does not — GitHub withholds the credentials the reviewer needs from a
+fork's workflow runs — so a maintainer reviews it by hand, or asks for the review with `@claude` in a
+PR comment.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
