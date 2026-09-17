@@ -1,0 +1,127 @@
+# label<TAB>key — see run.sh. The demo starts with one project (three checkouts, main dirty) and no
+# sessions, FOCUS on the Projects panel.
+focus worktrees	l
+worktree down	j
+worktree up	k
+focus sessions	l
+new session picker	n
+picker: take harness	Enter
+task box: launch empty	Enter
+leave pane	C-q
+new session picker (2)	n
+picker: take harness (2)	Enter
+task box: launch empty (2)	Enter
+leave pane (2)	C-q
+new terminal	t
+leave pane (3)	C-q
+session up	k
+session up (2)	k
+session down	j
+session down (2)	j
+attach (Enter)	Enter
+type a key in pane	a
+type a key in pane (2)	b
+type a key in pane (3)	c
+wheel up in pane	wheel:120,20
+wheel up in pane (2)	wheel:120,20
+leave pane (4)	C-q
+click session row	click:50,12
+click other session row	click:50,9
+click worktree row	click:25,20
+click worktree row back	click:25,9
+open diff	g
+diff: next file	Down
+diff: next file (2)	Down
+diff: prev file	Up
+diff: filter	text:ui
+diff: clear filter	Escape
+diff: close	Escape
+open file finder	f
+finder: type	text:event
+finder: down	Down
+finder: clear	Escape
+finder: close	Escape
+open tree browser	b
+tree: down	Down
+tree: down (2)	Down
+tree: filter	text:perf
+tree: clear	Escape
+tree: filter to a 1 MB file	text:tui/src/event_loop.rs
+tree: onto the file	Down
+tree: onto the file (2)	Down
+tree: clear (2)	Escape
+tree: close	Escape
+open grep	F
+grep: type	text:ATTACH_DEBOUNCE
+grep: clear	Escape
+grep: close	Escape
+open palette	/
+palette: type	text:feat
+palette: clear	Escape
+palette: close	Escape
+open settings	s
+settings: next tab	Tab
+settings: down	j
+settings: close	Escape
+open help	?
+help: close	Escape
+open workspace picker	w
+workspace picker: close	Escape
+open issues	i
+issues: down	j
+issues: close	Escape
+open branch switcher	c
+branch switcher: type	text:fea
+branch switcher: clear	Escape
+branch switcher: close	Escape
+open metrics	M
+metrics: close	Escape
+open presets	e
+presets: close	Escape
+open quick prompt	p
+quick prompt: type	text:fix the login redirect
+quick prompt: cancel	Escape
+context menu	m
+context menu: close	Escape
+toggle projects panel	P
+toggle projects panel back	P
+toggle workspaces bar	W
+toggle workspaces bar back	W
+fullscreen pane	z
+leave fullscreen	C-q
+next attention	]
+leave pane (5)	C-q
+prev attention	[
+leave pane (6)	C-q
+rename session	r
+rename: type	text:x
+rename: submit	Enter
+archive session	a
+show archived	A
+hide archived	A
+delete session	d
+delete: confirm	y
+open repo in browser	G
+focus worktrees (2)	h
+new worktree prompt	n
+new worktree: type	text:perf branch
+new worktree: submit	Enter
+wait for worktree	wait:3
+worktree down to new	j
+worktree up again	k
+quick prompt new worktree	p
+quick prompt nw: type	text:do the thing
+quick prompt nw: launch	Enter
+wait for launch	wait:3
+focus projects	h
+project down	j
+project up	k
+add project prompt	o
+add project: cancel	Escape
+workspace picker	w
+workspace picker: new	n
+workspace picker: name	text:second
+workspace picker: create	Enter
+back to workspace 1	1
+to workspace 2	2
+back to workspace 1 (2)	1

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/nebula-core", "crates/nebula-daemon", "crates/nebula-tui", "crates/nebula"]
+members = ["crates/nebula-core", "crates/nebula-daemon", "crates/nebula-fuzzy", "crates/nebula-tui", "crates/nebula"]
 exclude = ["vendor/vt100"]
 
 # Vendored vt100 with one patch: rows scrolled out of a top-anchored DECSTBM
@@ -19,6 +19,7 @@ license = "MIT"
 nebula-core = { path = "crates/nebula-core" }
 nebula-daemon = { path = "crates/nebula-daemon" }
 nebula-tui = { path = "crates/nebula-tui" }
+nebula-fuzzy = { path = "crates/nebula-fuzzy" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -39,6 +40,15 @@ directories = "6"
 # the release one didn't. Only the workspace crates stay at opt-level 0,
 # so incremental builds are as quick as before.
 [profile.dev.package."*"]
+opt-level = 3
+
+# …and the one workspace crate that is a hot loop and nothing else: the
+# fuzzy matcher runs over every path of a checkout on every keystroke of
+# the FILE FINDER. Unoptimised that is 13–27 ms a character over ten
+# thousand paths, felt as a filter that lags the typing; it is a few
+# hundred lines that rarely change, so optimising it costs the edit-build
+# loop nothing.
+[profile.dev.package.nebula-fuzzy]
 opt-level = 3
 
 [profile.release]

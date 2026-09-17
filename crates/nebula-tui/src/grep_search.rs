@@ -1,7 +1,10 @@
 //! `git grep` runner for the find-in-files overlay.
 //!
-//! Synchronous `std::process` on purpose (the git_diff.rs precedent): a
-//! search runs only on key events, and `git grep` over a checkout is fast.
+//! `search` runs the grep to its end and is what a view with no BACKGROUND
+//! READS handle calls inline (the unit tests). The live modal calls
+//! `search_streaming` off the loop (`view_jobs`): `git grep` over a
+//! ten-thousand-file checkout is 200 ms, and it used to be spent inside the
+//! key handler once per character typed.
 
 use crate::ui::truncate;
 use std::path::Path;
@@ -25,17 +28,85 @@ pub struct GrepHit {
     pub text: String,
 }
 
-/// Fixed-string smart-case search over the checkout (tracked + untracked,
-/// gitignore respected, binaries skipped). Returns `(hits, truncated)`;
-/// `Err` is a user-facing message shown inside the overlay.
-pub fn search(root: &Path, query: &str) -> Result<(Vec<GrepHit>, bool), String> {
+/// The `git grep` arguments for `query`: fixed-string, smart-case, tracked
+/// + untracked, gitignore respected, binaries skipped.
+fn grep_args(query: &str) -> Vec<&str> {
     let mut args = vec!["grep", "-z", "-n", "-I", "--untracked", "--no-color", "-F"];
     // Smart case: literal case only when the query has an uppercase char.
     if !query.chars().any(char::is_uppercase) {
         args.push("-i");
     }
     args.extend(["-e", query, "--", "."]);
-    let output = crate::git_diff::run_git(root, &args)?;
+    args
+}
+
+/// [`search`] for the live modal, run off the loop: the output is read as
+/// git writes it and git is killed at the result cap — a two-letter query
+/// in a big checkout matches a hundred thousand lines, and `search` reads
+/// every one of them to keep two hundred — or as soon as `cancel` says the
+/// query has moved on. `None` is that cancel: there is no answer to land.
+pub fn search_streaming(
+    root: &Path,
+    query: &str,
+    cancel: &crate::view_jobs::Cancel,
+) -> Option<Result<(Vec<GrepHit>, bool), String>> {
+    use std::io::{BufRead, Read};
+    let mut child = match crate::git_diff::git_command(root)
+        .args(grep_args(query))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return Some(Err(format!("failed to run git: {e}"))),
+    };
+    let mut hits = Vec::new();
+    let mut truncated = false;
+    let mut reader = std::io::BufReader::new(child.stdout.take()?);
+    let mut record = Vec::new();
+    loop {
+        record.clear();
+        match reader.read_until(b'\n', &mut record) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if cancel.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        let (mut parsed, _) = parse_grep_z(&record);
+        if parsed.is_empty() {
+            continue;
+        }
+        if hits.len() >= MAX_RESULTS {
+            truncated = true;
+            break;
+        }
+        hits.append(&mut parsed);
+    }
+    if truncated {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Some(Ok((hits, true)));
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    // git grep exits 1 for "no matches" — only >= 2 is an error.
+    match child.wait().ok().and_then(|status| status.code()) {
+        Some(0) | Some(1) => Some(Ok((hits, false))),
+        _ => Some(Err(format!("git grep failed: {}", stderr.trim()))),
+    }
+}
+
+/// Fixed-string smart-case search over the checkout (tracked + untracked,
+/// gitignore respected, binaries skipped). Returns `(hits, truncated)`;
+/// `Err` is a user-facing message shown inside the overlay.
+pub fn search(root: &Path, query: &str) -> Result<(Vec<GrepHit>, bool), String> {
+    let output = crate::git_diff::run_git(root, &grep_args(query))?;
     // git grep exits 1 for "no matches" — only >= 2 is an error.
     match output.status.code() {
         Some(0) => Ok(parse_grep_z(&output.stdout)),

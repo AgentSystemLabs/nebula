@@ -20,9 +20,12 @@ use tokio::sync::{broadcast, mpsc};
 const RING_CAPACITY: usize = 1024 * 1024;
 /// Flush coalesced output at this size…
 const COALESCE_BYTES: usize = 8 * 1024;
-/// …or this long after the first pending byte, whichever comes first. A hard
+/// …or this long after the previous flush, whichever comes first. A hard
 /// deadline (not a quiet-gap timer): a child streaming continuously in small
 /// chunks must still flush on time, or output arrives in laggy 8KB lumps.
+/// Counted from the last flush rather than from the first pending byte, so
+/// output that breaks a silence — the echo of a typed character, a prompt
+/// redrawn after Enter — is not held at all (`flush_deadline`).
 const COALESCE_HOLD: std::time::Duration = std::time::Duration::from_millis(5);
 /// Reader thread → pump channel bound; blocking_send gives natural
 /// backpressure against a fire-hosing child.
@@ -521,6 +524,25 @@ fn spawn_reader_thread(
         .expect("spawn pty reader thread");
 }
 
+/// When output that arrived at `now` has to be on its way to the clients.
+/// The hold exists to turn a stream of small writes into fewer, larger
+/// events — so it is spent only while there is a stream: a flush less than
+/// [`COALESCE_HOLD`] ago means more is likely right behind, and the bytes
+/// wait out the rest of that window. After a quiet spell they go at once.
+/// That is every keystroke's echo: held, it reached the TUI 5 ms late on
+/// every character typed into a pane, which the INPUT LATENCY PROBE put at
+/// half of what the key took to show. A stream still flushes at most once
+/// per hold, exactly as before; the one extra event is at its head.
+fn flush_deadline(
+    now: tokio::time::Instant,
+    last_flush: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    match last_flush {
+        Some(last) if now < last + COALESCE_HOLD => last + COALESCE_HOLD,
+        _ => now,
+    }
+}
+
 /// Drains the reader channel: append to the ring (always — detach is free),
 /// coalesce bursts, broadcast to whoever is attached.
 async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
@@ -568,6 +590,7 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
         }
     };
 
+    let mut last_flush: Option<tokio::time::Instant> = None;
     'outer: loop {
         if pending.is_empty() {
             match rx.recv().await {
@@ -580,10 +603,14 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
             }
         }
         // Coalesce until the deadline or the size cap; the deadline is fixed
-        // at the first pending byte so continuous streams still flush on time.
-        let deadline = tokio::time::Instant::now() + COALESCE_HOLD;
+        // when the first pending byte arrives so continuous streams still
+        // flush on time. Biased toward the channel: a deadline that has
+        // already passed (the quiet-spell case) still takes along whatever
+        // the reader has queued, so one write read in two pieces is one event.
+        let deadline = flush_deadline(tokio::time::Instant::now(), last_flush);
         while pending.len() < COALESCE_BYTES {
             tokio::select! {
+                biased;
                 msg = rx.recv() => match msg {
                     Some(ReaderMsg::Data(d)) => pending.extend_from_slice(&d),
                     Some(ReaderMsg::Eof { exit_code }) => {
@@ -600,6 +627,7 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
             }
         }
         flush(&session, &mut pending);
+        last_flush = Some(tokio::time::Instant::now());
     }
     tracing::info!(session = ?session.sref, "pty pump ended");
 }
@@ -608,6 +636,30 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
 mod tests {
     use super::*;
     use nebula_core::AgentId;
+
+    /// Output that breaks a silence is not held: a typed character's echo
+    /// leaves the DAEMON the moment it is read.
+    #[test]
+    fn output_after_a_quiet_spell_is_flushed_at_once() {
+        let now = tokio::time::Instant::now();
+        assert_eq!(flush_deadline(now, None), now, "the session's first bytes");
+        let long_ago = now - COALESCE_HOLD * 10;
+        assert_eq!(flush_deadline(now, Some(long_ago)), now);
+        assert_eq!(flush_deadline(now, Some(now - COALESCE_HOLD)), now);
+    }
+
+    /// A stream is still coalesced: bytes arriving inside the hold of the
+    /// last flush wait for that hold to end, so the event rate under
+    /// sustained output is what it was — one flush per hold at most.
+    #[test]
+    fn output_inside_the_hold_waits_for_it_to_end() {
+        let now = tokio::time::Instant::now();
+        let just_flushed = now - std::time::Duration::from_millis(1);
+        assert_eq!(
+            flush_deadline(now, Some(just_flushed)),
+            just_flushed + COALESCE_HOLD
+        );
+    }
 
     fn echo_session() -> Arc<PtySession> {
         PtySession::spawn(

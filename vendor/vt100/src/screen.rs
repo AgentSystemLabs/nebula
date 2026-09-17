@@ -123,6 +123,21 @@ impl Screen {
         self.grid().scrollback()
     }
 
+    /// NEBULA PATCH: rows held in the primary screen's scrollback —
+    /// whichever screen is showing, since a full-screen program parked
+    /// over a long shell history still holds that history.
+    #[must_use]
+    pub fn scrollback_rows(&self) -> usize {
+        self.grid.scrollback_rows()
+    }
+
+    /// NEBULA PATCH: drop the primary screen's scrollback and release its
+    /// memory. The visible screen, the cursor and every mode are untouched,
+    /// so output parsed afterwards lands exactly as it would have.
+    pub fn clear_scrollback(&mut self) {
+        self.grid.clear_scrollback();
+    }
+
     /// Returns the text contents of the terminal.
     ///
     /// This will not include any formatting information, and will be in plain

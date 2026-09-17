@@ -16,14 +16,19 @@ use std::path::PathBuf;
 /// size of [`App::sweep_phase`] (one text cell per frame).
 pub const SWEEP_FRAME: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// How many recently shown sessions keep their screen ([`App::term_cache`]).
-/// Two covers the flip between a pair of worktrees and a three-way rotation;
-/// each entry is a whole `vt100` parser, so this is not a number to grow.
-pub const TERM_CACHE_MAX: usize = 2;
-/// The largest screen worth keeping, in grid cells (32 bytes each, so this
-/// is about 12 MB). An alt-screen CLI is a screen's worth; a shell whose
-/// 10 000-line scrollback has filled is tens of megabytes, and re-parsing
-/// that on the way back is cheaper than holding it.
+/// How many recently shown sessions keep their screen ([`App::term_cache`]):
+/// enough for a rotation through the sessions of a couple of worktrees.
+/// What bounds the memory is [`TERM_CACHE_CELLS`], not this.
+pub const TERM_CACHE_MAX: usize = 6;
+/// The most the kept screens may hold between them, in grid cells (32 bytes
+/// each, so about 12 MB — half of what two entries of that size each used to
+/// be allowed). An alt-screen CLI is a screen's worth, 200 KB; a shell whose
+/// 10 000-line scrollback has filled is tens of megabytes on its own, and
+/// used never to be kept at all — every return to it re-parsed the whole
+/// ring, 33 ms of blank pane under the INPUT LATENCY PROBE. Now a screen
+/// that does not fit is kept WITHOUT its history ([`AttachedTerm::
+/// drop_history`]): the return paints on the keypress like any other, and
+/// the history is replayed if the user scrolls up into it.
 pub const TERM_CACHE_CELLS: usize = 400_000;
 
 /// Wall-clock epoch ms, comparable to the daemon's `status_changed_at`.
@@ -853,9 +858,86 @@ pub struct DiffView {
     /// HEAD OID the marks are scoped to (empty on an unborn HEAD). A moved
     /// HEAD — commit, checkout — resets the worktree's marks on next open.
     pub head_key: String,
+    /// BACKGROUND READS: with it, the file list and every file's diff are
+    /// read off the loop (`git_diff::load_selected_diff`); without (a view
+    /// built by a test, a pull request's prefetched view), inline.
+    pub jobs: Option<crate::view_jobs::Jobs>,
+    /// This view's own ticket, carried by every diff it asks for, so text
+    /// read for an earlier modal never lands in this one's cache.
+    pub id: u64,
+    /// The `git status` this view opened ahead of, by ticket: the list is
+    /// empty and says `reading changes…` until the listing lands.
+    pub listing: Option<u64>,
+    /// The selected file's diff in flight, by ticket. `diff` keeps the text
+    /// it had meanwhile (`view_jobs::STALE_GRACE`) — see `shown`.
+    pub waiting: Option<u64>,
+    /// The file `diff` is the diff of. Differs from the selected file while
+    /// that one's read is in flight, which is when a reviewed ✓ — a
+    /// fingerprint of the text on screen — must not be taken.
+    pub shown: Option<String>,
+    /// Diffs read while this modal has been open, newest last: walking
+    /// back onto a file shows it on the keypress (and re-reads it behind,
+    /// so an agent's edit meanwhile still shows up), and the row after the
+    /// cursor is read ahead. Bounded by [`DIFF_CACHE_BYTES`]; gone with
+    /// the modal.
+    pub cache: Vec<(String, std::sync::Arc<str>)>,
 }
 
+/// The most diff text a DIFF VIEWER keeps beyond the one on screen. Two
+/// megabytes is a few hundred ordinary files' worth, and an entry over
+/// [`DIFF_CACHE_ENTRY_MAX`] is never kept: re-reading one huge diff is
+/// cheaper than holding it.
+pub const DIFF_CACHE_BYTES: usize = 2 * 1024 * 1024;
+pub const DIFF_CACHE_ENTRY_MAX: usize = 512 * 1024;
+
 impl DiffView {
+    /// A view up before its file list is: `g` opens this at once and
+    /// `event_loop::land_view_answer` fills it when `git status` answers.
+    pub fn opening(
+        root: PathBuf,
+        branch: String,
+        jobs: crate::view_jobs::Jobs,
+        listing: u64,
+    ) -> Self {
+        let mut view = Self::new(root, branch, Vec::new(), true);
+        view.jobs = Some(jobs);
+        view.listing = Some(listing);
+        view
+    }
+
+    /// The cached diff of `path`, if this modal has read it.
+    pub fn cached(&self, path: &str) -> Option<std::sync::Arc<str>> {
+        self.cache
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, text)| text.clone())
+    }
+
+    /// Keep `diff` as the diff of `path`, dropping the oldest entries to
+    /// stay inside the budget.
+    pub fn cache_put(&mut self, path: &str, diff: &str) {
+        self.cache.retain(|(p, _)| p != path);
+        if diff.len() > DIFF_CACHE_ENTRY_MAX {
+            return;
+        }
+        self.cache.push((path.to_string(), diff.into()));
+        let mut held: usize = self.cache.iter().map(|(_, text)| text.len()).sum();
+        while held > DIFF_CACHE_BYTES && self.cache.len() > 1 {
+            held -= self.cache.remove(0).1.len();
+        }
+    }
+
+    /// Put `diff` on screen as the diff of `path`. `keep_scroll` is a
+    /// re-read of the file already showing: the reader's place is kept.
+    pub fn show_diff(&mut self, path: Option<&str>, diff: String, keep_scroll: bool) {
+        self.diff_line_count = diff.lines().count();
+        self.diff = diff;
+        self.shown = path.map(str::to_string);
+        if !keep_scroll {
+            self.scroll = 0;
+        }
+    }
+
     pub fn new(root: PathBuf, branch: String, files: Vec<DiffFile>, head_ok: bool) -> Self {
         let mut view = Self {
             root,
@@ -877,6 +959,12 @@ impl DiffView {
             pr_url: None,
             reviewed: HashMap::new(),
             head_key: String::new(),
+            jobs: None,
+            id: crate::view_jobs::ticket(),
+            listing: None,
+            waiting: None,
+            shown: None,
+            cache: Vec::new(),
         };
         view.apply_filter();
         view
@@ -960,6 +1048,11 @@ impl DiffView {
     /// diff; it persists `reviewed` either way).
     pub fn toggle_reviewed(&mut self) -> Option<bool> {
         let path = self.selected_file()?.path.clone();
+        // The mark is a fingerprint of the diff that was read — not of
+        // whatever the pane still holds while this file's is in flight.
+        if self.waiting.is_some() && self.shown.as_deref() != Some(path.as_str()) {
+            return None;
+        }
         let before = self.matches.get(self.selected).map(|m| m.file);
         let unmarked = self.reviewed.remove(&path).is_some();
         if !unmarked {
@@ -1026,6 +1119,11 @@ pub struct FileFinder {
     /// Screen rect of the result rows (query row excluded), written back
     /// during draw so clicks can hit-test rows.
     pub list_area: Rect,
+    /// The `git ls-files` this finder opened ahead of, by ticket
+    /// (`view_jobs`): the list is empty and says `listing files…` until
+    /// [`FileFinder::set_files`]. None once the listing is in hand — and
+    /// always, for a finder built with its files.
+    pub listing: Option<u64>,
 }
 
 impl FileFinder {
@@ -1040,9 +1138,26 @@ impl FileFinder {
             selected: 0,
             area: Rect::default(),
             list_area: Rect::default(),
+            listing: None,
         };
         finder.apply_filter();
         finder
+    }
+
+    /// A finder up before its listing is: `f` opens this at once, and
+    /// `set_files` fills it when `git ls-files` answers. What is typed
+    /// meanwhile is kept, and narrows the list the moment there is one.
+    pub fn opening(root: PathBuf, branch: String, editor: String, listing: u64) -> Self {
+        let mut finder = Self::new(root, branch, editor, Vec::new());
+        finder.listing = Some(listing);
+        finder
+    }
+
+    /// The listing landed: rank it by whatever the query holds by now.
+    pub fn set_files(&mut self, files: Vec<String>) {
+        self.files = files;
+        self.listing = None;
+        self.apply_filter();
     }
 
     /// First visible row of the result list's stateless follow-window for a
@@ -1099,6 +1214,14 @@ pub struct GrepView {
     /// Screen rect of the result rows (query row excluded), written back
     /// during draw so clicks can hit-test rows.
     pub list_area: Rect,
+    /// BACKGROUND READS: with it, a search runs off the loop and lands in
+    /// [`GrepView::land`]; without (a view built by a test), inline.
+    pub jobs: Option<crate::view_jobs::Jobs>,
+    /// The search in flight, by ticket. The hits on screen meanwhile are the
+    /// previous query's — the title says `searching…`.
+    pub waiting: Option<u64>,
+    /// Stops the search in flight when the query moves on.
+    pub cancel: crate::view_jobs::Cancel,
 }
 
 impl GrepView {
@@ -1114,6 +1237,9 @@ impl GrepView {
             selected: 0,
             area: Rect::default(),
             list_area: Rect::default(),
+            jobs: None,
+            waiting: None,
+            cancel: crate::view_jobs::Cancel::default(),
         }
     }
 
@@ -1122,12 +1248,56 @@ impl GrepView {
     pub fn run_search(&mut self) {
         self.selected = 0;
         self.error = None;
+        // Whatever was being searched for is no longer the query.
+        self.cancel.cancel();
+        self.waiting = None;
         if self.query.chars().count() < crate::grep_search::MIN_QUERY_LEN {
             self.hits.clear();
             self.truncated = false;
             return;
         }
-        match crate::grep_search::search(&self.root, &self.query) {
+        let Some(jobs) = &self.jobs else {
+            let result = crate::grep_search::search(&self.root, &self.query);
+            self.show(result);
+            return;
+        };
+        let ticket = crate::view_jobs::ticket();
+        self.waiting = Some(ticket);
+        self.cancel = crate::view_jobs::Cancel::default();
+        let (root, query, cancel) = (
+            self.root.clone(),
+            self.query.to_string(),
+            self.cancel.clone(),
+        );
+        jobs.run(move || {
+            // The next character, typed at speed, cancels this before git
+            // is ever started.
+            std::thread::sleep(crate::view_jobs::GREP_DEBOUNCE);
+            if cancel.is_cancelled() {
+                return None;
+            }
+            let result = crate::grep_search::search_streaming(&root, &query, &cancel)?;
+            Some(crate::view_jobs::Answer::Grep { ticket, result })
+        });
+    }
+
+    /// A background search's answer: shown when it is the one being waited
+    /// on, dropped when the query has moved on since.
+    pub fn land(
+        &mut self,
+        ticket: u64,
+        result: Result<(Vec<crate::grep_search::GrepHit>, bool), String>,
+    ) {
+        if self.waiting != Some(ticket) {
+            return;
+        }
+        self.waiting = None;
+        self.show(result);
+    }
+
+    fn show(&mut self, result: Result<(Vec<crate::grep_search::GrepHit>, bool), String>) {
+        self.selected = 0;
+        match result {
             Ok((hits, truncated)) => {
                 self.hits = hits;
                 self.truncated = truncated;
@@ -1547,7 +1717,22 @@ pub enum PendingIntent {
     OpenCreatedWorkspace,
     /// Worktree removed optimistically; restore these rows on Error.
     DeleteWorktree(WorktreeRollback),
+    /// A row renamed, archived, unarchived or deleted on the keypress
+    /// (`event_loop::optimistic`): put it back on Error.
+    Undo(Undo),
     None,
+}
+
+/// A row as it was before an OPTIMISTIC UPDATE changed it.
+#[derive(Debug, Clone)]
+pub enum Undo {
+    /// Renamed or (un)archived in place: this is the row to show again.
+    Restore(Box<nebula_core::Entity>),
+    /// Deleted: the row, and the index it held in its `tree` list.
+    Reinsert {
+        index: usize,
+        entity: Box<nebula_core::Entity>,
+    },
 }
 
 impl PendingIntent {
@@ -2097,6 +2282,14 @@ pub struct AttachedTerm {
     /// comes back as a gap-free delta onto the screen it left rather than a
     /// megabyte replay into a fresh parser (see [`App::term_cache`]).
     pub next_seq: u64,
+    /// The scrollback was let go while this screen sat in
+    /// [`App::term_cache`]: what is on screen is exact, what is above it is
+    /// gone. Scrolling up asks the DAEMON for the whole ring again
+    /// (`event_loop::rehydrate_history`), which rebuilds both.
+    pub history_dropped: bool,
+    /// The scroll offset to land on once that replay has rebuilt the
+    /// history: the notch that asked for it.
+    pub pending_scroll: Option<usize>,
 }
 
 impl AttachedTerm {
@@ -2112,6 +2305,8 @@ impl AttachedTerm {
             painted: false,
             booting: false,
             next_seq: 0,
+            history_dropped: false,
+            pending_scroll: None,
         }
     }
 
@@ -2128,6 +2323,7 @@ impl AttachedTerm {
         self.painted = false;
         self.booting = false;
         self.next_seq = 0;
+        self.history_dropped = false;
     }
 
     /// Apply a ring replay. One that continues exactly where this parser
@@ -2150,13 +2346,29 @@ impl AttachedTerm {
         if !self.painted {
             self.booting = true;
         }
+        // A replay asked for to get the history back lands the reader
+        // where the scroll that asked for it was headed.
+        if let Some(scroll) = self.pending_scroll.take() {
+            if rebuilt {
+                self.set_scroll(scroll);
+            }
+        }
         rebuilt
     }
 
-    /// Apply live output that follows what the parser holds.
+    /// Apply live output that follows what the parser holds. Bytes a replay
+    /// already covered are skipped: a second Attach of the session on
+    /// screen (the history replay) can cross a frame the first one's
+    /// forwarder had already queued, and parsing those bytes twice would
+    /// garble the screen the replay just rebuilt.
     pub fn apply_output(&mut self, seq: u64, data: &[u8]) {
-        self.next_seq = seq + data.len() as u64;
-        self.feed(data);
+        let end = seq + data.len() as u64;
+        if end <= self.next_seq {
+            return;
+        }
+        let covered = self.next_seq.saturating_sub(seq) as usize;
+        self.next_seq = end;
+        self.feed(&data[covered.min(data.len())..]);
     }
 
     fn feed(&mut self, data: &[u8]) {
@@ -2176,20 +2388,24 @@ impl AttachedTerm {
         }
     }
 
-    /// Rough footprint in grid cells: the visible grid plus every
-    /// scrollback row of the screen in use. `vt100` doesn't expose the
-    /// scrollback length, but its offset setter clamps to it. On the
-    /// alternate screen (a CLI in full-screen mode) this sees only that
-    /// screen's own, empty scrollback, so a shell with a long history
-    /// parked inside a full-screen program is under-counted — the one way
-    /// a cached screen can exceed [`TERM_CACHE_CELLS`].
-    pub fn estimated_cells(&mut self) -> usize {
-        let screen = self.parser.screen_mut();
-        let keep = screen.scrollback();
-        screen.set_scrollback(usize::MAX);
-        let lines = screen.scrollback();
-        screen.set_scrollback(keep);
+    /// Footprint in grid cells: the visible grid plus every scrollback row
+    /// the primary screen holds — also while a full-screen program is up
+    /// over it, which the offset-clamping trick this used to be could not
+    /// see (the vendored `vt100` now says, `Screen::scrollback_rows`).
+    pub fn estimated_cells(&self) -> usize {
+        let lines = self.parser.screen().scrollback_rows();
         (lines + self.rows as usize) * self.cols as usize
+    }
+
+    /// Let the scrollback go, keeping the screen: what a kept screen that
+    /// is over budget does instead of not being kept.
+    pub fn drop_history(&mut self) {
+        if self.parser.screen().scrollback_rows() == 0 {
+            return;
+        }
+        self.set_scroll(0);
+        self.parser.screen_mut().clear_scrollback();
+        self.history_dropped = true;
     }
 
     pub fn set_scroll(&mut self, scroll: usize) {
@@ -2816,6 +3032,25 @@ pub struct App {
     /// startup like `pr_diff_tx`, so the modal's own handlers can start a
     /// fetch. `None` in the unit tests, which then never spawn one.
     pub issues_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::issues::IssuesAnswer>>,
+    /// BACKGROUND READS for the worktree views (`view_jobs`): the DIFF
+    /// VIEWER, the FILE FINDER, its grep view and the TREE BROWSER are
+    /// handed a clone when they open, and their git and disk reads land
+    /// through the main loop instead of holding it. None with no loop
+    /// running (unit tests), where those views read inline.
+    pub view_jobs: Option<crate::view_jobs::Jobs>,
+    /// A `g` on a checkout the changed-files badge called clean: the ticket
+    /// of the `git status` checking that, and the checkout (path, branch)
+    /// to open the DIFF VIEWER on if git disagrees.
+    pub diff_probe: Option<(u64, PathBuf, String)>,
+    /// The changed files the badge's last `git status` listed, and the
+    /// checkout they are in (`event_loop::keep_changed_files`): what `g`
+    /// opens the DIFF VIEWER on while its own `git status` runs. One
+    /// checkout's worth, capped, replaced by every poll.
+    pub changed_files: Option<(WorktreeId, Vec<crate::git_diff::DiffFile>)>,
+    /// Rows deleted here ahead of the DAEMON's answer
+    /// (`event_loop::optimistic`): an upsert of one of them is a straggler
+    /// from before the delete, and is ignored rather than shown.
+    pub deleting: std::collections::HashSet<nebula_core::EntityId>,
     /// The BRANCH SWITCHER's answer channel, listing cache and fetch
     /// throttle — what outlives the modal.
     pub branch_switch: crate::branch_switch::Shared,
@@ -2972,6 +3207,10 @@ impl App {
             issue_comment_inflight: std::collections::HashSet::new(),
             pending_issue_detail: None,
             issues_tx: None,
+            view_jobs: None,
+            diff_probe: None,
+            changed_files: None,
+            deleting: std::collections::HashSet::new(),
             branch_switch: Default::default(),
             last_metrics: None,
             client_rss_bytes: 0,
@@ -3395,23 +3634,46 @@ impl App {
     }
 
     /// Put a screen the pane is leaving aside for a quick return, when it
-    /// is worth keeping: a real session that has painted, is still live
-    /// and fits the budget (see [`App::term_cache`]). The cache is
-    /// most-recent-first and bounded; whatever it already held for this
-    /// session is replaced.
-    pub fn stash_term(&mut self, mut term: AttachedTerm) {
+    /// is worth keeping: a real session that has painted and is still live
+    /// (see [`App::term_cache`]). The cache is most-recent-first and
+    /// bounded twice — [`TERM_CACHE_MAX`] screens, [`TERM_CACHE_CELLS`]
+    /// between them; whatever it already held for this session is
+    /// replaced. Over the cell budget, histories go before screens do,
+    /// oldest first: a screen without its scrollback is a fiftieth of the
+    /// size and still paints the return on the keypress.
+    pub fn stash_term(&mut self, term: AttachedTerm) {
         self.term_cache.retain(|t| t.sref != term.sref);
         let keep = term.painted
             && !term.exited
             && !self.is_placeholder_session(&term.sref)
-            && self.session_is_live(&term.sref)
-            && term.estimated_cells() <= TERM_CACHE_CELLS;
+            && self.session_is_live(&term.sref);
         if !keep {
             return;
+        }
+        let mut term = term;
+        // Left before the history it asked back had landed: still without
+        // it, and no longer asking.
+        if term.pending_scroll.take().is_some() {
+            term.history_dropped = true;
         }
         self.term_cache.insert(0, term);
         self.term_cache.truncate(TERM_CACHE_MAX);
         self.prune_term_cache();
+        let held = |cache: &[AttachedTerm]| -> usize {
+            cache.iter().map(AttachedTerm::estimated_cells).sum()
+        };
+        while held(&self.term_cache) > TERM_CACHE_CELLS {
+            let oldest_with_history = self
+                .term_cache
+                .iter()
+                .rposition(|t| t.parser.screen().scrollback_rows() > 0);
+            match oldest_with_history {
+                Some(i) => self.term_cache[i].drop_history(),
+                None => {
+                    self.term_cache.pop();
+                }
+            }
+        }
     }
 
     /// The kept screen for `sref`, if there is one and its session is

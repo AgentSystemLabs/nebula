@@ -47,6 +47,9 @@ const FOOTER_TERMINAL_FOCUSED: &str = "Enter: type into terminal";
 /// Terminal pane input-locked: keys forward to the PTY. The footer spells
 /// chords the compact way `KeyChord::display` does — `^q`, not `Ctrl+q`.
 const FOOTER_TERMINAL_LOCKED: &str = "^q: panels";
+/// The bottom border of the task box the NEW SESSION PICKER ends in. The box
+/// and the picker share the title `New session`; only the box says this.
+const TASK_BOX_HINT: &str = "Enter launch";
 
 struct TuiHarness {
     writer: Box<dyn Write + Send>,
@@ -489,10 +492,11 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"n");
     tui.wait_for_text("New session"); // Claude/Codex/Cursor/Terminal picker
     tui.send(ENTER); // pick the default (Claude)
-    tui.wait_for_gone("New session");
-    tui.wait_for_text("New agent");
-    tui.send(ENTER); // empty input falls back to "agent-1"
-    tui.wait_for_gone("New agent");
+                     // The picker ends in the task box — also titled `New session`, so its
+                     // own hint line is what tells the two apart.
+    tui.wait_for_text(TASK_BOX_HINT);
+    tui.send(ENTER); // empty: no first prompt, the name falls back to "agent-1"
+    tui.wait_for_gone(TASK_BOX_HINT);
     tui.wait_for_text("agent-1"); // now provably the sessions-panel row
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED); // auto-attach locks input
 
@@ -619,10 +623,9 @@ fn nebula_open_from_inside_a_session_raises_the_file_tabs() {
     tui.send(b"n");
     tui.wait_for_text("New session");
     tui.send(ENTER);
-    tui.wait_for_gone("New session");
-    tui.wait_for_text("New agent");
+    tui.wait_for_text(TASK_BOX_HINT);
     tui.send(ENTER);
-    tui.wait_for_gone("New agent");
+    tui.wait_for_gone(TASK_BOX_HINT);
     tui.wait_for_text("agent-1");
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
 

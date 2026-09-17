@@ -562,12 +562,22 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     message,
                 } => {
                     tracing::info!(agent = %id, bytes = message.len(), "send to cloud session");
-                    reply_done(
-                        &out_tx,
-                        req_id,
-                        daemon.send_cloud_message(&id, &message).await,
-                    )
-                    .await;
+                    // `claude -p … --cloud` is a login shell and a network
+                    // round trip — seconds. Off the request loop, like the
+                    // worktree ops above: run inline, every keystroke and
+                    // every session switch on this connection waited for
+                    // it, and the pane the user went back to typing in
+                    // looked hung until the message was sent.
+                    let daemon = daemon.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        reply_done(
+                            &out_tx,
+                            req_id,
+                            daemon.send_cloud_message(&id, &message).await,
+                        )
+                        .await;
+                    });
                 }
                 ClientRequest::CreateTerminal {
                     req_id,
