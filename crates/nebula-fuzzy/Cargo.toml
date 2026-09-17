@@ -1,0 +1,10 @@
+[package]
+name = "nebula-fuzzy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No dependencies, on purpose: this crate exists so that dev builds can
+# optimise it (see `[profile.dev.package.nebula-fuzzy]` in the workspace
+# manifest) without recompiling anything else at opt-level 3.
+[dependencies]

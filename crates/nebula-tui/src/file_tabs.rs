@@ -17,9 +17,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::{Position, Rect};
 
 use crate::app::{App, Overlay};
-use crate::markdown::{self, Rendered};
+use crate::markdown::Rendered;
 use crate::syntax::{Highlighter, TokenKind};
-use crate::tree_browser::read_preview;
+use crate::tree_browser::Preview;
 
 /// Widest a tab label gets; a handful have to fit side by side, and the
 /// tail of a path is the part that tells files apart.
@@ -80,11 +80,31 @@ pub struct FileTabsView {
     /// The preview pane's inner rect, written back during draw; the
     /// embedded editor spawns and renders at this size.
     pub body_area: Rect,
+    /// BACKGROUND READS (`view_jobs`): with it, a tab's file is read and
+    /// highlighted off the loop — the TREE BROWSER's rule, and its reader;
+    /// without (a view built by a test), inline.
+    pub jobs: Option<crate::view_jobs::Jobs>,
+    /// The preview in flight, by ticket; the pane keeps the last tab's
+    /// meanwhile (`view_jobs::STALE_GRACE`).
+    pub waiting: Option<u64>,
+    /// Stops the read in flight when the tab changes again.
+    pub cancel: crate::view_jobs::Cancel,
 }
 
 impl FileTabsView {
     /// Tabs on `paths` in the order given, the first one previewed.
     pub fn new(root: PathBuf, editor: String, paths: Vec<PathBuf>) -> Self {
+        Self::with_jobs(root, editor, paths, None)
+    }
+
+    /// [`FileTabsView::new`], reading its files off the loop when there
+    /// are BACKGROUND READS to read them with.
+    pub fn with_jobs(
+        root: PathBuf,
+        editor: String,
+        paths: Vec<PathBuf>,
+        jobs: Option<crate::view_jobs::Jobs>,
+    ) -> Self {
         let tabs = paths
             .into_iter()
             .map(|path| FileTab {
@@ -110,6 +130,9 @@ impl FileTabsView {
             area: Rect::default(),
             tab_hits: Vec::new(),
             body_area: Rect::default(),
+            jobs,
+            waiting: None,
+            cancel: crate::view_jobs::Cancel::default(),
         };
         view.load_preview();
         view
@@ -133,28 +156,57 @@ impl FileTabsView {
     }
 
     /// Re-read the focused tab's file into the preview, scrolled to the top.
+    /// Off the loop when this view has BACKGROUND READS: the pane keeps
+    /// what it showed until the read lands ([`FileTabsView::land_preview`])
+    /// or is slow ([`FileTabsView::preview_slow`]).
     pub fn load_preview(&mut self) {
+        self.cancel.cancel();
+        self.waiting = None;
+        let Some(path) = self.selected().map(|tab| tab.path.clone()) else {
+            self.set_preview(placeholder("(no files)"));
+            return;
+        };
+        let Some(jobs) = self.jobs.clone() else {
+            self.set_preview(read_tab(&path, None).unwrap_or_default());
+            return;
+        };
+        let ticket = crate::view_jobs::ticket();
+        self.waiting = Some(ticket);
+        self.cancel = crate::view_jobs::Cancel::default();
+        let cancel = self.cancel.clone();
+        jobs.run_with_grace(ticket, move || {
+            Some(crate::view_jobs::Answer::Preview {
+                ticket,
+                preview: Box::new(read_tab(&path, Some(&cancel))?),
+            })
+        });
+    }
+
+    fn set_preview(&mut self, preview: Preview) {
         self.scroll = 0;
-        let (text, is_file) = match self.selected() {
-            Some(tab) => match read_preview(&tab.path) {
-                Ok(text) => (text, true),
-                Err(message) => (message, false),
-            },
-            None => ("(no files)".to_string(), false),
-        };
-        let mut hl = match self.selected() {
-            Some(tab) if is_file => Highlighter::for_path(&tab.path.to_string_lossy()),
-            _ => Highlighter::plain(),
-        };
-        self.preview_is_file = is_file;
-        self.markdown = is_file
-            && self
-                .selected()
-                .is_some_and(|t| markdown::is_markdown_path(&t.path.to_string_lossy()));
+        self.preview_is_file = preview.is_file;
+        self.markdown = preview.markdown;
         self.rendered = None;
-        self.preview_lines = text.lines().map(|l| hl.line(l)).collect();
-        self.preview_line_count = self.preview_lines.len();
-        self.preview_text = text;
+        self.preview_line_count = preview.lines.len();
+        self.preview_lines = preview.lines;
+        self.preview_text = preview.text;
+    }
+
+    /// A background read came back: shown when it is the tab being waited
+    /// on, dropped when the strip has moved on since.
+    pub fn land_preview(&mut self, ticket: u64, preview: Preview) {
+        if self.waiting == Some(ticket) {
+            self.waiting = None;
+            self.set_preview(preview);
+        }
+    }
+
+    /// The read in flight has outlasted the grace the last tab's text was
+    /// kept for: say so rather than leave one file under another's label.
+    pub fn preview_slow(&mut self, ticket: u64) {
+        if self.waiting == Some(ticket) {
+            self.set_preview(placeholder("loading…"));
+        }
     }
 
     /// The preview is the rendered markdown page rather than the source.
@@ -193,6 +245,22 @@ impl FileTabsView {
     }
 }
 
+/// A tab's file, read and highlighted — the TREE BROWSER's reader, on an
+/// absolute path.
+fn read_tab(path: &Path, cancel: Option<&crate::view_jobs::Cancel>) -> Option<Preview> {
+    crate::tree_browser::file_preview(Path::new(""), &path.to_string_lossy(), cancel)
+}
+
+fn placeholder(text: &str) -> Preview {
+    let mut hl = Highlighter::plain();
+    Preview {
+        lines: text.lines().map(|l| hl.line(l)).collect(),
+        text: text.to_string(),
+        is_file: false,
+        markdown: false,
+    }
+}
+
 /// The strip's name for a file: its path under the checkout when it is
 /// there, else just the file name — cut from the front when long, since
 /// the tail is what tells `a/README.md` from `b/README.md`.
@@ -225,7 +293,8 @@ pub(crate) fn open(app: &mut App, root: PathBuf, paths: Vec<PathBuf>) {
         vim.embedded = false;
     }
     let editor = crate::config::Config::load().editor_command();
-    app.overlay = Some(Overlay::FileTabs(FileTabsView::new(root, editor, paths)));
+    let view = FileTabsView::with_jobs(root, editor, paths, app.view_jobs.clone());
+    app.overlay = Some(Overlay::FileTabs(view));
     app.dirty = true;
 }
 

@@ -113,7 +113,7 @@ impl DiffTree {
     /// first, so the top row is nearly always one, and this modal is for
     /// reading diffs, not folder summaries. The top row when every file is
     /// folded away.
-    fn home_row(&self) -> usize {
+    pub(crate) fn home_row(&self) -> usize {
         self.best_row
             .or_else(|| {
                 self.rows

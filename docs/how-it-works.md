@@ -10,8 +10,39 @@
   one on its own. Moving the cursor onto a live session — a row in the Sessions panel, or a worktree,
   project or workspace switch that brings one back — attaches it on the keypress; only a session the
   idle reaper took waits a moment, so that walking past its row doesn't boot a CLI. The screens of the
-  last two sessions shown are kept, so returning to one paints on the same frame and fetches only the
-  bytes it missed instead of replaying the whole ring.
+  last six sessions shown are kept, so returning to one paints on the same frame and fetches only the
+  bytes it missed instead of replaying the whole ring. Between them they may hold about 12 MB of grid;
+  past that the oldest give up their scrollback and keep only the screen (a fiftieth of the size), and
+  scrolling up in a pane that came back that way replays its ring once to get the history back.
+- **A key never waits on git, the disk or the DAEMON.** Everything a keypress can start that takes
+  longer than a frame runs off the event loop and lands when it is done. The DIFF VIEWER (`g`), the
+  FILE FINDER (`f`), its grep view (`F`) and the TREE BROWSER (`b`) open on the keypress and fill in
+  when `git status` / `git ls-files` answer — what is typed meanwhile is kept and applied — and a
+  file's diff, a search and a preview are read on the blocking pool: the pane keeps what it showed
+  for up to 60 ms, which is longer than a read takes, and says `loading…` past that. The DIFF VIEWER
+  opens on the list the changed-files badge's last `git status` found (two seconds old at most; its own
+  `git status` still runs, and the reader keeps their place when it lands), so the first diff is being
+  read while the list is checked rather than after — on a ten-thousand-file checkout `g` went from
+  260 ms of frozen UI to a list in 2 ms and a diff in 60. It reads the row after the cursor ahead and
+  keeps what it has read (2 MB at most, gone with the modal), so `↓` paints the next diff on the
+  keypress and re-reads it behind. List filters rank with `nebula-fuzzy`, a crate of its own only so
+  that a dev build compiles it optimised: 27 ms a keystroke over ten thousand paths became 5. `git grep` waits 40 ms for the
+  next character, streams, and is killed at 200 hits or when the query moves on. A browser `open` and
+  a clipboard `pbcopy` are started and left to finish. Rename, archive, unarchive, delete and close
+  are OPTIMISTIC UPDATES: the row changes on the keypress, by way of the same upsert or removal the
+  DAEMON is about to broadcast, and an Error puts it back and says why. FRAME PACING is a token
+  bucket rather than a fixed 16 ms tick — three frames may go out 2 ms apart, a token comes back
+  every 16 ms — so a key's frame and its answer's follow each other, while sustained PTY output still
+  paints at 60 fps; a key that only goes to the PTY paints nothing of its own; and the DAEMON flushes
+  PTY output that breaks a silence at once instead of holding it 5 ms to coalesce. A typed character
+  echoes in 2 ms in a release build (3.5 ms in a debug one), where it was 20 (25).
+- **…and that is measured, not felt.** `NEBULA_PERF_LOG=<file>` turns on the INPUT LATENCY PROBE: one
+  JSON line per input (how long its handler held the loop), per frame (draw time, what it showed, and
+  how long each input waited for it) and per DAEMON event. `make perf` drives the real TUI through
+  every panel, modal and verb inside a private tmux — isolated daemon, a clone of this repository as
+  the checkout, a stand-in agent with a full 1 MB ring — and prints handler / paint / settle / echo
+  per step plus the peak RSS of the TUI and the DAEMON; `python3 scripts/perf/report.py BEFORE AFTER`
+  compares two runs. A change to anything on a key path is judged by that table.
 - **Every pane is the same truecolor terminal.** A session paints nebula's own grid, not the terminal
   nebula runs in, so the daemon tells each child `TERM=xterm-256color` and `COLORTERM=truecolor` and
   drops any `NO_COLOR` / `FORCE_COLOR` it inherited. An agent launch runs through your login shell

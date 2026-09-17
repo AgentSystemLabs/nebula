@@ -25,6 +25,7 @@ pub(crate) mod list_hit;
 pub mod markdown;
 pub mod overlay_close;
 pub mod palette;
+pub mod perf;
 pub mod pr_cache;
 pub mod pr_preview;
 pub mod pr_row;
@@ -41,6 +42,7 @@ pub mod theme;
 pub mod tree_browser;
 pub mod ui;
 pub mod update_check;
+pub mod view_jobs;
 pub mod vim_term;
 
 use anyhow::Result;

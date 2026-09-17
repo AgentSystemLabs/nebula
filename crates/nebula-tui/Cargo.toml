@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 nebula-core = { workspace = true }
+nebula-fuzzy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }

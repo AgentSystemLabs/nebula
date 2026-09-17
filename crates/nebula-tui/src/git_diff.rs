@@ -1,8 +1,12 @@
 //! Git status/diff readers for the diff modal.
 //!
-//! Synchronous `std::process` on purpose (the `pbcopy` precedent in
-//! event_loop.rs): these run only on key events — opening the modal or
-//! switching files — and per-file diffs are fast.
+//! The readers are synchronous `std::process`; who calls them is what
+//! changed. They used to run inside the key handler — opening the modal,
+//! switching files — and the loop waited: 47 ms to open on a small checkout
+//! and 11 ms per file walked under the INPUT LATENCY PROBE, 80 ms to over
+//! a second for the `git status` alone on a large one. A view with
+//! BACKGROUND READS (`view_jobs`) runs them on the blocking pool instead;
+//! one without — every view a test builds — still calls them inline.
 
 use crate::app::DiffView;
 use std::path::Path;
@@ -242,29 +246,325 @@ pub fn cap_lines(text: &str, max: usize, already_cut: bool) -> String {
     out
 }
 
+/// Everything opening the DIFF VIEWER reads: the changed files, HEAD, and
+/// the reviewed ✓ marks that still apply — each stored mark checked against
+/// its file's diff as it is now, one `git diff` per mark, and the pruned
+/// set written back. Off the loop for a view with BACKGROUND READS.
+pub fn read_listing(root: &Path) -> Result<crate::view_jobs::DiffListing, String> {
+    let files = changed_files(root)?;
+    let head = head_oid(root);
+    let head_key = head.clone().unwrap_or_default();
+    let stored = crate::review::load_marks(root, &head_key);
+    let reviewed: std::collections::HashMap<String, u64> = files
+        .iter()
+        .filter_map(|file| {
+            let mark = *stored.get(&file.path)?;
+            let diff = diff_for(root, file, head.is_some());
+            (crate::review::fingerprint(&diff) == mark).then(|| (file.path.clone(), mark))
+        })
+        .collect();
+    if reviewed.len() != stored.len() {
+        crate::review::store_marks(root, &head_key, &reviewed);
+    }
+    Ok(crate::view_jobs::DiffListing {
+        files,
+        head,
+        reviewed,
+    })
+}
+
+/// Put a listing into the view that was opened ahead of it (or built for
+/// it): the files, HEAD, the marks — narrowed by whatever the filter holds
+/// by now, reviewed files sunk, so the modal lands on the first unreviewed
+/// file — and that file's diff.
+///
+/// A view opened on the badge's list (`event_loop::open_diff_view`) already
+/// shows files, and maybe a reader who has moved among them: they stay on
+/// the file they are on, wherever the fresh list puts it, and its diff is
+/// read again only if it is no longer the same entry. A reader who has not
+/// moved gets what a fresh open gives — the first unreviewed file.
+pub fn fill_view(view: &mut DiffView, listing: crate::view_jobs::DiffListing) {
+    let moved = !view.at_home() || view.scroll != 0;
+    let before = view.selected_file().cloned();
+    let head_ok = listing.head.is_some();
+    let head_changed = !view.files.is_empty() && view.head_ok != head_ok;
+    view.head_ok = head_ok;
+    view.head_key = listing.head.unwrap_or_default();
+    view.files = listing.files;
+    view.reviewed = listing.reviewed;
+    view.listing = None;
+    view.recompute_matches();
+    // The tree folds the fresh list the same way, keeping what the reader
+    // folded; both lists then send the cursor home.
+    if let Some(tree) = &view.tree {
+        view.tree = Some(tree.rebuilt(&view.files, &view.filter));
+    }
+    view.selected = 0;
+    // Home is the first unreviewed file — the flat list sinks the ✓ ones —
+    // and the tree lands on it too.
+    let home = view
+        .matches
+        .first()
+        .map(|m| view.files[m.file].path.clone());
+    let kept = before
+        .as_ref()
+        .filter(|_| moved)
+        .is_some_and(|was| view.select_path(&was.path));
+    if let (false, Some(path)) = (kept, home) {
+        view.select_path(&path);
+    }
+    // Diffs read against the wrong idea of HEAD (the badge's list cannot
+    // say whether there is one) are not worth keeping.
+    if head_changed {
+        view.cache.clear();
+    }
+    if head_changed || view.selected_file() != before.as_ref() {
+        load_selected_diff(view);
+    }
+}
+
 /// Reload `view.diff` for the currently selected file and reset the scroll.
 /// A view whose diffs were fetched whole (a pull request) reads them out of
 /// `prefetched` instead of shelling out — there is no local commit to ask
-/// git about, and the text is already in hand. A directory row of the tree
-/// list has no diff of its own: the pane lists what changed under it.
+/// git about, and the text is already in hand. A directory row of the
+/// tree list has no diff of its own: the pane lists what changed under
+/// it.
+///
+/// A view with BACKGROUND READS never waits on git here. A file this modal
+/// has read before is on screen on this keypress, out of `DiffView::cache`,
+/// and re-read behind it — an agent may have edited it since — with the
+/// reader's place kept if the text changed. One it has not keeps the last
+/// file's text up for `view_jobs::STALE_GRACE` while git runs, which is
+/// longer than a diff takes; past that the pane says `loading…`. Either way
+/// the answer comes back through [`land_diff`].
 pub fn load_selected_diff(view: &mut DiffView) {
-    let diff = match (view.selected_file(), &view.prefetched) {
-        (Some(file), Some(chunks)) => chunks
+    view.waiting = None;
+    let Some(file) = view.selected_file().cloned() else {
+        let summary = view.dir_summary().unwrap_or_default();
+        view.show_diff(None, summary, false);
+        return;
+    };
+    if let Some(chunks) = &view.prefetched {
+        let diff = chunks
             .get(&file.path)
             .cloned()
-            .unwrap_or_else(|| "(no diff for this file)".to_string()),
-        (Some(file), None) => diff_for(&view.root, file, view.head_ok),
-        (None, _) => view.dir_summary().unwrap_or_default(),
+            .unwrap_or_else(|| "(no diff for this file)".to_string());
+        view.show_diff(Some(&file.path), diff, false);
+        return;
+    }
+    let Some(jobs) = view.jobs.clone() else {
+        let diff = diff_for(&view.root, &file, view.head_ok);
+        view.show_diff(Some(&file.path), diff, false);
+        return;
     };
-    view.diff_line_count = diff.lines().count();
-    view.diff = diff;
-    view.scroll = 0;
+    if let Some(text) = view.cached(&file.path) {
+        view.show_diff(Some(&file.path), text.to_string(), false);
+    }
+    let ticket = crate::view_jobs::ticket();
+    view.waiting = Some(ticket);
+    request_diff(view, &jobs, file, ticket, false);
+}
+
+fn request_diff(
+    view: &DiffView,
+    jobs: &crate::view_jobs::Jobs,
+    file: DiffFile,
+    ticket: u64,
+    prefetch: bool,
+) {
+    let (root, head_ok, id) = (view.root.clone(), view.head_ok, view.id);
+    let work = move || {
+        Some(crate::view_jobs::Answer::DiffText {
+            view: id,
+            ticket,
+            diff: diff_for(&root, &file, head_ok),
+            path: file.path,
+            prefetch,
+        })
+    };
+    if prefetch {
+        jobs.run(work);
+    } else {
+        jobs.run_with_grace(ticket, work);
+    }
+}
+
+/// A background `git diff` came back. It is kept either way — it is the
+/// freshest text there is for that file — and shown when it is the one the
+/// cursor is waiting on. Then the row after the cursor is read ahead, once:
+/// `↓` is the key this modal is walked with, and its next press finds the
+/// text in hand.
+pub fn land_diff(
+    view: &mut DiffView,
+    id: u64,
+    ticket: u64,
+    path: &str,
+    diff: String,
+    prefetch: bool,
+) {
+    if id != view.id {
+        return;
+    }
+    view.cache_put(path, &diff);
+    if prefetch || view.waiting != Some(ticket) {
+        return;
+    }
+    view.waiting = None;
+    let same_file = view.shown.as_deref() == Some(path);
+    if !(same_file && view.diff == diff) {
+        view.show_diff(Some(path), diff, same_file);
+    }
+    let next = view
+        .file_after_cursor()
+        .filter(|file| view.cached(&file.path).is_none())
+        .cloned();
+    if let (Some(file), Some(jobs)) = (next, view.jobs.clone()) {
+        request_diff(view, &jobs, file, crate::view_jobs::ticket(), true);
+    }
+}
+
+/// The diff in flight has outlasted the grace the last file's text was kept
+/// for: say so, rather than leave one file's diff under another's name.
+pub fn diff_slow(view: &mut DiffView, ticket: u64) {
+    if view.waiting == Some(ticket)
+        && view.shown.as_deref() != view.selected_file().map(|f| f.path.as_str())
+    {
+        view.show_diff(None, "loading…".to_string(), false);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn modified(path: &str) -> DiffFile {
+        DiffFile {
+            path: path.into(),
+            orig_path: None,
+            xy: [' ', 'M'],
+        }
+    }
+
+    fn listing(paths: &[&str], reviewed: &[&str]) -> crate::view_jobs::DiffListing {
+        crate::view_jobs::DiffListing {
+            files: paths.iter().map(|p| modified(p)).collect(),
+            head: Some("abc123".into()),
+            reviewed: reviewed.iter().map(|p| (p.to_string(), 1)).collect(),
+        }
+    }
+
+    /// A view opened on the badge's list, as `g` leaves it: files up, the
+    /// `git status` that checks them still out.
+    fn opened_on(paths: &[&str]) -> DiffView {
+        // Not a repository: a diff read here is git's refusal, which is all
+        // these tests need it to be.
+        let mut view = DiffView::new(
+            std::env::temp_dir().join("nebula-no-such-checkout"),
+            "main".into(),
+            paths.iter().map(|p| modified(p)).collect(),
+            true,
+        );
+        view.listing = Some(7);
+        view
+    }
+
+    fn selected(view: &DiffView) -> Option<&str> {
+        view.selected_file().map(|f| f.path.as_str())
+    }
+
+    /// The fresh list lands under a reader who has moved: they stay on the
+    /// file they were reading, wherever it now sits.
+    #[test]
+    fn a_reader_who_moved_stays_on_their_file_when_the_fresh_list_lands() {
+        let mut view = opened_on(&["a.rs", "b.rs", "c.rs"]);
+        view.select(1);
+        view.show_diff(Some("b.rs"), "the diff of b".into(), false);
+
+        fill_view(&mut view, listing(&["new.rs", "a.rs", "b.rs", "c.rs"], &[]));
+        assert_eq!(view.listing, None);
+        assert_eq!(selected(&view), Some("b.rs"), "now the third row");
+        assert_eq!(view.diff, "the diff of b", "and it was not read again");
+    }
+
+    /// …and if that file is no longer changed, they are put on the first.
+    #[test]
+    fn a_file_that_left_the_list_hands_the_cursor_to_the_top() {
+        let mut view = opened_on(&["a.rs", "b.rs", "c.rs"]);
+        view.select(1);
+        fill_view(&mut view, listing(&["a.rs", "c.rs"], &[]));
+        assert_eq!(selected(&view), Some("a.rs"));
+    }
+
+    /// A reader who has not moved gets what a fresh open gives: reviewed ✓
+    /// files sunk, the cursor on the first that is not.
+    #[test]
+    fn an_unmoved_reader_lands_on_the_first_unreviewed_file() {
+        let mut view = opened_on(&["a.rs", "b.rs"]);
+        fill_view(&mut view, listing(&["a.rs", "b.rs"], &["a.rs"]));
+        assert_eq!(selected(&view), Some("b.rs"));
+        assert_eq!(view.head_key, "abc123");
+    }
+
+    /// The tree list lands a fresh listing the same way the flat one does:
+    /// folded over the new files, the reader's folds kept, an unmoved
+    /// reader on the first unreviewed file and a moved one on theirs.
+    #[test]
+    fn the_fresh_list_lands_in_the_tree_the_same_way() {
+        let mut view = opened_on(&["src/a.rs", "src/b.rs"]);
+        view.toggle_tree();
+        fill_view(&mut view, listing(&["src/a.rs", "src/b.rs"], &["src/a.rs"]));
+        assert!(view.tree.is_some(), "still the tree");
+        assert_eq!(selected(&view), Some("src/b.rs"), "the first unreviewed");
+
+        // The reader is on b.rs; a file that turned up since joins the tree
+        // under them.
+        fill_view(&mut view, listing(&["new.rs", "src/a.rs", "src/b.rs"], &[]));
+        assert_eq!(selected(&view), Some("src/b.rs"));
+        assert!(view.select_path("new.rs"), "a row of its own now");
+    }
+
+    /// The read-ahead walks the list that is showing: in the tree that
+    /// means the next file down, directories stepped over.
+    #[test]
+    fn the_row_read_ahead_is_the_next_file_of_the_list_on_screen() {
+        let mut view = opened_on(&["src/a.rs", "src/b.rs"]);
+        assert_eq!(
+            view.file_after_cursor().map(|f| f.path.as_str()),
+            Some("src/b.rs")
+        );
+
+        view.toggle_tree();
+        // Up onto the `src/` row: the file after it is still a.rs.
+        view.select_path("src");
+        assert_eq!(
+            view.file_after_cursor().map(|f| f.path.as_str()),
+            Some("src/a.rs")
+        );
+        view.select_path("src/b.rs");
+        assert_eq!(view.file_after_cursor(), None, "the end of the list");
+    }
+
+    /// The cache holds what the budget allows, newest kept, and never an
+    /// entry that is most of the budget by itself.
+    #[test]
+    fn the_diff_cache_stays_inside_its_budget() {
+        let mut view = opened_on(&["a.rs"]);
+        let chunk = "x".repeat(crate::app::DIFF_CACHE_ENTRY_MAX);
+        for n in 0..8 {
+            view.cache_put(&format!("f{n}.rs"), &chunk);
+        }
+        let held: usize = view.cache.iter().map(|(_, text)| text.len()).sum();
+        assert!(held <= crate::app::DIFF_CACHE_BYTES, "{held} bytes held");
+        assert!(view.cached("f7.rs").is_some(), "the newest is kept");
+        assert!(view.cached("f0.rs").is_none(), "the oldest went first");
+
+        view.cache_put("huge.rs", &"y".repeat(crate::app::DIFF_CACHE_ENTRY_MAX + 1));
+        assert!(
+            view.cached("huge.rs").is_none(),
+            "too big to be worth holding"
+        );
+    }
 
     #[test]
     fn cap_lines_keeps_the_head_and_marks_what_it_dropped() {

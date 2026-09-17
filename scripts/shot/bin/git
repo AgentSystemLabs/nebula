@@ -2,7 +2,9 @@
 # A stand-in `git` for the SCREENSHOT HARNESS: the real git, except that `worktree add` first sleeps
 # NEBULA_SHOT_SLOW_GIT_SECS seconds when that is set — the window in which a QUICK PROMPT's stand-in
 # WORKTREE and SESSION rows are on screen, which a real `git worktree add` on the demo repo closes in
-# milliseconds. Unset (every other scene), it is exactly git.
+# milliseconds. NEBULA_SHOT_SLOW_GIT_MATCH names another subcommand to slow instead (`ls-files`,
+# `status`): the window in which a BACKGROUND READ's modal is up ahead of its listing. Unset (every
+# other scene), it is exactly git.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 real=""
@@ -13,6 +15,6 @@ for d in "${dirs[@]}"; do
 done
 [ -n "$real" ] || { echo "shot git: no real git on PATH" >&2; exit 1; }
 if [ -n "${NEBULA_SHOT_SLOW_GIT_SECS:-}" ]; then
-  case " $* " in *" worktree add "*) sleep "$NEBULA_SHOT_SLOW_GIT_SECS";; esac
+  case " $* " in *" ${NEBULA_SHOT_SLOW_GIT_MATCH:-worktree add} "*) sleep "$NEBULA_SHOT_SLOW_GIT_SECS";; esac
 fi
 exec "$real" "$@"

@@ -32,6 +32,59 @@ pub struct TreeNode {
     pub depth: usize,
 }
 
+/// What the preview pane shows for one node, ready to draw: the text, its
+/// syntax-highlighted lines, and what kind of thing it is. Reading a file
+/// and highlighting it is the slow half of walking the tree — 56 ms for a
+/// megabyte of Rust under the INPUT LATENCY PROBE — so a browser with
+/// BACKGROUND READS builds this off the loop ([`file_preview`]).
+#[derive(Debug, Clone, Default)]
+pub struct Preview {
+    pub text: String,
+    pub lines: Vec<Vec<(TokenKind, String)>>,
+    /// Real file contents (earns a line-number gutter), as opposed to a
+    /// directory listing or a placeholder message.
+    pub is_file: bool,
+    pub markdown: bool,
+}
+
+impl Preview {
+    /// Unhighlighted text: a directory listing, an error, a placeholder.
+    fn plain(text: String) -> Self {
+        let mut hl = Highlighter::plain();
+        Self {
+            lines: text.lines().map(|l| hl.line(l)).collect(),
+            text,
+            is_file: false,
+            markdown: false,
+        }
+    }
+}
+
+/// The preview of the file at `root/path`: read (capped, binary-guarded)
+/// and highlighted. Never fails — an unreadable file previews as the
+/// reason. `None` only when `cancel` fired between the read and the
+/// highlight: the cursor has moved on and nobody is waiting.
+pub(crate) fn file_preview(
+    root: &std::path::Path,
+    path: &str,
+    cancel: Option<&crate::view_jobs::Cancel>,
+) -> Option<Preview> {
+    let text = match read_preview(&root.join(path)) {
+        Ok(text) => text,
+        Err(message) => return Some(Preview::plain(message)),
+    };
+    if cancel.is_some_and(|c| c.is_cancelled()) {
+        return None;
+    }
+    let mut hl = Highlighter::for_path(path);
+    Some(Preview {
+        lines: text.lines().map(|l| hl.line(l)).collect(),
+        text,
+        is_file: true,
+        markdown: markdown::is_markdown_path(path),
+    })
+}
+
 /// One visible row: a node index plus the char positions of the node's
 /// `name` the filter matched, for highlighting.
 #[derive(Debug, Clone)]
@@ -108,9 +161,54 @@ pub struct TreeBrowser {
     /// In-progress drag of the tree/preview border: `boundary_x - grab
     /// column` at mouse-down (the `SplitterDrag::grab_offset` pattern).
     pub files_drag: Option<i32>,
+    /// BACKGROUND READS: with it, a file's preview is read and highlighted
+    /// off the loop and lands in [`TreeBrowser::land_preview`]; without (a
+    /// browser built by a test), inline.
+    pub jobs: Option<crate::view_jobs::Jobs>,
+    /// The `git ls-files` this browser opened ahead of, by ticket: the
+    /// tree is empty and says so until [`TreeBrowser::set_files`].
+    pub listing: Option<u64>,
+    /// The preview in flight, by ticket. The pane keeps the last node's
+    /// preview meanwhile (`view_jobs::STALE_GRACE`).
+    pub waiting: Option<u64>,
+    /// Stops the preview in flight when the cursor moves on.
+    pub cancel: crate::view_jobs::Cancel,
 }
 
 impl TreeBrowser {
+    /// A browser up before its listing is: `b` opens this at once and
+    /// `set_files` fills it when `git ls-files` answers. What is typed
+    /// into the filter meanwhile is kept and applied to the tree it gets.
+    pub fn opening(
+        root: PathBuf,
+        branch: String,
+        editor: String,
+        jobs: crate::view_jobs::Jobs,
+        listing: u64,
+    ) -> Self {
+        let mut browser = Self::new(root, branch, editor, Vec::new());
+        browser.jobs = Some(jobs);
+        browser.listing = Some(listing);
+        browser
+    }
+
+    /// The listing landed: build the tree, narrow it by whatever the filter
+    /// holds by now, and preview where the cursor ends up.
+    pub fn set_files(&mut self, files: Vec<String>) {
+        let (nodes, top, file_count) = build_nodes(&files);
+        self.expanded = vec![false; nodes.len()];
+        self.nodes = nodes;
+        self.top = top;
+        self.file_count = file_count;
+        self.listing = None;
+        self.rebuild_rows();
+        self.selected = self
+            .best_row
+            .unwrap_or(0)
+            .min(self.rows.len().saturating_sub(1));
+        self.load_preview();
+    }
+
     pub fn new(root: PathBuf, branch: String, editor: String, files: Vec<String>) -> Self {
         let (nodes, top, file_count) = build_nodes(&files);
         let expanded = vec![false; nodes.len()];
@@ -141,6 +239,10 @@ impl TreeBrowser {
             area: Rect::default(),
             files_width: DEFAULT_DIFF_FILES_W,
             files_drag: None,
+            jobs: None,
+            listing: None,
+            waiting: None,
+            cancel: crate::view_jobs::Cancel::default(),
         };
         browser.rebuild_rows();
         browser.load_preview();
@@ -289,10 +391,16 @@ impl TreeBrowser {
     /// Reload the preview for the current selection and reset the scroll.
     /// Never fails: errors become the displayed text (the `diff_for` rule).
     /// Real file contents get syntax-highlighted; directory listings and
-    /// placeholder messages stay plain.
+    /// placeholder messages stay plain. A directory's listing is built on
+    /// the spot; a file's is read off the loop when there are BACKGROUND
+    /// READS to read it with, the pane holding what it showed until the
+    /// read lands ([`TreeBrowser::land_preview`]) or is slow
+    /// ([`TreeBrowser::preview_slow`]).
     pub fn load_preview(&mut self) {
-        self.scroll = 0;
-        let (text, highlight_path) = match self.selected_node() {
+        // Whatever was being read is no longer under the cursor.
+        self.cancel.cancel();
+        self.waiting = None;
+        let preview = match self.selected_node() {
             Some(n) if n.is_dir => {
                 let listing = n
                     .children
@@ -307,26 +415,57 @@ impl TreeBrowser {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                (listing, None)
+                Preview::plain(listing)
             }
-            Some(n) => match read_preview(&self.root.join(&n.path)) {
-                Ok(text) => (text, Some(n.path.clone())),
-                Err(message) => (message, None),
+            Some(n) => match self.jobs.clone() {
+                Some(jobs) => {
+                    let path = n.path.clone();
+                    let ticket = crate::view_jobs::ticket();
+                    self.waiting = Some(ticket);
+                    self.cancel = crate::view_jobs::Cancel::default();
+                    let (root, cancel) = (self.root.clone(), self.cancel.clone());
+                    jobs.run_with_grace(ticket, move || {
+                        let preview = file_preview(&root, &path, Some(&cancel))?;
+                        Some(crate::view_jobs::Answer::Preview {
+                            ticket,
+                            preview: Box::new(preview),
+                        })
+                    });
+                    return;
+                }
+                None => file_preview(&self.root, &n.path, None).unwrap_or_default(),
             },
-            None => (String::new(), None),
+            None => Preview::default(),
         };
-        let mut hl = match &highlight_path {
-            Some(path) => Highlighter::for_path(path),
-            None => Highlighter::plain(),
-        };
-        self.preview_is_file = highlight_path.is_some();
-        self.markdown = highlight_path
-            .as_deref()
-            .is_some_and(markdown::is_markdown_path);
+        self.set_preview(preview);
+    }
+
+    fn set_preview(&mut self, preview: Preview) {
+        self.scroll = 0;
+        self.preview_is_file = preview.is_file;
+        self.markdown = preview.markdown;
         self.rendered = None;
-        self.preview_lines = text.lines().map(|l| hl.line(l)).collect();
-        self.preview_line_count = self.preview_lines.len();
-        self.preview = text;
+        self.preview_line_count = preview.lines.len();
+        self.preview_lines = preview.lines;
+        self.preview = preview.text;
+    }
+
+    /// A background preview came back: shown when it is the one the cursor
+    /// is waiting on, dropped when the cursor has moved on since.
+    pub fn land_preview(&mut self, ticket: u64, preview: Preview) {
+        if self.waiting == Some(ticket) {
+            self.waiting = None;
+            self.set_preview(preview);
+        }
+    }
+
+    /// The preview in flight has outlasted the grace the last node's
+    /// preview was kept for: say so rather than leave one file's text
+    /// under another's name. Still waiting — the read lands over this.
+    pub fn preview_slow(&mut self, ticket: u64) {
+        if self.waiting == Some(ticket) {
+            self.set_preview(Preview::plain("loading…".to_string()));
+        }
     }
 
     /// The preview is the rendered markdown page rather than the source.
@@ -440,11 +579,12 @@ pub(crate) fn visible_rows(
     let mut name_positions: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
     let mut scores: Vec<Option<i32>> = vec![None; nodes.len()];
     let mut match_count = 0;
+    let mut matcher = crate::fuzzy::Matcher::new(filter);
     for i in 0..nodes.len() {
         if nodes[i].is_dir {
             continue;
         }
-        let Some(m) = crate::fuzzy::fuzzy_match(filter, &nodes[i].path) else {
+        let Some(m) = matcher.matches(&nodes[i].path) else {
             continue;
         };
         match_count += 1;

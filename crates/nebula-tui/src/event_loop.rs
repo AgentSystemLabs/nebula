@@ -32,6 +32,8 @@ mod activate;
 mod alerts;
 mod focus_walk;
 mod host_terminal;
+mod optimistic;
+mod pacing;
 mod placeholder;
 mod quick_launch;
 use focus_walk::{
@@ -92,10 +94,6 @@ const NO_SESSIONS_TO_JUMP: &str = "no sessions to jump to";
 
 /// Flash for an action an archived agent refuses until it's unarchived.
 const AGENT_ARCHIVED: &str = "agent is archived — unarchive first (u)";
-
-/// Redraw cap (~60fps). Output bursts coalesce into one frame; input events
-/// are still handled immediately between frames.
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 /// How often the worktree panel's changed-file badge re-reads `git status`
 /// for the selected checkout, so agent edits surface without a keypress.
@@ -277,11 +275,13 @@ async fn main_loop(
     // splitter swaps the cursor once instead of on every motion event.
     let mut pointer_sent = PointerShape::default();
     let mut next_draw = tokio::time::Instant::now();
+    // When the loop may paint again (FRAME PACING): back to back for a key
+    // and its answer, 60 fps under sustained output.
+    let mut pacer = pacing::FramePacer::new(next_draw);
     let mut next_git_poll = tokio::time::Instant::now();
     // The changed-file badge's `git status`, run off the loop; the count
     // lands here and in `app.git_changes`.
-    let (git_tx, mut git_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(WorktreeId, Option<usize>)>();
+    let (git_tx, mut git_rx) = tokio::sync::mpsc::unbounded_channel::<ChangedFiles>();
     // Pull-request lookups run off the loop (they hit the network); answers
     // come back here and land in `app.pull_requests`.
     let (pr_tx, mut pr_rx) = tokio::sync::mpsc::unbounded_channel::<(WorktreeId, Lookup)>();
@@ -314,6 +314,11 @@ async fn main_loop(
     let (branch_tx, mut branch_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::branch_switch::Answer>();
     app.branch_switch.tx = Some(branch_tx);
+    // BACKGROUND READS for the worktree views: the git and the disk behind
+    // `g`, `f`, `F` and `b` run on the blocking pool and land here.
+    let (views_tx, mut views_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::view_jobs::Answer>();
+    app.view_jobs = Some(crate::view_jobs::Jobs::new(views_tx));
     // A newer nebula published on GitHub, probed off the loop at start and
     // then on a slow beat (`update_check::interval`; the e2e tests turn it
     // off). Only a newer version ever arrives, so the footer's indicator,
@@ -333,6 +338,9 @@ async fn main_loop(
     // spawns (VimEvent generations keep them apart).
     let (vim_tx, mut vim_rx) = tokio::sync::mpsc::unbounded_channel::<VimEvent>();
     app.vim_tx = Some(vim_tx);
+    // The INPUT LATENCY PROBE (`NEBULA_PERF_LOG`); None outside a
+    // measurement run.
+    let mut perf = crate::perf::Perf::from_env();
 
     loop {
         if app.dirty && tokio::time::Instant::now() >= next_draw {
@@ -342,9 +350,13 @@ async fn main_loop(
             if app.git_changes_stale() {
                 request_git_changes(&mut app, &git_tx);
             }
+            let began = std::time::Instant::now();
             draw_frame(terminal, &mut app)?;
+            if let Some(perf) = &mut perf {
+                perf.frame(began, &app);
+            }
             app.dirty = false;
-            next_draw = tokio::time::Instant::now() + FRAME_INTERVAL;
+            next_draw = pacer.drew(tokio::time::Instant::now(), began.elapsed());
             sync_pty_size(&mut app, &mut out);
             sync_vim_size(&mut app);
         }
@@ -486,13 +498,23 @@ async fn main_loop(
                     if matches!(event, Event::Resize(..)) {
                         on_host_resize(terminal)?;
                     }
+                    let probe = perf
+                        .as_ref()
+                        .and_then(|_| crate::perf::label(&event))
+                        .map(|label| (label, std::time::Instant::now()));
                     handle_terminal_event(&mut app, event, &mut out);
+                    if let (Some(perf), Some((label, arrived))) = (&mut perf, probe) {
+                        perf.input(label, arrived, &app);
+                    }
                 }
                 Some(Err(_)) | None => app.should_quit = true,
             },
             ev = channels.rx.recv() => match ev {
                 Some(server_event) => {
                     log_server_event(&server_event);
+                    if let Some(perf) = &mut perf {
+                        perf.server(crate::perf::server_name(&server_event));
+                    }
                     handle_server_event(&mut app, server_event, &mut out);
                 }
                 None => {
@@ -515,7 +537,9 @@ async fn main_loop(
             }
             answer = git_rx.recv() => {
                 // Never None: `git_tx` lives as long as the loop.
-                if let Some((worktree, count)) = answer {
+                if let Some((worktree, files)) = answer {
+                    let count = files.as_ref().map(Vec::len);
+                    keep_changed_files(&mut app, &worktree, files);
                     land_git_changes(&mut app, worktree, count);
                     // The selection moved on while this one was being read:
                     // ask for where it is now, rather than wait a poll.
@@ -580,6 +604,12 @@ async fn main_loop(
                     crate::branch_switch::land_answer(&mut app, answer);
                 }
             }
+            answer = views_rx.recv() => {
+                // Never None: `app.view_jobs` keeps a sender alive.
+                if let Some(answer) = answer {
+                    land_view_answer(&mut app, answer);
+                }
+            }
         }
         if app.focus != focus_before {
             tracing::debug!(from = ?focus_before, to = ?app.focus, "focus changed");
@@ -590,6 +620,9 @@ async fn main_loop(
         // (burst coalescing for PTY output).
         while let Ok(ev) = channels.rx.try_recv() {
             log_server_event(&ev);
+            if let Some(perf) = &mut perf {
+                perf.server(crate::perf::server_name(&ev));
+            }
             handle_server_event(&mut app, ev, &mut out);
         }
         while let Ok(ev) = vim_rx.try_recv() {
@@ -686,10 +719,7 @@ async fn main_loop(
 /// feel instant — and on every poll, a hitch under the user's typing.
 /// Skipped while one is in flight (a repaint must never stack processes);
 /// the answer arrives on `git_tx` and lands in `land_git_changes`.
-fn request_git_changes(
-    app: &mut App,
-    git_tx: &tokio::sync::mpsc::UnboundedSender<(WorktreeId, Option<usize>)>,
-) {
+fn request_git_changes(app: &mut App, git_tx: &tokio::sync::mpsc::UnboundedSender<ChangedFiles>) {
     if app.git_changes_inflight.is_some() {
         return;
     }
@@ -702,9 +732,32 @@ fn request_git_changes(
     app.git_changes_inflight = Some(id.clone());
     let git_tx = git_tx.clone();
     tokio::task::spawn_blocking(move || {
-        let count = crate::git_diff::changed_files(&path).ok().map(|f| f.len());
-        let _ = git_tx.send((id, count));
+        let _ = git_tx.send((id, crate::git_diff::changed_files(&path).ok()));
     });
+}
+
+/// What the badge's `git status` found in a checkout; None when git could
+/// not say.
+type ChangedFiles = (WorktreeId, Option<Vec<crate::git_diff::DiffFile>>);
+
+/// The most changed files worth holding on to between polls for `g` to open
+/// on: a couple of hundred kilobytes of paths at the outside. A checkout
+/// with more than this changed waits for its own `git status` instead.
+const CHANGED_FILES_KEEP: usize = 2000;
+
+/// Keep the list the badge's count was taken from. The poll has already
+/// paid for it, every two seconds, for the checkout the user is in — which
+/// is the checkout `g` opens the DIFF VIEWER on, and the `git status` that
+/// `g` would otherwise wait for before it can show a single file
+/// (`open_diff_view`).
+fn keep_changed_files(
+    app: &mut App,
+    worktree: &WorktreeId,
+    files: Option<Vec<crate::git_diff::DiffFile>>,
+) {
+    app.changed_files = files
+        .filter(|files| files.len() <= CHANGED_FILES_KEEP)
+        .map(|files| (worktree.clone(), files));
 }
 
 /// Record a checkout's changed-file count. Stored whichever checkout it is
@@ -1698,12 +1751,25 @@ fn note_focus_change(app: &mut App) {
 /// Fire one memory reading for the metrics modal: sample this client's own
 /// RSS now (the daemon can't see us), ask the daemon for itself plus every
 /// session's process tree. The reply arrives as `ServerEvent::Metrics`.
+///
+/// The client's own reading is a `ps`, and this runs on the footer's beat —
+/// every five seconds for as long as the TUI is up — so the `ps` runs off
+/// the loop and lands like any other BACKGROUND READ, rather than stall
+/// whatever key arrives during it.
 fn request_metrics(app: &mut App, out: &mut Vec<ClientRequest>) {
-    app.client_rss_bytes = nebula_core::mem::process_rss_bytes(std::process::id()).unwrap_or(0);
-    if let Some(Overlay::Metrics(view)) = &mut app.overlay {
-        view.client_rss_bytes = app.client_rss_bytes;
+    let own_rss = || nebula_core::mem::process_rss_bytes(std::process::id()).unwrap_or(0);
+    match app.view_jobs.clone() {
+        Some(jobs) => jobs.run(move || Some(crate::view_jobs::Answer::ClientRss(own_rss()))),
+        None => land_client_rss(app, own_rss()),
     }
     send(app, out, |req_id| ClientRequest::GetMetrics { req_id });
+}
+
+fn land_client_rss(app: &mut App, bytes: u64) {
+    app.client_rss_bytes = bytes;
+    if let Some(Overlay::Metrics(view)) = &mut app.overlay {
+        view.client_rss_bytes = bytes;
+    }
 }
 
 /// Queue a request that wants no follow-up when its Ack lands.
@@ -1997,9 +2063,18 @@ fn dispatch_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientRequ
     }
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => {
+            let typing = typing_into_pane(app);
             app.flash = None;
             handle_key(app, key, out);
-            app.dirty = true;
+            // A key that only went to the PTY changed nothing here: what
+            // it does shows up as the PTY's answer, a couple of
+            // milliseconds on. Painting an identical frame for it first
+            // put that answer's frame a draw and a FRAME PACING gap
+            // behind — 8 ms from key to echo under the INPUT LATENCY
+            // PROBE instead of 3 — on every character typed at an agent.
+            if !(typing && typing_into_pane(app)) {
+                app.dirty = true;
+            }
         }
         Event::Mouse(mouse) => handle_mouse(app, mouse, out),
         Event::Paste(text) if app.vim.is_some() => {
@@ -2036,6 +2111,28 @@ fn dispatch_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientRequ
         Event::FocusLost => app.window_focused = false,
         _ => {}
     }
+}
+
+/// Is the next key headed for the PTY and nowhere else — a LOCKED PANE on a
+/// live session, nothing over it, and nothing on screen a keypress takes
+/// down (a flash, a selection highlight, a scrolled-back view, the KEY COMBO
+/// DISPLAY's last chord)? True before and after a key, that key left the
+/// screen exactly as it was: every hatch out of the pane fails the second
+/// test, and everything a forwarded key clears fails the first.
+fn typing_into_pane(app: &App) -> bool {
+    app.vim.is_none()
+        && app.overlay.is_none()
+        && app.focus == Focus::Terminal
+        && app.term_locked
+        && !app.splash_active()
+        && app.flash.is_none()
+        && app.term_selection.is_none()
+        && app.key_combo.is_none()
+        && !app.pane_shows_placeholder()
+        && app
+            .term
+            .as_ref()
+            .is_some_and(|t| !t.exited && t.scroll == 0)
 }
 
 /// `text` wrapped in the bracketed-paste markers, ready for a PTY.
@@ -2874,13 +2971,20 @@ fn open_repo_in_browser(app: &mut App) {
         app.flash = Some(SELECT_CONTEXT_FIRST.into());
         return;
     };
-    match crate::remote::repo_url(&root) {
-        // Not open_link: this is a repo page, never a PR row to mark read.
-        Ok(url) if open_url(&url) => {
-            app.flash = Some(format!("opened {}", crate::app::pretty_url(&url)))
+    // Not open_link: this is a repo page, never a PR row to mark read.
+    let open = move || match crate::remote::repo_url(&root) {
+        Ok(url) if open_url(&url) => format!("opened {}", crate::app::pretty_url(&url)),
+        Ok(url) => format!("couldn't open {url}"),
+        Err(msg) => msg,
+    };
+    // Which page it is takes a `git remote get-url` to know: asked off the
+    // loop, with the outcome flashed when it lands.
+    match app.view_jobs.clone() {
+        Some(jobs) => {
+            app.flash = Some("opening the repository's page…".into());
+            jobs.run(move || Some(crate::view_jobs::Answer::Flash(open())));
         }
-        Ok(url) => app.flash = Some(format!("couldn't open {url}")),
-        Err(msg) => app.flash = Some(msg),
+        None => app.flash = Some(open()),
     }
 }
 
@@ -2941,15 +3045,9 @@ fn open_in_app(bundle: &std::path::Path, path: &std::path::Path) -> bool {
     if cfg!(test) {
         return true;
     }
-    use std::process::{Command, Stdio};
-    Command::new("open")
-        .arg("-a")
-        .arg(bundle)
-        .arg(path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    let mut open = std::process::Command::new("open");
+    open.arg("-a").arg(bundle).arg(path);
+    spawn_and_reap(open, "open in app")
 }
 
 /// `r` on the Worktrees panel: start the selected checkout's RUN COMMAND,
@@ -3130,59 +3228,89 @@ fn load_worktree_files(
     Some((files, editor))
 }
 
+/// `g`: the DIFF VIEWER on the selected checkout. The modal is up on this
+/// keypress and its file list lands when `git status` answers
+/// (`land_view_answer`) — it is that `git status`, the HEAD lookup and a
+/// `git diff` per reviewed ✓ mark that the key used to wait on. The
+/// reviewed marks `git_diff::read_listing` restores drop any that no
+/// longer apply: `load_marks` already returns nothing when HEAD moved (a
+/// commit resets the whole worktree), and a mark whose file left the change
+/// list or whose diff text changed since it was approved is pruned — then
+/// the pruned set is written back. Restored marks sink to the bottom, so
+/// the modal opens on the first unreviewed file.
+///
+/// A checkout the changed-files badge already knows to be clean is told so
+/// on the spot instead of being shown a modal that closes again; the badge
+/// can be two seconds behind an agent, so git is still asked, and the
+/// modal opens after all if it disagrees (`App::diff_probe`).
 fn open_diff_view(app: &mut App) {
     let Some((path, branch)) = selected_checkout(app) else {
         return;
     };
-    let files = match crate::git_diff::changed_files(&path) {
-        Ok(files) => files,
-        Err(msg) => {
-            app.flash = Some(msg);
-            return;
+    let Some(jobs) = app.view_jobs.clone() else {
+        // No loop to land an answer on (unit tests): read inline.
+        match crate::git_diff::read_listing(&path) {
+            Ok(listing) => show_diff_listing(app, path, branch, listing),
+            Err(msg) => app.flash = Some(msg),
         }
+        return;
     };
-    if files.is_empty() {
+    let ticket = crate::view_jobs::ticket();
+    let selected = app.selected_worktree().map(|w| w.id.clone());
+    let known_clean =
+        matches!(&app.git_changes, Some((id, Some(0))) if Some(id) == selected.as_ref());
+    if known_clean {
+        app.flash = Some(format!("no changes in {branch}"));
+        app.diff_probe = Some((ticket, path.clone(), branch));
+    } else {
+        let mut view = DiffView::opening(path.clone(), branch, jobs.clone(), ticket);
+        view.files_width = app.diff_files_width;
+        if app.diff_tree {
+            view.toggle_tree();
+        }
+        // The badge's last `git status` — two seconds old at most — is the
+        // list to open on: the files are up on this keypress and the first
+        // diff is being read while the `git status` below checks them, not
+        // after it. `fill_view` reconciles the two when that lands.
+        let polled = app
+            .changed_files
+            .as_ref()
+            .filter(|(id, files)| Some(id) == selected.as_ref() && !files.is_empty());
+        if let Some((_, files)) = polled {
+            view.replace_files(files.clone());
+            crate::git_diff::load_selected_diff(&mut view);
+        }
+        app.overlay = Some(Overlay::Diff(view));
+    }
+    jobs.run(move || {
+        Some(crate::view_jobs::Answer::DiffListing {
+            ticket,
+            result: crate::git_diff::read_listing(&path),
+        })
+    });
+}
+
+/// Open the DIFF VIEWER on a listing already in hand — or say there is
+/// nothing to show.
+fn show_diff_listing(
+    app: &mut App,
+    path: std::path::PathBuf,
+    branch: String,
+    listing: crate::view_jobs::DiffListing,
+) {
+    if listing.files.is_empty() {
         app.flash = Some(format!("no changes in {branch}"));
         return;
     }
-    let head = crate::git_diff::head_oid(&path);
-    let head_ok = head.is_some();
-    let mut view = DiffView::new(path, branch, files, head_ok);
-    view.head_key = head.unwrap_or_default();
+    let mut view = DiffView::new(path, branch, Vec::new(), true);
+    view.jobs = app.view_jobs.clone();
     view.files_width = app.diff_files_width;
-    restore_reviewed_marks(&mut view);
+    crate::git_diff::fill_view(&mut view, listing);
     // After the marks: the tree opens on the first unreviewed file too.
-    if app.diff_tree {
-        view.toggle_tree();
+    if app.diff_tree && view.toggle_tree() {
+        crate::git_diff::load_selected_diff(&mut view);
     }
-    crate::git_diff::load_selected_diff(&mut view);
     app.overlay = Some(Overlay::Diff(view));
-}
-
-/// Restore the worktree's reviewed ✓ marks into `view.reviewed`, dropping
-/// any that no longer apply: `load_marks` already returns nothing when HEAD
-/// moved (a commit resets the whole worktree), and a mark whose file left
-/// the change list or whose diff text changed since it was approved is
-/// pruned here — then the pruned set is written back. Restored marks sink
-/// to the bottom, so the modal opens on the first unreviewed file.
-fn restore_reviewed_marks(view: &mut DiffView) {
-    let stored = crate::review::load_marks(&view.root, &view.head_key);
-    if stored.is_empty() {
-        return;
-    }
-    view.reviewed = view
-        .files
-        .iter()
-        .filter_map(|file| {
-            let mark = *stored.get(&file.path)?;
-            let diff = crate::git_diff::diff_for(&view.root, file, view.head_ok);
-            (crate::review::fingerprint(&diff) == mark).then(|| (file.path.clone(), mark))
-        })
-        .collect();
-    if view.reviewed.len() != stored.len() {
-        crate::review::store_marks(&view.root, &view.head_key, &view.reviewed);
-    }
-    view.recompute_matches();
 }
 
 /// Fuzzy file finder over every tracked + untracked file of the selected
@@ -3200,10 +3328,34 @@ fn open_file_finder(app: &mut App) {
     let Some((path, branch)) = selected_checkout(app) else {
         return;
     };
+    // The modal is up on this keypress, taking what is typed; the list
+    // lands when `git ls-files` answers (`land_view_answer`).
+    if let Some(jobs) = app.view_jobs.clone() {
+        let editor = crate::config::Config::load().editor_command();
+        let ticket = request_worktree_files(&jobs, &path);
+        app.overlay = Some(Overlay::Files(FileFinder::opening(
+            path, branch, editor, ticket,
+        )));
+        return;
+    }
     let Some((files, editor)) = load_worktree_files(app, &path, &branch) else {
         return;
     };
     app.overlay = Some(Overlay::Files(FileFinder::new(path, branch, editor, files)));
+}
+
+/// Ask for a checkout's file listing off the loop; the ticket is what the
+/// modal opened ahead of it waits on.
+fn request_worktree_files(jobs: &crate::view_jobs::Jobs, path: &std::path::Path) -> u64 {
+    let ticket = crate::view_jobs::ticket();
+    let root = path.to_path_buf();
+    jobs.run(move || {
+        Some(crate::view_jobs::Answer::Files {
+            ticket,
+            result: crate::git_diff::list_files(&root),
+        })
+    });
+    ticket
 }
 
 /// Tree browser (`b`): full file tree of the selected worktree with a
@@ -3214,6 +3366,15 @@ fn open_tree_browser(app: &mut App) {
     let Some((path, branch)) = selected_checkout(app) else {
         return;
     };
+    // Up on this keypress; the tree lands when `git ls-files` answers.
+    if let Some(jobs) = app.view_jobs.clone() {
+        let editor = crate::config::Config::load().editor_command();
+        let ticket = request_worktree_files(&jobs, &path);
+        app.overlay = Some(Overlay::Tree(TreeBrowser::opening(
+            path, branch, editor, jobs, ticket,
+        )));
+        return;
+    }
     let Some((files, editor)) = load_worktree_files(app, &path, &branch) else {
         return;
     };
@@ -3227,7 +3388,128 @@ fn open_grep_view(app: &mut App) {
         return;
     };
     let editor = crate::config::Config::load().editor_command();
-    app.overlay = Some(Overlay::Grep(GrepView::new(path, branch, editor)));
+    let mut view = GrepView::new(path, branch, editor);
+    view.jobs = app.view_jobs.clone();
+    app.overlay = Some(Overlay::Grep(view));
+}
+
+/// A BACKGROUND READ came back (`view_jobs`): hand it to the view that
+/// asked, if that view is still the one on screen. Every answer carries
+/// the ticket its view is waiting on, so one that outlived its modal — or
+/// its query, or its cursor — is dropped by the view itself.
+fn land_view_answer(app: &mut App, answer: crate::view_jobs::Answer) {
+    use crate::view_jobs::Answer;
+    match answer {
+        Answer::Grep { ticket, result } => {
+            if let Some(Overlay::Grep(view)) = &mut app.overlay {
+                view.land(ticket, result);
+            }
+        }
+        Answer::Files { ticket, result } => land_worktree_files(app, ticket, result),
+        Answer::DiffListing { ticket, result } => land_diff_listing(app, ticket, result),
+        Answer::DiffText {
+            view: id,
+            ticket,
+            path,
+            diff,
+            prefetch,
+        } => {
+            if let Some(Overlay::Diff(view)) = &mut app.overlay {
+                crate::git_diff::land_diff(view, id, ticket, &path, diff, prefetch);
+            }
+        }
+        Answer::Preview { ticket, preview } => match &mut app.overlay {
+            Some(Overlay::Tree(view)) => view.land_preview(ticket, *preview),
+            Some(Overlay::FileTabs(view)) => view.land_preview(ticket, *preview),
+            _ => {}
+        },
+        Answer::ClipboardViaTerminal { payload, flash } => {
+            app.pending_clipboard = Some(payload);
+            app.flash = Some(flash);
+        }
+        Answer::Flash(message) => app.flash = Some(message),
+        Answer::ClientRss(bytes) => land_client_rss(app, bytes),
+        Answer::Slow { ticket } => match &mut app.overlay {
+            Some(Overlay::Diff(view)) => crate::git_diff::diff_slow(view, ticket),
+            Some(Overlay::Tree(view)) => view.preview_slow(ticket),
+            Some(Overlay::FileTabs(view)) => view.preview_slow(ticket),
+            _ => {}
+        },
+    }
+    app.dirty = true;
+}
+
+/// `git ls-files` came back for the FILE FINDER or the TREE BROWSER that
+/// opened ahead of it. A checkout with nothing to list, or one git could
+/// not list, closes the modal with the reason — what `f` and `b` used to
+/// say instead of opening.
+fn land_worktree_files(app: &mut App, ticket: u64, result: Result<Vec<String>, String>) {
+    let branch = match &app.overlay {
+        Some(Overlay::Files(finder)) if finder.listing == Some(ticket) => finder.branch.clone(),
+        Some(Overlay::Tree(view)) if view.listing == Some(ticket) => view.branch.clone(),
+        _ => return,
+    };
+    let files = match result {
+        Ok(files) if !files.is_empty() => files,
+        Ok(_) => {
+            app.overlay = None;
+            app.flash = Some(format!("no files in {branch}"));
+            return;
+        }
+        Err(msg) => {
+            app.overlay = None;
+            app.flash = Some(msg);
+            return;
+        }
+    };
+    match &mut app.overlay {
+        Some(Overlay::Files(finder)) => finder.set_files(files),
+        Some(Overlay::Tree(view)) => view.set_files(files),
+        _ => {}
+    }
+}
+
+/// `git status` came back for a `g`: fill the DIFF VIEWER that opened ahead
+/// of it — or close it, saying why, when there is nothing to show — or, for
+/// the checkout that was told "no changes" off the badge, open it after all
+/// when git found some and nothing else has taken the screen since.
+fn land_diff_listing(
+    app: &mut App,
+    ticket: u64,
+    result: Result<crate::view_jobs::DiffListing, String>,
+) {
+    let probe = match &app.diff_probe {
+        Some((probed, ..)) if *probed == ticket => app.diff_probe.take(),
+        _ => None,
+    };
+    if let Some((_, path, branch)) = probe {
+        if let Ok(listing) = result {
+            if !listing.files.is_empty() && app.overlay.is_none() && app.vim.is_none() {
+                app.flash = None;
+                show_diff_listing(app, path, branch, listing);
+            }
+        }
+        return;
+    }
+    let branch = match &app.overlay {
+        Some(Overlay::Diff(view)) if view.listing == Some(ticket) => view.branch.clone(),
+        _ => return,
+    };
+    match result {
+        Ok(listing) if !listing.files.is_empty() => {
+            if let Some(Overlay::Diff(view)) = &mut app.overlay {
+                crate::git_diff::fill_view(view, listing);
+            }
+        }
+        Ok(_) => {
+            app.overlay = None;
+            app.flash = Some(format!("no changes in {branch}"));
+        }
+        Err(msg) => {
+            app.overlay = None;
+            app.flash = Some(msg);
+        }
+    }
 }
 
 /// Enter on a grep hit: spawn the editor at `path:line` inside the modal
@@ -3484,10 +3766,7 @@ fn archive_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
 /// dialog's Enter with it on.
 fn archive_agent_now(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
     detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
-    send(app, out, |req_id| ClientRequest::ArchiveAgent {
-        req_id,
-        id,
-    });
+    optimistic::set_archived(app, id, true, out);
 }
 
 /// The confirm before an agent is archived, when the setting asks for
@@ -5895,28 +6174,9 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 message: value,
             });
         }
-        PromptKind::RenameAgent { id } => {
-            send(app, out, |req_id| ClientRequest::RenameAgent {
-                req_id,
-                id,
-                name: value,
-            });
-        }
-        PromptKind::RenameTerminal { id } => {
-            send(app, out, |req_id| ClientRequest::RenameTerminal {
-                req_id,
-                id,
-                name: value,
-            });
-        }
-        PromptKind::RenameProject { id } => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::RenameProject {
-                req_id,
-                id,
-                name: value,
-            });
-        }
+        PromptKind::RenameAgent { id } => optimistic::rename_agent(app, id, value, out),
+        PromptKind::RenameTerminal { id } => optimistic::rename_terminal(app, id, value, out),
+        PromptKind::RenameProject { id } => optimistic::rename_project(app, id, value, out),
         PromptKind::NewWorkspace => {
             // Created from the switcher: open it as soon as the Ack lands.
             send_with(app, out, PendingIntent::OpenCreatedWorkspace, |req_id| {
@@ -5926,13 +6186,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 }
             });
         }
-        PromptKind::RenameWorkspace { id } => {
-            send(app, out, |req_id| ClientRequest::RenameWorkspace {
-                req_id,
-                id,
-                name: value,
-            });
-        }
+        PromptKind::RenameWorkspace { id } => optimistic::rename_workspace(app, id, value, out),
         PromptKind::SettingText { kind, project } => {
             // Same path as a toggled row (`apply_setting_at`): write the
             // file, adopt it live, and land back on the overlay — with the
@@ -6057,16 +6311,13 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
 /// Delete an agent for good, detaching the pane first if it's showing it.
 fn delete_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
     detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
-    send(app, out, |req_id| ClientRequest::DeleteAgent { req_id, id });
+    optimistic::delete_agent(app, id, out);
 }
 
 /// Close a terminal tab, detaching the pane first if it's showing it.
 fn close_terminal(app: &mut App, id: TerminalId, out: &mut Vec<ClientRequest>) {
     detach_if_attached(app, &SessionRef::Terminal(id.clone()), out);
-    send(app, out, |req_id| ClientRequest::CloseTerminal {
-        req_id,
-        id,
-    });
+    optimistic::close_terminal(app, id, out);
 }
 
 /// Delete a worktree optimistically: drop its rows now (the daemon deletes
@@ -7155,10 +7406,11 @@ fn send_attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     // starts exactly there (`AttachedTerm::apply_scrollback` appends it
     // onto the screen), or with the whole ring when that point has fallen
     // off, which rebuilds the screen as a first attach would.
+    // …unless the whole ring is the point: a history being brought back.
     let from_seq = app
         .term
         .as_ref()
-        .filter(|t| t.sref == sref && t.painted)
+        .filter(|t| t.sref == sref && t.painted && t.pending_scroll.is_none())
         .map(|t| t.next_seq);
     app.attached_sref = Some(sref.clone());
     out.push(ClientRequest::Attach {
@@ -7167,6 +7419,33 @@ fn send_attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
         cols,
         rows,
     });
+}
+
+/// The user scrolled up in a pane whose history was let go while its screen
+/// sat in the cache (`AttachedTerm::drop_history`): ask the DAEMON for the
+/// whole ring again. The replay rebuilds the screen and everything above
+/// it, and lands the reader on `scroll` — the notch that asked. One wheel
+/// notch late, once per return, is what the instant return costs.
+fn rehydrate_history(app: &mut App, scroll: usize, out: &mut Vec<ClientRequest>) {
+    let Some(term) = &mut app.term else {
+        return;
+    };
+    if !term.history_dropped {
+        return;
+    }
+    term.history_dropped = false;
+    term.pending_scroll = Some(scroll);
+    let sref = term.sref.clone();
+    // Let go first, so the forwarder of the attachment being replaced is
+    // gone before the replay that supersedes it is sent.
+    if app.attached_sref.as_ref() == Some(&sref) {
+        app.attached_sref = None;
+        out.push(ClientRequest::Detach {
+            session: sref.clone(),
+        });
+    }
+    app.pending_attach = None;
+    send_attach(app, sref, out);
 }
 
 /// Send the armed attach now — the selection settled, or something needs
@@ -7656,12 +7935,28 @@ fn copy_and_flash(app: &mut App, text: &str, label: &str) {
         app.flash = Some(label.to_string());
         return;
     }
+    let via_terminal = format!("{label} (via terminal)");
+    // `pbcopy` is a process to start and a pasteboard server to reach —
+    // ten to twenty milliseconds the loop used to spend on mouse-up. It
+    // all but never fails here, so the flash says so now, and the rare
+    // failure falls back to the terminal's OSC 52 when it is known.
+    if let (false, Some(jobs)) = (app.is_remote, app.view_jobs.clone()) {
+        app.flash = Some(label.to_string());
+        let text = text.to_string();
+        jobs.run(move || {
+            (!copy_to_clipboard(&text)).then(|| crate::view_jobs::Answer::ClipboardViaTerminal {
+                payload: base64_encode(text.as_bytes()),
+                flash: via_terminal,
+            })
+        });
+        return;
+    }
     if !app.is_remote && copy_to_clipboard(text) {
         app.flash = Some(label.to_string());
         return;
     }
     app.pending_clipboard = Some(base64_encode(text.as_bytes()));
-    app.flash = Some(format!("{label} (via terminal)"));
+    app.flash = Some(via_terminal);
 }
 
 /// Base64 (RFC 4648, padded) for OSC 52 payloads — one call site does not
@@ -7747,18 +8042,39 @@ pub(crate) fn open_url(url: &str) -> bool {
     }
     #[cfg(target_os = "macos")]
     {
-        use std::process::{Command, Stdio};
-        Command::new("open")
-            .arg(url)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+        let mut open = std::process::Command::new("open");
+        open.arg(url);
+        spawn_and_reap(open, "open url")
     }
     #[cfg(not(target_os = "macos"))]
     {
         false
     }
+}
+
+/// Start `command` and let it finish on its own: true once it is running.
+/// `open` spends 50 to 150 ms talking to LaunchServices before it exits,
+/// and the key that asked for a browser tab used to spend them with it —
+/// the loop frozen, the flash unpainted. Whether it then succeeds is not
+/// something the keypress can wait to learn; a failure is logged (the
+/// `spawn_open_command` rule), and the reaper thread is what keeps the
+/// child from lingering as a zombie.
+fn spawn_and_reap(mut command: std::process::Command, what: &'static str) -> bool {
+    use std::process::Stdio;
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return false;
+    };
+    std::thread::spawn(move || match child.wait() {
+        Ok(status) if !status.success() => tracing::warn!(what, %status, "open failed"),
+        Err(err) => tracing::warn!(what, %err, "open not reaped"),
+        Ok(_) => {}
+    });
+    true
 }
 
 /// Two clicks on the same cell within this window make a double-click.
@@ -8577,6 +8893,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                             term.scroll.saturating_sub(TERM_WHEEL_LINES)
                         };
                         term.set_scroll(new_scroll);
+                        if up {
+                            rehydrate_history(app, new_scroll, out);
+                        }
                     }
                     app.dirty = true;
                 }
@@ -8908,9 +9227,16 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     app.term_locked = false;
                     app.focus = app.first_sidebar_focus();
                 }
+                // An OPTIMISTIC UPDATE the DAEMON went along with.
+                (Some(PendingIntent::Undo(undo)), _) => optimistic::settled(app, undo),
                 _ => {}
             }
             app.dirty = true;
+        }
+        // A straggler for a row deleted here a moment ago: the DAEMON sent
+        // it before it got to the delete, and the row stays down.
+        ServerEvent::EntityUpserted { entity } if optimistic::is_deleting(app, &entity) => {
+            tracing::debug!(?entity, "upsert of a row being deleted — ignored");
         }
         ServerEvent::EntityUpserted { entity } => {
             // A checkout cut for a PR SESSION takes over its stand-in row
@@ -9020,6 +9346,9 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 Some(PendingIntent::DeleteWorktree(rollback)) => {
                     restore_worktree_rows(app, rollback)
                 }
+                // A rename, an archive or a delete shown on the keypress
+                // and then refused: the row goes back to what it was.
+                Some(PendingIntent::Undo(undo)) => optimistic::undo(app, undo, out),
                 Some(PendingIntent::AttachCreatedWithCloudRetry {
                     kind,
                     task: text,
@@ -9773,6 +10102,89 @@ mod tests {
             .map(|a| a.session.as_str())
             .collect();
         assert_eq!(names, ["agent-1", "agent-2"]);
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, mods))
+    }
+
+    fn locked_pane_app() -> App {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            40,
+            10,
+        ));
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        app.dirty = false;
+        app
+    }
+
+    /// TYPING ECHO: a key that only goes to the PTY leaves the screen as it
+    /// was, so it asks for no frame — the frame that matters is the one
+    /// the PTY's answer asks for a moment later, and an identical one
+    /// painted first only stood in its way.
+    #[test]
+    fn a_key_that_only_goes_to_the_pty_asks_for_no_frame() {
+        let mut app = locked_pane_app();
+        let mut out = Vec::new();
+        handle_terminal_event(
+            &mut app,
+            key(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut out,
+        );
+        assert!(
+            matches!(out.as_slice(), [ClientRequest::Input { .. }]),
+            "the key went to the PTY: {out:?}"
+        );
+        assert!(!app.dirty, "and changed nothing on screen");
+    }
+
+    /// …but whatever a forwarded key takes down is a change, and is
+    /// painted: a flash, a selection highlight, a scrolled-back view.
+    #[test]
+    fn a_forwarded_key_that_clears_something_still_paints() {
+        let mut out = Vec::new();
+
+        let mut app = locked_pane_app();
+        app.flash = Some("copied".into());
+        handle_terminal_event(
+            &mut app,
+            key(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut out,
+        );
+        assert!(app.dirty && app.flash.is_none(), "the flash came down");
+
+        let mut app = locked_pane_app();
+        if let Some(term) = &mut app.term {
+            term.parser.process(&b"line\r\n".repeat(40));
+            term.set_scroll(3);
+            assert!(term.scroll > 0);
+        }
+        handle_terminal_event(
+            &mut app,
+            key(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut out,
+        );
+        assert!(app.dirty, "typing left the scrollback for the live edge");
+        assert_eq!(app.term.as_ref().map(|t| t.scroll), Some(0));
+    }
+
+    /// The hatch out of the pane is not a forwarded key: FOCUS moves, and
+    /// that is a frame.
+    #[test]
+    fn the_unlock_key_in_a_locked_pane_paints() {
+        let mut app = locked_pane_app();
+        let mut out = Vec::new();
+        handle_terminal_event(
+            &mut app,
+            key(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            &mut out,
+        );
+        assert!(out.is_empty(), "nothing went to the PTY");
+        assert!(!app.term_locked && app.dirty);
     }
 
     /// A turn that stops to ask in the pane the user is locked into typing
@@ -15301,7 +15713,8 @@ diff --git a/src/c.rs b/src/c.rs
             &mut app,
             ServerEvent::Output {
                 session: sref,
-                seq: 27,
+                // Where the replay ended: bytes before it are the replay's.
+                seq: 30,
                 data: b"!\r\nline2".to_vec(),
             },
         );
@@ -18339,13 +18752,16 @@ diff --git a/src/c.rs b/src/c.rs
         );
     }
 
-    /// The cache holds the last two screens shown, most recent first; an
-    /// older one is re-parsed on the way back like a first visit.
+    /// The cache holds the last few screens shown, most recent first; one
+    /// older than that is re-parsed on the way back like a first visit.
     #[test]
-    fn the_screen_cache_keeps_the_last_two_sessions() {
+    fn the_screen_cache_keeps_the_last_few_sessions() {
         let mut app = App::new();
         seed_tree(&mut app);
-        for id in ["a2", "a3", "a4"] {
+        let ids: Vec<String> = (1..=crate::app::TERM_CACHE_MAX + 3)
+            .map(|n| format!("a{n}"))
+            .collect();
+        for id in &ids[1..] {
             hse(
                 &mut app,
                 ServerEvent::EntityUpserted {
@@ -18354,8 +18770,8 @@ diff --git a/src/c.rs b/src/c.rs
             );
         }
         let mut out = Vec::new();
-        for id in ["a1", "a2", "a3", "a4"] {
-            let sref = SessionRef::Agent(AgentId(id.into()));
+        for id in &ids {
+            let sref = SessionRef::Agent(AgentId(id.clone()));
             attach_now(&mut app, sref.clone(), &mut out);
             hse(
                 &mut app,
@@ -18366,17 +18782,171 @@ diff --git a/src/c.rs b/src/c.rs
                 },
             );
         }
+        // Everything but the one in the pane has been stashed; the newest
+        // TERM_CACHE_MAX of those are what is left, newest first.
+        let kept: Vec<SessionRef> = ids[..ids.len() - 1]
+            .iter()
+            .rev()
+            .take(crate::app::TERM_CACHE_MAX)
+            .map(|id| SessionRef::Agent(AgentId(id.clone())))
+            .collect();
         assert_eq!(
             app.term_cache
                 .iter()
                 .map(|t| t.sref.clone())
                 .collect::<Vec<_>>(),
-            [
-                SessionRef::Agent(AgentId("a3".into())),
-                SessionRef::Agent(AgentId("a2".into()))
-            ],
-            "two kept, newest first; a1 was evicted"
+            kept,
+            "the newest few, newest first; the oldest were evicted"
         );
+    }
+
+    /// A pane with `lines` lines of shell history above a prompt, attached
+    /// and painted, as the DAEMON's replay leaves it.
+    fn pane_with_history(app: &mut App, sref: &SessionRef, lines: usize) {
+        let mut out = Vec::new();
+        attach_now(app, sref.clone(), &mut out);
+        let mut data = Vec::new();
+        for n in 0..lines {
+            data.extend_from_slice(format!("line {n}\r\n").as_bytes());
+        }
+        data.extend_from_slice(b"$ ");
+        hse(
+            app,
+            ServerEvent::Scrollback {
+                session: sref.clone(),
+                base_seq: 0,
+                data,
+            },
+        );
+    }
+
+    /// A screen whose history is over the budget used not to be kept, so
+    /// every return to a long-running shell re-parsed its whole ring. It is
+    /// kept now, without the history: the return paints what was on screen
+    /// on the keypress and asks only for what it missed.
+    #[test]
+    fn a_long_history_is_let_go_and_the_screen_still_returns_at_once() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: agent_entity("a2", "w1", "agent-2", false),
+            },
+        );
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        let a2 = SessionRef::Agent(AgentId("a2".into()));
+        // Enough rows that the grid alone is over the whole budget.
+        let cols = pane_size(&app).0 as usize;
+        let lines = crate::app::TERM_CACHE_CELLS / cols + 50;
+        pane_with_history(&mut app, &a1, lines);
+        let seen = app.term.as_ref().expect("pane").next_seq;
+
+        let mut out = Vec::new();
+        attach_now(&mut app, a2.clone(), &mut out);
+        let kept = app.term_cache.first().expect("a1's screen is kept");
+        assert!(kept.history_dropped, "without its history");
+        assert_eq!(kept.parser.screen().scrollback_rows(), 0);
+        assert!(
+            kept.estimated_cells() <= crate::app::TERM_CACHE_CELLS,
+            "which is what fits it in the budget"
+        );
+
+        out.clear();
+        attach_now(&mut app, a1.clone(), &mut out);
+        let pane = app.term.as_ref().expect("pane");
+        assert!(pane.painted, "the screen is up on this frame");
+        assert!(
+            pane.parser.screen().contents().contains("$ "),
+            "as it was left: {:?}",
+            pane.parser.screen().contents()
+        );
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::Attach { from_seq: Some(n), .. }) if *n == seen
+            ),
+            "and only what it missed is asked for: {out:?}"
+        );
+    }
+
+    /// Scrolling up in a pane whose history was let go brings it back: the
+    /// attachment is dropped and re-made for the whole ring, and the replay
+    /// lands the reader on the notch that asked.
+    #[test]
+    fn scrolling_up_replays_a_history_that_was_let_go() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        pane_with_history(&mut app, &a1, 200);
+        let end = app.term.as_ref().expect("pane").next_seq;
+        app.term.as_mut().expect("pane").drop_history();
+        assert!(app.term.as_ref().expect("pane").history_dropped);
+
+        let mut out = Vec::new();
+        rehydrate_history(&mut app, 3, &mut out);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [
+                    ClientRequest::Detach { session },
+                    ClientRequest::Attach { from_seq: None, .. }
+                ] if *session == a1
+            ),
+            "let go, then the whole ring: {out:?}"
+        );
+
+        // The whole ring again, as the DAEMON replays it.
+        let mut data = Vec::new();
+        for n in 0..200 {
+            data.extend_from_slice(format!("line {n}\r\n").as_bytes());
+        }
+        data.extend_from_slice(b"$ ");
+        assert_eq!(data.len() as u64, end);
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: a1.clone(),
+                base_seq: 0,
+                data,
+            },
+        );
+        let pane = app.term.as_ref().expect("pane");
+        assert!(!pane.history_dropped && pane.pending_scroll.is_none());
+        assert!(
+            pane.parser.screen().scrollback_rows() > 100,
+            "history is back"
+        );
+        assert_eq!(
+            pane.scroll, 3,
+            "and the reader is where the wheel was headed"
+        );
+
+        // A second notch is an ordinary scroll: nothing more is asked.
+        out.clear();
+        rehydrate_history(&mut app, 6, &mut out);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// Output the replay already covered is not parsed a second time: a
+    /// frame the replaced attachment's forwarder had queued can cross the
+    /// replay that supersedes it.
+    #[test]
+    fn output_a_replay_covered_is_skipped() {
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        let mut term = AttachedTerm::new(sref, 40, 10);
+        term.apply_scrollback(0, b"hello world");
+        // Wholly covered.
+        term.apply_output(6, b"world");
+        // Half covered: only the tail is new.
+        term.apply_output(9, b"ld!");
+        assert_eq!(term.next_seq, 12);
+        assert!(
+            term.parser.screen().contents().starts_with("hello world!"),
+            "{:?}",
+            term.parser.screen().contents()
+        );
+        assert!(!term.parser.screen().contents().contains("worldworld"));
     }
 
     /// A session that leaves the tree takes its kept screen with it.
@@ -24872,7 +25442,9 @@ diff --git a/src/c.rs b/src/c.rs
 
     /// Archiving the selected session lands the cursor on the next row AND
     /// attaches it — the pane must show the newly highlighted session, not
-    /// stay blank after the archive's detach.
+    /// stay blank after the archive's detach. All of it on the keypress
+    /// (an OPTIMISTIC UPDATE): the DAEMON's upsert, when it lands, finds
+    /// the row already archived and changes nothing.
     #[test]
     fn archiving_selected_agent_previews_the_next_row() {
         let mut app = App::new();
@@ -24903,16 +25475,8 @@ diff --git a/src/c.rs b/src/c.rs
             "a requests the archive: {out:?}"
         );
 
-        // The daemon's upsert flips the archived flag; the row leaves the
-        // list, the cursor lands on agent-2, and agent-2 gets shown.
-        out.clear();
-        handle_server_event(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: agent_entity("a1", "w1", "agent-1", true),
-            },
-            &mut out,
-        );
+        // The row has left the list already: the cursor is on agent-2, and
+        // agent-2 is what the pane shows.
         let a2 = SessionRef::Agent(AgentId("a2".into()));
         assert_eq!(
             app.selected_session().map(|a| a.name),
@@ -24926,9 +25490,21 @@ diff --git a/src/c.rs b/src/c.rs
         );
         assert_eq!(
             app.term.as_ref().map(|t| t.sref.clone()),
-            Some(a2),
+            Some(a2.clone()),
             "the pane shows the newly highlighted session"
         );
+
+        // The daemon's upsert says what the screen already does.
+        out.clear();
+        handle_server_event(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: agent_entity("a1", "w1", "agent-1", true),
+            },
+            &mut out,
+        );
+        assert!(out.is_empty(), "nothing left to do: {out:?}");
+        assert_eq!(app.term.as_ref().map(|t| t.sref.clone()), Some(a2));
     }
 
     /// With `confirm_on_archive` on, `a` asks first: nothing is sent until

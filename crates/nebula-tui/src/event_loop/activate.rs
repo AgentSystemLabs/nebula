@@ -21,8 +21,8 @@
 //! its own is the smell to look for in review.
 
 use super::{
-    attach_now, jump_to_target, open_link, open_session, run_menu_action, send, Landing,
-    SettingsCmd, WORKTREE_STILL_CREATING,
+    attach_now, jump_to_target, open_link, open_session, run_menu_action, Landing, SettingsCmd,
+    WORKTREE_STILL_CREATING,
 };
 use crate::app::{App, ConfirmDialog, DiffView, Focus, Overlay, PendingAction};
 use nebula_core::{AgentId, ClientRequest, SessionRef, WorktreeId};
@@ -180,10 +180,7 @@ pub(super) fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientReques
 /// Bring an archived agent back — `u` on its row, **Unarchive** in its
 /// CONTEXT MENU.
 pub(super) fn unarchive(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
-    send(app, out, |req_id| ClientRequest::UnarchiveAgent {
-        req_id,
-        id,
-    });
+    super::optimistic::set_archived(app, id, false, out);
 }
 
 /// Ask before a checkout is deleted from disk — `d` on its row, **Delete

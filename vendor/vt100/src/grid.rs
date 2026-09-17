@@ -195,6 +195,20 @@ impl Grid {
         self.scrollback_offset
     }
 
+    // NEBULA PATCH: how many rows the scrollback holds, and a way to let
+    // them go. The TUI keeps the screens of recently shown sessions for an
+    // instant return; a long history is tens of megabytes of cells it does
+    // not need for that, and drops — a full replay brings it back if the
+    // user scrolls.
+    pub fn scrollback_rows(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    pub fn clear_scrollback(&mut self) {
+        self.scrollback = std::collections::VecDeque::new();
+        self.scrollback_offset = 0;
+    }
+
     pub fn set_scrollback(&mut self, rows: usize) {
         self.scrollback_offset = rows.min(self.scrollback.len());
     }

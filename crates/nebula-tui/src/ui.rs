@@ -1447,7 +1447,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // Left: changed-file list — flat paths, or the directory tree
             // (`Ctrl+t`); a stateless follow-window keeps the selected row
             // visible.
-            let mut files_title = if view.filter.is_empty() {
+            let mut files_title = if view.listing.is_some() && view.files.is_empty() {
+                "Files (…)".to_string()
+            } else if view.filter.is_empty() {
                 format!("Files ({})", view.files.len())
             } else {
                 format!("Files ({}/{})", view.matches.len(), view.files.len())
@@ -1474,7 +1476,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
             let list_inner = below_first_row(files_inner);
 
-            if view.row_count() == 0 {
+            if view.listing.is_some() && view.files.is_empty() {
+                empty_list_row(f, list_inner, "reading changes…", th);
+            } else if view.row_count() == 0 {
                 empty_list_row(f, list_inner, NO_MATCHES, th);
             }
             let start = view.window_start(list_inner.height as usize);
@@ -1593,9 +1597,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 );
             }
             f.render_widget(block, diff_a);
+            // Only the rows in view are styled: a diff runs to 20 000
+            // lines, and building a `Line` for each of them on every frame
+            // was most of what scrolling a large one cost.
             let lines: Vec<Line> = view
                 .diff
                 .lines()
+                .skip(scroll as usize)
+                .take(diff_inner.height as usize)
                 .map(|l| {
                     let style = match classify_diff_line(l) {
                         DiffLineKind::Add => Style::default().fg(th.ok),
@@ -1607,7 +1616,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     Line::from(Span::styled(l.to_string(), style))
                 })
                 .collect();
-            f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), diff_inner);
+            f.render_widget(Paragraph::new(lines), diff_inner);
 
             // Write-back (draw works on a clone): page size for key paging,
             // scroll re-clamped so resizes never strand the view.
@@ -1732,7 +1741,11 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
         }
         Overlay::Files(finder) => {
             let area = centered_rect(f.area(), FILES_SIZE.0, FILES_SIZE.1);
-            let title = if finder.query.is_empty() {
+            // No count to show until the listing lands: `(0/0)` reads as
+            // "no files", which is not what is known yet.
+            let title = if finder.listing.is_some() {
+                format!(" Find file — {} (listing…) ", finder.branch)
+            } else if finder.query.is_empty() {
                 format!(" Find file — {} ({}) ", finder.branch, finder.files.len())
             } else {
                 format!(
@@ -1751,7 +1764,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
             let list_inner = below_first_row(inner);
 
-            if finder.matches.is_empty() {
+            if finder.listing.is_some() {
+                empty_list_row(f, list_inner, "listing files…", th);
+            } else if finder.matches.is_empty() {
                 empty_list_row(f, list_inner, NO_MATCHES, th);
             }
             let start = finder.window_start(list_inner.height as usize);
@@ -1779,6 +1794,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             let area = centered_rect_pct(f.area(), GREP_MODAL_PCT.0, GREP_MODAL_PCT.1);
             let title = if view.query.chars().count() < crate::grep_search::MIN_QUERY_LEN {
                 format!(" Find in files — {} ", view.branch)
+            } else if view.waiting.is_some() {
+                format!(" Find in files — {} (searching…) ", view.branch)
             } else if view.truncated {
                 format!(
                     " Find in files — {} ({}+ hits) ",
@@ -1812,7 +1829,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     ),
                     Style::default().fg(th.dim),
                 ))
-            } else if view.hits.is_empty() {
+            } else if view.hits.is_empty() && view.waiting.is_none() {
                 Some(Span::styled(NO_MATCHES, Style::default().fg(th.dim)))
             } else {
                 None
@@ -2055,7 +2072,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             // Left: the file tree; a stateless follow-window keeps the
             // selected row visible.
-            let tree_title = if view.filter.is_empty() {
+            let tree_title = if view.listing.is_some() {
+                format!("Tree — {} (listing…)", view.branch)
+            } else if view.filter.is_empty() {
                 format!("Tree — {} ({})", view.branch, view.file_count)
             } else {
                 format!(
@@ -2074,7 +2093,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
             let list_inner = below_first_row(tree_inner);
 
-            if view.rows.is_empty() {
+            if view.listing.is_some() {
+                empty_list_row(f, list_inner, "listing files…", th);
+            } else if view.rows.is_empty() {
                 empty_list_row(f, list_inner, NO_MATCHES, th);
             }
             let start = view.window_start(list_inner.height as usize);
