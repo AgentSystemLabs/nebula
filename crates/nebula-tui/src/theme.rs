@@ -40,7 +40,10 @@ pub struct Theme {
     /// `n done` counts pointing at it. Deliberately NOT `ok` — the whole
     /// point is that this one wants a human, and green is the color a
     /// terminal teaches you to skip over. Reading the session turns the
-    /// dot green.
+    /// dot green. Sky blue unless the preset already owns blue, and never
+    /// a violet: `merged` is purple in every preset, a merged checkout's
+    /// row sits right above its unread session's, and the two dots say
+    /// opposite things (come read this / this landed, delete it).
     pub done: Color,
     /// Running / modified / flash messages / remote host.
     pub warn: Color,
@@ -71,8 +74,14 @@ pub struct Theme {
     /// with `err`.
     pub err_sweep: [Color; 3],
     /// Merged counterpart of `warn_sweep`, for the checkout row whose pull
-    /// request has landed. Purple family, paired with `merged`.
+    /// request has landed. Purple family, paired with `merged`. A ONE-SHOT
+    /// SWEEP: the row rides it for a few seconds after the merge is seen,
+    /// then rests on `merged`.
     pub merged_sweep: [Color; 3],
+    /// Unread-done counterpart, the other ONE-SHOT SWEEP: a row rides it
+    /// for a few seconds after a turn finishes unread, then holds still.
+    /// Rests on `done`, so a preset that moves `done` moves this with it.
+    pub done_sweep: [Color; 3],
     /// Focused-panel background: a dark neutral-gray floor with a faint
     /// lean toward the accent, filling the whole focused panel (and the
     /// rounded corners of a selected PILL ROW's pad rows) so it reads as
@@ -80,6 +89,15 @@ pub struct Theme {
     /// necessity (see module docs).
     pub focus_tint: Color,
 }
+
+/// `done` and its sweep for a preset that already owns blue.
+const DONE_PINK: [Color; 3] = [
+    Color::Indexed(212),
+    Color::Indexed(218),
+    Color::Indexed(225),
+];
+/// `done` and its sweep for a preset whose pinks and violets crowd the blue.
+const DONE_TURQUOISE: [Color; 3] = [Color::Indexed(45), Color::Indexed(81), Color::Indexed(159)];
 
 impl Default for Theme {
     fn default() -> Self {
@@ -91,11 +109,11 @@ impl Default for Theme {
             muted: Color::Gray,
             dim: Color::DarkGray,
             ok: Color::Green,
-            done: Color::Indexed(141), // violet — no other status is near it
+            done: Color::Indexed(75), // sky blue — a hue away from merged's purple, not a shade
             warn: Color::Yellow,
             err: Color::Red,
             special: Color::Magenta,
-            merged: Color::Indexed(135), // purple — GitHub's merged, a shade deeper than done's violet
+            merged: Color::Indexed(135), // purple — GitHub's merged
             sel_bg: Color::Indexed(237),
             sel_bg_dim: Color::Indexed(235),
             edge: Color::Indexed(238),
@@ -106,6 +124,7 @@ impl Default for Theme {
                 Color::Indexed(141),
                 Color::Indexed(183),
             ],
+            done_sweep: [Color::Indexed(75), Color::Indexed(111), Color::Indexed(153)],
             focus_tint: Color::Rgb(22, 33, 34),
         }
     }
@@ -118,6 +137,11 @@ impl Theme {
             "ocean" => Self {
                 accent: Color::Indexed(39),  // deep sky blue
                 special: Color::Indexed(75), // steel blue
+                // Blue is spoken for twice over here (the done sky blue IS
+                // this preset's terminated), so done goes pink — the one
+                // hue a blue preset leaves free.
+                done: DONE_PINK[0],
+                done_sweep: DONE_PINK,
                 focus_tint: Color::Rgb(21, 31, 38),
                 ..base
             },
@@ -130,9 +154,11 @@ impl Theme {
             "rose" => Self {
                 accent: Color::Indexed(211),  // pink
                 special: Color::Indexed(141), // violet
-                // Violet is spoken for here, so done goes turquoise — the
-                // one hue this preset leaves free.
-                done: Color::Indexed(45),
+                // Pink and violet are both spoken for here, and sky blue
+                // sits too near the violet, so done goes turquoise — the one
+                // hue this preset leaves free.
+                done: DONE_TURQUOISE[0],
+                done_sweep: DONE_TURQUOISE,
                 focus_tint: Color::Rgb(37, 28, 32),
                 ..base
             },
@@ -145,9 +171,10 @@ impl Theme {
             "lavender" => Self {
                 accent: Color::Indexed(147),  // periwinkle
                 special: Color::Indexed(176), // orchid
-                // The done violet would vanish into a periwinkle accent, so
-                // done goes turquoise here, as in rose.
-                done: Color::Indexed(45),
+                // The done sky blue would vanish into a periwinkle accent,
+                // so done goes turquoise here, as in rose.
+                done: DONE_TURQUOISE[0],
+                done_sweep: DONE_TURQUOISE,
                 focus_tint: Color::Rgb(30, 28, 38),
                 ..base
             },
@@ -163,6 +190,10 @@ impl Theme {
             "slate" => Self {
                 accent: Color::Indexed(110), // dusty sky blue
                 special: Color::Indexed(67), // steel blue
+                // The done sky blue would land between this preset's two
+                // blues, so done goes pink here, as in ocean.
+                done: DONE_PINK[0],
+                done_sweep: DONE_PINK,
                 focus_tint: Color::Rgb(27, 30, 36),
                 ..base
             },
@@ -219,6 +250,63 @@ mod tests {
             assert_ne!(th.done, th.err, "{name}: done reads as needs-feedback");
             assert_ne!(th.done, th.special, "{name}: done reads as terminated");
             assert_ne!(th.done, th.dim, "{name}: done reads as fresh");
+            assert_ne!(th.done, th.accent, "{name}: done reads as the cursor");
+        }
+    }
+
+    /// An unread-done dot sits right under a merged checkout's purple one,
+    /// and the two mean opposite things — so done keeps a whole hue away
+    /// from the merge, not a shade: it is no color the merged sweep passes
+    /// through (the branch name would flash "done" on every pass), and —
+    /// when both sit in the 256-color cube — it is at least three steps
+    /// from the merge there. The violet this replaced was one.
+    #[test]
+    fn done_is_never_a_shade_of_merged() {
+        /// Red, green, blue coordinates (0..=5) of a 6x6x6 cube color.
+        fn cube(c: Color) -> Option<[u8; 3]> {
+            match c {
+                Color::Indexed(n @ 16..=231) => {
+                    let n = n - 16;
+                    Some([n / 36, (n / 6) % 6, n % 6])
+                }
+                _ => None,
+            }
+        }
+        for name in THEMES {
+            let th = Theme::by_name(name);
+            assert!(
+                !th.merged_sweep.contains(&th.done),
+                "{name}: the merged sweep flashes the done color"
+            );
+            if let (Some(done), Some(merged)) = (cube(th.done), cube(th.merged)) {
+                let steps: u8 = (0..3).map(|i| done[i].abs_diff(merged[i])).sum();
+                assert!(
+                    steps >= 3,
+                    "{name}: done is {steps} cube steps from merged: a shade, not a hue"
+                );
+            }
+        }
+    }
+
+    /// The ONE-SHOT SWEEP an unread finish rides rests on that preset's
+    /// `done` — a preset that moves the one moves the other — brightens
+    /// toward its head, and is nobody else's sweep.
+    #[test]
+    fn done_sweep_rests_on_done_in_every_preset() {
+        for name in THEMES {
+            let th = Theme::by_name(name);
+            assert_eq!(th.done_sweep[0], th.done, "{name}: the sweep rests on done");
+            let [tail, mid, head] = th.done_sweep;
+            assert!(
+                tail != mid && mid != head && tail != head,
+                "{name}: a flat band"
+            );
+            for other in [th.warn_sweep, th.err_sweep, th.merged_sweep] {
+                assert!(
+                    th.done_sweep.iter().all(|c| !other.contains(c)),
+                    "{name}: the done sweep borrows a shade from another"
+                );
+            }
         }
     }
 
@@ -241,7 +329,7 @@ mod tests {
 
     /// A merged pull request is purple in every preset, and that purple is
     /// nobody else's: not the terminated `special`, not the unread `done`
-    /// violet a preset may move around, and not a status that would make a
+    /// a preset may move around, and not a status that would make a
     /// landed pull request look like it needs someone.
     #[test]
     fn merged_is_purple_and_its_own_color_in_every_preset() {

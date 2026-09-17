@@ -1,0 +1,24 @@
+# Onto the wheel-one-line checkout (its pull request has merged), two quick prompts there — the stand-in
+# agent in the .setup.sh leaves the first unread-done and the second read — then around the panels and
+# back to SESSIONS, five times over: that is the time the first launch's finish needs to arrive and its
+# blue ONE-SHOT SWEEP (about five seconds) to run out, so the capture is the colors at rest. Drop the last
+# three BTab/Tab pairs to catch the sweep mid-pass instead.
+Tab
+j
+Tab
+p
+Fix the login redirect
+Enter
+p
+Sort the changelog by date
+Enter
+BTab
+Tab
+BTab
+Tab
+BTab
+Tab
+BTab
+Tab
+BTab
+Tab

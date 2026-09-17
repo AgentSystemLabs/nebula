@@ -8,6 +8,7 @@ pub mod claude_catalogue;
 pub mod completion;
 pub mod config;
 pub mod cursor_catalogue;
+pub mod diff_tree;
 pub mod event_loop;
 pub mod file_tabs;
 pub mod fuzzy;

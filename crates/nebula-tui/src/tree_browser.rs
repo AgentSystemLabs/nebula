@@ -382,83 +382,10 @@ impl TreeBrowser {
     /// the expansion state; otherwise every file whose path fuzzy-matches is
     /// kept along with its ancestor directories, all forced open.
     fn rebuild_rows(&mut self) {
-        self.rows.clear();
-        self.best_row = None;
-        if self.filter.is_empty() {
-            self.match_count = self.file_count;
-            let mut stack: Vec<usize> = self.top.iter().rev().copied().collect();
-            while let Some(i) = stack.pop() {
-                self.rows.push(TreeRow {
-                    node: i,
-                    positions: Vec::new(),
-                });
-                if self.nodes[i].is_dir && self.expanded[i] {
-                    for &c in self.nodes[i].children.iter().rev() {
-                        stack.push(c);
-                    }
-                }
-            }
-            return;
-        }
-        // Match files on their full relative path (the file-finder rule, so
-        // "tui/app" works), then include every ancestor directory.
-        let mut include = vec![false; self.nodes.len()];
-        let mut name_positions: Vec<Vec<usize>> = vec![Vec::new(); self.nodes.len()];
-        let mut scores: Vec<Option<i32>> = vec![None; self.nodes.len()];
-        self.match_count = 0;
-        let mut matcher = crate::fuzzy::Matcher::new(&self.filter);
-        for i in 0..self.nodes.len() {
-            if self.nodes[i].is_dir {
-                continue;
-            }
-            let Some(m) = matcher.matches(&self.nodes[i].path) else {
-                continue;
-            };
-            self.match_count += 1;
-            // Map full-path match positions onto the displayed name; a hit
-            // landing in the directory prefix lights nothing on this row.
-            let name_chars = self.nodes[i].name.chars().count();
-            let offset = self.nodes[i].path.chars().count() - name_chars;
-            name_positions[i] = m
-                .positions
-                .iter()
-                .filter(|&&p| p >= offset)
-                .map(|p| p - offset)
-                .collect();
-            scores[i] = Some(m.score);
-            include[i] = true;
-            let mut parent = self.nodes[i].parent;
-            while let Some(p) = parent {
-                if include[p] {
-                    break;
-                }
-                include[p] = true;
-                parent = self.nodes[p].parent;
-            }
-        }
-        let mut best: Option<(i32, usize)> = None;
-        let mut stack: Vec<usize> = self.top.iter().rev().copied().collect();
-        while let Some(i) = stack.pop() {
-            if !include[i] {
-                continue;
-            }
-            let row = self.rows.len();
-            self.rows.push(TreeRow {
-                node: i,
-                positions: std::mem::take(&mut name_positions[i]),
-            });
-            if let Some(score) = scores[i] {
-                if best.is_none_or(|(b, _)| score > b) {
-                    best = Some((score, row));
-                }
-            }
-            if self.nodes[i].is_dir {
-                for &c in self.nodes[i].children.iter().rev() {
-                    stack.push(c);
-                }
-            }
-        }
-        self.best_row = best.map(|(_, row)| row);
+        let visible = visible_rows(&self.nodes, &self.top, &self.expanded, &self.filter);
+        self.rows = visible.rows;
+        self.best_row = visible.best_row;
+        self.match_count = visible.match_count.unwrap_or(self.file_count);
     }
 
     /// Reload the preview for the current selection and reset the scroll.
@@ -606,9 +533,114 @@ pub(crate) fn read_preview(path: &std::path::Path) -> Result<String, String> {
     Ok(out.replace('\t', "    "))
 }
 
+/// What a tree shows for one filter: see [`visible_rows`].
+pub(crate) struct VisibleRows {
+    pub rows: Vec<TreeRow>,
+    /// Row of the best-scoring file; `None` when the filter is empty.
+    pub best_row: Option<usize>,
+    /// Files matching the filter; `None` when it is empty and every file
+    /// does (the caller knows its own file count).
+    pub match_count: Option<usize>,
+}
+
+/// The visible rows of a node arena, in tree order. An empty filter walks
+/// the expansion state; otherwise every file whose path fuzzy-matches is
+/// kept along with its ancestor directories, all forced open. Shared with
+/// the DIFF VIEWER's tree list (`diff_tree`), which folds the same way.
+pub(crate) fn visible_rows(
+    nodes: &[TreeNode],
+    top: &[usize],
+    expanded: &[bool],
+    filter: &str,
+) -> VisibleRows {
+    let mut rows = Vec::new();
+    if filter.is_empty() {
+        let mut stack: Vec<usize> = top.iter().rev().copied().collect();
+        while let Some(i) = stack.pop() {
+            rows.push(TreeRow {
+                node: i,
+                positions: Vec::new(),
+            });
+            if nodes[i].is_dir && expanded[i] {
+                for &c in nodes[i].children.iter().rev() {
+                    stack.push(c);
+                }
+            }
+        }
+        return VisibleRows {
+            rows,
+            best_row: None,
+            match_count: None,
+        };
+    }
+    // Match files on their full relative path (the file-finder rule, so
+    // "tui/app" works), then include every ancestor directory.
+    let mut include = vec![false; nodes.len()];
+    let mut name_positions: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    let mut scores: Vec<Option<i32>> = vec![None; nodes.len()];
+    let mut match_count = 0;
+    let mut matcher = crate::fuzzy::Matcher::new(filter);
+    for i in 0..nodes.len() {
+        if nodes[i].is_dir {
+            continue;
+        }
+        let Some(m) = matcher.matches(&nodes[i].path) else {
+            continue;
+        };
+        match_count += 1;
+        // Map full-path match positions onto the displayed name; a hit
+        // landing in the directory prefix lights nothing on this row.
+        let name_chars = nodes[i].name.chars().count();
+        let offset = nodes[i].path.chars().count() - name_chars;
+        name_positions[i] = m
+            .positions
+            .iter()
+            .filter(|&&p| p >= offset)
+            .map(|p| p - offset)
+            .collect();
+        scores[i] = Some(m.score);
+        include[i] = true;
+        let mut parent = nodes[i].parent;
+        while let Some(p) = parent {
+            if include[p] {
+                break;
+            }
+            include[p] = true;
+            parent = nodes[p].parent;
+        }
+    }
+    let mut best: Option<(i32, usize)> = None;
+    let mut stack: Vec<usize> = top.iter().rev().copied().collect();
+    while let Some(i) = stack.pop() {
+        if !include[i] {
+            continue;
+        }
+        let row = rows.len();
+        rows.push(TreeRow {
+            node: i,
+            positions: std::mem::take(&mut name_positions[i]),
+        });
+        if let Some(score) = scores[i] {
+            if best.is_none_or(|(b, _)| score > b) {
+                best = Some((score, row));
+            }
+        }
+        if nodes[i].is_dir {
+            for &c in nodes[i].children.iter().rev() {
+                stack.push(c);
+            }
+        }
+    }
+    VisibleRows {
+        rows,
+        best_row: best.map(|(_, row)| row),
+        match_count: Some(match_count),
+    }
+}
+
 /// Build the node arena from the git listing: directories are implied by
 /// the paths, children sorted directories-first then by name.
-fn build_nodes(files: &[String]) -> (Vec<TreeNode>, Vec<usize>, usize) {
+pub(crate) fn build_nodes(files: &[String]) -> (Vec<TreeNode>, Vec<usize>, usize) {
     let mut nodes: Vec<TreeNode> = Vec::new();
     let mut top: Vec<usize> = Vec::new();
     let mut dir_index: HashMap<String, usize> = HashMap::new();

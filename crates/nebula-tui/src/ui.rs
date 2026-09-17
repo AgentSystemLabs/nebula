@@ -754,7 +754,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[Rename]), "run / stop the project's run command"),
                         (Act(&[OpenWorktree]), "fire its open command"),
                         (Act(&[HalfPageDown, HalfPageUp]), "half a panel down / up"),
-                        (Act(&[GitDiff]), "git diff (^r: mark reviewed ✓)"),
+                        (Act(&[GitDiff]), "git diff (^r: mark reviewed ✓, ^t: tree)"),
                         (
                             Act(&[OpenRepo, OpenGhosttyTab]),
                             "repo on GitHub / Ghostty tab",
@@ -1444,8 +1444,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             ])
             .areas(area);
 
-            // Left: changed-file list; a stateless follow-window keeps the
-            // selected row visible.
+            // Left: changed-file list — flat paths, or the directory tree
+            // (`Ctrl+t`); a stateless follow-window keeps the selected row
+            // visible.
             let mut files_title = if view.listing.is_some() && view.files.is_empty() {
                 "Files (…)".to_string()
             } else if view.filter.is_empty() {
@@ -1456,7 +1457,15 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if !view.reviewed.is_empty() {
                 files_title.push_str(&format!(" · {}✓", view.reviewed.len()));
             }
-            let block = panel_block(&files_title, true, th);
+            // The hint names the list `Ctrl+t` leads to, not the one up.
+            let block = panel_block(&files_title, true, th).title_bottom(Line::from(Span::styled(
+                if view.tree.is_some() {
+                    " ^t: flat list "
+                } else {
+                    " ^t: tree "
+                },
+                Style::default().fg(th.dim),
+            )));
             let files_inner = block.inner(files_a);
             f.render_widget(block, files_a);
 
@@ -1469,51 +1478,99 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
 
             if view.listing.is_some() && view.files.is_empty() {
                 empty_list_row(f, list_inner, "reading changes…", th);
-            } else if view.matches.is_empty() {
+            } else if view.row_count() == 0 {
                 empty_list_row(f, list_inner, NO_MATCHES, th);
             }
             let start = view.window_start(list_inner.height as usize);
-            for (row, (i, m)) in view.matches.iter().enumerate().skip(start).enumerate() {
-                let Some(row_area) = row_rect(list_inner, row) else {
-                    break;
-                };
-                let file = &view.files[m.file];
-                let status_color = match (file.xy[0], file.xy[1]) {
-                    ('?', '?') | ('A', _) => th.ok,
-                    ('D', _) | (_, 'D') => th.err,
-                    ('R', _) | ('C', _) => th.accent,
-                    _ => th.warn,
-                };
-                let budget = (list_inner.width as usize).saturating_sub(5);
-                let mut spans = vec![
-                    Span::styled(
+            // Both lists open a row the same way: the status code, then the
+            // ✓ — so the two columns read straight down whichever is up.
+            let gutter = |file: Option<&crate::git_diff::DiffFile>, reviewed: bool| {
+                let status = match file {
+                    Some(file) => Span::styled(
                         format!("{} ", file.status_str()),
-                        Style::default().fg(status_color),
+                        Style::default().fg(match (file.xy[0], file.xy[1]) {
+                            ('?', '?') | ('A', _) => th.ok,
+                            ('D', _) | (_, 'D') => th.err,
+                            ('R', _) | ('C', _) => th.accent,
+                            _ => th.warn,
+                        }),
                     ),
-                    if view.reviewed.contains_key(&file.path) {
-                        Span::styled("✓ ", Style::default().fg(th.ok))
-                    } else {
-                        Span::raw("  ")
-                    },
-                ];
-                let shown = truncate(&file.path, budget);
-                let used = shown.chars().count();
-                spans.extend(fuzzy_highlight_spans(&shown, &m.positions, th));
-                if let Some(orig) = &file.orig_path {
-                    let rest = budget.saturating_sub(used);
-                    if rest > 3 {
-                        spans.push(Span::styled(
-                            truncate(&format!(" ← {orig}"), rest),
-                            Style::default().fg(th.dim),
-                        ));
+                    None => Span::raw("   "),
+                };
+                let mark = if reviewed {
+                    Span::styled("✓ ", Style::default().fg(th.ok))
+                } else {
+                    Span::raw("  ")
+                };
+                vec![status, mark]
+            };
+            match &view.tree {
+                None => {
+                    for (row, (i, m)) in view.matches.iter().enumerate().skip(start).enumerate() {
+                        let Some(row_area) = row_rect(list_inner, row) else {
+                            break;
+                        };
+                        let file = &view.files[m.file];
+                        let budget = (list_inner.width as usize).saturating_sub(5);
+                        let mut spans = gutter(Some(file), view.reviewed.contains_key(&file.path));
+                        let shown = truncate(&file.path, budget);
+                        let used = shown.chars().count();
+                        spans.extend(fuzzy_highlight_spans(&shown, &m.positions, th));
+                        if let Some(orig) = &file.orig_path {
+                            let rest = budget.saturating_sub(used);
+                            if rest > 3 {
+                                spans.push(Span::styled(
+                                    truncate(&format!(" ← {orig}"), rest),
+                                    Style::default().fg(th.dim),
+                                ));
+                            }
+                        }
+                        render_row(f, row_area, spans, i == view.selected, true, th);
                     }
                 }
-                render_row(f, row_area, spans, i == view.selected, true, th);
+                // The TREE BROWSER's rows behind the flat list's gutter: a
+                // directory wears the fold marker and the accent, and its ✓
+                // once every file under it has one.
+                Some(tree) => {
+                    let done = tree.reviewed_nodes(&view.files, &view.reviewed);
+                    for (row, (i, r)) in tree.rows.iter().enumerate().skip(start).enumerate() {
+                        let Some(row_area) = row_rect(list_inner, row) else {
+                            break;
+                        };
+                        let node = &tree.nodes[r.node];
+                        let file = tree.file_of[r.node].map(|f| &view.files[f]);
+                        let indent = "  ".repeat(node.depth);
+                        let marker = if !node.is_dir {
+                            "  "
+                        } else if tree.is_open(r.node, !view.filter.is_empty()) {
+                            "▾ "
+                        } else {
+                            "▸ "
+                        };
+                        let budget = (list_inner.width as usize)
+                            .saturating_sub(5 + indent.chars().count() + 2);
+                        let shown = truncate(&node.name, budget);
+                        let mut spans = gutter(file, done[r.node]);
+                        spans.push(Span::raw(indent));
+                        spans.push(Span::styled(marker, Style::default().fg(th.accent)));
+                        if node.is_dir {
+                            spans.push(Span::styled(shown, Style::default().fg(th.accent)));
+                        } else {
+                            let positions = visible_positions(&r.positions, &shown, &node.name);
+                            spans.extend(fuzzy_highlight_spans(&shown, positions, th));
+                        }
+                        render_row(f, row_area, spans, i == tree.selected, true, th);
+                    }
+                }
             }
 
-            // Right: the selected file's diff, scrolled.
-            let sel_path = view.selected_file().map(|d| d.path.as_str()).unwrap_or("");
-            let sel_reviewed = view.reviewed.contains_key(sel_path);
+            // Right: the selected file's diff, scrolled — or, on a tree
+            // directory's row, the list of what changed under it.
+            let sel_path = match view.selected_dir() {
+                Some(dir) => format!("{dir}/"),
+                None => view.selected_path().unwrap_or("").to_string(),
+            };
+            let sel_reviewed = view.reviewed.contains_key(&sel_path);
             let title = truncate(
                 &format!(
                     "{}: {}{}",
@@ -1663,7 +1720,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     &shown,
                     positions,
                     quiet,
-                    sweep_ramp(status, th, app.animations),
+                    // No ONE-SHOT SWEEP in a list the user just summoned:
+                    // it is for the change nobody was looking at.
+                    sweep_ramp(status, false, th, app.animations),
                     app.sweep_phase(),
                     th,
                 ));
@@ -2507,16 +2566,26 @@ fn row_badges(unseen: usize, th: Theme) -> (Vec<(String, Style)>, usize) {
     (badges, len)
 }
 
-/// Sweep shades for a status that animates: running rows shimmer yellow,
-/// needs-feedback rows red; every other status holds still. `enabled` is
-/// the animations setting — off, nothing animates.
-fn sweep_ramp(status: Option<AgentStatus>, th: Theme, enabled: bool) -> Option<[Color; 3]> {
+/// Sweep shades for a status that animates. The live two sweep for as long
+/// as they last: running rows shimmer yellow, needs-feedback rows red. A
+/// finished row takes the ONE-SHOT SWEEP — the done ramp, while `fresh`
+/// says an unread finish under it is only seconds old
+/// (`app::fresh_done`) — and then holds still like every other status:
+/// motion means live, or just changed; a row at rest is at rest. `enabled`
+/// is the animations setting — off, nothing animates.
+fn sweep_ramp(
+    status: Option<AgentStatus>,
+    fresh: bool,
+    th: Theme,
+    enabled: bool,
+) -> Option<[Color; 3]> {
     if !enabled {
         return None;
     }
     match status {
         Some(AgentStatus::Running) => Some(th.warn_sweep),
         Some(AgentStatus::NeedsFeedback) => Some(th.err_sweep),
+        Some(AgentStatus::Finished) if fresh => Some(th.done_sweep),
         _ => None,
     }
 }
@@ -2609,7 +2678,7 @@ fn fit_ago(ago: String, free: usize) -> (String, usize) {
     }
 }
 
-/// The dot. `unseen` splits the finished state in two: violet while a
+/// The dot. `unseen` splits the finished state in two: blue while a
 /// finished turn is still unread — the one state that wants a human — and
 /// green once the cursor has been on it, which is a result filed away, not
 /// a job. Every other status ignores the flag.
@@ -2640,9 +2709,10 @@ fn status_color(status: Option<AgentStatus>, unseen: bool, th: Theme) -> Color {
 /// What a checkout row is colored on. Every other status-bearing row
 /// answers to its sessions alone; a checkout whose pull request has merged
 /// wears the merge instead (`App::worktree_wears_merge` decides — a live
-/// session still wins): purple dot, purple rail, and the branch name
-/// sweeping on the merged ramp the way a running row's sweeps yellow. The
-/// motion means what running's does — look here — but what it says is:
+/// session still wins): purple dot, purple rail, purple branch name. The
+/// name sweeps on the merged ramp for the few seconds after the merge is
+/// seen to land (the ONE-SHOT SWEEP) and is solid purple from then on —
+/// nothing about a landed checkout is live, so it says its piece once:
 /// this one landed, archive or delete it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowState {
@@ -2669,12 +2739,24 @@ impl RowState {
         }
     }
 
-    /// The sweep the name rides: [`sweep_ramp`]'s, or the merged ramp —
-    /// and nothing with animations off, same as every other sweep.
-    fn ramp(self, th: Theme, enabled: bool) -> Option<[Color; 3]> {
+    /// The sweep the name rides: [`sweep_ramp`]'s, or the merged ramp
+    /// while the merge is `fresh` (`App::worktree_fresh` answers for
+    /// whichever story the row tells) — and nothing with animations off,
+    /// same as every other sweep.
+    fn ramp(self, fresh: bool, th: Theme, enabled: bool) -> Option<[Color; 3]> {
         match self {
-            RowState::Sessions(status) => sweep_ramp(status, th, enabled),
-            RowState::Merged => enabled.then_some(th.merged_sweep),
+            RowState::Sessions(status) => sweep_ramp(status, fresh, th, enabled),
+            RowState::Merged => (enabled && fresh).then_some(th.merged_sweep),
+        }
+    }
+
+    /// What the branch name wears at rest: nothing of its own on a sessions
+    /// row, the merged purple on a merged one — the color the sweep rests
+    /// on, so the sweep ending (or never running) changes no color.
+    fn name_style(self, th: Theme) -> Style {
+        match self {
+            RowState::Sessions(_) => Style::default(),
+            RowState::Merged => Style::default().fg(th.merged),
         }
     }
 }
@@ -3143,9 +3225,10 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     let active = app.tree.active_workspace_index();
     // Per-tab display data, pre-collected to end the tree borrow: name,
-    // rollup, and how many sessions under it finished unread — the same
-    // count the project and worktree rows carry, one tier up.
-    let rows: Vec<(String, Option<AgentStatus>, usize)> = app
+    // rollup, how many sessions under it finished unread — the same count
+    // the project and worktree rows carry, one tier up — and whether one
+    // of those finishes is fresh enough to still sweep.
+    let rows: Vec<(String, Option<AgentStatus>, usize, bool)> = app
         .tree
         .workspaces
         .iter()
@@ -3154,6 +3237,7 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
                 w.name.clone(),
                 app.workspace_rollup(&w.id),
                 app.workspace_unseen(&w.id),
+                app.workspace_fresh_done(&w.id),
             )
         })
         .collect();
@@ -3164,7 +3248,7 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let tabs: Vec<(Vec<Span<'static>>, u16, Color)> = rows
         .iter()
         .enumerate()
-        .map(|(i, (name, roll, done))| {
+        .map(|(i, (name, roll, done, fresh))| {
             let selected = Some(i) == active;
             // Only nine tabs have a shortcut; past that the slot stays
             // blank so every name still starts on the same column.
@@ -3180,7 +3264,7 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
             spans.extend(status_name_spans(
                 truncate(name, TAB_NAME_MAX),
                 Style::default().add_modifier(Modifier::BOLD),
-                sweep_ramp(*roll, th, anim),
+                sweep_ramp(*roll, *fresh, th, anim),
                 phase,
             ));
             if *done > 0 {
@@ -3262,7 +3346,7 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
             // fill and the underline and reads as a gap. `▀` paints from
             // the cell's top edge, flush against the block above it. Its
             // color is the tab's rollup STATUS DOT — yellow while anything
-            // under the workspace runs, violet while a finish is UNSEEN —
+            // under the workspace runs, blue while a finish is UNSEEN —
             // not the theme accent.
             let underline = selection_mark(*mark, th);
             for cx in x..x + w {
@@ -3337,22 +3421,32 @@ fn push_bar_collapse_chevron(f: &mut Frame, app: &mut App, area: Rect, row_y: u1
 /// Per-row display data of the Projects panel, pre-collected to end the
 /// tree borrow: name, the folder name to show under it (Some only once the
 /// row has been renamed away from it), rollup, unwatched-finish count,
-/// last-turn stamp.
-type ProjectRowData = (String, Option<String>, Option<AgentStatus>, usize, i64);
+/// last-turn stamp, and whether one of those finishes still sweeps
+/// (`App::project_fresh_done`).
+type ProjectRowData = (
+    String,
+    Option<String>,
+    Option<AgentStatus>,
+    usize,
+    i64,
+    bool,
+);
 
 /// The same for the Worktrees panel: branch, is-root, rollup,
 /// unwatched-finish count, last-turn stamp.
 /// One WORKTREES PANEL row: branch, root-ness, status rollup, unseen
 /// count, recency stamp, whether it is a QUICK PROMPT stand-in the
 /// DAEMON has not cut yet, and whether it wears its merged pull request
-/// (`App::worktree_wears_merge`), and whether its RUN COMMAND is up
-/// (`App::worktree_running`).
+/// (`App::worktree_wears_merge`), whether its RUN COMMAND is up
+/// (`App::worktree_running`), and whether the row is inside its ONE-SHOT
+/// SWEEP (`App::worktree_fresh`).
 type WorktreeRowData = (
     String,
     bool,
     Option<AgentStatus>,
     usize,
     i64,
+    bool,
     bool,
     bool,
     bool,
@@ -3420,11 +3514,12 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                 app.project_rollup(&p.id),
                 app.project_unseen(&p.id),
                 app.project_recency(&p.id).stamped,
+                app.project_fresh_done(&p.id),
             )
         })
         .collect();
     let mut screen_row = 0usize;
-    for (row_idx, (text, folder, roll, unseen, stamped)) in rows.iter().enumerate() {
+    for (row_idx, (text, folder, roll, unseen, stamped, fresh)) in rows.iter().enumerate() {
         // A renamed row grows by the one line its folder name takes, so the
         // pads above and below stay a row each either way.
         let height = PROJECT_BTN_H + folder.is_some() as u16;
@@ -3444,7 +3539,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
         spans.extend(status_name_spans(
             truncate(text, name_max),
             Style::default().add_modifier(Modifier::BOLD),
-            sweep_ramp(*roll, th, app.animations),
+            sweep_ramp(*roll, *fresh, th, app.animations),
             app.sweep_phase(),
         ));
         if !ago.is_empty() {
@@ -3556,6 +3651,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             app.is_placeholder_worktree(&w.id),
             app.worktree_wears_merge(&w.id),
             app.worktree_running(&w.id),
+            app.worktree_fresh(&w.id),
         )
     };
     // The rows in cursor order: the plain checkouts, then each open pull
@@ -3724,7 +3820,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         };
         match &rows[i] {
             PanelRow::Checkout { data, nested } => {
-                let (branch, is_main, roll, unseen, stamped, pending, merged, running) = data;
+                let (branch, is_main, roll, unseen, stamped, pending, merged, running, fresh) =
+                    data;
                 let (badges, badge_len) = row_badges(*unseen, th);
                 // A stand-in checkout (QUICK PROMPT, git still cutting
                 // it) reads as not-there-yet: hollow dot, no sweep, and
@@ -3736,7 +3833,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     (false, true) => RowState::Merged,
                     (false, false) => RowState::Sessions(*roll),
                 };
-                let ramp = state.ramp(th, app.animations);
+                let ramp = state.ramp(*fresh, th, app.animations);
                 // A checkout under its pull request is stepped in behind
                 // a `└` that runs into its dot, the way a child row is
                 // anywhere: the row above is the pull request it is the
@@ -3791,7 +3888,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 spans.push(state.dot(*unseen > 0, th));
                 spans.extend(status_name_spans(
                     truncate(branch, max),
-                    Style::default(),
+                    state.name_style(th),
                     ramp,
                     app.sweep_phase(),
                 ));
@@ -4253,7 +4350,7 @@ fn draw_session_row(
             let ramp = if a.archived || pending || cold {
                 None
             } else {
-                sweep_ramp(Some(a.status), th, app.animations)
+                sweep_ramp(Some(a.status), app.agent_fresh_done(a), th, app.animations)
             };
             let mut spans = vec![dot];
             spans.extend(status_name_spans(
@@ -4933,9 +5030,13 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             ),
             Style::default().fg(th.dim),
         )
-    } else if matches!(&app.overlay, Some(Overlay::Diff(_))) {
+    } else if let Some(Overlay::Diff(view)) = &app.overlay {
         Span::styled(
-            "type: filter  ↑/↓: file  ⇧↑/↓: scroll  Ctrl+d/u: page  Ctrl+u: clear filter  Esc: clear/close",
+            if view.tree.is_some() {
+                "type: filter  ↑/↓: move  ←/→: fold  ⇧↑/↓: scroll  Ctrl+d/u: page  Ctrl+t: flat list  Ctrl+u: clear filter  Esc: clear/close"
+            } else {
+                "type: filter  ↑/↓: file  ⇧↑/↓: scroll  Ctrl+d/u: page  Ctrl+t: tree  Ctrl+u: clear filter  Esc: clear/close"
+            },
             Style::default().fg(th.dim),
         )
     } else if let Some(Overlay::FileTabs(view)) = &app.overlay {
@@ -5116,8 +5217,9 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::Help)
             ),
             Focus::Worktrees => format!(
-                "{}: new worktree  {}: {}  {}: open  {}: terminal  {}: delete  {}: refresh PRs  {}: search  {}: menu  {}: help",
+                "{}: new worktree  {}: presets  {}: {}  {}: open  {}: terminal  {}: delete  {}: refresh PRs  {}: search  {}: menu  {}: help",
                 k(Action::New),
+                k(Action::AgentPresets),
                 k(Action::Rename),
                 if app
                     .selected_worktree()
@@ -5901,47 +6003,72 @@ mod tests {
         );
     }
 
-    /// Only yellow (running) and red (needs feedback) animate; every other
-    /// status renders still text, and the animations setting kills even
-    /// those two.
+    /// Yellow (running) and red (needs feedback) animate for as long as
+    /// they last, whatever `fresh` says; a finished row animates only while
+    /// its unread finish is fresh — the ONE-SHOT SWEEP, on the done ramp —
+    /// and every other status renders still text. The animations setting
+    /// kills all three.
     #[test]
-    fn sweep_ramp_gates_on_live_statuses_and_the_setting() {
+    fn sweep_ramp_gates_on_live_statuses_a_fresh_finish_and_the_setting() {
         let th = Theme::default();
-        assert_eq!(
-            sweep_ramp(Some(AgentStatus::Running), th, true),
-            Some(th.warn_sweep)
-        );
-        assert_eq!(
-            sweep_ramp(Some(AgentStatus::NeedsFeedback), th, true),
-            Some(th.err_sweep)
-        );
-        for status in [
-            AgentStatus::Fresh,
-            AgentStatus::Finished,
-            AgentStatus::Terminated,
-            AgentStatus::Disconnected,
-        ] {
-            assert_eq!(sweep_ramp(Some(status), th, true), None, "{status:?}");
+        for fresh in [false, true] {
+            assert_eq!(
+                sweep_ramp(Some(AgentStatus::Running), fresh, th, true),
+                Some(th.warn_sweep)
+            );
+            assert_eq!(
+                sweep_ramp(Some(AgentStatus::NeedsFeedback), fresh, th, true),
+                Some(th.err_sweep)
+            );
+            for status in [
+                AgentStatus::Fresh,
+                AgentStatus::Terminated,
+                AgentStatus::Disconnected,
+            ] {
+                assert_eq!(
+                    sweep_ramp(Some(status), fresh, th, true),
+                    None,
+                    "{status:?}"
+                );
+            }
+            assert_eq!(sweep_ramp(None, fresh, th, true), None);
+            for status in [
+                AgentStatus::Running,
+                AgentStatus::NeedsFeedback,
+                AgentStatus::Finished,
+            ] {
+                assert_eq!(
+                    sweep_ramp(Some(status), fresh, th, false),
+                    None,
+                    "{status:?}, animations off"
+                );
+            }
         }
-        assert_eq!(sweep_ramp(None, th, true), None);
-        assert_eq!(sweep_ramp(Some(AgentStatus::Running), th, false), None);
         assert_eq!(
-            sweep_ramp(Some(AgentStatus::NeedsFeedback), th, false),
-            None
+            sweep_ramp(Some(AgentStatus::Finished), true, th, true),
+            Some(th.done_sweep),
+            "just finished, unread: the one-shot"
+        );
+        assert_eq!(
+            sweep_ramp(Some(AgentStatus::Finished), false, th, true),
+            None,
+            "and then it holds still"
         );
     }
 
-    /// A checkout wearing its merged pull request animates like a running
-    /// one — on the purple ramp — and the animations setting stills it the
-    /// same way. Its dot and rail are the merged purple; a checkout on its
-    /// sessions is exactly what `status_dot` / `status_color` /
-    /// `sweep_ramp` already say.
+    /// A checkout wearing its merged pull request is purple at rest — dot,
+    /// rail and name — and rides the purple ramp only while the merge is
+    /// fresh (the ONE-SHOT SWEEP), which the animations setting stills like
+    /// any other sweep. A checkout on its sessions is exactly what
+    /// `status_dot` / `status_color` / `sweep_ramp` already say.
     #[test]
-    fn merged_row_state_sweeps_purple_and_obeys_the_setting() {
+    fn merged_row_state_is_solid_purple_and_sweeps_only_while_fresh() {
         let th = Theme::default();
         let merged = RowState::Merged;
-        assert_eq!(merged.ramp(th, true), Some(th.merged_sweep));
-        assert_eq!(merged.ramp(th, false), None);
+        assert_eq!(merged.ramp(true, th, true), Some(th.merged_sweep));
+        assert_eq!(merged.ramp(false, th, true), None, "landed a while ago");
+        assert_eq!(merged.ramp(true, th, false), None, "animations off");
+        assert_eq!(merged.name_style(th).fg, Some(th.merged), "solid purple");
         assert_eq!(merged.color(false, th), th.merged);
         assert_eq!(
             merged.color(true, th),
@@ -5953,21 +6080,17 @@ mod tests {
         assert_eq!(dot.style.fg, Some(th.merged));
 
         let running = RowState::Sessions(Some(AgentStatus::Running));
-        assert_eq!(running.ramp(th, true), Some(th.warn_sweep));
+        assert_eq!(running.ramp(false, th, true), Some(th.warn_sweep));
         assert_eq!(running.color(false, th), th.warn);
+        assert_eq!(running.name_style(th), Style::default(), "no color at rest");
         let done = RowState::Sessions(Some(AgentStatus::Finished));
-        assert_eq!(done.ramp(th, true), None);
+        assert_eq!(done.ramp(false, th, true), None);
+        assert_eq!(done.ramp(true, th, true), Some(th.done_sweep));
         assert_eq!(done.color(true, th), th.done);
         assert_eq!(done.color(false, th), th.ok);
         assert_eq!(RowState::Sessions(None).dot(false, th).content, "○ ");
     }
 
-    /// The WORKTREES row of a checkout whose pull request has merged is
-    /// purple end to end — dot, selection rail, and the branch name on the
-    /// merged sweep — so the checkout to delete stands out. Animations off,
-    /// the name holds still in plain text and the purple stays. A session
-    /// still running there takes the row back: yellow, as a checkout not
-    /// to pull out from under it.
     /// A checkout whose RUN COMMAND is up wears a green `▶ running` after
     /// its branch — the bare glyph where the word would cut the branch —
     /// and a run that has exited wears nothing.
@@ -6036,14 +6159,63 @@ mod tests {
         );
     }
 
+    /// The selected `feat` row of the WORKTREES PANEL, drawn: its rail
+    /// color, its dot color, and the color of each cell of its name.
+    fn feat_row_colors(app: &mut App) -> (Color, Color, Vec<Color>) {
+        let area = Rect::new(0, 0, 30, 12);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 12)).unwrap();
+        terminal.draw(|f| draw_worktrees(f, app, area)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // Cell-wise, not by byte offset: the rail and dot glyphs ahead of
+        // the name are multi-byte.
+        let cells = |y: u16| -> Vec<String> {
+            (0..30)
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect()
+        };
+        let name_at = |y: u16| {
+            cells(y)
+                .windows(4)
+                .position(|w| w.concat() == "feat")
+                .map(|x| x as u16)
+        };
+        let (y, name_x) = (0..12)
+            .find_map(|y| name_at(y).map(|x| (y, x)))
+            .expect("the feat row");
+        let rail = buf.cell((0, y)).unwrap().clone();
+        assert_eq!(rail.symbol(), PILL_RAIL, "the cursor is on the row");
+        let dot = buf.cell((1, y)).unwrap().clone();
+        assert_eq!(dot.symbol(), "●", "solid dot");
+        let name: Vec<Color> = (name_x..name_x + 4)
+            .map(|x| buf.cell((x, y)).unwrap().fg)
+            .collect();
+        (rail.fg, dot.fg, name)
+    }
+
+    /// A stamp `ONE_SHOT_SWEEP` and a second old: a merge that landed, or a
+    /// turn that finished, long enough ago that its row has settled.
+    fn settled() -> std::time::Duration {
+        crate::app::ONE_SHOT_SWEEP + std::time::Duration::from_secs(1)
+    }
+
+    /// The WORKTREES row of a checkout whose pull request has merged is
+    /// purple end to end — dot, selection rail and branch name — so the
+    /// checkout to delete stands out. The name sweeps on the merged ramp
+    /// only for the few seconds after the merge is seen to land; a merge
+    /// met already landed (the cache, a first lookup) is solid from the
+    /// first frame, and so is every merge once its ONE-SHOT SWEEP has run
+    /// out or with animations off. A session still running there takes the
+    /// row back: yellow, as a checkout not to pull out from under it.
     #[test]
     fn worktree_row_wears_its_merged_pull_request() {
         use nebula_core::{AgentStatus, WorktreeId};
         let mut app = hit_test_app(&["main", "feat"], &["agent"], &[]);
         app.focus = Focus::Worktrees;
         app.sel_worktree = 1;
+        let w1 = WorktreeId("w1".into());
         app.pull_requests.insert(
-            WorktreeId("w1".into()),
+            w1.clone(),
             Some(crate::pull_request::PullRequest {
                 number: 7,
                 url: "https://github.com/o/r/pull/7".into(),
@@ -6054,64 +6226,90 @@ mod tests {
             }),
         );
         let th = app.theme;
-        let area = Rect::new(0, 0, 30, 12);
-        // The feat row's text line, as (rail color, dot color, name colors).
-        let row = |app: &mut App| {
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 12)).unwrap();
-            terminal.draw(|f| draw_worktrees(f, app, area)).unwrap();
-            let buf = terminal.backend().buffer().clone();
-            // Cell-wise, not by byte offset: the rail and dot glyphs
-            // ahead of the name are multi-byte.
-            let cells = |y: u16| -> Vec<String> {
-                (0..30)
-                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
-                    .collect()
-            };
-            let name_at = |y: u16| {
-                cells(y)
-                    .windows(4)
-                    .position(|w| w.concat() == "feat")
-                    .map(|x| x as u16)
-            };
-            let (y, name_x) = (0..12)
-                .find_map(|y| name_at(y).map(|x| (y, x)))
-                .expect("the feat row");
-            let rail = buf.cell((0, y)).unwrap().clone();
-            assert_eq!(rail.symbol(), PILL_RAIL, "the cursor is on the row");
-            let dot = buf.cell((1, y)).unwrap().clone();
-            assert_eq!(dot.symbol(), "●", "solid dot");
-            let name: Vec<Color> = (name_x..name_x + 4)
-                .map(|x| buf.cell((x, y)).unwrap().fg)
-                .collect();
-            (rail.fg, dot.fg, name)
-        };
 
-        let (rail, dot, name) = row(&mut app);
+        // Met already merged: nobody saw it land, so nothing moves.
+        let (rail, dot, name) = feat_row_colors(&mut app);
         assert_eq!(rail, th.merged, "the rail is the merge's purple");
         assert_eq!(dot, th.merged, "so is the dot");
+        assert_eq!(name, vec![th.merged; 4], "and the name, solid");
+
+        // Seen to land: the name rides the merged sweep...
+        app.note_merge_landed(w1.clone());
+        let (rail, dot, name) = feat_row_colors(&mut app);
+        assert_eq!((rail, dot), (th.merged, th.merged));
         assert!(
             name.iter().all(|c| th.merged_sweep.contains(c)),
             "the name rides the merged sweep: {name:?}"
         );
-
+        // ...unless animations are off: the same purple, holding still...
         app.animations = false;
-        let (rail, dot, name) = row(&mut app);
+        let (rail, dot, name) = feat_row_colors(&mut app);
         assert_eq!((rail, dot), (th.merged, th.merged), "still purple");
-        assert_eq!(name, vec![Color::Reset; 4], "the name holds still");
+        assert_eq!(name, vec![th.merged; 4], "the name holds still");
+        // ...which is also where the sweep ends up on its own.
+        app.animations = true;
+        let long_ago = std::time::Instant::now()
+            .checked_sub(settled())
+            .expect("uptime past the window");
+        app.merge_landed.insert(w1.clone(), long_ago);
+        let (rail, dot, name) = feat_row_colors(&mut app);
+        assert_eq!((rail, dot), (th.merged, th.merged));
+        assert_eq!(name, vec![th.merged; 4], "settled: solid purple");
 
         // A running session in the checkout: not one to delete yet.
-        app.animations = true;
-        app.tree.agents[0].worktree_id = WorktreeId("w1".into());
+        app.tree.agents[0].worktree_id = w1.clone();
         app.tree.agents[0].status = AgentStatus::Running;
-        let (rail, dot, name) = row(&mut app);
+        let (rail, dot, name) = feat_row_colors(&mut app);
         assert_eq!((rail, dot), (th.warn, th.warn), "running wins");
         assert!(name.iter().all(|c| th.warn_sweep.contains(c)), "{name:?}");
 
         // Finished, though, and the merge is the story again.
         app.tree.agents[0].status = AgentStatus::Finished;
-        let (rail, dot, _) = row(&mut app);
+        let (rail, dot, _) = feat_row_colors(&mut app);
         assert_eq!((rail, dot), (th.merged, th.merged));
+    }
+
+    /// A turn that finishes unread sweeps its checkout's row blue — the
+    /// done ramp, under a done dot — for `ONE_SHOT_SWEEP`, and then the row
+    /// is what an unread finish has always been: blue dot, plain name, no
+    /// motion. Reading it inside the window ends the sweep on the spot.
+    #[test]
+    fn worktree_row_sweeps_a_fresh_unread_finish_then_holds_still() {
+        use nebula_core::{AgentStatus, WorktreeId};
+        let mut app = hit_test_app(&["main", "feat"], &["agent"], &[]);
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 1;
+        let th = app.theme;
+        let now = crate::app::now_ms();
+        let agent = &mut app.tree.agents[0];
+        agent.worktree_id = WorktreeId("w1".into());
+        agent.status = AgentStatus::Finished;
+        agent.unseen = true;
+        agent.status_changed_at = now;
+
+        let (rail, dot, name) = feat_row_colors(&mut app);
+        assert_eq!((rail, dot), (th.done, th.done), "unread: the done color");
+        assert!(
+            name.iter().all(|c| th.done_sweep.contains(c)),
+            "just finished: the name rides the done sweep: {name:?}"
+        );
+
+        app.animations = false;
+        let (_, dot, name) = feat_row_colors(&mut app);
+        assert_eq!(dot, th.done);
+        assert_eq!(name, vec![Color::Reset; 4], "animations off: no sweep");
+        app.animations = true;
+
+        app.tree.agents[0].status_changed_at = now - settled().as_millis() as i64;
+        let (rail, dot, name) = feat_row_colors(&mut app);
+        assert_eq!((rail, dot), (th.done, th.done), "still unread");
+        assert_eq!(name, vec![Color::Reset; 4], "settled: the name holds still");
+
+        app.tree.agents[0].status_changed_at = now;
+        app.tree.agents[0].unseen = false;
+        let (_, dot, name) = feat_row_colors(&mut app);
+        assert_eq!(dot, th.ok, "read: green");
+        assert_eq!(name, vec![Color::Reset; 4], "and nothing left to sweep");
     }
 
     /// The tint fills every untouched cell of the panel rect — and only
@@ -6195,7 +6393,7 @@ mod tests {
     }
 
     /// The selection rail of the focused SESSION row is its STATUS DOT's
-    /// color, not the accent: yellow while it runs, violet while its
+    /// color, not the accent: yellow while it runs, blue while its
     /// finish is UNSEEN, green once read, and a FRESH or cold row's gray
     /// lifted to muted so it still reads as the cursor on the fill.
     #[test]

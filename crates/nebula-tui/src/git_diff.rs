@@ -284,7 +284,7 @@ pub fn read_listing(root: &Path) -> Result<crate::view_jobs::DiffListing, String
 /// read again only if it is no longer the same entry. A reader who has not
 /// moved gets what a fresh open gives — the first unreviewed file.
 pub fn fill_view(view: &mut DiffView, listing: crate::view_jobs::DiffListing) {
-    let moved = view.selected != 0 || view.scroll != 0;
+    let moved = !view.at_home() || view.scroll != 0;
     let before = view.selected_file().cloned();
     let head_ok = listing.head.is_some();
     let head_changed = !view.files.is_empty() && view.head_ok != head_ok;
@@ -294,15 +294,25 @@ pub fn fill_view(view: &mut DiffView, listing: crate::view_jobs::DiffListing) {
     view.reviewed = listing.reviewed;
     view.listing = None;
     view.recompute_matches();
-    view.selected = before
+    // The tree folds the fresh list the same way, keeping what the reader
+    // folded; both lists then send the cursor home.
+    if let Some(tree) = &view.tree {
+        view.tree = Some(tree.rebuilt(&view.files, &view.filter));
+    }
+    view.selected = 0;
+    // Home is the first unreviewed file — the flat list sinks the ✓ ones —
+    // and the tree lands on it too.
+    let home = view
+        .matches
+        .first()
+        .map(|m| view.files[m.file].path.clone());
+    let kept = before
         .as_ref()
         .filter(|_| moved)
-        .and_then(|was| {
-            view.matches
-                .iter()
-                .position(|m| view.files[m.file].path == was.path)
-        })
-        .unwrap_or(0);
+        .is_some_and(|was| view.select_path(&was.path));
+    if let (false, Some(path)) = (kept, home) {
+        view.select_path(&path);
+    }
     // Diffs read against the wrong idea of HEAD (the badge's list cannot
     // say whether there is one) are not worth keeping.
     if head_changed {
@@ -316,7 +326,9 @@ pub fn fill_view(view: &mut DiffView, listing: crate::view_jobs::DiffListing) {
 /// Reload `view.diff` for the currently selected file and reset the scroll.
 /// A view whose diffs were fetched whole (a pull request) reads them out of
 /// `prefetched` instead of shelling out — there is no local commit to ask
-/// git about, and the text is already in hand.
+/// git about, and the text is already in hand. A directory row of the
+/// tree list has no diff of its own: the pane lists what changed under
+/// it.
 ///
 /// A view with BACKGROUND READS never waits on git here. A file this modal
 /// has read before is on screen on this keypress, out of `DiffView::cache`,
@@ -328,7 +340,8 @@ pub fn fill_view(view: &mut DiffView, listing: crate::view_jobs::DiffListing) {
 pub fn load_selected_diff(view: &mut DiffView) {
     view.waiting = None;
     let Some(file) = view.selected_file().cloned() else {
-        view.show_diff(None, String::new(), false);
+        let summary = view.dir_summary().unwrap_or_default();
+        view.show_diff(None, summary, false);
         return;
     };
     if let Some(chunks) = &view.prefetched {
@@ -402,9 +415,7 @@ pub fn land_diff(
         view.show_diff(Some(path), diff, same_file);
     }
     let next = view
-        .matches
-        .get(view.selected + 1)
-        .and_then(|m| view.files.get(m.file))
+        .file_after_cursor()
         .filter(|file| view.cached(&file.path).is_none())
         .cloned();
     if let (Some(file), Some(jobs)) = (next, view.jobs.clone()) {
@@ -493,6 +504,45 @@ mod tests {
         fill_view(&mut view, listing(&["a.rs", "b.rs"], &["a.rs"]));
         assert_eq!(selected(&view), Some("b.rs"));
         assert_eq!(view.head_key, "abc123");
+    }
+
+    /// The tree list lands a fresh listing the same way the flat one does:
+    /// folded over the new files, the reader's folds kept, an unmoved
+    /// reader on the first unreviewed file and a moved one on theirs.
+    #[test]
+    fn the_fresh_list_lands_in_the_tree_the_same_way() {
+        let mut view = opened_on(&["src/a.rs", "src/b.rs"]);
+        view.toggle_tree();
+        fill_view(&mut view, listing(&["src/a.rs", "src/b.rs"], &["src/a.rs"]));
+        assert!(view.tree.is_some(), "still the tree");
+        assert_eq!(selected(&view), Some("src/b.rs"), "the first unreviewed");
+
+        // The reader is on b.rs; a file that turned up since joins the tree
+        // under them.
+        fill_view(&mut view, listing(&["new.rs", "src/a.rs", "src/b.rs"], &[]));
+        assert_eq!(selected(&view), Some("src/b.rs"));
+        assert!(view.select_path("new.rs"), "a row of its own now");
+    }
+
+    /// The read-ahead walks the list that is showing: in the tree that
+    /// means the next file down, directories stepped over.
+    #[test]
+    fn the_row_read_ahead_is_the_next_file_of_the_list_on_screen() {
+        let mut view = opened_on(&["src/a.rs", "src/b.rs"]);
+        assert_eq!(
+            view.file_after_cursor().map(|f| f.path.as_str()),
+            Some("src/b.rs")
+        );
+
+        view.toggle_tree();
+        // Up onto the `src/` row: the file after it is still a.rs.
+        view.select_path("src");
+        assert_eq!(
+            view.file_after_cursor().map(|f| f.path.as_str()),
+            Some("src/a.rs")
+        );
+        view.select_path("src/b.rs");
+        assert_eq!(view.file_after_cursor(), None, "the end of the list");
     }
 
     /// The cache holds what the budget allows, newest kept, and never an

@@ -16,6 +16,14 @@ use std::path::PathBuf;
 /// size of [`App::sweep_phase`] (one text cell per frame).
 pub const SWEEP_FRAME: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// How long a ONE-SHOT SWEEP runs: the sweep a row takes for a change that
+/// happened while nobody was looking — a turn finishing unread (blue), a
+/// checkout's pull request merging (purple) — before it settles into its
+/// still color. Two or three passes of the band: long enough to catch the
+/// eye from another panel, short enough that motion keeps meaning *live*.
+/// Only running and needs-feedback rows sweep for as long as they last.
+pub const ONE_SHOT_SWEEP: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How many recently shown sessions keep their screen ([`App::term_cache`]):
 /// enough for a rotation through the sessions of a couple of worktrees.
 /// What bounds the memory is [`TERM_CACHE_CELLS`], not this.
@@ -881,6 +889,11 @@ pub struct DiffView {
     /// cursor is read ahead. Bounded by [`DIFF_CACHE_BYTES`]; gone with
     /// the modal.
     pub cache: Vec<(String, std::sync::Arc<str>)>,
+    /// The file list folded into a directory tree (`Ctrl+t`, see
+    /// `diff_tree`); `None` is the flat list. While it is up the cursor is
+    /// the tree's — `selected` and `matches` stay current underneath, so
+    /// toggling back lands on a list that is already right.
+    pub tree: Option<crate::diff_tree::DiffTree>,
 }
 
 /// The most diff text a DIFF VIEWER keeps beyond the one on screen. Two
@@ -965,6 +978,7 @@ impl DiffView {
             waiting: None,
             shown: None,
             cache: Vec::new(),
+            tree: None,
         };
         view.apply_filter();
         view
@@ -993,34 +1007,204 @@ impl DiffView {
         self.scroll = scrolled_by(self.scroll, delta, self.max_scroll());
     }
 
-    /// Clamped absolute selection in the filtered list; true when it changed
-    /// (the caller reloads the diff).
+    /// Clamped absolute selection in the list on screen — the filtered
+    /// files, or the tree's rows; true when it changed (the caller reloads
+    /// the diff).
     pub fn select(&mut self, index: i64) -> bool {
+        if let Some(tree) = &mut self.tree {
+            return tree.select(index);
+        }
         let clamped = clamp_selection(index, self.matches.len());
         let changed = clamped != self.selected;
         self.selected = clamped;
         changed
     }
 
-    /// The file behind the current selection, if any row is visible.
+    /// The cursor's row in the list on screen: an index into `matches`, or
+    /// into the tree's rows.
+    pub fn cursor(&self) -> usize {
+        self.tree.as_ref().map_or(self.selected, |t| t.selected)
+    }
+
+    /// How many rows the list on screen has.
+    pub fn row_count(&self) -> usize {
+        self.tree
+            .as_ref()
+            .map_or(self.matches.len(), |t| t.rows.len())
+    }
+
+    /// The file behind the current selection, if any row is visible — and,
+    /// in the tree, if that row is a file's.
     pub fn selected_file(&self) -> Option<&DiffFile> {
-        self.files.get(self.matches.get(self.selected)?.file)
+        match &self.tree {
+            Some(tree) => self.files.get(tree.selected_file()?),
+            None => self.files.get(self.matches.get(self.selected)?.file),
+        }
+    }
+
+    /// The directory the tree's cursor rests on, as its path.
+    pub fn selected_dir(&self) -> Option<&str> {
+        let node = self.tree.as_ref()?.selected_node()?;
+        node.is_dir.then_some(node.path.as_str())
+    }
+
+    /// The selected row's path: the file's, or a tree directory's.
+    pub fn selected_path(&self) -> Option<&str> {
+        self.selected_file()
+            .map(|f| f.path.as_str())
+            .or_else(|| self.selected_dir())
+    }
+
+    /// Put the cursor on the row for `path`, in whichever list is showing.
+    /// False, and the cursor left alone, when no row has it.
+    pub fn select_path(&mut self, path: &str) -> bool {
+        if let Some(tree) = &mut self.tree {
+            return tree.select_path(path, &self.filter);
+        }
+        let row = self
+            .matches
+            .iter()
+            .position(|m| self.files[m.file].path == path);
+        if let Some(row) = row {
+            self.selected = row;
+        }
+        row.is_some()
     }
 
     /// First visible row of the file list's stateless follow-window for a
     /// list of `height` rows.
     pub fn window_start(&self, height: usize) -> usize {
-        window_start(self.selected, height)
+        window_start(self.cursor(), height)
     }
 
-    /// Recompute `matches` from `filter` and reset the selection to the top
-    /// row; true when the selected file changed (the caller reloads the
-    /// diff).
+    /// Whether the cursor is still where opening the modal put it: the top
+    /// of the flat list, the tree's home row. A reader who has moved keeps
+    /// the file they are on when a fresh listing lands (`git_diff::
+    /// fill_view`); one who has not gets what a fresh open gives.
+    pub fn at_home(&self) -> bool {
+        match &self.tree {
+            Some(tree) => tree.selected == tree.home_row(),
+            None => self.selected == 0,
+        }
+    }
+
+    /// The next file down from the cursor in whichever list is showing —
+    /// what the DIFF VIEWER reads ahead, `↓` being the key it is walked
+    /// with. Tree directories are stepped over: they have no diff to read.
+    pub fn file_after_cursor(&self) -> Option<&DiffFile> {
+        match &self.tree {
+            Some(tree) => tree
+                .rows
+                .iter()
+                .skip(tree.selected + 1)
+                .find_map(|row| tree.file_of[row.node])
+                .and_then(|file| self.files.get(file)),
+            None => self.files.get(self.matches.get(self.selected + 1)?.file),
+        }
+    }
+
+    /// Recompute the rows from `filter` and send the cursor home — the top
+    /// row, or in the tree the best match (its first file when the filter
+    /// is empty); true when that moved it off the row it was on (the caller
+    /// reloads the diff).
     pub fn apply_filter(&mut self) -> bool {
         let before = self.matches.get(self.selected).map(|m| m.file);
         self.recompute_matches();
         self.selected = 0;
-        before != self.matches.first().map(|m| m.file)
+        match &mut self.tree {
+            Some(tree) => tree.apply_filter(&self.filter),
+            None => before != self.matches.first().map(|m| m.file),
+        }
+    }
+
+    /// Swap in a new file list (a pull request's diff refreshed under the
+    /// modal): both lists are rebuilt — the tree keeping what the reader
+    /// folded — and the cursor goes home; the caller moves it back
+    /// (`select_path`) and reloads the diff.
+    pub fn replace_files(&mut self, files: Vec<DiffFile>) {
+        self.files = files;
+        self.recompute_matches();
+        self.selected = 0;
+        if let Some(tree) = &self.tree {
+            self.tree = Some(tree.rebuilt(&self.files, &self.filter));
+        }
+    }
+
+    /// `Ctrl+t`: the other shape of the file list — flat paths, or the
+    /// directory tree (`diff_tree`). The cursor stays on the file it was on;
+    /// leaving the tree from a directory row, that directory's first file
+    /// stands in, since the flat list has no row for a directory. True when
+    /// the diff pane has something else to show (the caller reloads it).
+    pub fn toggle_tree(&mut self) -> bool {
+        let before = self.selected_file().map(|f| f.path.clone());
+        let target = match self.tree.take() {
+            Some(tree) => before.clone().or_else(|| {
+                let under = tree.files_under(tree.rows.get(tree.selected)?.node);
+                Some(self.files[*under.first()?].path.clone())
+            }),
+            None => {
+                self.tree = Some(crate::diff_tree::DiffTree::new(&self.files, &self.filter));
+                before.clone()
+            }
+        };
+        if let Some(path) = target {
+            self.select_path(&path);
+        }
+        before.is_none() || before != self.selected_file().map(|f| f.path.clone())
+    }
+
+    /// `Enter` on a tree directory's row, or a click on it: fold or unfold
+    /// it. True when that moved the cursor onto another row.
+    pub fn toggle_dir(&mut self, row: usize) -> bool {
+        match &mut self.tree {
+            Some(tree) => tree.toggle_row(row, &self.filter),
+            None => false,
+        }
+    }
+
+    /// `→` in the tree: open the directory, or step into an open one. True
+    /// when the cursor moved onto another row.
+    pub fn expand_selected(&mut self) -> bool {
+        match &mut self.tree {
+            Some(tree) => tree.expand_selected(&self.filter),
+            None => false,
+        }
+    }
+
+    /// `←` in the tree: fold the directory, or jump to the parent's row.
+    /// True when the cursor moved onto another row.
+    pub fn collapse_selected(&mut self) -> bool {
+        match &mut self.tree {
+            Some(tree) => tree.collapse_selected(&self.filter),
+            None => false,
+        }
+    }
+
+    /// What the diff pane shows for a tree directory's row: the files that
+    /// changed under it, each with its status code and its ✓.
+    pub fn dir_summary(&self) -> Option<String> {
+        let tree = self.tree.as_ref()?;
+        let row = tree.rows.get(tree.selected)?;
+        let dir = &tree.nodes[row.node];
+        if !dir.is_dir {
+            return None;
+        }
+        let under = tree.files_under(row.node);
+        let plural = if under.len() == 1 { "" } else { "s" };
+        let mut out = format!("{}/ — {} changed file{plural}\n", dir.path, under.len());
+        for file in under.into_iter().map(|f| &self.files[f]) {
+            let name = file
+                .path
+                .strip_prefix(dir.path.as_str())
+                .map_or(file.path.as_str(), |rest| rest.trim_start_matches('/'));
+            let mark = if self.reviewed.contains_key(&file.path) {
+                "✓"
+            } else {
+                " "
+            };
+            out.push_str(&format!("\n{} {mark} {name}", file.status_str()));
+        }
+        Some(out)
     }
 
     /// Rebuild the visible rows from `filter` and the reviewed marks: best
@@ -1046,6 +1230,11 @@ impl DiffView {
     /// the file back to its natural spot. `None` when no row is selected,
     /// otherwise whether the selected file changed (the caller reloads the
     /// diff; it persists `reviewed` either way).
+    ///
+    /// The tree keeps its order — nothing sinks there — so the same sweep
+    /// moves the cursor instead: down to the next file still in the state
+    /// this one just left, staying put when there is none. A directory's
+    /// row has no mark of its own to toggle.
     pub fn toggle_reviewed(&mut self) -> Option<bool> {
         let path = self.selected_file()?.path.clone();
         // The mark is a fingerprint of the diff that was read — not of
@@ -1060,6 +1249,15 @@ impl DiffView {
             self.reviewed.insert(path.clone(), mark);
         }
         self.recompute_matches();
+        if let Some(tree) = &mut self.tree {
+            let (files, reviewed) = (&self.files, &self.reviewed);
+            let next = (tree.selected + 1..tree.rows.len()).find(|&row| {
+                tree.file_of[tree.rows[row].node]
+                    .is_some_and(|f| reviewed.contains_key(&files[f].path) == unmarked)
+            });
+            tree.selected = next.unwrap_or(tree.selected);
+            return Some(next.is_some());
+        }
         let marks_visible = self
             .matches
             .iter()
@@ -2033,6 +2231,40 @@ pub fn project_unseen(tree: &Tree, project_id: &ProjectId) -> usize {
         .sum()
 }
 
+/// Whether the agent's unread finish is recent enough (`ONE_SHOT_SWEEP`) to
+/// still be sweeping at `now` epoch ms. `unseen` is only ever true on a
+/// finished row, so `status_changed_at` is the finish itself. The stamp is
+/// the DAEMON's clock and `now` this client's, so the window is taken either
+/// side of it: a skewed pair sweeps a little off-time, never for an hour.
+pub fn fresh_done(agent: &Agent, now: i64) -> bool {
+    let window = ONE_SHOT_SWEEP.as_millis() as i64;
+    agent.unseen
+        && !agent.archived
+        && agent.status_changed_at > 0
+        && (now - agent.status_changed_at).abs() < window
+}
+
+/// [`fresh_done`] rolled up to a worktree row, the way [`worktree_unseen`]
+/// rolls the count up: some session under it just finished unread.
+pub fn worktree_fresh_done(tree: &Tree, worktree_id: &WorktreeId, now: i64) -> bool {
+    tree.agents
+        .iter()
+        .any(|a| &a.worktree_id == worktree_id && fresh_done(a, now))
+}
+
+/// The same over every worktree of a project.
+pub fn project_fresh_done(tree: &Tree, project_id: &ProjectId, now: i64) -> bool {
+    tree.worktrees
+        .iter()
+        .filter(|w| &w.project_id == project_id)
+        .any(|w| worktree_fresh_done(tree, &w.id, now))
+}
+
+/// And over every project of a workspace, for its tab.
+pub fn workspace_fresh_done(tree: &Tree, workspace_id: &WorkspaceId, now: i64) -> bool {
+    workspace_agents(tree, workspace_id).any(|a| fresh_done(a, now))
+}
+
 /// Every unarchived agent under every project in a workspace.
 fn workspace_agents<'a>(
     tree: &'a Tree,
@@ -2438,6 +2670,10 @@ pub struct UiState {
     /// Diff modal file-list width; absent in older blobs.
     #[serde(default)]
     pub diff_files_width: Option<u16>,
+    /// The diff modal's file list is the directory tree (`Ctrl+t`); absent
+    /// in older blobs, which keep the flat list.
+    #[serde(default)]
+    pub diff_tree: bool,
 }
 
 /// A mouse selection over the terminal pane (drag or double-click word), in
@@ -2825,6 +3061,9 @@ pub struct App {
     /// `panel_widths` so old persisted layouts still deserialize.
     /// File-list width of the diff modal, remembered across opens.
     pub diff_files_width: u16,
+    /// The diff modal lists its files as a directory tree (`Ctrl+t` inside
+    /// it), remembered across opens and launches like the width.
+    pub diff_tree: bool,
     /// Selected tab of the settings modal, remembered across opens.
     pub settings_tab: usize,
     /// Cursor row of the settings modal, one per tab, remembered across
@@ -2915,6 +3154,12 @@ pub struct App {
     /// the found ones come back from the last run's cache (`pr_cache`), so
     /// the rows are painted before the first lookup answers.
     pub pull_requests: HashMap<WorktreeId, Option<PullRequest>>,
+    /// When this client saw a checkout's pull request turn merged
+    /// (`note_merge_landed`) — what times the row's ONE-SHOT SWEEP. Only a
+    /// merge seen to happen is stamped: a row the cache hydrated as merged,
+    /// or whose first answer ever says merged, landed some other day and
+    /// paints solid purple from the first frame.
+    pub merge_landed: HashMap<WorktreeId, std::time::Instant>,
     /// How far the user has read into each pull request's conversation,
     /// keyed by PR URL — the daemon's `pr_seen` rows, plus whatever this
     /// session has marked since. What's newer than the mark is what the
@@ -3153,6 +3398,7 @@ impl App {
             term_file_links: Vec::new(),
             panel_widths: DEFAULT_PANEL_WIDTHS,
             diff_files_width: DEFAULT_DIFF_FILES_W,
+            diff_tree: false,
             settings_tab: 0,
             settings_selected: vec![0; crate::config::tab_count()],
             settings_on_tabs: true,
@@ -3175,6 +3421,7 @@ impl App {
             git_changes: None,
             git_changes_inflight: None,
             pull_requests: HashMap::new(),
+            merge_landed: HashMap::new(),
             pr_seen: HashMap::new(),
             pr_inflight: std::collections::HashSet::new(),
             pr_recheck: HashMap::new(),
@@ -3293,24 +3540,71 @@ impl App {
     }
 
     /// Some sidebar row is showing a running (yellow) or needs-feedback
-    /// (red) status, or a checkout row wears its merged pull request
-    /// (purple), so its text sweep should be ticking. Any live agent in
-    /// one of those states surfaces somewhere — its own row, or a worktree /
-    /// project rollup — unless the panels are hidden (collapsed, editor
-    /// modal, splash) or animations are switched off. A merged checkout
-    /// only shows while its project is selected, so only those keep the
-    /// clock running.
+    /// (red) status, or is inside a ONE-SHOT SWEEP — a turn that just
+    /// finished unread (blue), a checkout whose pull request was just seen
+    /// to merge (purple) — so its text sweep should be ticking. Any agent
+    /// in one of those states surfaces somewhere — its own row, or a
+    /// worktree / project rollup — unless the panels are hidden (collapsed,
+    /// editor modal, splash) or animations are switched off. A merged
+    /// checkout only shows while its project is selected, so only those
+    /// keep the clock running. The one-shots run out on the clock, so an
+    /// idle app with a week-old merged checkout on screen repaints nothing.
     pub fn status_anim_active(&self) -> bool {
+        let now = now_ms();
         self.animations
             && !self.collapsed
             && self.vim.is_none()
             && !self.splash_active()
             && (self.tree.agents.iter().any(|a| {
-                !a.archived && matches!(a.status, AgentStatus::Running | AgentStatus::NeedsFeedback)
+                !a.archived
+                    && (matches!(a.status, AgentStatus::Running | AgentStatus::NeedsFeedback)
+                        || fresh_done(a, now))
             }) || self
                 .visible_worktrees()
                 .iter()
-                .any(|w| self.worktree_wears_merge(&w.id)))
+                .any(|w| self.worktree_wears_merge(&w.id) && self.merge_is_fresh(&w.id)))
+    }
+
+    /// This client just saw `worktree`'s pull request turn merged: start
+    /// the row's ONE-SHOT SWEEP. Stamps that have run out go as new ones
+    /// arrive, so the map holds a few seconds' worth at most.
+    pub fn note_merge_landed(&mut self, worktree: WorktreeId) {
+        self.merge_landed
+            .retain(|_, at| at.elapsed() < ONE_SHOT_SWEEP);
+        self.merge_landed
+            .insert(worktree, std::time::Instant::now());
+    }
+
+    /// Whether the checkout's merge was seen to land within the last
+    /// `ONE_SHOT_SWEEP` — the purple row still sweeps; after, it is solid.
+    pub fn merge_is_fresh(&self, worktree_id: &WorktreeId) -> bool {
+        self.merge_landed
+            .get(worktree_id)
+            .is_some_and(|at| at.elapsed() < ONE_SHOT_SWEEP)
+    }
+
+    /// Whether the session's unread finish still sweeps ([`fresh_done`]).
+    pub fn agent_fresh_done(&self, agent: &Agent) -> bool {
+        fresh_done(agent, now_ms())
+    }
+
+    /// The same for a worktree row's rollup — or, on a row that wears its
+    /// merged pull request, whether the merge still sweeps: the one flag a
+    /// checkout's row needs, whichever story it is telling.
+    pub fn worktree_fresh(&self, worktree_id: &WorktreeId) -> bool {
+        if self.worktree_wears_merge(worktree_id) {
+            self.merge_is_fresh(worktree_id)
+        } else {
+            worktree_fresh_done(&self.tree, worktree_id, now_ms())
+        }
+    }
+
+    pub fn project_fresh_done(&self, project_id: &ProjectId) -> bool {
+        project_fresh_done(&self.tree, project_id, now_ms())
+    }
+
+    pub fn workspace_fresh_done(&self, workspace_id: &WorkspaceId) -> bool {
+        workspace_fresh_done(&self.tree, workspace_id, now_ms())
     }
 
     /// Frame counter for the status-sweep text animation — a pure function

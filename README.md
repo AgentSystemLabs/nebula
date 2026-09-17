@@ -44,7 +44,7 @@ dot on a collapsed PROJECT tells you exactly where to look without opening anyth
 |---|---|
 | **One tree, up to four PANELS** | PROJECTS → WORKTREES → SESSIONS → TERMINAL PANE. `h`/`j`/`k`/`l` moves, `Enter` drills in, and landing on a live pane hands it the keyboard — so `Tab` all the way right and start typing at the agent. |
 | **A DAEMON that owns the PTYs** | Quit the TUI, shut the laptop, come back tomorrow. The agents never stopped, and the SCROLLBACK RING is replayed on ATTACH. |
-| **STATUS DOTS you read instead of screens** | ● yellow mid-turn, ● violet finished and UNSEEN, ● green finished and read, ● red waiting on you — plus a violet `n done` DONE BADGE counting the terminals you still owe a look. |
+| **STATUS DOTS you read instead of screens** | ● yellow mid-turn, ● blue finished and UNSEEN, ● green finished and read, ● red waiting on you — plus a blue `n done` DONE BADGE counting the terminals you still owe a look. |
 | **Lists that order themselves** | PROJECTS, WORKTREES and SESSIONS all sit most-recent-first in RECENCY ORDER, with a dim `23m ago` after the name saying why the row is where it is. The one fixed seat is the ROOT WORKTREE, always the first WORKTREES PANEL row; nothing else is pinned or dragged into place by hand. |
 | **Real git WORKTREES, one keystroke** | `n` in the WORKTREES PANEL branches off into an actual `git worktree`. Two agents in two directories never collide. A WORKTREE HOOK in git config lets a project claim a port or a route when a checkout is created and release it when it is deleted. |
 | **The root checkout on any branch, no shell** | `c` on the ROOT WORKTREE lists every branch and remote branch, fuzzy-filtered as you type; `Enter` switches, or creates the branch when nothing matches. Uncommitted changes? The BRANCH SWITCHER asks first — stash them, bring them along, commit them, or discard them — the way an IDE would. |
@@ -141,7 +141,7 @@ Claude's prompt box and `/resume` picker on your next prompt.
 |---|---|
 | ● gray | FRESH — agent never run |
 | ● yellow | RUNNING — turn in progress (the STOP GATE holds it open while subagents are live) |
-| ● violet | UNSEEN — turn complete and nobody has looked at it yet |
+| ● blue | UNSEEN — turn complete and nobody has looked at it yet |
 | ● green | FINISHED — the same finished turn, once the cursor has been on the SESSION |
 | ● red | NEEDS FEEDBACK — permission prompt or question waiting on you |
 | ● magenta | terminated — process died mid-run |
@@ -152,11 +152,15 @@ event, so waiting-on-you is not detectable there. A Muse SESSION never goes red 
 has no managed hooks, so its status is process-based until a hook dialect is mapped.
 
 WORKTREE and PROJECT rows ROLL UP their children: red beats yellow beats done, and a parent's dot is
-violet whenever anything UNSEEN finished under it — so the violet walks up the tree and turns green as
+blue whenever anything UNSEEN finished under it — so the blue walks up the tree and turns green as
 you read your way down it.
 
-A dot going violet while you were looking elsewhere is easy to miss, so nebula counts those for you. When
-a turn finishes in a pane that isn't on screen, its WORKTREE and PROJECT rows grow a violet `n done`
+A dot going blue while you were looking elsewhere is easy to miss, so nebula marks the moment and then
+keeps count. The moment: a row's name sweeps — a bright band crossing it — in yellow while it runs and in
+red while it waits on you, for as long as either lasts; a turn that finishes unread sweeps blue for about
+five seconds, on its own row and every row that rolls it up, and then holds still. Motion means live, or
+just changed; a row at rest is at rest (`animations` off stills all of it). The count: when
+a turn finishes in a pane that isn't on screen, its WORKTREE and PROJECT rows grow a blue `n done`
 DONE BADGE — the number of terminals you have left to go read — and the SESSION row says `done` where its
 HARNESS BADGE normally sits. Walking the cursor onto a SESSION previews it, which reads it: the badges
 count down as you go and disappear at zero — `]` walks you onto the next one owed a look without hunting
