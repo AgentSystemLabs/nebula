@@ -2566,6 +2566,50 @@ fn row_badges(unseen: usize, th: Theme) -> (Vec<(String, Style)>, usize) {
     (badges, len)
 }
 
+/// The PR & ISSUE COUNTS badge of a project row (Settings → Experimental):
+/// ` 3 prs · 2 issues` — the pull requests in the accent the OPEN PRS rows
+/// wear (`pr_row::look`), the issues in the green the ISSUES MODAL paints
+/// `open` in, a dim `·` between — as spans, with the columns they take
+/// together so the name can be truncated around them. A count that is
+/// zero, or not known yet, leaves its word out, and the badge goes with
+/// both; one `pr` or `issue` is singular; a list cut off at the fetch cap
+/// counts `100+`, as the OPEN PRS header does.
+fn open_counts_badge(
+    counts: (Option<usize>, Option<usize>),
+    th: Theme,
+) -> Option<(Vec<(String, Style)>, usize)> {
+    fn word(n: usize, one: &str, many: &str, cap: usize) -> Option<String> {
+        match n {
+            0 => None,
+            1 => Some(format!("1 {one}")),
+            n if n >= cap => Some(format!("{cap}+ {many}")),
+            n => Some(format!("{n} {many}")),
+        }
+    }
+    let (prs, issues) = counts;
+    let parts = [
+        prs.and_then(|n| word(n, "pr", "prs", crate::pull_request::LIST_LIMIT))
+            .map(|text| (text, th.accent)),
+        issues
+            .and_then(|n| word(n, "issue", "issues", crate::issues::LIST_LIMIT))
+            .map(|text| (text, th.ok)),
+    ];
+    let mut spans: Vec<(String, Style)> = Vec::new();
+    for (text, color) in parts.into_iter().flatten() {
+        if spans.is_empty() {
+            spans.push((format!(" {text}"), Style::default().fg(color)));
+        } else {
+            spans.push((" · ".into(), Style::default().fg(th.dim)));
+            spans.push((text, Style::default().fg(color)));
+        }
+    }
+    if spans.is_empty() {
+        return None;
+    }
+    let len = spans.iter().map(|(s, _)| s.chars().count()).sum();
+    Some((spans, len))
+}
+
 /// Sweep shades for a status that animates. The live two sweep for as long
 /// as they last: running rows shimmer yellow, needs-feedback rows red. A
 /// finished row takes the ONE-SHOT SWEEP — the done ramp, while `fresh`
@@ -3421,8 +3465,9 @@ fn push_bar_collapse_chevron(f: &mut Frame, app: &mut App, area: Rect, row_y: u1
 /// Per-row display data of the Projects panel, pre-collected to end the
 /// tree borrow: name, the folder name to show under it (Some only once the
 /// row has been renamed away from it), rollup, unwatched-finish count,
-/// last-turn stamp, and whether one of those finishes still sweeps
-/// (`App::project_fresh_done`).
+/// last-turn stamp, whether one of those finishes still sweeps
+/// (`App::project_fresh_done`), and the PR & ISSUE COUNTS
+/// (`App::project_open_counts` — both `None` with the switch off).
 type ProjectRowData = (
     String,
     Option<String>,
@@ -3430,6 +3475,7 @@ type ProjectRowData = (
     usize,
     i64,
     bool,
+    (Option<usize>, Option<usize>),
 );
 
 /// The same for the Worktrees panel: branch, is-root, rollup,
@@ -3515,11 +3561,12 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                 app.project_unseen(&p.id),
                 app.project_recency(&p.id).stamped,
                 app.project_fresh_done(&p.id),
+                app.project_open_counts(&p.id),
             )
         })
         .collect();
     let mut screen_row = 0usize;
-    for (row_idx, (text, folder, roll, unseen, stamped, fresh)) in rows.iter().enumerate() {
+    for (row_idx, (text, folder, roll, unseen, stamped, fresh, counts)) in rows.iter().enumerate() {
         // A renamed row grows by the one line its folder name takes, so the
         // pads above and below stay a row each either way.
         let height = PROJECT_BTN_H + folder.is_some() as u16;
@@ -3529,11 +3576,30 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
         // Same badge as worktree rows: sessions that finished unwatched
         // anywhere under the project.
         let (badges, badge_len) = row_badges(*unseen, th);
+        let mut free = (inner.width as usize).saturating_sub(3 + badge_len);
+        // PR & ISSUE COUNTS (Settings → Experimental), after the ago label
+        // and before the done badge. They take their columns first — the
+        // switch was turned on to see them — and drop out whole, the way
+        // the ago label does, before the name would be squeezed under
+        // `MIN_NAME_W`.
+        let counts = open_counts_badge(*counts, th).filter(|(_, len)| {
+            free.checked_sub(*len)
+                .is_some_and(|rest| rest >= MIN_NAME_W)
+        });
+        if let Some((_, len)) = &counts {
+            free -= len;
+        }
         // How long since anything under the project last did something,
         // dim after the name. The column is sorted on this stamp, so the
-        // label is what makes the order legible.
-        let free = (inner.width as usize).saturating_sub(3 + badge_len);
-        let (ago, name_max) = fit_ago(ago_badge(*stamped), free);
+        // label is what makes the order legible. With counts following it
+        // ends in a ` -`, so `3m ago - 4 prs` reads as two facts rather
+        // than one run of words; the dash is the label's and goes when the
+        // label goes.
+        let mut ago = ago_badge(*stamped);
+        if counts.is_some() && !ago.is_empty() {
+            ago.push_str(" -");
+        }
+        let (ago, name_max) = fit_ago(ago, free);
         // Bold name: the top of the tree reads "biggest".
         let mut spans = vec![status_dot(*roll, *unseen > 0, th)];
         spans.extend(status_name_spans(
@@ -3544,6 +3610,13 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
         ));
         if !ago.is_empty() {
             spans.push(Span::styled(ago, Style::default().fg(th.dim)));
+        }
+        if let Some((counts, _)) = counts {
+            spans.extend(
+                counts
+                    .into_iter()
+                    .map(|(text, style)| Span::styled(text, style)),
+            );
         }
         for (text, style) in badges {
             spans.push(Span::styled(text, style));
@@ -6093,6 +6166,172 @@ mod tests {
         assert_eq!(done.color(true, th), th.done);
         assert_eq!(done.color(false, th), th.ok);
         assert_eq!(RowState::Sessions(None).dot(false, th).content, "○ ");
+    }
+
+    /// PR & ISSUE COUNTS (Settings → Experimental): with the switch on, a
+    /// project row counts its open pull requests and issues after its
+    /// name — the pull requests in the accent, the issues in green, a dim
+    /// dot between, and a dash closing the ago label when one precedes
+    /// them — drafts left out as `hide_draft_prs` says; a count still
+    /// unknown or zero leaves its word out; a column too narrow for the
+    /// badge drops it whole rather than squeezing the name, and one too
+    /// narrow for the ago label beside it drops the label first. Off, the
+    /// row is what it always was, whatever the lists hold. On out of the
+    /// box: the one Experimental row that starts on.
+    #[test]
+    fn project_row_counts_its_open_prs_and_issues_when_the_switch_is_on() {
+        let mut app = hit_test_app(&["main"], &["a"], &[]);
+        let pid = app.tree.projects[0].id.clone();
+        let now = std::time::Instant::now();
+        let pr = |number: u64, is_draft: bool| crate::pull_request::OpenPr {
+            number,
+            title: format!("pr {number}"),
+            url: format!("https://github.com/o/r/pull/{number}"),
+            is_draft,
+            head: format!("b{number}"),
+        };
+        let issue = |number: u64| crate::issues::Issue {
+            number,
+            url: format!("https://github.com/o/r/issues/{number}"),
+            title: format!("issue {number}"),
+            author: "webdevcody".into(),
+            created_at: "2026-09-10T12:00:00Z".into(),
+            updated_at: "2026-09-11T12:00:00Z".into(),
+            labels: Vec::new(),
+            body: String::new(),
+        };
+        app.open_prs.insert(
+            pid.clone(),
+            crate::app::OpenPrs {
+                list: vec![pr(1, false), pr(2, false), pr(3, true)],
+                at: now,
+                due: now,
+                step: std::time::Duration::from_secs(15),
+            },
+        );
+        let render = |app: &mut App, width: u16| -> Vec<(Vec<String>, Vec<Color>)> {
+            let area = Rect::new(0, 0, width, 8);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 8)).unwrap();
+            terminal.draw(|f| draw_projects(f, app, area)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..8)
+                .map(|y| {
+                    let cells: Vec<_> = (0..width)
+                        .map(|x| buf.cell((x, y)).unwrap().clone())
+                        .collect();
+                    (
+                        cells.iter().map(|c| c.symbol().to_string()).collect(),
+                        cells.iter().map(|c| c.fg).collect(),
+                    )
+                })
+                .collect()
+        };
+        // The demo row's text, and the cell column its badge starts on.
+        let row = |app: &mut App, width: u16| -> (String, Vec<Color>) {
+            render(app, width)
+                .into_iter()
+                .map(|(cells, colors)| (cells.concat(), colors))
+                .find(|(line, _)| line.contains("demo"))
+                .expect("the demo row")
+        };
+        let th = app.theme;
+
+        assert!(app.pr_issue_counts, "on out of the box");
+        let (line, _) = row(&mut app, 40);
+        assert!(
+            line.contains("demo 3 prs") && !line.contains("issue"),
+            "issues not asked yet: only the pull requests: {line:?}"
+        );
+        app.issues.insert(
+            pid.clone(),
+            crate::issues::IssueList {
+                list: vec![issue(9)],
+                at: now,
+            },
+        );
+        let (line, colors) = row(&mut app, 40);
+        assert!(line.contains("demo 3 prs · 1 issue"), "{line:?}");
+        // Cell-wise: the rail and dot ahead of the name are multi-byte.
+        let column = |line: &str, word: &str| {
+            let cells: Vec<char> = line.chars().collect();
+            let word: Vec<char> = word.chars().collect();
+            cells
+                .windows(word.len())
+                .position(|w| w == word.as_slice())
+                .unwrap_or_else(|| panic!("{word:?} in {line:?}"))
+        };
+        assert_eq!(
+            colors[column(&line, "3 prs")],
+            th.accent,
+            "the accent the OPEN PRS rows wear"
+        );
+        assert_eq!(
+            colors[column(&line, "1 issue")],
+            th.ok,
+            "the green the ISSUES MODAL paints open in"
+        );
+        // The dot is chrome in the ago label's dim — lifted to muted on
+        // this row, the selected one, as `render_button` lifts every dim
+        // span off the selection fill.
+        assert_eq!(colors[column(&line, "·")], th.muted, "dim, lifted");
+
+        app.hide_draft_prs = true;
+        let (line, _) = row(&mut app, 40);
+        assert!(
+            line.contains("demo 2 prs · 1 issue"),
+            "drafts out, as the group header counts them: {line:?}"
+        );
+        app.hide_draft_prs = false;
+
+        // Under a session that has run, the ago label closes in a dash so
+        // the two facts read apart: `3m ago - 3 prs · 1 issue`.
+        app.tree.agents[0].status_changed_at = crate::app::now_ms() - 3 * 60_000;
+        let (line, colors) = row(&mut app, 40);
+        assert!(
+            line.contains("demo 3m ago - 3 prs · 1 issue"),
+            "the ago label ends in a dash when counts follow: {line:?}"
+        );
+        assert_eq!(
+            colors[column(&line, "-")],
+            colors[column(&line, "ago")],
+            "the dash is the label's"
+        );
+        // A column with room for the counts but not the label beside them
+        // drops the label, dash and all — the counts are what the switch
+        // was turned on for.
+        let (line, _) = row(&mut app, 30);
+        assert!(
+            line.contains("demo 3 prs · 1 issue") && !line.contains("ago") && !line.contains('-'),
+            "{line:?}"
+        );
+        app.tree.agents[0].status_changed_at = 0;
+
+        app.issues.get_mut(&pid).unwrap().list.clear();
+        let (line, _) = row(&mut app, 40);
+        assert!(
+            line.contains("demo 3 prs") && !line.contains("issue"),
+            "zero says nothing: {line:?}"
+        );
+        app.issues.get_mut(&pid).unwrap().list = (0..120).map(issue).collect();
+        let (line, _) = row(&mut app, 40);
+        assert!(
+            line.contains("demo 3 prs · 100+ issues"),
+            "cut off at the fetch cap: {line:?}"
+        );
+
+        let (line, _) = row(&mut app, 14);
+        assert!(
+            line.contains("demo") && !line.contains("prs"),
+            "too narrow: the badge drops before the name is squeezed: {line:?}"
+        );
+
+        app.pr_issue_counts = false;
+        let (line, _) = row(&mut app, 40);
+        assert!(
+            !line.contains("prs"),
+            "off: whatever the lists hold, the row is what it was: {line:?}"
+        );
     }
 
     /// A checkout whose RUN COMMAND is up wears a green `▶ running` after

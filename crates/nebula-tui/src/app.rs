@@ -2946,6 +2946,12 @@ pub struct App {
     /// The KEY COMBO DISPLAY is on; mirrors CONFIG.JSON's `show_key_combos`
     /// (Settings → Experimental). `key_combo` is what it is showing.
     pub show_key_combos: bool,
+    /// PR & ISSUE COUNTS are on: each PROJECTS PANEL row counts its repo's
+    /// open pull requests and issues after its name; mirrors CONFIG.JSON's
+    /// `pr_issue_counts` (Settings → Experimental). Read through
+    /// `project_open_counts`, and what lets `issues::sweep_others` ask
+    /// about the projects the cursor is not on.
+    pub pr_issue_counts: bool,
     /// The last key press, spelled for the bottom-left of the screen with
     /// what it did, while the display is on and the press is fresh; the
     /// loop clears it after `key_combo::LINGER`. See `key_combo.rs`.
@@ -3350,6 +3356,7 @@ impl App {
             project_fallback: Default::default(),
             recent_prompts: 0,
             show_key_combos: false,
+            pr_issue_counts: true,
             key_combo: None,
             next_req_id: 1,
             pending: HashMap::new(),
@@ -4482,6 +4489,26 @@ impl App {
     pub fn keepwarm_delay(&self) -> Option<std::time::Duration> {
         let at = self.next_keepwarm.as_ref()?;
         Some(at.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// PR & ISSUE COUNTS for a project row, while the switch is on: how
+    /// many open pull requests its OPEN PRS GROUP lists (drafts left out
+    /// with `hide_draft_prs`, so the number is the group header's), and
+    /// how many issues are open on the repo. Each is `None` until its list
+    /// has landed — a repo nobody has asked about yet says nothing rather
+    /// than `0` — and both are `None` with the switch off.
+    pub fn project_open_counts(&self, project_id: &ProjectId) -> (Option<usize>, Option<usize>) {
+        if !self.pr_issue_counts {
+            return (None, None);
+        }
+        let prs = self.open_prs.get(project_id).map(|open| {
+            open.list
+                .iter()
+                .filter(|pr| !(self.hide_draft_prs && pr.is_draft))
+                .count()
+        });
+        let issues = self.issues.get(project_id).map(|l| l.list.len());
+        (prs, issues)
     }
 
     /// Aggregate status for a worktree row: red > yellow > green > gray,

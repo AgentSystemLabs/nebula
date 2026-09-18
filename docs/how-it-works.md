@@ -227,6 +227,13 @@
   one line in the hook receiver, kept on the AGENT row (the newest ten, in SQLite) and drawn under its
   pill in the SESSIONS PANEL with an ago label, newest last. Pure capture: nothing is injected into the
   model's context and no extra turn runs. See [Sessions](sessions.md#recent-prompts).
+- **Project rows count what is waiting on the repo.** With **PR & issue counts** on (Settings →
+  Experimental; on out of the box), each PROJECTS PANEL row says `3m ago - 3 prs · 2 issues` after
+  its name, the pull requests in the accent the OPEN PRS rows wear and the issues in green — the open
+  pull requests the OPEN PRS sweep already keeps warm for every project (drafts left out while
+  `hide_draft_prs` is on), and the open issues, which a sweep of their own asks for one project per
+  tick on a five-minute beat only while the switch is on. Zero says nothing, and a narrow column
+  drops the badge before the name. See [Configuration](configuration.md#every-setting).
 - **Ask the agent for a worktree and it moves there.** Tell a Claude session "do this in a worktree" and
   it runs `nebula worktree <name>` instead of its own `EnterWorktree` tool (whose checkouts land under
   `<repo>/.claude/worktrees/` on a `worktree-*` branch). nebula creates the checkout in its usual
@@ -307,7 +314,10 @@ remote — just shows no rows instead of an error. Only the selected project is 
 selected worktree's PR ROW and its PROJECT OPEN PRS GROUP on every tick, one process each, and its other
 checkouts on a sweep that takes one of them per tick — so every worktree row learns whether its branch
 has merged without the cursor ever visiting it (the ROOT WORKTREE is left out; nobody deletes it over a
-merge). Nothing is stacked while a call is in flight, and each is abandoned after 20 s. The selected
+merge). Nothing is stacked while a call is in flight, and each is abandoned after 20 s. With **PR &
+issue counts** on (Settings → Experimental, on out of the box), the other projects' open issues are
+swept the same way, one project per tick on the five-minute beat, so the counts on the PROJECTS
+PANEL rows are minutes old at worst. The selected
 worktree and the open list settle onto a steady 15 s beat; the swept checkouts onto 5 min, since a
 merge reaches them sooner anyway — the moment a pull request drops out of the open list, the checkout on
 its branch is asked again on the next tick, and turns purple seconds after the merge. An empty answer

@@ -390,6 +390,10 @@ async fn main_loop(
                 // The selected project's open issues, on the same beat, so
                 // `i` paints rows that are at most a couple of minutes old.
                 crate::issues::refresh_selected(&mut app);
+                // And, with PR & ISSUE COUNTS on, one other project's — the
+                // pass that keeps every row's count warm, `sweep_open_prs`
+                // for issues. Off, it asks nobody.
+                crate::issues::sweep_others(&mut app);
                 // Whatever the answers above changed since the last tick
                 // goes to disk, off the loop; the next launch paints from it.
                 if let Some((cache, store, live)) = crate::pr_cache::take_flush(&mut app) {
@@ -5701,6 +5705,7 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     set_projects_config(app, cfg.projects.clone(), cfg.project_fallback());
     set_hide_draft_prs(app, cfg.hide_draft_prs);
     app.recent_prompts = cfg.recent_prompts_shown();
+    app.pr_issue_counts = cfg.pr_issue_counts;
     app.show_key_combos = cfg.show_key_combos;
     if !app.show_key_combos {
         // Switched off: whatever the display was showing comes down now
@@ -33410,6 +33415,24 @@ diff --git a/src/c.rs b/src/c.rs
         assert!(app.key_combo.is_none(), "nothing lingers once it is off");
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
         assert!(app.key_combo.is_none());
+    }
+
+    /// PR & ISSUE COUNTS is live the same way: the switch reaches the
+    /// running app on apply, on and off, so the rows change on the next
+    /// paint and the issues sweep starts (or stops) on the next tick.
+    #[test]
+    fn pr_issue_counts_follows_the_config_on_apply() {
+        let mut app = App::new();
+        assert!(app.pr_issue_counts, "on out of the box, as the config is");
+        let mut cfg = crate::config::Config {
+            pr_issue_counts: false,
+            ..Default::default()
+        };
+        apply_config(&mut app, &cfg);
+        assert!(!app.pr_issue_counts);
+        cfg.pr_issue_counts = true;
+        apply_config(&mut app, &cfg);
+        assert!(app.pr_issue_counts);
     }
 
     /// Where it draws: the footer's padding row, far left — the one blank

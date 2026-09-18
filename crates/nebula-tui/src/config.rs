@@ -374,6 +374,7 @@ pub enum SettingKind {
     RecentPromptsCount,
     ShowKeyCombos,
     RememberHarness,
+    PrIssueCounts,
     HideUninstalledHarnesses,
 }
 
@@ -598,8 +599,8 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             },
         ]),
     },
-    // Behaviors that change how the tree is worked, off by default until
-    // they have earned a tab of their own. Before Hotkeys, which stays
+    // Behaviors that change how the tree is worked, off by default (PR &
+    // ISSUE COUNTS excepted) until they have earned a tab of their own. Before Hotkeys, which stays
     // last for the reason above.
     SettingsTab {
         title: "Experimental",
@@ -626,6 +627,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::RememberHarness,
                 label: "Remember harness",
                 hint: "A harness (and model) picked for a session becomes the Agents tab default the next launch starts on",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::PrIssueCounts,
+                label: "PR & issue counts",
+                hint: "Count each project's open pull requests and issues after its name, 3 prs · 2 issues",
                 group: "",
             },
         ]),
@@ -1013,6 +1020,17 @@ pub struct Config {
     /// ([`Config::remember_launch`]). Off by default: a pick is one
     /// session's, and the AGENTS TAB is where the defaults are set.
     pub remember_harness: bool,
+    /// Experimental: PR & ISSUE COUNTS — each PROJECTS PANEL row counts
+    /// the repo's open pull requests and issues after its name (`3 prs ·
+    /// 2 issues`), so what is waiting on a repo reads off the column
+    /// without visiting it. The pull requests are the lists the OPEN PRS
+    /// sweep already keeps warm for every project; the issues take a
+    /// sweep of their own (`issues::sweep_others`), one project per tick,
+    /// that only runs while this is on. On by default — the sweep is one
+    /// `gh issue list` per project every five minutes, well inside the
+    /// budget — and the one Experimental switch that is; off, the rows
+    /// are what they were and no project but the selected one is asked.
+    pub pr_issue_counts: bool,
     /// Default model/effort for new Claude / Codex / Cursor sessions.
     /// "default" means "don't pass the flag" (the CLI picks); any other
     /// value is passed through verbatim, so hand-edited configs can name
@@ -1223,6 +1241,7 @@ impl Default for Config {
             recent_prompts_count: DEFAULT_RECENT_PROMPTS_COUNT,
             show_key_combos: false,
             remember_harness: false,
+            pr_issue_counts: true,
             claude_model: DEFAULT_CHOICE.into(),
             claude_models: Vec::new(),
             claude_effort: DEFAULT_CHOICE.into(),
@@ -2029,6 +2048,7 @@ impl Config {
             SettingKind::RecentPrompts => on_off(self.recent_prompts).into(),
             SettingKind::ShowKeyCombos => on_off(self.show_key_combos).into(),
             SettingKind::RememberHarness => on_off(self.remember_harness).into(),
+            SettingKind::PrIssueCounts => on_off(self.pr_issue_counts).into(),
             SettingKind::RecentPromptsCount => self
                 .recent_prompts_count
                 .clamp(1, nebula_core::RECENT_PROMPTS_KEPT)
@@ -2142,6 +2162,9 @@ impl Config {
             }
             SettingKind::RememberHarness => {
                 self.remember_harness = !self.remember_harness;
+            }
+            SettingKind::PrIssueCounts => {
+                self.pr_issue_counts = !self.pr_issue_counts;
             }
             SettingKind::HideUninstalledHarnesses => {
                 self.hide_uninstalled_harnesses = !self.hide_uninstalled_harnesses;
@@ -3526,6 +3549,46 @@ mod tests {
 
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(!cfg.remember_harness);
+    }
+
+    /// PR & ISSUE COUNTS: an Experimental switch, on by default — the one
+    /// on the tab that is — a plain toggle persisted under
+    /// `pr_issue_counts`, unknown to a config written before it (which
+    /// reads as on). The newest switch, so it sits last on the tab, under
+    /// REMEMBER HARNESS.
+    #[test]
+    fn pr_issue_counts_is_on_by_default_on_the_experimental_tab_and_persists() {
+        let mut cfg = Config::default();
+        assert!(cfg.pr_issue_counts, "the rows count out of the box");
+        assert_eq!(cfg.value_label(SettingKind::PrIssueCounts), "on");
+
+        let (tab, row) = locate(SettingKind::PrIssueCounts).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Experimental");
+        assert_eq!(tab + 1, hotkeys_tab(), "Hotkeys stays last");
+        let (harness_tab, harness_row) = locate(SettingKind::RememberHarness).unwrap();
+        assert_eq!(
+            (harness_tab, harness_row + 1),
+            (tab, row),
+            "the newest switch sits last"
+        );
+        cfg.cycle(tab, row, 0);
+        assert!(!cfg.pr_issue_counts);
+        assert_eq!(cfg.value_label(SettingKind::PrIssueCounts), "off");
+        cfg.cycle(tab, row, 1);
+        assert!(cfg.pr_issue_counts, "either arrow toggles it back");
+        cfg.cycle(tab, row, -1);
+        assert!(!cfg.pr_issue_counts);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(!load_from(&path).pr_issue_counts, "off survives a save");
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(
+            cfg.pr_issue_counts,
+            "a config from before the key reads as on"
+        );
     }
 
     /// What a remembered launch writes: the harness into the QUICK

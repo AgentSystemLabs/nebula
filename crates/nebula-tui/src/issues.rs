@@ -83,6 +83,13 @@ pub(crate) const REFRESH: std::time::Duration = std::time::Duration::from_secs(2
 /// settles at the ceiling instead of being asked every beat.
 pub(crate) const RECHECK_MIN: std::time::Duration = std::time::Duration::from_secs(30);
 pub(crate) const RECHECK_MAX: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// How often the open issues of a project the cursor is *not* on are
+/// re-asked while PR & ISSUE COUNTS is on (Settings → Experimental) — the
+/// open pull requests' sweep beat, for the same budget: one `gh issue list`
+/// per project per beat, one project per tick ([`sweep_others`]), twelve
+/// calls an hour per project. With the switch off no project but the
+/// selected one is ever asked.
+pub(crate) const SWEEP_REFRESH: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 /// A list younger than this is what opening the modal shows, with no second
 /// ask: the prefetch that landed as the cursor settled *is* the answer `i`
 /// was waiting for. `r` asks regardless.
@@ -755,6 +762,52 @@ fn ask_selected_if_due(app: &mut App) {
     if prefetch_due(app, &project) {
         request_list(app, project, dir);
     }
+}
+
+/// The git tick, with PR & ISSUE COUNTS on: ask for the open issues of one
+/// project the cursor is *not* on, off the loop — the pass that keeps
+/// every PROJECTS PANEL row's count warm without the user visiting the
+/// project, the open pull requests' `sweep_open_prs` for issues. One
+/// process per tick at most ([`sweep_target`]); the answer lands on
+/// `App::issues_tx` like the selected project's own, which stays on its
+/// faster beat. With the switch off nothing is asked: the counts are the
+/// only reader, and the rows would spend a `gh` call per project for
+/// nothing.
+pub(crate) fn sweep_others(app: &mut App) {
+    if !app.pr_issue_counts {
+        return;
+    }
+    let Some((project, dir)) = sweep_target(app) else {
+        return;
+    };
+    request_list(app, project, dir);
+}
+
+/// The project the sweep should spend this tick on, if any: the first of
+/// the workspace's projects, in row order, that isn't selected, isn't in
+/// flight, and was never asked, or whose list is older than
+/// [`SWEEP_REFRESH`] — or whose own beat has run out, when that backoff is
+/// the longer wait (a repo with nothing open, or no `gh`, keeps its
+/// doubling step; a list that landed is on the two-minute [`REFRESH`],
+/// which the sweep's slower beat overrides).
+pub(crate) fn sweep_target(app: &App) -> Option<(ProjectId, PathBuf)> {
+    let selected = app.selected_project().map(|p| p.id.clone());
+    let now = std::time::Instant::now();
+    app.project_rows()
+        .into_iter()
+        .map(|i| &app.tree.projects[i])
+        .filter(|p| Some(&p.id) != selected.as_ref() && !app.issues_inflight.contains(&p.id))
+        .find(|p| match app.issues_due.get(&p.id) {
+            Some(beat) => {
+                let listed_recently = app
+                    .issues
+                    .get(&p.id)
+                    .is_some_and(|l| now < l.at + SWEEP_REFRESH);
+                now >= beat.due && !listed_recently
+            }
+            None => true,
+        })
+        .map(|p| (p.id.clone(), p.repo_path.clone()))
 }
 
 /// Whether the background should ask for this project now: not while an
@@ -2208,6 +2261,85 @@ mod tests {
             sort_order: 0,
         });
         project
+    }
+
+    /// PR & ISSUE COUNTS on, the git tick sweeps the other projects one
+    /// per tick on a slow beat — never the selected one (it has its own),
+    /// never one in flight, and only past its own backoff. Off, the sweep
+    /// asks nobody.
+    #[test]
+    fn the_sweep_visits_the_other_projects_only_while_counts_are_on() {
+        let mut app = App::new();
+        let p1 = seed_project(&mut app, "p1", "/nonexistent/nebula-issues-sweep-1");
+        let p2 = seed_project(&mut app, "p2", "/nonexistent/nebula-issues-sweep-2");
+        assert_eq!(
+            app.selected_project().map(|p| p.id.clone()),
+            Some(p1.clone())
+        );
+        let target = |app: &App| sweep_target(app).map(|(id, _)| id);
+        assert_eq!(target(&app), Some(p2.clone()), "never asked: due");
+
+        app.pr_issue_counts = false;
+        sweep_others(&mut app);
+        assert!(
+            app.issues_failed.is_empty() && app.issues_due.is_empty(),
+            "off: the sweep asks nobody"
+        );
+
+        app.pr_issue_counts = true;
+        sweep_others(&mut app);
+        assert!(
+            app.issues_failed.contains(&p2),
+            "not on disk: a miss without a process"
+        );
+        assert!(
+            !app.issues_failed.contains(&p1),
+            "the selected project is the prefetch's, never the sweep's"
+        );
+        assert_eq!(target(&app), None, "the miss armed its backoff");
+
+        let now = std::time::Instant::now();
+        app.issues.insert(
+            p2.clone(),
+            IssueList {
+                list: vec![issue(1, "a")],
+                at: now,
+            },
+        );
+        app.issues_due.insert(
+            p2.clone(),
+            IssuesBeat {
+                due: now,
+                backoff: None,
+            },
+        );
+        assert_eq!(
+            target(&app),
+            None,
+            "answered just now: the sweep's beat is slower than REFRESH"
+        );
+        let stale = now
+            .checked_sub(SWEEP_REFRESH + std::time::Duration::from_secs(1))
+            .expect("machine up for minutes");
+        app.issues.get_mut(&p2).unwrap().at = stale;
+        assert_eq!(target(&app), Some(p2.clone()), "older than the beat");
+
+        app.issues_due.get_mut(&p2).unwrap().due = now + RECHECK_MAX;
+        assert_eq!(target(&app), None, "its own, longer backoff holds it");
+        app.issues_due.get_mut(&p2).unwrap().due = now;
+
+        app.issues_inflight.insert(p2.clone());
+        assert_eq!(target(&app), None, "already in flight");
+        app.issues_inflight.clear();
+        assert_eq!(target(&app), Some(p2.clone()));
+
+        app.issues_due.remove(&p1);
+        app.issues.remove(&p1);
+        assert_eq!(
+            target(&app),
+            Some(p2),
+            "the selected project is never the sweep's, even unasked"
+        );
     }
 
     /// Landing on a project arms the debounced prefetch for it, and firing
