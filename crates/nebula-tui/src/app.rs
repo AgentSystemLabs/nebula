@@ -77,6 +77,9 @@ pub enum HitTarget {
     /// The Worktrees panel's OPEN PRS group header (either form); a click
     /// folds the group down to its count or opens it back up.
     OpenPrsHeader,
+    /// The Worktrees panel's ISSUES group header (either form); a click
+    /// folds or opens it, as the OPEN PRS header's does.
+    IssuesHeader,
     /// Panel background (registered after rows, so rows win).
     PanelBg(Focus),
     TerminalPane,
@@ -253,6 +256,8 @@ pub enum MenuAction {
     ToggleArchived,
     /// Fold / unfold the PROJECT OPEN PRS GROUP (Worktrees panel menu).
     ToggleOpenPrs,
+    /// Fold / unfold the PROJECT ISSUES GROUP (Worktrees panel menu).
+    ToggleIssues,
     /// Flip the `hide_draft_prs` SETTING from the Worktrees panel menu:
     /// drafts out of the group and `/`, or back in.
     ToggleDraftPrs,
@@ -505,11 +510,13 @@ pub enum PendingAction {
     },
     DeleteLink(LinkId),
     /// `d` in the AGENT PRESETS list: drop the preset at `index` from the
-    /// store. Both answers reopen the list for `worktree`, so the modal the
+    /// store. Both answers reopen the list for `worktree` — as the QUICK
+    /// PROMPT picker for `quick`'s box when it was one — so the modal the
     /// confirm evicted comes back where the user left it.
     DeleteAgentPreset {
         index: usize,
         worktree: WorktreeId,
+        quick: Option<Box<crate::quick_prompt::QuickReturn>>,
     },
     /// `R` in the settings overlay: rewrite config.json from the defaults
     /// (every setting and every hotkey), then reopen the overlay on them.
@@ -680,6 +687,11 @@ impl PromptDialog {
             list_area: Rect::default(),
             area: Rect::default(),
         };
+        // The task and comment boxes hold line breaks; the rest are one
+        // line. The field itself then knows which keys break a line and
+        // whether a paste keeps its newlines.
+        let multiline = prompt.is_multiline();
+        prompt.input.set_multiline(multiline);
         prompt.refresh_dirs();
         prompt
     }
@@ -1676,7 +1688,7 @@ pub enum Overlay {
     Hosts(HostsView),
     /// `e` in the SESSIONS PANEL: the AGENT PRESETS list.
     AgentPresets(crate::preset_overlays::AgentPresetsView),
-    /// The PRESET EDITOR form behind the list's `a` / `e`.
+    /// The PRESET EDITOR form behind the list's `Ctrl+a` / `Ctrl+e`.
     AgentPresetEditor(crate::preset_overlays::AgentPresetEditor),
     /// `i`: the ISSUES MODAL — the project's open GitHub issues.
     Issues(crate::issues::IssuesView),
@@ -2101,15 +2113,27 @@ pub enum WorktreeRow<'a> {
         worktree: &'a Worktree,
         pr: &'a OpenPr,
     },
+    /// A PROJECT ISSUES GROUP row: an issue open on the repo, listed under
+    /// the pull requests. No checkout and no sessions — the pane reads it,
+    /// as it reads a pull request row.
+    Issue(&'a crate::issues::Issue),
 }
 
 impl<'a> WorktreeRow<'a> {
     /// The checkout the row is, wherever it sits: a plain one, or one
-    /// nested under its pull request. None on a pull request row.
+    /// nested under its pull request. None on a pull request or issue row.
     pub fn checkout(self) -> Option<&'a Worktree> {
         match self {
             WorktreeRow::Checkout(w) | WorktreeRow::PrCheckout { worktree: w, .. } => Some(w),
-            WorktreeRow::Pr(_) => None,
+            WorktreeRow::Pr(_) | WorktreeRow::Issue(_) => None,
+        }
+    }
+
+    /// The issue the row *is* — a PROJECT ISSUES GROUP row.
+    pub fn open_issue(self) -> Option<&'a crate::issues::Issue> {
+        match self {
+            WorktreeRow::Issue(issue) => Some(issue),
+            WorktreeRow::Checkout(_) | WorktreeRow::Pr(_) | WorktreeRow::PrCheckout { .. } => None,
         }
     }
 
@@ -2119,7 +2143,9 @@ impl<'a> WorktreeRow<'a> {
     pub fn open_pr(self) -> Option<&'a OpenPr> {
         match self {
             WorktreeRow::Pr(pr) => Some(pr),
-            WorktreeRow::Checkout(_) | WorktreeRow::PrCheckout { .. } => None,
+            WorktreeRow::Checkout(_) | WorktreeRow::PrCheckout { .. } | WorktreeRow::Issue(_) => {
+                None
+            }
         }
     }
 
@@ -2127,7 +2153,7 @@ impl<'a> WorktreeRow<'a> {
     pub fn nested_under(self) -> Option<&'a OpenPr> {
         match self {
             WorktreeRow::PrCheckout { pr, .. } => Some(pr),
-            WorktreeRow::Checkout(_) | WorktreeRow::Pr(_) => None,
+            WorktreeRow::Checkout(_) | WorktreeRow::Pr(_) | WorktreeRow::Issue(_) => None,
         }
     }
 }
@@ -2641,6 +2667,10 @@ pub struct UiState {
     /// older blobs, which keep it open.
     #[serde(default)]
     pub open_prs_collapsed: bool,
+    /// The PROJECT ISSUES GROUP folded down to its header; absent in
+    /// older blobs, which keep it open.
+    #[serde(default)]
+    pub issues_collapsed: bool,
     /// Panel widths (projects, worktrees, sessions); absent in older blobs.
     #[serde(default)]
     pub panel_widths: Option<[u16; 3]>,
@@ -2653,18 +2683,26 @@ pub struct UiState {
     pub diff_tree: bool,
 }
 
-/// A mouse selection over the terminal pane (drag or double-click word), in
-/// pane-relative cell coordinates `(col, row)` with inclusive endpoints.
+/// A mouse selection over the terminal pane (drag or double-click word),
+/// with inclusive `(col, line)` endpoints: a pane-relative column and the
+/// screen's HISTORY LINE (`vt100::Screen::history_base`) — a number every
+/// row keeps as the view scrolls and as new output pushes it up into the
+/// scrollback. Anchored that way the highlight stays on its text while
+/// the pane scrolls under a drag (the EDGE AUTO-SCROLL, the wheel) and
+/// while the agent keeps printing, and the copy at release reads rows
+/// that have since left the screen.
 /// Nebula owns the mouse (the emulator's native shift+drag never reaches us
 /// reliably — Terminal.app has no such bypass at all), so selection is
 /// implemented app-side and copied to the system clipboard when it completes.
 /// The highlight persists after mouse-up; it's cleared by the next click,
-/// scrolling, typing into the PTY, or a resize/reattach (anything that moves
-/// the content under it — the selection is in screen coordinates).
+/// the wheel, typing into the PTY, a resize, or a replay that rebuilds the
+/// screen (its numbering starts over). A drag still in progress survives
+/// every one of those but the click: the button is the user's, and nothing
+/// here lets go of the selection until it comes up.
 #[derive(Debug, Clone, Copy)]
 pub struct TermSelection {
-    pub anchor: (u16, u16),
-    pub head: (u16, u16),
+    pub anchor: (u16, u64),
+    pub head: (u16, u64),
     /// Still being dragged (button down). Cleared on mouse-up.
     pub dragging: bool,
     /// A real selection, not just an armed click. Set once a drag leaves its
@@ -2672,11 +2710,16 @@ pub struct TermSelection {
     /// double-click word selection — which may be a single cell, so
     /// `anchor == head` can't be the "just a click" test.
     pub active: bool,
+    /// Where the pointer last was, in host cells, while dragging. The EDGE
+    /// AUTO-SCROLL re-reads the head from here on every tick, so a pointer
+    /// resting past the pane's top or bottom edge keeps selecting as the
+    /// history scrolls under it.
+    pub pointer: (u16, u16),
 }
 
 impl TermSelection {
-    /// Endpoints normalized to row-major order: (start, end).
-    pub fn bounds(&self) -> ((u16, u16), (u16, u16)) {
+    /// Endpoints normalized to line-major order: (start, end).
+    pub fn bounds(&self) -> ((u16, u64), (u16, u64)) {
         let anchor_key = (self.anchor.1, self.anchor.0);
         let head_key = (self.head.1, self.head.0);
         if anchor_key <= head_key {
@@ -2908,6 +2951,8 @@ pub struct App {
     /// click on it). Like `show_archived`, it rides the UI-state blob so a
     /// restart brings it back folded.
     pub open_prs_collapsed: bool,
+    /// The ISSUES group under it, folded and remembered the same way.
+    pub issues_collapsed: bool,
     /// Sidebars collapsed (z) — terminal takes the full width.
     pub collapsed: bool,
     /// Workspaces bar shown across the top of the body, with the panels
@@ -3019,6 +3064,11 @@ pub struct App {
     pub next_keepwarm: Option<std::time::Instant>,
     /// Mouse drag-selection over the terminal pane, if any.
     pub term_selection: Option<TermSelection>,
+    /// The next EDGE AUTO-SCROLL tick: set while a drag-selection's pointer
+    /// rests past the pane's top or bottom edge, so the history keeps
+    /// scrolling under it on a fixed beat with no further mouse report;
+    /// None once the pointer is back inside or the button is up.
+    pub next_drag_autoscroll: Option<std::time::Instant>,
     /// The session whose program holds the left button: it asked for the
     /// mouse (Claude Code's fullscreen renderer, vim `mouse=a`, htop), the
     /// press on the pane went to it, and the drag and release that follow
@@ -3186,8 +3236,9 @@ pub struct App {
     /// *now*: the event loop runs the two list lookups on its next turn
     /// instead of waiting for the git tick, then clears this.
     pub pr_refresh_requested: bool,
-    /// Top visible line of the pull-request preview pane, and the pane's
-    /// total line count as of the last draw (for clamping).
+    /// Top visible line of the reading pane — the pull request or the
+    /// issue under a cursor (`App::reading_url`) — and the pane's total
+    /// line count as of the last draw (for clamping).
     pub pr_preview_scroll: u16,
     pub pr_preview_lines: usize,
     /// The pull request whose full diff is being fetched, if any — one at a
@@ -3346,6 +3397,7 @@ impl App {
             overlay: None,
             show_archived: false,
             open_prs_collapsed: false,
+            issues_collapsed: false,
             collapsed: false,
             show_workspaces: true,
             hide_projects: false,
@@ -3375,6 +3427,7 @@ impl App {
             attached_sref: None,
             next_keepwarm: None,
             term_selection: None,
+            next_drag_autoscroll: None,
             term_mouse_grab: None,
             last_term_click: None,
             last_session_click: None,
@@ -3639,15 +3692,18 @@ impl App {
 
     /// Whether the SESSIONS PANEL stands folded to its rail: hidden with
     /// `Shift+S` (`hide_sessions`), or — the Worktrees cursor on a PROJECT
-    /// OPEN PRS row — with nothing to list. A pull request row has no
-    /// checkout and so no sessions, and the pane beside it is reading the
-    /// pull request, so the column gives the pane its width for as long
-    /// as the cursor rests there and comes back the moment it steps onto
-    /// a checkout. `hide_sessions` is untouched either way: a panel the
-    /// user collapsed stays a rail on the checkout too, and the fold a
-    /// pull request row causes is never written to CONFIG.JSON.
+    /// OPEN PRS or PROJECT ISSUES row — with nothing to list. Neither row
+    /// has a checkout and so neither has sessions, and the pane beside it
+    /// is reading the pull request or the issue, so the column gives the
+    /// pane its width for as long as the cursor rests there and comes
+    /// back the moment it steps onto a checkout. `hide_sessions` is
+    /// untouched either way: a panel the user collapsed stays a rail on
+    /// the checkout too, and the fold a pull request row causes is never
+    /// written to CONFIG.JSON.
     pub fn sessions_collapsed(&self) -> bool {
-        self.hide_sessions || self.selected_worktree_pr().is_some()
+        self.hide_sessions
+            || self.selected_worktree_pr().is_some()
+            || self.selected_worktree_issue().is_some()
     }
 
     /// Width a panel draws at: its remembered width expanded, the fixed
@@ -3762,6 +3818,18 @@ impl App {
         id
     }
 
+    /// Is the left button down, as far as nebula knows — a press came and
+    /// its release has not: a panel splitter being dragged, a program in
+    /// the pane holding the button, or a drag-selection under way? While
+    /// it is, the host terminal is left exactly as it is (re-asking it for
+    /// its modes mid-drag is a change under a gesture in progress), and a
+    /// motion report with no button named is still the drag.
+    pub fn mouse_held(&self) -> bool {
+        self.splitter_drag.is_some()
+            || self.term_mouse_grab.is_some()
+            || self.term_selection.is_some_and(|s| s.dragging)
+    }
+
     /// Is this worktree row a stand-in (a QUICK PROMPT's, or the NEW
     /// WORKTREE modal's) the DAEMON has not answered for yet? The
     /// in-flight intent is the one record of it —
@@ -3809,6 +3877,7 @@ impl App {
         if term.exited
             || self.pane_shows_placeholder()
             || self.previewed_pr().is_some()
+            || self.previewed_issue().is_some()
             || self.previewed_cloud().is_some()
         {
             return mouseless;
@@ -4183,6 +4252,28 @@ impl App {
         self.listed_open_prs()
     }
 
+    /// The selected project's open issues, as `gh issue list` last
+    /// answered (`issues::request_list`): the ISSUES MODAL's rows, and
+    /// what the PROJECT ISSUES GROUP under the pull requests lists and its
+    /// header counts while it is folded. Empty until the first answer, or
+    /// when the repo has none.
+    pub fn listed_issues(&self) -> &[crate::issues::Issue] {
+        self.selected_project()
+            .and_then(|p| self.issues.get(&p.id))
+            .map(|l| l.list.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// The issues with rows under the pull requests: the listed ones, or
+    /// none while the group is folded — a folded group has no rows for
+    /// the cursor to walk into, like the folded OPEN PRS group.
+    pub fn visible_issues(&self) -> &[crate::issues::Issue] {
+        if self.issues_collapsed {
+            return &[];
+        }
+        self.listed_issues()
+    }
+
     /// The Worktrees panel's rows in cursor order — what `sel_worktree`
     /// indexes: the project's checkouts, then the pull requests still open
     /// on its repo, each followed by the checkout on its head branch when
@@ -4202,6 +4293,10 @@ impl App {
     /// is the truth about it; one on a nested checkout has that worktree
     /// and no pull request — the row is a worktree, its pull request is
     /// the row above.
+    ///
+    /// The issues open on the repo close the list (`visible_issues`): one
+    /// row each under the pull requests, none while their group is
+    /// folded. An issue nests nothing — it has no branch to check out.
     pub fn worktree_rows(&self) -> Vec<WorktreeRow<'_>> {
         let checkouts = self.visible_worktrees();
         let prs = self.visible_open_prs();
@@ -4231,6 +4326,7 @@ impl App {
                     .map(|(w, _)| WorktreeRow::PrCheckout { worktree: w, pr }),
             );
         }
+        rows.extend(self.visible_issues().iter().map(WorktreeRow::Issue));
         rows
     }
 
@@ -4257,6 +4353,14 @@ impl App {
             .position(|row| row.open_pr().is_some_and(|pr| pr.url == url))
     }
 
+    /// The Worktrees row of the open issue at `url`, while the ISSUES
+    /// group is open and lists it.
+    pub fn issue_row_of(&self, url: &str) -> Option<usize> {
+        self.worktree_rows()
+            .iter()
+            .position(|row| row.open_issue().is_some_and(|i| i.url == url))
+    }
+
     /// Rows a half-page jump (Ctrl+d / Ctrl+u) moves the Worktrees
     /// cursor: half of what the column showed room for on the last
     /// frame, never less than one so the keys still move before the
@@ -4279,6 +4383,14 @@ impl App {
         self.worktree_rows()
             .get(self.sel_worktree)
             .and_then(|row| row.open_pr())
+    }
+
+    /// The issue under the Worktrees cursor — a PROJECT ISSUES GROUP row.
+    /// None on a checkout or a pull request.
+    pub fn selected_worktree_issue(&self) -> Option<&crate::issues::Issue> {
+        self.worktree_rows()
+            .get(self.sel_worktree)
+            .and_then(|row| row.open_issue())
     }
 
     /// The pull request the pane should be reading: the PROJECT OPEN PRS
@@ -4309,6 +4421,22 @@ impl App {
             url: pr.url.clone(),
             label: row.label(),
         })
+    }
+
+    /// The issue the pane should be reading: the PROJECT ISSUES GROUP row
+    /// under the Worktrees cursor. `draw_terminal` asks for the pull
+    /// request first; the two never share a cursor.
+    pub fn previewed_issue(&self) -> Option<&crate::issues::Issue> {
+        self.selected_worktree_issue()
+    }
+
+    /// What the pane is reading, by URL — the pull request or the issue
+    /// under a cursor — so the loop can tell a turn that changed it
+    /// (`note_preview_change`) from one that left the reader in place.
+    pub fn reading_url(&self) -> Option<String> {
+        self.previewed_pr()
+            .map(|pr| pr.url)
+            .or_else(|| self.previewed_issue().map(|i| i.url.clone()))
     }
 
     /// The Claude Cloud row the pane should be describing: the SESSIONS
@@ -4818,6 +4946,7 @@ mod tests {
             title: "Attach links".into(),
             state: crate::pull_request::STATE_OPEN.into(),
             is_draft: false,
+            health: Default::default(),
             activity: Vec::new(),
         }
     }

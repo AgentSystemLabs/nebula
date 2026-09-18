@@ -11,6 +11,7 @@
 //! key `config.local.json` holds is written back there, never into the
 //! portable file.
 
+use crate::agent_presets::PresetText;
 use nebula_core::harness::{CustomHarness, HarnessDescriptor};
 use nebula_core::AgentKind;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,14 @@ pub const DEFAULT_RECENT_PROMPTS_COUNT: usize = 3;
 /// accepts `+<line> <file>`, which is how the overlays launch it. As with
 /// models, hand-edited configs can name any command the list doesn't.
 pub const EDITORS: &[&str] = &["vim", "nvim", "nano", "emacs", "hx"];
+
+/// The **Preset text** choices (Settings → Sessions), in the order the row
+/// cycles them: the [`PresetText`] sides by label.
+pub const PRESET_TEXTS: &[&str] = &[
+    PresetText::Prefix.as_str(),
+    PresetText::Postfix.as_str(),
+    PresetText::Both.as_str(),
+];
 
 /// Values the settings overlay cycles through for `done_sound` (what rings
 /// when a turn reaches FINISHED) and `feedback_sound` (what rings when one
@@ -357,6 +366,7 @@ pub enum SettingKind {
     PrewarmSessions,
     DoneSound,
     FeedbackSound,
+    PresetText,
     Theme,
     Animations,
     FocusTint,
@@ -507,6 +517,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::FeedbackSound,
                 label: "Feedback sound",
                 hint: "Ring, and notify an unfocused window, when a turn stops to ask you (off silences both)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::PresetText,
+                label: "Preset text",
+                hint: "Where a new agent preset's text goes: a prefix before the task, a postfix after it, or both (its Text row can change one)",
                 group: "",
             },
         ]),
@@ -935,6 +951,14 @@ pub struct Config {
     /// FEEDBACK SOUND and the desktop notification an unfocused terminal
     /// window gets: "off" silences the pair.
     pub feedback_sound: String,
+    /// PRESET TEXT: which side of the task a new AGENT PRESET's text goes
+    /// — `prefix` (one box, sent before the task), `postfix` (one box,
+    /// sent after it) or `prefix & postfix` (both). The PRESET EDITOR
+    /// opens a new preset on the box(es) named here, and its Text row
+    /// changes one preset; a stored side with text always shows. Resolved
+    /// by [`Config::preset_text`]; `prefix` by default, the framing most
+    /// people reach for and one box to fill.
+    pub preset_text: String,
     /// Color theme name (see `theme::THEMES`). Unknown names fall back to
     /// the default theme.
     pub theme: String,
@@ -1227,6 +1251,7 @@ impl Default for Config {
             prewarm_sessions: true,
             done_sound: "Glass".into(),
             feedback_sound: "Sosumi".into(),
+            preset_text: PresetText::DEFAULT.as_str().into(),
             theme: "default".into(),
             animations: true,
             focus_tint: true,
@@ -1587,6 +1612,13 @@ impl Config {
             .iter()
             .find(|entry| entry.id == id)
             .is_some_and(|entry| entry.enabled && entry.problem().is_none())
+    }
+
+    /// PRESET TEXT resolved: the side(s) of the task a new AGENT PRESET's
+    /// text goes. `prefix` for a config that never set it or a hand edit
+    /// off the list; `both` is taken for `prefix & postfix`.
+    pub fn preset_text(&self) -> PresetText {
+        PresetText::parse(&self.preset_text).unwrap_or(PresetText::DEFAULT)
     }
 
     /// The effective descriptor for a registry id, or a placeholder under
@@ -2034,6 +2066,7 @@ impl Config {
             SettingKind::PrewarmSessions => on_off(self.prewarm_sessions).into(),
             SettingKind::DoneSound => self.done_sound.clone(),
             SettingKind::FeedbackSound => self.feedback_sound.clone(),
+            SettingKind::PresetText => self.preset_text().as_str().into(),
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
             SettingKind::FocusTint => on_off(self.focus_tint).into(),
@@ -2120,6 +2153,12 @@ impl Config {
             }
             SettingKind::FeedbackSound => {
                 self.feedback_sound = cycle_choice(&self.feedback_sound, SOUNDS, step).into();
+            }
+            SettingKind::PresetText => {
+                // Cycled from the resolved side, so a hand edit off the
+                // list steps on from the default it reads as.
+                self.preset_text =
+                    cycle_choice(self.preset_text().as_str(), PRESET_TEXTS, step).into();
             }
             SettingKind::Theme => {
                 self.theme = cycle_choice(&self.theme, crate::theme::THEMES, step).into();
@@ -3553,6 +3592,71 @@ mod tests {
 
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(!cfg.remember_harness);
+    }
+
+    /// PRESET TEXT: a Sessions row after the sounds, `prefix` by default,
+    /// cycling the three sides and persisted under `preset_text`; a hand
+    /// edit off the list reads as the default, and `both` as the long
+    /// label.
+    #[test]
+    fn preset_text_is_prefix_by_default_on_the_sessions_tab_and_cycles_the_sides() {
+        let mut cfg = Config::default();
+        assert_eq!(
+            cfg.preset_text(),
+            PresetText::Prefix,
+            "one box, before the task"
+        );
+        assert_eq!(cfg.value_label(SettingKind::PresetText), "prefix");
+        assert_eq!(
+            PRESET_TEXTS.to_vec(),
+            PresetText::ALL.map(PresetText::as_str).to_vec(),
+            "the row cycles every side, in the enum's order"
+        );
+
+        let (tab, row) = locate(SettingKind::PresetText).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Sessions");
+        let (sound_tab, sound_row) = locate(SettingKind::FeedbackSound).unwrap();
+        assert_eq!((sound_tab, sound_row + 1), (tab, row), "after the sounds");
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.preset_text(), PresetText::Postfix);
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.preset_text(), PresetText::Both);
+        assert_eq!(cfg.value_label(SettingKind::PresetText), "prefix & postfix");
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.preset_text(), PresetText::Prefix, "wraps");
+        cfg.cycle(tab, row, -1);
+        assert_eq!(cfg.preset_text(), PresetText::Both, "← steps back");
+        cfg.cycle(tab, row, 0);
+        assert_eq!(cfg.preset_text(), PresetText::Prefix, "Enter steps on");
+
+        cfg.cycle(tab, row, -1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert_eq!(load_from(&path).preset_text, "prefix & postfix");
+        assert_eq!(load_from(&path).preset_text(), PresetText::Both);
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            cfg.preset_text(),
+            PresetText::Prefix,
+            "unknown to an older file"
+        );
+        let cfg: Config = serde_json::from_str(r#"{"preset_text": "both"}"#).unwrap();
+        assert_eq!(cfg.preset_text(), PresetText::Both);
+        assert_eq!(cfg.value_label(SettingKind::PresetText), "prefix & postfix");
+        let mut cfg: Config = serde_json::from_str(r#"{"preset_text": "suffix"}"#).unwrap();
+        assert_eq!(
+            cfg.preset_text(),
+            PresetText::Prefix,
+            "an unknown value is the default"
+        );
+        cfg.cycle(tab, row, 1);
+        assert_eq!(
+            cfg.preset_text(),
+            PresetText::Postfix,
+            "and cycles on from it"
+        );
     }
 
     /// PR & ISSUE COUNTS: an Experimental switch, on by default — the one

@@ -25,7 +25,7 @@ and its effort is the `--thinking` level, `off` through `max`).
 In those submenus you type to filter — `opus` narrows the rows to the Opus families, `↑`/`↓` move, `Backspace` widens, `Esc` clears — and the preset editor's Harness / Model / Effort rows take the same type-ahead.
 `Enter` anywhere takes your configured defaults. On the
 Claude row, `Tab` toggles Cloud mode: enter the task in the wrapped editor
-(`Shift+Enter` or `Ctrl+J` adds a line) and nebula launches `claude --cloud=<task>` — the value binds
+(`Shift+Enter`, `Option+Enter` or `Ctrl+J` adds a line) and nebula launches `claude --cloud=<task>` — the value binds
 with `=` and never a space, because `--cloud` takes an *optional* value, so a separate argv item starting
 with `--` would be read as another Claude flag instead. The CLI creates the session, prints its URL and
 exits — nebula reads the session id off that output, and that is where the local side ends. The agent
@@ -84,9 +84,16 @@ its row is yellow while the PTY is live and green when the process ends, and it 
 
 If you keep starting the same kind of session with the same framing, save it as an **agent preset**:
 `e` in the Sessions column — or on a worktree's row in the Worktrees column, which launches into
-that worktree without walking over to its sessions — lists them, `a` opens a small form — name,
-harness, model, effort, an optional prefix and postfix, and **Task** (`ask` or `skip`) — and `e` / `d`
-edit or delete. `Enter` on a
+that worktree without walking over to its sessions — lists them. Type to find one by name: letters
+narrow the list to the fuzzy matches, `↑`/`↓` move, `Backspace` widens and `Esc` clears — as in the
+model and effort submenus. `Ctrl+a` opens a small form — name, harness, model, effort, **Text**
+(which side of the task the preset's text goes: `prefix`, `postfix` or `prefix & postfix`, with a
+box for each side it names) and **Task** (`ask` or `skip`) — and `Ctrl+e` / `Ctrl+d` edit or
+delete; they are chords because plain letters type. A new preset starts on the side **Preset text**
+in Settings → Sessions names (`preset_text` in CONFIG.JSON) — `prefix` unless you change it: one
+box, sent before your task — and cycling the row shows the other box or both; a side the row leaves
+out saves blank. Editing a preset also shows any side that already holds text, so one saved with
+both never loses either. `Enter` on a
 preset asks for the task in the same wrapped editor, then launches the CLI with `prefix + task + postfix`
 as its very first prompt, so the agent is already working when the pane opens. The task is optional:
 send the box empty and the prefix and postfix go on their own (a preset with neither starts the CLI
@@ -151,7 +158,12 @@ feature simply has nothing to show until its next prompt.
 Under the checkouts, an `OPEN PRS` group lists every pull request still open on the repo — drafts
 included, sunk to the bottom of the group, dimmed and badged `draft` so they are told apart from the
 ones asking for a reviewer (the `/` PALETTE lists the same rows and spells both states out, `draft` and
-`ready for review`) — fetched with `gh` when you open the project, re-asked every 15 seconds once
+`ready for review`). A pull request GitHub says cannot merge — its branch conflicts with the base, or a
+check is failing — is red end to end instead, arrow, title and rail, and badged `conflicts` or `failing`
+in place of its state (`merge conflicts` / `checks failing` in the PALETTE), draft or not: that row needs
+a person, and the red is the one the STATUS DOT wears on a session that needs someone. Conflicts win
+the badge when both hold; the row goes back to its state on the refresh that finds it clean. All of it is
+fetched with `gh` when you open the project, re-asked every 15 seconds once
 that PROJECT has answered with at least one open pull request, and again whenever the Worktrees or
 Sessions panel or the terminal window takes focus (one `gh pr list` per project, so a repo with a
 hundred open PRs still costs one API call) — or at once, past every timer, when you press `Shift+R`
@@ -218,6 +230,28 @@ draft's branch keeps its row, its sessions and its own PR ROW in the SESSIONS PA
 for browsing what is open, not for hiding work you have. Hiding the row the cursor is on lands it on
 the nearest row left, as a fold does. The choice is remembered across restarts.
 
+## The PROJECT ISSUES group
+
+Under the pull requests, an `ISSUES` group lists every issue open on the repo — the ISSUES MODAL's
+rows (`gh issue list`, newest first, pull requests left out), so it is there as soon as the cursor
+has rested on the project, kept fresh on the modal's own beat, and counts `100+` when the answer hit
+the fetch cap. Each row is `↗ #15 title`, in the green the modal paints `open` in. Rest the cursor on
+one and the pane reads it the way it reads a pull request — number and title, who opened it and
+when, its labels, the description as markdown and, once the cursor has rested a moment, its comments
+(one `gh issue view` per row you actually stop on, remembered for the session); `PgUp`/`PgDn`,
+`Home`/`End` and the wheel scroll it. The Sessions column folds to its rule meanwhile, as it does
+beside a pull request. `Enter` or a double-click opens the issue in the browser, `p` is the modal's
+`Enter` for it — the QUICK PROMPT carrying the issue, into the project's root checkout — `e`
+launches an AGENT PRESET on it, and `m` / right-click offers the browser. The checkout verbs (`n`,
+`d`, `r`, `Shift+Enter`) say there is no checkout here, as they do on a pull request.
+
+The group folds like the one above it: click its header — or pick **Show/hide issues** from the
+panel's right-click menu — and it drops to `▸ ISSUES · 12`; open, the header reads `▾ ISSUES · 12`
+over the rows. Folding away the row the cursor is on lands it on the row above the header — the last
+pull request, or the last checkout, whose session comes back into the pane. Stepping `↓` off that
+row into a folded group opens it onto its first issue (a folded OPEN PRS group opens first, on its
+own step). The fold is remembered across restarts, beside the OPEN PRS one.
+
 ## The ISSUES MODAL and ISSUE SESSIONS
 
 `i` from any panel lists the selected PROJECT's open GitHub issues — `gh issue list`, newest first,
@@ -243,7 +277,8 @@ refused (not logged in, no network) brings the box back with your text so nothin
 
 `E` edits the issue itself without leaving the modal at all: the reading pane becomes a form on
 the row's title and description — `Tab`, `↑`/`↓` or a click move between the two fields, and the
-description takes `Shift+Enter` (or `Ctrl+J`) for a line break, as every multi-row box does.
+description takes `Shift+Enter` (or `Option+Enter`, or `Ctrl+J`) for a line break and `↑`/`↓` to walk
+its lines, as every multi-row box does — the preset editor's prefix and postfix included.
 `Enter` sends both to GitHub as one `gh issue edit` (the title on the command line, the description
 on its stdin) and holds the form, its foot saying `saving…`, until GitHub answers: the row and the
 pane then carry the new text at once, the list is asked for again underneath, and the footer says

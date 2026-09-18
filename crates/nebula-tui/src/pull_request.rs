@@ -96,6 +96,82 @@ impl Standing {
     }
 }
 
+/// How a pull request's checks stand, folded from `gh`'s
+/// `statusCheckRollup` the way `gh pr checks` folds it ([`checks`]): one
+/// failure fails the lot, one still running leaves the lot pending, and a
+/// repo that runs no checks at all has nothing to say. Only `Failing` is
+/// trouble; the rest is what the PR PREVIEW spells out beside the state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Checks {
+    #[default]
+    Absent,
+    Pending,
+    Passing,
+    Failing,
+}
+
+/// What GitHub says stands between a pull request and its merge button:
+/// whether the branch still merges cleanly, and how its checks stand.
+/// Read off every payload — branch row, list row and detail alike — so
+/// the three surfaces go red together, and remembered with the row
+/// (`pr_cache`); a document written before it was asked reads as healthy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Health {
+    /// `gh`'s `mergeable` said `CONFLICTING`: the branch no longer merges
+    /// and a person has to resolve it. `MERGEABLE` reads as clean, and so
+    /// does `UNKNOWN` — GitHub computes mergeability lazily, so the first
+    /// ask after a push often says so; the next beat answers.
+    pub conflicts: bool,
+    pub checks: Checks,
+}
+
+impl Health {
+    /// The one word the row goes red for, if any. Conflicts outrank
+    /// failing checks when both hold: checks cannot be trusted on a branch
+    /// that no longer merges, and the rebase that resolves the conflict
+    /// re-runs them anyway.
+    pub fn trouble(self) -> Option<Trouble> {
+        if self.conflicts {
+            Some(Trouble::Conflicts)
+        } else if self.checks == Checks::Failing {
+            Some(Trouble::FailingChecks)
+        } else {
+            None
+        }
+    }
+}
+
+/// Why a pull request row is red: something GitHub says blocks the merge
+/// and needs a person — the same red the STATUS DOT wears on a session
+/// that needs someone. An open pull request's alone: a merged or closed
+/// one is past needing its branch resolved, whatever the answer says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trouble {
+    Conflicts,
+    FailingChecks,
+}
+
+impl Trouble {
+    /// Spelled out, for the `/` PALETTE and the PR PREVIEW, where there
+    /// is room: `merge conflicts`, `checks failing`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Trouble::Conflicts => "merge conflicts",
+            Trouble::FailingChecks => "checks failing",
+        }
+    }
+
+    /// The sidebar's badge — [`label`](Self::label) cut to the column, the
+    /// way [`Standing::badge`] cuts `ready for review` to `ready`, so a
+    /// title still fits beside it at the SESSIONS PANEL's default width.
+    pub fn badge(self) -> &'static str {
+        match self {
+            Trouble::Conflicts => "conflicts",
+            Trouble::FailingChecks => "failing",
+        }
+    }
+}
+
 /// Run `gh` with `args` (in `dir` when given) under `timeout`, yielding
 /// stdout on success. Every failure — no `gh`, bad exit, timeout — is
 /// `None`, since each is an ordinary "couldn't ask" to every caller.
@@ -189,6 +265,10 @@ pub struct PullRequest {
     /// [`STATE_CLOSED`].
     pub state: String,
     pub is_draft: bool,
+    /// Whether the branch still merges and its checks pass — what turns
+    /// the row red ([`trouble`](Self::trouble)).
+    #[serde(default)]
+    pub health: Health,
     /// When somebody *other than you* commented or submitted a review, as
     /// GitHub's RFC 3339 stamps, oldest first. Those sort lexicographically,
     /// so "posted since the mark we stored" is a string compare — nebula
@@ -211,6 +291,12 @@ impl PullRequest {
     /// rows use for their CLI kind: `ready`, `draft`, `merged` or `closed`.
     pub fn badge(&self) -> &'static str {
         self.standing().badge()
+    }
+
+    /// What the row goes red for, while the pull request is still open:
+    /// a merged or closed one is past needing its branch resolved.
+    pub fn trouble(&self) -> Option<Trouble> {
+        self.is_open().then(|| self.health.trouble()).flatten()
     }
 
     /// The mark to store when the user opens this PR: everything nebula
@@ -270,7 +356,7 @@ pub async fn lookup(dir: &Path) -> Lookup {
             "pr",
             "view",
             "--json",
-            "number,url,title,state,isDraft,comments,reviews",
+            "number,url,title,state,isDraft,mergeable,statusCheckRollup,comments,reviews",
         ],
         TIMEOUT,
     )
@@ -322,6 +408,7 @@ fn parse(json: &str, viewer: Option<&str>) -> Option<PullRequest> {
         title: str_at(&v, "title"),
         state: state_at(&v),
         is_draft: bool_at(&v, "isDraft"),
+        health: health(&v),
         activity: activity(&v, viewer),
     })
 }
@@ -358,6 +445,46 @@ fn activity(v: &serde_json::Value, viewer: Option<&str>) -> Vec<String> {
     stamps
 }
 
+/// The pull request's [`Health`] as a `gh pr view` / `gh pr list` payload
+/// carries it: `mergeable` and `statusCheckRollup`, either missing when the
+/// caller did not ask for it, which reads as healthy.
+fn health(v: &serde_json::Value) -> Health {
+    Health {
+        conflicts: str_at(v, "mergeable") == "CONFLICTING",
+        checks: checks(arr_at(v, "statusCheckRollup")),
+    }
+}
+
+/// Fold a `statusCheckRollup` — one entry per check run or commit status
+/// on the head commit — the way `gh pr checks` does. A check run's word is
+/// its `conclusion` once `COMPLETED` and its `status` (queued, in
+/// progress) until then; a plain commit status carries a `state` instead.
+/// Any failure fails the lot; else anything still running leaves the lot
+/// pending; else it passes — a skipped or neutral job is not a failure.
+fn checks(rollup: &[serde_json::Value]) -> Checks {
+    let mut out = Checks::Absent;
+    for entry in rollup {
+        let word = if entry.get("state").is_some() {
+            str_at(entry, "state")
+        } else if str_at(entry, "status") == "COMPLETED" {
+            str_at(entry, "conclusion")
+        } else {
+            str_at(entry, "status")
+        };
+        let one = match word.as_str() {
+            "SUCCESS" | "NEUTRAL" | "SKIPPED" => Checks::Passing,
+            "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED"
+            | "STARTUP_FAILURE" => return Checks::Failing,
+            _ => Checks::Pending,
+        };
+        out = match (out, one) {
+            (Checks::Pending, _) | (_, Checks::Pending) => Checks::Pending,
+            _ => Checks::Passing,
+        };
+    }
+    out
+}
+
 /// Every open pull request on a project's repo, and what it costs to ask.
 ///
 /// A worktree's own PR ([`lookup`]) is one `gh pr view` per checkout; this
@@ -379,6 +506,10 @@ pub struct OpenPr {
     pub title: String,
     pub url: String,
     pub is_draft: bool,
+    /// Whether the branch still merges and its checks pass — what turns
+    /// the row red ([`trouble`](Self::trouble)).
+    #[serde(default)]
+    pub health: Health,
     /// The local branch the pull request's checkout is on
     /// ([`checkout_branch`]) — the one a PR SESSION's worktree is cut on,
     /// the one a checkout has to be on to list under this row, and what
@@ -410,6 +541,12 @@ impl OpenPr {
     /// Trailing badge: `ready` or `draft`.
     pub fn badge(&self) -> &'static str {
         self.standing().badge()
+    }
+
+    /// What the row goes red for — every row here is open, so the
+    /// health's word is the row's.
+    pub fn trouble(&self) -> Option<Trouble> {
+        self.health.trouble()
     }
 }
 
@@ -471,7 +608,8 @@ pub async fn list(dir: &Path) -> Option<Vec<OpenPr>> {
             "--limit",
             &limit,
             "--json",
-            "number,url,title,isDraft,headRefName,isCrossRepository,headRepositoryOwner",
+            "number,url,title,isDraft,headRefName,isCrossRepository,headRepositoryOwner,\
+             mergeable,statusCheckRollup",
         ],
         TIMEOUT,
     )
@@ -525,6 +663,7 @@ pub(crate) fn parse_list(json: &str) -> Option<Vec<OpenPr>> {
                     title: str_at(v, "title"),
                     url,
                     is_draft: bool_at(v, "isDraft"),
+                    health: health(v),
                     head: checkout_branch(v),
                 })
             })
@@ -560,6 +699,10 @@ pub struct PrDetail {
     pub title: String,
     pub state: String,
     pub is_draft: bool,
+    /// Whether the branch still merges and its checks pass — spelled out
+    /// beside the state, and what the row it was fetched for goes red for.
+    #[serde(default)]
+    pub health: Health,
     pub author: String,
     /// Branch this merges into, and the branch it comes from.
     pub base: String,
@@ -585,6 +728,11 @@ impl PrDetail {
     /// row without waiting for the next list.
     pub fn is_open(&self) -> bool {
         state_is_open(&self.state)
+    }
+
+    /// What the row goes red for, while the pull request is still open.
+    pub fn trouble(&self) -> Option<Trouble> {
+        self.is_open().then(|| self.health.trouble()).flatten()
     }
 }
 
@@ -624,8 +772,9 @@ pub async fn detail(dir: &Path, number: u64) -> Option<PrDetail> {
             "view",
             &number,
             "--json",
-            "number,url,title,state,isDraft,author,baseRefName,headRefName,\
-             additions,deletions,changedFiles,body,comments,reviews",
+            "number,url,title,state,isDraft,mergeable,statusCheckRollup,author,\
+             baseRefName,headRefName,additions,deletions,changedFiles,body,\
+             comments,reviews",
         ],
         TIMEOUT,
     )
@@ -641,6 +790,7 @@ fn parse_detail(json: &str) -> Option<PrDetail> {
         title: str_at(&v, "title"),
         state: state_at(&v),
         is_draft: bool_at(&v, "isDraft"),
+        health: health(&v),
         author: login(v.get("author")),
         base: str_at(&v, "baseRefName"),
         head: str_at(&v, "headRefName"),
@@ -849,6 +999,7 @@ mod tests {
             title: "t".into(),
             state: STATE_OPEN.into(),
             is_draft: false,
+            health: Default::default(),
             activity: stamps.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -865,6 +1016,129 @@ mod tests {
         assert_eq!(pr.title, "Attach links to worktrees");
         assert_eq!(pr.badge(), "ready");
         assert!(pr.is_open());
+    }
+
+    /// GitHub's word on whether the branch still merges (`mergeable`) and
+    /// how its checks stand (`statusCheckRollup`) rides every payload —
+    /// branch row, list row and detail alike — into the same `Health`, so
+    /// the three surfaces go red together. `UNKNOWN` mergeability, what
+    /// GitHub says while it is still computing, is not a conflict.
+    #[test]
+    fn health_reads_conflicts_and_checks_off_every_payload() {
+        let view = r#"{"number":7,"url":"https://github.com/o/r/pull/7","title":"t","state":"OPEN","isDraft":false,"mergeable":"CONFLICTING","statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}"#;
+        let pr = parse(view, None).expect("parsed");
+        assert!(pr.health.conflicts);
+        assert_eq!(pr.health.checks, Checks::Passing);
+        assert_eq!(pr.trouble(), Some(Trouble::Conflicts));
+
+        let list = r#"[{"number":8,"url":"https://github.com/o/r/pull/8","title":"t","isDraft":false,"headRefName":"h","mergeable":"UNKNOWN","statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"FAILURE"}]}]"#;
+        let rows = parse_list(list).expect("parsed");
+        assert!(!rows[0].health.conflicts, "UNKNOWN is not a conflict");
+        assert_eq!(rows[0].health.checks, Checks::Failing);
+        assert_eq!(rows[0].trouble(), Some(Trouble::FailingChecks));
+
+        let detail = r#"{"number":9,"url":"https://github.com/o/r/pull/9","state":"OPEN","mergeable":"MERGEABLE","statusCheckRollup":[]}"#;
+        let d = parse_detail(detail).expect("parsed");
+        assert_eq!(d.health, Health::default());
+        assert_eq!(d.trouble(), None);
+
+        // Not asked for — an older payload shape — reads as healthy.
+        let bare = parse(
+            r#"{"number":1,"url":"https://x.dev/pull/1","state":"OPEN"}"#,
+            None,
+        )
+        .expect("parsed");
+        assert_eq!(bare.health, Health::default());
+    }
+
+    /// The rollup folds the way `gh pr checks` folds it: any failure fails
+    /// the lot, else anything still running leaves it pending, else it
+    /// passes — a skipped or neutral job counts as a pass — and a plain
+    /// commit status (`StatusContext`, a `state` rather than a conclusion)
+    /// is read by the same words. No checks at all is nothing to say.
+    #[test]
+    fn checks_fold_like_gh_pr_checks() {
+        let run = |status: &str, conclusion: &str| serde_json::json!({"__typename":"CheckRun","status":status,"conclusion":conclusion});
+        let ctx = |state: &str| serde_json::json!({"__typename":"StatusContext","state":state});
+        assert_eq!(checks(&[]), Checks::Absent);
+        assert_eq!(
+            checks(&[
+                run("COMPLETED", "SUCCESS"),
+                run("COMPLETED", "SKIPPED"),
+                run("COMPLETED", "NEUTRAL"),
+            ]),
+            Checks::Passing
+        );
+        assert_eq!(
+            checks(&[run("COMPLETED", "SUCCESS"), run("IN_PROGRESS", "")]),
+            Checks::Pending
+        );
+        assert_eq!(
+            checks(&[run("QUEUED", ""), run("COMPLETED", "FAILURE")]),
+            Checks::Failing,
+            "one failure fails the lot, whatever is still running"
+        );
+        for word in [
+            "FAILURE",
+            "ERROR",
+            "CANCELLED",
+            "TIMED_OUT",
+            "ACTION_REQUIRED",
+            "STARTUP_FAILURE",
+        ] {
+            assert_eq!(checks(&[run("COMPLETED", word)]), Checks::Failing, "{word}");
+        }
+        assert_eq!(checks(&[ctx("SUCCESS")]), Checks::Passing);
+        assert_eq!(checks(&[ctx("PENDING")]), Checks::Pending);
+        assert_eq!(checks(&[ctx("ERROR")]), Checks::Failing);
+    }
+
+    /// Trouble is an open pull request's: a merged or closed one is past
+    /// needing its branch resolved, whatever the cached answer says; a
+    /// draft's conflict still needs a person. Conflicts outrank failing
+    /// checks when both hold.
+    #[test]
+    fn trouble_is_an_open_pull_requests_and_conflicts_come_first() {
+        let both = Health {
+            conflicts: true,
+            checks: Checks::Failing,
+        };
+        assert_eq!(both.trouble(), Some(Trouble::Conflicts));
+        let pending = Health {
+            conflicts: false,
+            checks: Checks::Pending,
+        };
+        assert_eq!(pending.trouble(), None, "still running is not failing");
+
+        let mut pr = parse(
+            r#"{"number":7,"url":"https://github.com/o/r/pull/7","state":"MERGED","mergeable":"CONFLICTING"}"#,
+            None,
+        )
+        .expect("parsed");
+        assert!(pr.health.conflicts, "the answer is kept as given");
+        assert_eq!(
+            pr.trouble(),
+            None,
+            "a merged pull request is not in trouble"
+        );
+        pr.state = STATE_OPEN.into();
+        assert_eq!(pr.trouble(), Some(Trouble::Conflicts));
+        pr.is_draft = true;
+        assert_eq!(
+            pr.trouble(),
+            Some(Trouble::Conflicts),
+            "a draft's conflict still needs resolving"
+        );
+    }
+
+    /// The palette and the preview spell the trouble out; the sidebar's
+    /// badge is the same word cut to fit its column.
+    #[test]
+    fn the_palette_label_and_the_sidebar_badge_name_the_same_trouble() {
+        assert_eq!(Trouble::Conflicts.label(), "merge conflicts");
+        assert_eq!(Trouble::Conflicts.badge(), "conflicts");
+        assert_eq!(Trouble::FailingChecks.label(), "checks failing");
+        assert_eq!(Trouble::FailingChecks.badge(), "failing");
     }
 
     /// `gh pr view` keeps answering with a branch's pull request after it
@@ -914,6 +1188,7 @@ mod tests {
             title: String::new(),
             url: format!("https://github.com/o/r/pull/{number}"),
             is_draft,
+            health: Default::default(),
             head: String::new(),
         };
         let mut list = vec![row(42, true), row(40, false), row(31, true), row(30, false)];

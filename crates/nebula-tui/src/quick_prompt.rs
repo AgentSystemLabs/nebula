@@ -75,12 +75,19 @@ pub struct QuickLaunch {
     pub pr: Option<PrLaunch>,
 }
 
-/// What a picker opened *from* the box carries, so the trip loses nothing:
-/// the launch as it stood (restored on Esc) and the text typed so far.
+/// What a picker for a QUICK PROMPT launch carries, so the trip loses
+/// nothing: the launch as it stood, the text typed so far, and whether a
+/// box was up to come back to.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuickReturn {
     pub launch: QuickLaunch,
     pub text: String,
+    /// Was the box up when the picker opened (`Tab` / `Shift+Tab` in it)?
+    /// Esc puts the box back only then. A picker reached with no box up —
+    /// `e` on a pull request or an issue — closes on Esc instead, as the
+    /// manager does: it used to put up an empty box nobody asked for. A
+    /// pick opens the box either way.
+    pub from_box: bool,
 }
 
 impl QuickLaunch {
@@ -293,6 +300,12 @@ pub(crate) fn open_quick_prompt(app: &mut App) {
         open_for_pr(app);
         return;
     }
+    // An issue row is the ISSUES MODAL's row, in the panel: the box
+    // carries the issue, into the project's root checkout.
+    if app.selected_worktree_issue().is_some() {
+        crate::issues::open_prompt_for_row(app);
+        return;
+    }
     if app.focus == Focus::Worktrees {
         let Some(project) = app.selected_project().map(|p| p.id.clone()) else {
             app.flash = Some("quick prompt: select a project first".into());
@@ -398,7 +411,7 @@ fn picker_context(app: &App, launch: &QuickLaunch) -> Option<WorktreeId> {
 pub(crate) fn reopen(app: &mut App, launch: QuickLaunch, text: &str) {
     crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch));
     if let Some(crate::app::Overlay::Prompt(prompt)) = &mut app.overlay {
-        prompt.input.insert_multiline_str(text);
+        prompt.input.insert_str(text);
     }
 }
 
@@ -492,16 +505,13 @@ pub(crate) fn open_launch_picker(app: &mut App, back: QuickReturn) {
 }
 
 /// `Shift+Tab` in the box: the saved AGENT PRESETS as a picker. The list is
-/// the one `e` opens in the SESSIONS PANEL, in pick-only mode — Enter
-/// adopts the row's harness, MODEL / EFFORT and prefix/postfix for this
-/// launch, Esc comes back unchanged, and `a`/`e`/`d` stay in the SESSIONS
-/// PANEL where presets are managed. Nothing to pick leaves the box up.
+/// the one `e` opens in the SESSIONS PANEL, in picker mode — Enter adopts
+/// the row's harness, MODEL / EFFORT and prefix/postfix for this launch and
+/// Esc comes back unchanged, while `Ctrl+a` / `Ctrl+e` / `Ctrl+d` manage
+/// the presets as they do there and come back to this picker. With none
+/// saved yet it opens empty, on the same `Ctrl+a` hint the manager shows.
 pub(crate) fn open_preset_picker(app: &mut App, back: QuickReturn) {
     let presets = crate::agent_presets::load();
-    if presets.is_empty() {
-        app.flash = Some("no agent presets yet — press e in the Sessions panel to add one".into());
-        return;
-    }
     let selected = back
         .launch
         .preset
@@ -527,7 +537,9 @@ pub(crate) fn open_preset_picker(app: &mut App, back: QuickReturn) {
 /// and cutting one otherwise, with the PR URL and its work rule in the
 /// system prompt and the preset's composed text as the first prompt. The
 /// box's target is the PROJECT's ROOT WORKTREE, which only names the
-/// PROJECT the create is addressed to (as the `n` picker's is).
+/// PROJECT the create is addressed to (as the `n` picker's is). No box
+/// was up when the list opened, so Esc closes it rather than putting up
+/// an empty prompt nobody asked for.
 pub(crate) fn open_preset_picker_for_pr(app: &mut App) {
     let Some(launch) = pr_launch(app) else {
         return;
@@ -537,6 +549,7 @@ pub(crate) fn open_preset_picker_for_pr(app: &mut App) {
         QuickReturn {
             launch,
             text: String::new(),
+            from_box: false,
         },
     );
 }

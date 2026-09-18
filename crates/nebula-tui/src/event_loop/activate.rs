@@ -147,11 +147,15 @@ pub(super) fn settings_row_cmd(hotkeys: bool, selected: usize) -> SettingsCmd {
 }
 
 /// Enter on the WORKTREES PANEL's row — and a double-click on it: a pull
-/// request leads out of nebula, so it is handed to the browser and the
-/// cursor stays put; a checkout hands FOCUS one column right, to its
-/// sessions.
+/// request or an issue leads out of nebula, so it is handed to the browser
+/// and the cursor stays put; a checkout hands FOCUS one column right, to
+/// its sessions.
 pub(super) fn worktrees_row(app: &mut App, out: &mut Vec<ClientRequest>) {
-    match app.selected_worktree_pr().map(|pr| pr.url.clone()) {
+    let link = app
+        .selected_worktree_pr()
+        .map(|pr| pr.url.clone())
+        .or_else(|| app.selected_worktree_issue().map(|i| i.url.clone()));
+    match link {
         Some(url) => open_link(app, &url, out),
         None => app.focus = Focus::Sessions,
     }

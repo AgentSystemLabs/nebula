@@ -260,6 +260,7 @@ mod tests {
             title: "Attach links".into(),
             url: PR_URL.into(),
             is_draft: false,
+            health: Default::default(),
             head: PR_HEAD.into(),
         }
     }
@@ -441,6 +442,7 @@ mod tests {
                     pr: None,
                 },
                 text: "typed so far".into(),
+                from_box: true,
             };
             open_kind_picker(&mut app, KindPicker::quick_prompt(worktree.clone(), back));
             let Some(Overlay::Menu(menu)) = &app.overlay else {
@@ -512,6 +514,7 @@ mod tests {
                         pr: None,
                     },
                     text: String::new(),
+                    from_box: true,
                 };
                 open_kind_picker(&mut app, KindPicker::quick_prompt(worktree.clone(), back));
                 assert_eq!(

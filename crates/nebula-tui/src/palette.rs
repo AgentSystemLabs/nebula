@@ -9,7 +9,7 @@ use crate::app::{
     window_start, workspace_recency, workspace_rollup, workspace_unseen, worktree_recency,
     worktree_rollup, worktree_unseen, OpenPrs, Tree,
 };
-use crate::pull_request::Standing;
+use crate::pull_request::{Standing, Trouble};
 use crate::text_input::TextInput;
 use nebula_core::{Agent, AgentId, AgentStatus, Project, ProjectId, WorkspaceId, WorktreeId};
 use ratatui::layout::Rect;
@@ -90,6 +90,11 @@ pub struct PaletteItem {
     /// as list answers land, so a draft marked ready flips on the next
     /// refresh.
     pub standing: Option<Standing>,
+    /// What a pull request row's PR is in trouble for — conflicts, or a
+    /// failing check — and `None` for a healthy one and for every other
+    /// kind of row. The row goes red for it and its badge names it
+    /// (`merge conflicts`, `checks failing`) in place of the standing.
+    pub trouble: Option<Trouble>,
 }
 
 /// One visible palette row: an index into `items` plus the char positions of
@@ -301,6 +306,7 @@ fn build_palette_items(
                 tier: PaletteTier::Rest,
                 interacted: workspace_recency(tree, &ws.id, now).interacted,
                 standing: None,
+                trouble: None,
             });
         }
         let at = match workspace {
@@ -324,6 +330,7 @@ fn build_palette_items(
                 tier: PaletteTier::Rest,
                 interacted: project_recency(tree, &p.id, now).interacted,
                 standing: None,
+                trouble: None,
             });
         }
         for p in &projects {
@@ -337,6 +344,7 @@ fn build_palette_items(
                     tier: PaletteTier::Rest,
                     interacted: worktree_recency(tree, &w.id, now).interacted,
                     standing: None,
+                    trouble: None,
                 });
             }
         }
@@ -361,6 +369,7 @@ fn build_palette_items(
                             last_interaction_ms(a, now)
                         },
                         standing: None,
+                        trouble: None,
                     });
                 }
             }
@@ -389,6 +398,7 @@ fn build_palette_items(
                     tier: PaletteTier::Rest,
                     interacted: 0,
                     standing: Some(pr.standing()),
+                    trouble: pr.trouble(),
                 });
             }
         }
@@ -607,6 +617,7 @@ mod tests {
             title: title.into(),
             url: format!("https://github.com/o/r/pull/{number}"),
             is_draft,
+            health: Default::default(),
             head: format!("pr-{number}"),
         };
         let now = std::time::Instant::now();
@@ -651,6 +662,75 @@ mod tests {
         );
     }
 
+    /// A pull request row carries what its PR is in trouble for, so `/`
+    /// paints it red and names it — `merge conflicts`, `checks failing` —
+    /// the way the sidebar's row does; a healthy one, and every other
+    /// kind of row, carries none.
+    #[test]
+    fn pull_request_rows_carry_their_trouble() {
+        use crate::app::OpenPrs;
+        use crate::pull_request::{Checks, Health, OpenPr};
+        let tree = tree();
+        let pr = |number: u64, health: Health| OpenPr {
+            number,
+            title: format!("pr {number}"),
+            url: format!("https://github.com/o/r/pull/{number}"),
+            is_draft: false,
+            health,
+            head: format!("pr-{number}"),
+        };
+        let now = std::time::Instant::now();
+        let mut open_prs = HashMap::new();
+        open_prs.insert(
+            ProjectId("p1".into()),
+            OpenPrs {
+                list: vec![
+                    pr(7, Health::default()),
+                    pr(
+                        8,
+                        Health {
+                            conflicts: true,
+                            checks: Checks::Passing,
+                        },
+                    ),
+                    pr(
+                        9,
+                        Health {
+                            conflicts: false,
+                            checks: Checks::Failing,
+                        },
+                    ),
+                ],
+                at: now,
+                due: now,
+                step: std::time::Duration::from_secs(1),
+            },
+        );
+        let palette = Palette::new(&tree, false, false, &open_prs, false);
+        let troubles: Vec<(&str, Option<Trouble>)> = palette
+            .items
+            .iter()
+            .filter(|i| matches!(i.target, PaletteTarget::PullRequest { .. }))
+            .map(|i| (i.text.as_str(), i.trouble))
+            .collect();
+        assert_eq!(
+            troubles,
+            [
+                ("default/demo/#7 pr 7", None),
+                ("default/demo/#8 pr 8", Some(Trouble::Conflicts)),
+                ("default/demo/#9 pr 9", Some(Trouble::FailingChecks)),
+            ]
+        );
+        assert!(
+            palette
+                .items
+                .iter()
+                .filter(|i| !matches!(i.target, PaletteTarget::PullRequest { .. }))
+                .all(|i| i.trouble.is_none()),
+            "no other row is in trouble"
+        );
+    }
+
     /// A pull request row knows whether its PR is a draft or ready for
     /// review — the one thing the row can say about it beyond the title —
     /// and no other kind of row carries a standing at all. The list's
@@ -666,6 +746,7 @@ mod tests {
             title: title.into(),
             url: format!("https://github.com/o/r/pull/{number}"),
             is_draft,
+            health: Default::default(),
             head: format!("pr-{number}"),
         };
         let now = std::time::Instant::now();

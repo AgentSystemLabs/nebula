@@ -138,6 +138,83 @@ impl Screen {
         self.grid.clear_scrollback();
     }
 
+    /// NEBULA PATCH: the HISTORY LINE of the top visible row of whichever
+    /// screen is showing — visible row `r` is history line
+    /// `history_base() + r`. A row keeps its history line as the view
+    /// scrolls and as later output pushes it into the scrollback (see
+    /// `Grid::history_base`), so a selection anchored to one stays on its
+    /// text through both.
+    #[must_use]
+    pub fn history_base(&self) -> u64 {
+        self.grid().history_base()
+    }
+
+    /// NEBULA PATCH: one past the last history line of the screen showing.
+    #[must_use]
+    pub fn history_end(&self) -> u64 {
+        self.grid().history_end()
+    }
+
+    /// NEBULA PATCH: `contents_between`, with the rows named by HISTORY
+    /// LINE instead of visible row — so a selection that scrolled off the
+    /// screen while it was being made, or was made across more rows than
+    /// the screen holds, still reads back whole. Lines the grid no longer
+    /// holds contribute nothing. `end_col` is exclusive, as in
+    /// `contents_between`.
+    #[must_use]
+    pub fn contents_between_history(
+        &self,
+        start_line: u64,
+        start_col: u16,
+        end_line: u64,
+        end_col: u16,
+    ) -> String {
+        let (_, cols) = self.size();
+        let grid = self.grid();
+        let mut contents = String::new();
+        match start_line.cmp(&end_line) {
+            std::cmp::Ordering::Less => {
+                for line in start_line..=end_line {
+                    let Some(row) = grid.history_row(line) else {
+                        continue;
+                    };
+                    if line == start_line {
+                        row.write_contents(
+                            &mut contents,
+                            start_col,
+                            cols.saturating_sub(start_col),
+                            false,
+                        );
+                        if !row.wrapped() {
+                            contents.push('\n');
+                        }
+                    } else if line == end_line {
+                        row.write_contents(&mut contents, 0, end_col, false);
+                    } else {
+                        row.write_contents(&mut contents, 0, cols, false);
+                        if !row.wrapped() {
+                            contents.push('\n');
+                        }
+                    }
+                }
+            }
+            std::cmp::Ordering::Equal => {
+                if start_col < end_col {
+                    if let Some(row) = grid.history_row(start_line) {
+                        row.write_contents(
+                            &mut contents,
+                            start_col,
+                            end_col - start_col,
+                            false,
+                        );
+                    }
+                }
+            }
+            std::cmp::Ordering::Greater => {}
+        }
+        contents
+    }
+
     /// Returns the text contents of the terminal.
     ///
     /// This will not include any formatting information, and will be in plain

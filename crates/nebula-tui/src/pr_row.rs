@@ -4,7 +4,7 @@
 //! PROJECT OPEN PRS GROUP (WORKTREES PANEL) and the PR ROW (SESSIONS PANEL)
 //! both build their spans here, so the two lists read as one.
 
-use crate::pull_request::Standing;
+use crate::pull_request::{Standing, Trouble};
 use crate::theme::Theme;
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
@@ -33,7 +33,23 @@ pub struct Look {
 /// the preview's `closed` color and dims the rest, so it reads as done-with
 /// rather than as a session needing someone — the rail is the surface the
 /// STATUS DOT colors own on the rows above.
-pub fn look(standing: Standing, th: Theme) -> Look {
+///
+/// A pull request GitHub says cannot merge — its branch conflicts with the
+/// base, or a check is failing (`trouble`) — is red end to end, arrow,
+/// title, rail and badge: the red the STATUS DOT wears on a session that
+/// needs someone, because this row does too, and loud enough to be seen
+/// from across the room, which is the point. It outranks a draft's dim —
+/// a draft's conflict still needs a person — and applies only while the
+/// pull request is open: a merged or closed one is past resolving.
+pub fn look(standing: Standing, trouble: Option<Trouble>, th: Theme) -> Look {
+    if trouble.is_some() && matches!(standing, Standing::Open | Standing::Draft) {
+        return Look {
+            glyph: th.err,
+            label: th.err,
+            rail: th.err,
+            badge: th.err,
+        };
+    }
     match standing {
         Standing::Open => Look {
             glyph: th.accent,
@@ -98,8 +114,8 @@ mod tests {
     fn a_draft_is_dimmed_where_an_open_pull_request_is_accented() {
         for name in crate::theme::THEMES {
             let th = Theme::by_name(name);
-            let open = look(Standing::Open, th);
-            let draft = look(Standing::Draft, th);
+            let open = look(Standing::Open, None, th);
+            let draft = look(Standing::Draft, None, th);
             assert_eq!(open.glyph, th.accent, "{name}");
             assert_eq!(open.rail, th.accent, "{name}");
             assert_eq!(
@@ -129,12 +145,12 @@ mod tests {
     fn merged_and_closed_rows_wear_the_preview_state_colors() {
         for name in crate::theme::THEMES {
             let th = Theme::by_name(name);
-            let merged = look(Standing::Merged, th);
+            let merged = look(Standing::Merged, None, th);
             assert_eq!(merged.glyph, th.merged, "{name}");
             assert_eq!(merged.badge, th.merged, "{name}");
             assert_eq!(merged.rail, th.merged, "{name}");
             assert_eq!(merged.label, th.muted, "{name}: the title stays readable");
-            let closed = look(Standing::Closed, th);
+            let closed = look(Standing::Closed, None, th);
             assert_eq!(closed.glyph, th.err, "{name}");
             assert_eq!(closed.badge, th.err, "{name}");
             assert_eq!(closed.rail, th.dim, "{name}: no red rail on a closed PR");
@@ -146,13 +162,51 @@ mod tests {
         }
     }
 
+    /// A pull request in trouble — conflicts or a failing check — is red
+    /// end to end in every theme, arrow, title, rail and badge alike, and
+    /// the same red whether the trouble is one or the other: the badge
+    /// word tells them apart, the color says "needs you". A draft's dim
+    /// gives way to it; a merged or closed pull request is past resolving
+    /// and keeps its own look.
+    #[test]
+    fn a_pull_request_in_trouble_is_red_end_to_end() {
+        for name in crate::theme::THEMES {
+            let th = Theme::by_name(name);
+            let red = Look {
+                glyph: th.err,
+                label: th.err,
+                rail: th.err,
+                badge: th.err,
+            };
+            for trouble in [Trouble::Conflicts, Trouble::FailingChecks] {
+                assert_eq!(look(Standing::Open, Some(trouble), th), red, "{name}");
+                assert_eq!(look(Standing::Draft, Some(trouble), th), red, "{name}");
+                assert_eq!(
+                    look(Standing::Merged, Some(trouble), th),
+                    look(Standing::Merged, None, th),
+                    "{name}: merged is past resolving"
+                );
+                assert_eq!(
+                    look(Standing::Closed, Some(trouble), th),
+                    look(Standing::Closed, None, th),
+                    "{name}: so is closed"
+                );
+            }
+            assert_ne!(
+                red,
+                look(Standing::Closed, None, th),
+                "{name}: a closed pull request's red arrow is not the whole row"
+            );
+        }
+    }
+
     /// The badge keeps its cell budget: a long title shortens, the `draft`
     /// mark does not fall off the end.
     #[test]
     fn the_badge_is_billed_before_the_title() {
         let th = Theme::default();
         let rows = spans(
-            look(Standing::Draft, th),
+            look(Standing::Draft, None, th),
             "#9 A title far too long for the column",
             20,
             Some((" draft".into(), th.dim)),
@@ -162,7 +216,7 @@ mod tests {
         assert!(text.chars().count() <= 20, "{text:?}");
         assert_eq!(rows[0].style.fg, Some(th.dim), "a draft's arrow is dim");
 
-        let plain = spans(look(Standing::Open, th), "#7 Attach links", 20, None);
+        let plain = spans(look(Standing::Open, None, th), "#7 Attach links", 20, None);
         assert_eq!(plain.len(), 2, "no badge, no span for one");
         assert_eq!(plain[0].style.fg, Some(th.accent));
     }

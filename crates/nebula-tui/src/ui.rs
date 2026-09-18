@@ -1681,13 +1681,15 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 // A pull request carries no status; its colors are its
                 // standing's, the look its Worktrees-panel row wears — the
                 // accent for one ready for review, the dim end to end for
-                // a draft — and a trailing badge spells that state out in
-                // full (`draft`, `ready for review`), the sidebar's words
-                // at this modal's width, so the two are told apart before
-                // either is picked, by the word and not only by the color.
+                // a draft, red for one GitHub says cannot merge — and a
+                // trailing badge spells that state out in full (`draft`,
+                // `ready for review`, or the trouble: `merge conflicts`,
+                // `checks failing`), the sidebar's words at this modal's
+                // width, so the rows are told apart before one is picked,
+                // by the word and not only by the color.
                 let pr = item
                     .standing
-                    .map(|standing| (standing, crate::pr_row::look(standing, th)));
+                    .map(|standing| (standing, crate::pr_row::look(standing, item.trouble, th)));
                 let (glyph, glyph_color) = if item.archived {
                     ("⊘ ", th.dim)
                 } else if let Some((_, look)) = pr {
@@ -1703,8 +1705,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         Some(AgentStatus::Disconnected) | None => (hollow, th.dim),
                     }
                 };
-                let badge =
-                    pr.map(|(standing, look)| (format!(" {}", standing.label()), look.badge));
+                let badge = pr.map(|(standing, look)| {
+                    let word = item.trouble.map_or(standing.label(), |t| t.label());
+                    (format!(" {word}"), look.badge)
+                });
                 // The badge is billed before the text, as `pr_row::spans`
                 // does, so a long title shortens and the state never clips.
                 let badge_len = badge.as_ref().map_or(0, |(b, _)| b.chars().count());
@@ -1714,7 +1718,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 let shown = truncate(&item.text, budget);
                 let positions = visible_positions(&m.positions, &shown, &item.text);
                 let quiet = item.archived
-                    || matches!(item.standing, Some(crate::pull_request::Standing::Draft));
+                    || (item.trouble.is_none()
+                        && matches!(item.standing, Some(crate::pull_request::Standing::Draft)));
                 let mut spans = vec![Span::styled(glyph, Style::default().fg(glyph_color))];
                 spans.extend(path_highlight_spans(
                     &shown,
@@ -1724,6 +1729,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     // it is for the change nobody was looking at.
                     sweep_ramp(status, false, th, app.animations),
                     app.sweep_phase(),
+                    // A pull request in trouble paints its title in its
+                    // row's red — the end-to-end red its sidebar row wears.
+                    pr.filter(|_| item.trouble.is_some())
+                        .map_or(th.text, |(_, look)| look.label),
                     th,
                 ));
                 if let Some((badge, color)) = badge {
@@ -3665,18 +3674,27 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
 /// rows share a single virtual-row layout, computed unbounded by the panel
 /// height, so a project with a long open-PR list scrolls as one column.
 enum WorktreeEntry {
-    /// The OPEN PRS group header — the panel's one group header, in
-    /// whichever form the fold is in. A click target.
+    /// The OPEN PRS group header, in whichever form the fold is in. A
+    /// click target.
     PrHeader(String),
+    /// The ISSUES group header under it, the same way.
+    IssuesHeader(String),
     /// Index into [`App::worktree_rows`].
     Row(usize),
 }
 
 /// What one `WorktreeEntry::Row` draws: a checkout — plain, or nested
-/// under the pull request row above it — or a pull request.
+/// under the pull request row above it — a pull request, or an issue.
 enum PanelRow {
-    Checkout { data: WorktreeRowData, nested: bool },
+    Checkout {
+        data: WorktreeRowData,
+        nested: bool,
+    },
     Pr(crate::pull_request::OpenPr),
+    /// An open issue: its `#15 title` label is all the row draws.
+    Issue {
+        label: String,
+    },
 }
 
 impl WorktreeEntry {
@@ -3742,6 +3760,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 nested: true,
             },
             WorktreeRow::Pr(pr) => PanelRow::Pr(pr.clone()),
+            WorktreeRow::Issue(issue) => PanelRow::Issue {
+                label: issue.label(),
+            },
         })
         .collect();
     // The plain checkouts lead the list; everything after them belongs to
@@ -3757,7 +3778,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     // where it was reads as a setting, not a loss.
     let pr_total = app.listed_open_prs().len();
     let drafts_hidden = app.hidden_draft_prs();
-    if wt_count == 0 && pr_total == 0 && drafts_hidden == 0 {
+    // The ISSUES header counts the same way: every open issue the list
+    // holds, folded or not.
+    let issue_total = app.listed_issues().len();
+    if wt_count == 0 && pr_total == 0 && drafts_hidden == 0 && issue_total == 0 {
         if app.tree.has_visible_projects() {
             f.render_widget(
                 Paragraph::new(hint_line(&[("n", " starts a worktree")], th)),
@@ -3773,13 +3797,12 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     // ---- lay the column out in virtual rows ----
     let mut layout: Vec<(usize, WorktreeEntry)> = Vec::new();
     let mut vrow: usize = 0;
-    let header = |layout: &mut Vec<(usize, WorktreeEntry)>, vrow: &mut usize, text: String| {
+    let header = |layout: &mut Vec<(usize, WorktreeEntry)>, vrow: &mut usize, e: WorktreeEntry| {
         // A blank row above every group after the first keeps the groups
         // scannable without drawing more chrome.
         if *vrow > 0 {
             *vrow += 1;
         }
-        let e = WorktreeEntry::PrHeader(text);
         let h = e.height();
         layout.push((*vrow, e));
         *vrow += h;
@@ -3794,6 +3817,12 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             vrow += 1;
         }
     }
+    // The issue rows close the list; everything between the plain
+    // checkouts and them is the OPEN PRS group.
+    let pr_end = rows
+        .iter()
+        .position(|r| matches!(r, PanelRow::Issue { .. }))
+        .unwrap_or(rows.len());
     if pr_total > 0 || drafts_hidden > 0 {
         // A list cut off at the fetch cap says so rather than passing
         // itself off as the whole set. The cap is on the answer, drafts
@@ -3816,11 +3845,34 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         // click (or ↓ off the last checkout) would open them. Folded, the
         // header is the whole group and its count says what it hides.
         let fold = if app.open_prs_collapsed { "▸" } else { "▾" };
-        header(&mut layout, &mut vrow, format!("{fold} OPEN PRS · {count}"));
+        header(
+            &mut layout,
+            &mut vrow,
+            WorktreeEntry::PrHeader(format!("{fold} OPEN PRS · {count}")),
+        );
         // A checkout under its pull request stacks straight onto the
         // pull request's pill, no quiet row between: the two are one
         // thing, and the indent says which is under which.
-        for i in plain..rows.len() {
+        for i in plain..pr_end {
+            layout.push((vrow, WorktreeEntry::Row(i)));
+            vrow += PILL_H as usize;
+        }
+    }
+    if issue_total > 0 {
+        // The same `+` as the pull requests' when the answer hit the
+        // fetch cap: a hundred rows is not "a hundred issues".
+        let more = if issue_total >= crate::issues::LIST_LIMIT {
+            "+"
+        } else {
+            ""
+        };
+        let fold = if app.issues_collapsed { "▸" } else { "▾" };
+        header(
+            &mut layout,
+            &mut vrow,
+            WorktreeEntry::IssuesHeader(format!("{fold} ISSUES · {issue_total}{more}")),
+        );
+        for i in pr_end..rows.len() {
             layout.push((vrow, WorktreeEntry::Row(i)));
             vrow += PILL_H as usize;
         }
@@ -3844,7 +3896,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             // Scrolling up to the first row of a group brings that group's
             // header along, so the cursor never sits under a bare edge.
             let up_to = match pos.checked_sub(1).map(|p| &layout[p]) {
-                Some((h, WorktreeEntry::PrHeader(_))) => *h,
+                Some((h, WorktreeEntry::PrHeader(_) | WorktreeEntry::IssuesHeader(_))) => *h,
                 _ => *top,
             };
             let bottom = top + entry.height();
@@ -3880,12 +3932,16 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         }
         let hit_h = pill_hit_height(*top, layout.get(pos + 1).map(|(t, _)| *t));
         let i = match entry {
-            WorktreeEntry::PrHeader(text) => {
+            WorktreeEntry::PrHeader(text) | WorktreeEntry::IssuesHeader(text) => {
                 // Both forms are click targets: a click folds or unfolds
                 // the group, like the ARCHIVED header in Sessions.
                 if let Some(r) = row_rect_at(inner, y) {
                     f.render_widget(Paragraph::new(Span::styled(format!(" {text}"), dim)), r);
-                    app.hits.push((r, HitTarget::OpenPrsHeader));
+                    let hit = match entry {
+                        WorktreeEntry::IssuesHeader(_) => HitTarget::IssuesHeader,
+                        _ => HitTarget::OpenPrsHeader,
+                    };
+                    app.hits.push((r, hit));
                 }
                 continue;
             }
@@ -4001,13 +4057,46 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 // column this narrow the width is better spent on the title.
                 // A draft is also dimmed end to end (`pr_row::look`) and
                 // sits below every finished pull request, so it reads as
-                // "not ready" from across the room.
-                let look = crate::pr_row::look(pr.standing(), th);
-                let badge = pr
-                    .is_draft
-                    .then(|| (format!(" {}", pr.badge()), look.badge));
+                // "not ready" from across the room. One GitHub says cannot
+                // merge — conflicts, a failing check — is red end to end
+                // instead, and its badge names the trouble (`conflicts`,
+                // `failing`): that row needs a person, draft or not.
+                let trouble = pr.trouble();
+                let look = crate::pr_row::look(pr.standing(), trouble, th);
+                let badge = match trouble {
+                    Some(trouble) => Some((format!(" {}", trouble.badge()), look.badge)),
+                    None => pr
+                        .is_draft
+                        .then(|| (format!(" {}", pr.badge()), look.badge)),
+                };
                 let spans = crate::pr_row::spans(look, &pr.label(), inner.width as usize, badge);
                 // No STATUS DOT on a pull request, so the rail is the look's.
+                render_pill(
+                    f,
+                    inner,
+                    y,
+                    spans,
+                    i == app.sel_worktree,
+                    focused,
+                    th,
+                    look.rail,
+                );
+                if let Some(hit) = rows_rect_at(inner, y, hit_h) {
+                    app.hits.push((hit, HitTarget::Worktree(i)));
+                }
+            }
+            PanelRow::Issue { label } => {
+                // An issue is a link out of nebula like a pull request, so
+                // it takes the same arrow — in the green the ISSUES MODAL
+                // paints `open` in and the project rows count issues in,
+                // so the two groups are told apart from across the room.
+                let look = crate::pr_row::Look {
+                    glyph: th.ok,
+                    label: th.muted,
+                    rail: th.ok,
+                    badge: th.dim,
+                };
+                let spans = crate::pr_row::spans(look, label, inner.width as usize, None);
                 render_pill(
                     f,
                     inner,
@@ -4483,14 +4572,16 @@ fn draw_session_row(
             // link is as quiet as a terminal row.
             //
             // The badge slot is normally the state word in the look's badge
-            // color, but comments that landed since the row was last opened
-            // take it over and go loud: an unread count is the one thing
-            // here worth walking over to look at, and the state is already
-            // in the glyph.
+            // color — or the trouble word (`conflicts`, `failing`) on a
+            // pull request GitHub says cannot merge, whose whole row is
+            // red for it — but comments that landed since the row was last
+            // opened take it over and go loud: an unread count is the one
+            // thing here worth walking over to look at, and the state is
+            // already in the glyph (and the trouble in the row's red).
             let pr = l.pull_request();
             let unseen = l.unseen_comments(&app.pr_seen);
             let look = match pr {
-                Some(pr) => crate::pr_row::look(pr.standing(), th),
+                Some(pr) => crate::pr_row::look(pr.standing(), pr.trouble(), th),
                 None => crate::pr_row::Look {
                     glyph: th.muted,
                     label: th.muted,
@@ -4498,10 +4589,11 @@ fn draw_session_row(
                     badge: th.dim,
                 },
             };
-            let badge = match pr {
-                Some(_) if unseen > 0 => Some((format!(" {unseen} new"), th.warn)),
-                Some(pr) => Some((format!(" {}", pr.badge()), look.badge)),
-                None => None,
+            let badge = match (pr, pr.and_then(|pr| pr.trouble())) {
+                (Some(_), _) if unseen > 0 => Some((format!(" {unseen} new"), th.warn)),
+                (Some(_), Some(trouble)) => Some((format!(" {}", trouble.badge()), look.badge)),
+                (Some(pr), None) => Some((format!(" {}", pr.badge()), look.badge)),
+                (None, _) => None,
             };
             let spans = crate::pr_row::spans(look, &l.label(), width as usize, badge);
             (spans, look.rail)
@@ -4604,6 +4696,53 @@ fn draw_pr_preview(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     // Clamp here rather than in the handlers: the pane is what knows how
     // many rows the prose wrapped to, and a narrower window can strand the
     // offset past the end.
+    let max = (lines.len() as u16).saturating_sub(inner.height.max(1));
+    let scroll = app.pr_preview_scroll.min(max);
+    app.pr_preview_scroll = scroll;
+    let shown: Vec<Line> = lines.into_iter().skip(scroll as usize).collect();
+    f.render_widget(Paragraph::new(shown), inner);
+}
+
+/// The ISSUE PREVIEW: what the pane shows while the Worktrees cursor rests
+/// on a PROJECT ISSUES GROUP row (`App::previewed_issue`) — the ISSUES
+/// MODAL's reading pane, in the pane: headline, description, then the
+/// conversation once it lands, scrolled by `pr_preview_scroll` like the
+/// pull request's. The description rides the list, so there is nothing to
+/// wait for before the first paint; only the comments are fetched on the
+/// rest, and `issues::lines` says so until they land.
+fn draw_issue_preview(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
+    let th = app.theme;
+    let Some(issue) = app.previewed_issue().cloned() else {
+        return;
+    };
+    let left = vec![
+        Span::styled(" · ".to_string(), Style::default().fg(th.dim)),
+        Span::styled(format!("#{}", issue.number), Style::default().fg(th.muted)),
+    ];
+    let inner = titled_frame(f, area, "ISSUE", left, None, focused, th);
+    let inner = Rect {
+        x: inner.x + 1,
+        width: inner.width.saturating_sub(1),
+        ..inner
+    };
+    app.term_area = inner;
+    app.hits.push((inner, HitTarget::TerminalPane));
+    // Nothing in this pane is a PTY, so the link/file scanners have nothing
+    // to find — clear them or ⌥click would still hit last frame's hits.
+    app.term_links = Vec::new();
+    app.term_file_links = Vec::new();
+
+    let lines = crate::issues::lines(
+        &issue,
+        app.issue_detail.get(&issue.url),
+        app.issue_detail_failed.contains(&issue.url),
+        app.issue_comment_inflight.contains(&issue.url),
+        inner.width as usize,
+        th,
+    );
+    app.pr_preview_lines = lines.len();
+    // Clamp here, as the pull request's pane does: this is what knows how
+    // many rows the prose wrapped to.
     let max = (lines.len() as u16).saturating_sub(inner.height.max(1));
     let scroll = app.pr_preview_scroll.min(max);
     app.pr_preview_scroll = scroll;
@@ -4796,6 +4935,12 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         draw_pr_preview(f, app, area, focused);
         return;
     }
+    // An open issue under the Worktrees cursor: the pane reads it, as it
+    // reads a pull request.
+    if app.previewed_issue().is_some() {
+        draw_issue_preview(f, app, area, focused);
+        return;
+    }
     // A Claude Cloud row: the agent runs in the cloud sandbox, so the pane
     // says where and links there instead of showing a PTY nebula would
     // have to keep teleporting to stay current.
@@ -4874,15 +5019,23 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
             // Selection highlight: overlay REVERSED on the selected cells
             // (stream selection — full rows between the endpoints).
             if let Some(sel) = app.term_selection.filter(|s| s.active) {
-                let ((start_col, start_row), (end_col, end_row)) = sel.bounds();
+                let ((start_col, start_line), (end_col, end_line)) = sel.bounds();
                 let reversed = Style::default().add_modifier(Modifier::REVERSED);
                 let last_col = inner.width.saturating_sub(1);
-                for row in start_row..=end_row {
-                    let (from, to) = if start_row == end_row {
+                // The selection names HISTORY LINES; the rows on screen
+                // are `base..base + height` of them at this scroll, and
+                // only the part of the selection in that window paints.
+                let base = screen.history_base();
+                for row in 0..inner.height {
+                    let line = base + u64::from(row);
+                    if line < start_line || line > end_line {
+                        continue;
+                    }
+                    let (from, to) = if start_line == end_line {
                         (start_col, end_col)
-                    } else if row == start_row {
+                    } else if line == start_line {
                         (start_col, last_col)
-                    } else if row == end_row {
+                    } else if line == end_line {
                         (0, end_col)
                     } else {
                         (0, last_col)
@@ -5175,9 +5328,9 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
             },
             Style::default().fg(th.dim),
         )
-    } else if matches!(&app.overlay, Some(Overlay::AgentPresets(_))) {
+    } else if let Some(Overlay::AgentPresets(view)) = &app.overlay {
         Span::styled(
-            "↑/↓: select  Enter: launch  a: new  e: edit  d: delete  Esc: close",
+            crate::preset_overlays::footer_hint(view),
             Style::default().fg(th.dim),
         )
     } else if matches!(&app.overlay, Some(Overlay::AgentPresetEditor(_))) {
@@ -5290,6 +5443,17 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
                 k(Action::Activate),
                 k(Action::GitDiff),
                 k(Action::RefreshPullRequests),
+                k(Action::Palette),
+                k(Action::ContextMenu),
+                k(Action::Help)
+            ),
+            // An issue row: the browser, a prompt or a preset on it, and
+            // the pane's scroll keys.
+            Focus::Worktrees if app.selected_worktree_issue().is_some() => format!(
+                "{}: open in browser  {}: prompt  {}: preset  PgUp/PgDn: scroll  {}: search  {}: menu  {}: help",
+                k(Action::Activate),
+                k(Action::QuickPrompt),
+                k(Action::AgentPresets),
                 k(Action::Palette),
                 k(Action::ContextMenu),
                 k(Action::Help)
@@ -5557,6 +5721,7 @@ fn path_highlight_spans(
     quiet: bool,
     ramp: Option<[Color; 3]>,
     phase: usize,
+    text: Color,
     th: Theme,
 ) -> Vec<Span<'static>> {
     let boundary = shown
@@ -5576,7 +5741,7 @@ fn path_highlight_spans(
         } else if let Some(ramp) = ramp {
             sweep_style(Style::default(), ramp, phase, i - boundary, leaf_len)
         } else {
-            Style::default().fg(th.text)
+            Style::default().fg(text)
         };
         if run_style != Some(style) {
             if let Some(s) = run_style.take() {
@@ -5597,7 +5762,11 @@ fn path_highlight_spans(
 /// Split a (possibly truncated) path into spans, lighting the chars the
 /// fuzzy filter matched. `positions` are ascending char indices into the
 /// untruncated path; anything cut off by truncation simply isn't lit.
-fn fuzzy_highlight_spans(shown: &str, positions: &[usize], th: Theme) -> Vec<Span<'static>> {
+pub(crate) fn fuzzy_highlight_spans(
+    shown: &str,
+    positions: &[usize],
+    th: Theme,
+) -> Vec<Span<'static>> {
     if positions.is_empty() {
         return vec![Span::raw(shown.to_string())];
     }
@@ -5894,6 +6063,63 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+    /// The selection highlight paints the part of the selection on screen
+    /// at the current scroll: its endpoints are history lines, and the
+    /// rows under them move as the pane scrolls back.
+    #[test]
+    fn selection_highlight_follows_its_text_through_the_scroll() {
+        use crate::app::{AttachedTerm, TermSelection};
+        use nebula_core::{AgentId, SessionRef};
+        let mut app = App::new();
+        let mut term = AttachedTerm::new(SessionRef::Agent(AgentId("a1".into())), 20, 5);
+        let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        term.parser.process(b"\x1b[?25l");
+        term.parser.process(lines.join("\r\n").as_bytes());
+        app.term = Some(term);
+        // Lines 17–18, through column 3 of the last: rows 2–3 of the pane
+        // at the live tail.
+        app.term_selection = Some(TermSelection {
+            anchor: (0, 17),
+            head: (3, 18),
+            dragging: true,
+            active: true,
+            pointer: (0, 0),
+        });
+        // The frame takes three rows and the pane is inset a column:
+        // content at x 1..=20, y 3..=7.
+        let reversed_rows = |app: &mut App| -> Vec<(u16, Vec<u16>)> {
+            let area = Rect::new(0, 0, 21, 8);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(21, 8)).unwrap();
+            terminal.draw(|f| draw_terminal(f, app, area)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..8)
+                .filter_map(|y| {
+                    let xs: Vec<u16> = (0..21)
+                        .filter(|&x| {
+                            buf.cell((x, y))
+                                .unwrap()
+                                .modifier
+                                .contains(Modifier::REVERSED)
+                        })
+                        .collect();
+                    (!xs.is_empty()).then_some((y, xs))
+                })
+                .collect()
+        };
+        assert_eq!(
+            reversed_rows(&mut app),
+            vec![(5, (1..=20).collect()), (6, (1..=4).collect())]
+        );
+        // Scrolled back two lines: line 17 is the bottom row, line 18 is
+        // below the screen.
+        app.term.as_mut().unwrap().set_scroll(2);
+        assert_eq!(reversed_rows(&mut app), vec![(7, (1..=20).collect())]);
+        // Scrolled past the selection: nothing to paint.
+        app.term.as_mut().unwrap().set_scroll(5);
+        assert!(reversed_rows(&mut app).is_empty());
+    }
+
     #[test]
     fn truncate_clips_to_max_chars_with_an_ellipsis() {
         assert_eq!(truncate("short", 10), "short");
@@ -6188,6 +6414,7 @@ mod tests {
             title: format!("pr {number}"),
             url: format!("https://github.com/o/r/pull/{number}"),
             is_draft,
+            health: Default::default(),
             head: format!("b{number}"),
         };
         let issue = |number: u64| crate::issues::Issue {
@@ -6465,6 +6692,7 @@ mod tests {
                 title: "Attach links".into(),
                 state: crate::pull_request::STATE_MERGED.into(),
                 is_draft: false,
+                health: Default::default(),
                 activity: Vec::new(),
             }),
         );
@@ -6825,6 +7053,172 @@ mod tests {
         app
     }
 
+    /// A pull request GitHub says cannot merge — its branch conflicting
+    /// with the base, or a check failing — is red end to end on both
+    /// sidebar rows, the PROJECT OPEN PRS GROUP's and the checkout's own
+    /// PR ROW in the SESSIONS PANEL: arrow, title and badge, the badge
+    /// naming the trouble (`conflicts`, `failing`) in place of the state.
+    /// A healthy pull request beside it keeps its accent, so the red is
+    /// the one thing that changed; and comments that landed since the
+    /// row was opened still take the badge slot, loud, on a row that
+    /// stays red around them.
+    #[test]
+    fn pull_request_rows_go_red_for_conflicts_and_failing_checks() {
+        use crate::pull_request::{Checks, Health, OpenPr, PullRequest, STATE_OPEN};
+        use nebula_core::WorktreeId;
+        let mut app = hit_test_app(&["main", "feat"], &[], &[]);
+        let th = app.theme;
+        let pid = app.tree.projects[0].id.clone();
+        let now = std::time::Instant::now();
+        let conflicting = Health {
+            conflicts: true,
+            checks: Checks::Passing,
+        };
+        let failing = Health {
+            conflicts: false,
+            checks: Checks::Failing,
+        };
+        let pr = |number: u64, title: &str, health: Health| OpenPr {
+            number,
+            title: title.into(),
+            url: format!("https://github.com/o/r/pull/{number}"),
+            is_draft: false,
+            health,
+            head: format!("b{number}"),
+        };
+        app.open_prs.insert(
+            pid,
+            crate::app::OpenPrs {
+                list: vec![
+                    pr(7, "Fine", Health::default()),
+                    pr(8, "Stuck", conflicting),
+                    pr(9, "Broken", failing),
+                ],
+                at: now,
+                due: now,
+                step: std::time::Duration::from_secs(15),
+            },
+        );
+        app.pull_requests.insert(
+            WorktreeId("w1".into()),
+            Some(PullRequest {
+                number: 8,
+                url: "https://github.com/o/r/pull/8".into(),
+                title: "Stuck".into(),
+                state: STATE_OPEN.into(),
+                is_draft: false,
+                health: conflicting,
+                activity: Vec::new(),
+            }),
+        );
+        app.sel_worktree = 1;
+
+        const W: u16 = 36;
+        const H: u16 = 16;
+        // Every row of a panel: its text, and the color of each cell.
+        let paint = |app: &mut App, draw: fn(&mut Frame, &mut App, Rect)| {
+            let area = Rect::new(0, 0, W, H);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, H)).unwrap();
+            terminal.draw(|f| draw(f, app, area)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..H)
+                .map(|y| {
+                    let cells: Vec<_> = (0..W).map(|x| buf.cell((x, y)).unwrap().clone()).collect();
+                    (
+                        cells
+                            .iter()
+                            .map(|c| c.symbol().to_string())
+                            .collect::<String>(),
+                        cells.iter().map(|c| c.fg).collect::<Vec<Color>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let row = |rows: &[(String, Vec<Color>)], needle: &str| {
+            rows.iter()
+                .find(|(line, _)| line.contains(needle))
+                .cloned()
+                .unwrap_or_else(|| {
+                    let screen: Vec<&str> = rows.iter().map(|(l, _)| l.as_str()).collect();
+                    panic!("{needle} on screen:\n{}", screen.join("\n"))
+                })
+        };
+        // Cell-wise: the arrow ahead of the title is multi-byte.
+        let col = |line: &str, word: &str| {
+            let chars: Vec<char> = line.chars().collect();
+            let word: Vec<char> = word.chars().collect();
+            chars
+                .windows(word.len())
+                .position(|w| w == word.as_slice())
+                .unwrap_or_else(|| panic!("{word:?} in {line:?}"))
+        };
+        // The arrow's, the title's first letter's and the badge word's
+        // colors on the row that holds `needle` (`#8 Stuck`: the letter
+        // after the number and its space).
+        let colors = |rows: &[(String, Vec<Color>)], needle: &str, badge: Option<&str>| {
+            let (line, fg) = row(rows, needle);
+            let arrow = fg[col(&line, "↗")];
+            let title = fg[col(&line, needle) + 3];
+            let badge = badge.map(|b| fg[col(&line, b)]);
+            (arrow, title, badge, line)
+        };
+
+        app.focus = Focus::Worktrees;
+        let rows = paint(&mut app, draw_worktrees);
+        let (arrow, title, _, line) = colors(&rows, "#7 Fine", None);
+        assert_eq!(
+            (arrow, title),
+            (th.accent, th.muted),
+            "healthy: the accent arrow, the plain title: {line:?}"
+        );
+        assert!(
+            !line.contains("conflicts") && !line.contains("failing"),
+            "and no badge: {line:?}"
+        );
+        let (arrow, title, badge, line) = colors(&rows, "#8 Stuck", Some("conflicts"));
+        assert_eq!(
+            (arrow, title, badge),
+            (th.err, th.err, Some(th.err)),
+            "conflicts: red end to end: {line:?}"
+        );
+        let (arrow, title, badge, line) = colors(&rows, "#9 Broken", Some("failing"));
+        assert_eq!(
+            (arrow, title, badge),
+            (th.err, th.err, Some(th.err)),
+            "a failing check: red end to end: {line:?}"
+        );
+
+        app.focus = Focus::Sessions;
+        let rows = paint(&mut app, draw_sessions);
+        let (arrow, title, badge, line) = colors(&rows, "#8 Stuck", Some("conflicts"));
+        assert_eq!(
+            (arrow, title, badge),
+            (th.err, th.err, Some(th.err)),
+            "the checkout's PR ROW: red end to end: {line:?}"
+        );
+        let (line, fg) = row(&rows, "#8 Stuck");
+        if line.starts_with(PILL_RAIL) {
+            assert_eq!(fg[0], th.err, "the selected row's rail is red too");
+        }
+        // Comments landed since the row was opened: the count takes the
+        // badge slot, in its own loud color, and the row stays red.
+        if let Some(Some(pr)) = app.pull_requests.get_mut(&WorktreeId("w1".into())) {
+            pr.activity.push("2026-09-18T12:00:00Z".into());
+        }
+        let rows = paint(&mut app, draw_sessions);
+        let (arrow, title, badge, line) = colors(&rows, "#8 Stuck", Some("1 new"));
+        assert_eq!(
+            (arrow, title, badge),
+            (th.err, th.err, Some(th.warn)),
+            "unread comments on a red row: {line:?}"
+        );
+        assert!(
+            !line.contains("conflicts"),
+            "the count took the badge slot: {line:?}"
+        );
+    }
+
     /// A checkout on an open pull request's head branch draws under that
     /// pull request's row — stacked straight onto it, stepped in behind a
     /// `└` that runs into its STATUS DOT — not among the plain checkouts
@@ -6844,6 +7238,7 @@ mod tests {
                     title: "Attach links".into(),
                     url: "https://github.com/o/r/pull/7".into(),
                     is_draft: false,
+                    health: Default::default(),
                     head: "feat".into(),
                 }],
                 at: now,

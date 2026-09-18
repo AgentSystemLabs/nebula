@@ -292,7 +292,9 @@
 nebula finds the pull request on each branch with `gh` and shows it in the Sessions panel's
 PULL REQUESTS group, including a count of comments that landed while you were away. The row outlives
 the pull request: once it is merged or closed the row stays, badged `merged` or `closed` (an open one is
-badged `ready` — ready for review, the state and nothing more — and a draft is dimmed and badged `draft`),
+badged `ready` — ready for review, the state and nothing more — and a draft is dimmed and badged `draft`;
+one GitHub says cannot merge, its branch conflicting with the base or a check failing, is red end to end
+and badged `conflicts` or `failing` instead, the PR PREVIEW spelling the same out beside the state),
 for as long as the checkout does — a worktree whose PR has shipped is the one
 you are about to archive or delete, and the PR is what you check first. A merged one also takes over the
 checkout's row in the Worktrees panel: purple dot, purple rail and purple branch name, so the checkout to

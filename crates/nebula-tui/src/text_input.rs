@@ -1,10 +1,23 @@
-//! One-line text field with the editing keys a terminal user expects.
+//! Text field with the editing keys a terminal user expects — one line by
+//! default, multi-row on request.
 //!
 //! Every typed field in the TUI — the prompt dialog, the fuzzy filters,
-//! the grep query, the ssh destination — is one of these, so
-//! the keys are learned once and work everywhere: arrows and Home/End,
-//! word motion on ⌥←/⌥→, the readline control chords (Ctrl+A/E/B/F/W/U/K),
-//! and word/line deletes.
+//! the grep query, the ssh destination, the task boxes, a preset's prefix
+//! and postfix, an issue's description — is one of these, so the keys are
+//! learned once and work everywhere: arrows and Home/End, word motion on
+//! ⌥←/⌥→, the readline control chords (Ctrl+A/E/B/F/W/U/K), and word/line
+//! deletes.
+//!
+//! A [`TextInput::multiline`] field holds hard line breaks as well, and
+//! takes them the way Claude Code's own prompt does: Shift+Enter,
+//! Option+Enter — the `ESC` `CR` a terminal without the kitty protocol
+//! sends for a mapped Shift+Enter, which is Alt+Enter to us — and Ctrl+J
+//! all break the line; ↑/↓ walk the lines and fall through to the caller
+//! past the first or last, so a form can step to its next field; Home/End
+//! and the readline chords work on the line under the caret; a paste keeps
+//! its newlines. A one-line field flattens a paste and leaves the break
+//! keys to the caller, so Enter — always the caller's — stays the only
+//! way out of it.
 //!
 //! On macOS the option-arrow combos are what actually reaches us as
 //! `Alt+b` / `Alt+f`: both Terminal.app (its bundled keyMappings.plist maps
@@ -44,12 +57,15 @@ impl Edit {
     }
 }
 
-/// Editable single-line text plus a cursor into it.
+/// Editable text plus a cursor into it: one line, or many.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TextInput {
     text: String,
     /// Byte offset into `text`; always on a char boundary, always ≤ len.
     cursor: usize,
+    /// Hard line breaks allowed: the break keys insert one and a paste
+    /// keeps its own. Off, the field is one line whatever comes in.
+    multiline: bool,
 }
 
 /// Word characters for ⌥-arrow / Ctrl+W motion: a run of these is one word,
@@ -69,7 +85,63 @@ impl TextInput {
     pub fn with_text(text: impl Into<String>) -> Self {
         let text = text.into();
         let cursor = text.len();
-        Self { text, cursor }
+        Self {
+            text,
+            cursor,
+            multiline: false,
+        }
+    }
+
+    /// An empty multi-row field: line breaks typed, pasted and walked.
+    pub fn multiline() -> Self {
+        Self {
+            multiline: true,
+            ..Self::default()
+        }
+    }
+
+    /// A multi-row field pre-filled with `text`, cursor at the end.
+    pub fn multiline_with_text(text: impl Into<String>) -> Self {
+        let mut input = Self::with_text(text);
+        input.multiline = true;
+        input
+    }
+
+    /// Does the field hold hard line breaks?
+    pub fn is_multiline(&self) -> bool {
+        self.multiline
+    }
+
+    /// Switch line breaks on or off for a field built before its shape was
+    /// known — a prompt dialog decides by its kind.
+    pub fn set_multiline(&mut self, multiline: bool) {
+        self.multiline = multiline;
+    }
+
+    /// Is `key` one of the chords that break a line — Shift+Enter,
+    /// Option (Alt)+Enter or Ctrl+J? The three ways the one intent reaches
+    /// a terminal program: the kitty protocol delivers the shifted Enter
+    /// as a key of its own; a mapped Shift+Enter (Claude Code's
+    /// `/terminal-setup`, or Option+Enter with Option as Meta) arrives as
+    /// `ESC` `CR`, which is Alt+Enter; and Ctrl+J is the line feed itself,
+    /// which every terminal and tmux pass through. Claude Code's prompt
+    /// takes all three, so its muscle memory works here.
+    pub fn is_newline_key(key: &KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Enter => key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT),
+            KeyCode::Char('j' | 'J') => key.modifiers.contains(KeyModifiers::CONTROL),
+            _ => false,
+        }
+    }
+
+    /// Will [`handle_key`](Self::handle_key) turn `key` into a line break
+    /// here? Only in a multi-row field. A caller whose Enter submits guards
+    /// that arm with this, so a shifted Enter is never a send in a box
+    /// that breaks lines.
+    pub fn takes_newline(&self, key: &KeyEvent) -> bool {
+        self.multiline && Self::is_newline_key(key)
     }
 
     pub fn as_str(&self) -> &str {
@@ -97,24 +169,18 @@ impl TextInput {
         self.cursor += c.len_utf8();
     }
 
-    /// Insert a whole run at the cursor — a bracketed paste, minus the
-    /// newlines a one-line field can't hold.
+    /// Insert a whole run at the cursor — a bracketed paste. A multi-row
+    /// field keeps its line breaks (`\r\n` and a bare `\r` become `\n`);
+    /// a one-line field turns each into a space.
     pub fn insert_str(&mut self, s: &str) {
-        let flat: String = s
-            .chars()
-            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-            .collect();
-        self.text.insert_str(self.cursor, &flat);
-        self.cursor += flat.len();
-    }
-
-    /// Insert a bracketed paste while preserving line breaks. This is kept
-    /// opt-in so every established one-line field retains its flattening
-    /// contract; the Claude Cloud task editor is the sole caller.
-    pub fn insert_multiline_str(&mut self, s: &str) {
         let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
-        self.text.insert_str(self.cursor, &normalized);
-        self.cursor += normalized.len();
+        let run = if self.multiline {
+            normalized
+        } else {
+            normalized.replace('\n', " ")
+        };
+        self.text.insert_str(self.cursor, &run);
+        self.cursor += run.len();
     }
 
     /// Apply one key press. Returns [`Edit::Ignored`] for anything that
@@ -128,24 +194,38 @@ impl TextInput {
             .intersects(KeyModifiers::SUPER | KeyModifiers::META | KeyModifiers::HYPER);
 
         match key.code {
+            // ---- line breaks (multi-row fields only) ----
+            _ if self.takes_newline(key) => {
+                self.insert_char('\n');
+                Edit::Changed
+            }
+
             // ---- motion ----
-            KeyCode::Left if cmd => self.move_to(0),
+            // Line-wise keys work on the line under the caret — the whole
+            // text, in a one-line field.
+            KeyCode::Left if cmd => self.move_to(self.line_start(self.cursor)),
             KeyCode::Left if alt || ctrl => self.move_to(self.word_left(self.cursor)),
             KeyCode::Left => self.move_to(self.prev_boundary(self.cursor)),
-            KeyCode::Right if cmd => self.move_to(self.text.len()),
+            KeyCode::Right if cmd => self.move_to(self.line_end(self.cursor)),
             KeyCode::Right if alt || ctrl => self.move_to(self.word_right(self.cursor)),
             KeyCode::Right => self.move_to(self.next_boundary(self.cursor)),
-            KeyCode::Home => self.move_to(0),
-            KeyCode::End => self.move_to(self.text.len()),
+            KeyCode::Home => self.move_to(self.line_start(self.cursor)),
+            KeyCode::End => self.move_to(self.line_end(self.cursor)),
+            // ↑/↓ walk a multi-row field's lines, keeping the column where
+            // the line has it; past the first or last line they are the
+            // caller's (a form steps to its next field), and a one-line
+            // field never has a second line to walk to.
+            KeyCode::Up => self.line_up(),
+            KeyCode::Down => self.line_down(),
 
             // ---- deletion ----
             // Cmd+⌫ kills the line, ⌥⌫ / Ctrl+⌫ the previous word.
-            KeyCode::Backspace if cmd => self.delete(0, self.cursor),
+            KeyCode::Backspace if cmd => self.delete(self.line_start(self.cursor), self.cursor),
             KeyCode::Backspace if alt || ctrl => {
                 self.delete(self.word_left(self.cursor), self.cursor)
             }
             KeyCode::Backspace => self.delete(self.prev_boundary(self.cursor), self.cursor),
-            KeyCode::Delete if cmd => self.delete(self.cursor, self.text.len()),
+            KeyCode::Delete if cmd => self.delete(self.cursor, self.line_end(self.cursor)),
             KeyCode::Delete if alt || ctrl => {
                 self.delete(self.cursor, self.word_right(self.cursor))
             }
@@ -155,14 +235,21 @@ impl TextInput {
             // Cmd+key never means "type this" — leave it to the caller.
             KeyCode::Char(_) if cmd => Edit::Ignored,
             KeyCode::Char(c) if ctrl => match c.to_ascii_lowercase() {
-                'a' => self.move_to(0),
-                'e' => self.move_to(self.text.len()),
+                'a' => self.move_to(self.line_start(self.cursor)),
+                'e' => self.move_to(self.line_end(self.cursor)),
                 'b' => self.move_to(self.prev_boundary(self.cursor)),
                 'f' => self.move_to(self.next_boundary(self.cursor)),
                 'd' => self.delete(self.cursor, self.next_boundary(self.cursor)),
                 'w' => self.delete(self.word_left(self.cursor), self.cursor),
-                'u' => self.delete(0, self.cursor),
-                'k' => self.delete(self.cursor, self.text.len()),
+                'u' => self.delete(self.line_start(self.cursor), self.cursor),
+                // To the end of the line — or, standing at its end, the
+                // line break itself, as readline does.
+                'k' => match self.line_end(self.cursor) {
+                    end if end == self.cursor => {
+                        self.delete(self.cursor, self.next_boundary(self.cursor))
+                    }
+                    end => self.delete(self.cursor, end),
+                },
                 _ => Edit::Ignored,
             },
             // ⌥b/⌥f are what macOS terminals send for ⌥←/⌥→; ⌥d is
@@ -220,6 +307,59 @@ impl TextInput {
 
     fn next_boundary(&self, at: usize) -> usize {
         self.char_at(at).map_or(at, |c| at + c.len_utf8())
+    }
+
+    /// Start of the line `at` sits on: just past the previous line break,
+    /// or 0 — always 0 in a one-line field.
+    fn line_start(&self, at: usize) -> usize {
+        self.text[..at].rfind('\n').map_or(0, |i| i + 1)
+    }
+
+    /// End of the line `at` sits on: its line break, or the end of the
+    /// text — always the end in a one-line field.
+    fn line_end(&self, at: usize) -> usize {
+        self.text[at..]
+            .find('\n')
+            .map_or(self.text.len(), |i| at + i)
+    }
+
+    /// The caret's column on its line, in characters — what ↑/↓ keep.
+    fn column(&self) -> usize {
+        self.text[self.line_start(self.cursor)..self.cursor]
+            .chars()
+            .count()
+    }
+
+    /// `col` characters into the line starting at `start`, or that line's
+    /// end when it is shorter.
+    fn at_column(&self, start: usize, col: usize) -> usize {
+        let end = self.line_end(start);
+        self.text[start..end]
+            .char_indices()
+            .nth(col)
+            .map_or(end, |(i, _)| start + i)
+    }
+
+    /// ↑: the same column one line up, or [`Edit::Ignored`] on the first
+    /// line so the caller can act on the key.
+    fn line_up(&mut self) -> Edit {
+        let start = self.line_start(self.cursor);
+        if start == 0 {
+            return Edit::Ignored;
+        }
+        let col = self.column();
+        let above = self.line_start(start - 1);
+        self.move_to(self.at_column(above, col))
+    }
+
+    /// ↓: the same column one line down, or [`Edit::Ignored`] on the last.
+    fn line_down(&mut self) -> Edit {
+        let end = self.line_end(self.cursor);
+        if end == self.text.len() {
+            return Edit::Ignored;
+        }
+        let col = self.column();
+        self.move_to(self.at_column(end + 1, col))
     }
 
     /// Start of the word at or before `at`: skip back over separators, then
@@ -466,22 +606,153 @@ mod tests {
         assert_eq!(input.as_str(), "x");
     }
 
+    /// One paste, two fields: the one-line field spaces out every kind of
+    /// line break, the multi-row field keeps them all as `\n`.
     #[test]
-    fn paste_inserts_at_the_cursor_and_flattens_newlines() {
-        let mut input = typed("ab");
-        press(&mut input, KeyCode::Left, KeyModifiers::NONE);
-        input.insert_str("one\ntwo");
-        assert_eq!(input.as_str(), "aone twob");
-        assert_eq!(input.cursor_chars(), 8);
+    fn a_paste_keeps_its_lines_only_in_a_multi_row_field() {
+        let mut one = typed("ab");
+        press(&mut one, KeyCode::Left, KeyModifiers::NONE);
+        one.insert_str("one\r\ntwo\rthree");
+        assert_eq!(one.as_str(), "aone two threeb");
+        assert_eq!(one.cursor_chars(), 14);
+
+        let mut many = TextInput::multiline_with_text("ab");
+        press(&mut many, KeyCode::Left, KeyModifiers::NONE);
+        many.insert_str("one\r\ntwo\rthree");
+        assert_eq!(many.as_str(), "aone\ntwo\nthreeb");
+        assert_eq!(many.cursor_chars(), 14);
     }
 
+    /// The three chords Claude Code's prompt breaks a line on — the kitty
+    /// protocol's Shift+Enter, the `ESC` `CR` (Alt+Enter) a mapped
+    /// Shift+Enter or Option+Enter sends, and Ctrl+J — all break one
+    /// here; a plain Enter is still the caller's.
     #[test]
-    fn multiline_paste_preserves_and_normalizes_line_breaks() {
-        let mut input = typed("ab");
-        press(&mut input, KeyCode::Left, KeyModifiers::NONE);
-        input.insert_multiline_str("one\r\ntwo\rthree");
-        assert_eq!(input.as_str(), "aone\ntwo\nthreeb");
-        assert_eq!(input.cursor_chars(), 14);
+    fn a_multi_row_field_breaks_lines_three_ways() {
+        let mut input = TextInput::multiline();
+        for c in "one".chars() {
+            press(&mut input, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(
+            press(&mut input, KeyCode::Enter, KeyModifiers::SHIFT),
+            Edit::Changed
+        );
+        for c in "two".chars() {
+            press(&mut input, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(
+            press(&mut input, KeyCode::Enter, KeyModifiers::ALT),
+            Edit::Changed
+        );
+        for c in "three".chars() {
+            press(&mut input, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(
+            press(&mut input, KeyCode::Char('j'), KeyModifiers::CONTROL),
+            Edit::Changed
+        );
+        assert_eq!(input.as_str(), "one\ntwo\nthree\n");
+        assert_eq!(
+            press(&mut input, KeyCode::Enter, KeyModifiers::NONE),
+            Edit::Ignored,
+            "Enter is the caller's send or save"
+        );
+        assert!(input.takes_newline(&key(KeyCode::Enter, KeyModifiers::SHIFT)));
+        assert!(!input.takes_newline(&key(KeyCode::Enter, KeyModifiers::NONE)));
+    }
+
+    /// A one-line field has no line to break: the chords are recognized
+    /// (a form can still act on them) but left to the caller untouched.
+    #[test]
+    fn a_one_line_field_leaves_the_break_keys_to_the_caller() {
+        let mut input = typed("one");
+        for (code, mods) in [
+            (KeyCode::Enter, KeyModifiers::SHIFT),
+            (KeyCode::Enter, KeyModifiers::ALT),
+            (KeyCode::Char('j'), KeyModifiers::CONTROL),
+        ] {
+            assert!(TextInput::is_newline_key(&key(code, mods)), "{code:?}");
+            assert!(!input.takes_newline(&key(code, mods)), "{code:?}");
+            assert_eq!(press(&mut input, code, mods), Edit::Ignored, "{code:?}");
+        }
+        assert_eq!(input.as_str(), "one");
+        assert!(!TextInput::is_newline_key(&key(
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        )));
+    }
+
+    /// ↑/↓ walk the lines keeping the column (clamped to a shorter line),
+    /// and past the first or last line they are Ignored, so a form can
+    /// step to its next field on the very same key.
+    #[test]
+    fn arrows_walk_the_lines_and_fall_through_at_the_ends() {
+        let mut input = TextInput::multiline_with_text("first line\nhi\nthird");
+        // From the end of "third" (column 5): "hi" is shorter, so its end.
+        assert_eq!(
+            press(&mut input, KeyCode::Up, KeyModifiers::NONE),
+            Edit::Moved
+        );
+        assert_eq!(input.cursor_chars(), "first line\nhi".len());
+        // Column 2 now, onto the first line.
+        assert_eq!(
+            press(&mut input, KeyCode::Up, KeyModifiers::NONE),
+            Edit::Moved
+        );
+        assert_eq!(input.cursor_chars(), 2);
+        assert_eq!(
+            press(&mut input, KeyCode::Up, KeyModifiers::NONE),
+            Edit::Ignored,
+            "no line above the first"
+        );
+        assert_eq!(input.cursor_chars(), 2, "the caret stays put");
+        press(&mut input, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut input, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(input.cursor_chars(), "first line\nhi\nth".len());
+        assert_eq!(
+            press(&mut input, KeyCode::Down, KeyModifiers::NONE),
+            Edit::Ignored,
+            "no line below the last"
+        );
+        // A one-line field never walks: still the caller's keys.
+        let mut one = typed("solo");
+        assert_eq!(
+            press(&mut one, KeyCode::Up, KeyModifiers::NONE),
+            Edit::Ignored
+        );
+        assert_eq!(
+            press(&mut one, KeyCode::Down, KeyModifiers::NONE),
+            Edit::Ignored
+        );
+    }
+
+    /// Home/End, Ctrl+A/E and the line kills act on the line under the
+    /// caret, and Ctrl+K at a line's end joins it to the next.
+    #[test]
+    fn line_keys_work_on_the_line_under_the_caret() {
+        let mut input = TextInput::multiline_with_text("keep this\ncut here");
+        press(&mut input, KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(input.cursor_chars(), "keep this\n".len());
+        press(&mut input, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(input.cursor_chars(), "keep this\ncut here".len());
+        press(&mut input, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        press(&mut input, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(
+            input.as_str(),
+            "keep this\n",
+            "^K kills the second line only"
+        );
+        press(&mut input, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut input, KeyCode::End, KeyModifiers::NONE);
+        assert_eq!(input.cursor_chars(), "keep this".len());
+        press(&mut input, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(input.as_str(), "keep this", "^K at the end eats the break");
+        let mut input = TextInput::multiline_with_text("one\ntwo three");
+        press(&mut input, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(input.as_str(), "one\n", "^U stops at the line's start");
+        assert_eq!(input.cursor_chars(), 4);
+        press(&mut input, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(input.as_str(), "one", "⌫ at a line's start joins it");
     }
 
     #[test]
