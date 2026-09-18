@@ -1,6 +1,6 @@
 <div align="center">
 
-# nebula
+# NebulaX
 
 **Mission control for your coding agents.**
 
