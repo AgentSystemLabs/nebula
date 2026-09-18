@@ -37,12 +37,19 @@ switches branch, and **Attach** and **Restart** are not offered: there is no loc
 row, and the daemon refuses to boot a bare `claude` in its name. To steer the cloud agent without a
 browser, pick **Send to cloud session** from the row's `m` menu — the same wrapped editor — and nebula
 runs `claude -p <message> --cloud=<id>`; the reply lands on the session's page, the CLI never returns
-one. Otherwise the picker ends in the same task
-box `p` opens (the QUICK PROMPT — see [Keys](keys.md)): type the agent's first prompt and `Enter`, or
-`Enter` on the empty box to start with none and type it in the CLI, and nebula spawns the CLI in that
-worktree with it and drops you straight into it. The session titles itself from that first prompt
-(AUTO-TITLE); `r` renames it whenever you like. **Skip starting prompt** (Settings → Sessions) launches
-straight from the picker instead.
+one. Otherwise `Enter` on a row is the launch: nothing asks for a name or a task first — nebula spawns
+the CLI in that worktree and drops you straight into it, and you type the agent's first prompt there.
+The session titles itself from that first prompt (AUTO-TITLE); `r` renames it whenever you like. To
+start an agent on a task you type up front instead, use `p` (the QUICK PROMPT — see [Keys](keys.md)).
+
+The picker opens on its first row every time, whatever you picked last — unless **Remember harness**
+is on (Settings → Experimental, `remember_harness` in CONFIG.JSON). Then every launch you walk
+through this picker, the PR SESSION picker or the QUICK PROMPT's `Tab` picker writes its harness into
+the Agents tab's **Quick prompt › Agent** row, and a model or effort you drilled into through the
+submenus into that harness's own **Model** / **Effort** rows: the next `n` opens on that harness with
+its ✓ on that model, `Enter` launches it, and `p` launches it too. The rows are the ordinary settings,
+so the Agents tab always shows what the next launch will be, and you can still change them there. An
+AGENT PRESET launch leaves them alone — its harness is the preset's, not a change of mind.
 
 The rows do not run under the same permissions, and the picker is where you decide that. Claude
 is spawned with no permission flag at all and keeps its normal prompts — it stops and asks before the
@@ -163,7 +170,8 @@ opens it in the browser, and `/` finds it by title. Press `n` — or choose **Ne
 Codex session**, **New Cursor session**, **New Pi session** or **New Muse session** from `m` / right-click — to start a SESSION on any enabled
 harness in a checkout of the pull request's head branch — the project's worktree already on that
 branch, or one the DAEMON cuts for it — through the same MODEL / EFFORT submenus as the NEW SESSION
-PICKER, with a rule that limits all work to that PR and includes its URL: Claude and Pi get it as an appended
+PICKER, and as directly (`Enter` on a row starts it; `p` or `e` on the row is the launch that takes a
+task first), with a rule that limits all work to that PR and includes its URL: Claude and Pi get it as an appended
 system prompt, Codex, Cursor and Muse as their first prompt. The URL is kept with the AGENT, so RESUME
 reapplies the same scope. Only the row you actually stop on is fetched. While the cursor rests on a
 pull request the Sessions column folds to its bare rule — a pull request has no checkout, so it has

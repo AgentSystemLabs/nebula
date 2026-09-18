@@ -28,7 +28,10 @@ pub(crate) struct KindPicker {
     pub pr: Option<PrLaunch>,
     /// The QUICK PROMPT box owed back (its `Tab` picker).
     pub quick: Option<Box<QuickReturn>>,
-    /// The row to start on; the first row when None or not offered.
+    /// The row to start on: the surface's own ask (a QUICK PROMPT picker
+    /// opens on its box's harness); None leaves it to REMEMBER HARNESS
+    /// (Settings → Experimental — the last launch's), else the first
+    /// row, which one not offered any more falls to as well.
     pub hover: Option<HarnessRow>,
 }
 
@@ -58,14 +61,13 @@ impl KindPicker {
         }
     }
 
-    /// The QUICK PROMPT's `Tab` picker (the NEW SESSION PICKER's own box
-    /// included — the title says which): every row hands the box back,
+    /// The QUICK PROMPT's `Tab` picker: every row hands the box back,
     /// and the cursor starts on the harness the box is already set to.
     /// `worktree` is the checkout the menu is built against, not where
     /// the launch lands — that stays the box's own `QuickLaunch::target`.
     pub fn quick_prompt(worktree: WorktreeId, back: QuickReturn) -> Self {
         Self {
-            title: back.launch.picker_title(),
+            title: "Quick prompt agent".into(),
             worktree,
             pr: None,
             hover: Some(HarnessRow {
@@ -89,8 +91,8 @@ pub(crate) struct HarnessRow {
 /// entries — or None, with the FLASH set, when a hand-edited config left
 /// nothing to offer. An empty `ContextMenu` panics on Enter and `j`, so no
 /// caller opens one.
-pub(crate) fn enabled_harnesses_or_flash(app: &mut App) -> Option<Vec<HarnessRow>> {
-    let rows: Vec<HarnessRow> = Config::load()
+pub(crate) fn enabled_harnesses_or_flash(app: &mut App, cfg: &Config) -> Option<Vec<HarnessRow>> {
+    let rows: Vec<HarnessRow> = cfg
         .offered_harnesses()
         .into_iter()
         .map(|(kind, custom)| HarnessRow { kind, custom })
@@ -149,7 +151,8 @@ pub(crate) fn harness_label(kind: AgentKind, custom: Option<&str>) -> String {
 
 /// Open `picker` as the OVERLAY, or FLASH when no harness is enabled.
 pub(crate) fn open_kind_picker(app: &mut App, picker: KindPicker) {
-    let Some(rows) = enabled_harnesses_or_flash(app) else {
+    let cfg = Config::load();
+    let Some(rows) = enabled_harnesses_or_flash(app, &cfg) else {
         return;
     };
     let KindPicker {
@@ -160,6 +163,10 @@ pub(crate) fn open_kind_picker(app: &mut App, picker: KindPicker) {
         hover,
     } = picker;
     let hover = hover
+        .or_else(|| {
+            cfg.remembered_kind()
+                .map(|kind| HarnessRow { kind, custom: None })
+        })
         .and_then(|wanted| {
             rows.iter().position(|row| {
                 row.kind == wanted.kind && row.custom.as_deref() == wanted.custom.as_deref()
@@ -432,7 +439,6 @@ mod tests {
                     preset: None,
                     issue: None,
                     pr: None,
-                    origin: crate::quick_prompt::QuickOrigin::Hotkey,
                 },
                 text: "typed so far".into(),
             };
@@ -457,6 +463,80 @@ mod tests {
                 .collect();
             assert_eq!(names, expected);
         });
+    }
+
+    /// REMEMBER HARNESS on: the NEW SESSION and PR SESSION pickers open on
+    /// the last launch's harness — the `quick_prompt_kind` it wrote; off,
+    /// on the first row whatever that setting says. A remembered harness
+    /// switched off since steps to the first enabled one, and the QUICK
+    /// PROMPT's picker still opens on its own box's harness.
+    #[test]
+    fn pickers_open_on_the_remembered_harness_only_while_the_switch_is_on() {
+        let worktree = WorktreeId("w1".into());
+        let pr = open_pr();
+        fn hover_of(app: &App) -> usize {
+            match &app.overlay {
+                Some(Overlay::Menu(menu)) => menu.hover,
+                other => panic!("expected a picker, got {other:?}"),
+            }
+        }
+
+        pinned(r#"{"quick_prompt_kind": "cursor"}"#, || {
+            let mut app = App::new();
+            open_kind_picker(&mut app, KindPicker::new_session(worktree.clone()));
+            assert_eq!(
+                hover_of(&app),
+                0,
+                "off: the quick prompt's harness is its own"
+            );
+        });
+
+        pinned(
+            r#"{"remember_harness": true, "quick_prompt_kind": "cursor"}"#,
+            || {
+                let mut app = App::new();
+                open_kind_picker(&mut app, KindPicker::new_session(worktree.clone()));
+                assert_eq!(hover_of(&app), 2, "on: Cursor, the last launch's");
+                open_kind_picker(&mut app, KindPicker::pr_session(worktree.clone(), &pr));
+                assert_eq!(hover_of(&app), 2, "the PR SESSION picker too");
+
+                let back = QuickReturn {
+                    launch: QuickLaunch {
+                        target: crate::quick_prompt::QuickTarget::Worktree(worktree.clone()),
+                        kind: AgentKind::Codex,
+                        custom: None,
+                        model: None,
+                        effort: None,
+                        preset: None,
+                        issue: None,
+                        pr: None,
+                    },
+                    text: String::new(),
+                };
+                open_kind_picker(&mut app, KindPicker::quick_prompt(worktree.clone(), back));
+                assert_eq!(
+                    hover_of(&app),
+                    1,
+                    "the box's own harness outranks the remembered one"
+                );
+            },
+        );
+
+        pinned(
+            r#"{"remember_harness": true, "quick_prompt_kind": "cursor", "cursor_enabled": false}"#,
+            || {
+                let mut app = App::new();
+                open_kind_picker(&mut app, KindPicker::new_session(worktree.clone()));
+                let Some(Overlay::Menu(menu)) = &app.overlay else {
+                    panic!("{:?}", app.overlay);
+                };
+                assert_eq!(labels(menu), ["Claude", "Codex", "Pi", "Muse"]);
+                assert_eq!(
+                    menu.hover, 0,
+                    "a remembered harness switched off steps to the first enabled"
+                );
+            },
+        );
     }
 
     /// Only a hand-edited config reaches an empty list: the picker flashes

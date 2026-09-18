@@ -118,8 +118,8 @@ in the WORKTREES PANEL to branch off into a real `git worktree`. That's the whol
 two agents in two WORKTREES edit two directories and never collide.
 
 **4. Start the agent.** `n` in the SESSIONS PANEL opens the NEW SESSION PICKER — **Claude**, **Codex**,
-**Cursor**, **Pi** or **Muse**, `→` for MODEL and EFFORT, `Enter` for your defaults — then type the agent's first prompt
-in the box that follows (or `Enter` on it empty to start in the CLI). Or skip the picker entirely: `p` from any
+**Cursor**, **Pi** or **Muse**, `→` for MODEL and EFFORT, `Enter` for your defaults — and the session starts, its
+pane yours to type the first prompt into. Or skip the picker entirely: `p` from any
 PANEL opens the QUICK PROMPT, you type the task, and an agent starts working on it in the selected
 WORKTREE — or, from the WORKTREES PANEL or with `Ctrl+N` inside the box, in a fresh worktree cut for the
 job, the box turning green to say so. Save a framing you keep retyping as an AGENT PRESET (`e`) and it

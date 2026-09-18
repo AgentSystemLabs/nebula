@@ -640,8 +640,7 @@ fn apply_preset_to_quick_prompt(
     let launch_now = preset.skip_task && back.text.trim().is_empty();
     let launch = crate::quick_prompt::QuickLaunch::of_preset(back.launch.target, preset, &cfg)
         .with_issue(back.launch.issue)
-        .with_pr(back.launch.pr)
-        .with_origin(back.launch.origin);
+        .with_pr(back.launch.pr);
     if launch_now {
         crate::event_loop::submit_prompt_now(app, PromptKind::QuickPrompt(launch), out);
     } else {

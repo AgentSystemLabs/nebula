@@ -4095,13 +4095,18 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     app.sessions_view_rows = (inner.height / PILL_H) as usize;
 
     let rows = app.visible_session_rows();
-    if rows.is_empty() && app.selected_worktree().is_some() {
+    let (active_count, archived_count) = app.session_group_counts();
+    // The empty-column hint only when the column lists nothing at all —
+    // the ARCHIVED group included, folded or not, as the Worktrees column
+    // counts its folded OPEN PRS group. Folded, that group's header lands
+    // on the same top row the hint takes, and the two printed over each
+    // other: `… 5 archived` with the hint's `terminal` showing past it.
+    if rows.is_empty() && archived_count == 0 && app.selected_worktree().is_some() {
         f.render_widget(
             Paragraph::new(hint_line(&[("n", " agent · "), ("t", " terminal")], th)),
             inner,
         );
     }
-    let (active_count, archived_count) = app.session_group_counts();
     let terminal_count = rows
         .iter()
         .filter(|r| matches!(r, SessionRow::Terminal(_)))
@@ -5913,7 +5918,6 @@ mod tests {
             preset: None,
             issue: None,
             pr: None,
-            origin: crate::quick_prompt::QuickOrigin::Hotkey,
         });
         let cloud = PromptKind::CloudMessage {
             id: nebula_core::AgentId::from("a".to_string()),
@@ -6750,6 +6754,63 @@ mod tests {
         terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
         assert_eq!(app.sessions_view_rows, 1, "three title rows, one pill");
         assert_eq!(app.sessions_half_page(), 1, "never less than a row");
+    }
+
+    /// A worktree whose every session is archived: the folded ARCHIVED
+    /// header is the column's whole content, and the empty-column hint
+    /// stays away from it. Before, the hint was drawn whenever no row
+    /// was listed, and the header — laid out on the same top row — was
+    /// painted over it, leaving `… 1 archived` running straight into the
+    /// hint's `terminal`. Unfolded, the group's rows keep the hint away
+    /// as ever; with nothing at all under the worktree, the hint shows.
+    #[test]
+    fn folded_archived_header_is_not_drawn_over_the_empty_hint() {
+        let mut app = hit_test_app(&["main"], &["old"], &[]);
+        app.tree.agents[0].archived = true;
+        app.show_archived = false;
+        let area = Rect::new(0, 0, 32, 12);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(32, 12)).unwrap();
+        let rows_text = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+            let buf = terminal.backend().buffer();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        let rows = rows_text(&terminal);
+        assert!(
+            rows[3].contains("… 1 archived") && !rows[3].contains("terminal"),
+            "folded header stands alone on its row: {:?}",
+            rows[3]
+        );
+        assert!(
+            !rows.concat().contains("terminal"),
+            "no hint under a folded archived group: {rows:?}"
+        );
+
+        app.show_archived = true;
+        app.hits.clear();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        let rows = rows_text(&terminal);
+        assert!(rows[3].contains("ARCHIVED · 1"), "{:?}", rows[3]);
+        assert!(!rows.concat().contains("terminal"), "{rows:?}");
+
+        // Nothing under the worktree at all: the hint is the column.
+        app.tree.agents.clear();
+        app.hits.clear();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        let rows = rows_text(&terminal);
+        assert!(
+            rows[3].contains("n agent · t terminal"),
+            "empty column keeps its hint: {:?}",
+            rows[3]
+        );
     }
 
     /// RECENT PROMPTS under a session's name. Off (the default), the list

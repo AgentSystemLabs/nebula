@@ -13,21 +13,34 @@
 //! whose checkout of the PR's head branch the DAEMON finds or cuts.
 
 use super::{
-    create_agent, placeholder, schedule_prewarm, select_worktree_by_id, send_with, AgentLaunchDraft,
+    create_agent, placeholder, remember_launch, schedule_prewarm, select_worktree_by_id, send_with,
+    AgentLaunchDraft,
 };
 use crate::app::{App, PendingIntent, PlaceholderRows, PromptKind};
-use crate::quick_prompt::{QuickLaunch, QuickOrigin, QuickTarget};
+use crate::quick_prompt::{QuickLaunch, QuickTarget};
 use nebula_core::{AgentId, ClientRequest, WorktreeId};
 
 /// Enter in the box, with `text` already sized — and non-empty, unless
-/// the box `launches_empty` (the NEW SESSION PICKER's, or one an AGENT
-/// PRESET is on, sent as it is).
+/// the box `launches_empty` (one an AGENT PRESET is on, sent as it is).
 pub(super) fn submit(
     app: &mut App,
     launch: QuickLaunch,
     text: String,
     out: &mut Vec<ClientRequest>,
 ) {
+    // REMEMBER HARNESS (Settings → Experimental): a box fired on a harness
+    // — or a MODEL / EFFORT — picked through `Tab` makes that the next
+    // launch's default. A preset's harness is the preset's own, not a
+    // change of default, so a preset launch leaves the rows alone.
+    if launch.preset.is_none() {
+        remember_launch(
+            app,
+            launch.kind,
+            launch.custom.as_deref(),
+            launch.model.as_deref(),
+            launch.effort.as_deref(),
+        );
+    }
     match launch.target.clone() {
         QuickTarget::Worktree(worktree) => {
             create_agent(app, draft(launch, worktree, text, None), out)
@@ -122,13 +135,10 @@ pub(super) fn draft(
     text: String,
     placeholder: Option<AgentId>,
 ) -> AgentLaunchDraft {
-    // The hotkey's box is the one launch that stays out of the way by
-    // default: `p`, type, Enter, keep working. The NEW SESSION PICKER's
-    // takes the pane, as every picker-walked launch does.
-    let focus_pane = match launch.origin {
-        QuickOrigin::Hotkey => crate::config::Config::load().quick_prompt_focus,
-        QuickOrigin::NewSession => true,
-    };
+    // The box is the one launch that stays out of the way by default:
+    // `p`, type, Enter, keep working. A picker-walked launch (`n`) takes
+    // the pane instead.
+    let focus_pane = crate::config::Config::load().quick_prompt_focus;
     let base = AgentLaunchDraft::new(
         worktree,
         launch.kind,

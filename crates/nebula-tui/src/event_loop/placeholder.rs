@@ -1575,17 +1575,12 @@ mod tests {
 
     // ---- a PR SESSION into a checkout that does not exist yet ----
 
-    /// Enter on the OPEN PRS row for #7 — `n` opens the PR SESSION
-    /// picker, Enter takes its first row (Claude), `name` goes into the
-    /// name box (empty takes the default), Enter launches. The checkout
-    /// row for the head branch and the session row are up, and nothing
-    /// but the `CreatePrAgent` went to the DAEMON. Returns the stand-in
-    /// ids the intent carries and the request id.
-    fn stage_pr_session(
-        app: &mut App,
-        name: &str,
-        out: &mut Vec<ClientRequest>,
-    ) -> (PlaceholderRows, u64) {
+    /// `n` on the OPEN PRS row for #7 opens the PR SESSION picker, and
+    /// Enter on its first row (Claude) launches — no box in between. The
+    /// checkout row for the head branch and the session row are up, and
+    /// nothing but the `CreatePrAgent` went to the DAEMON. Returns the
+    /// stand-in ids the intent carries and the request id.
+    fn stage_pr_session(app: &mut App, out: &mut Vec<ClientRequest>) -> (PlaceholderRows, u64) {
         seed_tree(app);
         seed_open_prs(app, &[(7, "Attach links")]);
         app.focus = Focus::Worktrees;
@@ -1599,15 +1594,10 @@ mod tests {
         );
         press(app, KeyCode::Enter, KeyModifiers::NONE, out);
         assert!(
-            matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, PromptKind::NewPrAgent { .. })),
-            "the picker's row opens the name box: {:?}",
+            app.overlay.is_none(),
+            "the picker's row launches, with no box after it: {:?}",
             app.overlay
         );
-        if !name.is_empty() {
-            assert!(paste_into_overlay(app, name));
-        }
-        press(app, KeyCode::Enter, KeyModifiers::NONE, out);
-        assert!(app.overlay.is_none(), "launching closes the box");
         let creates: Vec<&ClientRequest> = out
             .iter()
             .filter(|r| matches!(r, ClientRequest::CreatePrAgent { .. }))
@@ -1645,7 +1635,7 @@ mod tests {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            let (rows, _) = stage_pr_session(&mut app, "", &mut out);
+            let (rows, _) = stage_pr_session(&mut app, &mut out);
 
             assert_eq!(worktree_branches(&app), ["main", "pr-7-head"]);
             let selected = app.selected_worktree().expect("a row is selected");
@@ -1694,10 +1684,11 @@ mod tests {
         });
     }
 
-    /// A name typed in the box is the stand-in row's from the start, and
-    /// the one the create carries.
+    /// No box asks for a name, so the stand-in row wears the generated
+    /// one from the start, and the create carries it with AUTO-TITLE on —
+    /// the session names itself from its first prompt.
     #[test]
-    fn a_typed_name_is_on_the_pr_stand_in_row() {
+    fn the_pr_stand_in_row_wears_the_generated_name_the_create_carries() {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
@@ -1707,18 +1698,17 @@ mod tests {
             app.sel_worktree = 1;
             press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(paste_into_overlay(&mut app, "review-7"));
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
 
             let sessions = app.visible_session_rows();
             assert_eq!(sessions.len(), 1, "{sessions:?}");
-            assert_eq!(sessions[0].name(), "review-7");
+            let shown = sessions[0].name().to_string();
             assert!(
                 out.iter().any(|r| matches!(
                     r,
-                    ClientRequest::CreatePrAgent { name, auto_title: false, .. } if name == "review-7"
+                    ClientRequest::CreatePrAgent { name, auto_title: true, .. } if *name == shown
                 )),
-                "{out:?}"
+                "the row says {shown:?}: {out:?}"
             );
         });
     }
@@ -1734,7 +1724,7 @@ mod tests {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            let (rows, req_id) = stage_pr_session(&mut app, "", &mut out);
+            let (rows, req_id) = stage_pr_session(&mut app, &mut out);
 
             seed_feat_worktree(&mut app, "w3", "pr-7-head");
             assert_eq!(worktree_branches(&app), ["main", "pr-7-head"]);
@@ -1799,7 +1789,7 @@ mod tests {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            let (rows, req_id) = stage_pr_session(&mut app, "", &mut out);
+            let (rows, req_id) = stage_pr_session(&mut app, &mut out);
 
             handle_server_event(
                 &mut app,
@@ -1840,7 +1830,7 @@ mod tests {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            let (rows, req_id) = stage_pr_session(&mut app, "", &mut out);
+            let (rows, req_id) = stage_pr_session(&mut app, &mut out);
 
             handle_server_event(
                 &mut app,
@@ -1871,7 +1861,7 @@ mod tests {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            let (rows, req_id) = stage_pr_session(&mut app, "", &mut out);
+            let (rows, req_id) = stage_pr_session(&mut app, &mut out);
 
             seed_feat_worktree(&mut app, "w3", "pr-7-head");
             handle_server_event(
@@ -1911,7 +1901,6 @@ mod tests {
             );
             press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
 
             assert!(
                 out.iter()
@@ -1939,14 +1928,13 @@ mod tests {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            let (rows, _) = stage_pr_session(&mut app, "", &mut out);
+            let (rows, _) = stage_pr_session(&mut app, &mut out);
 
             // Back on the pull request's row — the stand-in checkout sits
             // under it, so the pull request is the row after the root.
             app.sel_worktree = 1;
             assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
             press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert_eq!(
                 app.flash.as_deref(),
@@ -2062,7 +2050,7 @@ mod tests {
             with_default_config(|| {
                 let mut app = App::new();
                 let mut out = Vec::new();
-                let (rows, req_id) = stage_pr_session(&mut app, "", &mut out);
+                let (rows, req_id) = stage_pr_session(&mut app, &mut out);
                 assert_eq!(
                     app.selected_worktree().map(|w| w.id.clone()),
                     Some(rows.worktree.clone()),
@@ -2126,7 +2114,7 @@ mod tests {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            let (rows, req_id) = stage_pr_session(&mut app, "", &mut out);
+            let (rows, req_id) = stage_pr_session(&mut app, &mut out);
 
             key(&mut app, KeyCode::Up, &mut out);
             assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
@@ -2159,7 +2147,7 @@ mod tests {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            let (_, req_id) = stage_pr_session(&mut app, "", &mut out);
+            let (_, req_id) = stage_pr_session(&mut app, &mut out);
 
             handle_terminal_event(
                 &mut app,
@@ -2196,7 +2184,7 @@ mod tests {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            let (_, req_id) = stage_pr_session(&mut app, "", &mut out);
+            let (_, req_id) = stage_pr_session(&mut app, &mut out);
             handle_server_event(
                 &mut app,
                 ServerEvent::Ack {

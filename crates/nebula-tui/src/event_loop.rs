@@ -2784,25 +2784,6 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
             format!("branch name (empty = {suggestion})").into(),
             String::new(),
         ),
-        PromptKind::NewPrAgent { model, effort, .. } => {
-            // Surface the resolved launch options so Enter-with-defaults is
-            // visibly what it is; plain "New agent" means CLI defaults.
-            let opts: Vec<&str> = model
-                .as_deref()
-                .into_iter()
-                .chain(effort.as_deref())
-                .collect();
-            let title = if opts.is_empty() {
-                "New agent".into()
-            } else {
-                format!("New agent ({})", opts.join(" · ")).into()
-            };
-            (
-                title,
-                format!("name (empty = {})", app.default_session_name("agent")).into(),
-                String::new(),
-            )
-        }
         PromptKind::ClaudeCloudTask { .. } => (
             "Claude Cloud task".into(),
             "what should Claude do?".into(),
@@ -4173,17 +4154,18 @@ fn open_menu(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
     }));
 }
 
-/// Step 1 of new-session creation: pick which CLI the session runs. The
-/// kind chains into the NEW SESSION box (the QUICK PROMPT's, asking for
-/// the first prompt) via `MenuAction::NewAgentOfKind` — unless
-/// `skip_session_naming` is on, which creates it right there.
+/// New-session creation, all of it: pick which CLI the session runs, and
+/// Enter on the row creates it (`MenuAction::NewAgentOfKind`) — no box
+/// follows; the first prompt is typed in the CLI, and a launch that starts
+/// from a typed task is the QUICK PROMPT's (`p`). Only the `Claude · cloud`
+/// row still asks, a cloud launch being nothing without its task.
 /// Claude/Codex rows expand (→) into model and effort submenus; Enter
 /// anywhere takes the configured defaults for whatever wasn't drilled into.
 /// A plain TERMINAL SESSION is not offered here: NEW TERMINAL (`t`) and the
 /// CONTEXT MENU's "New terminal" already cover it.
 fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
     // A stand-in checkout is not a place the DAEMON knows yet; better to
-    // say so here than after a kind, a model and a name were picked.
+    // say so here than after a kind and a model were picked.
     if app.is_placeholder_worktree(&worktree) {
         app.flash = Some(WORKTREE_STILL_CREATING.into());
         return;
@@ -4206,8 +4188,8 @@ fn selected_project_main_worktree(app: &App) -> Option<WorktreeId> {
 }
 
 /// `n` on a PROJECT OPEN PRS GROUP row: the NEW SESSION PICKER's harness
-/// rows, every one carrying the PR's URL and launching a local AGENT in
-/// the ROOT WORKTREE through the same MODEL / EFFORT and naming steps.
+/// rows, every one carrying the PR's URL and — through the same MODEL /
+/// EFFORT submenus, and as directly on Enter — launching a PR SESSION.
 fn open_pr_agent_picker(app: &mut App) {
     let Some(pr) = app.selected_worktree_pr().cloned() else {
         return;
@@ -5616,6 +5598,24 @@ fn edit_keymap(app: &mut App, edit: impl FnOnce(&mut crate::keymap::Keymap)) -> 
     save_keymap(app, keymap)
 }
 
+/// REMEMBER HARNESS (Settings → Experimental): make a launch's harness —
+/// and a model or effort picked for it — the defaults the next NEW
+/// SESSION PICKER and QUICK PROMPT start from
+/// (`Config::remember_launch`). Nothing is written while the switch is
+/// off or the pick already is the default; a failed write flashes.
+fn remember_launch(
+    app: &mut App,
+    kind: AgentKind,
+    custom: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) {
+    let mut cfg = crate::config::Config::load();
+    if cfg.remember_launch(kind, custom, model, effort) {
+        save_config(app, &cfg);
+    }
+}
+
 /// Write the config file, flashing the failure. False when it didn't land.
 fn save_config(app: &mut App, cfg: &crate::config::Config) -> bool {
     match cfg.save() {
@@ -6009,18 +6009,15 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             return;
         }
     }
-    // An empty agent name falls back to the next free default (agent-1, …),
-    // an empty worktree name to the random branch the prompt offered, an
-    // empty project name undoes the rename — the row goes back to the
-    // folder's own name, which is the only way back from a rename — an
-    // empty typed setting is that row's default (`auto`), which is the only
-    // way back to it, the NEW SESSION PICKER's empty box launches with no
-    // STARTING PROMPT, and an AGENT PRESET's task is optional — its box, or
-    // a QUICK PROMPT it is on, launches on prefix + postfix alone. For
-    // every other prompt an empty field is a cancel.
+    // An empty worktree name falls back to the random branch the prompt
+    // offered, an empty project name undoes the rename — the row goes back
+    // to the folder's own name, which is the only way back from a rename —
+    // an empty typed setting is that row's default (`auto`), which is the
+    // only way back to it, and an AGENT PRESET's task is optional — its
+    // box, or a QUICK PROMPT it is on, launches on prefix + postfix alone.
+    // For every other prompt an empty field is a cancel.
     let empty_is_a_default = match &prompt.kind {
-        PromptKind::NewPrAgent { .. }
-        | PromptKind::NewWorktree { .. }
+        PromptKind::NewWorktree { .. }
         | PromptKind::RenameProject { .. }
         | PromptKind::SettingText { .. }
         | PromptKind::AgentPresetTask { .. } => true,
@@ -6099,23 +6096,6 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 },
             );
         }
-        PromptKind::NewPrAgent {
-            worktree,
-            kind,
-            custom,
-            model,
-            effort,
-            pr,
-        } => create_agent(
-            app,
-            AgentLaunchDraft {
-                custom,
-                name: value,
-                pr: Some(pr),
-                ..AgentLaunchDraft::new(worktree, kind, model, effort)
-            },
-            out,
-        ),
         PromptKind::ClaudeCloudTask {
             worktree,
             name,
@@ -6391,8 +6371,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     &crate::config::Config::load(),
                 )
                 .with_issue(back.launch.issue.clone())
-                .with_pr(back.launch.pr.clone())
-                .with_origin(back.launch.origin);
+                .with_pr(back.launch.pr.clone());
                 crate::quick_prompt::reopen(app, launch, &back.text);
                 return;
             }
@@ -6400,7 +6379,10 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             // an unexpanded submenu (None) and the explicit "default" row
             // both take the setting; the setting's own "default" means
             // "no flag" and reaches the daemon as None.
-            let cfg = crate::config::Config::load();
+            let mut cfg = crate::config::Config::load();
+            // What the submenus chose, before the defaults fill in the
+            // rest: REMEMBER HARNESS below records a pick, never a fallback.
+            let picked = (model.clone(), effort.clone());
             let resolve = |choice: Option<String>, configured: Option<String>| match choice {
                 None => configured,
                 Some(c) if c == "default" => configured,
@@ -6430,54 +6412,36 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 );
                 return;
             }
-            // No box means no typing at all: create straight from the
-            // picker. The standing default-spec warm slot gets adopted
-            // where it matches, and the refill behind the create re-warms
-            // it either way.
-            if cfg.skip_session_naming {
-                create_agent(
-                    app,
-                    AgentLaunchDraft {
-                        custom: custom.clone(),
-                        pr,
-                        ..AgentLaunchDraft::new(worktree, kind, model, effort)
-                    },
-                    out,
-                );
-                return;
-            }
-            // A PR SESSION from this picker still asks for a name; the
-            // box is the preset route's (`e` on the OPEN PRS row), which
-            // sends its text as the `CreatePrAgent`'s STARTING PROMPT.
-            // Nothing is warmed for it either — an unscoped warm CLI
-            // cannot be adopted for a PR launch.
-            if let Some(pr) = pr {
-                open_prompt(
-                    app,
-                    PromptKind::NewPrAgent {
-                        worktree,
-                        kind,
-                        custom: custom.clone(),
-                        model,
-                        effort,
-                        pr,
-                    },
-                );
-                return;
-            }
-            // The box, where the name prompt used to be: what is typed is
-            // the session's STARTING PROMPT, and an empty Enter starts it
-            // with none. Nothing is warmed while the user types — a launch
-            // carrying a STARTING PROMPT can adopt no WARM SPARE, and one
-            // sent empty adopts the standing default-spec slot as it is.
-            crate::quick_prompt::open_for_new_session(
-                app,
-                worktree,
+            // The pick is the whole flow: the session starts right here,
+            // under the generated name and AUTO-TITLE, its first prompt
+            // typed in the CLI. No box stands between the picker and the
+            // pane — a launch that starts from a typed task is the QUICK
+            // PROMPT's (`p`; `e` on an OPEN PRS row for a PR SESSION). The
+            // standing default-spec warm slot gets adopted where it
+            // matches (never for a PR SESSION: an unscoped warm CLI cannot
+            // be adopted for one), and the refill behind the create
+            // re-warms it either way.
+            //
+            // REMEMBER HARNESS (Settings → Experimental): the pick is the
+            // next launch's default — this harness, and a model or effort
+            // only where a submenu chose one. A failed write flashes; the
+            // launch goes ahead regardless.
+            if cfg.remember_launch(
                 kind,
-                custom.clone(),
-                model,
-                effort,
-                &cfg,
+                custom.as_deref(),
+                picked.0.as_deref(),
+                picked.1.as_deref(),
+            ) {
+                save_config(app, &cfg);
+            }
+            create_agent(
+                app,
+                AgentLaunchDraft {
+                    custom: custom.clone(),
+                    pr,
+                    ..AgentLaunchDraft::new(worktree, kind, model, effort)
+                },
+                out,
             );
         }
         MenuAction::NewWorktree(project) => open_new_worktree_prompt(app, project),
@@ -7614,14 +7578,6 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
                     out,
                 )),
             };
-            // A name typed in the box is the row's from the start.
-            if let Some(rows) = &rows {
-                if !name.is_empty() {
-                    if let Some(a) = app.tree.agents.iter_mut().find(|a| a.id == rows.agent) {
-                        a.name = name.clone();
-                    }
-                }
-            }
             Some((project, pr, rows))
         }
         None => None,
@@ -9704,8 +9660,8 @@ struct SelectionSnapshot {
     /// one (`worktree` is None then). The pull requests list below the
     /// checkouts, so every checkout that comes or goes shifts them: left
     /// to its index, the cursor slid onto the next pull request — and a
-    /// launch with no box (`n` under `skip_session_naming`, a `skip`-task
-    /// preset) then ran against a pull request nobody picked.
+    /// launch with no box (`n`, a `skip`-task preset) then ran against a
+    /// pull request nobody picked.
     pr: Option<String>,
     session: Option<SessionRef>,
     /// The Sessions panel row the cursor was on, and the group that row
@@ -12169,9 +12125,9 @@ mod tests {
 
     /// `n` on an OPEN PRS row offers the same harness rows as the NEW
     /// SESSION PICKER, every one a SESSION draft against the PROJECT's ROOT
-    /// WORKTREE carrying the PR URL. The URL survives the normal naming flow
-    /// and crosses IPC on the dedicated create request with the picked
-    /// kind; no unscoped PREWARM POOL process can be adopted for it.
+    /// WORKTREE carrying the PR URL. Enter on a row is the launch: the URL
+    /// crosses IPC on the dedicated create request with the picked kind;
+    /// no unscoped PREWARM POOL process can be adopted for it.
     #[test]
     fn new_on_an_open_pr_row_offers_every_harness_and_carries_its_url() {
         with_default_config(|| {
@@ -12218,52 +12174,37 @@ mod tests {
             );
             assert_eq!(rows[1].1, AgentKind::Codex);
 
-            // The second row: a Codex PR SESSION.
+            // The second row: a Codex PR SESSION, started by the pick
+            // itself — no box asks for a name or a task first.
             press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "no box: {:?}", app.overlay);
+            let creates: Vec<&ClientRequest> = out
+                .iter()
+                .filter(|request| matches!(request, ClientRequest::CreatePrAgent { .. }))
+                .collect();
             assert!(
                 matches!(
-                    &app.overlay,
-                    Some(Overlay::Prompt(p)) if matches!(
-                        &p.kind,
-                        PromptKind::NewPrAgent {
-                            kind: AgentKind::Codex,
-                            custom: None,
-                            pr,
-                            ..
-                        } if pr.url == "https://github.com/o/r/pull/7"
-                    )
-                ),
-                "{:?}",
-                app.overlay
-            );
-            assert!(
-                out.iter()
-                    .all(|request| !matches!(request, ClientRequest::PrewarmAgent { .. })),
-                "an unscoped warm CLI must not start before a PR SESSION: {out:?}"
-            );
-
-            for c in "pr-7".chars() {
-                press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
-            }
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(
-                matches!(
-                    out.first(),
-                    Some(ClientRequest::CreatePrAgent {
+                    creates.as_slice(),
+                    [ClientRequest::CreatePrAgent {
                         project,
-                        name,
                         kind: AgentKind::Codex,
                         custom_harness: None,
+                        auto_title: true,
+                        starting_prompt: None,
                         pr_url,
                         head,
                         ..
-                    }) if project.as_str() == "p1"
-                        && name == "pr-7"
+                    }] if project.as_str() == "p1"
                         && pr_url == "https://github.com/o/r/pull/7"
                         && head == "pr-7-head"
                 ),
                 "{out:?}"
+            );
+            assert!(
+                out.iter()
+                    .all(|request| !matches!(request, ClientRequest::PrewarmAgent { .. })),
+                "an unscoped warm CLI must not start for a PR SESSION: {out:?}"
             );
         });
     }
@@ -15457,22 +15398,17 @@ diff --git a/src/c.rs b/src/c.rs
         })
     }
 
-    /// Esc on the NEW SESSION PICKER's box sends nothing: nothing was
-    /// warmed for it (a launch carrying a STARTING PROMPT can adopt no
-    /// WARM SPARE), so there is no default spec to put back either.
+    /// Esc on the NEW SESSION PICKER sends nothing: opening it warmed
+    /// nothing, and only Enter on a row creates.
     #[test]
-    fn esc_on_the_new_session_box_sends_nothing() {
+    fn esc_on_the_new_session_picker_sends_nothing() {
         with_default_config(|| {
             let mut app = App::new();
             seed_tree(&mut app);
             app.focus = Focus::Sessions;
             let mut out = Vec::new();
             press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(matches!(
-                &app.overlay,
-                Some(Overlay::Prompt(p)) if matches!(p.kind, PromptKind::QuickPrompt(_))
-            ));
+            assert!(matches!(&app.overlay, Some(Overlay::Menu(_))));
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
             assert!(app.overlay.is_none());
             assert!(
@@ -16445,8 +16381,11 @@ diff --git a/src/c.rs b/src/c.rs
         crate::config::with_config_path(path, f)
     }
 
+    /// `n`, then Enter on a harness, is the whole flow: the session is
+    /// created right there. No box asks for a name or a first prompt — a
+    /// launch that starts from a typed task is the QUICK PROMPT's (`p`).
     #[test]
-    fn n_in_sessions_opens_agent_type_picker_then_prompt() {
+    fn n_in_sessions_opens_agent_type_picker_and_enter_starts_the_session() {
         with_default_config(|| {
             let mut app = App::new();
             seed_tree(&mut app);
@@ -16468,67 +16407,46 @@ diff --git a/src/c.rs b/src/c.rs
             assert_eq!(menu.items[2].label, "Cursor");
             assert_eq!(menu.hover, 0, "Claude is the default");
 
-            // Enter on the default chains into the box where the name
-            // prompt used to be, with kind=Claude. Nothing is warmed for
-            // it: a launch carrying a STARTING PROMPT can adopt no WARM
-            // SPARE. Nothing configured → no model/effort flags.
+            // Enter on the default is the launch, with kind=Claude: no box
+            // follows, so there is no STARTING PROMPT — the CLI's own input
+            // is the first prompt — and the row takes the next free default
+            // name and AUTO-TITLE. Nothing configured → no model/effort
+            // flags. The default-spec warm slot the create adopts is
+            // refilled right behind it, and that is the only prewarm: with
+            // no box there is no typing to warm under.
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(out.is_empty(), "opening the box sends nothing: {out:?}");
-            let Some(Overlay::Prompt(p)) = &app.overlay else {
-                panic!("expected the new-session box, got {:?}", app.overlay);
-            };
-            assert_eq!(p.title, "New session (claude)");
-            assert_eq!(p.input, "", "the box starts blank");
-            assert_eq!(
-                p.label,
-                "what should the agent do? (empty = start with no prompt)"
+            assert!(app.overlay.is_none(), "no box: {:?}", app.overlay);
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [
+                        ClientRequest::CreateAgent {
+                            name,
+                            kind: AgentKind::Claude,
+                            model: None,
+                            effort: None,
+                            auto_title: true,
+                            cloud_prompt: None,
+                            starting_prompt: None,
+                            ..
+                        },
+                        ClientRequest::PrewarmAgent {
+                            kind: AgentKind::Claude,
+                            model: None,
+                            effort: None,
+                            ..
+                        }
+                    ] if name == "agent-2"
+                ),
+                "one create, then the refill: {out:?}"
             );
-            assert!(p.is_multiline(), "a task box, not a one-line name");
-            assert!(matches!(
-                &p.kind,
-                PromptKind::QuickPrompt(launch)
-                    if launch.kind == AgentKind::Claude
-                        && launch.model.is_none()
-                        && launch.effort.is_none()
-                        && launch.origin == crate::quick_prompt::QuickOrigin::NewSession
-            ));
-
-            // Enter on the empty box still launches — no STARTING PROMPT,
-            // the next free default name and AUTO-TITLE, as accepting the
-            // empty name prompt did — and the default-spec warm slot the
-            // create adopts is refilled right behind it.
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(app.overlay.is_none());
-            assert!(matches!(
-                &out[out.len() - 2],
-                ClientRequest::CreateAgent {
-                    name,
-                    kind: AgentKind::Claude,
-                    custom_harness: None,
-                    model: None,
-                    effort: None,
-                    auto_title: true,
-                    starting_prompt: None,
-                    ..
-                } if name == "agent-2"
-            ));
-            assert!(matches!(
-                out.last(),
-                Some(ClientRequest::PrewarmAgent {
-                    kind: AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    ..
-                })
-            ));
         })
     }
 
-    /// What is typed into the NEW SESSION PICKER's box is the session's
-    /// STARTING PROMPT — and, unlike the `p` box, the launch takes the
-    /// TERMINAL PANE, as every picker-walked launch does.
+    /// The pick takes the TERMINAL PANE, as every picker-walked launch
+    /// does — the first prompt is typed there.
     #[test]
-    fn the_new_session_box_launches_on_the_typed_prompt_and_takes_the_pane() {
+    fn a_picked_session_launches_into_the_selected_worktree_and_takes_the_pane() {
         use nebula_core::{Agent, AgentStatus, Entity, WorktreeId};
 
         with_default_config(|| {
@@ -16540,29 +16458,13 @@ diff --git a/src/c.rs b/src/c.rs
 
             press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(paste_into_overlay(&mut app, "Fix auth"));
-            press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
-            assert!(paste_into_overlay(&mut app, "then ship it"));
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(app.overlay.is_none(), "launching closes the box");
+            assert!(app.overlay.is_none(), "no box: {:?}", app.overlay);
             assert!(
                 matches!(
-                    out.as_slice(),
-                    [ClientRequest::CreateAgent {
-                        worktree: w,
-                        kind: AgentKind::Claude,
-                        custom_harness: None,
-                        model: None,
-                        effort: None,
-                        auto_title: true,
-                        cloud_prompt: None,
-                        starting_prompt: Some(text),
-                        ..
-                    }] if *w == worktree && text == "Fix auth\nthen ship it"
+                    &out[0],
+                    ClientRequest::CreateAgent { worktree: w, .. } if *w == worktree
                 ),
-                "one create carrying the typed prompt and no prewarm — a \
-                 launch with a first prompt neither adopts nor refills the \
-                 warm slot: {out:?}"
+                "{out:?}"
             );
 
             // The daemon broadcasts the new row before it acks the create;
@@ -16690,12 +16592,11 @@ diff --git a/src/c.rs b/src/c.rs
         })
     }
 
+    /// The one picker row that still asks: a cloud launch is nothing
+    /// without its task.
     #[test]
-    fn cloud_task_is_still_required_when_session_naming_is_skipped() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        std::fs::write(&path, r#"{"skip_session_naming": true}"#).unwrap();
-        crate::config::with_config_path(path, || {
+    fn cloud_task_is_still_required_though_the_picker_launches_directly() {
+        with_default_config(|| {
             let mut app = App::new();
             seed_tree(&mut app);
             app.focus = Focus::Sessions;
@@ -16783,14 +16684,14 @@ diff --git a/src/c.rs b/src/c.rs
         assert!(text.contains("Esc") && text.contains("^J") && text.contains("Enter"));
     }
 
-    /// With `skip_session_naming` on, picking the kind is the whole flow:
-    /// no box, the generated default name, and the same auto-title opt-in
-    /// that sending the box empty gives.
+    /// The retired `skip_session_naming` key changes nothing either way:
+    /// a file that still says `false` — the old "ask first" — launches
+    /// straight from the picker like every other.
     #[test]
-    fn skip_session_naming_creates_straight_from_the_picker() {
+    fn a_stored_skip_session_naming_false_still_launches_from_the_picker() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        std::fs::write(&path, r#"{"skip_session_naming": true}"#).unwrap();
+        std::fs::write(&path, r#"{"skip_session_naming": false}"#).unwrap();
         crate::config::with_config_path(path, || {
             let mut app = App::new();
             seed_tree(&mut app);
@@ -16819,8 +16720,7 @@ diff --git a/src/c.rs b/src/c.rs
                     ..
                 } if name == "agent-2"
             ));
-            // Only the refill behind the create — the warm-while-typing
-            // prewarm has no typing to cover, so it never fires.
+            // Only the refill behind the create.
             assert!(matches!(
                 out.last(),
                 Some(ClientRequest::PrewarmAgent {
@@ -16840,14 +16740,11 @@ diff --git a/src/c.rs b/src/c.rs
         })
     }
 
-    /// The submenu picks still apply when the prompt is skipped: the model
-    /// row Enter lands on is what the create carries.
+    /// The submenu picks apply to the direct launch: the model row Enter
+    /// lands on is what the create carries.
     #[test]
-    fn skip_session_naming_keeps_the_submenu_model_pick() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        std::fs::write(&path, r#"{"skip_session_naming": true}"#).unwrap();
-        crate::config::with_config_path(path, || {
+    fn enter_on_a_submenu_model_row_creates_with_that_model() {
+        with_default_config(|| {
             let mut app = App::new();
             seed_tree(&mut app);
             app.focus = Focus::Sessions;
@@ -17111,22 +17008,19 @@ diff --git a/src/c.rs b/src/c.rs
             press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
 
-            assert!(out.is_empty(), "the box warms nothing: {out:?}");
-            let Some(Overlay::Prompt(p)) = &app.overlay else {
-                panic!("expected the new-session box, got {:?}", app.overlay);
-            };
-            assert_eq!(p.title, "New session (codex · gpt-5.6-luna · minimal)");
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(matches!(
-                out.last(),
-                Some(ClientRequest::CreateAgent {
-                    kind: AgentKind::Codex,
-                    custom_harness: None,
-                    model: Some(m),
-                    effort: Some(e),
-                    ..
-                }) if m == "gpt-5.6-luna" && e == "minimal"
-            ));
+            assert!(app.overlay.is_none(), "no box: {:?}", app.overlay);
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [ClientRequest::CreateAgent {
+                        kind: AgentKind::Codex,
+                        model: Some(m),
+                        effort: Some(e),
+                        ..
+                    }] if m == "gpt-5.6-luna" && e == "minimal"
+                ),
+                "one create, and no Claude refill behind a Codex launch: {out:?}"
+            );
         })
     }
 
@@ -17148,12 +17042,20 @@ diff --git a/src/c.rs b/src/c.rs
             // Enter straight on the Claude row: both settings apply.
             press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(out.is_empty(), "the box warms nothing: {out:?}");
-            let Some(Overlay::Prompt(p)) = &app.overlay else {
-                panic!("expected the new-session box");
-            };
-            assert_eq!(p.title, "New session (claude · sonnet · max)");
-            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "no box: {:?}", app.overlay);
+            assert!(
+                matches!(
+                    &out[0],
+                    ClientRequest::CreateAgent {
+                        kind: AgentKind::Claude,
+                        model: Some(m),
+                        effort: Some(e),
+                        ..
+                    } if m == "sonnet" && e == "max"
+                ),
+                "{out:?}"
+            );
+            out.clear();
 
             // The model submenu highlights and checks the configured model,
             // and its explicit "default" row resolves to the same setting.
@@ -17168,15 +17070,18 @@ diff --git a/src/c.rs b/src/c.rs
             press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(matches!(
-                &app.overlay,
-                Some(Overlay::Prompt(p)) if matches!(
-                    &p.kind,
-                    PromptKind::QuickPrompt(launch)
-                        if launch.model.as_deref() == Some("sonnet")
-                            && launch.effort.as_deref() == Some("max")
-                )
-            ));
+            assert!(app.overlay.is_none(), "no box: {:?}", app.overlay);
+            assert!(
+                matches!(
+                    &out[0],
+                    ClientRequest::CreateAgent {
+                        model: Some(m),
+                        effort: Some(e),
+                        ..
+                    } if m == "sonnet" && e == "max"
+                ),
+                "{out:?}"
+            );
         })
     }
 
@@ -17193,15 +17098,7 @@ diff --git a/src/c.rs b/src/c.rs
             for code in [KeyCode::Char('n'), KeyCode::Char('j'), KeyCode::Enter] {
                 handle_key(&mut app, KeyEvent::new(code, KeyModifiers::NONE), &mut out);
             }
-            assert!(matches!(
-                &app.overlay,
-                Some(Overlay::Prompt(p)) if matches!(&p.kind, PromptKind::QuickPrompt(launch) if launch.kind == AgentKind::Codex)
-            ));
-            handle_key(
-                &mut app,
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                &mut out,
-            );
+            assert!(app.overlay.is_none(), "no box: {:?}", app.overlay);
             assert!(matches!(
                 out.last(),
                 Some(ClientRequest::CreateAgent {
@@ -17229,15 +17126,7 @@ diff --git a/src/c.rs b/src/c.rs
             ] {
                 handle_key(&mut app, KeyEvent::new(code, KeyModifiers::NONE), &mut out);
             }
-            assert!(matches!(
-                &app.overlay,
-                Some(Overlay::Prompt(p)) if matches!(&p.kind, PromptKind::QuickPrompt(launch) if launch.kind == AgentKind::Cursor)
-            ));
-            handle_key(
-                &mut app,
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                &mut out,
-            );
+            assert!(app.overlay.is_none(), "no box: {:?}", app.overlay);
             assert!(matches!(
                 out.last(),
                 Some(ClientRequest::CreateAgent {
@@ -17246,6 +17135,243 @@ diff --git a/src/c.rs b/src/c.rs
                     ..
                 })
             ));
+        });
+    }
+
+    // ---- REMEMBER HARNESS (Settings → Experimental) ----
+
+    /// A row the hovered menu shows, without the `✓` a default row wears.
+    fn hovered_choice(app: &App) -> String {
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected a menu, got {:?}", app.overlay);
+        };
+        menu.items[menu.hover]
+            .label
+            .trim_end_matches(" ✓")
+            .to_string()
+    }
+
+    /// With the switch on, the harness picked on `n` — and a model drilled
+    /// into through `→` — become the AGENTS TAB defaults: the next picker
+    /// opens on that harness with its `✓` on that model, and the QUICK
+    /// PROMPT's harness follows.
+    #[test]
+    fn a_picker_launch_is_remembered_as_the_next_default_while_the_switch_is_on() {
+        with_config_json(r#"{"remember_harness": true}"#, || {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+
+            // The harness alone: Codex, second row.
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(ClientRequest::CreateAgent {
+                        kind: AgentKind::Codex,
+                        model: None,
+                        ..
+                    })
+                ),
+                "{out:?}"
+            );
+            let cfg = crate::config::Config::load();
+            assert_eq!(
+                cfg.quick_prompt_kind(),
+                AgentKind::Codex,
+                "written to the Agents tab"
+            );
+            assert_eq!(
+                cfg.codex_model, "default",
+                "no model was picked, so none was written"
+            );
+            assert!(app.flash.is_none(), "{:?}", app.flash);
+
+            // The next picker opens on it.
+            out.clear();
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("{:?}", app.overlay);
+            };
+            assert_eq!(menu.items[menu.hover].label, "Codex");
+
+            // A model drilled into on the Claude row lands on Claude's
+            // Model row — the pick, not the fallback.
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("{:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("Claude model"));
+            assert!(menu.items.len() >= 2, "{:?}", menu.items);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            let picked = hovered_choice(&app);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(ClientRequest::CreateAgent {
+                        kind: AgentKind::Claude,
+                        model: Some(model),
+                        ..
+                    }) if *model == picked
+                ),
+                "{out:?}"
+            );
+            let cfg = crate::config::Config::load();
+            assert_eq!(cfg.quick_prompt_kind(), AgentKind::Claude);
+            assert_eq!(cfg.claude_model, picked, "the Agents tab's Claude model");
+            assert_eq!(
+                cfg.codex_model, "default",
+                "another harness's row is its own"
+            );
+
+            // The next picker: Claude, with the ✓ (and the cursor) on it.
+            out.clear();
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            assert_eq!(hovered_choice(&app), "Claude");
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("{:?}", app.overlay);
+            };
+            assert_eq!(menu.items[menu.hover].label, format!("{picked} ✓"));
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        });
+    }
+
+    /// Off — the default — a pick is one session's: nothing is written,
+    /// and the next picker opens on its first row as it always has.
+    #[test]
+    fn a_picker_launch_is_not_remembered_while_the_switch_is_off() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(ClientRequest::CreateAgent {
+                        kind: AgentKind::Codex,
+                        ..
+                    })
+                ),
+                "{out:?}"
+            );
+            let cfg = crate::config::Config::load();
+            assert_eq!(cfg.quick_prompt_kind(), AgentKind::Claude, "untouched");
+            assert!(!cfg.remember_harness);
+
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            assert_eq!(hovered_choice(&app), "Claude", "the first row, as ever");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        });
+    }
+
+    /// A QUICK PROMPT fired on a harness picked through `Tab` is a change
+    /// of default too — recorded when the box fires, not when the picker
+    /// hands it back — so the next `p` opens on that harness.
+    #[test]
+    fn a_quick_prompt_fired_on_a_tab_picked_harness_is_remembered() {
+        with_config_json(r#"{"remember_harness": true}"#, || {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(paste_into_overlay(&mut app, "Fix auth"));
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            assert_eq!(
+                hovered_choice(&app),
+                "Claude",
+                "opens on the box's own harness"
+            );
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("the pick should hand the box back, got {:?}", app.overlay);
+            };
+            assert_eq!(prompt.title, "Quick prompt (codex)");
+            assert_eq!(
+                crate::config::Config::load().quick_prompt_kind(),
+                AgentKind::Claude,
+                "handing the box back is not a launch: nothing written yet"
+            );
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(ClientRequest::CreateAgent {
+                        kind: AgentKind::Codex,
+                        starting_prompt: Some(text),
+                        ..
+                    }) if text == "Fix auth"
+                ),
+                "{out:?}"
+            );
+            assert_eq!(
+                crate::config::Config::load().quick_prompt_kind(),
+                AgentKind::Codex,
+                "the fire is the change of default"
+            );
+
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("{:?}", app.overlay);
+            };
+            assert_eq!(prompt.title, "Quick prompt (codex)", "the next box follows");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        });
+    }
+
+    /// An AGENT PRESET launch is the preset's harness and model, not a
+    /// change of mind: with the switch on, the AGENTS TAB rows stay put.
+    #[test]
+    fn a_preset_launch_is_not_remembered_as_the_default() {
+        with_seeded_presets(|| {
+            let mut cfg = crate::config::Config::load();
+            cfg.remember_harness = true;
+            cfg.save().unwrap();
+
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(paste_into_overlay(&mut app, "Fix auth"));
+            // "reviewer": claude · opus · high, the first preset.
+            press(&mut app, KeyCode::BackTab, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(ClientRequest::CreateAgent {
+                        kind: AgentKind::Claude,
+                        model: Some(model),
+                        effort: Some(effort),
+                        ..
+                    }) if model == "opus" && effort == "high"
+                ),
+                "{out:?}"
+            );
+            let cfg = crate::config::Config::load();
+            assert!(cfg.remember_harness);
+            assert_eq!(
+                cfg.claude_model, "default",
+                "the preset's model stays the preset's"
+            );
+            assert_eq!(cfg.claude_effort, "default");
+            assert_eq!(cfg.quick_prompt_kind(), AgentKind::Claude);
         });
     }
 
@@ -17273,10 +17399,17 @@ diff --git a/src/c.rs b/src/c.rs
             // The second row is now Cursor: the rows shift, nothing is dead.
             press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(matches!(
-                &app.overlay,
-                Some(Overlay::Prompt(p)) if matches!(&p.kind, PromptKind::QuickPrompt(launch) if launch.kind == AgentKind::Cursor)
-            ));
+            assert!(app.overlay.is_none(), "no box: {:?}", app.overlay);
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [ClientRequest::CreateAgent {
+                        kind: AgentKind::Cursor,
+                        ..
+                    }]
+                ),
+                "{out:?}"
+            );
         });
     }
 
@@ -28764,8 +28897,8 @@ diff --git a/src/c.rs b/src/c.rs
     /// The pull requests list below the checkouts, so a checkout that comes
     /// or goes shifts every one of them. The cursor follows its pull
     /// request by URL, as it follows a checkout by id: left to its index it
-    /// slid onto the next pull request, and a launch with no box — a
-    /// `skip`-task preset, `n` under `skip_session_naming` — then ran
+    /// slid onto the next pull request, and a launch with no box — `n`,
+    /// a `skip`-task preset — then ran
     /// against a pull request nobody picked. A PR SESSION's create fired
     /// from the row also boots no warm Claude in the ROOT WORKTREE, which
     /// only names the project.
@@ -28795,12 +28928,12 @@ diff --git a/src/c.rs b/src/c.rs
             );
             assert_eq!(app.selected_worktree_pr().map(|pr| pr.number), Some(9));
 
-            // `n` with no name box: the create goes out at once, for #9,
-            // and nothing is warmed in the root for it.
+            // `n`, then Enter on a harness: the create goes out at once,
+            // for #9, and nothing is warmed in the root for it.
             let mut out = Vec::new();
             press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "no box: {:?}", app.overlay);
             assert!(
                 out.iter().any(|r| matches!(
                     r,

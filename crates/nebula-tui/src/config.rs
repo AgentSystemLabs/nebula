@@ -351,7 +351,6 @@ pub enum SettingKind {
     Editor,
     CloseFinderOnOpen,
     SshSyncConfig,
-    SkipSessionNaming,
     ConfirmOnArchive,
     SessionIdleTimeout,
     PrewarmAgents,
@@ -374,6 +373,7 @@ pub enum SettingKind {
     RecentPrompts,
     RecentPromptsCount,
     ShowKeyCombos,
+    RememberHarness,
     HideUninstalledHarnesses,
 }
 
@@ -472,12 +472,6 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
     SettingsTab {
         title: "Sessions",
         body: TabBody::Values(&[
-            SettingSpec {
-                kind: SettingKind::SkipSessionNaming,
-                label: "Skip starting prompt",
-                hint: "New agents launch straight from the picker; type the first prompt in the CLI",
-                group: "",
-            },
             SettingSpec {
                 kind: SettingKind::ConfirmOnArchive,
                 label: "Confirm on archive",
@@ -626,6 +620,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::ShowKeyCombos,
                 label: "Key combo display",
                 hint: "Spell each key you press bottom-left with what it did, for anyone watching",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::RememberHarness,
+                label: "Remember harness",
+                hint: "A harness (and model) picked for a session becomes the Agents tab default the next launch starts on",
                 group: "",
             },
         ]),
@@ -884,12 +884,13 @@ pub struct Config {
     /// own on every connect — its `config.local.json` still wins there. On
     /// by default; `--no-sync-config` leaves them behind for one connection.
     pub ssh_sync_config: bool,
-    /// Create new agent sessions straight from the kind picker, with no
-    /// task box: the session takes the generated default name and
-    /// agent-driven auto-titling, and the first prompt is typed in the
-    /// CLI. Off by default — the box is the point of the picker. The key
-    /// predates the box: it once skipped a name prompt, which the box
-    /// replaced.
+    /// The key of the **Skip starting prompt** SETTING (Settings →
+    /// Sessions, through 0.30): on, `n` created the session straight from
+    /// the NEW SESSION PICKER instead of putting a task box up first.
+    /// Every `n` does that now — a launch that starts from a typed task is
+    /// the QUICK PROMPT's — so this build never reads it and no tab edits
+    /// it any more. Still loaded and written back as stored, so an older
+    /// build sharing the file keeps the behavior its user chose.
     pub skip_session_naming: bool,
     /// Put a CONFIRM DIALOG in front of archiving a session — the `a` key
     /// and the row menu's Archive alike. Off by default: archive is cheap
@@ -1004,6 +1005,14 @@ pub struct Config {
     /// overlay's text field never show. Off by default: it is a teaching
     /// aid, and a row of chrome nobody asked for otherwise.
     pub show_key_combos: bool,
+    /// Experimental: REMEMBER HARNESS — a launch walked through the NEW
+    /// SESSION PICKER, the PR SESSION picker or the QUICK PROMPT's `Tab`
+    /// picker writes its harness into `quick_prompt_kind`, and a model or
+    /// effort a submenu chose into that harness's own rows, so the next
+    /// picker starts on it and the next `p` launches it
+    /// ([`Config::remember_launch`]). Off by default: a pick is one
+    /// session's, and the AGENTS TAB is where the defaults are set.
+    pub remember_harness: bool,
     /// Default model/effort for new Claude / Codex / Cursor sessions.
     /// "default" means "don't pass the flag" (the CLI picks); any other
     /// value is passed through verbatim, so hand-edited configs can name
@@ -1213,6 +1222,7 @@ impl Default for Config {
             recent_prompts: false,
             recent_prompts_count: DEFAULT_RECENT_PROMPTS_COUNT,
             show_key_combos: false,
+            remember_harness: false,
             claude_model: DEFAULT_CHOICE.into(),
             claude_models: Vec::new(),
             claude_effort: DEFAULT_CHOICE.into(),
@@ -1839,6 +1849,76 @@ impl Config {
         self.enabled_kinds().first().copied().unwrap_or(configured)
     }
 
+    /// The harness the NEW SESSION PICKER (and the PR SESSION picker)
+    /// starts on: the last launch's while REMEMBER HARNESS is on — read
+    /// through [`Config::quick_prompt_kind`], so one switched off since
+    /// steps aside — and None, the first row, while it is off.
+    pub fn remembered_kind(&self) -> Option<AgentKind> {
+        self.remember_harness.then(|| self.quick_prompt_kind())
+    }
+
+    /// REMEMBER HARNESS (Settings → Experimental): make `kind` — and a
+    /// model or effort a picker chose for it, `None` for one it did not —
+    /// the defaults the next launch starts from, by writing the AGENTS
+    /// TAB's own rows: `quick_prompt_kind`, and that harness's Model /
+    /// Effort (the registry entry's, keyed by the kind name or the
+    /// custom id). An explicit `"default"` pick lands as the row's own
+    /// `default`. The QUICK PROMPT names only built-in kinds, so a custom
+    /// entry is remembered by its Model / Effort rows alone. Returns
+    /// whether anything changed, so the caller saves only then; nothing
+    /// moves while the switch is off.
+    pub fn remember_launch(
+        &mut self,
+        kind: AgentKind,
+        custom: Option<&str>,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> bool {
+        if !self.remember_harness {
+            return false;
+        }
+        let id = match (kind, custom) {
+            (AgentKind::Custom, Some(id)) => id.to_string(),
+            (AgentKind::Custom, None) => return false,
+            (kind, _) => kind.as_str().to_string(),
+        };
+        let mut changed = false;
+        if kind != AgentKind::Custom && self.quick_prompt_kind != kind.as_str() {
+            self.quick_prompt_kind = kind.as_str().into();
+            changed = true;
+        }
+        let before = self.effective_harness_by_id(&id);
+        if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+            if before.model.default != model {
+                self.set_harness_model(&id, model.into());
+                changed = true;
+            }
+        }
+        if let Some(effort) = effort.map(str::trim).filter(|e| !e.is_empty()) {
+            if before.effort.default != effort {
+                self.set_harness_effort(&id, effort.into());
+                changed = true;
+            }
+        }
+        // A composing harness (Cursor's family-suffix shape) keeps the
+        // stored effort only if the family it now names ships it, as the
+        // AGENTS TAB's own Model cycle does — never an id the CLI would
+        // refuse.
+        if changed {
+            let descriptor = self.effective_harness_by_id(&id);
+            if descriptor.compose_model_effort {
+                let family = descriptor.default_model().map(str::to_string);
+                let choices = effort_choices_in(&descriptor, family.as_deref());
+                if !fits(&descriptor.effort.default, &choices) {
+                    let fitted = fit_effort_in(&descriptor, family.as_deref(), None)
+                        .unwrap_or_else(|| DEFAULT_CHOICE.into());
+                    self.set_harness_effort(&id, fitted);
+                }
+            }
+        }
+        changed
+    }
+
     /// How many RECENT PROMPTS the SESSIONS PANEL lists under a session:
     /// zero while the feature is off, else the count clamped to what the
     /// daemon keeps (a hand-edited `0` or `50` reads as `1` or the cap,
@@ -1929,7 +2009,6 @@ impl Config {
             SettingKind::Editor => self.editor.clone(),
             SettingKind::CloseFinderOnOpen => on_off(self.close_finder_on_open).into(),
             SettingKind::SshSyncConfig => on_off(self.ssh_sync_config).into(),
-            SettingKind::SkipSessionNaming => on_off(self.skip_session_naming).into(),
             SettingKind::ConfirmOnArchive => on_off(self.confirm_on_archive).into(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
             SettingKind::PrewarmAgents => on_off(self.prewarm_agents).into(),
@@ -1949,6 +2028,7 @@ impl Config {
             }
             SettingKind::RecentPrompts => on_off(self.recent_prompts).into(),
             SettingKind::ShowKeyCombos => on_off(self.show_key_combos).into(),
+            SettingKind::RememberHarness => on_off(self.remember_harness).into(),
             SettingKind::RecentPromptsCount => self
                 .recent_prompts_count
                 .clamp(1, nebula_core::RECENT_PROMPTS_KEPT)
@@ -2001,9 +2081,6 @@ impl Config {
             }
             SettingKind::SshSyncConfig => {
                 self.ssh_sync_config = !self.ssh_sync_config;
-            }
-            SettingKind::SkipSessionNaming => {
-                self.skip_session_naming = !self.skip_session_naming;
             }
             SettingKind::ConfirmOnArchive => {
                 self.confirm_on_archive = !self.confirm_on_archive;
@@ -2062,6 +2139,9 @@ impl Config {
             }
             SettingKind::ShowKeyCombos => {
                 self.show_key_combos = !self.show_key_combos;
+            }
+            SettingKind::RememberHarness => {
+                self.remember_harness = !self.remember_harness;
             }
             SettingKind::HideUninstalledHarnesses => {
                 self.hide_uninstalled_harnesses = !self.hide_uninstalled_harnesses;
@@ -2612,26 +2692,29 @@ mod tests {
         assert!(!cfg.git_init_on_create);
     }
 
+    /// `n` always launches straight from the picker now, so **Skip
+    /// starting prompt** has no row to be edited on — but the key an
+    /// earlier release wrote still loads, and is written back unchanged
+    /// for the older builds that read it.
     #[test]
-    fn skip_session_naming_defaults_off_toggles_and_persists() {
-        assert!(
-            !Config::default().skip_session_naming,
-            "naming is the default; skipping it is opt-in"
-        );
-        let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert!(!cfg.skip_session_naming);
-
-        let mut cfg = Config::default();
-        let (tab, row) = locate(SettingKind::SkipSessionNaming).unwrap();
-        assert_eq!(cfg.value_label(SettingKind::SkipSessionNaming), "off");
-        cfg.cycle(tab, row, 0);
-        assert!(cfg.skip_session_naming);
-        assert_eq!(cfg.value_label(SettingKind::SkipSessionNaming), "on");
+    fn skip_session_naming_has_no_row_and_is_written_back_for_older_builds() {
+        assert!(SETTINGS_TABS.iter().all(|tab| match &tab.body {
+            TabBody::Values(rows) | TabBody::Project(rows) => {
+                rows.iter().all(|row| row.label != "Skip starting prompt")
+            }
+            TabBody::Hotkeys | TabBody::Agents => true,
+        }));
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"skip_session_naming": true}"#).unwrap();
+        let mut cfg = load_from(&path);
+        assert!(cfg.skipped.is_empty(), "{:?}", cfg.skipped);
+        assert!(cfg.skip_session_naming);
+
+        cfg.focus_tint = false;
         cfg.save_to(&path).unwrap();
-        assert!(load_from(&path).skip_session_naming);
+        assert_eq!(read_json_file(&path)["skip_session_naming"], true);
     }
 
     #[test]
@@ -3398,6 +3481,128 @@ mod tests {
 
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(!cfg.show_key_combos);
+    }
+
+    /// REMEMBER HARNESS: an Experimental switch, off by default, a plain
+    /// toggle persisted under `remember_harness`, unknown to a config
+    /// written before it (which reads as off).
+    #[test]
+    fn remember_harness_is_off_by_default_on_the_experimental_tab_and_persists() {
+        let mut cfg = Config::default();
+        assert!(!cfg.remember_harness, "a pick is one session's by default");
+        assert_eq!(cfg.value_label(SettingKind::RememberHarness), "off");
+        assert_eq!(
+            cfg.remembered_kind(),
+            None,
+            "off: the picker starts on its first row"
+        );
+
+        let (tab, row) = locate(SettingKind::RememberHarness).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Experimental");
+        assert_eq!(tab + 1, hotkeys_tab(), "Hotkeys stays last");
+        let (combo_tab, combo_row) = locate(SettingKind::ShowKeyCombos).unwrap();
+        assert_eq!(
+            (combo_tab, combo_row + 1),
+            (tab, row),
+            "the newest switch sits last"
+        );
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.remember_harness);
+        assert_eq!(cfg.value_label(SettingKind::RememberHarness), "on");
+        assert_eq!(cfg.remembered_kind(), Some(AgentKind::Claude));
+        cfg.cycle(tab, row, 1);
+        assert!(!cfg.remember_harness, "either arrow toggles it back");
+        cfg.cycle(tab, row, -1);
+        assert!(cfg.remember_harness);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).remember_harness);
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.remember_harness);
+    }
+
+    /// What a remembered launch writes: the harness into the QUICK
+    /// PROMPT's `quick_prompt_kind`, a picked model or effort into that
+    /// harness's own rows — and nothing at all while the switch is off,
+    /// or when the pick already is the default.
+    #[test]
+    fn remember_launch_writes_the_agents_tab_rows_only_while_on() {
+        let mut cfg = Config::default();
+        assert!(
+            !cfg.remember_launch(AgentKind::Codex, None, Some("gpt-5.5"), Some("high")),
+            "off: nothing moves"
+        );
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Claude);
+        assert_eq!(cfg.codex_model, DEFAULT_CHOICE);
+        assert_eq!(cfg.codex_effort, DEFAULT_CHOICE);
+
+        cfg.remember_harness = true;
+        // The harness alone: the rows it did not drill into stay put.
+        assert!(cfg.remember_launch(AgentKind::Codex, None, None, None));
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Codex);
+        assert_eq!(cfg.remembered_kind(), Some(AgentKind::Codex));
+        assert_eq!(cfg.codex_model, DEFAULT_CHOICE, "no model was picked");
+        assert_eq!(cfg.codex_effort, DEFAULT_CHOICE);
+        assert!(
+            !cfg.remember_launch(AgentKind::Codex, None, None, None),
+            "the same pick again changes nothing, so nothing is saved"
+        );
+
+        // A model and effort drilled into land on that harness's rows.
+        assert!(cfg.remember_launch(AgentKind::Claude, None, Some("opus"), Some("high")));
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Claude);
+        assert_eq!(
+            cfg.default_model(AgentKind::Claude).as_deref(),
+            Some("opus")
+        );
+        assert_eq!(
+            cfg.default_effort(AgentKind::Claude).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            cfg.codex_model, DEFAULT_CHOICE,
+            "another harness's rows are its own"
+        );
+        // The explicit "default" row is a pick too: back to no flag.
+        assert!(cfg.remember_launch(AgentKind::Claude, None, Some("default"), None));
+        assert_eq!(cfg.claude_model, DEFAULT_CHOICE);
+        assert_eq!(
+            cfg.default_effort(AgentKind::Claude).as_deref(),
+            Some("high")
+        );
+        // A blank pick is no pick.
+        assert!(!cfg.remember_launch(AgentKind::Claude, None, Some("  "), Some("")));
+
+        // Cursor: a family picked without an effort refits the stored one
+        // to what the family ships, as the AGENTS TAB's own cycle does.
+        cfg.cursor_effort = "high".into();
+        let family_without_efforts = crate::cursor_catalogue::models()
+            .iter()
+            .find(|m| {
+                !m.eq_ignore_ascii_case(DEFAULT_CHOICE)
+                    && effort_choices(AgentKind::Cursor, Some(m), None).is_empty()
+            })
+            .copied()
+            .expect("the seed catalogue ships a family with no effort variants");
+        assert!(cfg.remember_launch(AgentKind::Cursor, None, Some(family_without_efforts), None));
+        assert_eq!(cfg.cursor_model, family_without_efforts);
+        assert_eq!(
+            cfg.default_effort(AgentKind::Cursor),
+            None,
+            "refitted, never refused"
+        );
+
+        // Round trip: what was remembered is what loads.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.quick_prompt_kind(), AgentKind::Cursor);
+        assert_eq!(loaded.claude_effort, "high");
+        assert_eq!(loaded.cursor_model, family_without_efforts);
     }
 
     /// RECENT PROMPTS: an Experimental switch that is off by default and

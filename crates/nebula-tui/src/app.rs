@@ -544,26 +544,6 @@ pub enum PromptKind {
         /// empty input, so the name offered is the name created.
         suggestion: String,
     },
-    /// The PR SESSION's name prompt — the one picker walk that still asks
-    /// for a name: the `n` picker on an OPEN PRS row ends here, where the
-    /// NEW SESSION PICKER ends in the QUICK PROMPT box (a preset picked on
-    /// that row with `e` uses the box, and sends its text as the
-    /// `CreatePrAgent`'s STARTING PROMPT).
-    /// Enter creates the session; an empty name takes the generated
-    /// default and opts into AUTO-TITLE.
-    NewPrAgent {
-        worktree: WorktreeId,
-        kind: AgentKind,
-        /// Registry id when `kind` is [`AgentKind::Custom`].
-        custom: Option<String>,
-        /// Resolved launch options (picker choice or configured default);
-        /// None = the CLI's own default.
-        model: Option<String>,
-        effort: Option<String>,
-        /// OPEN PRS launch context, carried through the prompt so Enter
-        /// can send `CreatePrAgent`.
-        pr: crate::pull_request::PrLaunch,
-    },
     /// Final task input for a one-shot `claude --cloud <task>` launch,
     /// opened straight from the picker's `Claude · cloud` row. Multi-row:
     /// Shift+Enter inserts task newlines where the one-line prompts submit.
@@ -583,10 +563,10 @@ pub enum PromptKind {
     /// The QUICK PROMPT's task: one multi-row box, opened by its hotkey
     /// from anywhere, that launches an AGENT in the selected WORKTREE with
     /// the typed text as its STARTING PROMPT. It carries the whole launch
-    /// spec, resolved when the dialog opens (as [`PromptKind::NewPrAgent`]'s
-    /// options are) so the title can show what Enter is about to start —
-    /// and rewritten in place by the box's `Tab` / `Shift+Tab` pickers. The
-    /// NEW SESSION PICKER ends in this same box (`QuickOrigin::NewSession`).
+    /// spec, resolved when the dialog opens so the title can show what
+    /// Enter is about to start — and rewritten in place by the box's `Tab`
+    /// / `Shift+Tab` pickers. The NEW SESSION PICKER never ends here: its
+    /// pick creates the session outright.
     QuickPrompt(crate::quick_prompt::QuickLaunch),
     /// A message to queue on a row's Claude Cloud session
     /// (`claude -p <message> --cloud <id>`). Multi-row like the launch task:
@@ -656,8 +636,7 @@ impl PromptKind {
     /// one of its own.
     pub fn worktree_mut(&mut self) -> Option<&mut WorktreeId> {
         match self {
-            PromptKind::NewPrAgent { worktree, .. }
-            | PromptKind::ClaudeCloudTask { worktree, .. }
+            PromptKind::ClaudeCloudTask { worktree, .. }
             | PromptKind::AgentPresetTask { worktree, .. } => Some(worktree),
             PromptKind::QuickPrompt(launch) => launch.worktree_mut(),
             _ => None,
@@ -1740,10 +1719,8 @@ pub struct PlaceholderRows {
 ///
 /// An empty `name` takes the generated default (agent-1, …) and opts the
 /// session into agent-driven auto-titling (`nebula rename` on the first
-/// prompt) — what every launch from the NEW SESSION box and the QUICK
-/// PROMPT does, and what the `skip_session_naming` setting does without
-/// asking. A typed name (a PR SESSION's prompt) is the user's choice and
-/// stays.
+/// prompt) — what every launch from the NEW SESSION PICKER and the QUICK
+/// PROMPT does. A name a surface does set is the user's choice and stays.
 #[derive(Debug, Clone)]
 pub struct AgentLaunchDraft {
     pub worktree: WorktreeId,
