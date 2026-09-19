@@ -3786,6 +3786,44 @@ mod tests {
     }
 
     #[test]
+    fn grok_spawn_uses_verified_flags_and_preserves_prompt_boundaries() {
+        let grok = nebula_core::harness::builtin("grok").unwrap();
+        assert_eq!(
+            agent_spawn_command_with(&grok, None, None, None, None, None, None, None, false),
+            ("grok".into(), vec![], false)
+        );
+        let (program, args, resumed) = agent_spawn_command_with(
+            &grok,
+            Some("session-id"),
+            Some(Path::new(TEST_CWD)),
+            Some("model-id"),
+            Some("high"),
+            None,
+            Some("fix the bug; keep this as one argument"),
+            Some("Review only PR #42"),
+            false,
+        );
+        assert_eq!(program, "grok");
+        assert!(resumed);
+        assert_eq!(
+            args,
+            vec![
+                "--resume",
+                "session-id",
+                "--model",
+                "model-id",
+                "--reasoning-effort",
+                "high",
+                "--rules",
+                "Review only PR #42",
+                "fix the bug; keep this as one argument",
+            ]
+        );
+        assert_eq!(grok.hook_dialect(), None);
+        assert_eq!(grok.permissions_flag, None);
+    }
+
+    #[test]
     fn spawn_command_initial_prompt_is_the_trailing_positional_argument() {
         let all = test_registry();
         let claude = test_harness(&all, AgentKind::Claude);

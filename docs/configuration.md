@@ -45,7 +45,7 @@ Forty-five keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key
 exists only in the file, so it is hand-edit-only. Most rows toggle or cycle on `Enter` / `←` / `→`; a
 *typed* row (`worktree_base_branch`) opens a one-line prompt on `Enter` instead, pre-filled with the
 stored value, and an empty answer puts its default back. The Agents tab groups its rows under **Quick
-prompt**, **Claude**, **Codex**, **Cursor**, **Pi** and **Muse** headers, so a harness's rows read `Enabled` / `Model` /
+prompt**, **Claude**, **Codex**, **Cursor**, **Pi**, **Muse** and **Grok Build** headers, so a harness's rows read `Enabled` / `Model` /
 `Effort` under its name rather than repeating it. The **Experimental** tab holds behaviors that change
 how the tree is worked; every switch there is off by default.
 
@@ -73,7 +73,7 @@ how the tree is worked; every switch there is off by default.
 | `recent_prompts` | bool | `false` | Experimental | RECENT PROMPTS: list the last few prompts typed into each session under its row in the SESSIONS PANEL — the text the `UserPromptSubmit` hook carried, condensed to one line — oldest first so the bottom line is the latest ask, each with a dim `30m ago` pinned right; a click on any line lands on its session. Every harness reports its prompt (Claude, Codex and Cursor in the hook payload, Pi through its managed extension). Prompts nebula composes itself — a PR SESSION's scope, the note a `nebula worktree` relocation reopens on — are left out, and archived rows list none. Off, the rows are the single pills they always were. See [Sessions](sessions.md#recent-prompts). |
 | `recent_prompts_count` | integer | `3` | Experimental | How many of those prompts to list while `recent_prompts` is on. The overlay cycles `1` to `5`; a hand edit is clamped to the ten the DAEMON keeps per session (`0` reads as `1`, `50` as `10`). |
 | `show_key_combos` | bool | `false` | Experimental | The KEY COMBO DISPLAY: each key pressed in the panels spelled at the bottom left of the screen — the blank row above the FOOTER — with what it did, `j - Move down`, `^d - Half page down`, `h h - Workspaces` for a double tap, so anyone watching a screen share picks the shortcuts up as they are used; vim's `showcmd`. An unbound key shows bare, so a watcher sees it did nothing. Each press replaces the last and clears itself three seconds on. What never shows: keys typed into a LOCKED PANE (they are the agent's — a password at a prompt in there stays off the screen; only the unlock hatch shows, `^q - Unlock terminal input`), and text typed into an overlay's field — inside a modal only `Esc`, `Enter`, `Tab`, the arrows and `^`/`⌥` chords show, bare. See [Keys](keys.md#chips-and-readouts). |
-| `quick_prompt_kind` | string | `"claude"` | Agents | Which AGENT KIND the QUICK PROMPT (`p`) launches: `claude`, `codex`, `cursor`, `pi` or `muse`. Its model and effort come from that kind's own defaults below, so this is one name, not a third pair. A kind switched off here is stepped around. |
+| `quick_prompt_kind` | string | `"claude"` | Agents | Which AGENT KIND the QUICK PROMPT (`p`) launches: `claude`, `codex`, `cursor`, `pi`, `muse` or `grok`. Its model and effort come from that kind's own defaults below, so this is one name, not a third pair. A kind switched off here is stepped around. |
 | `quick_prompt_focus` | bool | `false` | Agents | QUICK PROMPT FOCUS: whether a QUICK PROMPT launch enters and locks the new session's TERMINAL PANE. Off, its row is selected and previewed but FOCUS stays on the panel you fired from. Only the QUICK PROMPT reads it — every other launch takes the pane. |
 | `claude_enabled` | bool | `true` | Agents | HARNESS TOGGLE. Off leaves Claude out of the NEW SESSION PICKER and the PR SESSION picker, and skips the standing PREWARM POOL slot; existing sessions keep attaching and resuming. The last kind left on cannot be switched off. |
 | `codex_enabled` | bool | `true` | Agents | HARNESS TOGGLE for Codex, same rules. |
@@ -93,7 +93,7 @@ how the tree is worked; every switch there is off by default.
 | `muse_model` | string | `"default"` | Agents | Default `--model` for new Muse sessions. Any model id passes through verbatim; `"default"` means don't pass the flag. |
 | `muse_effort` | string | `"default"` | Agents | Reserved until the `muse` CLI documents a reasoning flag. Stored, never sent. |
 | `custom_harnesses` | array | `[]` | Agents | Extra CLIs the NEW SESSION PICKER offers after the built-ins, each with its own Agents tab section (Enabled and Model rows). Each entry is `{id, program}` plus options: `label` (picker text, defaults to the id), `enabled` (default `true`), `model` (default `"default"` = the CLI's pick, else passed verbatim), `model_flag` (default `"--model"`), and `hooks` (a built-in dialect the program speaks: `claude`, `codex`, `cursor` or `pi` — with one set the sessions report status, prompts and permission waits exactly like that harness, including title sync and auto-title for `claude`; without one they stay process-based, running while the PTY is live and never waiting-on-you). Ids use lowercase letters, digits and hyphens and must not collide with a built-in. Legacy: new harnesses belong in `harnesses`, where they also gain resume, effort, system-prompt and hook-dialect rows. Invalid entries never launch — the picker hides them and the daemon refuses them with the reason. |
-| `harnesses` | object | `{}` | Agents | The harness registry: per-harness deltas over the compiled-in known harnesses (Claude, Codex, Cursor, Pi, Muse), and whole new third-party CLIs. The Agents tab grows one section per entry — Enabled, Model, and Effort rows while the harness offers effort — and the `n` picker, `e` presets, spawn, resume and hooks all read the merged rows. A hand edit that breaks one entry refuses its launches with the reason, never the whole file. Run `nebula config harnesses` to print the effective rows to copy from. |
+| `harnesses` | object | `{}` | Agents | The harness registry: per-harness deltas over the compiled-in known harnesses (Claude, Codex, Cursor, Pi, Muse, Grok Build), and whole new third-party CLIs. The Agents tab grows one section per entry — Enabled, Model, and Effort rows while the harness offers effort — and the `n` picker, `e` presets, spawn, resume and hooks all read the merged rows. A hand edit that breaks one entry refuses its launches with the reason, never the whole file. Run `nebula config harnesses` to print the effective rows to copy from. |
 | `keybindings` | object | `{}` | Hotkeys | KEYMAP overrides, keyed by action id, valued with a comma-separated chord list: `{"git_diff": "ctrl+g, g"}`. An empty string deliberately unbinds; unknown ids are ignored. Only rows that differ from the defaults are written. |
 | `prewarm_agents` | bool | `true` | Sessions | DAEMON-owned PREWARM POOL: keep one booted agent CLI standing by in the selected WORKTREE, so creating a session there adopts it and feels instant. **Costs one idle CLI process per warm slot** (150–300 MB each, up to 15 minutes), and that spare is a real session as far as the CLI is concerned — Claude's own `/list-agents` lists it beside the sessions you made, named after the directory (`my-repo-3f`), and the memory modal (`Shift+M`) groups it under **warm spares**. Off drains the pool on the DAEMON's next sweep (within 30 s). |
 | `prewarm_sessions` | bool | `true` | Sessions | DAEMON-owned SESSION PREWARM: boot a WORKTREE's dead sessions when your selection rests on it, so attaching shows an already-booted screen instead of a booting shell. **Costs idle shell/CLI processes for sessions you may never open.** Off stops booting them; sessions already up stay until the IDLE REAPER takes them. |
@@ -122,7 +122,7 @@ is what bounds the cost of both when they are left on.
 
 ### The harness registry
 
-The five known harnesses ship compiled in, and `harnesses` edits them per field — or adds a new
+The six known harnesses ship compiled in, and `harnesses` edits them per field — or adds a new
 CLI outright. Only your deltas go in the file; `nebula config harnesses` prints the effective rows
 to copy from. Disabling one is one line, and adding a CLI is one block: picker, presets, spawn,
 resume, hooks and the Agents tab section all follow, with no rebuild.
@@ -150,6 +150,13 @@ map stays silent. Omit the map entirely and you get every built-in, enabled, wit
 including ones a later nebula adds. Like every other object key, a `harnesses` map in
 `config.local.json` replaces the whole map from `config.json` rather than merging per harness,
 so keep machine-specific overrides in one layer.
+
+Grok Build is enabled by default and launches `grok`. Its Enabled toggle is stored under
+`harnesses.grok.enabled`. Set `harnesses.grok.model_default` and `effort_default` in config.json
+to pass `--model` and `--reasoning-effort`; unset values use the CLI defaults. The picker offers
+only `default` unless you configure `models` and `efforts` lists in that same block.
+`--rules` carries additional system guidance and `--resume` accepts a stored session ID, but
+automatic session-ID capture and managed hooks are not yet supported. Status is process-based.
 
 ### What `session_idle_timeout` accepts
 

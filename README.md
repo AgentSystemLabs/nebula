@@ -4,7 +4,7 @@
 
 **Mission control for your coding agents.**
 
-Run **Claude Code**, **Codex**, **Cursor**, **Pi** and **Muse** across every project and git WORKTREE you own — from one
+Run **Claude Code**, **Codex**, **Cursor**, **Pi**, **Muse** and **Grok Build** across every project and git WORKTREE you own — from one
 terminal, one keyboard, one tree. They keep working when you close it.
 
 [![Release](https://img.shields.io/github/v/release/AgentSystemLabs/nebula?style=flat-square&color=e8c547&label=release)](https://github.com/AgentSystemLabs/nebula/releases)
@@ -57,8 +57,7 @@ dot on a collapsed PROJECT tells you exactly where to look without opening anyth
 
 ## Supported harnesses
 
-Five CLIs work out of the box, each with its own Agents tab section and model/effort rows. A
-sixth, Grok, needs one config block (see "Teach nebula a new agent CLI" below). Install the CLI,
+Six CLIs work out of the box, each with its own Agents tab section and model/effort rows. Install the CLI,
 pick it in the `n` picker, done. A CLI missing from PATH still shows in the picker; the DAEMON
 re-checks through the login shell at launch.
 
@@ -89,7 +88,7 @@ build speaks a different protocol, in which case it can't attach until that rest
 says so and offers to do it for you. `nebula --version`
 (`-V`) says which binary you are on.
 
-> **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, `pi`, or `muse`.
+> **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, `pi`, `muse`, or `grok`.
 > nebula spawns them; it doesn't ship them.
 >
 > Three commands each want one more binary, and only those commands: `nebula ssh` and `nebula tunnel`
@@ -118,7 +117,7 @@ in the WORKTREES PANEL to branch off into a real `git worktree`. That's the whol
 two agents in two WORKTREES edit two directories and never collide.
 
 **4. Start the agent.** `n` in the SESSIONS PANEL opens the NEW SESSION PICKER — **Claude**, **Codex**,
-**Cursor**, **Pi** or **Muse**, `→` for MODEL and EFFORT, `Enter` for your defaults — then type the agent's first prompt
+**Cursor**, **Pi**, **Muse** or **Grok Build**, `→` for MODEL and EFFORT, `Enter` for your defaults — then type the agent's first prompt
 in the box that follows (or `Enter` on it empty to start in the CLI). Or skip the picker entirely: `p` from any
 PANEL opens the QUICK PROMPT, you type the task, and an agent starts working on it in the selected
 WORKTREE — or, from the WORKTREES PANEL or with `Ctrl+N` inside the box, in a fresh worktree cut for the
@@ -149,7 +148,9 @@ Claude's prompt box and `/resume` picker on your next prompt.
 
 A Cursor SESSION never goes red: nebula runs `cursor-agent --force` and Cursor reports no permission
 event, so waiting-on-you is not detectable there. A Muse SESSION never goes red either yet: `muse`
-has no managed hooks, so its status is process-based until a hook dialect is mapped.
+has no managed hooks, so its status is process-based until a hook dialect is mapped. Grok Build also uses process-based status,
+with no managed hooks or automatic capture of its session ID yet. Model and effort IDs can be
+set through `harnesses.grok` in config.json; the CLI supplies their defaults when unset.
 
 WORKTREE and PROJECT rows ROLL UP their children: red beats yellow beats done, and a parent's dot is
 violet whenever anything UNSEEN finished under it — so the violet walks up the tree and turns green as
@@ -183,7 +184,7 @@ is open.
 
 ## Teach nebula a new agent CLI
 
-The five built-ins are just rows in a table, and the table is open. One block in `config.json` adds
+The six built-ins are just rows in a table, and the table is open. One block in `config.json` adds
 a CLI everywhere at once: the `n` picker, the `e` presets, spawn, resume, and the Agents tab, which
 grows it a section to tune without hand-editing.
 
