@@ -268,6 +268,9 @@ pub(crate) struct CreatePrAgentSpec {
     pub auto_title: bool,
     pub pr_url: String,
     pub head: String,
+    /// The CLI's positional first prompt (an AGENT PRESET launched on the
+    /// row); checked and sent exactly as `CreateAgentSpec`'s is.
+    pub starting_prompt: Option<String>,
 }
 
 impl Daemon {
@@ -288,6 +291,7 @@ impl Daemon {
             auto_title,
             pr_url,
             head,
+            starting_prompt,
         } = spec;
         let pr_url = validate_pr_url(&pr_url)?;
         let number = pr_number(&pr_url)?;
@@ -302,7 +306,7 @@ impl Daemon {
             effort,
             auto_title,
             cloud_prompt: None,
-            starting_prompt: None,
+            starting_prompt,
             pr_url: Some(pr_url),
             issue_url: None,
         })

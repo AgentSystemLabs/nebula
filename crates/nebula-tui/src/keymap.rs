@@ -76,15 +76,25 @@ pub enum Action {
     /// `Shift+R`: ask GitHub for the pull requests again now, past every
     /// timer — the open list, the worktree's PR, the one the pane is reading.
     RefreshPullRequests,
+    /// `y`: reply — the COMMENT BOX on the pull request under the cursor,
+    /// posted to GitHub with `gh pr comment` on Enter.
+    CommentPullRequest,
     /// `i`: the ISSUES MODAL — the project's open GitHub issues, read in
-    /// place, with a QUICK PROMPT or an AGENT PRESET launched on one.
+    /// place, commented on, with a QUICK PROMPT or an AGENT PRESET launched
+    /// on one.
     Issues,
     /// `c`: the BRANCH SWITCHER — move the project's ROOT WORKTREE onto
     /// another branch, asking what to do with uncommitted changes.
     SwitchBranch,
-    /// `Shift+Enter` on a worktree: fire its `.nebula.json` OPEN COMMAND
-    /// (`open http://localhost:3000`, say). Its RUN COMMAND is `r`, which
-    /// takes that meaning on the Worktrees panel, where nothing is renamed.
+    /// `Shift+Enter` / `Shift+O` / `Alt+Enter`, from any panel: fire the
+    /// selected worktree's OPEN COMMAND — the project's **Open command**
+    /// setting, else its `.nebula.json` `open` (`open http://localhost:3000`,
+    /// say). Three chords because only the kitty protocol carries a shifted
+    /// Enter: Terminal.app sends a plain one and tmux flattens it, while
+    /// `ESC CR` — what `/terminal-setup` gives Shift+Enter in VS Code, and
+    /// Option+Enter on a Mac with Option as Meta — gets through both and
+    /// parses as Alt+Enter. Its RUN COMMAND is `r`, which takes that
+    /// meaning on the Worktrees panel, where nothing is renamed.
     OpenWorktree,
     // sessions
     NewTerminal,
@@ -99,6 +109,10 @@ pub enum Action {
     AgentPresets,
     /// The QUICK PROMPT: type a task, launch an agent on it.
     QuickPrompt,
+    /// `Space`: expand the selected session card into its FOLLOW-UP
+    /// COMPOSER — the next turn typed into the card itself — or fold it
+    /// back up.
+    FollowUp,
     // files
     FindFile,
     Grep,
@@ -111,6 +125,10 @@ pub enum Action {
     ToggleWorkspaces,
     ToggleProjects,
     ToggleWorktrees,
+    ToggleSessions,
+    /// Collapse every sidebar panel to its rail, or expand them all:
+    /// the one-keystroke way to give the terminal the full width.
+    ToggleSidebars,
     /// Open the Nth workspace tab (1-based) straight from the top bar.
     SelectWorkspace(u8),
     Hosts,
@@ -328,6 +346,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         defaults: &["shift+r"],
     },
     ActionSpec {
+        action: Action::CommentPullRequest,
+        id: "comment_pull_request",
+        label: "Comment on pull request",
+        hint: "On a pull request row, open a box to type a comment and post it on that PR through gh",
+        group: "PROJECTS & WORKTREES",
+        scope: Scope::Global,
+        defaults: &["y"],
+    },
+    ActionSpec {
         action: Action::Issues,
         id: "issues",
         label: "GitHub issues",
@@ -349,10 +376,10 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::OpenWorktree,
         id: "open_worktree",
         label: "Open worktree",
-        hint: "On a worktree, run the \"open\" command from its .nebula.json — e.g. open http://localhost:3000 (⇧Enter needs the kitty protocol; ⇧O arrives everywhere)",
+        hint: "Open the selected worktree: its project's Open command (Settings → Project), else .nebula.json \"open\" — e.g. open http://localhost:3000 (⇧Enter needs the kitty protocol; ⇧O arrives everywhere; ⌥Enter is the ESC CR that VS Code's Shift+Enter setup sends and tmux passes through)",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
-        defaults: &["shift+enter", "shift+o"],
+        defaults: &["shift+enter", "shift+o", "alt+enter"],
     },
     // ---- SESSIONS ----
     ActionSpec {
@@ -368,7 +395,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::Rename,
         id: "rename",
         label: "Rename",
-        hint: "Rename the selected session, or edit a link's URL; on a worktree, start or stop the \"run\" command from its .nebula.json",
+        hint: "Rename the selected session, or edit a link's URL; on a worktree, start or stop its run command (Settings → Project, else .nebula.json \"run\")",
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["r"],
@@ -431,7 +458,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::AgentPresets,
         id: "agent_presets",
         label: "Agent presets",
-        hint: "Saved launch presets (CLI, model, effort, prefix/postfix); Enter asks for an optional task, or skips it",
+        hint: "Saved launch presets (CLI, model, effort, prefix/postfix) for the selected worktree, from its row or its sessions; Enter asks for an optional task, or skips it; on an open PR row, a PR session in that branch's worktree",
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["e"],
@@ -444,6 +471,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["p"],
+    },
+    ActionSpec {
+        action: Action::FollowUp,
+        id: "follow_up",
+        label: "Follow-up prompt",
+        hint: "Expand the selected session's card into a box for its next turn, sent to the running agent on Enter; the cards below move down, and Esc or the card's chevron folds it back",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["space"],
     },
     // ---- FILES ----
     ActionSpec {
@@ -515,7 +551,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::ToggleProjects,
         id: "toggle_projects",
         label: "Projects panel",
-        hint: "Show or hide the Projects panel and give its width to the terminal",
+        hint: "Collapse or expand the Projects panel and give its width to the terminal",
         group: "GENERAL",
         scope: Scope::Global,
         defaults: &["shift+p"],
@@ -524,10 +560,28 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::ToggleWorktrees,
         id: "toggle_worktrees",
         label: "Worktrees panel",
-        hint: "Show or hide the Worktrees panel and give its width to the terminal",
+        hint: "Collapse or expand the Worktrees panel and give its width to the terminal",
         group: "GENERAL",
         scope: Scope::Global,
         defaults: &["shift+b"],
+    },
+    ActionSpec {
+        action: Action::ToggleSessions,
+        id: "toggle_sessions",
+        label: "Sessions panel",
+        hint: "Collapse or expand the Sessions panel and give its width to the terminal",
+        group: "GENERAL",
+        scope: Scope::Global,
+        defaults: &["shift+s"],
+    },
+    ActionSpec {
+        action: Action::ToggleSidebars,
+        id: "toggle_sidebars",
+        label: "All sidebars",
+        hint: "Collapse every panel and the workspaces bar, or bring them all back",
+        group: "GENERAL",
+        scope: Scope::Global,
+        defaults: &["ctrl+b", "cmd+b", "shift+z"],
     },
     workspace_slot!(1, "select_workspace_1", "Open workspace 1", "cmd+1", "1"),
     workspace_slot!(2, "select_workspace_2", "Open workspace 2", "cmd+2", "2"),
@@ -900,7 +954,7 @@ pub fn host_warning(chord: &KeyChord) -> (Reach, Option<&'static str>) {
     if shift && !ctrl && !alt && chord.code == KeyCode::Enter {
         return (
             Reach::Risky,
-            Some("⇧Enter needs the kitty keyboard protocol — Ghostty/kitty send it, Terminal.app sends a plain Enter"),
+            Some("⇧Enter needs the kitty keyboard protocol — Ghostty/kitty send it, Terminal.app sends a plain Enter and tmux flattens it to one; ⇧O and ⌥Enter arrive everywhere"),
         );
     }
     if ctrl && shift {
@@ -1240,9 +1294,16 @@ mod tests {
         );
         assert_eq!(shift_enter.spec(), "shift+enter");
         assert_eq!(host_warning(&shift_enter).0, Reach::Risky);
-        // …so a stock terminal gets a letter for it too.
+        // …so a stock terminal gets a letter for it too, and the ESC CR a
+        // Shift+Enter mapping (VS Code's /terminal-setup, Option as Meta)
+        // sends — which tmux passes through where it flattens the shifted
+        // Enter — lands on the same action as Alt+Enter.
         assert_eq!(
             map.lookup(Scope::Global, &ev(KeyCode::Char('O'), KeyModifiers::SHIFT)),
+            Some(Action::OpenWorktree)
+        );
+        assert_eq!(
+            map.lookup(Scope::Global, &ev(KeyCode::Enter, KeyModifiers::ALT)),
             Some(Action::OpenWorktree)
         );
     }

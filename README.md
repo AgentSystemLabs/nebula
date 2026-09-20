@@ -44,14 +44,14 @@ dot on a collapsed PROJECT tells you exactly where to look without opening anyth
 |---|---|
 | **One tree, up to four PANELS** | PROJECTS → WORKTREES → SESSIONS → TERMINAL PANE. `h`/`j`/`k`/`l` moves, `Enter` drills in, and landing on a live pane hands it the keyboard — so `Tab` all the way right and start typing at the agent. |
 | **A DAEMON that owns the PTYs** | Quit the TUI, shut the laptop, come back tomorrow. The agents never stopped, and the SCROLLBACK RING is replayed on ATTACH. |
-| **STATUS DOTS you read instead of screens** | ● yellow mid-turn, ● violet finished and UNSEEN, ● green finished and read, ● red waiting on you — plus a violet `n done` DONE BADGE counting the terminals you still owe a look. |
+| **STATUS DOTS you read instead of screens** | ● yellow mid-turn, ● blue finished and UNSEEN, ● green finished and read, ● red waiting on you — plus a blue `n done` DONE BADGE counting the terminals you still owe a look. |
 | **Lists that order themselves** | PROJECTS, WORKTREES and SESSIONS all sit most-recent-first in RECENCY ORDER, with a dim `23m ago` after the name saying why the row is where it is. The one fixed seat is the ROOT WORKTREE, always the first WORKTREES PANEL row; nothing else is pinned or dragged into place by hand. |
 | **Real git WORKTREES, one keystroke** | `n` in the WORKTREES PANEL branches off into an actual `git worktree`. Two agents in two directories never collide. A WORKTREE HOOK in git config lets a project claim a port or a route when a checkout is created and release it when it is deleted. |
 | **The root checkout on any branch, no shell** | `c` on the ROOT WORKTREE lists every branch and remote branch, fuzzy-filtered as you type; `Enter` switches, or creates the branch when nothing matches. Uncommitted changes? The BRANCH SWITCHER asks first — stash them, bring them along, commit them, or discard them — the way an IDE would. |
 | **Agents that drive nebula back** | Tell a Claude SESSION *"do this in a worktree"* and it runs `nebula worktree`, then restarts itself resumed inside the new checkout. Say *"show me the file"* and `nebula open` puts it in front of you in a tabbed modal. Say *"start a new nebula session that…"* and `nebula spawn` has a second agent working beside it before you look. |
-| **Every open pull request, in place** | nebula asks `gh` what's still open on the repo. Rest on a PR ROW and the PR PREVIEW reads it to you — description, stats, the whole conversation. `g` for its diff, `Enter` for the browser, `n` for a SESSION on any harness, scoped to that PR. |
-| **Every open issue, one key from an agent** | `i` lists the project's open GitHub issues, newest first, and reads the one under the cursor — description, labels, comments. `Enter` opens a QUICK PROMPT for it, `e` launches one of your AGENT PRESETS on it; the issue's URL travels with the session as context on every spawn, so the harness knows what it is fixing. |
-| **Diff, find, grep, browse** | `g` opens the DIFF VIEWER with REVIEWED MARKS, `f` the FILE FINDER, `F` a `git grep`, `b` the TREE BROWSER — all scoped to the selected WORKTREE, all one key from anywhere. |
+| **Every open pull request, in place** | nebula asks `gh` what's still open on the repo. Rest on a PR ROW and the PR PREVIEW reads it to you — description, stats, the whole conversation. A row goes red, badged `conflicts` or `failing`, when GitHub says the branch no longer merges or a check failed. `g` for its diff, `y` to comment on it without leaving the keyboard, `Enter` for the browser, `n` for a SESSION on any harness, scoped to that PR. |
+| **Every open issue, one key from an agent** | `i` lists the project's open GitHub issues, newest first, and reads the one under the cursor — description, labels, comments. `Enter` opens a QUICK PROMPT for it, `e` launches one of your AGENT PRESETS on it, `E` edits its title and description in place; the issue's URL travels with the session as context on every spawn, so the harness knows what it is fixing. |
+| **Diff, find, grep, browse** | `g` opens the DIFF VIEWER with REVIEWED MARKS, `f` the FILE FINDER, `F` a `git grep`, `b` the TREE BROWSER — all scoped to the selected WORKTREE, all one key from anywhere. Markdown previews are rendered pages, not raw `#` and `*`. |
 | **`/` finds anything, anywhere** | The PALETTE spans every WORKSPACE, not just the open one. Before you type it sorts by attention: NEEDS FEEDBACK first, then RUNNING, then UNSEEN — so `/` `Enter` is the fastest way back to whatever needs you, and `]` / `[` cycle that same attention order with no modal at all, one session per press, workspaces included. Open pull requests are rows too: `Enter` on one lands on its PR ROW with the PR PREVIEW reading it, `Ctrl+o` hands it to the browser. |
 | **It follows you to other machines** | `nebula ssh <host>` opens nebula there, installing it if missing. `nebula tunnel <host>` puts that machine's TUI in a browser tab over a single ssh tunnel. Your settings and agent presets go along, and `nebula config export` / `import` back them up. |
 
@@ -117,8 +117,8 @@ in the WORKTREES PANEL to branch off into a real `git worktree`. That's the whol
 two agents in two WORKTREES edit two directories and never collide.
 
 **4. Start the agent.** `n` in the SESSIONS PANEL opens the NEW SESSION PICKER — **Claude**, **Codex**,
-**Cursor**, **Pi**, **Muse** or **Grok Build**, `→` for MODEL and EFFORT, `Enter` for your defaults — then type the agent's first prompt
-in the box that follows (or `Enter` on it empty to start in the CLI). Or skip the picker entirely: `p` from any
+**Cursor**, **Pi**, **Muse** or **Grok Build**, `→` for MODEL and EFFORT, `Enter` for your defaults — and the session starts, its
+pane yours to type the first prompt into. Or skip the picker entirely: `p` from any
 PANEL opens the QUICK PROMPT, you type the task, and an agent starts working on it in the selected
 WORKTREE — or, from the WORKTREES PANEL or with `Ctrl+N` inside the box, in a fresh worktree cut for the
 job, the box turning green to say so. Save a framing you keep retyping as an AGENT PRESET (`e`) and it
@@ -140,7 +140,7 @@ Claude's prompt box and `/resume` picker on your next prompt.
 |---|---|
 | ● gray | FRESH — agent never run |
 | ● yellow | RUNNING — turn in progress (the STOP GATE holds it open while subagents are live) |
-| ● violet | UNSEEN — turn complete and nobody has looked at it yet |
+| ● blue | UNSEEN — turn complete and nobody has looked at it yet |
 | ● green | FINISHED — the same finished turn, once the cursor has been on the SESSION |
 | ● red | NEEDS FEEDBACK — permission prompt or question waiting on you |
 | ● magenta | terminated — process died mid-run |
@@ -153,11 +153,15 @@ with no managed hooks or automatic capture of its session ID yet. Model and effo
 set through `harnesses.grok` in config.json; the CLI supplies their defaults when unset.
 
 WORKTREE and PROJECT rows ROLL UP their children: red beats yellow beats done, and a parent's dot is
-violet whenever anything UNSEEN finished under it — so the violet walks up the tree and turns green as
+blue whenever anything UNSEEN finished under it — so the blue walks up the tree and turns green as
 you read your way down it.
 
-A dot going violet while you were looking elsewhere is easy to miss, so nebula counts those for you. When
-a turn finishes in a pane that isn't on screen, its WORKTREE and PROJECT rows grow a violet `n done`
+A dot going blue while you were looking elsewhere is easy to miss, so nebula marks the moment and then
+keeps count. The moment: a row's name sweeps — a bright band crossing it — in yellow while it runs and in
+red while it waits on you, for as long as either lasts; a turn that finishes unread sweeps blue for about
+five seconds, on its own row and every row that rolls it up, and then holds still. Motion means live, or
+just changed; a row at rest is at rest (`animations` off stills all of it). The count: when
+a turn finishes in a pane that isn't on screen, its WORKTREE and PROJECT rows grow a blue `n done`
 DONE BADGE — the number of terminals you have left to go read — and the SESSION row says `done` where its
 HARNESS BADGE normally sits. Walking the cursor onto a SESSION previews it, which reads it: the badges
 count down as you go and disappear at zero — `]` walks you onto the next one owed a look without hunting
@@ -246,6 +250,11 @@ SCROLLBACK RING instead of being discarded, so wheel-up over a codex SESSION has
 
 Releases: push a `v*` tag (`git tag v0.1.0 && git push --tags`) and CI builds mac (arm/intel) and linux (x64/arm64, static musl) binaries and
 attaches them to a GitHub release — which is what `install.sh` downloads.
+
+Pull requests: a branch pushed to this repository gets an automated Claude code review on its PR, as
+inline comments. A PR from a fork does not — GitHub withholds the credentials the reviewer needs from a
+fork's workflow runs — so a maintainer reviews it by hand, or asks for the review with `@claude` in a
+PR comment.
 
 ## License
 

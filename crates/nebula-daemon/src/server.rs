@@ -398,42 +398,59 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     auto_title,
                     pr_url,
                     head,
+                    starting_prompt,
                 } => {
-                    let result = daemon
-                        .create_pr_agent(CreatePrAgentSpec {
-                            project: project.clone(),
-                            name,
-                            kind,
-                            custom_harness,
-                            model,
-                            effort,
-                            auto_title,
-                            pr_url: pr_url.clone(),
-                            head,
-                        })
-                        .await;
-                    match &result {
-                        Ok(nebula_core::EntityId::Agent(agent)) => tracing::info!(
-                            req_id,
-                            agent = %agent,
-                            kind = kind.as_str(),
-                            project = %project,
-                            pr_url = %pr_url,
-                            launch_mode = "pull_request",
-                            "agent session spawned"
-                        ),
-                        Err(error) => tracing::warn!(
-                            req_id,
-                            error = %error,
-                            kind = kind.as_str(),
-                            project = %project,
-                            pr_url = %pr_url,
-                            launch_mode = "pull_request",
-                            "agent session spawn failed"
-                        ),
-                        Ok(_) => unreachable!("CreatePrAgent returned a non-agent id"),
-                    }
-                    reply(&out_tx, req_id, result.map(Some)).await;
+                    // A PR SESSION whose checkout does not exist yet is a
+                    // fetch, a `git worktree add` and the WORKTREE HOOK
+                    // before the CLI spawns — seconds, each step bounded by
+                    // its own timeout. Off the request loop, like
+                    // `CreateWorktree` above: the client put stand-in rows
+                    // up precisely so the user keeps working meanwhile, and
+                    // run inline every Attach, Input and Resize on this
+                    // connection queued behind it — moving to another
+                    // session showed nothing until the Ack. `worktree_ops`
+                    // still serializes the checkout against every other
+                    // worktree op.
+                    let daemon = daemon.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        let result = daemon
+                            .create_pr_agent(CreatePrAgentSpec {
+                                project: project.clone(),
+                                name,
+                                kind,
+                                custom_harness,
+                                model,
+                                effort,
+                                auto_title,
+                                pr_url: pr_url.clone(),
+                                head,
+                                starting_prompt,
+                            })
+                            .await;
+                        match &result {
+                            Ok(nebula_core::EntityId::Agent(agent)) => tracing::info!(
+                                req_id,
+                                agent = %agent,
+                                kind = kind.as_str(),
+                                project = %project,
+                                pr_url = %pr_url,
+                                launch_mode = "pull_request",
+                                "agent session spawned"
+                            ),
+                            Err(error) => tracing::warn!(
+                                req_id,
+                                error = %error,
+                                kind = kind.as_str(),
+                                project = %project,
+                                pr_url = %pr_url,
+                                launch_mode = "pull_request",
+                                "agent session spawn failed"
+                            ),
+                            Ok(_) => unreachable!("CreatePrAgent returned a non-agent id"),
+                        }
+                        reply(&out_tx, req_id, result.map(Some)).await;
+                    });
                 }
                 ClientRequest::PrewarmAgent {
                     worktree,
@@ -545,12 +562,22 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     message,
                 } => {
                     tracing::info!(agent = %id, bytes = message.len(), "send to cloud session");
-                    reply_done(
-                        &out_tx,
-                        req_id,
-                        daemon.send_cloud_message(&id, &message).await,
-                    )
-                    .await;
+                    // `claude -p … --cloud` is a login shell and a network
+                    // round trip — seconds. Off the request loop, like the
+                    // worktree ops above: run inline, every keystroke and
+                    // every session switch on this connection waited for
+                    // it, and the pane the user went back to typing in
+                    // looked hung until the message was sent.
+                    let daemon = daemon.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        reply_done(
+                            &out_tx,
+                            req_id,
+                            daemon.send_cloud_message(&id, &message).await,
+                        )
+                        .await;
+                    });
                 }
                 ClientRequest::CreateTerminal {
                     req_id,

@@ -54,8 +54,11 @@ const STORE_FILE: &str = "pull-requests.json";
 const DIFFS_DIR: &str = "diffs";
 /// Bumped when the document's shape changes incompatibly; an older
 /// document is ignored rather than half-read. Field additions don't need
-/// it — `#[serde(default)]` covers those.
-const VERSION: u32 = 1;
+/// it — `#[serde(default)]` covers those. 2: an open row's `head` is the
+/// checkout's branch (`pull_request::checkout_branch`), not `gh`'s bare
+/// `headRefName` — a fork row cached under 1 would launch its PR SESSION
+/// into whichever checkout of ours shares the fork branch's name.
+const VERSION: u32 = 2;
 
 /// The document on disk. Keyed the way the app keys the same things:
 /// checkout rows by worktree id, open lists by project id, bodies by URL.
@@ -340,6 +343,7 @@ mod tests {
             title: format!("PR {number}"),
             state: state.into(),
             is_draft: false,
+            health: Default::default(),
             activity: vec!["2024-04-25T19:55:42Z".into()],
         }
     }
@@ -350,6 +354,7 @@ mod tests {
             title: format!("PR {number}"),
             url: format!("https://github.com/o/r/pull/{number}"),
             is_draft: number % 2 == 1,
+            health: Default::default(),
             head: format!("head-{number}"),
         }
     }
@@ -361,6 +366,7 @@ mod tests {
             title: format!("PR {number}"),
             state: STATE_OPEN.into(),
             is_draft: false,
+            health: Default::default(),
             author: "kate".into(),
             base: "main".into(),
             head: format!("head-{number}"),
@@ -425,6 +431,30 @@ mod tests {
         assert!(cache.load_store().is_none(), "a newer version is not ours");
         std::fs::write(cache.store_path(), "{not json").unwrap();
         assert!(cache.load_store().is_none());
+    }
+
+    /// A document written before rows carried their health — the same
+    /// version, one field short — reads back with every row healthy, the
+    /// field's default, rather than being thrown away for its shape.
+    #[test]
+    fn a_document_from_before_health_reads_as_healthy() {
+        let (_dir, cache) = cache();
+        let mut raw = serde_json::to_value(store()).unwrap();
+        fn strip(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    map.remove("health");
+                    map.values_mut().for_each(strip);
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        strip(&mut raw);
+        assert!(!raw.to_string().contains("health"), "{raw}");
+        std::fs::create_dir_all(cache.store_path().parent().unwrap()).unwrap();
+        std::fs::write(cache.store_path(), raw.to_string()).unwrap();
+        assert_eq!(cache.load_store().expect("readable"), store());
     }
 
     /// Hydration paints the rows, arms every list to be re-asked at once

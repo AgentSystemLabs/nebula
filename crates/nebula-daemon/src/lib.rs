@@ -1,4 +1,5 @@
 pub mod attach;
+pub mod claude_bg;
 pub mod config;
 pub mod git;
 pub mod hooks;

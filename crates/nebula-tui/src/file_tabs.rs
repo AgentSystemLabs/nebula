@@ -6,6 +6,10 @@
 //! of the editor or the preview, Ctrl+Q steps back to the strip, and only
 //! from the strip does it close — asked for on 2026-09-04, so a file can be
 //! read, edited and left without ever losing the set of tabs by accident.
+//! A markdown tab is previewed as the rendered page (the MARKDOWN module);
+//! `m` flips it to the source and back. The same modal is where a `.md`
+//! lands from the FILE FINDER's Enter and from a path ⌥clicked in the
+//! pane: read first, edit on Enter.
 
 use std::path::{Path, PathBuf};
 
@@ -13,8 +17,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::{Position, Rect};
 
 use crate::app::{App, Overlay};
+use crate::markdown::Rendered;
 use crate::syntax::{Highlighter, TokenKind};
-use crate::tree_browser::read_preview;
+use crate::tree_browser::Preview;
 
 /// Widest a tab label gets; a handful have to fit side by side, and the
 /// tail of a path is the part that tells files apart.
@@ -51,6 +56,17 @@ pub struct FileTabsView {
     /// Real file contents — the case that earns a line-number gutter —
     /// rather than a read error or placeholder.
     pub preview_is_file: bool,
+    /// The text behind `preview_lines`, for the markdown flow.
+    pub preview_text: String,
+    /// The focused tab's file is markdown: `m` chooses between the
+    /// rendered page and the source.
+    pub markdown: bool,
+    /// Show markdown as the rendered page rather than the source. Kept
+    /// across tabs, so a reader who wants the source keeps seeing it.
+    pub pretty: bool,
+    /// The page flowed for the last drawn width, written back during draw
+    /// (see [`Rendered`]).
+    pub rendered: Option<Rendered>,
     /// Top visible preview line.
     pub scroll: u16,
     /// Inner height of the preview, written back during draw so paging
@@ -64,11 +80,31 @@ pub struct FileTabsView {
     /// The preview pane's inner rect, written back during draw; the
     /// embedded editor spawns and renders at this size.
     pub body_area: Rect,
+    /// BACKGROUND READS (`view_jobs`): with it, a tab's file is read and
+    /// highlighted off the loop — the TREE BROWSER's rule, and its reader;
+    /// without (a view built by a test), inline.
+    pub jobs: Option<crate::view_jobs::Jobs>,
+    /// The preview in flight, by ticket; the pane keeps the last tab's
+    /// meanwhile (`view_jobs::STALE_GRACE`).
+    pub waiting: Option<u64>,
+    /// Stops the read in flight when the tab changes again.
+    pub cancel: crate::view_jobs::Cancel,
 }
 
 impl FileTabsView {
     /// Tabs on `paths` in the order given, the first one previewed.
     pub fn new(root: PathBuf, editor: String, paths: Vec<PathBuf>) -> Self {
+        Self::with_jobs(root, editor, paths, None)
+    }
+
+    /// [`FileTabsView::new`], reading its files off the loop when there
+    /// are BACKGROUND READS to read them with.
+    pub fn with_jobs(
+        root: PathBuf,
+        editor: String,
+        paths: Vec<PathBuf>,
+        jobs: Option<crate::view_jobs::Jobs>,
+    ) -> Self {
         let tabs = paths
             .into_iter()
             .map(|path| FileTab {
@@ -85,11 +121,18 @@ impl FileTabsView {
             preview_lines: Vec::new(),
             preview_line_count: 0,
             preview_is_file: false,
+            preview_text: String::new(),
+            markdown: false,
+            pretty: true,
+            rendered: None,
             scroll: 0,
             view_height: 0,
             area: Rect::default(),
             tab_hits: Vec::new(),
             body_area: Rect::default(),
+            jobs,
+            waiting: None,
+            cancel: crate::view_jobs::Cancel::default(),
         };
         view.load_preview();
         view
@@ -113,22 +156,73 @@ impl FileTabsView {
     }
 
     /// Re-read the focused tab's file into the preview, scrolled to the top.
+    /// Off the loop when this view has BACKGROUND READS: the pane keeps
+    /// what it showed until the read lands ([`FileTabsView::land_preview`])
+    /// or is slow ([`FileTabsView::preview_slow`]).
     pub fn load_preview(&mut self) {
+        self.cancel.cancel();
+        self.waiting = None;
+        let Some(path) = self.selected().map(|tab| tab.path.clone()) else {
+            self.set_preview(placeholder("(no files)"));
+            return;
+        };
+        let Some(jobs) = self.jobs.clone() else {
+            self.set_preview(read_tab(&path, None).unwrap_or_default());
+            return;
+        };
+        let ticket = crate::view_jobs::ticket();
+        self.waiting = Some(ticket);
+        self.cancel = crate::view_jobs::Cancel::default();
+        let cancel = self.cancel.clone();
+        jobs.run_with_grace(ticket, move || {
+            Some(crate::view_jobs::Answer::Preview {
+                ticket,
+                preview: Box::new(read_tab(&path, Some(&cancel))?),
+            })
+        });
+    }
+
+    fn set_preview(&mut self, preview: Preview) {
         self.scroll = 0;
-        let (text, is_file) = match self.selected() {
-            Some(tab) => match read_preview(&tab.path) {
-                Ok(text) => (text, true),
-                Err(message) => (message, false),
-            },
-            None => ("(no files)".to_string(), false),
-        };
-        let mut hl = match self.selected() {
-            Some(tab) if is_file => Highlighter::for_path(&tab.path.to_string_lossy()),
-            _ => Highlighter::plain(),
-        };
-        self.preview_is_file = is_file;
-        self.preview_lines = text.lines().map(|l| hl.line(l)).collect();
-        self.preview_line_count = self.preview_lines.len();
+        self.preview_is_file = preview.is_file;
+        self.markdown = preview.markdown;
+        self.rendered = None;
+        self.preview_line_count = preview.lines.len();
+        self.preview_lines = preview.lines;
+        self.preview_text = preview.text;
+    }
+
+    /// A background read came back: shown when it is the tab being waited
+    /// on, dropped when the strip has moved on since.
+    pub fn land_preview(&mut self, ticket: u64, preview: Preview) {
+        if self.waiting == Some(ticket) {
+            self.waiting = None;
+            self.set_preview(preview);
+        }
+    }
+
+    /// The read in flight has outlasted the grace the last tab's text was
+    /// kept for: say so rather than leave one file under another's label.
+    pub fn preview_slow(&mut self, ticket: u64) {
+        if self.waiting == Some(ticket) {
+            self.set_preview(placeholder("loading…"));
+        }
+    }
+
+    /// The preview is the rendered markdown page rather than the source.
+    pub fn renders_markdown(&self) -> bool {
+        self.markdown && self.pretty
+    }
+
+    /// `m`: the other view of a markdown file. The scroll stays put and the
+    /// draw re-clamps it against the new line count — a source line and a
+    /// rendered row have no mapping to do better with.
+    pub fn toggle_pretty(&mut self) {
+        self.pretty = !self.pretty;
+        self.rendered = None;
+        if !self.pretty {
+            self.preview_line_count = self.preview_lines.len();
+        }
     }
 
     pub fn max_scroll(&self) -> u16 {
@@ -148,6 +242,22 @@ impl FileTabsView {
     pub fn editor_closed(&mut self) {
         self.load_preview();
         self.on_tabs = true;
+    }
+}
+
+/// A tab's file, read and highlighted — the TREE BROWSER's reader, on an
+/// absolute path.
+fn read_tab(path: &Path, cancel: Option<&crate::view_jobs::Cancel>) -> Option<Preview> {
+    crate::tree_browser::file_preview(Path::new(""), &path.to_string_lossy(), cancel)
+}
+
+fn placeholder(text: &str) -> Preview {
+    let mut hl = Highlighter::plain();
+    Preview {
+        lines: text.lines().map(|l| hl.line(l)).collect(),
+        text: text.to_string(),
+        is_file: false,
+        markdown: false,
     }
 }
 
@@ -183,7 +293,8 @@ pub(crate) fn open(app: &mut App, root: PathBuf, paths: Vec<PathBuf>) {
         vim.embedded = false;
     }
     let editor = crate::config::Config::load().editor_command();
-    app.overlay = Some(Overlay::FileTabs(FileTabsView::new(root, editor, paths)));
+    let view = FileTabsView::with_jobs(root, editor, paths, app.view_jobs.clone());
+    app.overlay = Some(Overlay::FileTabs(view));
     app.dirty = true;
 }
 
@@ -191,7 +302,8 @@ pub(crate) fn open(app: &mut App, root: PathBuf, paths: Vec<PathBuf>) {
 /// OVERLAY's pattern): Tab / ⇧Tab / ←/→ / h/l / 1-9 switch tabs from
 /// anywhere; ↓/j from the strip drops into the preview, where j/k scroll
 /// and ↑ off the top steps back onto the strip; Enter opens the editor;
-/// Esc backs out one level, so from the strip it closes.
+/// Esc backs out one level, so from the strip it closes. `m` on a
+/// markdown tab flips between the rendered page and the source.
 enum Cmd {
     Close,
     ToStrip,
@@ -201,6 +313,7 @@ enum Cmd {
     Scroll(i32),
     Top,
     Bottom,
+    Pretty,
 }
 
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
@@ -230,6 +343,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Enter => Cmd::Edit,
+        KeyCode::Char('m') if view.markdown => Cmd::Pretty,
         // ---- the strip has the cursor ----
         KeyCode::Down | KeyCode::Char('j') if on_tabs => Cmd::IntoPreview,
         KeyCode::Up | KeyCode::Char('k') if on_tabs => return,
@@ -245,7 +359,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::End | KeyCode::Char('G') => Cmd::Bottom,
         _ => return,
     };
+    run(app, cmd);
+}
 
+/// Run one FILE TABS command: the one place the modal changes, whether a
+/// key or the mouse asked for it.
+fn run(app: &mut App, cmd: Cmd) {
     match cmd {
         Cmd::Close => app.overlay = None,
         Cmd::Edit => open_in_editor(app),
@@ -260,6 +379,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 Cmd::Scroll(delta) => view.scroll_by(delta),
                 Cmd::Top => view.scroll = 0,
                 Cmd::Bottom => view.scroll = view.max_scroll(),
+                Cmd::Pretty => view.toggle_pretty(),
                 Cmd::Close | Cmd::Edit => unreachable!("handled above"),
             }
         }
@@ -274,25 +394,29 @@ pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent, pos: Position) {
     let Some(Overlay::FileTabs(view)) = &mut app.overlay else {
         return;
     };
-    match mouse.kind {
+    // The mouse only names commands — the keys' own (`run`).
+    let cmds: Vec<Cmd> = match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             // The strip is the first inner row, right under the top border.
             if mouse.row == view.area.y.saturating_add(1) {
-                if let Some(i) = view
-                    .tab_hits
+                view.tab_hits
                     .iter()
                     .position(|(x0, x1)| mouse.column >= *x0 && mouse.column < *x1)
-                {
-                    view.select_tab(i as i64);
-                    view.on_tabs = true;
-                }
+                    // That tab's digit, with the cursor parked on the strip.
+                    .map(|i| vec![Cmd::Tab(i as i64), Cmd::ToStrip])
+                    .unwrap_or_default()
             } else if view.body_area.contains(pos) {
-                view.on_tabs = false;
+                vec![Cmd::IntoPreview]
+            } else {
+                Vec::new()
             }
         }
-        MouseEventKind::ScrollDown => view.scroll_by(WHEEL_LINES),
-        MouseEventKind::ScrollUp => view.scroll_by(-WHEEL_LINES),
+        MouseEventKind::ScrollDown => vec![Cmd::Scroll(WHEEL_LINES)],
+        MouseEventKind::ScrollUp => vec![Cmd::Scroll(-WHEEL_LINES)],
         _ => return,
+    };
+    for cmd in cmds {
+        run(app, cmd);
     }
     app.dirty = true;
 }
@@ -460,6 +584,107 @@ mod tests {
             "←/→ work from the preview too"
         );
         assert_eq!(text_of(&view.preview_lines[0]), "file 2");
+    }
+
+    #[test]
+    fn m_flips_a_markdown_tab_between_the_page_and_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write(dir.path(), "a.md", "# alpha\n\n- one\n");
+        let b = write(dir.path(), "b.rs", "fn main() {}\n");
+        let mut app = App::new();
+        app.overlay = Some(Overlay::FileTabs(FileTabsView::new(
+            dir.path().to_path_buf(),
+            "vi".into(),
+            vec![a, b],
+        )));
+        let view = view_in(&app);
+        assert!(
+            view.markdown && view.renders_markdown(),
+            "a .md tab opens rendered"
+        );
+        assert_eq!(
+            view.preview_text, "# alpha\n\n- one",
+            "read_preview drops the final newline"
+        );
+        key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        assert!(!view_in(&app).renders_markdown(), "m shows the source");
+        key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        let view = view_in(&app);
+        assert!(
+            !view.markdown && !view.renders_markdown(),
+            "a .rs tab is never rendered"
+        );
+        key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        assert!(!view_in(&app).pretty, "m on a code tab does nothing");
+        key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(
+            !view_in(&app).renders_markdown(),
+            "the choice holds across tabs"
+        );
+        key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        assert!(view_in(&app).renders_markdown());
+    }
+
+    /// The modal draws a markdown tab as the rendered page — a bullet, a
+    /// table, no `#` — keeps the flowed page for the next draw, and `m`
+    /// swaps in the source with its line numbers.
+    #[test]
+    fn the_preview_draws_the_rendered_page_and_m_swaps_in_the_source() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let dir = tempfile::tempdir().unwrap();
+        let a = write(
+            dir.path(),
+            "a.md",
+            "# Alpha title\n\n- one item\n\n| k | v |\n|---|---|\n| x | y |\n",
+        );
+        let mut app = App::new();
+        app.overlay = Some(Overlay::FileTabs(FileTabsView::new(
+            dir.path().to_path_buf(),
+            "vi".into(),
+            vec![a],
+        )));
+        let screen = |app: &mut App| -> String {
+            let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            term.draw(|f| crate::ui::draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..30)
+                .map(|y| {
+                    (0..100)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let page = screen(&mut app);
+        assert!(page.contains("Alpha title"), "{page}");
+        assert!(
+            !page.contains("# Alpha"),
+            "the heading marker is gone: {page}"
+        );
+        assert!(page.contains("• one item"), "{page}");
+        assert!(page.contains("k │ v"), "the table has its columns: {page}");
+        assert!(
+            page.contains("m: source"),
+            "the hint names the toggle: {page}"
+        );
+        let view = view_in(&app);
+        let kept = view.rendered.as_ref().expect("the flowed page is kept");
+        assert_eq!(
+            view.preview_line_count,
+            kept.lines.len(),
+            "the scroller counts rendered rows"
+        );
+
+        key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        let source = screen(&mut app);
+        assert!(
+            source.contains(" 1 # Alpha title"),
+            "the source, numbered: {source}"
+        );
+        assert!(source.contains("m: rendered"), "{source}");
+        assert_eq!(view_in(&app).preview_line_count, 7);
     }
 
     #[test]

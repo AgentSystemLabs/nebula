@@ -1,0 +1,15 @@
+# Three quick prompts on the root checkout (the stand-in agent in the .setup.sh leaves them unread-done,
+# running and needs-feedback), then back to the SESSIONS panel so it wears the preset's focus colors.
+Tab
+Tab
+p
+Fix the login redirect
+Enter
+p
+Sort the changelog by date
+Enter
+p
+Profile the daemon startup
+Enter
+BTab
+Tab

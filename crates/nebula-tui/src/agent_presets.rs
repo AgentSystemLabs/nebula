@@ -78,6 +78,79 @@ impl AgentPreset {
     }
 }
 
+/// Which side of the task a preset's text goes: a PREFIX before it, a
+/// POSTFIX after it, or both. The PRESET EDITOR shows one box per side —
+/// its Text row picks — and **Preset text** (Settings → Sessions,
+/// [`crate::config::Config::preset_text`]) is what a new preset starts on:
+/// prefix alone by default, the framing most people reach for and one box
+/// to fill. Never stored on the preset — a side is what it holds, so the
+/// form derives it ([`PresetText::for_preset`]) and an older nebula reads
+/// the file unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresetText {
+    Prefix,
+    Postfix,
+    Both,
+}
+
+impl PresetText {
+    /// In cycle order, as the Text row and the setting step them.
+    pub const ALL: [PresetText; 3] = [PresetText::Prefix, PresetText::Postfix, PresetText::Both];
+    /// What a config that never set `preset_text` means.
+    pub const DEFAULT: PresetText = PresetText::Prefix;
+
+    /// The label the setting stores and both rows show.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PresetText::Prefix => "prefix",
+            PresetText::Postfix => "postfix",
+            PresetText::Both => "prefix & postfix",
+        }
+    }
+
+    /// A label back to its side, case-insensitively and trimmed; `both` is
+    /// accepted for a hand edit. None for anything else.
+    pub fn parse(value: &str) -> Option<PresetText> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("both") {
+            return Some(PresetText::Both);
+        }
+        Self::ALL
+            .into_iter()
+            .find(|side| side.as_str().eq_ignore_ascii_case(value))
+    }
+
+    pub fn has_prefix(self) -> bool {
+        matches!(self, PresetText::Prefix | PresetText::Both)
+    }
+
+    pub fn has_postfix(self) -> bool {
+        matches!(self, PresetText::Postfix | PresetText::Both)
+    }
+
+    /// The side (or sides) two flags name; None when neither is set.
+    pub fn of_sides(prefix: bool, postfix: bool) -> Option<PresetText> {
+        match (prefix, postfix) {
+            (true, true) => Some(PresetText::Both),
+            (true, false) => Some(PresetText::Prefix),
+            (false, true) => Some(PresetText::Postfix),
+            (false, false) => None,
+        }
+    }
+
+    /// What the editor shows for a stored preset under the `default`
+    /// setting: every side the preset already holds text on, plus the
+    /// side(s) the setting names — so nothing saved is ever hidden, and a
+    /// blank preset opens the way a new one would.
+    pub fn for_preset(preset: &AgentPreset, default: PresetText) -> PresetText {
+        Self::of_sides(
+            !preset.prefix.trim().is_empty() || default.has_prefix(),
+            !preset.postfix.trim().is_empty() || default.has_postfix(),
+        )
+        .unwrap_or(default)
+    }
+}
+
 pub fn load() -> Vec<AgentPreset> {
     load_from(&store_path())
 }
@@ -274,6 +347,72 @@ mod tests {
         assert!(p.has_wrapping());
         p.postfix.clear();
         assert!(!p.has_wrapping());
+    }
+
+    #[test]
+    fn preset_text_labels_round_trip_and_both_is_an_alias() {
+        for side in PresetText::ALL {
+            assert_eq!(PresetText::parse(side.as_str()), Some(side));
+            assert_eq!(
+                PresetText::parse(&format!(" {} ", side.as_str().to_uppercase())),
+                Some(side)
+            );
+        }
+        assert_eq!(PresetText::parse(" both "), Some(PresetText::Both));
+        assert_eq!(PresetText::parse("suffix"), None);
+        assert_eq!(PresetText::parse(""), None);
+        assert_eq!(PresetText::DEFAULT, PresetText::Prefix);
+        assert!(PresetText::Prefix.has_prefix() && !PresetText::Prefix.has_postfix());
+        assert!(!PresetText::Postfix.has_prefix() && PresetText::Postfix.has_postfix());
+        assert!(PresetText::Both.has_prefix() && PresetText::Both.has_postfix());
+        assert_eq!(PresetText::of_sides(false, false), None);
+    }
+
+    /// A stored side is never hidden: the form shows what the preset holds
+    /// on top of what the setting names, and a blank preset follows the
+    /// setting alone.
+    #[test]
+    fn for_preset_shows_every_side_with_text_and_the_setting_for_the_rest() {
+        use PresetText::*;
+        let blank = preset("p", AgentKind::Claude);
+        let pre = AgentPreset {
+            prefix: "PRE".into(),
+            ..blank.clone()
+        };
+        let post = AgentPreset {
+            postfix: "POST".into(),
+            ..blank.clone()
+        };
+        let both = AgentPreset {
+            prefix: "PRE".into(),
+            postfix: "POST".into(),
+            ..blank.clone()
+        };
+        assert_eq!(PresetText::for_preset(&blank, Prefix), Prefix);
+        assert_eq!(PresetText::for_preset(&blank, Postfix), Postfix);
+        assert_eq!(PresetText::for_preset(&blank, Both), Both);
+        assert_eq!(PresetText::for_preset(&pre, Prefix), Prefix);
+        assert_eq!(
+            PresetText::for_preset(&pre, Postfix),
+            Both,
+            "the prefix it holds stays on screen"
+        );
+        assert_eq!(
+            PresetText::for_preset(&post, Prefix),
+            Both,
+            "the postfix it holds stays on screen"
+        );
+        assert_eq!(PresetText::for_preset(&post, Postfix), Postfix);
+        assert_eq!(PresetText::for_preset(&both, Prefix), Both);
+        let spaces = AgentPreset {
+            postfix: "  \n".into(),
+            ..blank
+        };
+        assert_eq!(
+            PresetText::for_preset(&spaces, Prefix),
+            Prefix,
+            "whitespace is no text"
+        );
     }
 
     #[test]

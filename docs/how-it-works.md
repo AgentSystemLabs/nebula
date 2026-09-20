@@ -10,8 +10,39 @@
   one on its own. Moving the cursor onto a live session — a row in the Sessions panel, or a worktree,
   project or workspace switch that brings one back — attaches it on the keypress; only a session the
   idle reaper took waits a moment, so that walking past its row doesn't boot a CLI. The screens of the
-  last two sessions shown are kept, so returning to one paints on the same frame and fetches only the
-  bytes it missed instead of replaying the whole ring.
+  last six sessions shown are kept, so returning to one paints on the same frame and fetches only the
+  bytes it missed instead of replaying the whole ring. Between them they may hold about 12 MB of grid;
+  past that the oldest give up their scrollback and keep only the screen (a fiftieth of the size), and
+  scrolling up in a pane that came back that way replays its ring once to get the history back.
+- **A key never waits on git, the disk or the DAEMON.** Everything a keypress can start that takes
+  longer than a frame runs off the event loop and lands when it is done. The DIFF VIEWER (`g`), the
+  FILE FINDER (`f`), its grep view (`F`) and the TREE BROWSER (`b`) open on the keypress and fill in
+  when `git status` / `git ls-files` answer — what is typed meanwhile is kept and applied — and a
+  file's diff, a search and a preview are read on the blocking pool: the pane keeps what it showed
+  for up to 60 ms, which is longer than a read takes, and says `loading…` past that. The DIFF VIEWER
+  opens on the list the changed-files badge's last `git status` found (two seconds old at most; its own
+  `git status` still runs, and the reader keeps their place when it lands), so the first diff is being
+  read while the list is checked rather than after — on a ten-thousand-file checkout `g` went from
+  260 ms of frozen UI to a list in 2 ms and a diff in 60. It reads the row after the cursor ahead and
+  keeps what it has read (2 MB at most, gone with the modal), so `↓` paints the next diff on the
+  keypress and re-reads it behind. List filters rank with `nebula-fuzzy`, a crate of its own only so
+  that a dev build compiles it optimised: 27 ms a keystroke over ten thousand paths became 5. `git grep` waits 40 ms for the
+  next character, streams, and is killed at 200 hits or when the query moves on. A browser `open` and
+  a clipboard `pbcopy` are started and left to finish. Rename, archive, unarchive, delete and close
+  are OPTIMISTIC UPDATES: the row changes on the keypress, by way of the same upsert or removal the
+  DAEMON is about to broadcast, and an Error puts it back and says why. FRAME PACING is a token
+  bucket rather than a fixed 16 ms tick — three frames may go out 2 ms apart, a token comes back
+  every 16 ms — so a key's frame and its answer's follow each other, while sustained PTY output still
+  paints at 60 fps; a key that only goes to the PTY paints nothing of its own; and the DAEMON flushes
+  PTY output that breaks a silence at once instead of holding it 5 ms to coalesce. A typed character
+  echoes in 2 ms in a release build (3.5 ms in a debug one), where it was 20 (25).
+- **…and that is measured, not felt.** `NEBULA_PERF_LOG=<file>` turns on the INPUT LATENCY PROBE: one
+  JSON line per input (how long its handler held the loop), per frame (draw time, what it showed, and
+  how long each input waited for it) and per DAEMON event. `make perf` drives the real TUI through
+  every panel, modal and verb inside a private tmux — isolated daemon, a clone of this repository as
+  the checkout, a stand-in agent with a full 1 MB ring — and prints handler / paint / settle / echo
+  per step plus the peak RSS of the TUI and the DAEMON; `python3 scripts/perf/report.py BEFORE AFTER`
+  compares two runs. A change to anything on a key path is judged by that table.
 - **Every pane is the same truecolor terminal.** A session paints nebula's own grid, not the terminal
   nebula runs in, so the daemon tells each child `TERM=xterm-256color` and `COLORTERM=truecolor` and
   drops any `NO_COLOR` / `FORCE_COLOR` it inherited. An agent launch runs through your login shell
@@ -76,12 +107,13 @@
   a warning in every client, never a rolled-back create or delete. Per repo in git config rather than in CONFIG.JSON, and never a file inside the
   checkout. See [Configuration](configuration.md#worktree-hooks).
 - **A worktree runs its own project — the PROJECT FILE.** A committed `.nebula.json` names a `run` and
-  an `open` command. `r` on a worktree has the DAEMON start `run` in a RUN TERMINAL — a terminal row
+  an `open` command; the Project tab of the SETTINGS OVERLAY can hold either instead, per project in
+  `config.json`, and wins over the file while it is set. `r` on a worktree has the DAEMON start `run` in a RUN TERMINAL — a terminal row
   that carries its command and spawns `$SHELL -l -i -c '<run>'` instead of an interactive shell — so the
   PTY's life is the worktree's RUNNING state, broadcast as that terminal's `alive` and drawn as the
   row's `▶ running`; `r` again kills the process tree and drops the row. The idle reaper and the prewarm
   sweep leave that terminal alone, and a run that exits on its own keeps its PTY, so an attach replays
-  the ending instead of respawning — a command starts only on the keypress. `Shift+Enter` (or `Shift+O`) runs `open`
+  the ending instead of respawning — a command starts only on the keypress. `Shift+Enter` (or `Shift+O`, from any panel) runs `open`
   once, from the TUI. See [Configuration](configuration.md#the-project-file-nebulajson).
 - **Agents boot `claude`, `codex`, `cursor-agent`, `pi`, `muse`, or a custom registry program.** Creating an agent (`n`) first asks which CLI to
   run, then spawns it in the worktree. Claude's picker can also dispatch a one-shot Cloud task as
@@ -96,7 +128,14 @@
   resume reads on the first prompt — so a CLI booted and never used resumes as nothing. Claude
   ids are checked against the transcripts on disk before the spawn, and one with none boots fresh;
   any resume that exits with an error within 10 s of its spawn is respawned fresh, unless its Claude
-  transcript is still there (then the id is kept, and the pane shows why the CLI quit). An AGENT created from a PROJECT OPEN PRS row also receives the PR URL and a PR-only
+  transcript is still there (then the id is kept, and the pane shows why the CLI quit). A Claude
+  session sent to Claude's own background (`/background`) is the exception to resuming: its worker
+  keeps the pane's `NEBULA_*` env, so hooks — and the forked session id — still land on the same
+  row, but `claude --resume` refuses a session that runs in the background. When Claude holds a job
+  dir for the id (`~/.claude/jobs/<first 8 of the id>/`), the DAEMON asks `claude agents --json`
+  before the spawn, and an id listed as a `background` session opens as `claude attach <id>`
+  instead — the live conversation, which detaching (Ctrl+Z) or archiving the row leaves running. A
+  refused resume the job-dir look missed is asked about the same way and re-opened attached. An AGENT created from a PROJECT OPEN PRS row also receives the PR URL and a PR-only
   work rule — Claude and Pi through `--append-system-prompt` on every spawn, Codex, Cursor and Muse as the first prompt of
   their cold spawn (their transcripts carry it through a resume); nebula persists that URL. An AGENT
   launched from the ISSUES MODAL (`i`) carries the GitHub issue's URL the same way — persisted with
@@ -188,6 +227,13 @@
   one line in the hook receiver, kept on the AGENT row (the newest ten, in SQLite) and drawn under its
   pill in the SESSIONS PANEL with an ago label, newest last. Pure capture: nothing is injected into the
   model's context and no extra turn runs. See [Sessions](sessions.md#recent-prompts).
+- **Project rows count what is waiting on the repo.** With **PR & issue counts** on (Settings →
+  Experimental; on out of the box), each PROJECTS PANEL row says `3m ago - 3 prs · 2 issues` after
+  its name, the pull requests in the accent the OPEN PRS rows wear and the issues in green — the open
+  pull requests the OPEN PRS sweep already keeps warm for every project (drafts left out while
+  `hide_draft_prs` is on), and the open issues, which a sweep of their own asks for one project per
+  tick on a five-minute beat only while the switch is on. Zero says nothing, and a narrow column
+  drops the badge before the name. See [Configuration](configuration.md#every-setting).
 - **Ask the agent for a worktree and it moves there.** Tell a Claude session "do this in a worktree" and
   it runs `nebula worktree <name>` instead of its own `EnterWorktree` tool (whose checkouts land under
   `<repo>/.claude/worktrees/` on a `worktree-*` branch). nebula creates the checkout in its usual
@@ -211,7 +257,8 @@
   prompt as the worktree rule, plus a `Bash(nebula spawn:*)` permission.
 - **Ask the agent to show you a file and it opens in nebula.** Say "open it" or "show me the examples"
   and the session runs `nebula open <file>…`; every TUI attached to the daemon raises its file tabs on
-  them — a modal with one tab per file, the focused one previewed with syntax highlighting, `Enter`
+  them — a modal with one tab per file, the focused one previewed with syntax highlighting (a
+  markdown file as a rendered page), `Enter`
   editing it in place — so the agent puts the file in front of you instead of pasting it into the
   reply. Only when you ask: the appended prompt forbids opening anything unprompted, so an agent that
   wants you to look at its work names the path and waits. And text only: the CLI resolves the paths
@@ -226,8 +273,10 @@
   before you ask for one, and pre-boot a worktree's dead sessions while your selection rests on it, so attaching
   lands on a booted screen instead of a booting shell. To bound what that costs, idle PTYs in worktrees
   no client is watching are killed after `session_idle_timeout` (5m by default) — working agents, ones
-  waiting on you, and terminals with a command running are all spared, and a reaped agent
-  revives on the next attach with its conversation resumed. Until then its row's STATUS DOT is gray,
+  waiting on you, ones whose backgrounded tool call is still running (Claude's `run_in_background`
+  Bash or Monitor, a Codex shell command; the clock restarts when it ends), and terminals with a
+  command running are all spared, and a reaped agent revives on the next attach with its
+  conversation resumed. Until then its row's STATUS DOT is gray,
   whatever its last status was — a cold session shows what it last did, not what it is doing. Both halves of the PREWARM POOL are
   switchable — `prewarm_agents` and `prewarm_sessions`, `true` by default, on the SETTINGS OVERLAY's
   Sessions tab or by hand in CONFIG.JSON (see [Configuration](configuration.md)); switching the pool
@@ -243,12 +292,17 @@
 nebula finds the pull request on each branch with `gh` and shows it in the Sessions panel's
 PULL REQUESTS group, including a count of comments that landed while you were away. The row outlives
 the pull request: once it is merged or closed the row stays, badged `merged` or `closed` (an open one is
-badged `ready` — ready for review, the state and nothing more — and a draft is dimmed and badged `draft`),
+badged `ready` — ready for review, the state and nothing more — and a draft is dimmed and badged `draft`;
+one GitHub says cannot merge, its branch conflicting with the base or a check failing, is red end to end
+and badged `conflicts` or `failing` instead, the PR PREVIEW spelling the same out beside the state),
 for as long as the checkout does — a worktree whose PR has shipped is the one
 you are about to archive or delete, and the PR is what you check first. A merged one also takes over the
-checkout's row in the Worktrees panel: purple dot, purple rail, and the branch name sweeping the way a
-running row's does, so the checkout to delete stands out from across the room (a session still running
-or asking there keeps its yellow or red — that is not a checkout to pull out from under it). Rest on that
+checkout's row in the Worktrees panel: purple dot, purple rail and purple branch name, so the checkout to
+delete stands out from across the room (a session still running or asking there keeps its yellow or red —
+that is not a checkout to pull out from under it). The name sweeps the way a running row's does for about
+five seconds after nebula sees the merge land, then holds still in solid purple — nothing about a landed
+checkout is live, so it says so once; one found already merged (last run's cache, a first lookup) never
+sweeps, and a merged checkout left lying around costs an idle nebula no repaints. Rest on that
 row and the pane reads the pull request — description, stats, conversation — exactly as it does for the
 project-wide OPEN PRS rows under the worktrees, which do retire on merge (and which the `hide_draft_prs`
 setting can thin to the non-drafts — this row is never thinned, it is the checkout's own); `g` shows its diff. Manual link
@@ -256,13 +310,16 @@ attachment is currently unavailable; previously saved links remain visible so th
 discard data.
 
 This is the one part of nebula the TUI asks for itself rather than the DAEMON: every `gh pr view`,
-`gh pr list` and `gh pr diff` — and the ISSUES MODAL's `gh issue list` and `gh issue view` — is spawned by the client, which is why the lookups stop the moment you
+`gh pr list` and `gh pr diff` — and the ISSUES MODAL's `gh issue list`, `gh issue view` and `gh issue comment` — is spawned by the client, which is why the lookups stop the moment you
 quit, and why a machine with no `gh` — or one that is unauthenticated, or pointed at a checkout with no
 remote — just shows no rows instead of an error. Only the selected project is ever asked about: its
 selected worktree's PR ROW and its PROJECT OPEN PRS GROUP on every tick, one process each, and its other
 checkouts on a sweep that takes one of them per tick — so every worktree row learns whether its branch
 has merged without the cursor ever visiting it (the ROOT WORKTREE is left out; nobody deletes it over a
-merge). Nothing is stacked while a call is in flight, and each is abandoned after 20 s. The selected
+merge). Nothing is stacked while a call is in flight, and each is abandoned after 20 s. With **PR &
+issue counts** on (Settings → Experimental, on out of the box), the other projects' open issues are
+swept the same way, one project per tick on the five-minute beat, so the counts on the PROJECTS
+PANEL rows are minutes old at worst. The selected
 worktree and the open list settle onto a steady 15 s beat; the swept checkouts onto 5 min, since a
 merge reaches them sooner anyway — the moment a pull request drops out of the open list, the checkout on
 its branch is asked again on the next tick, and turns purple seconds after the merge. An empty answer

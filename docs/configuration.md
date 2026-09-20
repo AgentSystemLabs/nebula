@@ -26,7 +26,8 @@ into `config.json`:
 
 Both halves of nebula read the two files. The TUI owns most keys; the DAEMON owns
 `git_init_on_create`, `worktree_base_branch`, `session_idle_timeout`, `prewarm_agents` and
-`prewarm_sessions`. Each side deserializes only its own fields and ignores the rest, and both load
+`prewarm_sessions`, and reads one key out of each `projects` entry, `run_command`. Each side
+deserializes only its own fields and ignores the rest, and both load
 them fresh on every use — so a hand edit applies without restarting either. No key is required: a
 missing file is all defaults, an unknown field is skipped, a value this build can't read costs only
 that key (it takes its default and stays as stored in the file), and a malformed file is logged and
@@ -41,13 +42,17 @@ convenience stores: missing or malformed reads as empty.
 
 ## Every setting
 
-Forty-five keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
+Fifty keys. **Overlay** is the SETTINGS OVERLAY tab whose row edits the key; `—` means the key
 exists only in the file, so it is hand-edit-only. Most rows toggle or cycle on `Enter` / `←` / `→`; a
-*typed* row (`worktree_base_branch`) opens a one-line prompt on `Enter` instead, pre-filled with the
-stored value, and an empty answer puts its default back. The Agents tab groups its rows under **Quick
+*typed* row (`worktree_base_branch`, the Project tab's **Run command**) opens a one-line prompt on
+`Enter` instead, pre-filled with the stored value, and an empty answer puts its default back. The Agents tab groups its rows under **Quick
 prompt**, **Claude**, **Codex**, **Cursor**, **Pi**, **Muse** and **Grok Build** headers, so a harness's rows read `Enabled` / `Model` /
-`Effort` under its name rather than repeating it. The **Experimental** tab holds behaviors that change
-how the tree is worked; every switch there is off by default.
+`Effort` under its name rather than repeating it. The **Project** tab is the one tab whose rows are
+not nebula's but one project's: the project selected in the PROJECTS PANEL, named with its path on
+the tab's first line, and each row there reads and writes that project's own entry under `projects`
+— so the same row shows a different value on the next project over. The **Experimental** tab holds
+behaviors that change how the tree is worked; every switch there is off by default but **PR & issue
+counts**, which starts on.
 
 | Key | Type | Default | Overlay | What it does |
 |---|---|---|---|---|
@@ -57,23 +62,28 @@ how the tree is worked; every switch there is off by default.
 | `editor` | string | `"vim"` | General | The EDITOR the FILE FINDER (`f`), TREE BROWSER (`b`), find-in-files (`Shift+F`) and ⌥click launch, invoked as `<editor> +<line> <file>`. The overlay cycles `vim`, `nvim`, `nano`, `emacs`, `hx`; any command passes through verbatim, so a hand edit can name one the picker doesn't. `NEBULA_EDITOR` overrides it for the process. |
 | `close_finder_on_open` | bool | `true` | General | Opening a file closes the FILE FINDER behind the editor modal, so quitting the editor is one Esc instead of two. Off leaves the results underneath. Never touches the TREE BROWSER (its editor is its own preview pane) or ⌥click. |
 | `ssh_sync_config` | bool | `true` | General | SETTINGS SYNC: `nebula ssh` and `nebula tunnel` send this machine's `config.json` and AGENT PRESETS along, and the remote nebula merges them into its own settings before it starts — so a remote is set up the way this machine is on every connect, without reconfiguring it. Its `config.local.json` still wins there, and its projects, sessions and SSH HOSTS FILE stay its own. `--no-sync-config` leaves the settings behind for one connection. See [Backup, restore and other machines](#backup-restore-and-other-machines). |
-| `skip_session_naming` | bool | `false` | Sessions | New AGENTS launch straight from the NEW SESSION PICKER with no task box, taking the generated name and AUTO-TITLE; the first prompt is typed in the CLI instead. The key predates the box, which stands where a name prompt used to. |
+| `skip_session_naming` | bool | `false` | — (retired) | Through 0.30, **Skip starting prompt**: on, new AGENTS launched straight from the NEW SESSION PICKER instead of stopping at a task box first. Every `n` launches that way now (a task typed up front is `p`, the QUICK PROMPT), so this build never reads the key and no tab edits it; it is still loaded and written back as stored for an older nebula sharing the file ([Compatibility rules](#compatibility-rules)). |
 | `confirm_on_archive` | bool | `false` | Sessions | Put a CONFIRM DIALOG in front of archiving a session — `a` and the row menu's **Archive** alike — for when typing aimed at an agent keeps landing on the SESSIONS PANEL and archiving the session under the cursor. Off, archive is the one verb on that panel that skips the dialog `d` goes behind: it is cheap to undo with `u`, and the dialog says so. |
 | `session_idle_timeout` | string | `"5m"` | Sessions | DAEMON-owned IDLE TIMEOUT: how long a session in a WORKTREE no client is viewing goes unwatched before the IDLE REAPER kills its PTY. See the values below. |
 | `done_sound` | string | `"Glass"` | Sessions | The DONE SOUND rung when a turn reaches FINISHED: `off`, `bell` (the terminal BEL — silent in Ghostty unless its `bell-features` include `audio`), or a macOS system sound from `/System/Library/Sounds` played with `afplay` (`Glass`, `Ping`, `Pop`, `Hero`, …). Over `nebula ssh` and off macOS it is always the bell. |
 | `feedback_sound` | string | `"Sosumi"` | Sessions | The FEEDBACK SOUND rung when a turn stops at NEEDS FEEDBACK — a permission prompt or a question — with the same values and fallbacks as `done_sound`, and a different default so red and green sound different from the next room. It never rings for the session whose pane you are locked into typing at while the terminal window has focus: that prompt is already under your hands. The one switch for the DESKTOP NOTIFICATION too: while the terminal window is in the background (from the focus reports nebula asks the terminal for — tmux needs `focus-events on`), each session that goes red is also named in a desktop notification (`osascript` on macOS, `notify-send` on Linux; never over `nebula ssh`, where the desktop is the wrong machine's; a notifier that is missing or fails is a debug line, not an error). `off` silences the sound and the notification together. |
-| `theme` | string | `"default"` | Appearance | The THEME: `default`, `ocean`, `forest`, `rose`, `amber`. An unknown name falls back to `default`. |
-| `animations` | bool | `true` | Appearance | Master switch for the STATUS SWEEP and the SPLASH's motion. Off trades them for fewer repaints on a constrained machine. |
+| `preset_text` | string | `"prefix"` | Sessions | PRESET TEXT: which side of the task a new AGENT PRESET's text goes — `prefix` (one box, sent before the task), `postfix` (one box, sent after it) or `prefix & postfix` (both, the form every preset had through 0.32). The PRESET EDITOR opens a new preset with the box(es) named here, and its **Text** row changes one preset — a side the row leaves out saves blank; editing a stored preset also shows any side that already holds text, so nothing saved is ever hidden. Prefix alone by default: the framing most people reach for, and one box to fill. A hand-edited `both` reads as `prefix & postfix`; anything else as the default. See [Sessions](sessions.md#agent-presets). |
+| `theme` | string | `"default"` | Appearance | The THEME: `default`, `ocean`, `forest`, `rose`, `amber`, `lavender`, `coral`, `slate`, `sand`, `mono`. An unknown name falls back to `default`. |
+| `animations` | bool | `true` | Appearance | Master switch for the STATUS SWEEP (running and needs-feedback rows for as long as they last; an unread finish and a just-merged checkout for about five seconds) and the SPLASH's motion. Off trades them for fewer repaints on a constrained machine. |
 | `focus_tint` | bool | `true` | Appearance | The FOCUSED PANEL TINT: a faint accent wash behind whichever panel keys land in. Off leaves every cell on the terminal's own background, so a transparency or image configured in the terminal shows through the whole window instead of stopping at the focused panel. |
 | `show_workspaces` | bool | `true` | Appearance | Whether the WORKSPACES BAR is drawn across the top. `Shift+W` writes the key as it toggles, so a hidden bar stays hidden across restarts. |
 | `hide_projects` | bool | `false` | Appearance | Hide the PROJECTS PANEL and give its width to the TERMINAL PANE (`Shift+P`). |
 | `hide_worktrees` | bool | `false` | Appearance | Hide the WORKTREES PANEL (`Shift+B`), independently of `hide_projects`. |
+| `hide_sessions` | bool | `false` | Appearance | Hide the SESSIONS PANEL (`Shift+S`), independently of the other two. Whatever this says, the panel folds to a bare rule while the Worktrees cursor rests on a PROJECT OPEN PRS or PROJECT ISSUES row (neither has sessions to list) and opens again on the next checkout; that fold never writes the key. |
 | `hide_draft_prs` | bool | `false` | Appearance | Leave draft pull requests out of the PROJECT OPEN PRS GROUP and the PALETTE's (`/`) pull-request rows, so browsing what's open shows only the rows asking for a reviewer; the group's header then counts `9/12` — listed over open. A view filter, not a fetch filter: `gh pr list` still fetches the drafts and the PR CACHE still holds them, so `shown` brings them back at once and a draft marked ready joins the rows on the refresh that says so. Worktrees, their sessions and a checkout's own PR ROW in the SESSIONS PANEL are never hidden. The Worktrees panel's right-click menu flips it too (**Hide draft PRs** / **Show draft PRs**). |
-| `hide_root_worktree` | bool | `false` | Experimental | Leave the ROOT WORKTREE row out of the WORKTREES PANEL, so nothing launched from that panel lands in the shared checkout. The root's sessions keep running and stay reachable from the PALETTE (`/`). Not what makes `p` on that panel cut a fresh WORKTREE — a random `<adj>-<noun>-<verb>` branch off the freshly fetched `origin/HEAD`, or the `worktree_base_branch` above, the agent started in it and the cursor moved onto the new row — that is the panel's own behaviour, on or off. |
+| `projects` | object | `{}` | Project | PROJECT SETTINGS: one entry per project set up differently from the rest, keyed by the project's repo path exactly as the DAEMON stores it, holding that project's rows from the **Project** tab — `{"projects": {"/Users/me/src/app": {"run_command": "npm run dev", "open_command": "open http://localhost:3000", "hide_root_worktree": true}}}`. Three rows: **Run command** (`run_command`, string, default `""`) is the RUN COMMAND `r` starts in *that project's* worktrees — the same shell line a `.nebula.json` `run` would carry, and the way to set one without committing a file; while it is set, `r` runs it and never opens the file, and empty (shown as `.nebula.json`) hands the decision back to the checkout's PROJECT FILE, so a project that has one needs nothing here. Typed, not cycled: `Enter` opens a prompt titled with the project, an empty answer puts `.nebula.json` back. The DAEMON reads it fresh at each `r`. **Open command** (`open_command`, string, default `""`) is its twin for the OPEN COMMAND `Shift+Enter` / `Shift+O` fires on that project's worktrees — `open http://localhost:3000`, say — with the same precedence over the file's `open` and the same prompt; the TUI reads it fresh at each press, since it runs on the machine you are sitting at. **Hide root worktree** (`hide_root_worktree`, bool) leaves that project's ROOT WORKTREE row out of the WORKTREES PANEL, so nothing launched from the panel lands in its shared checkout. The root's sessions keep running and stay reachable from the PALETTE (`/`). Not what makes `p` on that panel cut a fresh WORKTREE — a random `<adj>-<noun>-<verb>` branch off the freshly fetched `origin/HEAD`, or the `worktree_base_branch` above, the agent started in it and the cursor moved onto the new row — that is the panel's own behaviour, on or off. The tab edits the selected project and names it on its first line; with no project in the tree its rows read `n/a`. A project with no entry gets the fallback (an empty command, and `hide_root_worktree` below), and an entry that only repeats the fallback is dropped on save, so the map names only the projects that differ; an empty `run_command` or `open_command` is left out of an entry rather than written; a key inside an entry this build doesn't know is carried through a save. To the file's rules the map is one key: a value in it this build can't read costs the whole map, not one project. |
+| `hide_root_worktree` | bool | `false` | — | What every project without a `projects` entry gets for **Hide root worktree** — the key the switch lived under while it was one setting for every project (Settings → Experimental, through 0.27). Still read, and written back unchanged, so a file that set it keeps hiding the root in every project until a project's own row says otherwise, and an older build sharing the file still finds its key; no tab edits it any more. |
 | `recent_prompts` | bool | `false` | Experimental | RECENT PROMPTS: list the last few prompts typed into each session under its row in the SESSIONS PANEL — the text the `UserPromptSubmit` hook carried, condensed to one line — oldest first so the bottom line is the latest ask, each with a dim `30m ago` pinned right; a click on any line lands on its session. Every harness reports its prompt (Claude, Codex and Cursor in the hook payload, Pi through its managed extension). Prompts nebula composes itself — a PR SESSION's scope, the note a `nebula worktree` relocation reopens on — are left out, and archived rows list none. Off, the rows are the single pills they always were. See [Sessions](sessions.md#recent-prompts). |
 | `recent_prompts_count` | integer | `3` | Experimental | How many of those prompts to list while `recent_prompts` is on. The overlay cycles `1` to `5`; a hand edit is clamped to the ten the DAEMON keeps per session (`0` reads as `1`, `50` as `10`). |
 | `show_key_combos` | bool | `false` | Experimental | The KEY COMBO DISPLAY: each key pressed in the panels spelled at the bottom left of the screen — the blank row above the FOOTER — with what it did, `j - Move down`, `^d - Half page down`, `h h - Workspaces` for a double tap, so anyone watching a screen share picks the shortcuts up as they are used; vim's `showcmd`. An unbound key shows bare, so a watcher sees it did nothing. Each press replaces the last and clears itself three seconds on. What never shows: keys typed into a LOCKED PANE (they are the agent's — a password at a prompt in there stays off the screen; only the unlock hatch shows, `^q - Unlock terminal input`), and text typed into an overlay's field — inside a modal only `Esc`, `Enter`, `Tab`, the arrows and `^`/`⌥` chords show, bare. See [Keys](keys.md#chips-and-readouts). |
-| `quick_prompt_kind` | string | `"claude"` | Agents | Which AGENT KIND the QUICK PROMPT (`p`) launches: `claude`, `codex`, `cursor`, `pi`, `muse` or `grok`. Its model and effort come from that kind's own defaults below, so this is one name, not a third pair. A kind switched off here is stepped around. |
+| `remember_harness` | bool | `false` | Experimental | REMEMBER HARNESS: a launch walked through the NEW SESSION PICKER (`n`), the PR SESSION picker or the QUICK PROMPT's `Tab` picker makes its harness the default the next launch starts on — the picker opens on that row and `p` launches it — and a model or effort drilled into through the submenus becomes that harness's own Model / Effort default. It writes the Agents tab's own rows (`quick_prompt_kind`, `<kind>_model`, `<kind>_effort`), so the tab always shows what the next launch will be; a pick that already is the default writes nothing, and an AGENT PRESET launch changes nothing, its harness being the preset's. Off, a pick is one session's and the picker opens on its first row. See [Sessions](sessions.md#the-new-session-picker). |
+| `pr_issue_counts` | bool | `true` | Experimental | PR & ISSUE COUNTS: each PROJECTS PANEL row counts its repo's open pull requests and issues after its name — `3m ago - 3 prs · 2 issues`: the pull requests in the accent the OPEN PRS rows wear, the issues in the green the ISSUES MODAL paints `open` in, a dim `·` between, and a dash closing the ago label when counts follow it — so what is waiting on a repo reads off the column without visiting it. The pull requests are the lists the OPEN PRS sweep already keeps warm for every project (drafts left out while `hide_draft_prs` is on, so the number is the group header's); the issues take a sweep of their own that only runs while this is on — one `gh issue list` per project every five minutes, one project per tick, with the selected project on the ISSUES MODAL's own two-minute beat — so the rows fill in over the first seconds after the switch goes on and are minutes old at worst. A zero, or a list that has not landed yet, leaves its word out; a list cut off at the fetch cap counts `100+`; a column too narrow for the badge beside the name drops it whole before squeezing the name, and one too narrow for the ago label beside the badge drops the label first, dash and all. On out of the box — the one Experimental switch that is. Off, the rows are what they were, and no project but the selected one is ever asked about its issues. |
+| `quick_prompt_kind` | string | `"claude"` | Agents | Which AGENT KIND the QUICK PROMPT (`p`) launches: `claude`, `codex`, `cursor`, `pi` or `muse`. Its model and effort come from that kind's own defaults below, so this is one name, not a third pair. A kind switched off here is stepped around. With **Remember harness** on (Experimental), every picker-walked launch rewrites it, and the NEW SESSION PICKER opens on it too. |
 | `quick_prompt_focus` | bool | `false` | Agents | QUICK PROMPT FOCUS: whether a QUICK PROMPT launch enters and locks the new session's TERMINAL PANE. Off, its row is selected and previewed but FOCUS stays on the panel you fired from. Only the QUICK PROMPT reads it — every other launch takes the pane. |
 | `claude_enabled` | bool | `true` | Agents | HARNESS TOGGLE. Off leaves Claude out of the NEW SESSION PICKER and the PR SESSION picker, and skips the standing PREWARM POOL slot; existing sessions keep attaching and resuming. The last kind left on cannot be switched off. |
 | `codex_enabled` | bool | `true` | Agents | HARNESS TOGGLE for Codex, same rules. |
@@ -96,10 +106,10 @@ how the tree is worked; every switch there is off by default.
 | `harnesses` | object | `{}` | Agents | The harness registry: per-harness deltas over the compiled-in known harnesses (Claude, Codex, Cursor, Pi, Muse, Grok Build), and whole new third-party CLIs. The Agents tab grows one section per entry — Enabled, Model, and Effort rows while the harness offers effort — and the `n` picker, `e` presets, spawn, resume and hooks all read the merged rows. A hand edit that breaks one entry refuses its launches with the reason, never the whole file. Run `nebula config harnesses` to print the effective rows to copy from. |
 | `keybindings` | object | `{}` | Hotkeys | KEYMAP overrides, keyed by action id, valued with a comma-separated chord list: `{"git_diff": "ctrl+g, g"}`. An empty string deliberately unbinds; unknown ids are ignored. Only rows that differ from the defaults are written. |
 | `prewarm_agents` | bool | `true` | Sessions | DAEMON-owned PREWARM POOL: keep one booted agent CLI standing by in the selected WORKTREE, so creating a session there adopts it and feels instant. **Costs one idle CLI process per warm slot** (150–300 MB each, up to 15 minutes), and that spare is a real session as far as the CLI is concerned — Claude's own `/list-agents` lists it beside the sessions you made, named after the directory (`my-repo-3f`), and the memory modal (`Shift+M`) groups it under **warm spares**. Off drains the pool on the DAEMON's next sweep (within 30 s). |
-| `prewarm_sessions` | bool | `true` | Sessions | DAEMON-owned SESSION PREWARM: boot a WORKTREE's dead sessions when your selection rests on it, so attaching shows an already-booted screen instead of a booting shell. **Costs idle shell/CLI processes for sessions you may never open.** Off stops booting them; sessions already up stay until the IDLE REAPER takes them. |
+| `prewarm_sessions` | bool | `true` | Sessions | DAEMON-owned SESSION PREWARM: boot a WORKTREE's dead sessions when your selection rests on it, so attaching shows an already-booted screen instead of a booting shell. **Costs idle shell/CLI processes for sessions you may never open.** Off — for a machine with less memory to spare — landing on a worktree boots nothing: a session forks only when your cursor lands on its row or you attach to it, one at a time; sessions already up stay until the IDLE REAPER takes them. |
 
-`hide_projects` and `hide_worktrees` default to `false`. Set either to `true` to start with that panel
-hidden; the SESSIONS PANEL always remains visible.
+`hide_projects`, `hide_worktrees` and `hide_sessions` default to `false`. Set any of them to `true` to
+start with that panel collapsed to its rail.
 
 ### Prewarming
 
@@ -165,8 +175,10 @@ The overlay cycles `off`, `1m`, `5m`, `15m`, `30m`, `1h`, but the DAEMON parses 
 value falls back to the 5m default, *not* to off — a typo makes reaping ordinary, not absent.
 
 The IDLE REAPER sweeps every 15s and only takes sessions in WORKTREES no client is viewing. RUNNING
-and NEEDS FEEDBACK agents, and terminals with a command running, are spared. A reaped session revives
-on the next ATTACH or prewarm, and an agent RESUMES its conversation there.
+and NEEDS FEEDBACK agents, agents whose backgrounded tool call is still running (a Claude
+`run_in_background` Bash call or Monitor watch, a Codex shell command — the idle clock restarts when
+that job ends), and terminals with a command running, are spared. A reaped session revives on the
+next ATTACH or prewarm, and an agent RESUMES its conversation there.
 
 ## What the settings overlay owns
 
@@ -177,17 +189,18 @@ on the next ATTACH or prewarm, and an agent RESUMES its conversation there.
   editor, the branch new worktrees start from (`worktree_base_branch`: `auto` for origin's default
   branch, or a name such as `master`, typed into a prompt that `Enter` opens on the row), which
   agent CLIs the new-session menu offers (at least one stays on) and their default model
-  and reasoning effort, the idle timeout, whether a warm spare and a worktree's dead sessions are
+  and reasoning effort, the selected project's own settings on the **Project** tab (`projects`,
+  keyed by repo path — whether its root worktree row is hidden), the idle timeout, whether a warm spare and a worktree's dead sessions are
   pre-booted (`prewarm_agents`, `prewarm_sessions`), the done sound (`done_sound`: a ding
   when a turn finishes — a macOS system sound such as `Glass`, the default; `bell` for the terminal
   bell, which Ghostty keeps silent unless its `bell-features` include `audio`; or `off`. Over
   `nebula ssh` and off macOS it is always the bell), the feedback sound (`feedback_sound`: the same
   choices, `Sosumi` by default, rung when a turn stops to ask you — and, while the terminal window
   is in the background, a desktop notification naming the session and its worktree; `off` silences
-  both), whether new sessions stop to ask for a first
-  prompt (`skip_session_naming`), and whether `a` asks before archiving one (`confirm_on_archive`, off unless you turn it
-  on). `R` inside the overlay puts every setting — hotkeys included — back to its default, after a
-  confirmation, and removes `config.local.json`.
+  both), which side of the task a new AGENT PRESET's text goes (`preset_text`: `prefix`, the
+  default, `postfix` or `prefix & postfix`), and whether `a` asks before archiving one
+  (`confirm_on_archive`, off unless you turn it on). `R` inside the overlay puts every setting —
+  hotkeys included — back to its default, after a confirmation, and removes `config.local.json`.
 - **Every panel key is rebindable.** The overlay's Hotkeys tab lists every action and what it answers to,
   and writes overrides into the same file (`"keybindings": {"git_diff": "ctrl+g, g"}`); an empty value
   unbinds. Because nebula is always a guest inside Terminal.app / Ghostty / tmux, the tab says at bind
@@ -288,11 +301,14 @@ Both keys are optional shell command lines, and both run in the selected worktre
   replays how the run ended, and nothing but `r` runs it again — not an attach, not the prewarm sweep.
   There is one run per worktree: a second client's `r` on a worktree already running never starts
   another.
-- **`open`** — the OPEN COMMAND. `Shift+Enter` on a checkout row fires it once, from the TUI rather than
+- **`open`** — the OPEN COMMAND. `Shift+Enter` on a worktree fires it once, from the TUI rather than
   the DAEMON, since what it opens — a browser tab, an editor — belongs on the machine you are sitting
-  at. It runs through `$SHELL -c` with its output discarded, and nebula does not wait for it.
-  `Shift+Enter` needs the KITTY PROTOCOL (Ghostty, kitty); Terminal.app sends it as a plain `Enter`, so
-  `Shift+O` is bound beside it, and the row's context menu has **Open**.
+  at. It runs through `$SHELL -c` with its output discarded, and nebula does not wait for it. The key
+  answers from any panel: the worktree is the one under the Worktrees cursor.
+  `Shift+Enter` needs the KITTY PROTOCOL (Ghostty, kitty); Terminal.app sends it as a plain `Enter` and
+  tmux flattens it to one, so `Shift+O` and `Alt+Enter` (the `ESC` `CR` a mapped Shift+Enter sends, which
+  tmux passes through) are bound beside it, and the row's context menu has **Open**. See
+  [Keys](keys.md#full-keymap) for teaching Terminal.app the real key.
 
 The file is read fresh at every press, so an edit applies on the next `r` or `Shift+Enter`. Nebula looks
 in the worktree's own checkout first, so a branch can carry commands of its own, and falls back to the
@@ -300,6 +316,14 @@ project's main checkout, so a worktree cut before the file was committed still r
 is the whole answer: a worktree's file with no `open` does not borrow the main checkout's. A missing
 file, a missing key, or JSON that doesn't parse is a one-line footer message saying what to fix; unknown
 keys are ignored.
+
+Both commands have a second home: **Run command** and **Open command** on the SETTINGS OVERLAY's
+Project tab (`s`), which keep them in `config.json` under the project's `projects` entry instead of in
+the repository — for a project you would rather not commit a file to, or one whose commands are yours
+alone. Set, the row is what `r` runs, or `Shift+Enter` opens, in every worktree of that project, and the
+file is not consulted for that command; empty, the file decides as above. They are one project's
+settings, so each project can run and open its own way, and the footer names both places when neither
+has the command. See `projects` in [Every setting](#every-setting).
 
 Unlike the WORKTREE HOOKS below, which nebula runs on its own and so never takes from a checkout,
 nothing in the PROJECT FILE runs until you press its key on that worktree — the same trust as typing the

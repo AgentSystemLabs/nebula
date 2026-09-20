@@ -1,0 +1,10 @@
+# Down the Worktrees panel — past the root and the OPEN PRS rows #42 and #37 — onto the
+# wheel-one-line checkout nested under #37, then Tab into the Sessions panel: its PR ROW is #37,
+# red and badged `failing` for the check GitHub says failed, with the PR PREVIEW reading
+# `checks failing` beside the state. Behind it the PROJECT OPEN PRS GROUP shows #42 red and badged
+# `conflicts` and #37 red and badged `failing`, with the draft #39 dim and last as ever.
+Tab
+j
+j
+j
+Tab

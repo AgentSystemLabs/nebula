@@ -1,6 +1,7 @@
 //! Small memory probes shared by the daemon and the TUI client. All of them
-//! shell out (macOS has no /proc) and only run on the metrics modal's slow
-//! poll, never on a hot path.
+//! shell out (macOS has no /proc), so none of them belongs on an event
+//! loop: the daemon runs its sweep on the blocking pool, and the TUI reads
+//! its own RSS there too — the footer's readout asks every five seconds.
 
 /// Resident set size of one process, bytes.
 pub fn process_rss_bytes(pid: u32) -> Option<u64> {

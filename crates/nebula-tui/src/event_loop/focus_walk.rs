@@ -112,9 +112,24 @@ pub(super) fn land_click_focus(app: &mut App, column: u16, row: u16, out: &mut V
     match app.hit_at(column, row) {
         Some(HitTarget::Workspace(_)) => enter_workspaces_bar(app),
         Some(HitTarget::Project(_)) => app.focus = app.first_sidebar_focus(),
-        Some(HitTarget::Worktree(_) | HitTarget::OpenPrsHeader) => app.focus = Focus::Worktrees,
-        Some(HitTarget::Session(_) | HitTarget::ArchivedHeader) => app.focus = Focus::Sessions,
+        Some(HitTarget::Worktree(_) | HitTarget::OpenPrsHeader | HitTarget::IssuesHeader) => {
+            app.focus = Focus::Worktrees
+        }
+        Some(
+            HitTarget::Session(_)
+            | HitTarget::ArchivedHeader
+            | HitTarget::SessionFollowUp(_)
+            | HitTarget::FollowUpBox,
+        ) => app.focus = Focus::Sessions,
         Some(HitTarget::PanelBg(focus)) => app.focus = focus,
+        // The click was spent closing the modal, so a chevron or rail
+        // only takes focus when its panel is open; toggling is the
+        // direct-click path's job.
+        Some(HitTarget::CollapsePanel(focus)) => {
+            if app.collapse_target_open(focus) {
+                app.focus = focus;
+            }
+        }
         Some(HitTarget::TerminalPane | HitTarget::CloudSessionLink) => {
             enter_terminal_pane(app, out)
         }

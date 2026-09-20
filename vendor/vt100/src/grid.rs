@@ -13,6 +13,10 @@ pub struct Grid {
     scrollback: std::collections::VecDeque<crate::row::Row>,
     scrollback_len: usize,
     scrollback_offset: usize,
+    // NEBULA PATCH: rows that have fallen off the front of `scrollback`
+    // since this grid was made. With it every row the grid has ever held
+    // has a HISTORY LINE number that never changes — see `history_base`.
+    scrollback_dropped: u64,
 }
 
 impl Grid {
@@ -29,6 +33,7 @@ impl Grid {
             scrollback: std::collections::VecDeque::new(),
             scrollback_len,
             scrollback_offset: 0,
+            scrollback_dropped: 0,
         }
     }
 
@@ -195,8 +200,57 @@ impl Grid {
         self.scrollback_offset
     }
 
+    // NEBULA PATCH: how many rows the scrollback holds, and a way to let
+    // them go. The TUI keeps the screens of recently shown sessions for an
+    // instant return; a long history is tens of megabytes of cells it does
+    // not need for that, and drops — a full replay brings it back if the
+    // user scrolls.
+    pub fn scrollback_rows(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    pub fn clear_scrollback(&mut self) {
+        self.scrollback_dropped += self.scrollback.len() as u64;
+        self.scrollback = std::collections::VecDeque::new();
+        self.scrollback_offset = 0;
+    }
+
     pub fn set_scrollback(&mut self, rows: usize) {
         self.scrollback_offset = rows.min(self.scrollback.len());
+    }
+
+    // NEBULA PATCH: HISTORY LINES. Every row this grid has held — dropped
+    // off the ring, in the scrollback, or on the drawing screen — is
+    // numbered from 0 (the first row ever scrolled out) upward, and keeps
+    // its number as the view scrolls and as new output pushes it up into
+    // the scrollback. A selection anchored to history lines stays on its
+    // text through both, which a visible-row selection cannot.
+
+    /// The history line of the top visible row, at the current scrollback
+    /// offset: visible row `r` is history line `history_base() + r`.
+    pub fn history_base(&self) -> u64 {
+        self.scrollback_dropped
+            + (self.scrollback.len() - self.scrollback_offset) as u64
+    }
+
+    /// One past the last history line — the bottom row of the drawing
+    /// screen is `history_end() - 1`.
+    pub fn history_end(&self) -> u64 {
+        self.scrollback_dropped
+            + (self.scrollback.len() + self.rows.len()) as u64
+    }
+
+    /// The row at history line `line`, if the grid still holds it (a line
+    /// that fell off the ring, or one past the screen, is None).
+    pub fn history_row(&self, line: u64) -> Option<&crate::row::Row> {
+        let i = usize::try_from(line.checked_sub(self.scrollback_dropped)?)
+            .ok()?;
+        let held = self.scrollback.len();
+        if i < held {
+            self.scrollback.get(i)
+        } else {
+            self.rows.get(i - held)
+        }
     }
 
     pub fn write_contents(&self, contents: &mut String) {
@@ -574,6 +628,7 @@ impl Grid {
                 self.scrollback.push_back(removed);
                 while self.scrollback.len() > self.scrollback_len {
                     self.scrollback.pop_front();
+                    self.scrollback_dropped += 1;
                 }
                 if self.scrollback_offset > 0 {
                     self.scrollback_offset =

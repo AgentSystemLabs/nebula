@@ -12,11 +12,12 @@ on:
 
 jobs:
   claude-review:
-    # Optional: Filter by PR author
-    # if: |
-    #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
-    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
+    # A pull request from a fork runs without the repository's secrets and
+    # without an OIDC token (GitHub withholds both from `pull_request` runs of
+    # foreign code), so the action can't authenticate and every contributor PR
+    # shows a red check. Skip the job there: the check reports "skipped"
+    # instead of "failure", and same-repo branches are reviewed as before.
+    if: github.event.pull_request.head.repo.full_name == github.repository
 
     runs-on: ubuntu-latest
     permissions:

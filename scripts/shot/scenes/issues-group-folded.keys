@@ -1,0 +1,11 @@
+# The PROJECT ISSUES GROUP folded: walk onto its first issue as issues-group does, then click its
+# header (col 24, row 23 at 190x50) — the group drops to `▸ ISSUES · 5`, the cursor lands on the row
+# above the header (the checkout under the last pull request) and that checkout's session is back.
+Tab
+j
+j
+j
+j
+j
+j
+click 24 23

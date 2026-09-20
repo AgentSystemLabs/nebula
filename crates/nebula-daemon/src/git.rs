@@ -421,6 +421,16 @@ async fn origin_head(repo: &Path) -> Option<String> {
 /// branch is not on `origin`, so the PR ref itself (`refs/pull/N/head`)
 /// seeds a local branch of that name. A branch that already exists locally
 /// is checked out as is — `add_worktree`'s own fallback — even offline.
+///
+/// A fork's `head` arrives under its owner's name (`givemeurhats/main` —
+/// the client's `checkout_branch`), so it is never a branch `origin` has,
+/// nor one of ours: the first fetch misses and the PR ref seeds it. That
+/// branch has no upstream of its own, so it is given the one `gh pr
+/// checkout` gives a fork's — `origin`, `refs/pull/N/head`
+/// (`track_pr_ref`): `git pull` in the checkout then brings the
+/// contributor's new commits in, and `gh pr view` there finds the pull
+/// request, which a bare branch name never did for a fork — the
+/// checkout's own PR ROW, its merge and its unread count hang on that.
 pub async fn add_pr_worktree(repo: &Path, number: u64, head: &str) -> Result<PathBuf> {
     let local = git(
         repo,
@@ -433,21 +443,88 @@ pub async fn add_pr_worktree(repo: &Path, number: u64, head: &str) -> Result<Pat
     )
     .await
     .is_ok();
-    let base = match git(repo, &["fetch", "origin", head]).await {
-        Ok(_) => Some(format!("origin/{head}")),
-        Err(branch_err) => {
-            let pr_ref = format!("refs/pull/{number}/head");
-            match git(repo, &["fetch", "origin", &pr_ref]).await {
-                Ok(_) => Some("FETCH_HEAD".to_string()),
-                Err(_) if local => None,
-                Err(pr_err) => bail!(
-                    "could not fetch pull request #{number} ({head}) from origin: {pr_err} \
-                     (branch: {branch_err})"
-                ),
+    // Both fetches talk to the remote under the DAEMON's worktree lock, so
+    // they are bounded (`git_remote`): a stalled connection must not hold
+    // every worktree op — and this launch's stand-in rows — with it.
+    let pr_ref = format!("refs/pull/{number}/head");
+    let mut from_pr_ref = false;
+    let base = match git_remote(repo, &["fetch", "origin", head]).await {
+        // The remote-tracking ref when the clone keeps one, so the new
+        // branch tracks it; a single-branch clone's fetch writes only
+        // FETCH_HEAD, and the tip it names is the base then.
+        Ok(_) => match origin_branch(repo, head).await {
+            Some(remote) => Some(remote),
+            None => fetched_tip(repo).await,
+        },
+        Err(branch_err) => match git_remote(repo, &["fetch", "origin", &pr_ref]).await {
+            Ok(_) => {
+                from_pr_ref = true;
+                fetched_tip(repo).await
             }
-        }
+            Err(_) if local => None,
+            Err(pr_err) => bail!(
+                "could not fetch pull request #{number} ({head}) from origin: {pr_err} \
+                 (branch: {branch_err})"
+            ),
+        },
     };
-    add_worktree(repo, head, base.as_deref()).await
+    let path = add_worktree(repo, head, base.as_deref()).await?;
+    if from_pr_ref {
+        track_pr_ref(repo, head, &pr_ref).await;
+    }
+    // A branch that was already here — this pull request reviewed before,
+    // its worktree deleted since (a delete keeps the branch) — came up as
+    // it was left, which is behind whatever the author pushed meanwhile:
+    // the session would review commits `gh pr diff` no longer shows. The
+    // checkout is seconds old and clean, so it fast-forwards to the
+    // fetched tip; a branch with commits of its own is left as it is.
+    if let (true, Some(tip)) = (local, base.as_deref()) {
+        if let Err(error) = git(&path, &["merge", "--ff-only", "--quiet", tip]).await {
+            tracing::info!(
+                branch = head,
+                error = %error,
+                "a pull request's existing branch was not fast-forwarded to its fetched tip"
+            );
+        }
+    }
+    Ok(path)
+}
+
+/// The commit the fetch that just ran brought in, by SHA rather than as
+/// `FETCH_HEAD` — which the next fetch anyone runs in this repo (an agent's,
+/// the default-base fetch of another worktree op's tail) would repoint
+/// before `git worktree add` read it.
+async fn fetched_tip(repo: &Path) -> Option<String> {
+    git(repo, &["rev-parse", "--verify", "--quiet", "FETCH_HEAD"])
+        .await
+        .ok()
+        .map(|sha| sha.trim().to_string())
+        .filter(|sha| !sha.is_empty())
+}
+
+/// Point `branch` — a fork pull request's local branch, seeded from
+/// `pr_ref` — at that ref on `origin`, the upstream `gh pr checkout` gives
+/// a fork it cannot push to. Left alone when the branch already has an
+/// upstream (a checkout `gh` made, pushing to the fork itself). A failure
+/// costs the checkout its `git pull` and its PR ROW, not the launch, so it
+/// is logged rather than returned.
+async fn track_pr_ref(repo: &Path, branch: &str, pr_ref: &str) {
+    let merge = format!("branch.{branch}.merge");
+    if config_get(repo, &merge).await.is_some() {
+        return;
+    }
+    let remote = format!("branch.{branch}.remote");
+    for (key, value) in [(remote.as_str(), "origin"), (merge.as_str(), pr_ref)] {
+        if let Err(error) = git(repo, &["config", key, value]).await {
+            tracing::warn!(
+                repo = %repo.display(),
+                branch,
+                error = %error,
+                "could not point a fork pull request's branch at its PR ref"
+            );
+            return;
+        }
+    }
 }
 
 /// One git config value for `repo`, resolved the way git resolves it —
@@ -742,10 +819,128 @@ mod tests {
         assert_eq!(branch.trim(), "their-fix");
         let head = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
         assert_eq!(head.trim(), expected.trim());
+        // Its upstream is the PR ref, as `gh pr checkout` leaves a fork's:
+        // what `git pull` and `gh pr view` in the checkout go by.
+        assert_eq!(
+            config_get(&repo, "branch.their-fix.remote")
+                .await
+                .as_deref(),
+            Some("origin")
+        );
+        assert_eq!(
+            config_get(&repo, "branch.their-fix.merge").await.as_deref(),
+            Some("refs/pull/9/head")
+        );
 
         // Neither route: no such PR, no such branch anywhere.
         let err = add_pr_worktree(&repo, 10, "nowhere").await.unwrap_err();
         assert!(err.to_string().contains("#10"), "{err}");
+    }
+
+    /// A pull request reviewed before: its worktree was deleted, its branch
+    /// kept, and the author has pushed since. The new checkout comes up on
+    /// what the pull request holds now, not on the commits of the last
+    /// review — fast-forwarded, since a delete-and-recut leaves nothing of
+    /// the user's on the branch.
+    #[tokio::test]
+    async fn add_pr_worktree_brings_a_kept_branch_up_to_the_fetched_tip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let origin = add_bare_origin(&repo, tmp.path()).await;
+
+        let wt = add_pr_worktree(&repo, 7, "feat-x").await.unwrap();
+        let reviewed = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
+        remove_worktree(&repo, &wt, false).await.unwrap();
+        assert!(local_branch(&repo, "feat-x").await, "the delete keeps it");
+
+        // The author pushes another commit to the pull request's branch.
+        git(&repo, &["checkout", "-q", "-b", "author", "origin/feat-x"])
+            .await
+            .unwrap();
+        git(&repo, &["commit", "--allow-empty", "-m", "review feedback"])
+            .await
+            .unwrap();
+        git(&repo, &["push", "-q", "origin", "author:feat-x"])
+            .await
+            .unwrap();
+        git(&repo, &["checkout", "-q", "main"]).await.unwrap();
+        git(&repo, &["branch", "-D", "author"]).await.unwrap();
+        let pushed = git(&origin, &["rev-parse", "refs/heads/feat-x"])
+            .await
+            .unwrap();
+        assert_ne!(reviewed.trim(), pushed.trim());
+
+        let wt = add_pr_worktree(&repo, 7, "feat-x").await.unwrap();
+        let head = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(
+            head.trim(),
+            pushed.trim(),
+            "what the pull request holds now"
+        );
+    }
+
+    /// A fork's pull request from its own `main`: the client names the
+    /// checkout's branch for its owner (`someone/main`), so it is neither
+    /// the ROOT WORKTREE's `main` nor `origin/main` — the checkout holds
+    /// the contributor's commit, on its own branch, in its own directory,
+    /// and the root is left exactly where it was. A later `git pull` there
+    /// follows the pull request.
+    #[tokio::test]
+    async fn add_pr_worktree_keeps_a_forks_main_apart_from_ours() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let origin = add_bare_origin(&repo, tmp.path()).await;
+        git(&repo, &["commit", "--allow-empty", "-m", "fork work"])
+            .await
+            .unwrap();
+        git(&repo, &["push", "origin", "HEAD:refs/pull/129/head"])
+            .await
+            .unwrap();
+        git(&repo, &["reset", "--hard", "origin/main"])
+            .await
+            .unwrap();
+        let ours = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        let theirs = git(&origin, &["rev-parse", "refs/pull/129/head"])
+            .await
+            .unwrap();
+        assert_ne!(ours.trim(), theirs.trim());
+
+        let wt = add_pr_worktree(&repo, 129, "someone/main").await.unwrap();
+        assert_eq!(wt, worktree_dir(&repo, "someone/main"));
+        assert!(wt.ends_with("someone-main"), "{}", wt.display());
+        let branch = git(&wt, &["branch", "--show-current"]).await.unwrap();
+        assert_eq!(branch.trim(), "someone/main");
+        let head = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(head.trim(), theirs.trim(), "the contributor's commit");
+        let root = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(root.trim(), ours.trim(), "the root is where it was");
+        let root_branch = git(&repo, &["branch", "--show-current"]).await.unwrap();
+        assert_eq!(root_branch.trim(), "main");
+
+        // The contributor pushes again, on top of their first commit:
+        // `git pull` in the checkout follows.
+        git(&repo, &["reset", "--hard", theirs.trim()])
+            .await
+            .unwrap();
+        git(&repo, &["commit", "--allow-empty", "-m", "more fork work"])
+            .await
+            .unwrap();
+        git(&repo, &["push", "-f", "origin", "HEAD:refs/pull/129/head"])
+            .await
+            .unwrap();
+        git(&repo, &["reset", "--hard", "origin/main"])
+            .await
+            .unwrap();
+        let newer = git(&origin, &["rev-parse", "refs/pull/129/head"])
+            .await
+            .unwrap();
+        git(&wt, &["pull", "--ff-only"]).await.unwrap();
+        let head = git(&wt, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(head.trim(), newer.trim());
     }
 
     /// No `origin`, no default base: the branch starts at HEAD, as before.

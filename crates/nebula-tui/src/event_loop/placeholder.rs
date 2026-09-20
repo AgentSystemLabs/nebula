@@ -26,13 +26,21 @@
 //! is removed by the very Ack or Error that resolves them, so nothing has
 //! to be kept in sync. Nothing ever reaches the DAEMON under a stand-in
 //! id — `send_attach`, `create_agent`, `create_terminal`, the prewarm,
-//! the delete and the pane's Input all check first.
+//! the delete and the pane's Input all check first. One launch is held
+//! rather than refused: an AGENT PRESET run off the modal's row before
+//! the DAEMON has answered waits on the checkout's own Ack
+//! (`defer_launch`), and a modal opened on a stand-in — the presets
+//! list, its task box — is readdressed to the real row when that Ack
+//! lands (`resolve_worktree`).
 
 use super::{
-    pane_size, reconcile_selection, release_attachment, remove_worktree_rows, restore_context,
-    select_worktree_by_id, selection_snapshot,
+    create_agent, pane_size, reconcile_selection, release_attachment, remove_worktree_rows,
+    restore_context, select_worktree_by_id, selection_snapshot, WORKTREE_STILL_CREATING,
 };
-use crate::app::{now_ms, App, AttachedTerm, PendingIntent, PlaceholderRows};
+use crate::app::{
+    now_ms, AgentLaunchDraft, App, AttachedTerm, ConfirmDialog, Overlay, PendingAction,
+    PendingIntent, PlaceholderRows,
+};
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, ClientRequest, ProjectId, SessionRef, Worktree,
     WorktreeId,
@@ -88,12 +96,38 @@ pub(super) fn stage(
 ) -> PlaceholderRows {
     let focus = app.focus;
     let worktree = stage_worktree(app, project, branch, out);
+    let agent = stage_agent(app, &worktree, kind, custom, model, effort, out);
+    app.focus = focus;
+    PlaceholderRows { worktree, agent }
+}
+
+/// Put the session row up under `worktree` — a `kind` CLI at `model` /
+/// `effort`, named as the create will name it — selected, the pane
+/// showing "starting…" for it; FOCUS stays where it is. `stage`'s second
+/// half, and on its own the row of a launch waiting on the NEW WORKTREE
+/// modal's checkout (`defer_launch`). Returns the id the intent carries.
+pub(super) fn stage_agent(
+    app: &mut App,
+    worktree: &WorktreeId,
+    kind: AgentKind,
+    custom: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    out: &mut Vec<ClientRequest>,
+) -> AgentId {
     // The name the DAEMON will give the real row: `default_session_name`
-    // reads the selected worktree, which is the stand-in now (no
+    // reads the selected worktree, which is the stand-in (no
     // sessions), and `create_agent` takes the name off this row when the
     // create goes out, so the two agree.
     let name = app.default_session_name("agent");
     let agent = AgentId::generate();
+    // The stamp below re-sorts the PROJECTS PANEL as well: the newest
+    // session under any project, it puts the checkout's project on the
+    // top row. `sel_project` is a row index, so the project is held by
+    // id across the push — left alone, the cursor would highlight
+    // whichever project slid into the vacated row, and `worktree_row_of`
+    // below would look for the stand-in among that project's checkouts.
+    let project = app.selected_project().map(|p| p.id.clone());
     app.tree.agents.push(Agent {
         id: agent.clone(),
         worktree_id: worktree.clone(),
@@ -116,12 +150,16 @@ pub(super) fn stage(
         alive: false,
         recent_prompts: Vec::new(),
     });
-    // That stamp just moved the row to the top: re-seat the cursor on it.
-    if let Some(i) = app
-        .visible_worktrees()
-        .iter()
-        .position(|w| w.id == worktree)
-    {
+    if let Some(i) = project.and_then(|id| {
+        app.project_rows()
+            .iter()
+            .position(|i| app.tree.projects[*i].id == id)
+    }) {
+        app.sel_project = i;
+    }
+    // That stamp just moved the row to the top — or, for a PR SESSION's
+    // stand-in, under its pull request's row: re-seat the cursor on it.
+    if let Some(i) = app.worktree_row_of(worktree) {
         app.sel_worktree = i;
     }
     app.sel_session = 0;
@@ -138,9 +176,8 @@ pub(super) fn stage(
     // "starting session…" is the whole story for now.
     term.booting = true;
     app.term = Some(term);
-    app.focus = focus;
     app.dirty = true;
-    PlaceholderRows { worktree, agent }
+    agent
 }
 
 /// The `CreateWorktree` Ack: `real` is the checkout the DAEMON cut. Its
@@ -172,6 +209,20 @@ pub(super) fn resolve_worktree(app: &mut App, placeholder: &WorktreeId, real: &W
     for wid in app.last_worktree_for_project.values_mut() {
         if wid == placeholder {
             *wid = real.clone();
+        }
+    }
+    // A modal opened on the stand-in — the AGENT PRESETS list `e` put up
+    // on the new row, the task box behind it — is addressed to the real
+    // checkout from here, so its Enter names a checkout the DAEMON has
+    // rather than an id it never had. The prewarm armed on the row too.
+    if let Some(named) = app.overlay.as_mut().and_then(modal_worktree_mut) {
+        if *named == *placeholder {
+            *named = real.clone();
+        }
+    }
+    if let Some((armed, _)) = &mut app.pending_prewarm {
+        if *armed == *placeholder {
+            *armed = real.clone();
         }
     }
     forget_worktree(app, placeholder);
@@ -290,6 +341,17 @@ pub(super) fn discard_worktree(
         .is_some_and(|w| &w.id == placeholder);
     let before = selection_snapshot(app);
     let _ = remove_worktree_rows(app, placeholder);
+    // A modal opened on the stand-in has nothing to launch into now: it
+    // closes with the row. (The NEW WORKTREE modal's refusal puts its
+    // own box back over this.)
+    if app
+        .overlay
+        .as_mut()
+        .and_then(modal_worktree_mut)
+        .is_some_and(|named| *named == *placeholder)
+    {
+        app.overlay = None;
+    }
     app.last_session_for_worktree.remove(placeholder);
     app.last_worktree_for_project
         .retain(|_, wid| wid != placeholder);
@@ -316,6 +378,92 @@ pub(super) fn discard_agent(app: &mut App, placeholder: &AgentId, out: &mut Vec<
     app.dirty = true;
 }
 
+/// A launch fired into a stand-in checkout. Nothing goes to the DAEMON
+/// under an id it has never seen — but a launch into the NEW WORKTREE
+/// modal's row (`e` on the new row, an AGENT PRESET picked, its task
+/// typed, all before the DAEMON's `git worktree add` has finished) is
+/// not lost either: its session row goes up under the stand-in as a
+/// QUICK PROMPT's would, the draft rides the checkout's own PENDING
+/// INTENT, and the Ack that names the real checkout sends it there
+/// (`replay_launch`). Every other launch waits as before, saying so: one
+/// into a QUICK PROMPT's or a PR SESSION's stand-in, whose intent
+/// already carries the launch that made it; a second into the modal's
+/// while one is waiting; a PR SESSION, which is addressed to the PROJECT
+/// and cuts a checkout of its own.
+pub(super) fn defer_launch(
+    app: &mut App,
+    mut draft: AgentLaunchDraft,
+    out: &mut Vec<ClientRequest>,
+) {
+    let slot = app
+        .pending
+        .iter()
+        .find_map(|(req_id, intent)| match intent {
+            PendingIntent::SelectCreatedWorktree {
+                placeholder,
+                launch: None,
+                ..
+            } if *placeholder == draft.worktree => Some(*req_id),
+            _ => None,
+        });
+    let Some(req_id) = slot.filter(|_| draft.pr.is_none()) else {
+        app.flash = Some(WORKTREE_STILL_CREATING.into());
+        return;
+    };
+    let agent = stage_agent(
+        app,
+        &draft.worktree,
+        draft.kind,
+        draft.custom.clone(),
+        draft.model.clone(),
+        draft.effort.clone(),
+        out,
+    );
+    draft.placeholder = Some(agent);
+    if let Some(PendingIntent::SelectCreatedWorktree { launch, .. }) = app.pending.get_mut(&req_id)
+    {
+        *launch = Some(Box::new(draft));
+    }
+}
+
+/// The modal's Ack with a launch waiting on it: the checkout is `real`
+/// now, its stand-in session row moved under it by `resolve_worktree`,
+/// so the draft — and the box it brings back should the DAEMON refuse
+/// the create — is addressed there and goes out as it would have from a
+/// real row.
+pub(super) fn replay_launch(
+    app: &mut App,
+    mut draft: AgentLaunchDraft,
+    real: &WorktreeId,
+    out: &mut Vec<ClientRequest>,
+) {
+    draft.worktree = real.clone();
+    if let Some(named) = draft
+        .reopen_on_error
+        .as_mut()
+        .and_then(|(kind, _)| kind.worktree_mut())
+    {
+        *named = real.clone();
+    }
+    create_agent(app, draft, out);
+}
+
+/// The checkout a modal is addressed to — the one its Enter launches
+/// into, or the AGENT PRESETS list it reopens for. None for a modal that
+/// names no checkout, and for a QUICK PROMPT about to cut one.
+fn modal_worktree_mut(overlay: &mut Overlay) -> Option<&mut WorktreeId> {
+    match overlay {
+        Overlay::Prompt(dialog) => dialog.kind.worktree_mut(),
+        Overlay::AgentPresets(view) => Some(&mut view.worktree),
+        Overlay::AgentPresetEditor(editor) => Some(&mut editor.worktree),
+        Overlay::Confirm(ConfirmDialog {
+            action: PendingAction::DeleteAgentPreset { worktree, .. },
+            ..
+        }) => Some(worktree),
+        _ => None,
+    }
+}
+
 /// A pane showing the stand-in has nothing attached behind it, so it is
 /// blanked here rather than detached: a Detach for a session the DAEMON
 /// never had would be noise.
@@ -339,14 +487,18 @@ fn forget_worktree(app: &mut App, id: &WorktreeId) {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{
-        buffer_text, hse, press, seed_feat_worktree, seed_open_prs, seed_tree, with_default_config,
-        worktree_branches,
+        buffer_text, hide_root, hse, press, seed_feat_worktree, seed_open_prs, seed_tree,
+        with_default_config, with_seeded_presets, worktree_branches,
     };
-    use super::super::{fire_pending_prewarm, handle_server_event, paste_into_overlay};
-    use crate::app::{App, Focus, Overlay, PendingIntent, PlaceholderRows, PromptKind};
+    use super::super::{
+        fire_pending_prewarm, handle_server_event, handle_terminal_event, paste_into_overlay,
+    };
+    use crate::app::{App, Focus, HitTarget, Overlay, PendingIntent, PlaceholderRows, PromptKind};
     use crate::quick_prompt::QuickTarget;
     use crate::ui;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use nebula_core::{
         Agent, AgentId, AgentKind, AgentStatus, ClientRequest, Entity, EntityId, ServerEvent,
         SessionRef, WorktreeId,
@@ -363,7 +515,7 @@ mod tests {
     fn stage_launch(app: &mut App, out: &mut Vec<ClientRequest>) -> (String, PlaceholderRows, u64) {
         seed_tree(app);
         seed_feat_worktree(app, "w2", "feat");
-        app.hide_root_worktree = true;
+        hide_root(app, true);
         app.focus = Focus::Worktrees;
         app.sel_worktree = 0;
         assert_eq!(
@@ -1087,19 +1239,348 @@ mod tests {
         });
     }
 
+    // ---- an AGENT PRESET run off the modal's stand-in ----
+
+    /// `n`, "feat", Enter, then `e` on the new row and Enter on the
+    /// "reviewer" preset: the task box is open with "Fix auth" typed, and
+    /// the DAEMON has not answered the `CreateWorktree` yet. Returns the
+    /// stand-in id and that request's id.
+    fn type_preset_task(app: &mut App, out: &mut Vec<ClientRequest>) -> (WorktreeId, u64) {
+        let (placeholder, req_id) = stage_modal(app, out);
+        press(app, KeyCode::Char('e'), KeyModifiers::NONE, out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::AgentPresets(view)) if view.worktree == placeholder),
+            "e on the new row opens the list for it: {:?}",
+            app.overlay
+        );
+        press(app, KeyCode::Enter, KeyModifiers::NONE, out);
+        assert!(
+            matches!(
+                &app.overlay,
+                Some(Overlay::Prompt(prompt))
+                    if matches!(&prompt.kind, PromptKind::AgentPresetTask { worktree, preset } if *worktree == placeholder && preset.name == "reviewer")
+            ),
+            "Enter asks for the task: {:?}",
+            app.overlay
+        );
+        assert!(paste_into_overlay(app, "Fix auth"));
+        assert!(out.is_empty(), "{out:?}");
+        (placeholder, req_id)
+    }
+
+    /// The DAEMON's answer to the modal's `CreateWorktree`, in its own
+    /// order: the row's upsert, then the Ack naming it `w2`.
+    fn modal_worktree_created(app: &mut App, req_id: u64, out: &mut Vec<ClientRequest>) {
+        seed_feat_worktree(app, "w2", "feat");
+        handle_server_event(
+            app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(EntityId::Worktree(WorktreeId("w2".into()))),
+            },
+            out,
+        );
+    }
+
+    /// The bug as reported: the checkout lands while the task is being
+    /// typed. The list and the box were opened on the stand-in's id; the
+    /// Ack readdresses the box, so Enter launches into the checkout the
+    /// DAEMON cut — not into an id it never had ("worktree not found").
+    #[test]
+    fn a_task_typed_on_the_stand_in_launches_into_the_real_checkout() {
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            let (placeholder, req_id) = type_preset_task(&mut app, &mut out);
+
+            modal_worktree_created(&mut app, req_id, &mut out);
+            assert!(!app.tree.worktrees.iter().any(|w| w.id == placeholder));
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(prompt))
+                        if matches!(&prompt.kind, PromptKind::AgentPresetTask { worktree, .. } if worktree.0 == "w2")
+                            && prompt.input.as_str() == "Fix auth"
+                ),
+                "the box is addressed to the real checkout, text kept: {:?}",
+                app.overlay
+            );
+            assert!(out.is_empty(), "the Ack sends nothing: {out:?}");
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "launching closes the box");
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [ClientRequest::CreateAgent {
+                        worktree,
+                        starting_prompt: Some(text),
+                        ..
+                    }] if worktree.0 == "w2" && text == "Be strict.\n\nFix auth\n\nRun the tests."
+                ),
+                "one create, in w2: {out:?}"
+            );
+        });
+    }
+
+    /// The same with the list still open when the checkout lands: the
+    /// list is readdressed, and the task box it opens names the real row.
+    #[test]
+    fn a_presets_list_open_on_the_stand_in_follows_it_to_the_real_row() {
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            let (placeholder, req_id) = stage_modal(&mut app, &mut out);
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(&app.overlay, Some(Overlay::AgentPresets(view)) if view.worktree == placeholder),
+                "{:?}",
+                app.overlay
+            );
+
+            modal_worktree_created(&mut app, req_id, &mut out);
+            assert!(
+                matches!(&app.overlay, Some(Overlay::AgentPresets(view)) if view.worktree.0 == "w2"),
+                "{:?}",
+                app.overlay
+            );
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(prompt))
+                        if matches!(&prompt.kind, PromptKind::AgentPresetTask { worktree, .. } if worktree.0 == "w2")
+                ),
+                "{:?}",
+                app.overlay
+            );
+            // An empty task launches on the preset's prefix and postfix.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [ClientRequest::CreateAgent {
+                        worktree,
+                        starting_prompt: Some(_),
+                        ..
+                    }] if worktree.0 == "w2"
+                ),
+                "{out:?}"
+            );
+        });
+    }
+
+    /// Enter on the task before the DAEMON has answered: nothing can go
+    /// out under the stand-in's id, so the launch waits on the checkout's
+    /// own Ack — its session row up under the new checkout meanwhile, the
+    /// pane showing it starting, nothing sent — and goes out into the
+    /// real checkout the moment the Ack names it. A second launch while
+    /// one waits, waits.
+    #[test]
+    fn a_preset_run_before_the_ack_waits_for_the_checkout() {
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            let (placeholder, req_id) = type_preset_task(&mut app, &mut out);
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
+            assert!(out.is_empty(), "nothing under a made-up id: {out:?}");
+            assert_ne!(
+                app.flash.as_deref(),
+                Some("worktree is still being created")
+            );
+            let agent = match app.pending.get(&req_id) {
+                Some(PendingIntent::SelectCreatedWorktree {
+                    launch: Some(draft),
+                    ..
+                }) => draft
+                    .placeholder
+                    .clone()
+                    .expect("the waiting launch has its stand-in row"),
+                other => panic!("the launch rides the checkout's intent: {other:?}"),
+            };
+            assert!(app.is_placeholder_agent(&agent));
+            let sessions = app.visible_session_rows();
+            assert_eq!(sessions.len(), 1, "{sessions:?}");
+            assert_eq!(sessions[0].sref(), Some(SessionRef::Agent(agent.clone())));
+            assert!(app.tree.agents.iter().any(|a| a.id == agent
+                && a.worktree_id == placeholder
+                && a.kind == AgentKind::Claude
+                && a.model.as_deref() == Some("opus")));
+            assert_eq!(
+                app.term.as_ref().map(|t| (t.sref.clone(), t.booting)),
+                Some((SessionRef::Agent(agent.clone()), true)),
+                "the pane shows the row starting"
+            );
+            assert_eq!(app.focus, Focus::Sessions);
+
+            // A second launch while the first waits is refused as before.
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert_eq!(
+                app.flash.as_deref(),
+                Some("worktree is still being created")
+            );
+            assert_eq!(app.visible_session_rows().len(), 1, "no second stand-in");
+            assert!(out.is_empty(), "{out:?}");
+
+            modal_worktree_created(&mut app, req_id, &mut out);
+            let create_id = match out.as_slice() {
+                [ClientRequest::CreateAgent {
+                    req_id,
+                    worktree,
+                    name,
+                    kind: AgentKind::Claude,
+                    model: Some(model),
+                    effort: Some(effort),
+                    auto_title: true,
+                    starting_prompt: Some(text),
+                    ..
+                }] if worktree.0 == "w2"
+                    && model == "opus"
+                    && effort == "high"
+                    && text == "Be strict.\n\nFix auth\n\nRun the tests." =>
+                {
+                    assert_eq!(name, "agent-1", "the stand-in is not a taken name");
+                    *req_id
+                }
+                other => panic!("one CreateAgent in w2: {other:?}"),
+            };
+            out.clear();
+            assert!(
+                app.tree
+                    .agents
+                    .iter()
+                    .any(|a| a.id == agent && a.worktree_id.0 == "w2"),
+                "the row moved under the real checkout"
+            );
+            assert!(
+                app.is_placeholder_agent(&agent),
+                "still a stand-in until its own Ack"
+            );
+            assert!(
+                matches!(
+                    app.pending.get(&create_id),
+                    Some(PendingIntent::AttachCreatedWithCloudRetry {
+                        kind: PromptKind::AgentPresetTask { worktree, .. },
+                        placeholder: Some(stand_in),
+                        ..
+                    }) if worktree.0 == "w2" && *stand_in == agent
+                ),
+                "{:?}",
+                app.pending
+            );
+
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(real_agent("a9", "w2")),
+                },
+            );
+            handle_server_event(
+                &mut app,
+                ServerEvent::Ack {
+                    req_id: create_id,
+                    created: Some(EntityId::Agent(AgentId("a9".into()))),
+                },
+                &mut out,
+            );
+            let sessions = app.visible_session_rows();
+            assert_eq!(sessions.len(), 1, "one row, not two: {sessions:?}");
+            assert_eq!(
+                sessions[0].sref(),
+                Some(SessionRef::Agent(AgentId("a9".into())))
+            );
+            assert!(
+                !app.tree.agents.iter().any(|a| a.id == agent),
+                "the stand-in is gone"
+            );
+            assert!(app.pending.is_empty(), "{:?}", app.pending);
+            assert!(
+                out.iter().any(|r| matches!(r, ClientRequest::Attach { session, .. } if session == &SessionRef::Agent(AgentId("a9".into())))),
+                "the real session is attached: {out:?}"
+            );
+            assert_eq!(app.focus, Focus::Terminal, "a preset launch takes the pane");
+            assert!(app.term_locked);
+        });
+    }
+
+    /// The checkout is refused with a launch waiting on it: both stand-in
+    /// rows go, the pane with them, the cursor and FOCUS go back to where
+    /// `n` was pressed, and the NEW WORKTREE box comes back with the name
+    /// — no create ever went out.
+    #[test]
+    fn a_refused_checkout_takes_the_waiting_launch_down_with_it() {
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            let (placeholder, req_id) = type_preset_task(&mut app, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let agent = match app.pending.get(&req_id) {
+                Some(PendingIntent::SelectCreatedWorktree {
+                    launch: Some(draft),
+                    ..
+                }) => draft.placeholder.clone().expect("staged"),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(app.visible_session_rows().len(), 1);
+
+            handle_server_event(
+                &mut app,
+                ServerEvent::Error {
+                    req_id: Some(req_id),
+                    message: "branch exists".into(),
+                },
+                &mut out,
+            );
+            assert_eq!(worktree_branches(&app), ["main"]);
+            assert!(
+                !app.tree
+                    .agents
+                    .iter()
+                    .any(|a| a.id == agent || a.worktree_id == placeholder),
+                "the waiting row went with the checkout"
+            );
+            assert!(app.pending.is_empty(), "{:?}", app.pending);
+            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
+            assert_eq!(app.focus, Focus::Worktrees, "back where n was pressed");
+            assert_eq!(app.flash.as_deref(), Some("branch exists"));
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(prompt))
+                        if matches!(&prompt.kind, PromptKind::NewWorktree { .. })
+                            && prompt.input.as_str() == "feat"
+                ),
+                "{:?}",
+                app.overlay
+            );
+            assert_ne!(
+                app.term.as_ref().map(|t| t.sref.clone()),
+                Some(SessionRef::Agent(agent)),
+                "the pane no longer shows the stand-in"
+            );
+            assert!(
+                !out.iter().any(|r| matches!(
+                    r,
+                    ClientRequest::CreateAgent { .. } | ClientRequest::Input { .. }
+                )),
+                "{out:?}"
+            );
+        });
+    }
+
     // ---- a PR SESSION into a checkout that does not exist yet ----
 
-    /// Enter on the OPEN PRS row for #7 — `n` opens the PR SESSION
-    /// picker, Enter takes its first row (Claude), `name` goes into the
-    /// name box (empty takes the default), Enter launches. The checkout
-    /// row for the head branch and the session row are up, and nothing
-    /// but the `CreatePrAgent` went to the DAEMON. Returns the stand-in
-    /// ids the intent carries and the request id.
-    fn stage_pr_session(
-        app: &mut App,
-        name: &str,
-        out: &mut Vec<ClientRequest>,
-    ) -> (PlaceholderRows, u64) {
+    /// `n` on the OPEN PRS row for #7 opens the PR SESSION picker, and
+    /// Enter on its first row (Claude) launches — no box in between. The
+    /// checkout row for the head branch and the session row are up, and
+    /// nothing but the `CreatePrAgent` went to the DAEMON. Returns the
+    /// stand-in ids the intent carries and the request id.
+    fn stage_pr_session(app: &mut App, out: &mut Vec<ClientRequest>) -> (PlaceholderRows, u64) {
         seed_tree(app);
         seed_open_prs(app, &[(7, "Attach links")]);
         app.focus = Focus::Worktrees;
@@ -1113,15 +1594,10 @@ mod tests {
         );
         press(app, KeyCode::Enter, KeyModifiers::NONE, out);
         assert!(
-            matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, PromptKind::NewPrAgent { .. })),
-            "the picker's row opens the name box: {:?}",
+            app.overlay.is_none(),
+            "the picker's row launches, with no box after it: {:?}",
             app.overlay
         );
-        if !name.is_empty() {
-            assert!(paste_into_overlay(app, name));
-        }
-        press(app, KeyCode::Enter, KeyModifiers::NONE, out);
-        assert!(app.overlay.is_none(), "launching closes the box");
         let creates: Vec<&ClientRequest> = out
             .iter()
             .filter(|r| matches!(r, ClientRequest::CreatePrAgent { .. }))
@@ -1159,7 +1635,7 @@ mod tests {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            let (rows, _) = stage_pr_session(&mut app, "", &mut out);
+            let (rows, _) = stage_pr_session(&mut app, &mut out);
 
             assert_eq!(worktree_branches(&app), ["main", "pr-7-head"]);
             let selected = app.selected_worktree().expect("a row is selected");
@@ -1182,11 +1658,25 @@ mod tests {
             assert!(!term.painted, "nothing has come off a PTY");
             assert!(app.attached_sref.is_none(), "nothing is attached behind it");
 
+            // Two cells wider than the default column, so the row reads
+            // whole: at the default width the branch was already giving
+            // its last letter to the ` creating` badge, and the `└` the
+            // stand-in now sits behind, under its pull request, costs one
+            // more — in a column that narrow the badge yields to the
+            // branch like any ago label (`fit_ago`), and the hollow dot
+            // and the pane's "starting…" still say what the row is.
+            app.panel_widths[1] += 2;
             let text = screen(&mut app);
             assert!(text.contains("pr-7-head"), "{text}");
             assert!(text.contains(" creating"), "{text}");
             assert!(text.contains("agent-1 starting"), "{text}");
             assert!(text.contains("starting session…"), "{text}");
+            // The stand-in goes up where the real checkout will list:
+            // under the pull request's row, not among the plain checkouts
+            // — so nothing jumps when the DAEMON's row replaces it.
+            assert_eq!(app.worktree_row_of(&rows.worktree), Some(2));
+            assert_eq!(app.sel_worktree, 2);
+            assert!(text.contains("└○ pr-7-head"), "{text}");
 
             // The landing armed the prewarm; it stops at the stand-in.
             fire_pending_prewarm(&mut app, &mut out);
@@ -1194,10 +1684,11 @@ mod tests {
         });
     }
 
-    /// A name typed in the box is the stand-in row's from the start, and
-    /// the one the create carries.
+    /// No box asks for a name, so the stand-in row wears the generated
+    /// one from the start, and the create carries it with AUTO-TITLE on —
+    /// the session names itself from its first prompt.
     #[test]
-    fn a_typed_name_is_on_the_pr_stand_in_row() {
+    fn the_pr_stand_in_row_wears_the_generated_name_the_create_carries() {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
@@ -1207,18 +1698,17 @@ mod tests {
             app.sel_worktree = 1;
             press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(paste_into_overlay(&mut app, "review-7"));
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "{:?}", app.overlay);
 
             let sessions = app.visible_session_rows();
             assert_eq!(sessions.len(), 1, "{sessions:?}");
-            assert_eq!(sessions[0].name(), "review-7");
+            let shown = sessions[0].name().to_string();
             assert!(
                 out.iter().any(|r| matches!(
                     r,
-                    ClientRequest::CreatePrAgent { name, auto_title: false, .. } if name == "review-7"
+                    ClientRequest::CreatePrAgent { name, auto_title: true, .. } if *name == shown
                 )),
-                "{out:?}"
+                "the row says {shown:?}: {out:?}"
             );
         });
     }
@@ -1234,7 +1724,7 @@ mod tests {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            let (rows, req_id) = stage_pr_session(&mut app, "", &mut out);
+            let (rows, req_id) = stage_pr_session(&mut app, &mut out);
 
             seed_feat_worktree(&mut app, "w3", "pr-7-head");
             assert_eq!(worktree_branches(&app), ["main", "pr-7-head"]);
@@ -1299,7 +1789,7 @@ mod tests {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            let (rows, req_id) = stage_pr_session(&mut app, "", &mut out);
+            let (rows, req_id) = stage_pr_session(&mut app, &mut out);
 
             handle_server_event(
                 &mut app,
@@ -1340,7 +1830,7 @@ mod tests {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            let (rows, req_id) = stage_pr_session(&mut app, "", &mut out);
+            let (rows, req_id) = stage_pr_session(&mut app, &mut out);
 
             handle_server_event(
                 &mut app,
@@ -1371,7 +1861,7 @@ mod tests {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            let (rows, req_id) = stage_pr_session(&mut app, "", &mut out);
+            let (rows, req_id) = stage_pr_session(&mut app, &mut out);
 
             seed_feat_worktree(&mut app, "w3", "pr-7-head");
             handle_server_event(
@@ -1401,9 +1891,15 @@ mod tests {
             seed_feat_worktree(&mut app, "w2", "pr-7-head");
             seed_open_prs(&mut app, &[(7, "Attach links")]);
             app.focus = Focus::Worktrees;
-            app.sel_worktree = 2;
+            // The pull request's row; its checkout is the row under it.
+            app.sel_worktree = 1;
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+            assert_eq!(
+                app.worktree_row_of(&WorktreeId("w2".into())),
+                Some(2),
+                "the checkout on the head branch lists under the pull request"
+            );
             press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
 
             assert!(
@@ -1432,12 +1928,13 @@ mod tests {
         with_default_config(|| {
             let mut app = App::new();
             let mut out = Vec::new();
-            let (rows, _) = stage_pr_session(&mut app, "", &mut out);
+            let (rows, _) = stage_pr_session(&mut app, &mut out);
 
-            // Back on the pull request's row, after the two checkouts.
-            app.sel_worktree = 2;
+            // Back on the pull request's row — the stand-in checkout sits
+            // under it, so the pull request is the row after the root.
+            app.sel_worktree = 1;
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
             press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert_eq!(
                 app.flash.as_deref(),
@@ -1457,6 +1954,516 @@ mod tests {
                     .count(),
                 1
             );
+        });
+    }
+
+    // ---- a launch the user walked away from while the DAEMON worked ----
+
+    /// A key through the real funnel (`handle_terminal_event`), which is
+    /// where a manual move is told from the tree shifting under the
+    /// cursors — `press` goes straight to `handle_key` and never sees it.
+    fn key(app: &mut App, code: KeyCode, out: &mut Vec<ClientRequest>) {
+        handle_terminal_event(
+            app,
+            Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+            out,
+        );
+    }
+
+    /// A left click on WORKTREES PANEL row `row`, through the same funnel.
+    fn click_worktree_row(app: &mut App, row: usize, out: &mut Vec<ClientRequest>) {
+        app.hits.clear();
+        app.hits.push((
+            ratatui::layout::Rect::new(0, 0, 20, 1),
+            HitTarget::Worktree(row),
+        ));
+        handle_terminal_event(
+            app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            out,
+        );
+    }
+
+    /// Walk the Worktrees cursor onto `target` with ↑ / ↓.
+    fn walk_to_worktree(app: &mut App, target: &str, out: &mut Vec<ClientRequest>) {
+        let there = app
+            .worktree_row_of(&WorktreeId(target.into()))
+            .expect("the row is listed");
+        let here = app.sel_worktree;
+        let code = if there > here {
+            KeyCode::Down
+        } else {
+            KeyCode::Up
+        };
+        for _ in 0..here.abs_diff(there) {
+            key(app, code, out);
+        }
+    }
+
+    /// The DAEMON's answer to a PR SESSION's `CreatePrAgent`, in its own
+    /// order: the checkout's upsert, the session's, then the Ack.
+    fn pr_session_created(app: &mut App, req_id: u64, out: &mut Vec<ClientRequest>) {
+        seed_feat_worktree(app, "w3", "pr-7-head");
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(real_agent("a9", "w3")),
+            },
+        );
+        handle_server_event(
+            app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(EntityId::Agent(AgentId("a9".into()))),
+            },
+            out,
+        );
+    }
+
+    fn attached(out: &[ClientRequest], id: &str) -> bool {
+        let sref = SessionRef::Agent(AgentId(id.into()));
+        out.iter()
+            .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == sref))
+    }
+
+    /// The bug report: a prompt run on a pull request, then ↑ (or a click)
+    /// onto another row while the DAEMON fetched the branch and cut the
+    /// checkout — and seconds later the Ack dragged the cursor back to the
+    /// new session, switched the worktree and took FOCUS into the pane. A
+    /// manual move outranks the follow: the rows still become the real
+    /// ones, and the cursors, the pane and FOCUS stay where the user put
+    /// them. INPUT PARITY: the key and the click leave the same app.
+    #[test]
+    fn a_pr_session_the_user_walked_away_from_is_not_followed() {
+        type Leave = fn(&mut App, &mut Vec<ClientRequest>);
+        let by_key: Leave = |app, out| walk_to_worktree(app, "w1", out);
+        let by_click: Leave = |app, out| {
+            let row = app.worktree_row_of(&WorktreeId("w1".into())).unwrap();
+            click_worktree_row(app, row, out);
+        };
+        for (how, leave) in [("key", by_key), ("click", by_click)] {
+            with_default_config(|| {
+                let mut app = App::new();
+                let mut out = Vec::new();
+                let (rows, req_id) = stage_pr_session(&mut app, &mut out);
+                assert_eq!(
+                    app.selected_worktree().map(|w| w.id.clone()),
+                    Some(rows.worktree.clone()),
+                    "{how}: the launch left the cursor on its stand-in"
+                );
+
+                leave(&mut app, &mut out);
+                assert_eq!(
+                    app.selected_worktree().map(|w| w.id.0.as_str()),
+                    Some("w1"),
+                    "{how}"
+                );
+                assert_eq!(app.left_behind.len(), 1, "{how}");
+                out.clear();
+
+                pr_session_created(&mut app, req_id, &mut out);
+
+                assert_eq!(
+                    app.selected_worktree().map(|w| w.id.0.as_str()),
+                    Some("w1"),
+                    "{how}: the cursor stayed where the user put it"
+                );
+                assert_eq!(
+                    app.selected_session().map(|a| a.id.0).as_deref(),
+                    Some("a1"),
+                    "{how}"
+                );
+                assert_eq!(app.focus, Focus::Worktrees, "{how}");
+                assert!(!app.term_locked, "{how}");
+                assert_eq!(
+                    app.term.as_ref().map(|t| t.sref.clone()),
+                    Some(SessionRef::Agent(AgentId("a1".into()))),
+                    "{how}: the pane stayed on the session under the cursor"
+                );
+                assert!(!attached(&out, "a9"), "{how}: {out:?}");
+                assert!(app.select_when_seen.is_none(), "{how}");
+                assert!(app.pending.is_empty(), "{how}");
+                assert!(app.left_behind.is_empty(), "{how}");
+
+                // The rows are the real ones all the same.
+                assert_eq!(worktree_branches(&app), ["main", "pr-7-head"], "{how}");
+                assert!(!app.tree.agents.iter().any(|a| a.id == rows.agent), "{how}");
+                assert!(
+                    app.tree
+                        .agents
+                        .iter()
+                        .any(|a| a.id.0 == "a9" && a.worktree_id.0 == "w3"),
+                    "{how}"
+                );
+            });
+        }
+    }
+
+    /// One ↑ from the stand-in is its pull request's row, which leaves the
+    /// pane as it was — on the stand-in. The Ack keeps the cursor on the
+    /// pull request and FOCUS on the panel, and the pane goes on showing
+    /// that session, now the real one, rather than a "starting…" for an
+    /// id nothing will ever answer to.
+    #[test]
+    fn a_pane_left_on_the_stand_in_shows_the_real_session_without_the_cursor() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            let (rows, req_id) = stage_pr_session(&mut app, &mut out);
+
+            key(&mut app, KeyCode::Up, &mut out);
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+            assert_eq!(
+                app.term.as_ref().map(|t| t.sref.clone()),
+                Some(SessionRef::Agent(rows.agent.clone())),
+                "a pull request's row leaves the pane as it was"
+            );
+            out.clear();
+
+            pr_session_created(&mut app, req_id, &mut out);
+
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+            assert_eq!(app.focus, Focus::Worktrees);
+            assert!(!app.term_locked);
+            assert_eq!(
+                app.term.as_ref().map(|t| t.sref.clone()),
+                Some(SessionRef::Agent(AgentId("a9".into())))
+            );
+            assert!(!app.pane_shows_placeholder());
+            assert!(attached(&out, "a9"), "{out:?}");
+        });
+    }
+
+    /// Input that moves nothing is not a manual move — the pointer
+    /// crossing the screen, ↓ on the last row. The Ack follows as ever:
+    /// the created session selected, the pane entered and locked.
+    #[test]
+    fn input_that_moves_nothing_keeps_the_follow() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            let (_, req_id) = stage_pr_session(&mut app, &mut out);
+
+            handle_terminal_event(
+                &mut app,
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: 5,
+                    row: 5,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                &mut out,
+            );
+            key(&mut app, KeyCode::Down, &mut out);
+            assert!(app.left_behind.is_empty());
+            out.clear();
+
+            pr_session_created(&mut app, req_id, &mut out);
+
+            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w3"));
+            assert_eq!(
+                app.selected_session().map(|a| a.id.0).as_deref(),
+                Some("a9")
+            );
+            assert_eq!(app.focus, Focus::Terminal);
+            assert!(app.term_locked);
+            assert!(attached(&out, "a9"), "{out:?}");
+        });
+    }
+
+    /// The Ack outran the upserts, so the follow is parked in
+    /// `select_when_seen` — and the user moves before the rows arrive. The
+    /// parked follow goes with the move: the rows land, the cursor stays.
+    #[test]
+    fn a_move_after_the_ack_drops_the_follow_parked_for_the_upsert() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            let (_, req_id) = stage_pr_session(&mut app, &mut out);
+            handle_server_event(
+                &mut app,
+                ServerEvent::Ack {
+                    req_id,
+                    created: Some(EntityId::Agent(AgentId("a9".into()))),
+                },
+                &mut out,
+            );
+            assert!(app.select_when_seen.is_some());
+
+            let pr_row = app
+                .open_pr_row_of("https://github.com/o/r/pull/7")
+                .expect("the pull request is listed");
+            click_worktree_row(&mut app, pr_row, &mut out);
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+            assert!(app.select_when_seen.is_none(), "the move outranks it");
+
+            seed_feat_worktree(&mut app, "w3", "pr-7-head");
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(real_agent("a9", "w3")),
+                },
+            );
+            assert_eq!(worktree_branches(&app), ["main", "pr-7-head"]);
+            assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+            assert_eq!(app.focus, Focus::Worktrees);
+        });
+    }
+
+    /// The two-request launch (`p` into a worktree that does not exist
+    /// yet): the user walks off while the checkout is cut. Its Ack still
+    /// sends the `CreateAgent` into the real checkout — the launch is not
+    /// lost — but moves no cursor there, and the session's own Ack, born
+    /// left behind, moves none either.
+    #[test]
+    fn a_quick_prompt_launch_walked_away_from_still_launches_but_is_not_followed() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            let (branch, rows, req_id) = stage_launch(&mut app, &mut out);
+
+            walk_to_worktree(&mut app, "w2", &mut out);
+            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w2"));
+            out.clear();
+
+            let agent_req = worktree_created(&mut app, &branch, req_id, &mut out);
+            assert_eq!(
+                app.selected_worktree().map(|w| w.id.0.as_str()),
+                Some("w2"),
+                "the checkout's Ack moved no cursor"
+            );
+            assert!(app.left_behind.contains(&agent_req), "born left behind");
+
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(real_agent("a9", "w3")),
+                },
+            );
+            handle_server_event(
+                &mut app,
+                ServerEvent::Ack {
+                    req_id: agent_req,
+                    created: Some(EntityId::Agent(AgentId("a9".into()))),
+                },
+                &mut out,
+            );
+            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w2"));
+            assert_eq!(app.focus, Focus::Worktrees);
+            assert!(!attached(&out, "a9"), "{out:?}");
+            assert!(app.pending.is_empty());
+            assert!(app.left_behind.is_empty());
+            assert!(!app.tree.agents.iter().any(|a| a.id == rows.agent));
+            assert!(app
+                .tree
+                .agents
+                .iter()
+                .any(|a| a.id.0 == "a9" && a.worktree_id.0 == "w3"));
+        });
+    }
+
+    /// The project on the BOTTOM row of the PROJECTS PANEL and its two
+    /// rows: the second project, whose session finished a minute ago,
+    /// heads the column; `demo`, never run, is the last row, and the
+    /// cursor is on it.
+    fn seed_project_that_ran_first(app: &mut App) {
+        use nebula_core::{Project, ProjectId, Worktree};
+        seed_tree(app);
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(Project {
+                    workspace_id: Default::default(),
+                    id: ProjectId("p2".into()),
+                    name: "two".into(),
+                    repo_path: "/tmp/two".into(),
+                    sort_order: 1,
+                }),
+            },
+        );
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w9".into()),
+                    project_id: ProjectId("p2".into()),
+                    path: "/tmp/two".into(),
+                    branch: "main".into(),
+                    is_main: true,
+                    sort_order: 0,
+                }),
+            },
+        );
+        let mut ran = real_agent("a2", "w9");
+        ran.status = AgentStatus::Finished;
+        ran.status_changed_at = crate::app::now_ms() - 60_000;
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(ran),
+            },
+        );
+        assert_eq!(project_names(app), ["two", "demo"]);
+        app.sel_project = 1;
+        assert_eq!(
+            app.selected_project().map(|p| p.name.as_str()),
+            Some("demo")
+        );
+    }
+
+    /// The PROJECTS PANEL's rows, top down.
+    fn project_names(app: &App) -> Vec<String> {
+        app.project_rows()
+            .into_iter()
+            .map(|i| app.tree.projects[i].name.clone())
+            .collect()
+    }
+
+    /// `p` on the WORKTREES PANEL of the project on the BOTTOM row of the
+    /// PROJECTS PANEL. The stand-in session's fresh stamp is the newest
+    /// under any project, so the row moves to the top — and the cursor
+    /// moves with it. `sel_project` is a row index: left alone it would
+    /// highlight whichever project slid into the vacated bottom row, with
+    /// that project's checkouts in the WORKTREES PANEL instead of the
+    /// stand-in. The cursor keeps following through the Acks that turn
+    /// the stand-ins into the real rows.
+    #[test]
+    fn the_stand_in_moves_its_project_to_the_top_and_the_cursor_follows() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_project_that_ran_first(&mut app);
+            let (branch, rows, req_id) = stage_launch(&mut app, &mut out);
+
+            assert_eq!(
+                project_names(&app),
+                ["demo", "two"],
+                "the launch moved demo to the top"
+            );
+            assert_eq!(app.sel_project, 0, "the cursor moved with it");
+            assert_eq!(
+                app.selected_project().map(|p| p.name.as_str()),
+                Some("demo")
+            );
+            assert_eq!(
+                app.selected_worktree().map(|w| w.id.clone()),
+                Some(rows.worktree.clone()),
+                "its WORKTREES PANEL holds the stand-in, selected"
+            );
+            assert_eq!(app.sel_session, 0);
+            assert_eq!(app.focus, Focus::Worktrees);
+
+            // The DAEMON's answers keep it there.
+            let req_id = worktree_created(&mut app, &branch, req_id, &mut out);
+            assert_eq!(
+                app.selected_project().map(|p| p.name.as_str()),
+                Some("demo")
+            );
+            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w3"));
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(real_agent("a9", "w3")),
+                },
+            );
+            handle_server_event(
+                &mut app,
+                ServerEvent::Ack {
+                    req_id,
+                    created: Some(EntityId::Agent(AgentId("a9".into()))),
+                },
+                &mut out,
+            );
+            assert_eq!(project_names(&app), ["demo", "two"]);
+            assert_eq!(app.sel_project, 0);
+            assert_eq!(
+                app.selected_project().map(|p| p.name.as_str()),
+                Some("demo")
+            );
+            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w3"));
+            assert_eq!(
+                app.selected_session_row().and_then(|r| r.sref()),
+                Some(SessionRef::Agent(AgentId("a9".into())))
+            );
+            assert_eq!(
+                app.term.as_ref().map(|t| t.sref.clone()),
+                Some(SessionRef::Agent(AgentId("a9".into()))),
+                "the pane shows the session the prompt went into"
+            );
+        });
+    }
+
+    /// The same from the PROJECTS PANEL, where `p` launches into the
+    /// selected checkout and nothing is staged: the project moves to the
+    /// top only when the DAEMON's upsert lands, and the cursor follows
+    /// through the upsert, the Ack and the first status change.
+    #[test]
+    fn a_launch_into_the_bottom_projects_checkout_keeps_the_cursor_on_it() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_project_that_ran_first(&mut app);
+            app.focus = Focus::Projects;
+            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(paste_into_overlay(&mut app, "Fix auth"));
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let req_id = match out.as_slice() {
+                [ClientRequest::CreateAgent {
+                    req_id, worktree, ..
+                }] if worktree.0 == "w1" => *req_id,
+                other => panic!("one CreateAgent in w1 and nothing else: {other:?}"),
+            };
+            out.clear();
+            assert_eq!(project_names(&app), ["two", "demo"], "nothing staged");
+            assert_eq!(app.sel_project, 1);
+
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(real_agent("a9", "w1")),
+                },
+            );
+            assert_eq!(
+                project_names(&app),
+                ["demo", "two"],
+                "the upsert moved demo up"
+            );
+            assert_eq!(app.sel_project, 0, "the cursor moved with it");
+            handle_server_event(
+                &mut app,
+                ServerEvent::Ack {
+                    req_id,
+                    created: Some(EntityId::Agent(AgentId("a9".into()))),
+                },
+                &mut out,
+            );
+            hse(
+                &mut app,
+                ServerEvent::StatusChanged {
+                    agent: AgentId("a9".into()),
+                    status: AgentStatus::Running,
+                    changed_at: crate::app::now_ms(),
+                    unseen: false,
+                },
+            );
+            assert_eq!(project_names(&app), ["demo", "two"]);
+            assert_eq!(app.sel_project, 0);
+            assert_eq!(
+                app.selected_project().map(|p| p.name.as_str()),
+                Some("demo")
+            );
+            assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
+            assert_eq!(
+                app.selected_session_row().and_then(|r| r.sref()),
+                Some(SessionRef::Agent(AgentId("a9".into())))
+            );
+            assert_eq!(app.focus, Focus::Projects, "quick_prompt_focus is off");
         });
     }
 }

@@ -705,7 +705,8 @@ impl HarnessDescriptor {
         if let Some(cd) = over.resume_cd {
             self.resume.cd = cd;
         }
-        over.system_append_flag.apply_to(&mut self.system.append_flag);
+        over.system_append_flag
+            .apply_to(&mut self.system.append_flag);
         if let Some(prepend) = over.system_prepend_to_first_prompt {
             self.system.prepend_to_first_prompt = prepend;
         }
@@ -930,9 +931,8 @@ pub fn resolve<'a>(
 
 /// Find a usable legacy entry by id: present, valid, and enabled.
 pub fn find_custom<'a>(list: &'a [CustomHarness], id: &str) -> Option<&'a CustomHarness> {
-    list.iter().find(|entry| {
-        entry.id.trim() == id.trim() && entry.enabled && entry.problem().is_none()
-    })
+    list.iter()
+        .find(|entry| entry.id.trim() == id.trim() && entry.enabled && entry.problem().is_none())
 }
 
 /// Every usable legacy entry, in list order.
@@ -1098,7 +1098,10 @@ mod tests {
         assert!(descriptor.problem().is_some(), "unknown dialect");
         let mut descriptor = builtin("codex").unwrap();
         descriptor.effort.config_flag = None;
-        assert!(descriptor.problem().is_some(), "config key without its flag");
+        assert!(
+            descriptor.problem().is_some(),
+            "config key without its flag"
+        );
         let empty_program = HarnessDescriptor {
             program: String::new(),
             ..builtin("claude").unwrap()
@@ -1111,7 +1114,9 @@ mod tests {
         let all = registry(&BTreeMap::new(), &[custom("agy")]);
         assert_eq!(resolve(&all, AgentKind::Claude, None).unwrap().id, "claude");
         assert_eq!(
-            resolve(&all, AgentKind::Custom, Some("agy")).unwrap().program,
+            resolve(&all, AgentKind::Custom, Some("agy"))
+                .unwrap()
+                .program,
             "agy"
         );
         assert!(resolve(&all, AgentKind::Custom, Some("gone")).is_err());
@@ -1135,9 +1140,6 @@ mod tests {
             ..custom("agy")
         };
         assert_eq!(claude_hooks.problem(), None);
-        assert_eq!(
-            claude_hooks.hook_dialect(),
-            Some(crate::AgentKind::Claude)
-        );
+        assert_eq!(claude_hooks.hook_dialect(), Some(crate::AgentKind::Claude));
     }
 }

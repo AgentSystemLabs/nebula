@@ -1,6 +1,7 @@
 //! The daemon's world: persisted entity tree + live PTY sessions, and the
 //! operations the IPC surface exposes over them.
 
+use crate::claude_bg;
 use crate::git;
 use crate::hooks::{self, HookEnv};
 use crate::pty::{PtyEvent, PtySession, SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
@@ -68,6 +69,11 @@ const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 type FinishedRun = (Arc<PtySession>, Option<i32>);
 /// What a RUN TERMINAL's row is called in the Sessions panel.
 const RUN_TERMINAL_NAME: &str = "run";
+/// `r` on a worktree with nothing to run: the footer line naming both
+/// places a RUN COMMAND can come from.
+const NO_RUN_COMMAND: &str =
+    "no run command for this worktree — set one in Settings (s) → Project, \
+                              or add .nebula.json with {\"run\": \"npm run dev\"}";
 /// Why a RUN TERMINAL with nothing left to replay will not attach — its
 /// run ended before a DAEMON restart, typically.
 const RUN_NOT_RUNNING: &str = "this run has stopped — press r on its worktree to start it again";
@@ -422,7 +428,9 @@ impl Daemon {
     /// attached session; in-view sessions get their stamps refreshed
     /// instead, so the full timeout starts only when the user leaves.
     /// Spared regardless of age: agents that are running or waiting on
-    /// feedback, terminals with a command running, and prewarm-pool sessions
+    /// feedback, agents with a backgrounded tool call still running (a job
+    /// detached from their terminal — see `pty::detached_job_under`),
+    /// terminals with a command running, and prewarm-pool sessions
     /// (`reap_prewarmed` owns those). A reaped session revives on the next
     /// attach or prewarm; agents resume their conversation.
     pub fn reap_idle_sessions(self: &Arc<Self>) {
@@ -462,10 +470,28 @@ impl Daemon {
             }
             let spared = match &sref {
                 SessionRef::Agent(id) => match self.store.get_agent(id).ok().flatten() {
-                    Some(agent) => matches!(
-                        agent.status,
-                        AgentStatus::Running | AgentStatus::NeedsFeedback
-                    ),
+                    Some(agent)
+                        if matches!(
+                            agent.status,
+                            AgentStatus::Running | AgentStatus::NeedsFeedback
+                        ) =>
+                    {
+                        true
+                    }
+                    // A backgrounded tool call — Claude's `run_in_background`
+                    // Bash, its Monitor watch, a Codex shell command —
+                    // outlives the turn that started it, and the hook-fed
+                    // status machine read that turn's Stop as Finished. The
+                    // process tree still knows (#78). Restamped rather than
+                    // just skipped: the job ending is the moment the agent
+                    // wakes to read its result, so the clock starts there.
+                    Some(_) => {
+                        let busy = agent_has_detached_job(&session);
+                        if busy {
+                            self.touch_session(&sref);
+                        }
+                        busy
+                    }
                     // Row vanished mid-sweep: its delete kills the PTY anyway.
                     None => true,
                 },
@@ -843,6 +869,9 @@ impl Daemon {
     /// WORKTREE only when the branch is checked out there — git allows a
     /// branch in one checkout at a time), or a new one under the WORKTREE
     /// DIR with the branch fetched from `origin` (`git::add_pr_worktree`).
+    /// `head` is the checkout's branch as the client names it: a fork's
+    /// arrives under its owner's name (`givemeurhats/main`), so a
+    /// contributor's `main` never matches the ROOT WORKTREE on ours.
     /// Serialized with the other worktree ops, so two PR SESSIONS launched
     /// together get one checkout, not a race to create it.
     pub(crate) async fn pr_worktree(
@@ -1999,12 +2028,23 @@ impl Daemon {
 
     // ---- run terminals ----
 
-    /// `r` on a worktree: start its RUN COMMAND — `.nebula.json`'s `run`,
-    /// read fresh from the worktree's checkout, else the main checkout's —
-    /// in the worktree's RUN TERMINAL. A run that already exited lends its
-    /// row; one still going is the answer as it stands, so a second
-    /// client's `r` never starts a second server.
+    /// `r` on a worktree: start its RUN COMMAND — the project's
+    /// `run_command` setting (Settings → Project), else `.nebula.json`'s
+    /// `run`, read fresh from the worktree's checkout, else the main
+    /// checkout's — in the worktree's RUN TERMINAL. A run that already
+    /// exited lends its row; one still going is the answer as it stands,
+    /// so a second client's `r` never starts a second server.
     pub fn start_run(self: &Arc<Self>, worktree_id: &WorktreeId) -> Result<EntityId> {
+        self.start_run_with(worktree_id, &crate::config::Config::load())
+    }
+
+    /// [`Daemon::start_run`] against a given config, for the tests that
+    /// can't pin the settings file.
+    pub fn start_run_with(
+        self: &Arc<Self>,
+        worktree_id: &WorktreeId,
+        config: &crate::config::Config,
+    ) -> Result<EntityId> {
         let worktree = self
             .store
             .get_worktree(worktree_id)?
@@ -2022,8 +2062,12 @@ impl Daemon {
             .store
             .get_project(&worktree.project_id)?
             .map_or_else(|| worktree.path.clone(), |p| p.repo_path);
-        let command = project_file::command(&worktree.path, &main, ProjectCommand::Run)
-            .map_err(anyhow::Error::msg)?;
+        let command = match config.run_command(&main) {
+            Some(command) => command.to_string(),
+            None => project_file::lookup(&worktree.path, &main, ProjectCommand::Run)
+                .map_err(anyhow::Error::msg)?
+                .context(NO_RUN_COMMAND)?,
+        };
         let mut term = match existing {
             Some(mut term) => {
                 self.store.set_terminal_run_command(&term.id, &command)?;
@@ -2313,6 +2357,40 @@ impl Daemon {
         cloud_task: Option<&str>,
         initial_prompt: Option<&str>,
     ) -> Result<Arc<PtySession>> {
+        // A session the user sent to Claude's background (`/background`)
+        // can't be resumed, only attached to — see `claude_bg`. The probe
+        // costs a login shell, so it hides behind the one-`stat` hint.
+        let attach = if cloud_task.is_none() && self.claude_job_hint(agent) {
+            self.claude_background_id(agent)
+        } else {
+            None
+        };
+        self.spawn_agent_pty(
+            agent,
+            worktree,
+            cols,
+            rows,
+            cloud_task,
+            initial_prompt,
+            attach.as_deref(),
+        )
+    }
+
+    /// [`Self::spawn_agent_session_with`] past its look for a backgrounded
+    /// Claude session: `attach` is the id `claude attach` takes, and wins
+    /// over a resume of the stored session id — and over `initial_prompt`,
+    /// which `attach` has no way to submit.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_agent_pty(
+        self: &Arc<Self>,
+        agent: &Agent,
+        worktree: &Worktree,
+        cols: u16,
+        rows: u16,
+        cloud_task: Option<&str>,
+        initial_prompt: Option<&str>,
+        attach: Option<&str>,
+    ) -> Result<Arc<PtySession>> {
         // Whatever spawns this agent, it runs in `worktree` from here: a
         // relocation still pending for it has been overtaken.
         self.pending_moves.lock().unwrap().remove(&agent.id);
@@ -2364,6 +2442,7 @@ impl Daemon {
                 if agent.kind == AgentKind::Claude
                     && cloud_task.is_none()
                     && cmd_override.is_none()
+                    && attach.is_none()
                     && claude_transcript_exists(&self.claude_projects_dirs(), sid)
                         == Some(false) =>
             {
@@ -2416,15 +2495,27 @@ impl Daemon {
             rule.as_deref(),
             initial_prompt,
         );
-        let (program, args, resumed) = match cloud_task {
-            Some(task) => claude_cloud_spawn_command(
+        let (program, args, resumed) = match (cloud_task, attach) {
+            (Some(task), _) => claude_cloud_spawn_command(
                 &harness,
                 task,
                 agent.model.as_deref(),
                 agent.effort.as_deref(),
                 cmd_override.as_deref(),
             ),
-            None => agent_spawn_command_with(
+            // Never a watched resume: an attach that dies at once keeps the
+            // row's session id, and the pane keeps the CLI's reason.
+            (None, Some(id)) => {
+                if prompts.initial.is_some() {
+                    tracing::warn!(agent = %agent.id, "backgrounded Claude session — `claude attach` takes no prompt, dropping the initial one");
+                }
+                (
+                    harness.program.trim().to_string(),
+                    claude_bg::attach_args(id),
+                    false,
+                )
+            }
+            (None, None) => agent_spawn_command_with(
                 &harness,
                 agent.session_id.as_deref(),
                 Some(&worktree.path),
@@ -2524,6 +2615,27 @@ impl Daemon {
         if agent.kind == AgentKind::Claude
             && claude_transcript_exists(&self.claude_projects_dirs(), &sid) == Some(true)
         {
+            // One reason Claude refuses a good id: the session runs in its
+            // background daemon now, and only `claude attach` opens it. The
+            // spawn's own look missed it — its job-dir hint is Claude's
+            // private layout, free to move — so this one asks outright.
+            agent.session_id = Some(sid);
+            if let Some(attach) = self.claude_background_id(&agent) {
+                let Ok(Some(worktree)) = self.store.get_worktree(&agent.worktree_id) else {
+                    return;
+                };
+                tracing::info!(agent = %id, attach = %attach, "resume refused for a backgrounded session — attaching");
+                if self
+                    .spawn_agent_pty(&agent, &worktree, cols, rows, None, None, Some(&attach))
+                    .is_ok()
+                {
+                    agent.alive = true;
+                    self.broadcast(ServerEvent::EntityUpserted {
+                        entity: Entity::Agent(agent),
+                    });
+                }
+                return;
+            }
             tracing::info!(agent = %id, "resume failed fast with its transcript intact — keeping the session id");
             return;
         }
@@ -2555,6 +2667,32 @@ impl Daemon {
             }
             _ => None,
         }
+    }
+
+    /// Whether Claude keeps a background job under `agent`'s session id —
+    /// the cheap look that earns [`Self::claude_background_id`] its probe.
+    /// The job dirs sit beside the projects dirs, in the same config dir.
+    fn claude_job_hint(&self, agent: &Agent) -> bool {
+        let Some(sid) = claude_resumable_session(agent) else {
+            return false;
+        };
+        self.claude_projects_dirs()
+            .iter()
+            .filter_map(|projects| projects.parent())
+            .any(|config| claude_bg::job_hint(config, sid))
+    }
+
+    /// The id `claude attach` takes for `agent`'s session, when `claude
+    /// agents --json` lists it as a background session. The listing runs
+    /// through the login shell the agent itself would: the same `claude`,
+    /// the same `CLAUDE_CONFIG_DIR`.
+    fn claude_background_id(&self, agent: &Agent) -> Option<String> {
+        let sid = claude_resumable_session(agent)?;
+        let listing = ["agents".to_string(), "--json".to_string()];
+        let (program, args) = login_shell_wrap(&user_shell(), agent.kind.cli_program(), &listing);
+        let id = claude_bg::probe(&program, &args, sid)?;
+        tracing::info!(agent = %agent.id, session = %sid, attach = %id, "Claude session runs in the background");
+        Some(id)
     }
 
     /// Every Claude projects dir a transcript may sit in: the ones this
@@ -2753,6 +2891,16 @@ fn claude_config_dir() -> Option<PathBuf> {
         .or_else(|| env::home_dir().map(|home| home.join(".claude")))
 }
 
+/// The session id a spawn of `agent` would hand `claude --resume` — the
+/// only kind of session Claude can have sent to its background. None under
+/// the `NEBULA_AGENT_CMD` override (tests), which never resumes.
+fn claude_resumable_session(agent: &Agent) -> Option<&str> {
+    if agent.kind != AgentKind::Claude || std::env::var(env::AGENT_CMD).is_ok() {
+        return None;
+    }
+    agent.session_id.as_deref()
+}
+
 /// Whether Claude Code still holds the transcript `claude --resume <id>`
 /// reads — `<projects>/<cwd slug>/<id>.jsonl` under any of `roots`, in any
 /// slug: a session `nebula worktree` relocated keeps its transcript where
@@ -2839,10 +2987,7 @@ fn agent_spawn_command(
 /// no legacy entries — what a fresh install launches.
 #[cfg(test)]
 fn test_registry() -> Vec<nebula_core::harness::HarnessDescriptor> {
-    harness_registry_in(
-        &std::collections::BTreeMap::new(),
-        &[],
-    )
+    harness_registry_in(&std::collections::BTreeMap::new(), &[])
 }
 
 /// The pinned descriptor `kind` launches as in spawn tests.
@@ -3093,7 +3238,15 @@ fn claude_cloud_spawn_command(
     cmd_override: Option<&str>,
 ) -> (String, Vec<String>, bool) {
     let (program, mut args, resumed) = agent_spawn_command_with(
-        harness, None, None, model, effort, cmd_override, None, None, false,
+        harness,
+        None,
+        None,
+        model,
+        effort,
+        cmd_override,
+        None,
+        None,
+        false,
     );
     if cmd_override.is_none() {
         args.insert(0, format!("--cloud={task}"));
@@ -3123,6 +3276,16 @@ pub(crate) fn sanitize_title(raw: &str) -> String {
 /// symlinks (`/tmp` → `/private/tmp`) otherwise break `starts_with`.
 fn canonical_or_raw(path: &Path) -> std::path::PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Does this agent still have a backgrounded tool call running — a job it
+/// cut loose from its terminal, which the turn that started it has already
+/// left behind? An unknown child pid counts as busy, as for terminals.
+fn agent_has_detached_job(session: &PtySession) -> bool {
+    match session.child_pid {
+        Some(pid) => crate::pty::detached_job_under(pid),
+        None => true,
+    }
 }
 
 /// Does this terminal's shell have any child processes (a command or job
@@ -3375,7 +3538,11 @@ mod tests {
         // Fresh sessions: bare CLI (Claude plus its system-prompt guidance).
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, None, None, None, None),
-            ("claude".into(), guided("--append-system-prompt", &[]), false)
+            (
+                "claude".into(),
+                guided("--append-system-prompt", &[]),
+                false
+            )
         );
         // Codex/cursor always run in skip-permissions mode.
         assert_eq!(
@@ -3397,7 +3564,11 @@ mod tests {
         // relocated session's new cwd never dies on a stale id.
         assert_eq!(
             agent_spawn_command(AgentKind::Pi, Some("sid-4"), None, None, None),
-            ("pi".into(), guided("--append-system-prompt", &["--session-id", "sid-4"]), true)
+            (
+                "pi".into(),
+                guided("--append-system-prompt", &["--session-id", "sid-4"]),
+                true
+            )
         );
         // Muse boots bare and fresh: no resume flag is mapped yet, so a
         // stored session id is ignored rather than sent.
@@ -3412,7 +3583,11 @@ mod tests {
         // Claude resumes with a flag; codex with a subcommand (order matters).
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, Some("sid-1"), None, None, None),
-            ("claude".into(), guided("--append-system-prompt", &["--resume", "sid-1"]), true)
+            (
+                "claude".into(),
+                guided("--append-system-prompt", &["--resume", "sid-1"]),
+                true
+            )
         );
         // Skip-permissions flags trail the resume args. A codex resume is
         // told its checkout (`--cd`): without it codex reopens the session
@@ -3468,13 +3643,20 @@ mod tests {
             agent_spawn_command(AgentKind::Claude, None, Some("opus"), Some("high"), None),
             (
                 "claude".into(),
-                guided("--append-system-prompt", &["--model", "opus", "--effort", "high"]),
+                guided(
+                    "--append-system-prompt",
+                    &["--model", "opus", "--effort", "high"]
+                ),
                 false
             )
         );
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, None, None, Some("max"), None),
-            ("claude".into(), guided("--append-system-prompt", &["--effort", "max"]), false)
+            (
+                "claude".into(),
+                guided("--append-system-prompt", &["--effort", "max"]),
+                false
+            )
         );
         // Codex takes --model plus a config override for effort, after --yolo.
         assert_eq!(
@@ -3497,13 +3679,20 @@ mod tests {
             agent_spawn_command(AgentKind::Pi, None, Some("sonnet"), Some("high"), None),
             (
                 "pi".into(),
-                guided("--append-system-prompt", &["--model", "sonnet", "--thinking", "high"]),
+                guided(
+                    "--append-system-prompt",
+                    &["--model", "sonnet", "--thinking", "high"]
+                ),
                 false
             )
         );
         assert_eq!(
             agent_spawn_command(AgentKind::Pi, None, None, Some("off"), None),
-            ("pi".into(), guided("--append-system-prompt", &["--thinking", "off"]), false)
+            (
+                "pi".into(),
+                guided("--append-system-prompt", &["--thinking", "off"]),
+                false
+            )
         );
         // Muse takes `--model` verbatim and no effort flag yet: effort is
         // dropped, never sent.
@@ -3521,7 +3710,10 @@ mod tests {
             agent_spawn_command(AgentKind::Claude, Some("sid"), Some("sonnet"), None, None),
             (
                 "claude".into(),
-                guided("--append-system-prompt", &["--resume", "sid", "--model", "sonnet"]),
+                guided(
+                    "--append-system-prompt",
+                    &["--resume", "sid", "--model", "sonnet"]
+                ),
                 true
             )
         );
@@ -3843,7 +4035,10 @@ mod tests {
             true,
         );
         assert!(resumed);
-        let mut expected = guided("--append-system-prompt", &["--resume", "sid", "--model", "opus"]);
+        let mut expected = guided(
+            "--append-system-prompt",
+            &["--resume", "sid", "--model", "opus"],
+        );
         expected.push("carry on".into());
         assert_eq!(args, expected);
         // Codex and cursor take it as their trailing positional too.
@@ -3879,7 +4074,10 @@ mod tests {
         );
         // A fresh spawn with a starting prompt (an AGENT PRESET launch):
         // model, effort and system prompt all precede it.
-        let mut expected = guided("--append-system-prompt", &["--model", "opus", "--effort", "high"]);
+        let mut expected = guided(
+            "--append-system-prompt",
+            &["--model", "opus", "--effort", "high"],
+        );
         expected.push("fix auth".into());
         assert_eq!(
             agent_spawn_command_with(
@@ -4391,7 +4589,11 @@ mod tests {
         let (dir, worktree) = run_worktree(&daemon);
 
         let missing = daemon.start_run(&worktree.id).unwrap_err();
-        assert!(missing.to_string().contains("no .nebula.json"), "{missing}");
+        assert!(
+            missing.to_string().contains("Settings (s) → Project")
+                && missing.to_string().contains(".nebula.json"),
+            "names both places: {missing}"
+        );
         assert!(daemon
             .store
             .run_terminals_in(&worktree.id)
@@ -4426,6 +4628,61 @@ mod tests {
             .is_empty());
         // Nothing left to stop is not an error.
         daemon.stop_run(&worktree.id).unwrap();
+    }
+
+    /// The project's `run_command` setting (Settings → Project) is what
+    /// `r` runs when it is set, over whatever `.nebula.json` says; blank,
+    /// the file decides as before; a project's setting is its own; and a
+    /// file that won't parse is still that file's error, not "no command".
+    #[tokio::test]
+    async fn the_project_setting_wins_over_the_project_file() {
+        let daemon = test_daemon();
+        let (dir, worktree) = run_worktree(&daemon);
+        let config =
+            |json: String| -> crate::config::Config { serde_json::from_str(&json).unwrap() };
+        let entry = |path: &Path, run: &str| {
+            config(format!(
+                r#"{{"projects": {{"{}": {{"run_command": "{run}"}}}}}}"#,
+                path.display()
+            ))
+        };
+        let run_with = |cfg: &crate::config::Config| -> String {
+            let EntityId::Terminal(id) = daemon.start_run_with(&worktree.id, cfg).unwrap() else {
+                panic!("a run lives in a terminal");
+            };
+            let command = daemon.store.get_terminal(&id).unwrap().unwrap().run_command;
+            daemon.stop_run(&worktree.id).unwrap();
+            command.unwrap()
+        };
+
+        // No file: the setting is the whole answer.
+        assert_eq!(run_with(&entry(dir.path(), "sleep 31")), "sleep 31");
+        // Both: the setting wins.
+        std::fs::write(dir.path().join(".nebula.json"), r#"{"run": "sleep 30"}"#).unwrap();
+        assert_eq!(run_with(&entry(dir.path(), "sleep 31")), "sleep 31");
+        // Blank, or another project's: the file.
+        assert_eq!(run_with(&entry(dir.path(), "   ")), "sleep 30");
+        assert_eq!(
+            run_with(&entry(Path::new("/tmp/other"), "sleep 31")),
+            "sleep 30"
+        );
+        // Neither: the message names both.
+        std::fs::remove_file(dir.path().join(".nebula.json")).unwrap();
+        let err = daemon
+            .start_run_with(&worktree.id, &entry(dir.path(), ""))
+            .unwrap_err();
+        assert!(err.to_string().contains("Settings (s) → Project"), "{err}");
+        // A broken file is its own complaint, whatever the setting isn't.
+        std::fs::write(dir.path().join(".nebula.json"), "{").unwrap();
+        let err = daemon
+            .start_run_with(&worktree.id, &crate::config::Config::default())
+            .unwrap_err();
+        assert!(err.to_string().contains(".nebula.json:"), "{err}");
+        assert_eq!(
+            run_with(&entry(dir.path(), "sleep 31")),
+            "sleep 31",
+            "and the setting never opens the file"
+        );
     }
 
     /// A run that ends on its own keeps its output for the attach that
@@ -4653,6 +4910,25 @@ mod tests {
             "a PR whose branch the root has checked out is already there"
         );
 
+        // A fork's `main` is not that branch: the client names its checkout
+        // for the fork's owner, so the root is no match — the contributor's
+        // commit gets a checkout of its own, shared like any other.
+        git_in(&repo, &["commit", "--allow-empty", "-m", "fork work"]);
+        git_in(&repo, &["push", "origin", "HEAD:refs/pull/129/head"]);
+        git_in(&repo, &["reset", "--hard", "origin/main"]);
+        let fork = daemon
+            .pr_worktree(&project, 129, "someone/main")
+            .await
+            .unwrap();
+        assert!(!fork.is_main, "a fork's main is never the ROOT WORKTREE");
+        assert_eq!(fork.branch, "someone/main");
+        assert_eq!(fork.path, git::worktree_dir(&repo, "someone/main"));
+        let again = daemon
+            .pr_worktree(&project, 129, "someone/main")
+            .await
+            .unwrap();
+        assert_eq!(again.id, fork.id, "and later launches share it");
+
         // A bad head never reaches git — it is refused ahead of the lookup.
         let err = daemon
             .create_pr_agent(crate::pr_scope::CreatePrAgentSpec {
@@ -4665,10 +4941,31 @@ mod tests {
                 auto_title: false,
                 pr_url: "https://github.com/o/r/pull/7".into(),
                 head: "--force".into(),
+                starting_prompt: None,
             })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not a branch name"), "{err}");
+
+        // A preset's composed prompt rides the same create, and is held to
+        // `CreateAgent`'s rules once the checkout is found: it reaches the
+        // agent create, where the NUL is refused.
+        let err = daemon
+            .create_pr_agent(crate::pr_scope::CreatePrAgentSpec {
+                project: project.clone(),
+                name: "pr".into(),
+                kind: AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                auto_title: true,
+                pr_url: "https://github.com/o/r/pull/7".into(),
+                head: "feat-x".into(),
+                starting_prompt: Some("fix\0auth".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("NUL"), "{err}");
     }
 
     /// The ISSUE SESSION's URL is checked at the boundary like the PR
@@ -5785,12 +6082,13 @@ mod tests {
     fn cli_missing_message_names_the_binary_not_the_kind() {
         // Cursor ships its agent as `cursor-agent`; naming the kind would
         // send the user off to install the wrong thing.
+        assert!(cli_missing_message(AgentKind::Cursor.cli_program())
+            .starts_with("cursor-agent was not found"));
+        assert!(cli_missing_message(AgentKind::Claude.cli_program())
+            .starts_with("claude was not found"));
         assert!(
-            cli_missing_message(AgentKind::Cursor.cli_program())
-                .starts_with("cursor-agent was not found")
+            cli_missing_message(AgentKind::Codex.cli_program()).starts_with("codex was not found")
         );
-        assert!(cli_missing_message(AgentKind::Claude.cli_program()).starts_with("claude was not found"));
-        assert!(cli_missing_message(AgentKind::Codex.cli_program()).starts_with("codex was not found"));
         assert!(cli_missing_message(AgentKind::Pi.cli_program()).starts_with("pi was not found"));
         assert!(cli_missing_message("agy").starts_with("agy was not found"));
         // No "restart nebula": agent CLIs are spawned through the user's

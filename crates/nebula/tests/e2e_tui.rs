@@ -485,14 +485,11 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(ENTER);
     tui.wait_for_text(FOOTER_SESSIONS);
 
-    // ---- create an agent: kind picker → name prompt, auto-attaches ----
+    // ---- create an agent: kind picker, Enter launches, auto-attaches ----
     tui.send(b"n");
-    tui.wait_for_text("New session"); // Claude/Codex/Cursor/Terminal picker
-    tui.send(ENTER); // pick the default (Claude)
+    tui.wait_for_text("New session"); // Claude/Codex/Cursor/Pi picker
+    tui.send(ENTER); // pick the default (Claude): no box follows
     tui.wait_for_gone("New session");
-    tui.wait_for_text("New agent");
-    tui.send(ENTER); // empty input falls back to "agent-1"
-    tui.wait_for_gone("New agent");
     tui.wait_for_text("agent-1"); // now provably the sessions-panel row
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED); // auto-attach locks input
 
@@ -618,11 +615,8 @@ fn nebula_open_from_inside_a_session_raises_the_file_tabs() {
     // ---- an agent (the stand-in shell), auto-attached and locked ----
     tui.send(b"n");
     tui.wait_for_text("New session");
-    tui.send(ENTER);
+    tui.send(ENTER); // no box follows the pick
     tui.wait_for_gone("New session");
-    tui.wait_for_text("New agent");
-    tui.send(ENTER);
-    tui.wait_for_gone("New agent");
     tui.wait_for_text("agent-1");
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
 
@@ -778,6 +772,154 @@ fn tui_pull_request_row_leads_the_pull_requests_group() {
     tui.wait_for_text("can't be deleted");
 }
 
+/// The ISSUES MODAL opens on rows fetched before `i` is ever pressed. A stub
+/// `gh` on PATH answers `issue list` with one issue and records each call:
+/// the record appears with no key sent — selecting the project is what
+/// asks — and the modal then opens on that answer without a second ask.
+#[test]
+fn tui_issues_are_prefetched_before_the_modal_opens() {
+    let stub_bin = tempfile::tempdir().unwrap();
+    let calls = stub_bin.path().join("issue-list-calls");
+    let gh = stub_bin.path().join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "case \"$1 $2\" in\n",
+                "  'issue list') echo x >> '{calls}'; printf '%s' '[{{\"number\":15,",
+                "\"title\":\"Fix login redirect\",\"url\":\"https://github.com/o/r/issues/15\",",
+                "\"author\":{{\"login\":\"webdevcody\"}},\"createdAt\":\"2026-09-10T12:00:00Z\",",
+                "\"updatedAt\":\"2026-09-11T12:00:00Z\",\"labels\":[],\"body\":\"Login bounces.\"}}]' ;;\n",
+                "  'issue view') printf '%s' '{{\"url\":\"https://github.com/o/r/issues/15\",\"comments\":[]}}' ;;\n",
+                "  *) exit 1 ;;\n",
+                "esac\n",
+            ),
+            calls = calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        stub_bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let mut tui = TuiHarness::spawn_with_env(&[("PATH", path)]);
+    let repo = tui.make_repo("issues-proj");
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "issues-proj");
+    tui.wait_for_text("⌂ root");
+
+    // No `i` yet: the list is asked for because the project is selected.
+    let deadline = Instant::now() + WAIT;
+    while !calls.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "gh issue list never ran in the background\n--- screen ---\n{}",
+            tui.screen_text()
+        );
+        std::thread::sleep(POLL_STEP);
+    }
+
+    // The modal opens on the prefetched row — and spends no second process
+    // on a list that just landed (or is still landing).
+    tui.send(b"i");
+    tui.wait_for_text("Issues — issues-proj (1)");
+    tui.wait_for_text("#15 Fix login redirect");
+    let asks = std::fs::read_to_string(&calls).unwrap().lines().count();
+    assert_eq!(asks, 1, "opening on a fresh list asks GitHub again");
+    tui.send(ESC);
+    tui.wait_for_gone("Issues — issues-proj");
+}
+
+/// `E` in the ISSUES MODAL edits the issue in place: the reading pane
+/// becomes a form on the row's title and description, and Enter sends both
+/// as one `gh issue edit` — the title on argv, the description on stdin —
+/// then puts the reading pane back on the new text. A stub `gh` on PATH
+/// answers the list and records the edit it is sent.
+#[test]
+fn tui_issues_modal_edits_the_issue_in_place() {
+    // A stub `gh` that answers the list from what the last edit sent it,
+    // as GitHub would, and records each edit it is sent.
+    let stub_bin = tempfile::tempdir().unwrap();
+    let edits = stub_bin.path().join("calls");
+    let gh = stub_bin.path().join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "dir='{dir}'\n",
+                "case \"$1 $2\" in\n",
+                "  'issue list')\n",
+                "    title='Fix login redirect'; body='Login bounces.'\n",
+                "    [ -f \"$dir/title\" ] && title=$(cat \"$dir/title\")\n",
+                "    [ -f \"$dir/body\" ] && body=$(cat \"$dir/body\")\n",
+                "    printf '[{{\"number\":15,\"title\":\"%s\",\"url\":\"https://github.com/o/r/issues/15\",",
+                "\"author\":{{\"login\":\"webdevcody\"}},\"createdAt\":\"2026-09-10T12:00:00Z\",",
+                "\"updatedAt\":\"2026-09-11T12:00:00Z\",\"labels\":[],\"body\":\"%s\"}}]' \"$title\" \"$body\" ;;\n",
+                "  'issue view') printf '%s' '{{\"url\":\"https://github.com/o/r/issues/15\",\"comments\":[]}}' ;;\n",
+                "  'issue edit')\n",
+                "    echo \"argv: $*\" >> \"$dir/calls\"\n",
+                "    printf '%s' \"${{4#--title=}}\" > \"$dir/title\"\n",
+                "    cat > \"$dir/body\"\n",
+                "    printf 'stdin: ' >> \"$dir/calls\"; cat \"$dir/body\" >> \"$dir/calls\"; echo >> \"$dir/calls\" ;;\n",
+                "  *) exit 1 ;;\n",
+                "esac\n",
+            ),
+            dir = stub_bin.path().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        stub_bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let mut tui = TuiHarness::spawn_with_env(&[("PATH", path)]);
+    let repo = tui.make_repo("issues-proj");
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "issues-proj");
+    tui.wait_for_text("⌂ root");
+    tui.send(b"i");
+    tui.wait_for_text("#15 Fix login redirect");
+
+    // The form opens on the row's text, caret at the end of the title.
+    tui.send(b"E");
+    tui.wait_for_text("Edit issue #15");
+    tui.wait_for_text("Title  Fix login redirect");
+    tui.send(b"!");
+    tui.wait_for_text("Fix login redirect!");
+    tui.send(TAB);
+    tui.send(b" Again.");
+    tui.wait_for_text("Login bounces. Again.");
+
+    // Enter sends the edit and the pane comes back on the new text.
+    tui.send(ENTER);
+    tui.wait_for_text("issue #15 updated");
+    tui.wait_for_gone("Edit issue #15");
+    tui.wait_for_text("#15 Fix login redirect!");
+    let sent = std::fs::read_to_string(&edits).unwrap();
+    assert!(
+        sent.contains("argv: issue edit 15 --title=Fix login redirect! --body-file -"),
+        "{sent}"
+    );
+    assert!(sent.contains("stdin: Login bounces. Again."), "{sent}");
+
+    // Esc from the form drops the draft and keeps the modal.
+    tui.send(b"E");
+    tui.wait_for_text("Edit issue #15");
+    tui.send(ESC);
+    tui.wait_for_gone("Edit issue #15");
+    tui.wait_for_text("Issues — issues-proj");
+    tui.send(ESC);
+    tui.wait_for_gone("Issues — issues-proj");
+}
+
 #[test]
 fn tui_git_diff_modal() {
     let mut tui = TuiHarness::spawn();
@@ -921,4 +1063,145 @@ fn tui_branch_switcher_moves_the_root_checkout() {
         "{}",
         String::from_utf8_lossy(&stashes.stdout)
     );
+}
+
+/// An SGR mouse report as the terminal would send it: `button` (0 = left,
+/// 32 = left held while moving) at 0-based `col`,`row`.
+fn sgr_mouse(button: u16, col: u16, row: u16, release: bool) -> Vec<u8> {
+    format!(
+        "\x1b[<{button};{};{}{}",
+        col + 1,
+        row + 1,
+        if release { 'm' } else { 'M' }
+    )
+    .into_bytes()
+}
+
+/// Where `needle` first appears on screen: (row, col), in cells.
+fn find_text(screen: &vt100::Screen, needle: &str) -> Option<(u16, u16)> {
+    screen_to_text(screen)
+        .lines()
+        .enumerate()
+        .find_map(|(row, line)| {
+            let at = line.find(needle)?;
+            Some((row as u16, line[..at].chars().count() as u16))
+        })
+}
+
+/// How far back the pane says it is scrolled — the `scroll N` tag in the
+/// TERMINAL header — or 0 at the live tail.
+fn scrolled(screen: &vt100::Screen) -> usize {
+    let text = screen_to_text(screen);
+    text.match_indices("scroll ")
+        .filter_map(|(at, _)| {
+            let digits: String = text[at + 7..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// A drag-select past the pane's top edge scrolls the history under the
+/// pointer on the event loop's own beat — with no further mouse report —
+/// and the release copies rows that were never on screen together. A stub
+/// clipboard tool on PATH catches the copy.
+#[test]
+fn tui_drag_past_the_pane_top_autoscrolls_and_copies_the_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let stub_bin = tempfile::tempdir().unwrap();
+    let copied = stub_bin.path().join("copied");
+    // Whichever tool this platform's copy reaches for.
+    for tool in ["pbcopy", "xclip", "xsel", "wl-copy"] {
+        let stub = stub_bin.path().join(tool);
+        std::fs::write(&stub, format!("#!/bin/sh\ncat > {}\n", copied.display())).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        stub_bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut tui = TuiHarness::spawn_with_env(&[("PATH", path)]);
+    let repo = tui.make_repo("drag-proj");
+
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "drag-proj");
+    tui.send(ENTER); // Projects → Worktrees
+    tui.wait_for_text(FOOTER_WORKTREES);
+    tui.send(ENTER); // Worktrees → Sessions
+    tui.wait_for_text(FOOTER_SESSIONS);
+    tui.send(b"n");
+    tui.wait_for_text("New session");
+    tui.send(ENTER);
+    tui.wait_for_gone("New session");
+    tui.wait_for_text("agent-1");
+    tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
+
+    // Sixty numbered rows out of the stand-in shell: twice the pane's height.
+    tui.type_str("i=1; while [ $i -le 60 ]; do echo \"row $i\"; i=$((i+1)); done");
+    tui.send(ENTER);
+    tui.wait_for_text("row 60");
+
+    // The pane's first content row is two below its TERMINAL header;
+    // `row 58` sits near the bottom of the pane.
+    let (header_row, content_top, row58, col58) = {
+        let parser = tui.parser.lock().unwrap();
+        let screen = parser.screen();
+        let (header_row, _) = find_text(screen, "TERMINAL").expect("the pane header");
+        let (row58, col58) = find_text(screen, "row 58").expect("row 58 on screen");
+        (header_row, header_row + 2, row58, col58)
+    };
+    assert!(
+        row58 > content_top + 5,
+        "row 58 is well inside the pane (header {header_row})"
+    );
+    // Rows on screen above `row 58` at the press; the top one is
+    // `row {58 - visible_above}`.
+    let visible_above = usize::from(row58 - content_top);
+    let off_screen_row = format!("row {}", 58 - visible_above - 3);
+    assert!(!tui.screen_text().contains(&off_screen_row));
+
+    // Press on the last character of `row 58`, drag up onto the pane's
+    // top row, then one row further — onto the rule above it — and rest.
+    tui.send(&sgr_mouse(0, col58 + 5, row58, false));
+    tui.send(&sgr_mouse(32, col58, content_top, false));
+    tui.send(&sgr_mouse(32, col58, content_top - 1, false));
+    // The loop's beat scrolls the history under the resting pointer; the
+    // header counts the lines.
+    tui.wait_for("the pane to scroll back under the held drag", |s| {
+        scrolled(s) >= 5
+    });
+    tui.wait_for_text(&off_screen_row);
+
+    // Release there: the copy runs from rows above anything that was on
+    // screen at the press down to `row 58`.
+    tui.send(&sgr_mouse(0, col58, content_top - 1, true));
+    tui.wait_for_text("copied");
+    let deadline = Instant::now() + WAIT;
+    while !std::fs::read_to_string(&copied).is_ok_and(|t| t.ends_with("row 58")) {
+        assert!(
+            Instant::now() < deadline,
+            "the copy never reached the stub clipboard"
+        );
+        std::thread::sleep(POLL_STEP);
+    }
+    let text = std::fs::read_to_string(&copied).unwrap();
+    let rows: Vec<&str> = text.lines().collect();
+    assert!(
+        rows.len() >= visible_above + 6,
+        "rows above the screen at the press are in the copy: {} rows, {visible_above} visible above row 58\n{text}",
+        rows.len()
+    );
+    assert!(text.contains(&off_screen_row), "{text}");
+    // Every row is one the shell printed, in order.
+    let first: usize = rows[0]
+        .strip_prefix("row ")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("a numbered row first: {:?}", rows[0]));
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(*row, format!("row {}", first + i), "{text}");
+    }
 }

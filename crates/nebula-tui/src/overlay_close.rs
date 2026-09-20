@@ -80,12 +80,14 @@ pub(crate) fn click_outside(app: &mut App, out: &mut Vec<ClientRequest>) {
             | Overlay::FileTabs(_)
             | Overlay::Metrics(_)
             | Overlay::Hosts(_)
-            | Overlay::Issues(_)
             | Overlay::BranchSwitch(_),
         ) => app.overlay = None,
         // Confirm, Prompt, the AGENT PRESETS list and the PRESET EDITOR each
         // have a side effect on the way out that their own Esc already
-        // spells out; none of the four stages it.
+        // spells out; none of the four stages it. The ISSUES MODAL's Esc
+        // does stage, once: with the ISSUE EDITOR up it puts the reading
+        // pane back first, and a click outside steps back the same way
+        // rather than dropping the draft with the modal.
         Some(_) => crate::event_loop::handle_overlay_key(app, esc(), out),
     }
 }

@@ -1128,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "nebula"
-version = "0.27.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1146,7 +1146,7 @@ dependencies = [
 
 [[package]]
 name = "nebula-core"
-version = "0.27.0"
+version = "0.33.0"
 dependencies = [
  "directories",
  "rmp-serde",
@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "nebula-daemon"
-version = "0.27.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1185,15 +1185,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nebula-fuzzy"
+version = "0.33.0"
+
+[[package]]
 name = "nebula-tui"
-version = "0.27.0"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "base64",
  "crossterm",
  "futures",
  "nebula-core",
+ "nebula-fuzzy",
  "portable-pty",
+ "pulldown-cmark",
  "ratatui",
  "rmp-serde",
  "serde",
@@ -1203,6 +1209,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui-term",
+ "unicode-width",
  "vt100",
 ]
 
@@ -1532,6 +1539,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+dependencies = [
+ "bitflags 2.13.1",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]
@@ -2437,6 +2455,12 @@ dependencies = [
  "serde",
  "web-time",
 ]
+
+[[package]]
+name = "unicase"
+version = "2.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
 name = "unicode-ident"

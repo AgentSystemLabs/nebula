@@ -8,7 +8,7 @@ use nebula_core::{
     TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
 };
 use ratatui::layout::{Position, Rect};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 /// Frame duration of the status-sweep text animation: the event loop's
@@ -16,14 +16,27 @@ use std::path::PathBuf;
 /// size of [`App::sweep_phase`] (one text cell per frame).
 pub const SWEEP_FRAME: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// How many recently shown sessions keep their screen ([`App::term_cache`]).
-/// Two covers the flip between a pair of worktrees and a three-way rotation;
-/// each entry is a whole `vt100` parser, so this is not a number to grow.
-pub const TERM_CACHE_MAX: usize = 2;
-/// The largest screen worth keeping, in grid cells (32 bytes each, so this
-/// is about 12 MB). An alt-screen CLI is a screen's worth; a shell whose
-/// 10 000-line scrollback has filled is tens of megabytes, and re-parsing
-/// that on the way back is cheaper than holding it.
+/// How long a ONE-SHOT SWEEP runs: the sweep a row takes for a change that
+/// happened while nobody was looking — a turn finishing unread (blue), a
+/// checkout's pull request merging (purple) — before it settles into its
+/// still color. Two or three passes of the band: long enough to catch the
+/// eye from another panel, short enough that motion keeps meaning *live*.
+/// Only running and needs-feedback rows sweep for as long as they last.
+pub const ONE_SHOT_SWEEP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How many recently shown sessions keep their screen ([`App::term_cache`]):
+/// enough for a rotation through the sessions of a couple of worktrees.
+/// What bounds the memory is [`TERM_CACHE_CELLS`], not this.
+pub const TERM_CACHE_MAX: usize = 6;
+/// The most the kept screens may hold between them, in grid cells (32 bytes
+/// each, so about 12 MB — half of what two entries of that size each used to
+/// be allowed). An alt-screen CLI is a screen's worth, 200 KB; a shell whose
+/// 10 000-line scrollback has filled is tens of megabytes on its own, and
+/// used never to be kept at all — every return to it re-parsed the whole
+/// ring, 33 ms of blank pane under the INPUT LATENCY PROBE. Now a screen
+/// that does not fit is kept WITHOUT its history ([`AttachedTerm::
+/// drop_history`]): the return paints on the keypress like any other, and
+/// the history is replayed if the user scrolls up into it.
 pub const TERM_CACHE_CELLS: usize = 400_000;
 
 /// Wall-clock epoch ms, comparable to the daemon's `status_changed_at`.
@@ -58,12 +71,24 @@ pub enum HitTarget {
     Project(usize),
     Worktree(usize),
     Session(usize),
+    /// The FOLLOW-UP CHEVRON at the right end of a session card's name row
+    /// (index into `App::visible_session_rows()`); a click expands or folds
+    /// that card's FOLLOW-UP COMPOSER, same as the space key. Registered
+    /// ahead of the row it sits on, so it wins.
+    SessionFollowUp(usize),
+    /// The open FOLLOW-UP COMPOSER's box. Registered ahead of its row so a
+    /// click inside the box lands on the box — typing into it must not read
+    /// as a second click on the card, which would attach and lock the pane.
+    FollowUpBox,
     /// The ARCHIVED group header (either form); a click toggles the group
     /// open/closed, same as the A key.
     ArchivedHeader,
     /// The Worktrees panel's OPEN PRS group header (either form); a click
     /// folds the group down to its count or opens it back up.
     OpenPrsHeader,
+    /// The Worktrees panel's ISSUES group header (either form); a click
+    /// folds or opens it, as the OPEN PRS header's does.
+    IssuesHeader,
     /// Panel background (registered after rows, so rows win).
     PanelBg(Focus),
     TerminalPane,
@@ -74,6 +99,9 @@ pub enum HitTarget {
     /// logical (0 Projects, 1 Worktrees, 2 Sessions), so hidden panels keep
     /// their remembered widths without owning a boundary.
     Splitter(usize),
+    /// The small collapse button in a sidebar panel's header row (right
+    /// end). A click hides that panel, the same as its `Shift+` hotkey.
+    CollapsePanel(Focus),
 }
 
 /// Default widths of the Projects / Worktrees / Sessions panels. Sessions
@@ -88,6 +116,15 @@ pub const DEFAULT_PANEL_WIDTHS: [u16; 3] = [20, 22, 32];
 pub const WORKSPACES_BAR_H: u16 = 4;
 /// A panel can't be dragged narrower than this.
 pub const MIN_PANEL_W: u16 = 10;
+/// Height of the hidden workspaces bar: one rail row carrying an expand
+/// chevron at the same right-end column the bar's collapse chevron sits
+/// in. Clickable across the whole row.
+pub const COLLAPSED_BAR_H: u16 = 1;
+/// Width of a collapsed sidebar panel's rail: the column rule itself,
+/// with the expand chevron drawn over it on the header row. Clickable
+/// along its whole height. The panel's remembered width is untouched
+/// while it is a rail, so expanding restores it.
+pub const COLLAPSED_RAIL_W: u16 = 1;
 /// The terminal pane always keeps at least this much width.
 pub const MIN_TERM_W: u16 = 20;
 
@@ -198,6 +235,15 @@ pub enum MenuAction {
     /// no id: the row is the selection, and the fetch reads it back off the
     /// cursor the same way `g` does.
     ViewPrDiff,
+    /// Open the COMMENT BOX on the selected pull request. Like
+    /// `ViewPrDiff`, carries no id: the row is the selection, and `y`
+    /// reads it off the cursor the same way.
+    CommentPullRequest,
+    /// Expand the selected session card into its FOLLOW-UP COMPOSER, or
+    /// fold it back up. Carries no id for the same reason `ViewPrDiff`
+    /// doesn't: the card is the selection, and Space reads it off the
+    /// cursor the same way.
+    FollowUp,
     EditLink(LinkId),
     DeleteLink(LinkId),
     DeleteWorktree(WorktreeId),
@@ -224,6 +270,8 @@ pub enum MenuAction {
     ToggleArchived,
     /// Fold / unfold the PROJECT OPEN PRS GROUP (Worktrees panel menu).
     ToggleOpenPrs,
+    /// Fold / unfold the PROJECT ISSUES GROUP (Worktrees panel menu).
+    ToggleIssues,
     /// Flip the `hide_draft_prs` SETTING from the Worktrees panel menu:
     /// drafts out of the group and `/`, or back in.
     ToggleDraftPrs,
@@ -476,11 +524,13 @@ pub enum PendingAction {
     },
     DeleteLink(LinkId),
     /// `d` in the AGENT PRESETS list: drop the preset at `index` from the
-    /// store. Both answers reopen the list for `worktree`, so the modal the
+    /// store. Both answers reopen the list for `worktree` — as the QUICK
+    /// PROMPT picker for `quick`'s box when it was one — so the modal the
     /// confirm evicted comes back where the user left it.
     DeleteAgentPreset {
         index: usize,
         worktree: WorktreeId,
+        quick: Option<Box<crate::quick_prompt::QuickReturn>>,
     },
     /// `R` in the settings overlay: rewrite config.json from the defaults
     /// (every setting and every hotkey), then reopen the overlay on them.
@@ -515,24 +565,6 @@ pub enum PromptKind {
         /// empty input, so the name offered is the name created.
         suggestion: String,
     },
-    /// The PR SESSION's name prompt — the one launch that still asks for
-    /// a name: `CreatePrAgent` carries no STARTING PROMPT, so the box the
-    /// NEW SESSION PICKER otherwise ends in has nothing to send for it.
-    /// Enter creates the session; an empty name takes the generated
-    /// default and opts into AUTO-TITLE.
-    NewPrAgent {
-        worktree: WorktreeId,
-        kind: AgentKind,
-        /// Registry id when `kind` is [`AgentKind::Custom`].
-        custom: Option<String>,
-        /// Resolved launch options (picker choice or configured default);
-        /// None = the CLI's own default.
-        model: Option<String>,
-        effort: Option<String>,
-        /// OPEN PRS launch context, carried through the prompt so Enter
-        /// can send `CreatePrAgent`.
-        pr: crate::pull_request::PrLaunch,
-    },
     /// Final task input for a one-shot `claude --cloud <task>` launch,
     /// opened straight from the picker's `Claude · cloud` row. Multi-row:
     /// Shift+Enter inserts task newlines where the one-line prompts submit.
@@ -552,16 +584,28 @@ pub enum PromptKind {
     /// The QUICK PROMPT's task: one multi-row box, opened by its hotkey
     /// from anywhere, that launches an AGENT in the selected WORKTREE with
     /// the typed text as its STARTING PROMPT. It carries the whole launch
-    /// spec, resolved when the dialog opens (as [`PromptKind::NewPrAgent`]'s
-    /// options are) so the title can show what Enter is about to start —
-    /// and rewritten in place by the box's `Tab` / `Shift+Tab` pickers. The
-    /// NEW SESSION PICKER ends in this same box (`QuickOrigin::NewSession`).
+    /// spec, resolved when the dialog opens so the title can show what
+    /// Enter is about to start — and rewritten in place by the box's `Tab`
+    /// / `Shift+Tab` pickers. The NEW SESSION PICKER never ends here: its
+    /// pick creates the session outright.
     QuickPrompt(crate::quick_prompt::QuickLaunch),
     /// A message to queue on a row's Claude Cloud session
     /// (`claude -p <message> --cloud <id>`). Multi-row like the launch task:
     /// steering a cloud agent is rarely one line.
     CloudMessage {
         id: AgentId,
+    },
+    /// A comment to post on the pull request under the cursor — a
+    /// PROJECT OPEN PRS GROUP row or the Sessions panel's PR ROW — with
+    /// `gh pr comment` (`y`, or **Comment…** from the row's menu).
+    /// Multi-row like the cloud message: a review note is rarely one
+    /// line, and it is markdown. Carries the pull request the box was
+    /// opened on, so Enter posts where the title said it would.
+    PrComment {
+        number: u64,
+        url: String,
+        /// Row text, `#42 title` — what the box is titled with.
+        label: String,
     },
     RenameAgent {
         id: AgentId,
@@ -578,8 +622,13 @@ pub enum PromptKind {
     /// Enter on it: the one-line prompt stands in for the overlay while the
     /// value is typed, and both Enter and Esc put the overlay back on the
     /// row it left. An empty value is the row's default, not a cancel.
+    /// `project` is the repo path of the project a PROJECT TAB row
+    /// (`SettingKind::is_project`) was opened on, so the value lands in
+    /// that project's entry even if the selection moves meanwhile; None
+    /// for a top-level row.
     SettingText {
         kind: crate::config::SettingKind,
+        project: Option<std::path::PathBuf>,
     },
     /// Name for a workspace created from the switcher; opened on Ack.
     NewWorkspace,
@@ -590,6 +639,30 @@ pub enum PromptKind {
     EditLink {
         id: LinkId,
     },
+    /// `c` in the ISSUES MODAL: a comment to post on the issue under the
+    /// cursor, as you, with `gh issue comment`. Multi-row like the tasks —
+    /// a comment is rarely one line. Enter posts it off the loop and puts
+    /// the modal back on its row while the answer lands; Esc, or an empty
+    /// box, puts the modal back without posting.
+    IssueComment {
+        view: crate::issues::IssuesView,
+        issue: crate::issues::IssueRef,
+    },
+}
+
+impl PromptKind {
+    /// The checkout this box is addressed to — the one its Enter launches
+    /// into — to rewrite when a stand-in becomes the real row. None for a
+    /// box that names no checkout, and for a QUICK PROMPT about to cut
+    /// one of its own.
+    pub fn worktree_mut(&mut self) -> Option<&mut WorktreeId> {
+        match self {
+            PromptKind::ClaudeCloudTask { worktree, .. }
+            | PromptKind::AgentPresetTask { worktree, .. } => Some(worktree),
+            PromptKind::QuickPrompt(launch) => launch.worktree_mut(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -628,6 +701,11 @@ impl PromptDialog {
             list_area: Rect::default(),
             area: Rect::default(),
         };
+        // The task and comment boxes hold line breaks; the rest are one
+        // line. The field itself then knows which keys break a line and
+        // whether a paste keeps its newlines.
+        let multiline = prompt.is_multiline();
+        prompt.input.set_multiline(multiline);
         prompt.refresh_dirs();
         prompt
     }
@@ -638,15 +716,17 @@ impl PromptDialog {
     }
 
     /// The task prompts — the Claude Cloud launch task, a message to a live
-    /// cloud session, an AGENT PRESET's task and the QUICK PROMPT — are the
-    /// ones with a multi-row editor.
+    /// cloud session, an AGENT PRESET's task and the QUICK PROMPT — and an
+    /// issue comment are the ones with a multi-row editor.
     pub fn is_multiline(&self) -> bool {
         matches!(
             self.kind,
             PromptKind::ClaudeCloudTask { .. }
                 | PromptKind::CloudMessage { .. }
+                | PromptKind::PrComment { .. }
                 | PromptKind::AgentPresetTask { .. }
                 | PromptKind::QuickPrompt { .. }
+                | PromptKind::IssueComment { .. }
         )
     }
 
@@ -791,9 +871,91 @@ pub struct DiffView {
     /// HEAD OID the marks are scoped to (empty on an unborn HEAD). A moved
     /// HEAD — commit, checkout — resets the worktree's marks on next open.
     pub head_key: String,
+    /// BACKGROUND READS: with it, the file list and every file's diff are
+    /// read off the loop (`git_diff::load_selected_diff`); without (a view
+    /// built by a test, a pull request's prefetched view), inline.
+    pub jobs: Option<crate::view_jobs::Jobs>,
+    /// This view's own ticket, carried by every diff it asks for, so text
+    /// read for an earlier modal never lands in this one's cache.
+    pub id: u64,
+    /// The `git status` this view opened ahead of, by ticket: the list is
+    /// empty and says `reading changes…` until the listing lands.
+    pub listing: Option<u64>,
+    /// The selected file's diff in flight, by ticket. `diff` keeps the text
+    /// it had meanwhile (`view_jobs::STALE_GRACE`) — see `shown`.
+    pub waiting: Option<u64>,
+    /// The file `diff` is the diff of. Differs from the selected file while
+    /// that one's read is in flight, which is when a reviewed ✓ — a
+    /// fingerprint of the text on screen — must not be taken.
+    pub shown: Option<String>,
+    /// Diffs read while this modal has been open, newest last: walking
+    /// back onto a file shows it on the keypress (and re-reads it behind,
+    /// so an agent's edit meanwhile still shows up), and the row after the
+    /// cursor is read ahead. Bounded by [`DIFF_CACHE_BYTES`]; gone with
+    /// the modal.
+    pub cache: Vec<(String, std::sync::Arc<str>)>,
+    /// The file list folded into a directory tree (`Ctrl+t`, see
+    /// `diff_tree`); `None` is the flat list. While it is up the cursor is
+    /// the tree's — `selected` and `matches` stay current underneath, so
+    /// toggling back lands on a list that is already right.
+    pub tree: Option<crate::diff_tree::DiffTree>,
 }
 
+/// The most diff text a DIFF VIEWER keeps beyond the one on screen. Two
+/// megabytes is a few hundred ordinary files' worth, and an entry over
+/// [`DIFF_CACHE_ENTRY_MAX`] is never kept: re-reading one huge diff is
+/// cheaper than holding it.
+pub const DIFF_CACHE_BYTES: usize = 2 * 1024 * 1024;
+pub const DIFF_CACHE_ENTRY_MAX: usize = 512 * 1024;
+
 impl DiffView {
+    /// A view up before its file list is: `g` opens this at once and
+    /// `event_loop::land_view_answer` fills it when `git status` answers.
+    pub fn opening(
+        root: PathBuf,
+        branch: String,
+        jobs: crate::view_jobs::Jobs,
+        listing: u64,
+    ) -> Self {
+        let mut view = Self::new(root, branch, Vec::new(), true);
+        view.jobs = Some(jobs);
+        view.listing = Some(listing);
+        view
+    }
+
+    /// The cached diff of `path`, if this modal has read it.
+    pub fn cached(&self, path: &str) -> Option<std::sync::Arc<str>> {
+        self.cache
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, text)| text.clone())
+    }
+
+    /// Keep `diff` as the diff of `path`, dropping the oldest entries to
+    /// stay inside the budget.
+    pub fn cache_put(&mut self, path: &str, diff: &str) {
+        self.cache.retain(|(p, _)| p != path);
+        if diff.len() > DIFF_CACHE_ENTRY_MAX {
+            return;
+        }
+        self.cache.push((path.to_string(), diff.into()));
+        let mut held: usize = self.cache.iter().map(|(_, text)| text.len()).sum();
+        while held > DIFF_CACHE_BYTES && self.cache.len() > 1 {
+            held -= self.cache.remove(0).1.len();
+        }
+    }
+
+    /// Put `diff` on screen as the diff of `path`. `keep_scroll` is a
+    /// re-read of the file already showing: the reader's place is kept.
+    pub fn show_diff(&mut self, path: Option<&str>, diff: String, keep_scroll: bool) {
+        self.diff_line_count = diff.lines().count();
+        self.diff = diff;
+        self.shown = path.map(str::to_string);
+        if !keep_scroll {
+            self.scroll = 0;
+        }
+    }
+
     pub fn new(root: PathBuf, branch: String, files: Vec<DiffFile>, head_ok: bool) -> Self {
         let mut view = Self {
             root,
@@ -815,6 +977,13 @@ impl DiffView {
             pr_url: None,
             reviewed: HashMap::new(),
             head_key: String::new(),
+            jobs: None,
+            id: crate::view_jobs::ticket(),
+            listing: None,
+            waiting: None,
+            shown: None,
+            cache: Vec::new(),
+            tree: None,
         };
         view.apply_filter();
         view
@@ -843,34 +1012,204 @@ impl DiffView {
         self.scroll = scrolled_by(self.scroll, delta, self.max_scroll());
     }
 
-    /// Clamped absolute selection in the filtered list; true when it changed
-    /// (the caller reloads the diff).
+    /// Clamped absolute selection in the list on screen — the filtered
+    /// files, or the tree's rows; true when it changed (the caller reloads
+    /// the diff).
     pub fn select(&mut self, index: i64) -> bool {
+        if let Some(tree) = &mut self.tree {
+            return tree.select(index);
+        }
         let clamped = clamp_selection(index, self.matches.len());
         let changed = clamped != self.selected;
         self.selected = clamped;
         changed
     }
 
-    /// The file behind the current selection, if any row is visible.
+    /// The cursor's row in the list on screen: an index into `matches`, or
+    /// into the tree's rows.
+    pub fn cursor(&self) -> usize {
+        self.tree.as_ref().map_or(self.selected, |t| t.selected)
+    }
+
+    /// How many rows the list on screen has.
+    pub fn row_count(&self) -> usize {
+        self.tree
+            .as_ref()
+            .map_or(self.matches.len(), |t| t.rows.len())
+    }
+
+    /// The file behind the current selection, if any row is visible — and,
+    /// in the tree, if that row is a file's.
     pub fn selected_file(&self) -> Option<&DiffFile> {
-        self.files.get(self.matches.get(self.selected)?.file)
+        match &self.tree {
+            Some(tree) => self.files.get(tree.selected_file()?),
+            None => self.files.get(self.matches.get(self.selected)?.file),
+        }
+    }
+
+    /// The directory the tree's cursor rests on, as its path.
+    pub fn selected_dir(&self) -> Option<&str> {
+        let node = self.tree.as_ref()?.selected_node()?;
+        node.is_dir.then_some(node.path.as_str())
+    }
+
+    /// The selected row's path: the file's, or a tree directory's.
+    pub fn selected_path(&self) -> Option<&str> {
+        self.selected_file()
+            .map(|f| f.path.as_str())
+            .or_else(|| self.selected_dir())
+    }
+
+    /// Put the cursor on the row for `path`, in whichever list is showing.
+    /// False, and the cursor left alone, when no row has it.
+    pub fn select_path(&mut self, path: &str) -> bool {
+        if let Some(tree) = &mut self.tree {
+            return tree.select_path(path, &self.filter);
+        }
+        let row = self
+            .matches
+            .iter()
+            .position(|m| self.files[m.file].path == path);
+        if let Some(row) = row {
+            self.selected = row;
+        }
+        row.is_some()
     }
 
     /// First visible row of the file list's stateless follow-window for a
     /// list of `height` rows.
     pub fn window_start(&self, height: usize) -> usize {
-        window_start(self.selected, height)
+        window_start(self.cursor(), height)
     }
 
-    /// Recompute `matches` from `filter` and reset the selection to the top
-    /// row; true when the selected file changed (the caller reloads the
-    /// diff).
+    /// Whether the cursor is still where opening the modal put it: the top
+    /// of the flat list, the tree's home row. A reader who has moved keeps
+    /// the file they are on when a fresh listing lands (`git_diff::
+    /// fill_view`); one who has not gets what a fresh open gives.
+    pub fn at_home(&self) -> bool {
+        match &self.tree {
+            Some(tree) => tree.selected == tree.home_row(),
+            None => self.selected == 0,
+        }
+    }
+
+    /// The next file down from the cursor in whichever list is showing —
+    /// what the DIFF VIEWER reads ahead, `↓` being the key it is walked
+    /// with. Tree directories are stepped over: they have no diff to read.
+    pub fn file_after_cursor(&self) -> Option<&DiffFile> {
+        match &self.tree {
+            Some(tree) => tree
+                .rows
+                .iter()
+                .skip(tree.selected + 1)
+                .find_map(|row| tree.file_of[row.node])
+                .and_then(|file| self.files.get(file)),
+            None => self.files.get(self.matches.get(self.selected + 1)?.file),
+        }
+    }
+
+    /// Recompute the rows from `filter` and send the cursor home — the top
+    /// row, or in the tree the best match (its first file when the filter
+    /// is empty); true when that moved it off the row it was on (the caller
+    /// reloads the diff).
     pub fn apply_filter(&mut self) -> bool {
         let before = self.matches.get(self.selected).map(|m| m.file);
         self.recompute_matches();
         self.selected = 0;
-        before != self.matches.first().map(|m| m.file)
+        match &mut self.tree {
+            Some(tree) => tree.apply_filter(&self.filter),
+            None => before != self.matches.first().map(|m| m.file),
+        }
+    }
+
+    /// Swap in a new file list (a pull request's diff refreshed under the
+    /// modal): both lists are rebuilt — the tree keeping what the reader
+    /// folded — and the cursor goes home; the caller moves it back
+    /// (`select_path`) and reloads the diff.
+    pub fn replace_files(&mut self, files: Vec<DiffFile>) {
+        self.files = files;
+        self.recompute_matches();
+        self.selected = 0;
+        if let Some(tree) = &self.tree {
+            self.tree = Some(tree.rebuilt(&self.files, &self.filter));
+        }
+    }
+
+    /// `Ctrl+t`: the other shape of the file list — flat paths, or the
+    /// directory tree (`diff_tree`). The cursor stays on the file it was on;
+    /// leaving the tree from a directory row, that directory's first file
+    /// stands in, since the flat list has no row for a directory. True when
+    /// the diff pane has something else to show (the caller reloads it).
+    pub fn toggle_tree(&mut self) -> bool {
+        let before = self.selected_file().map(|f| f.path.clone());
+        let target = match self.tree.take() {
+            Some(tree) => before.clone().or_else(|| {
+                let under = tree.files_under(tree.rows.get(tree.selected)?.node);
+                Some(self.files[*under.first()?].path.clone())
+            }),
+            None => {
+                self.tree = Some(crate::diff_tree::DiffTree::new(&self.files, &self.filter));
+                before.clone()
+            }
+        };
+        if let Some(path) = target {
+            self.select_path(&path);
+        }
+        before.is_none() || before != self.selected_file().map(|f| f.path.clone())
+    }
+
+    /// `Enter` on a tree directory's row, or a click on it: fold or unfold
+    /// it. True when that moved the cursor onto another row.
+    pub fn toggle_dir(&mut self, row: usize) -> bool {
+        match &mut self.tree {
+            Some(tree) => tree.toggle_row(row, &self.filter),
+            None => false,
+        }
+    }
+
+    /// `→` in the tree: open the directory, or step into an open one. True
+    /// when the cursor moved onto another row.
+    pub fn expand_selected(&mut self) -> bool {
+        match &mut self.tree {
+            Some(tree) => tree.expand_selected(&self.filter),
+            None => false,
+        }
+    }
+
+    /// `←` in the tree: fold the directory, or jump to the parent's row.
+    /// True when the cursor moved onto another row.
+    pub fn collapse_selected(&mut self) -> bool {
+        match &mut self.tree {
+            Some(tree) => tree.collapse_selected(&self.filter),
+            None => false,
+        }
+    }
+
+    /// What the diff pane shows for a tree directory's row: the files that
+    /// changed under it, each with its status code and its ✓.
+    pub fn dir_summary(&self) -> Option<String> {
+        let tree = self.tree.as_ref()?;
+        let row = tree.rows.get(tree.selected)?;
+        let dir = &tree.nodes[row.node];
+        if !dir.is_dir {
+            return None;
+        }
+        let under = tree.files_under(row.node);
+        let plural = if under.len() == 1 { "" } else { "s" };
+        let mut out = format!("{}/ — {} changed file{plural}\n", dir.path, under.len());
+        for file in under.into_iter().map(|f| &self.files[f]) {
+            let name = file
+                .path
+                .strip_prefix(dir.path.as_str())
+                .map_or(file.path.as_str(), |rest| rest.trim_start_matches('/'));
+            let mark = if self.reviewed.contains_key(&file.path) {
+                "✓"
+            } else {
+                " "
+            };
+            out.push_str(&format!("\n{} {mark} {name}", file.status_str()));
+        }
+        Some(out)
     }
 
     /// Rebuild the visible rows from `filter` and the reviewed marks: best
@@ -896,8 +1235,18 @@ impl DiffView {
     /// the file back to its natural spot. `None` when no row is selected,
     /// otherwise whether the selected file changed (the caller reloads the
     /// diff; it persists `reviewed` either way).
+    ///
+    /// The tree keeps its order — nothing sinks there — so the same sweep
+    /// moves the cursor instead: down to the next file still in the state
+    /// this one just left, staying put when there is none. A directory's
+    /// row has no mark of its own to toggle.
     pub fn toggle_reviewed(&mut self) -> Option<bool> {
         let path = self.selected_file()?.path.clone();
+        // The mark is a fingerprint of the diff that was read — not of
+        // whatever the pane still holds while this file's is in flight.
+        if self.waiting.is_some() && self.shown.as_deref() != Some(path.as_str()) {
+            return None;
+        }
         let before = self.matches.get(self.selected).map(|m| m.file);
         let unmarked = self.reviewed.remove(&path).is_some();
         if !unmarked {
@@ -905,6 +1254,15 @@ impl DiffView {
             self.reviewed.insert(path.clone(), mark);
         }
         self.recompute_matches();
+        if let Some(tree) = &mut self.tree {
+            let (files, reviewed) = (&self.files, &self.reviewed);
+            let next = (tree.selected + 1..tree.rows.len()).find(|&row| {
+                tree.file_of[tree.rows[row].node]
+                    .is_some_and(|f| reviewed.contains_key(&files[f].path) == unmarked)
+            });
+            tree.selected = next.unwrap_or(tree.selected);
+            return Some(next.is_some());
+        }
         let marks_visible = self
             .matches
             .iter()
@@ -964,6 +1322,11 @@ pub struct FileFinder {
     /// Screen rect of the result rows (query row excluded), written back
     /// during draw so clicks can hit-test rows.
     pub list_area: Rect,
+    /// The `git ls-files` this finder opened ahead of, by ticket
+    /// (`view_jobs`): the list is empty and says `listing files…` until
+    /// [`FileFinder::set_files`]. None once the listing is in hand — and
+    /// always, for a finder built with its files.
+    pub listing: Option<u64>,
 }
 
 impl FileFinder {
@@ -978,9 +1341,26 @@ impl FileFinder {
             selected: 0,
             area: Rect::default(),
             list_area: Rect::default(),
+            listing: None,
         };
         finder.apply_filter();
         finder
+    }
+
+    /// A finder up before its listing is: `f` opens this at once, and
+    /// `set_files` fills it when `git ls-files` answers. What is typed
+    /// meanwhile is kept, and narrows the list the moment there is one.
+    pub fn opening(root: PathBuf, branch: String, editor: String, listing: u64) -> Self {
+        let mut finder = Self::new(root, branch, editor, Vec::new());
+        finder.listing = Some(listing);
+        finder
+    }
+
+    /// The listing landed: rank it by whatever the query holds by now.
+    pub fn set_files(&mut self, files: Vec<String>) {
+        self.files = files;
+        self.listing = None;
+        self.apply_filter();
     }
 
     /// First visible row of the result list's stateless follow-window for a
@@ -1037,6 +1417,14 @@ pub struct GrepView {
     /// Screen rect of the result rows (query row excluded), written back
     /// during draw so clicks can hit-test rows.
     pub list_area: Rect,
+    /// BACKGROUND READS: with it, a search runs off the loop and lands in
+    /// [`GrepView::land`]; without (a view built by a test), inline.
+    pub jobs: Option<crate::view_jobs::Jobs>,
+    /// The search in flight, by ticket. The hits on screen meanwhile are the
+    /// previous query's — the title says `searching…`.
+    pub waiting: Option<u64>,
+    /// Stops the search in flight when the query moves on.
+    pub cancel: crate::view_jobs::Cancel,
 }
 
 impl GrepView {
@@ -1052,6 +1440,9 @@ impl GrepView {
             selected: 0,
             area: Rect::default(),
             list_area: Rect::default(),
+            jobs: None,
+            waiting: None,
+            cancel: crate::view_jobs::Cancel::default(),
         }
     }
 
@@ -1060,12 +1451,56 @@ impl GrepView {
     pub fn run_search(&mut self) {
         self.selected = 0;
         self.error = None;
+        // Whatever was being searched for is no longer the query.
+        self.cancel.cancel();
+        self.waiting = None;
         if self.query.chars().count() < crate::grep_search::MIN_QUERY_LEN {
             self.hits.clear();
             self.truncated = false;
             return;
         }
-        match crate::grep_search::search(&self.root, &self.query) {
+        let Some(jobs) = &self.jobs else {
+            let result = crate::grep_search::search(&self.root, &self.query);
+            self.show(result);
+            return;
+        };
+        let ticket = crate::view_jobs::ticket();
+        self.waiting = Some(ticket);
+        self.cancel = crate::view_jobs::Cancel::default();
+        let (root, query, cancel) = (
+            self.root.clone(),
+            self.query.to_string(),
+            self.cancel.clone(),
+        );
+        jobs.run(move || {
+            // The next character, typed at speed, cancels this before git
+            // is ever started.
+            std::thread::sleep(crate::view_jobs::GREP_DEBOUNCE);
+            if cancel.is_cancelled() {
+                return None;
+            }
+            let result = crate::grep_search::search_streaming(&root, &query, &cancel)?;
+            Some(crate::view_jobs::Answer::Grep { ticket, result })
+        });
+    }
+
+    /// A background search's answer: shown when it is the one being waited
+    /// on, dropped when the query has moved on since.
+    pub fn land(
+        &mut self,
+        ticket: u64,
+        result: Result<(Vec<crate::grep_search::GrepHit>, bool), String>,
+    ) {
+        if self.waiting != Some(ticket) {
+            return;
+        }
+        self.waiting = None;
+        self.show(result);
+    }
+
+    fn show(&mut self, result: Result<(Vec<crate::grep_search::GrepHit>, bool), String>) {
+        self.selected = 0;
+        match result {
             Ok((hits, truncated)) => {
                 self.hits = hits;
                 self.truncated = truncated;
@@ -1267,7 +1702,7 @@ pub enum Overlay {
     Hosts(HostsView),
     /// `e` in the SESSIONS PANEL: the AGENT PRESETS list.
     AgentPresets(crate::preset_overlays::AgentPresetsView),
-    /// The PRESET EDITOR form behind the list's `a` / `e`.
+    /// The PRESET EDITOR form behind the list's `Ctrl+a` / `Ctrl+e`.
     AgentPresetEditor(crate::preset_overlays::AgentPresetEditor),
     /// `i`: the ISSUES MODAL — the project's open GitHub issues.
     Issues(crate::issues::IssuesView),
@@ -1301,6 +1736,91 @@ pub struct PlaceholderRows {
     pub agent: AgentId,
 }
 
+/// A `CreateAgent` (or `CreatePrAgent`) as a launch surface drafts it —
+/// the NEW SESSION PICKER, the QUICK PROMPT, an AGENT PRESET's task box,
+/// the ISSUES MODAL. `event_loop::create_agent` turns it into the request
+/// and the PENDING INTENT that attaches the row; a draft aimed at a
+/// stand-in checkout waits on that checkout's own intent instead
+/// (`PendingIntent::SelectCreatedWorktree::launch`).
+///
+/// An empty `name` takes the generated default (agent-1, …) and opts the
+/// session into agent-driven auto-titling (`nebula rename` on the first
+/// prompt) — what every launch from the NEW SESSION PICKER and the QUICK
+/// PROMPT does. A name a surface does set is the user's choice and stays.
+#[derive(Debug, Clone)]
+pub struct AgentLaunchDraft {
+    pub worktree: WorktreeId,
+    pub kind: AgentKind,
+    /// Registry id when `kind` is [`AgentKind::Custom`].
+    pub custom: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub name: String,
+    pub cloud_prompt: Option<String>,
+    /// An AGENT PRESET launch's composed first prompt (see
+    /// `ClientRequest::CreateAgent::starting_prompt`).
+    pub starting_prompt: Option<String>,
+    /// The prompt (and its typed text) to bring back should the daemon
+    /// refuse the create — so a rejected preset task is not lost.
+    pub reopen_on_error: Option<(PromptKind, String)>,
+    /// OPEN PRS launch context: this launch is a PR SESSION, scoped to that
+    /// pull request and run in a checkout of its head branch.
+    pub pr: Option<crate::pull_request::PrLaunch>,
+    /// ISSUES MODAL launch context: this launch is an ISSUE SESSION, and
+    /// the DAEMON persists the URL as the row's context (see
+    /// `ClientRequest::CreateAgent::issue_url`).
+    pub issue_url: Option<String>,
+    /// Enter and lock the TERMINAL PANE once the create is acked. True for
+    /// every launch the user walked a picker to reach; the QUICK PROMPT
+    /// passes the `quick_prompt_focus` SETTING, which is off by default.
+    pub focus_pane: bool,
+    /// The stand-in session row already on screen for this create (a
+    /// QUICK PROMPT into a worktree that did not exist, a launch that
+    /// waited on the NEW WORKTREE modal's checkout): the Ack turns it
+    /// into the created row, an Error drops it.
+    pub placeholder: Option<AgentId>,
+    /// Land the cursors, the pane and FOCUS on the created session when
+    /// its Ack arrives. False only for the second half of a two-request
+    /// launch (a checkout cut first, then the session) whose first half
+    /// the user navigated away from: the create is born in
+    /// `App::left_behind`, so the manual move still outranks the follow.
+    pub follow: bool,
+}
+
+impl AgentLaunchDraft {
+    /// A launch of `kind` at `model` / `effort` into `worktree` with
+    /// nothing else said: no name (the row titles itself), no first
+    /// prompt, no pull request or issue behind it, no box to bring back,
+    /// no stand-in row, and the pane taken — what a launch the user walked
+    /// a picker to reach looks like. Every launch surface starts from this
+    /// and names only what is its own (`..AgentLaunchDraft::new(…)`), so a
+    /// field added here has one default instead of one per surface that
+    /// would otherwise have to remember it.
+    pub fn new(
+        worktree: WorktreeId,
+        kind: AgentKind,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Self {
+        Self {
+            worktree,
+            kind,
+            custom: None,
+            model,
+            effort,
+            name: String::new(),
+            cloud_prompt: None,
+            starting_prompt: None,
+            reopen_on_error: None,
+            pr: None,
+            issue_url: None,
+            focus_pane: true,
+            placeholder: None,
+            follow: true,
+        }
+    }
+}
+
 /// What to do when an Ack (or Error) for this req_id arrives.
 #[derive(Debug, Clone)]
 pub enum PendingIntent {
@@ -1310,6 +1830,10 @@ pub enum PendingIntent {
     /// cursor off whatever panel the create was fired from.
     AttachCreated {
         focus: bool,
+        /// The stand-in session row up for this create — a launch that
+        /// waited on the NEW WORKTREE modal's checkout: the Ack turns it
+        /// into the created row, an Error drops it.
+        placeholder: Option<AgentId>,
     },
     /// Attach on success; on failure, reopen the exact Cloud task so a
     /// transient daemon/CLI error never makes the user retype it.
@@ -1347,6 +1871,13 @@ pub enum PendingIntent {
         focus: Focus,
         prompt: PromptKind,
         text: String,
+        /// A launch fired into the stand-in while the DAEMON was still
+        /// cutting the checkout (`e` on the new row, an AGENT PRESET
+        /// run): its session row is up under the stand-in, and the Ack
+        /// sends the create into the real checkout
+        /// (`placeholder::defer_launch` / `replay_launch`). An Error
+        /// takes that row down with the checkout's.
+        launch: Option<Box<AgentLaunchDraft>>,
     },
     /// A QUICK PROMPT whose target was a worktree that did not exist yet:
     /// the Ack names the checkout the DAEMON cut, the cursor moves onto
@@ -1364,20 +1895,66 @@ pub enum PendingIntent {
     /// stand-in checkout row is adopted by the worktree's upsert as it
     /// lands (`placeholder::adopt_worktree`), the session row by the Ack,
     /// which then attaches it like `AttachCreated` — `focus` enters and
-    /// locks the pane. An Error takes down whatever is still a stand-in.
+    /// locks the pane. An Error takes down whatever is still a stand-in
+    /// and, like every other launch out of a box, brings `reopen`'s box
+    /// back with what was typed in it — this create is the one most
+    /// likely to be refused (a fetch offline, a fork since deleted, a
+    /// branch git will not cut), and a review prompt is not retyped
+    /// gladly. None for the `n` picker's name box, which has no task.
     AttachCreatedPrSession {
         focus: bool,
         placeholder: PlaceholderRows,
+        reopen: Option<(PromptKind, String)>,
+        /// The pull request the launch was fired from: where a cursor
+        /// still on the refused stand-in goes back to. The row it left had
+        /// no worktree, so `remember_context` recorded nothing to return
+        /// to, and `restore_context` alone would drop the cursor on the
+        /// ROOT WORKTREE — one `p` away from a session in the main
+        /// checkout.
+        pr_url: String,
     },
     /// Open the workspace this Ack just created (switcher's "New workspace…"
     /// flow: creating from there means you want to be in it).
     OpenCreatedWorkspace,
     /// Worktree removed optimistically; restore these rows on Error.
     DeleteWorktree(WorktreeRollback),
+    /// A row renamed, archived, unarchived or deleted on the keypress
+    /// (`event_loop::optimistic`): put it back on Error.
+    Undo(Undo),
     None,
 }
 
+/// A row as it was before an OPTIMISTIC UPDATE changed it.
+#[derive(Debug, Clone)]
+pub enum Undo {
+    /// Renamed or (un)archived in place: this is the row to show again.
+    Restore(Box<nebula_core::Entity>),
+    /// Deleted: the row, and the index it held in its `tree` list.
+    Reinsert {
+        index: usize,
+        entity: Box<nebula_core::Entity>,
+    },
+}
+
 impl PendingIntent {
+    /// Will this request's Ack move a cursor, the pane or FOCUS onto what
+    /// it created? Those are the follows a manual move cancels
+    /// (`App::left_behind`). The NEW WORKTREE modal's own Ack moves
+    /// nothing — its select happened at Enter — until a launch is waiting
+    /// on it.
+    pub fn follows(&self) -> bool {
+        match self {
+            PendingIntent::AttachCreated { .. }
+            | PendingIntent::AttachCreatedWithCloudRetry { .. }
+            | PendingIntent::AttachCreatedPrSession { .. }
+            | PendingIntent::LaunchInCreatedWorktree { .. }
+            | PendingIntent::SelectCreatedProject
+            | PendingIntent::OpenCreatedWorkspace => true,
+            PendingIntent::SelectCreatedWorktree { launch, .. } => launch.is_some(),
+            _ => false,
+        }
+    }
+
     /// The stand-in worktree row this in-flight request is holding up.
     pub fn placeholder_worktree(&self) -> Option<&WorktreeId> {
         match self {
@@ -1395,7 +1972,11 @@ impl PendingIntent {
         match self {
             PendingIntent::LaunchInCreatedWorktree { placeholder, .. }
             | PendingIntent::AttachCreatedPrSession { placeholder, .. } => Some(&placeholder.agent),
-            PendingIntent::AttachCreatedWithCloudRetry { placeholder, .. } => placeholder.as_ref(),
+            PendingIntent::AttachCreatedWithCloudRetry { placeholder, .. }
+            | PendingIntent::AttachCreated { placeholder, .. } => placeholder.as_ref(),
+            PendingIntent::SelectCreatedWorktree { launch, .. } => {
+                launch.as_ref().and_then(|draft| draft.placeholder.as_ref())
+            }
             _ => None,
         }
     }
@@ -1527,13 +2108,78 @@ impl SessionRow {
     }
 }
 
+/// One row of the WORKTREES PANEL, in cursor order — what `sel_worktree`
+/// indexes (see [`App::worktree_rows`]).
+#[derive(Debug, Clone, Copy)]
+pub enum WorktreeRow<'a> {
+    /// A checkout listed on its own: the ROOT WORKTREE, or a branch no
+    /// open pull request on screen is from.
+    Checkout(&'a Worktree),
+    /// A PROJECT OPEN PRS GROUP row.
+    Pr(&'a OpenPr),
+    /// A checkout on an open pull request's head branch — the one a PR
+    /// SESSION launched off that row works in (`CreatePrAgent` cuts or
+    /// reuses it), or one `n` cut on a branch a pull request was later
+    /// opened from — listed under that pull request's row rather than
+    /// among the plain checkouts, so the checkout and the pull request it
+    /// is for read as one thing.
+    PrCheckout {
+        worktree: &'a Worktree,
+        pr: &'a OpenPr,
+    },
+    /// A PROJECT ISSUES GROUP row: an issue open on the repo, listed under
+    /// the pull requests. No checkout and no sessions — the pane reads it,
+    /// as it reads a pull request row.
+    Issue(&'a crate::issues::Issue),
+}
+
+impl<'a> WorktreeRow<'a> {
+    /// The checkout the row is, wherever it sits: a plain one, or one
+    /// nested under its pull request. None on a pull request or issue row.
+    pub fn checkout(self) -> Option<&'a Worktree> {
+        match self {
+            WorktreeRow::Checkout(w) | WorktreeRow::PrCheckout { worktree: w, .. } => Some(w),
+            WorktreeRow::Pr(_) | WorktreeRow::Issue(_) => None,
+        }
+    }
+
+    /// The issue the row *is* — a PROJECT ISSUES GROUP row.
+    pub fn open_issue(self) -> Option<&'a crate::issues::Issue> {
+        match self {
+            WorktreeRow::Issue(issue) => Some(issue),
+            WorktreeRow::Checkout(_) | WorktreeRow::Pr(_) | WorktreeRow::PrCheckout { .. } => None,
+        }
+    }
+
+    /// The pull request the row *is* — the OPEN PRS row itself, not the
+    /// checkout nested under one: that row is a worktree, with a
+    /// worktree's keys and sessions, and its pull request is one row up.
+    pub fn open_pr(self) -> Option<&'a OpenPr> {
+        match self {
+            WorktreeRow::Pr(pr) => Some(pr),
+            WorktreeRow::Checkout(_) | WorktreeRow::PrCheckout { .. } | WorktreeRow::Issue(_) => {
+                None
+            }
+        }
+    }
+
+    /// The pull request a nested checkout sits under.
+    pub fn nested_under(self) -> Option<&'a OpenPr> {
+        match self {
+            WorktreeRow::PrCheckout { pr, .. } => Some(pr),
+            WorktreeRow::Checkout(_) | WorktreeRow::Pr(_) | WorktreeRow::Issue(_) => None,
+        }
+    }
+}
+
 /// What a click landed on, for the double-click window. Sessions are their
 /// own reference; a link has none (the pull-request row isn't even stored),
-/// so its URL is the identity.
+/// so its URL is the identity; a checkout is its id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowKey {
     Session(SessionRef),
     Link(String),
+    Worktree(WorktreeId),
 }
 
 /// Aggregate status for a worktree row: red > yellow > green > gray,
@@ -1600,6 +2246,40 @@ pub fn project_unseen(tree: &Tree, project_id: &ProjectId) -> usize {
         .filter(|w| &w.project_id == project_id)
         .map(|w| worktree_unseen(tree, &w.id))
         .sum()
+}
+
+/// Whether the agent's unread finish is recent enough (`ONE_SHOT_SWEEP`) to
+/// still be sweeping at `now` epoch ms. `unseen` is only ever true on a
+/// finished row, so `status_changed_at` is the finish itself. The stamp is
+/// the DAEMON's clock and `now` this client's, so the window is taken either
+/// side of it: a skewed pair sweeps a little off-time, never for an hour.
+pub fn fresh_done(agent: &Agent, now: i64) -> bool {
+    let window = ONE_SHOT_SWEEP.as_millis() as i64;
+    agent.unseen
+        && !agent.archived
+        && agent.status_changed_at > 0
+        && (now - agent.status_changed_at).abs() < window
+}
+
+/// [`fresh_done`] rolled up to a worktree row, the way [`worktree_unseen`]
+/// rolls the count up: some session under it just finished unread.
+pub fn worktree_fresh_done(tree: &Tree, worktree_id: &WorktreeId, now: i64) -> bool {
+    tree.agents
+        .iter()
+        .any(|a| &a.worktree_id == worktree_id && fresh_done(a, now))
+}
+
+/// The same over every worktree of a project.
+pub fn project_fresh_done(tree: &Tree, project_id: &ProjectId, now: i64) -> bool {
+    tree.worktrees
+        .iter()
+        .filter(|w| &w.project_id == project_id)
+        .any(|w| worktree_fresh_done(tree, &w.id, now))
+}
+
+/// And over every project of a workspace, for its tab.
+pub fn workspace_fresh_done(tree: &Tree, workspace_id: &WorkspaceId, now: i64) -> bool {
+    workspace_agents(tree, workspace_id).any(|a| fresh_done(a, now))
 }
 
 /// Every unarchived agent under every project in a workspace.
@@ -1851,6 +2531,14 @@ pub struct AttachedTerm {
     /// comes back as a gap-free delta onto the screen it left rather than a
     /// megabyte replay into a fresh parser (see [`App::term_cache`]).
     pub next_seq: u64,
+    /// The scrollback was let go while this screen sat in
+    /// [`App::term_cache`]: what is on screen is exact, what is above it is
+    /// gone. Scrolling up asks the DAEMON for the whole ring again
+    /// (`event_loop::rehydrate_history`), which rebuilds both.
+    pub history_dropped: bool,
+    /// The scroll offset to land on once that replay has rebuilt the
+    /// history: the notch that asked for it.
+    pub pending_scroll: Option<usize>,
 }
 
 impl AttachedTerm {
@@ -1866,6 +2554,8 @@ impl AttachedTerm {
             painted: false,
             booting: false,
             next_seq: 0,
+            history_dropped: false,
+            pending_scroll: None,
         }
     }
 
@@ -1882,6 +2572,7 @@ impl AttachedTerm {
         self.painted = false;
         self.booting = false;
         self.next_seq = 0;
+        self.history_dropped = false;
     }
 
     /// Apply a ring replay. One that continues exactly where this parser
@@ -1904,13 +2595,29 @@ impl AttachedTerm {
         if !self.painted {
             self.booting = true;
         }
+        // A replay asked for to get the history back lands the reader
+        // where the scroll that asked for it was headed.
+        if let Some(scroll) = self.pending_scroll.take() {
+            if rebuilt {
+                self.set_scroll(scroll);
+            }
+        }
         rebuilt
     }
 
-    /// Apply live output that follows what the parser holds.
+    /// Apply live output that follows what the parser holds. Bytes a replay
+    /// already covered are skipped: a second Attach of the session on
+    /// screen (the history replay) can cross a frame the first one's
+    /// forwarder had already queued, and parsing those bytes twice would
+    /// garble the screen the replay just rebuilt.
     pub fn apply_output(&mut self, seq: u64, data: &[u8]) {
-        self.next_seq = seq + data.len() as u64;
-        self.feed(data);
+        let end = seq + data.len() as u64;
+        if end <= self.next_seq {
+            return;
+        }
+        let covered = self.next_seq.saturating_sub(seq) as usize;
+        self.next_seq = end;
+        self.feed(&data[covered.min(data.len())..]);
     }
 
     fn feed(&mut self, data: &[u8]) {
@@ -1930,20 +2637,24 @@ impl AttachedTerm {
         }
     }
 
-    /// Rough footprint in grid cells: the visible grid plus every
-    /// scrollback row of the screen in use. `vt100` doesn't expose the
-    /// scrollback length, but its offset setter clamps to it. On the
-    /// alternate screen (a CLI in full-screen mode) this sees only that
-    /// screen's own, empty scrollback, so a shell with a long history
-    /// parked inside a full-screen program is under-counted — the one way
-    /// a cached screen can exceed [`TERM_CACHE_CELLS`].
-    pub fn estimated_cells(&mut self) -> usize {
-        let screen = self.parser.screen_mut();
-        let keep = screen.scrollback();
-        screen.set_scrollback(usize::MAX);
-        let lines = screen.scrollback();
-        screen.set_scrollback(keep);
+    /// Footprint in grid cells: the visible grid plus every scrollback row
+    /// the primary screen holds — also while a full-screen program is up
+    /// over it, which the offset-clamping trick this used to be could not
+    /// see (the vendored `vt100` now says, `Screen::scrollback_rows`).
+    pub fn estimated_cells(&self) -> usize {
+        let lines = self.parser.screen().scrollback_rows();
         (lines + self.rows as usize) * self.cols as usize
+    }
+
+    /// Let the scrollback go, keeping the screen: what a kept screen that
+    /// is over budget does instead of not being kept.
+    pub fn drop_history(&mut self) {
+        if self.parser.screen().scrollback_rows() == 0 {
+            return;
+        }
+        self.set_scroll(0);
+        self.parser.screen_mut().clear_scrollback();
+        self.history_dropped = true;
     }
 
     pub fn set_scroll(&mut self, scroll: usize) {
@@ -1970,26 +2681,42 @@ pub struct UiState {
     /// older blobs, which keep it open.
     #[serde(default)]
     pub open_prs_collapsed: bool,
+    /// The PROJECT ISSUES GROUP folded down to its header; absent in
+    /// older blobs, which keep it open.
+    #[serde(default)]
+    pub issues_collapsed: bool,
     /// Panel widths (projects, worktrees, sessions); absent in older blobs.
     #[serde(default)]
     pub panel_widths: Option<[u16; 3]>,
     /// Diff modal file-list width; absent in older blobs.
     #[serde(default)]
     pub diff_files_width: Option<u16>,
+    /// The diff modal's file list is the directory tree (`Ctrl+t`); absent
+    /// in older blobs, which keep the flat list.
+    #[serde(default)]
+    pub diff_tree: bool,
 }
 
-/// A mouse selection over the terminal pane (drag or double-click word), in
-/// pane-relative cell coordinates `(col, row)` with inclusive endpoints.
+/// A mouse selection over the terminal pane (drag or double-click word),
+/// with inclusive `(col, line)` endpoints: a pane-relative column and the
+/// screen's HISTORY LINE (`vt100::Screen::history_base`) — a number every
+/// row keeps as the view scrolls and as new output pushes it up into the
+/// scrollback. Anchored that way the highlight stays on its text while
+/// the pane scrolls under a drag (the EDGE AUTO-SCROLL, the wheel) and
+/// while the agent keeps printing, and the copy at release reads rows
+/// that have since left the screen.
 /// Nebula owns the mouse (the emulator's native shift+drag never reaches us
 /// reliably — Terminal.app has no such bypass at all), so selection is
 /// implemented app-side and copied to the system clipboard when it completes.
 /// The highlight persists after mouse-up; it's cleared by the next click,
-/// scrolling, typing into the PTY, or a resize/reattach (anything that moves
-/// the content under it — the selection is in screen coordinates).
+/// the wheel, typing into the PTY, a resize, or a replay that rebuilds the
+/// screen (its numbering starts over). A drag still in progress survives
+/// every one of those but the click: the button is the user's, and nothing
+/// here lets go of the selection until it comes up.
 #[derive(Debug, Clone, Copy)]
 pub struct TermSelection {
-    pub anchor: (u16, u16),
-    pub head: (u16, u16),
+    pub anchor: (u16, u64),
+    pub head: (u16, u64),
     /// Still being dragged (button down). Cleared on mouse-up.
     pub dragging: bool,
     /// A real selection, not just an armed click. Set once a drag leaves its
@@ -1997,11 +2724,16 @@ pub struct TermSelection {
     /// double-click word selection — which may be a single cell, so
     /// `anchor == head` can't be the "just a click" test.
     pub active: bool,
+    /// Where the pointer last was, in host cells, while dragging. The EDGE
+    /// AUTO-SCROLL re-reads the head from here on every tick, so a pointer
+    /// resting past the pane's top or bottom edge keeps selecting as the
+    /// history scrolls under it.
+    pub pointer: (u16, u16),
 }
 
 impl TermSelection {
-    /// Endpoints normalized to row-major order: (start, end).
-    pub fn bounds(&self) -> ((u16, u16), (u16, u16)) {
+    /// Endpoints normalized to line-major order: (start, end).
+    pub fn bounds(&self) -> ((u16, u64), (u16, u64)) {
         let anchor_key = (self.anchor.1, self.anchor.0);
         let head_key = (self.head.1, self.head.0);
         if anchor_key <= head_key {
@@ -2088,6 +2820,19 @@ pub struct PrDiffAnswer {
     pub diff: Option<String>,
 }
 
+/// A finished `gh pr comment`, back on the loop: which pull request (and
+/// the row text that titled its box), the text that was sent — handed
+/// back to the box when the post failed — and what `gh` said: the new
+/// comment's URL, or why it refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrCommentAnswer {
+    pub number: u64,
+    pub url: String,
+    pub label: String,
+    pub body: String,
+    pub result: Result<String, String>,
+}
+
 /// The pull request the TERMINAL PANE is reading instead of a session,
 /// wherever the cursor found it — a PROJECT OPEN PRS GROUP row or the
 /// SESSIONS PANEL's PR ROW. Just enough to fetch, title and scroll it.
@@ -2129,6 +2874,21 @@ pub struct FeedbackAlert {
     pub place: String,
 }
 
+/// The FOLLOW-UP COMPOSER: the box a session card grows when it is
+/// expanded, and the next turn being typed into it.
+///
+/// One at a time, because it owns the keyboard while it is open: the
+/// SESSIONS PANEL's own keys (`j`, `a`, `d`…) are letters, so a card with a
+/// live box takes every key the panel would otherwise act on. It is bound
+/// to the AGENT rather than to a row index — the list re-sorts on every
+/// status change, and the box has to stay on the card it was opened on.
+pub struct FollowUp {
+    pub agent: AgentId,
+    /// Multi-line, like the QUICK PROMPT's box: Enter sends, Shift+Enter /
+    /// ⌥Enter / `^J` break the line.
+    pub input: TextInput,
+}
+
 pub struct App {
     pub tree: Tree,
     pub focus: Focus,
@@ -2144,9 +2904,12 @@ pub struct App {
     /// the selection moved (so arrows follow the cursor but the wheel
     /// doesn't fight it).
     pub sessions_scroll: usize,
-    /// `(sel_worktree, sel_session)` as of the last draw — the draw
-    /// re-anchors `sessions_scroll` only when this changes.
-    pub sessions_anchor: Option<(usize, usize)>,
+    /// `(sel_worktree, sel_session, follow-up rows)` as of the last draw —
+    /// the draw re-anchors `sessions_scroll` only when this changes. The
+    /// third member is how tall the FOLLOW-UP COMPOSER drew: expanding a
+    /// card, and every line typed into it, scrolls the column after the box
+    /// the way a moved cursor scrolls it after the selection.
+    pub sessions_anchor: Option<(usize, usize, usize)>,
     /// First visible row of the Worktrees panel, in panel rows. Same
     /// contract as `sessions_scroll`: the wheel moves it freely, the draw
     /// clamps it and re-anchors on the cursor when `worktrees_anchor` shows
@@ -2215,11 +2978,18 @@ pub struct App {
     /// drops back onto it. Projects until the bar has been entered.
     pub bar_return: Focus,
     pub overlay: Option<Overlay>,
+    /// The expanded session card's FOLLOW-UP COMPOSER, or None with every
+    /// card folded. Not an `Overlay`: it draws inside the SESSIONS PANEL
+    /// and the panels stay live around it — what it takes is the keyboard,
+    /// not the screen.
+    pub follow_up: Option<FollowUp>,
     pub show_archived: bool,
     /// The Worktrees panel's OPEN PRS group folded down to its header (a
     /// click on it). Like `show_archived`, it rides the UI-state blob so a
     /// restart brings it back folded.
     pub open_prs_collapsed: bool,
+    /// The ISSUES group under it, folded and remembered the same way.
+    pub issues_collapsed: bool,
     /// Sidebars collapsed (z) — terminal takes the full width.
     pub collapsed: bool,
     /// Workspaces bar shown across the top of the body, with the panels
@@ -2227,18 +2997,29 @@ pub struct App {
     /// setting, which both `Shift+W` and the Appearance tab write — this
     /// field is the live copy, the config file is where it persists.
     pub show_workspaces: bool,
-    /// Projects panel hidden; mirrors CONFIG.JSON's `hide_projects`.
+    /// Projects panel collapsed to a rail; mirrors CONFIG.JSON's
+    /// `hide_projects` (the key predates rails and keeps its name so
+    /// existing configs carry over: `true` used to hide the panel
+    /// outright, now it collapses it).
     pub hide_projects: bool,
-    /// Worktrees panel hidden; mirrors CONFIG.JSON's `hide_worktrees`.
+    /// Worktrees panel collapsed to a rail; mirrors CONFIG.JSON's
+    /// `hide_worktrees` (same rename history as `hide_projects`).
     pub hide_worktrees: bool,
+    /// Sessions panel collapsed to a rail; mirrors CONFIG.JSON's
+    /// `hide_sessions`.
+    pub hide_sessions: bool,
     /// Draft pull requests left out of the PROJECT OPEN PRS GROUP and the
     /// `/` PALETTE; mirrors CONFIG.JSON's `hide_draft_prs` (Settings →
     /// Appearance, or the Worktrees panel menu). Read on every look at
     /// the list (`listed_open_prs`), never applied to what is stored.
     pub hide_draft_prs: bool,
-    /// The ROOT WORKTREE row left out of the Worktrees panel; mirrors
-    /// CONFIG.JSON's `hide_root_worktree` (Settings → Experimental).
-    pub hide_root_worktree: bool,
+    /// PROJECT SETTINGS as the panels read them: each project's own entry
+    /// keyed by repo path, and beside it what a project without one gets;
+    /// mirror CONFIG.JSON's `projects` map and `Config::project_fallback`
+    /// (Settings → Project). Resolved by `project_settings`; the one row
+    /// so far is read through `root_hidden`.
+    pub projects_config: BTreeMap<PathBuf, crate::config::ProjectSettings>,
+    pub project_fallback: crate::config::ProjectSettings,
     /// How many RECENT PROMPTS the SESSIONS PANEL lists under each
     /// session, newest at the bottom; 0 draws none. Mirrors CONFIG.JSON's
     /// `recent_prompts` switch and `recent_prompts_count` (Settings →
@@ -2247,12 +3028,26 @@ pub struct App {
     /// The KEY COMBO DISPLAY is on; mirrors CONFIG.JSON's `show_key_combos`
     /// (Settings → Experimental). `key_combo` is what it is showing.
     pub show_key_combos: bool,
+    /// PR & ISSUE COUNTS are on: each PROJECTS PANEL row counts its repo's
+    /// open pull requests and issues after its name; mirrors CONFIG.JSON's
+    /// `pr_issue_counts` (Settings → Experimental). Read through
+    /// `project_open_counts`, and what lets `issues::sweep_others` ask
+    /// about the projects the cursor is not on.
+    pub pr_issue_counts: bool,
     /// The last key press, spelled for the bottom-left of the screen with
     /// what it did, while the display is on and the press is fresh; the
     /// loop clears it after `key_combo::LINGER`. See `key_combo.rs`.
     pub key_combo: Option<crate::key_combo::KeyCombo>,
     pub next_req_id: u64,
     pub pending: HashMap<u64, PendingIntent>,
+    /// In-flight creates — keys of `pending` — the user has navigated away
+    /// from since firing them: a key or a click moved a cursor or FOCUS
+    /// while the DAEMON worked (a PR SESSION's fetch and `git worktree
+    /// add` are seconds). Their Ack still turns the stand-ins into the
+    /// real rows, but leaves the cursors, the pane and FOCUS where the
+    /// user put them — a manual move outranks a selection-follow. Filled
+    /// by `event_loop::handle_terminal_event`, emptied by the Ack or Error.
+    pub left_behind: std::collections::HashSet<u64>,
     /// `nebula --workspace <name>`: the workspace this instance was asked
     /// to open into, held until the first snapshot arrives with the names
     /// to resolve it against. Taken there — it applies once, at boot.
@@ -2283,6 +3078,13 @@ pub struct App {
     /// deadline — armed on every worktree context switch, so walking the
     /// list doesn't boot every CLI it passes.
     pub pending_prewarm: Option<(WorktreeId, std::time::Instant)>,
+    /// A refused PR SESSION's box that could not come back because another
+    /// modal was up when the refusal landed — the DAEMON fetches before it
+    /// refuses, seconds after Enter, so the user has usually moved on. It
+    /// is never put over that modal (whose own text would go); the next
+    /// quick prompt opened on the same pull request starts from it
+    /// instead, as a refused pull request comment does.
+    pub parked_pr_prompt: Option<(String, String)>,
     /// Debounced attach: the session the pane is showing but the daemon has
     /// not been told about yet. Stepping a selection is not a decision to
     /// boot a CLI — and in the Workspaces column every step is a full
@@ -2299,6 +3101,11 @@ pub struct App {
     pub next_keepwarm: Option<std::time::Instant>,
     /// Mouse drag-selection over the terminal pane, if any.
     pub term_selection: Option<TermSelection>,
+    /// The next EDGE AUTO-SCROLL tick: set while a drag-selection's pointer
+    /// rests past the pane's top or bottom edge, so the history keeps
+    /// scrolling under it on a fixed beat with no further mouse report;
+    /// None once the pointer is back inside or the button is up.
+    pub next_drag_autoscroll: Option<std::time::Instant>,
     /// The session whose program holds the left button: it asked for the
     /// mouse (Claude Code's fullscreen renderer, vim `mouse=a`, htop), the
     /// press on the pane went to it, and the drag and release that follow
@@ -2324,6 +3131,9 @@ pub struct App {
     /// `panel_widths` so old persisted layouts still deserialize.
     /// File-list width of the diff modal, remembered across opens.
     pub diff_files_width: u16,
+    /// The diff modal lists its files as a directory tree (`Ctrl+t` inside
+    /// it), remembered across opens and launches like the width.
+    pub diff_tree: bool,
     /// Selected tab of the settings modal, remembered across opens.
     pub settings_tab: usize,
     /// Cursor row of the settings modal, one per tab, remembered across
@@ -2414,6 +3224,12 @@ pub struct App {
     /// the found ones come back from the last run's cache (`pr_cache`), so
     /// the rows are painted before the first lookup answers.
     pub pull_requests: HashMap<WorktreeId, Option<PullRequest>>,
+    /// When this client saw a checkout's pull request turn merged
+    /// (`note_merge_landed`) — what times the row's ONE-SHOT SWEEP. Only a
+    /// merge seen to happen is stamped: a row the cache hydrated as merged,
+    /// or whose first answer ever says merged, landed some other day and
+    /// paints solid purple from the first frame.
+    pub merge_landed: HashMap<WorktreeId, std::time::Instant>,
     /// How far the user has read into each pull request's conversation,
     /// keyed by PR URL — the daemon's `pr_seen` rows, plus whatever this
     /// session has marked since. What's newer than the mark is what the
@@ -2457,8 +3273,9 @@ pub struct App {
     /// *now*: the event loop runs the two list lookups on its next turn
     /// instead of waiting for the git tick, then clears this.
     pub pr_refresh_requested: bool,
-    /// Top visible line of the pull-request preview pane, and the pane's
-    /// total line count as of the last draw (for clamping).
+    /// Top visible line of the reading pane — the pull request or the
+    /// issue under a cursor (`App::reading_url`) — and the pane's total
+    /// line count as of the last draw (for clamping).
     pub pr_preview_scroll: u16,
     pub pr_preview_lines: usize,
     /// The pull request whose full diff is being fetched, if any — one at a
@@ -2474,6 +3291,17 @@ pub struct App {
     /// installs it at startup (the `vim_tx` precedent). Key handlers can
     /// therefore start a network fetch without the loop's channels in hand.
     pub pr_diff_tx: Option<tokio::sync::mpsc::UnboundedSender<PrDiffAnswer>>,
+    /// Pull requests (by URL) with a `gh pr comment` still running. A
+    /// second box sent on the same pull request waits for the first to
+    /// land rather than racing it.
+    pub pr_comment_inflight: std::collections::HashSet<String>,
+    /// Comment text a refused post handed back while another modal was
+    /// up, by PR URL: the next COMMENT BOX opened on that pull request
+    /// starts from it, so the refusal cost nothing typed.
+    pub pr_comment_drafts: HashMap<String, String>,
+    /// Where a finished `gh pr comment` lands (`PrCommentAnswer`);
+    /// installed by the loop at startup like `pr_diff_tx`.
+    pub pr_comment_tx: Option<tokio::sync::mpsc::UnboundedSender<PrCommentAnswer>>,
     /// The on-disk memory of every pull-request answer (`pr_cache`), when
     /// this instance has one: the main loop installs the real one at
     /// startup and hydrates from it; the unit tests leave it `None`, so no
@@ -2488,19 +3316,31 @@ pub struct App {
     /// and the answer takes the URL out of here.
     pub pr_detail_stale: std::collections::HashSet<String>,
     /// What `gh issue list` last said about each project's open issues —
-    /// the ISSUES MODAL's rows, kept for the session so reopening paints
-    /// at once while the fresh answer lands. Asked only when the modal
-    /// opens (and on its `r`), never on a beat.
+    /// the ISSUES MODAL's rows, kept for the session. Prefetched in the
+    /// background once the cursor rests on a project and kept fresh on a
+    /// slow beat while it stays selected (`issues::schedule_prefetch`,
+    /// `issues::refresh_selected`), so `i` paints rows at once; the modal
+    /// re-asks on open only past `issues::FRESH`, and on its `r`.
     pub issues: HashMap<ProjectId, crate::issues::IssueList>,
     /// Projects with a list lookup in flight, and ones whose first ask
     /// `gh` couldn't answer (the modal says so rather than spinning).
     pub issues_inflight: std::collections::HashSet<ProjectId>,
     pub issues_failed: std::collections::HashSet<ProjectId>,
+    /// When each project's next background list ask is owed — the steady
+    /// beat once it has issues, a backoff while it hasn't — so the git
+    /// tick spends a `gh` only when one is due.
+    pub issues_due: HashMap<ProjectId, crate::issues::IssuesBeat>,
+    /// The debounced prefetch: the project the cursor landed on and when
+    /// its list is asked for, re-armed on every project switch.
+    pub pending_issues_prefetch: Option<(ProjectId, std::time::Instant)>,
     /// The conversations of the issues the cursor has rested on, keyed by
     /// URL; in flight and failed like the pull requests'.
     pub issue_detail: HashMap<String, crate::issues::IssueDetail>,
     pub issue_detail_inflight: std::collections::HashSet<String>,
     pub issue_detail_failed: std::collections::HashSet<String>,
+    /// Issues with a comment on its way to GitHub (`gh issue comment`),
+    /// by URL, so the reading pane says so until the answer lands.
+    pub issue_comment_inflight: std::collections::HashSet<String>,
     /// Debounced comments fetch: the issue under the cursor and when its
     /// lookup is due, re-armed on every move.
     pub pending_issue_detail: Option<(crate::issues::PendingIssueDetail, std::time::Instant)>,
@@ -2508,6 +3348,25 @@ pub struct App {
     /// startup like `pr_diff_tx`, so the modal's own handlers can start a
     /// fetch. `None` in the unit tests, which then never spawn one.
     pub issues_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::issues::IssuesAnswer>>,
+    /// BACKGROUND READS for the worktree views (`view_jobs`): the DIFF
+    /// VIEWER, the FILE FINDER, its grep view and the TREE BROWSER are
+    /// handed a clone when they open, and their git and disk reads land
+    /// through the main loop instead of holding it. None with no loop
+    /// running (unit tests), where those views read inline.
+    pub view_jobs: Option<crate::view_jobs::Jobs>,
+    /// A `g` on a checkout the changed-files badge called clean: the ticket
+    /// of the `git status` checking that, and the checkout (path, branch)
+    /// to open the DIFF VIEWER on if git disagrees.
+    pub diff_probe: Option<(u64, PathBuf, String)>,
+    /// The changed files the badge's last `git status` listed, and the
+    /// checkout they are in (`event_loop::keep_changed_files`): what `g`
+    /// opens the DIFF VIEWER on while its own `git status` runs. One
+    /// checkout's worth, capped, replaced by every poll.
+    pub changed_files: Option<(WorktreeId, Vec<crate::git_diff::DiffFile>)>,
+    /// Rows deleted here ahead of the DAEMON's answer
+    /// (`event_loop::optimistic`): an upsert of one of them is a straggler
+    /// from before the delete, and is ignored rather than shown.
+    pub deleting: std::collections::HashSet<nebula_core::EntityId>,
     /// The BRANCH SWITCHER's answer channel, listing cache and fetch
     /// throttle — what outlives the modal.
     pub branch_switch: crate::branch_switch::Shared,
@@ -2554,6 +3413,7 @@ impl App {
             sel_session: 0,
             sessions_scroll: 0,
             sessions_anchor: None,
+            follow_up: None,
             worktrees_scroll: 0,
             worktrees_anchor: None,
             worktrees_view_rows: 0,
@@ -2575,17 +3435,22 @@ impl App {
             overlay: None,
             show_archived: false,
             open_prs_collapsed: false,
+            issues_collapsed: false,
             collapsed: false,
             show_workspaces: true,
             hide_projects: false,
             hide_worktrees: false,
+            hide_sessions: false,
             hide_draft_prs: false,
-            hide_root_worktree: false,
+            projects_config: BTreeMap::new(),
+            project_fallback: Default::default(),
             recent_prompts: 0,
             show_key_combos: false,
+            pr_issue_counts: true,
             key_combo: None,
             next_req_id: 1,
             pending: HashMap::new(),
+            left_behind: std::collections::HashSet::new(),
             startup_workspace: None,
             select_when_seen: None,
             select_project_when_seen: None,
@@ -2595,10 +3460,12 @@ impl App {
             last_session_for_worktree: HashMap::new(),
             last_project_for_workspace: HashMap::new(),
             pending_prewarm: None,
+            parked_pr_prompt: None,
             pending_attach: None,
             attached_sref: None,
             next_keepwarm: None,
             term_selection: None,
+            next_drag_autoscroll: None,
             term_mouse_grab: None,
             last_term_click: None,
             last_session_click: None,
@@ -2606,6 +3473,7 @@ impl App {
             term_file_links: Vec::new(),
             panel_widths: DEFAULT_PANEL_WIDTHS,
             diff_files_width: DEFAULT_DIFF_FILES_W,
+            diff_tree: false,
             settings_tab: 0,
             settings_selected: vec![0; crate::config::tab_count()],
             settings_on_tabs: true,
@@ -2628,6 +3496,7 @@ impl App {
             git_changes: None,
             git_changes_inflight: None,
             pull_requests: HashMap::new(),
+            merge_landed: HashMap::new(),
             pr_seen: HashMap::new(),
             pr_inflight: std::collections::HashSet::new(),
             pr_recheck: HashMap::new(),
@@ -2643,17 +3512,27 @@ impl App {
             pr_diff_inflight: None,
             pr_diff_refreshing: std::collections::HashSet::new(),
             pr_diff_tx: None,
+            pr_comment_inflight: std::collections::HashSet::new(),
+            pr_comment_drafts: HashMap::new(),
+            pr_comment_tx: None,
             pr_cache: None,
             pr_cache_dirty: false,
             pr_detail_stale: std::collections::HashSet::new(),
             issues: HashMap::new(),
             issues_inflight: std::collections::HashSet::new(),
             issues_failed: std::collections::HashSet::new(),
+            issues_due: HashMap::new(),
+            pending_issues_prefetch: None,
             issue_detail: HashMap::new(),
             issue_detail_inflight: std::collections::HashSet::new(),
             issue_detail_failed: std::collections::HashSet::new(),
+            issue_comment_inflight: std::collections::HashSet::new(),
             pending_issue_detail: None,
             issues_tx: None,
+            view_jobs: None,
+            diff_probe: None,
+            changed_files: None,
+            deleting: std::collections::HashSet::new(),
             branch_switch: Default::default(),
             last_metrics: None,
             client_rss_bytes: 0,
@@ -2736,24 +3615,71 @@ impl App {
     }
 
     /// Some sidebar row is showing a running (yellow) or needs-feedback
-    /// (red) status, or a checkout row wears its merged pull request
-    /// (purple), so its text sweep should be ticking. Any live agent in
-    /// one of those states surfaces somewhere — its own row, or a worktree /
-    /// project rollup — unless the panels are hidden (collapsed, editor
-    /// modal, splash) or animations are switched off. A merged checkout
-    /// only shows while its project is selected, so only those keep the
-    /// clock running.
+    /// (red) status, or is inside a ONE-SHOT SWEEP — a turn that just
+    /// finished unread (blue), a checkout whose pull request was just seen
+    /// to merge (purple) — so its text sweep should be ticking. Any agent
+    /// in one of those states surfaces somewhere — its own row, or a
+    /// worktree / project rollup — unless the panels are hidden (collapsed,
+    /// editor modal, splash) or animations are switched off. A merged
+    /// checkout only shows while its project is selected, so only those
+    /// keep the clock running. The one-shots run out on the clock, so an
+    /// idle app with a week-old merged checkout on screen repaints nothing.
     pub fn status_anim_active(&self) -> bool {
+        let now = now_ms();
         self.animations
             && !self.collapsed
             && self.vim.is_none()
             && !self.splash_active()
             && (self.tree.agents.iter().any(|a| {
-                !a.archived && matches!(a.status, AgentStatus::Running | AgentStatus::NeedsFeedback)
+                !a.archived
+                    && (matches!(a.status, AgentStatus::Running | AgentStatus::NeedsFeedback)
+                        || fresh_done(a, now))
             }) || self
                 .visible_worktrees()
                 .iter()
-                .any(|w| self.worktree_wears_merge(&w.id)))
+                .any(|w| self.worktree_wears_merge(&w.id) && self.merge_is_fresh(&w.id)))
+    }
+
+    /// This client just saw `worktree`'s pull request turn merged: start
+    /// the row's ONE-SHOT SWEEP. Stamps that have run out go as new ones
+    /// arrive, so the map holds a few seconds' worth at most.
+    pub fn note_merge_landed(&mut self, worktree: WorktreeId) {
+        self.merge_landed
+            .retain(|_, at| at.elapsed() < ONE_SHOT_SWEEP);
+        self.merge_landed
+            .insert(worktree, std::time::Instant::now());
+    }
+
+    /// Whether the checkout's merge was seen to land within the last
+    /// `ONE_SHOT_SWEEP` — the purple row still sweeps; after, it is solid.
+    pub fn merge_is_fresh(&self, worktree_id: &WorktreeId) -> bool {
+        self.merge_landed
+            .get(worktree_id)
+            .is_some_and(|at| at.elapsed() < ONE_SHOT_SWEEP)
+    }
+
+    /// Whether the session's unread finish still sweeps ([`fresh_done`]).
+    pub fn agent_fresh_done(&self, agent: &Agent) -> bool {
+        fresh_done(agent, now_ms())
+    }
+
+    /// The same for a worktree row's rollup — or, on a row that wears its
+    /// merged pull request, whether the merge still sweeps: the one flag a
+    /// checkout's row needs, whichever story it is telling.
+    pub fn worktree_fresh(&self, worktree_id: &WorktreeId) -> bool {
+        if self.worktree_wears_merge(worktree_id) {
+            self.merge_is_fresh(worktree_id)
+        } else {
+            worktree_fresh_done(&self.tree, worktree_id, now_ms())
+        }
+    }
+
+    pub fn project_fresh_done(&self, project_id: &ProjectId) -> bool {
+        project_fresh_done(&self.tree, project_id, now_ms())
+    }
+
+    pub fn workspace_fresh_done(&self, workspace_id: &WorkspaceId) -> bool {
+        workspace_fresh_done(&self.tree, workspace_id, now_ms())
     }
 
     /// Frame counter for the status-sweep text animation — a pure function
@@ -2763,34 +3689,93 @@ impl App {
         (self.splash_epoch.elapsed().as_millis() / SWEEP_FRAME.as_millis()) as usize
     }
 
-    /// Rows the Workspaces bar takes off the top of the body when it's
-    /// shown, nothing when hidden. Every screen-y computation for the
-    /// panels below it starts here.
+    /// Rows the Workspaces bar takes off the top of the body: the full
+    /// bar when shown, a one-row rail with an expand chevron when hidden
+    /// (like the side panels' rails, so the bar never vanishes without a
+    /// way back). Every screen-y computation for the panels below it
+    /// starts here.
     pub fn workspaces_bar_h(&self) -> u16 {
         if self.show_workspaces {
             WORKSPACES_BAR_H
         } else {
-            0
+            COLLAPSED_BAR_H
         }
     }
 
-    /// Visible sidebar indices, left to right. Sessions is always present.
+    /// Sidebar indices occupying body columns, left to right. Collapsed
+    /// panels stay in the row as rails, so every panel is always present;
+    /// the terminal pane takes whatever width is left.
     pub fn visible_panel_indices(&self) -> Vec<usize> {
         (0..3).filter(|idx| self.panel_visible(*idx)).collect()
     }
 
     pub fn panel_visible(&self, idx: usize) -> bool {
+        matches!(idx, 0 | 1 | 2)
+    }
+
+    /// Expanded sidebar indices: collapsed panels (rails) hold no rows,
+    /// own no splitter, and take no part in width normalization.
+    pub fn expanded_panel_indices(&self) -> Vec<usize> {
+        (0..3).filter(|idx| self.panel_expanded(*idx)).collect()
+    }
+
+    pub fn panel_expanded(&self, idx: usize) -> bool {
         match idx {
             0 => !self.hide_projects,
             1 => !self.hide_worktrees,
-            2 => true,
+            2 => !self.sessions_collapsed(),
             _ => false,
         }
     }
 
-    /// Every visible sidebar owns the draggable boundary on its right.
+    /// Whether the SESSIONS PANEL stands folded to its rail: hidden with
+    /// `Shift+S` (`hide_sessions`), or — the Worktrees cursor on a PROJECT
+    /// OPEN PRS or PROJECT ISSUES row — with nothing to list. Neither row
+    /// has a checkout and so neither has sessions, and the pane beside it
+    /// is reading the pull request or the issue, so the column gives the
+    /// pane its width for as long as the cursor rests there and comes
+    /// back the moment it steps onto a checkout. `hide_sessions` is
+    /// untouched either way: a panel the user collapsed stays a rail on
+    /// the checkout too, and the fold a pull request row causes is never
+    /// written to CONFIG.JSON.
+    pub fn sessions_collapsed(&self) -> bool {
+        self.hide_sessions
+            || self.selected_worktree_pr().is_some()
+            || self.selected_worktree_issue().is_some()
+    }
+
+    /// Width a panel draws at: its remembered width expanded, the fixed
+    /// rail width collapsed.
+    pub fn panel_draw_width(&self, idx: usize) -> u16 {
+        if self.panel_expanded(idx) {
+            self.panel_widths[idx]
+        } else {
+            COLLAPSED_RAIL_W
+        }
+    }
+
+    /// True when at least one sidebar panel is expanded past its rail.
+    pub fn any_panel_expanded(&self) -> bool {
+        (0..3).any(|idx| self.panel_expanded(idx))
+    }
+
+    /// Whether a collapse target currently shows its content: an expanded
+    /// panel, or the shown workspaces bar. A rail click expands, a header
+    /// chevron click collapses.
+    pub fn collapse_target_open(&self, focus: Focus) -> bool {
+        match focus {
+            Focus::Workspaces => self.show_workspaces,
+            Focus::Projects => !self.hide_projects,
+            Focus::Worktrees => !self.hide_worktrees,
+            Focus::Sessions => !self.sessions_collapsed(),
+            Focus::Terminal => false,
+        }
+    }
+
+    /// Every expanded sidebar owns the draggable boundary on its right.
+    /// Rails are fixed width and own none.
     pub fn splitter_indices(&self) -> Vec<usize> {
-        self.visible_panel_indices()
+        self.expanded_panel_indices()
     }
 
     /// Screen x of splitter `idx` — the column where the panel to its right
@@ -2799,15 +3784,26 @@ impl App {
         self.visible_panel_indices()
             .into_iter()
             .filter(|visible| *visible <= idx)
-            .map(|visible| self.panel_widths[visible])
+            .map(|visible| self.panel_draw_width(visible))
             .sum()
+    }
+
+    /// Whether the panel right of splitter `idx` is a rail — the one
+    /// column its grab zone would otherwise claim along with the rule.
+    pub fn splitter_abuts_rail(&self, idx: usize) -> bool {
+        self.visible_panel_indices()
+            .into_iter()
+            .find(|visible| *visible > idx)
+            .is_some_and(|next| !self.panel_expanded(next))
     }
 
     /// Move splitter `idx` so its boundary lands at `boundary_x`, clamped so
     /// the panel keeps `MIN_PANEL_W` and the terminal pane keeps `MIN_TERM_W`.
+    /// Rails are fixed width: dragging at one does nothing, and neighbors
+    /// measure past them at rail width.
     pub fn set_splitter(&mut self, idx: usize, boundary_x: i32, body_w: u16) {
         let want = boundary_x.max(0) as u16;
-        if !self.panel_visible(idx) {
+        if !self.panel_expanded(idx) {
             return;
         }
         let visible = self.visible_panel_indices();
@@ -2815,13 +3811,13 @@ impl App {
             .iter()
             .copied()
             .filter(|visible| *visible < idx)
-            .map(|visible| self.panel_widths[visible])
+            .map(|visible| self.panel_draw_width(visible))
             .sum();
         let fixed_right: u16 = visible
             .iter()
             .copied()
             .filter(|visible| *visible > idx)
-            .map(|visible| self.panel_widths[visible])
+            .map(|visible| self.panel_draw_width(visible))
             .sum();
         let max = body_w.saturating_sub(left + fixed_right + MIN_TERM_W);
         if max < MIN_PANEL_W {
@@ -2835,10 +3831,14 @@ impl App {
     /// `MIN_TERM_W` whenever the screen allows it at all. The Workspaces bar
     /// spans the full width above them, so it costs the panels nothing here.
     pub fn normalize_panel_widths(&mut self, body_w: u16) {
-        let budget = body_w.saturating_sub(MIN_TERM_W);
-        let visible = self.visible_panel_indices();
-        for i in visible.iter().rev().copied() {
-            let others: u16 = visible
+        let rails: u16 = (0..3)
+            .filter(|i| !self.panel_expanded(*i))
+            .map(|_| COLLAPSED_RAIL_W)
+            .sum();
+        let budget = body_w.saturating_sub(MIN_TERM_W + rails);
+        let expanded = self.expanded_panel_indices();
+        for i in expanded.iter().rev().copied() {
+            let others: u16 = expanded
                 .iter()
                 .copied()
                 .filter(|j| *j != i)
@@ -2854,6 +3854,18 @@ impl App {
         self.next_req_id += 1;
         self.pending.insert(id, intent);
         id
+    }
+
+    /// Is the left button down, as far as nebula knows — a press came and
+    /// its release has not: a panel splitter being dragged, a program in
+    /// the pane holding the button, or a drag-selection under way? While
+    /// it is, the host terminal is left exactly as it is (re-asking it for
+    /// its modes mid-drag is a change under a gesture in progress), and a
+    /// motion report with no button named is still the drag.
+    pub fn mouse_held(&self) -> bool {
+        self.splitter_drag.is_some()
+            || self.term_mouse_grab.is_some()
+            || self.term_selection.is_some_and(|s| s.dragging)
     }
 
     /// Is this worktree row a stand-in (a QUICK PROMPT's, or the NEW
@@ -2903,6 +3915,7 @@ impl App {
         if term.exited
             || self.pane_shows_placeholder()
             || self.previewed_pr().is_some()
+            || self.previewed_issue().is_some()
             || self.previewed_cloud().is_some()
         {
             return mouseless;
@@ -2951,9 +3964,31 @@ impl App {
         self.tree.projects.get(self.selected_project_index()?)
     }
 
+    /// `project`'s own settings (Settings → Project): its entry in
+    /// `projects_config`, else the fallback every project without one gets.
+    pub fn project_settings(&self, project: &Project) -> &crate::config::ProjectSettings {
+        self.projects_config
+            .get(&project.repo_path)
+            .unwrap_or(&self.project_fallback)
+    }
+
+    /// Whether `project`'s ROOT WORKTREE row is left out of the WORKTREES
+    /// PANEL — its **Hide root worktree** project setting.
+    pub fn root_hidden(&self, project: &Project) -> bool {
+        self.project_settings(project).hide_root_worktree
+    }
+
+    /// `root_hidden` for the selected project; false while there is none.
+    pub fn selected_root_hidden(&self) -> bool {
+        self.selected_project().is_some_and(|p| self.root_hidden(p))
+    }
+
+    /// The checkout under the Worktrees cursor — a plain row or one nested
+    /// under its pull request. None while the cursor is on a pull request.
     pub fn selected_worktree(&self) -> Option<&Worktree> {
-        let worktrees = self.visible_worktrees();
-        worktrees.get(self.sel_worktree).copied()
+        self.worktree_rows()
+            .get(self.sel_worktree)
+            .and_then(|row| row.checkout())
     }
 
     /// The cached changed-file count when it belongs to the selected
@@ -2984,23 +4019,46 @@ impl App {
     }
 
     /// Put a screen the pane is leaving aside for a quick return, when it
-    /// is worth keeping: a real session that has painted, is still live
-    /// and fits the budget (see [`App::term_cache`]). The cache is
-    /// most-recent-first and bounded; whatever it already held for this
-    /// session is replaced.
-    pub fn stash_term(&mut self, mut term: AttachedTerm) {
+    /// is worth keeping: a real session that has painted and is still live
+    /// (see [`App::term_cache`]). The cache is most-recent-first and
+    /// bounded twice — [`TERM_CACHE_MAX`] screens, [`TERM_CACHE_CELLS`]
+    /// between them; whatever it already held for this session is
+    /// replaced. Over the cell budget, histories go before screens do,
+    /// oldest first: a screen without its scrollback is a fiftieth of the
+    /// size and still paints the return on the keypress.
+    pub fn stash_term(&mut self, term: AttachedTerm) {
         self.term_cache.retain(|t| t.sref != term.sref);
         let keep = term.painted
             && !term.exited
             && !self.is_placeholder_session(&term.sref)
-            && self.session_is_live(&term.sref)
-            && term.estimated_cells() <= TERM_CACHE_CELLS;
+            && self.session_is_live(&term.sref);
         if !keep {
             return;
+        }
+        let mut term = term;
+        // Left before the history it asked back had landed: still without
+        // it, and no longer asking.
+        if term.pending_scroll.take().is_some() {
+            term.history_dropped = true;
         }
         self.term_cache.insert(0, term);
         self.term_cache.truncate(TERM_CACHE_MAX);
         self.prune_term_cache();
+        let held = |cache: &[AttachedTerm]| -> usize {
+            cache.iter().map(AttachedTerm::estimated_cells).sum()
+        };
+        while held(&self.term_cache) > TERM_CACHE_CELLS {
+            let oldest_with_history = self
+                .term_cache
+                .iter()
+                .rposition(|t| t.parser.screen().scrollback_rows() > 0);
+            match oldest_with_history {
+                Some(i) => self.term_cache[i].drop_history(),
+                None => {
+                    self.term_cache.pop();
+                }
+            }
+        }
     }
 
     /// The kept screen for `sref`, if there is one and its session is
@@ -3054,8 +4112,7 @@ impl App {
     /// pull-request row — a duplicate would just be the same destination
     /// twice.
     pub fn visible_links(&self) -> Vec<LinkRow> {
-        let worktrees = self.visible_worktrees();
-        let Some(wt) = worktrees.get(self.sel_worktree) else {
+        let Some(wt) = self.selected_worktree() else {
             return vec![];
         };
         let saved: Vec<&Link> = self
@@ -3110,10 +4167,45 @@ impl App {
         }
     }
 
+    // ---- the FOLLOW-UP COMPOSER ----
+
+    /// Can this row grow a FOLLOW-UP COMPOSER? An agent with a local PTY
+    /// behind it, and only that: an ARCHIVED row's turn is over, a CLOUD
+    /// row's agent is in a sandbox with a message queue of its own (its
+    /// menu's **Send to cloud session**), a QUICK PROMPT stand-in has no
+    /// session yet, and a TERMINAL or a PULL REQUEST row was never a
+    /// conversation to follow up on.
+    pub fn takes_follow_up(&self, row: &SessionRow) -> bool {
+        matches!(
+            row,
+            SessionRow::Agent(a)
+                if !a.archived
+                    && a.cloud_session_id.is_none()
+                    && !self.is_placeholder_agent(&a.id)
+        )
+    }
+
+    /// The row the open FOLLOW-UP COMPOSER belongs to — an index into
+    /// [`App::visible_session_rows`], found by AGENT so a re-sorted list
+    /// keeps the box on its own card. None with nothing expanded, or when
+    /// the agent it was opened on has left the list (archived, deleted, or
+    /// the panel moved to another checkout).
+    pub fn follow_up_row(&self) -> Option<usize> {
+        let id = &self.follow_up.as_ref()?.agent;
+        self.visible_session_rows()
+            .iter()
+            .position(|row| matches!(row, SessionRow::Agent(a) if &a.id == id))
+    }
+
+    /// Is the composer live — open, and on a card still in the list? What
+    /// decides whether the SESSIONS PANEL's keys are the box's.
+    pub fn follow_up_live(&self) -> bool {
+        self.follow_up_row().is_some()
+    }
+
     /// Shell terminals of the selected worktree, in tree order.
     pub fn visible_terminals(&self) -> Vec<TerminalTab> {
-        let worktrees = self.visible_worktrees();
-        let Some(wt) = worktrees.get(self.sel_worktree) else {
+        let Some(wt) = self.selected_worktree() else {
             return vec![];
         };
         self.tree
@@ -3153,15 +4245,17 @@ impl App {
             return vec![];
         };
         let now = now_ms();
-        // With `hide_root_worktree` on the ROOT WORKTREE is not a row: it
-        // is still in the tree (its sessions keep running, the PALETTE
-        // still knows them), it just cannot be selected here, so nothing
-        // launched from this panel ever lands in the shared checkout.
+        // With the project's **Hide root worktree** on, the ROOT WORKTREE
+        // is not a row: it is still in the tree (its sessions keep running,
+        // the PALETTE still knows them), it just cannot be selected here,
+        // so nothing launched from this panel ever lands in the shared
+        // checkout.
+        let hide_root = self.root_hidden(project);
         let mut rows: Vec<&Worktree> = self
             .tree
             .worktrees
             .iter()
-            .filter(|w| w.project_id == project.id && !(self.hide_root_worktree && w.is_main))
+            .filter(|w| w.project_id == project.id && !(hide_root && w.is_main))
             .collect();
         rows.sort_by_key(|w| {
             (
@@ -3232,14 +4326,113 @@ impl App {
         self.listed_open_prs()
     }
 
-    /// How many rows the Worktrees panel has: the project's checkouts, then
-    /// the pull requests still open on its repo. `sel_worktree` indexes that
-    /// combined list, and because the checkouts come first every existing
-    /// "index into `visible_worktrees()`" stays exactly right — a cursor
-    /// parked on a pull request simply has no selected worktree, which is
-    /// the truth about it.
+    /// The selected project's open issues, as `gh issue list` last
+    /// answered (`issues::request_list`): the ISSUES MODAL's rows, and
+    /// what the PROJECT ISSUES GROUP under the pull requests lists and its
+    /// header counts while it is folded. Empty until the first answer, or
+    /// when the repo has none.
+    pub fn listed_issues(&self) -> &[crate::issues::Issue] {
+        self.selected_project()
+            .and_then(|p| self.issues.get(&p.id))
+            .map(|l| l.list.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// The issues with rows under the pull requests: the listed ones, or
+    /// none while the group is folded — a folded group has no rows for
+    /// the cursor to walk into, like the folded OPEN PRS group.
+    pub fn visible_issues(&self) -> &[crate::issues::Issue] {
+        if self.issues_collapsed {
+            return &[];
+        }
+        self.listed_issues()
+    }
+
+    /// The Worktrees panel's rows in cursor order — what `sel_worktree`
+    /// indexes: the project's checkouts, then the pull requests still open
+    /// on its repo, each followed by the checkout on its head branch when
+    /// the project has one. A PR SESSION works in a checkout of the pull
+    /// request's head branch (`CreatePrAgent` cuts it, or reuses the one
+    /// already there), and that checkout listed among the plain ones left
+    /// no way to tell which pull request it was for — so it sits under
+    /// the pull request's row instead, indented, and the plain rows above
+    /// are the checkouts that are nobody's PR. The ROOT WORKTREE never
+    /// nests, whatever branch it is on; a branch two open pull requests
+    /// share nests under the first listed. Only a pull request *on
+    /// screen* takes its checkout: with the group folded, or the pull
+    /// request a draft `hide_draft_prs` keeps out, the checkout is a plain
+    /// row again — hiding pull requests must never hide work you have.
+    ///
+    /// A cursor parked on a pull request has no selected worktree, which
+    /// is the truth about it; one on a nested checkout has that worktree
+    /// and no pull request — the row is a worktree, its pull request is
+    /// the row above.
+    ///
+    /// The issues open on the repo close the list (`visible_issues`): one
+    /// row each under the pull requests, none while their group is
+    /// folded. An issue nests nothing — it has no branch to check out.
+    pub fn worktree_rows(&self) -> Vec<WorktreeRow<'_>> {
+        let checkouts = self.visible_worktrees();
+        let prs = self.visible_open_prs();
+        // Which listed pull request each checkout nests under, if any.
+        let under: Vec<Option<usize>> = checkouts
+            .iter()
+            .map(|w| {
+                if w.is_main {
+                    return None;
+                }
+                prs.iter().position(|pr| pr.head == w.branch)
+            })
+            .collect();
+        let mut rows: Vec<WorktreeRow<'_>> = checkouts
+            .iter()
+            .zip(&under)
+            .filter(|(_, under)| under.is_none())
+            .map(|(w, _)| WorktreeRow::Checkout(w))
+            .collect();
+        for (i, pr) in prs.iter().enumerate() {
+            rows.push(WorktreeRow::Pr(pr));
+            rows.extend(
+                checkouts
+                    .iter()
+                    .zip(&under)
+                    .filter(|(_, under)| **under == Some(i))
+                    .map(|(w, _)| WorktreeRow::PrCheckout { worktree: w, pr }),
+            );
+        }
+        rows.extend(self.visible_issues().iter().map(WorktreeRow::Issue));
+        rows
+    }
+
+    /// How many rows the Worktrees panel has — see [`App::worktree_rows`].
     pub fn worktree_row_count(&self) -> usize {
-        self.visible_worktrees().len() + self.visible_open_prs().len()
+        self.worktree_rows().len()
+    }
+
+    /// The Worktrees row of checkout `id`, wherever it sits — among the
+    /// plain checkouts or under its pull request. None when it is not a
+    /// row of the selected project (or is the hidden ROOT WORKTREE).
+    pub fn worktree_row_of(&self, id: &WorktreeId) -> Option<usize> {
+        self.worktree_rows()
+            .iter()
+            .position(|row| row.checkout().is_some_and(|w| &w.id == id))
+    }
+
+    /// The Worktrees row of the open pull request at `url`: its own row,
+    /// not the checkout nested under it. None while the group is folded
+    /// or the pull request is not listed.
+    pub fn open_pr_row_of(&self, url: &str) -> Option<usize> {
+        self.worktree_rows()
+            .iter()
+            .position(|row| row.open_pr().is_some_and(|pr| pr.url == url))
+    }
+
+    /// The Worktrees row of the open issue at `url`, while the ISSUES
+    /// group is open and lists it.
+    pub fn issue_row_of(&self, url: &str) -> Option<usize> {
+        self.worktree_rows()
+            .iter()
+            .position(|row| row.open_issue().is_some_and(|i| i.url == url))
     }
 
     /// Rows a half-page jump (Ctrl+d / Ctrl+u) moves the Worktrees
@@ -3257,13 +4450,21 @@ impl App {
     }
 
     /// The open pull request under the Worktrees cursor, when it's on one.
-    /// Mutually exclusive with [`App::selected_worktree`] — the checkouts
-    /// occupy the rows below the pull requests.
+    /// Mutually exclusive with [`App::selected_worktree`]: a pull request
+    /// row has no checkout, and a checkout nested under a pull request is
+    /// still a checkout, not the pull request.
     pub fn selected_worktree_pr(&self) -> Option<&OpenPr> {
-        let i = self
-            .sel_worktree
-            .checked_sub(self.visible_worktrees().len())?;
-        self.visible_open_prs().get(i).copied()
+        self.worktree_rows()
+            .get(self.sel_worktree)
+            .and_then(|row| row.open_pr())
+    }
+
+    /// The issue under the Worktrees cursor — a PROJECT ISSUES GROUP row.
+    /// None on a checkout or a pull request.
+    pub fn selected_worktree_issue(&self) -> Option<&crate::issues::Issue> {
+        self.worktree_rows()
+            .get(self.sel_worktree)
+            .and_then(|row| row.open_issue())
     }
 
     /// The pull request the pane should be reading: the PROJECT OPEN PRS
@@ -3296,6 +4497,22 @@ impl App {
         })
     }
 
+    /// The issue the pane should be reading: the PROJECT ISSUES GROUP row
+    /// under the Worktrees cursor. `draw_terminal` asks for the pull
+    /// request first; the two never share a cursor.
+    pub fn previewed_issue(&self) -> Option<&crate::issues::Issue> {
+        self.selected_worktree_issue()
+    }
+
+    /// What the pane is reading, by URL — the pull request or the issue
+    /// under a cursor — so the loop can tell a turn that changed it
+    /// (`note_preview_change`) from one that left the reader in place.
+    pub fn reading_url(&self) -> Option<String> {
+        self.previewed_pr()
+            .map(|pr| pr.url)
+            .or_else(|| self.previewed_issue().map(|i| i.url.clone()))
+    }
+
     /// The Claude Cloud row the pane should be describing: the SESSIONS
     /// PANEL's cursor on an agent that launched a cloud session. The agent
     /// runs in the cloud sandbox, so the pane shows the CLOUD SESSION
@@ -3326,8 +4543,7 @@ impl App {
     /// interacting now, which keeps them on top however long the turn has
     /// taken.
     pub fn visible_sessions(&self) -> Vec<Agent> {
-        let worktrees = self.visible_worktrees();
-        let Some(wt) = worktrees.get(self.sel_worktree) else {
+        let Some(wt) = self.selected_worktree() else {
             return vec![];
         };
         let now = now_ms();
@@ -3359,8 +4575,7 @@ impl App {
 
     /// (live, archived) agent counts for the selected worktree.
     pub fn session_group_counts(&self) -> (usize, usize) {
-        let worktrees = self.visible_worktrees();
-        let Some(wt) = worktrees.get(self.sel_worktree) else {
+        let Some(wt) = self.selected_worktree() else {
             return (0, 0);
         };
         let live = self
@@ -3439,6 +4654,13 @@ impl App {
         Some(at.saturating_duration_since(std::time::Instant::now()))
     }
 
+    /// Delay until the debounced issues prefetch is due, so the loop can
+    /// wake up and fire it. None when nothing is armed.
+    pub fn issues_prefetch_delay(&self) -> Option<std::time::Duration> {
+        let (_, at) = self.pending_issues_prefetch.as_ref()?;
+        Some(at.saturating_duration_since(std::time::Instant::now()))
+    }
+
     /// The body and conversation behind the pull request the pane is
     /// reading: `Some(Some(_))` once fetched, `Some(None)` while it's still
     /// coming (or came back empty), `None` when the pane isn't reading one.
@@ -3469,6 +4691,26 @@ impl App {
     pub fn keepwarm_delay(&self) -> Option<std::time::Duration> {
         let at = self.next_keepwarm.as_ref()?;
         Some(at.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// PR & ISSUE COUNTS for a project row, while the switch is on: how
+    /// many open pull requests its OPEN PRS GROUP lists (drafts left out
+    /// with `hide_draft_prs`, so the number is the group header's), and
+    /// how many issues are open on the repo. Each is `None` until its list
+    /// has landed — a repo nobody has asked about yet says nothing rather
+    /// than `0` — and both are `None` with the switch off.
+    pub fn project_open_counts(&self, project_id: &ProjectId) -> (Option<usize>, Option<usize>) {
+        if !self.pr_issue_counts {
+            return (None, None);
+        }
+        let prs = self.open_prs.get(project_id).map(|open| {
+            open.list
+                .iter()
+                .filter(|pr| !(self.hide_draft_prs && pr.is_draft))
+                .count()
+        });
+        let issues = self.issues.get(project_id).map(|l| l.list.len());
+        (prs, issues)
     }
 
     /// Aggregate status for a worktree row: red > yellow > green > gray,
@@ -3542,14 +4784,17 @@ impl App {
         project_unseen(&self.tree, project_id)
     }
 
-    /// First visible sidebar under the Workspaces bar.
+    /// First visible sidebar under the Workspaces bar. With every panel
+    /// hidden there is no sidebar to land on, so the terminal takes it.
     pub fn first_sidebar_focus(&self) -> Focus {
         if !self.hide_projects {
             Focus::Projects
         } else if !self.hide_worktrees {
             Focus::Worktrees
-        } else {
+        } else if !self.sessions_collapsed() {
             Focus::Sessions
+        } else {
+            Focus::Terminal
         }
     }
 
@@ -3558,8 +4803,30 @@ impl App {
             Focus::Workspaces => self.show_workspaces,
             Focus::Projects => !self.hide_projects,
             Focus::Worktrees => !self.hide_worktrees,
-            Focus::Sessions | Focus::Terminal => true,
+            Focus::Sessions => !self.sessions_collapsed(),
+            Focus::Terminal => true,
         }
+    }
+
+    /// Step focus off a SESSIONS PANEL that has folded under it. The
+    /// hotkey and the chevron move a cursor off the panel as they fold
+    /// it (`set_hide_sessions`); the fold a pull request row causes has
+    /// no keypress of its own — the checkout under a Sessions cursor is
+    /// deleted, or its row hidden, and the Worktrees cursor lands on the
+    /// pull request beside it — so the frame that finds focus on the rail
+    /// settles it: back onto the nearest column to the left, the way
+    /// `⇧Tab` walks, or on to the pane when no column is open. Nothing
+    /// to do while the panel is open, or focus is elsewhere.
+    pub fn settle_focus(&mut self) {
+        if self.focus != Focus::Sessions || self.focus_visible(Focus::Sessions) {
+            return;
+        }
+        let back = self.previous_visible_focus(Focus::Sessions);
+        self.focus = if back == Focus::Sessions {
+            self.next_visible_focus(Focus::Sessions)
+        } else {
+            back
+        };
     }
 
     fn focus_rank(focus: Focus) -> u8 {
@@ -3753,6 +5020,7 @@ mod tests {
             title: "Attach links".into(),
             state: crate::pull_request::STATE_OPEN.into(),
             is_draft: false,
+            health: Default::default(),
             activity: Vec::new(),
         }
     }

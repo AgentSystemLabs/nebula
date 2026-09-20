@@ -1,0 +1,10 @@
+# The PROJECT ISSUES GROUP under the OPEN PRS group: Tab into the WORKTREES PANEL, then walk down
+# past the checkouts and the pull requests onto the first open issue, so the pane reads it and the
+# SESSIONS PANEL folds to its rule beside it.
+Tab
+j
+j
+j
+j
+j
+j

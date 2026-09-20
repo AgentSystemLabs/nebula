@@ -52,7 +52,7 @@ DEV_ENV = NEBULA_RUNTIME_DIR=$(DEV_RUNTIME) NEBULA_DATA_DIR=$(DEV_DATA) \
 	$(if $(AGENT),NEBULA_AGENT_CMD=$(AGENT))
 
 .DEFAULT_GOAL := help
-.PHONY: help dev browser dev-prep dev-seed dev-reset dev-ls dev-stop build install kill prune cycle check fmt lint test ci clean shot
+.PHONY: help dev browser dev-prep dev-seed dev-reset dev-ls dev-stop build install kill prune cycle check fmt lint test ci clean shot perf
 
 help: ## Show this help
 	@grep -hE '^[a-z][a-z-]*:.*?## ' $(MAKEFILE_LIST) \
@@ -125,6 +125,15 @@ dev-reset: dev-stop ## Wipe this checkout's dev data; the next `make dev` re-see
 # scenes live in scripts/shot/scenes/. Needs tmux; Pillow is installed into a venv on first run.
 shot: ## Screenshot the debug TUI with demo data (SCENE=open-prs KEYS="…")
 	scripts/shot/shot.sh $(SCENE)
+
+# The LATENCY HARNESS: the same isolation as `make shot`, against a clone of this repository, with the
+# INPUT LATENCY PROBE on (NEBULA_PERF_LOG). Drives scripts/perf/scenario.steps — every panel, modal and
+# verb — and prints per step how long the key held the loop, how long it waited for its frame, how long
+# the screen took to settle, and the TUI's and daemon's peak RSS. `make perf BIN=target/release/nebula`
+# measures the release build; `python3 scripts/perf/report.py BEFORE AFTER` compares two runs.
+perf: ## Measure input latency per action in the debug TUI (BIN=… OUT=… PERF_DUMP=1)
+	cargo build -q
+	scripts/perf/run.sh
 
 # Slots accumulate: a worktree you deleted leaves its DB behind under
 # ~/.nebula-dev. This lists every one with its daemon's state, so you can see

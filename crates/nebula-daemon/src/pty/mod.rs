@@ -20,9 +20,12 @@ use tokio::sync::{broadcast, mpsc};
 const RING_CAPACITY: usize = 1024 * 1024;
 /// Flush coalesced output at this size…
 const COALESCE_BYTES: usize = 8 * 1024;
-/// …or this long after the first pending byte, whichever comes first. A hard
+/// …or this long after the previous flush, whichever comes first. A hard
 /// deadline (not a quiet-gap timer): a child streaming continuously in small
 /// chunks must still flush on time, or output arrives in laggy 8KB lumps.
+/// Counted from the last flush rather than from the first pending byte, so
+/// output that breaks a silence — the echo of a typed character, a prompt
+/// redrawn after Enter — is not held at all (`flush_deadline`).
 const COALESCE_HOLD: std::time::Duration = std::time::Duration::from_millis(5);
 /// Reader thread → pump channel bound; blocking_send gives natural
 /// backpressure against a fire-hosing child.
@@ -51,55 +54,112 @@ fn pty_size(cols: u16, rows: u16) -> PtySize {
     }
 }
 
-/// Every process group with a member in `root`'s subtree, `root`'s own
-/// first (it leads its PTY session, so that group is its pid, and it is
-/// named even when the `ps` sweep fails). An interactive shell running the
-/// agent as a job puts it in a group of its own; SIGKILLing the leader's
-/// group alone would miss it. Taken while the tree is intact — see `kill`.
-fn process_groups_under(root: u32) -> Vec<u32> {
-    let table = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,pgid="])
+/// The live process table, one process per line, as `ps -axo
+/// pid=,ppid=,pgid=,stat=` prints it; None when `ps` itself fails.
+fn ps_table() -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,pgid=,stat="])
         .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-    process_groups_in_table(&table, root)
+        .ok()?;
+    String::from_utf8(out.stdout).ok()
 }
 
-/// Pure core of [`process_groups_under`]: `table` is `ps -axo
-/// pid=,ppid=,pgid=` output, one process per line.
-fn process_groups_in_table(table: &str, root: u32) -> Vec<u32> {
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut group_of: HashMap<u32, u32> = HashMap::new();
-    for line in table.lines() {
-        let mut cols = line.split_whitespace();
-        let (Some(pid), Some(ppid), Some(pgid)) = (
-            cols.next().and_then(|s| s.parse::<u32>().ok()),
-            cols.next().and_then(|s| s.parse::<u32>().ok()),
-            cols.next().and_then(|s| s.parse::<u32>().ok()),
-        ) else {
-            continue;
-        };
-        children.entry(ppid).or_default().push(pid);
-        group_of.insert(pid, pgid);
+/// One process as the `ps` sweep reports it.
+struct ProcRow {
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+    /// The `s` flag of `stat`: the process leads a session of its own, so
+    /// something called `setsid` to cut it loose from its terminal.
+    session_leader: bool,
+}
+
+/// Parse [`ps_table`] output. A row without a `stat` column parses too (as
+/// no session leader), so a bare `pid ppid pgid` table works.
+fn parse_ps_table(table: &str) -> Vec<ProcRow> {
+    table
+        .lines()
+        .filter_map(|line| {
+            let mut cols = line.split_whitespace();
+            let pid = cols.next()?.parse().ok()?;
+            let ppid = cols.next()?.parse().ok()?;
+            let pgid = cols.next()?.parse().ok()?;
+            let session_leader = cols.next().is_some_and(|stat| stat.contains('s'));
+            Some(ProcRow {
+                pid,
+                ppid,
+                pgid,
+                session_leader,
+            })
+        })
+        .collect()
+}
+
+/// `root`'s subtree — children, grandchildren, and on down — without
+/// `root` itself.
+fn descendants(rows: &[ProcRow], root: u32) -> Vec<&ProcRow> {
+    let mut children: HashMap<u32, Vec<&ProcRow>> = HashMap::new();
+    for row in rows {
+        children.entry(row.ppid).or_default().push(row);
     }
-    let mut groups = vec![root];
+    let mut found = Vec::new();
     let mut stack = vec![root];
     let mut seen = HashSet::new();
     while let Some(pid) = stack.pop() {
         if !seen.insert(pid) {
             continue;
         }
-        if let Some(&pgid) = group_of.get(&pid) {
-            if !groups.contains(&pgid) {
-                groups.push(pgid);
-            }
+        if let Some(kids) = children.remove(&pid) {
+            stack.extend(kids.iter().map(|kid| kid.pid));
+            found.extend(kids);
         }
-        if let Some(kids) = children.get(&pid) {
-            stack.extend(kids);
+    }
+    found
+}
+
+/// Every process group with a member in `root`'s subtree, `root`'s own
+/// first (it leads its PTY session, so that group is its pid, and it is
+/// named even when the `ps` sweep fails). An interactive shell running the
+/// agent as a job puts it in a group of its own; SIGKILLing the leader's
+/// group alone would miss it. Taken while the tree is intact — see `kill`.
+fn process_groups_under(root: u32) -> Vec<u32> {
+    process_groups_in_table(&ps_table().unwrap_or_default(), root)
+}
+
+/// Pure core of [`process_groups_under`] over a [`ps_table`].
+fn process_groups_in_table(table: &str, root: u32) -> Vec<u32> {
+    let rows = parse_ps_table(table);
+    let mut groups = vec![root];
+    let own = rows.iter().filter(|row| row.pid == root);
+    for row in own.chain(descendants(&rows, root)) {
+        if !groups.contains(&row.pgid) {
+            groups.push(row.pgid);
         }
     }
     groups
+}
+
+/// Is a job the agent cut loose from its terminal still running under
+/// `root` — a descendant leading a session of its own? That is how Claude
+/// Code runs a backgrounded Bash call or a Monitor watch and how Codex runs
+/// a shell command: work that outlives the turn which started it, and that
+/// the hook-fed status machine therefore no longer sees. The helpers an
+/// agent keeps inside its own session — MCP servers, `caffeinate`, Codex's
+/// code-mode host — are not counted, so an idle agent still reads as idle.
+/// A failed `ps` counts as busy: never kill what can't be inspected.
+pub(crate) fn detached_job_under(root: u32) -> bool {
+    match ps_table() {
+        Some(table) => detached_job_in_table(&table, root),
+        None => true,
+    }
+}
+
+/// Pure core of [`detached_job_under`] over a [`ps_table`].
+fn detached_job_in_table(table: &str, root: u32) -> bool {
+    let rows = parse_ps_table(table);
+    descendants(&rows, root)
+        .iter()
+        .any(|row| row.session_leader)
 }
 
 /// Broadcast to attached clients (and, later, the status machine).
@@ -464,6 +524,25 @@ fn spawn_reader_thread(
         .expect("spawn pty reader thread");
 }
 
+/// When output that arrived at `now` has to be on its way to the clients.
+/// The hold exists to turn a stream of small writes into fewer, larger
+/// events — so it is spent only while there is a stream: a flush less than
+/// [`COALESCE_HOLD`] ago means more is likely right behind, and the bytes
+/// wait out the rest of that window. After a quiet spell they go at once.
+/// That is every keystroke's echo: held, it reached the TUI 5 ms late on
+/// every character typed into a pane, which the INPUT LATENCY PROBE put at
+/// half of what the key took to show. A stream still flushes at most once
+/// per hold, exactly as before; the one extra event is at its head.
+fn flush_deadline(
+    now: tokio::time::Instant,
+    last_flush: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    match last_flush {
+        Some(last) if now < last + COALESCE_HOLD => last + COALESCE_HOLD,
+        _ => now,
+    }
+}
+
 /// Drains the reader channel: append to the ring (always — detach is free),
 /// coalesce bursts, broadcast to whoever is attached.
 async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
@@ -511,6 +590,7 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
         }
     };
 
+    let mut last_flush: Option<tokio::time::Instant> = None;
     'outer: loop {
         if pending.is_empty() {
             match rx.recv().await {
@@ -523,10 +603,14 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
             }
         }
         // Coalesce until the deadline or the size cap; the deadline is fixed
-        // at the first pending byte so continuous streams still flush on time.
-        let deadline = tokio::time::Instant::now() + COALESCE_HOLD;
+        // when the first pending byte arrives so continuous streams still
+        // flush on time. Biased toward the channel: a deadline that has
+        // already passed (the quiet-spell case) still takes along whatever
+        // the reader has queued, so one write read in two pieces is one event.
+        let deadline = flush_deadline(tokio::time::Instant::now(), last_flush);
         while pending.len() < COALESCE_BYTES {
             tokio::select! {
+                biased;
                 msg = rx.recv() => match msg {
                     Some(ReaderMsg::Data(d)) => pending.extend_from_slice(&d),
                     Some(ReaderMsg::Eof { exit_code }) => {
@@ -543,6 +627,7 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
             }
         }
         flush(&session, &mut pending);
+        last_flush = Some(tokio::time::Instant::now());
     }
     tracing::info!(session = ?session.sref, "pty pump ended");
 }
@@ -551,6 +636,30 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
 mod tests {
     use super::*;
     use nebula_core::AgentId;
+
+    /// Output that breaks a silence is not held: a typed character's echo
+    /// leaves the DAEMON the moment it is read.
+    #[test]
+    fn output_after_a_quiet_spell_is_flushed_at_once() {
+        let now = tokio::time::Instant::now();
+        assert_eq!(flush_deadline(now, None), now, "the session's first bytes");
+        let long_ago = now - COALESCE_HOLD * 10;
+        assert_eq!(flush_deadline(now, Some(long_ago)), now);
+        assert_eq!(flush_deadline(now, Some(now - COALESCE_HOLD)), now);
+    }
+
+    /// A stream is still coalesced: bytes arriving inside the hold of the
+    /// last flush wait for that hold to end, so the event rate under
+    /// sustained output is what it was — one flush per hold at most.
+    #[test]
+    fn output_inside_the_hold_waits_for_it_to_end() {
+        let now = tokio::time::Instant::now();
+        let just_flushed = now - std::time::Duration::from_millis(1);
+        assert_eq!(
+            flush_deadline(now, Some(just_flushed)),
+            just_flushed + COALESCE_HOLD
+        );
+    }
 
     fn echo_session() -> Arc<PtySession> {
         PtySession::spawn(
@@ -723,5 +832,45 @@ mod tests {
         assert_eq!(process_groups_in_table(table, 20), vec![20, 21]);
         // A failed sweep still names the leader's own group.
         assert_eq!(process_groups_in_table("", 20), vec![20]);
+    }
+
+    /// The reaper's "still working?" question is whether anything under the
+    /// agent leads a session of its own: a backgrounded Bash call does
+    /// (Claude spawns it detached), an MCP server or a shell job does not.
+    #[test]
+    fn detached_job_is_a_session_leader_below_the_agent() {
+        // Agent 20 leads its PTY session and is its foreground job (`+`).
+        // Its MCP server 21 shares that group; 22 is a helper in a group of
+        // its own but the same session (Codex's code-mode host). 30 is
+        // another session entirely, 99 unrelated.
+        let idle = "\
+ 20    10    20  Ss+
+ 21    20    20  S+
+ 22    20    22  S
+ 30    10    30  Ss+
+ 99     1    99  S
+";
+        assert!(!detached_job_in_table(idle, 20));
+        // A backgrounded Bash call: shell 23 started its own session (`s`)
+        // and runs sleep 24 inside it.
+        let busy = format!("{idle} 23    20    23  Ss\n 24    23    23  S\n");
+        assert!(detached_job_in_table(&busy, 20));
+        // Under a login shell that forked the agent as a job: 20 is bash,
+        // 21 the agent in a group of its own but not a session of its own,
+        // 25 its detached Bash call.
+        let wrapped = "\
+ 20    10    20  Ss
+ 21    20    21  S+
+ 25    21    25  Ss
+";
+        assert!(detached_job_in_table(wrapped, 20));
+        assert!(!detached_job_in_table(
+            " 20    10    20  Ss\n 21    20    21  S+\n",
+            20
+        ));
+        // Another session's job, a missing root, an empty sweep: no work.
+        assert!(!detached_job_in_table(idle, 30));
+        assert!(!detached_job_in_table(idle, 40));
+        assert!(!detached_job_in_table("", 20));
     }
 }

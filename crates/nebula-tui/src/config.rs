@@ -11,8 +11,9 @@
 //! key `config.local.json` holds is written back there, never into the
 //! portable file.
 
-use nebula_core::AgentKind;
+use crate::agent_presets::PresetText;
 use nebula_core::harness::{CustomHarness, HarnessDescriptor};
+use nebula_core::AgentKind;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -31,6 +32,14 @@ pub const DEFAULT_RECENT_PROMPTS_COUNT: usize = 3;
 /// accepts `+<line> <file>`, which is how the overlays launch it. As with
 /// models, hand-edited configs can name any command the list doesn't.
 pub const EDITORS: &[&str] = &["vim", "nvim", "nano", "emacs", "hx"];
+
+/// The **Preset text** choices (Settings → Sessions), in the order the row
+/// cycles them: the [`PresetText`] sides by label.
+pub const PRESET_TEXTS: &[&str] = &[
+    PresetText::Prefix.as_str(),
+    PresetText::Postfix.as_str(),
+    PresetText::Both.as_str(),
+];
 
 /// Values the settings overlay cycles through for `done_sound` (what rings
 /// when a turn reaches FINISHED) and `feedback_sound` (what rings when one
@@ -70,6 +79,9 @@ pub const DEFAULT_CHOICE: &str = "default";
 /// picks origin's default branch itself. Display only — the file holds
 /// `""`, never this word.
 pub const AUTO_CHOICE: &str = "auto";
+/// What the Project tab's **Run command** row shows while it is empty:
+/// the checkout's `.nebula.json` is what `r` reads then.
+pub const PROJECT_FILE_CHOICE: &str = nebula_core::project_file::FILE_NAME;
 
 /// The static model/effort lists live in the core registry table now
 /// ([`nebula_core::harness::builtin`]); what the pickers show is built
@@ -112,7 +124,12 @@ pub fn model_choices_in(descriptor: &nebula_core::harness::HarnessDescriptor) ->
             .map(|s| s.to_string())
             .collect(),
         None => headed(
-            descriptor.model.models.iter().map(|entry| entry.id.clone()).collect(),
+            descriptor
+                .model
+                .models
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect(),
         ),
     }
 }
@@ -122,11 +139,7 @@ pub fn model_choices_in(descriptor: &nebula_core::harness::HarnessDescriptor) ->
 /// harness offers no effort. Cursor's list follows the family (`-fast`
 /// variants ride in the effort, `high-fast`); any other harness takes its
 /// static list with any model.
-pub fn effort_choices(
-    kind: AgentKind,
-    model: Option<&str>,
-    custom: Option<&str>,
-) -> Vec<String> {
+pub fn effort_choices(kind: AgentKind, model: Option<&str>, custom: Option<&str>) -> Vec<String> {
     effort_choices_in(&describe(kind, custom), model)
 }
 
@@ -259,7 +272,11 @@ fn describe(kind: AgentKind, custom: Option<&str>) -> nebula_core::harness::Harn
         _ => kind.as_str(),
     };
     let cfg = Config::load();
-    if let Some(descriptor) = cfg.harness_registry().into_iter().find(|entry| entry.id == id) {
+    if let Some(descriptor) = cfg
+        .harness_registry()
+        .into_iter()
+        .find(|entry| entry.id == id)
+    {
         return descriptor;
     }
     nebula_core::harness::CustomHarness {
@@ -286,7 +303,10 @@ pub struct SettingSpec {
     pub group: &'static str,
 }
 
-/// What a tab shows. Ordinary tabs are a list of value settings; the
+/// What a tab shows. Ordinary tabs are a list of value settings. The
+/// Project tab is a list too, but its rows are one project's — the one
+/// selected in the PROJECTS PANEL, named on the tab's first line — and
+/// read and write that project's entry instead of a top-level key. The
 /// Hotkeys tab is generated from [`crate::keymap::ACTIONS`] instead, so a
 /// new action shows up there without being declared twice — and the Agents
 /// tab is generated from the harness registry, so a new CLI shows up
@@ -294,6 +314,7 @@ pub struct SettingSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabBody {
     Values(&'static [SettingSpec]),
+    Project(&'static [SettingSpec]),
     Hotkeys,
     Agents,
 }
@@ -339,26 +360,31 @@ pub enum SettingKind {
     Editor,
     CloseFinderOnOpen,
     SshSyncConfig,
-    SkipSessionNaming,
     ConfirmOnArchive,
     SessionIdleTimeout,
     PrewarmAgents,
     PrewarmSessions,
     DoneSound,
     FeedbackSound,
+    PresetText,
     Theme,
     Animations,
     FocusTint,
     ShowWorkspaces,
     HideProjects,
     HideWorktrees,
+    HideSessions,
     HideDraftPrs,
     QuickPromptKind,
     QuickPromptFocus,
     HideRootWorktree,
+    RunCommand,
+    OpenCommand,
     RecentPrompts,
     RecentPromptsCount,
     ShowKeyCombos,
+    RememberHarness,
+    PrIssueCounts,
     HideUninstalledHarnesses,
 }
 
@@ -389,7 +415,23 @@ impl SettingKind {
     /// nothing to step through. [`Config::cycle`] leaves such a row alone;
     /// [`Config::set_text`] is what writes it.
     pub fn is_text(self) -> bool {
-        matches!(self, SettingKind::WorktreeBaseBranch)
+        matches!(
+            self,
+            SettingKind::WorktreeBaseBranch | SettingKind::RunCommand | SettingKind::OpenCommand
+        )
+    }
+
+    /// A row on the PROJECT TAB: its value is the focused project's, kept
+    /// in that project's `projects` entry rather than at the top level of
+    /// the file. [`Config::cycle`] leaves such a row alone;
+    /// [`Config::cycle_project`] (or [`Config::set_project_text`], for a
+    /// row that is typed as well) is what writes it, and
+    /// [`ProjectSettings::value_label`] what reads it.
+    pub fn is_project(self) -> bool {
+        matches!(
+            self,
+            SettingKind::HideRootWorktree | SettingKind::RunCommand | SettingKind::OpenCommand
+        )
     }
 }
 
@@ -442,12 +484,6 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
         title: "Sessions",
         body: TabBody::Values(&[
             SettingSpec {
-                kind: SettingKind::SkipSessionNaming,
-                label: "Skip starting prompt",
-                hint: "New agents launch straight from the picker; type the first prompt in the CLI",
-                group: "",
-            },
-            SettingSpec {
                 kind: SettingKind::ConfirmOnArchive,
                 label: "Confirm on archive",
                 hint: "a asks before archiving the selected session (off archives at once; u undoes)",
@@ -483,6 +519,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 hint: "Ring, and notify an unfocused window, when a turn stops to ask you (off silences both)",
                 group: "",
             },
+            SettingSpec {
+                kind: SettingKind::PresetText,
+                label: "Preset text",
+                hint: "Where a new agent preset's text goes: a prefix before the task, a postfix after it, or both (its Text row can change one)",
+                group: "",
+            },
         ]),
     },
     SettingsTab {
@@ -515,13 +557,19 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             SettingSpec {
                 kind: SettingKind::HideProjects,
                 label: "Projects panel",
-                hint: "Show or hide the Projects panel (Shift+P toggles)",
+                hint: "Collapse or expand the Projects panel (Shift+P toggles)",
                 group: "",
             },
             SettingSpec {
                 kind: SettingKind::HideWorktrees,
                 label: "Worktrees panel",
-                hint: "Show or hide the Worktrees panel (Shift+B toggles)",
+                hint: "Collapse or expand the Worktrees panel (Shift+B toggles)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::HideSessions,
+                label: "Sessions panel",
+                hint: "Collapse or expand the Sessions panel (Shift+S toggles)",
                 group: "",
             },
             SettingSpec {
@@ -540,18 +588,39 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
         title: "Agents",
         body: TabBody::Agents,
     },
-    // Behaviors that change how the tree is worked, off by default until
-    // they have earned a tab of their own. Before Hotkeys, which stays
+    // Settings that belong to one project rather than to nebula. The tab
+    // edits the selected project's entry in `projects` and names that
+    // project on its first line, so a row here never reads as a switch
+    // for every project at once.
+    SettingsTab {
+        title: "Project",
+        body: TabBody::Project(&[
+            SettingSpec {
+                kind: SettingKind::RunCommand,
+                label: "Run command",
+                hint: "Shell line r runs in this project's worktrees (empty = its .nebula.json \"run\")",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::OpenCommand,
+                label: "Open command",
+                hint: "Shell line ⇧Enter / ⇧O runs to open a worktree of this project, e.g. open http://localhost:3000 (empty = its .nebula.json \"open\")",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::HideRootWorktree,
+                label: "Hide root worktree",
+                hint: "Drop this project's ⌂ root row so nothing launched from Worktrees lands in its shared checkout",
+                group: "",
+            },
+        ]),
+    },
+    // Behaviors that change how the tree is worked, off by default (PR &
+    // ISSUE COUNTS excepted) until they have earned a tab of their own. Before Hotkeys, which stays
     // last for the reason above.
     SettingsTab {
         title: "Experimental",
         body: TabBody::Values(&[
-            SettingSpec {
-                kind: SettingKind::HideRootWorktree,
-                label: "Hide root worktree",
-                hint: "Drop the ⌂ root row so nothing launched from Worktrees lands in the shared checkout",
-                group: "",
-            },
             SettingSpec {
                 kind: SettingKind::RecentPrompts,
                 label: "Recent prompts",
@@ -568,6 +637,18 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::ShowKeyCombos,
                 label: "Key combo display",
                 hint: "Spell each key you press bottom-left with what it did, for anyone watching",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::RememberHarness,
+                label: "Remember harness",
+                hint: "A harness (and model) picked for a session becomes the Agents tab default the next launch starts on",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::PrIssueCounts,
+                label: "PR & issue counts",
+                hint: "Count each project's open pull requests and issues after its name, 3 prs · 2 issues",
                 group: "",
             },
         ]),
@@ -594,6 +675,14 @@ pub fn agents_tab() -> usize {
         .expect("SETTINGS_TABS declares an Agents tab")
 }
 
+/// Index of the Project tab, whose rows are the selected project's.
+pub fn project_tab() -> usize {
+    SETTINGS_TABS
+        .iter()
+        .position(|t| matches!(t.body, TabBody::Project(_)))
+        .expect("SETTINGS_TABS declares a Project tab")
+}
+
 pub fn tab_count() -> usize {
     SETTINGS_TABS.len()
 }
@@ -603,7 +692,7 @@ pub fn tab_count() -> usize {
 /// [`Config::agent_rows`]). Empty for the Hotkeys tab.
 pub fn tab_settings(tab: usize) -> &'static [SettingSpec] {
     match SETTINGS_TABS.get(tab).map(|t| t.body) {
-        Some(TabBody::Values(settings)) => settings,
+        Some(TabBody::Values(settings) | TabBody::Project(settings)) => settings,
         Some(TabBody::Agents) => AGENTS_HEAD,
         _ => &[],
     }
@@ -613,7 +702,7 @@ pub fn tab_settings(tab: usize) -> &'static [SettingSpec] {
 /// registry, so a new CLI grows it without a code change.
 pub fn tab_len(tab: usize) -> usize {
     match SETTINGS_TABS.get(tab).map(|t| t.body) {
-        Some(TabBody::Values(settings)) => settings.len(),
+        Some(TabBody::Values(settings) | TabBody::Project(settings)) => settings.len(),
         Some(TabBody::Hotkeys) => crate::keymap::ACTIONS.len(),
         Some(TabBody::Agents) => AGENTS_HEAD.len() + Config::load().agent_rows().len(),
         None => 0,
@@ -636,7 +725,9 @@ pub fn setting_at(tab: usize, index: usize) -> Option<&'static SettingSpec> {
 pub fn locate(kind: SettingKind) -> Option<(usize, usize)> {
     SETTINGS_TABS.iter().enumerate().find_map(|(t, tab)| {
         match tab.body {
-            TabBody::Values(settings) => settings.iter().position(|s| s.kind == kind),
+            TabBody::Values(settings) | TabBody::Project(settings) => {
+                settings.iter().position(|s| s.kind == kind)
+            }
             TabBody::Agents => AGENTS_HEAD.iter().position(|s| s.kind == kind),
             TabBody::Hotkeys => None,
         }
@@ -678,9 +769,11 @@ pub fn all_settings() -> impl Iterator<Item = (usize, usize, &'static SettingSpe
 /// The Agents tab reads the registry for its harness rows.
 pub fn hint_at(tab: usize, index: usize) -> String {
     match SETTINGS_TABS.get(tab).map(|t| t.body) {
-        Some(TabBody::Values(settings)) => {
-            settings.get(index).map(|s| s.hint).unwrap_or("").to_string()
-        }
+        Some(TabBody::Values(settings) | TabBody::Project(settings)) => settings
+            .get(index)
+            .map(|s| s.hint)
+            .unwrap_or("")
+            .to_string(),
         Some(TabBody::Hotkeys) => crate::keymap::spec_at(index)
             .map(|s| s.hint)
             .unwrap_or("")
@@ -696,6 +789,10 @@ pub fn hint_at(tab: usize, index: usize) -> String {
 pub enum SettingsRow {
     Blank,
     Header(String),
+    /// The Project tab's first line: the selected project's name and repo
+    /// path, which the renderer reads off the app — the row map is static
+    /// and only knows there is such a line. Not selectable.
+    Project,
     /// Label + value line for the value setting at this tab-local index.
     Setting(usize),
     /// Label + chord list for `keymap::ACTIONS[index]`.
@@ -719,6 +816,14 @@ pub fn settings_rows(tab: usize) -> Vec<SettingsRow> {
             settings.iter().map(|s| s.group.to_string()),
             SettingsRow::Setting,
         ),
+        Some(TabBody::Project(settings)) => {
+            let mut rows = vec![SettingsRow::Project];
+            rows.extend(grouped(
+                settings.iter().map(|s| s.group.to_string()),
+                SettingsRow::Setting,
+            ));
+            rows
+        }
         Some(TabBody::Hotkeys) => grouped(
             crate::keymap::ACTIONS.iter().map(|s| s.group.to_string()),
             SettingsRow::Hotkey,
@@ -727,9 +832,9 @@ pub fn settings_rows(tab: usize) -> Vec<SettingsRow> {
             let cfg = Config::load();
             let head = AGENTS_HEAD.iter().map(|s| s.group.to_string());
             let rows = cfg.agent_rows();
-            let groups = rows.iter().map(|(id, _)| {
-                cfg.effective_harness_by_id(id).display_label().to_string()
-            });
+            let groups = rows
+                .iter()
+                .map(|(id, _)| cfg.effective_harness_by_id(id).display_label().to_string());
             grouped(head.chain(groups), SettingsRow::Setting)
         }
         None => Vec::new(),
@@ -802,12 +907,13 @@ pub struct Config {
     /// own on every connect — its `config.local.json` still wins there. On
     /// by default; `--no-sync-config` leaves them behind for one connection.
     pub ssh_sync_config: bool,
-    /// Create new agent sessions straight from the kind picker, with no
-    /// task box: the session takes the generated default name and
-    /// agent-driven auto-titling, and the first prompt is typed in the
-    /// CLI. Off by default — the box is the point of the picker. The key
-    /// predates the box: it once skipped a name prompt, which the box
-    /// replaced.
+    /// The key of the **Skip starting prompt** SETTING (Settings →
+    /// Sessions, through 0.30): on, `n` created the session straight from
+    /// the NEW SESSION PICKER instead of putting a task box up first.
+    /// Every `n` does that now — a launch that starts from a typed task is
+    /// the QUICK PROMPT's — so this build never reads it and no tab edits
+    /// it any more. Still loaded and written back as stored, so an older
+    /// build sharing the file keeps the behavior its user chose.
     pub skip_session_naming: bool,
     /// Put a CONFIRM DIALOG in front of archiving a session — the `a` key
     /// and the row menu's Archive alike. Off by default: archive is cheap
@@ -845,6 +951,14 @@ pub struct Config {
     /// FEEDBACK SOUND and the desktop notification an unfocused terminal
     /// window gets: "off" silences the pair.
     pub feedback_sound: String,
+    /// PRESET TEXT: which side of the task a new AGENT PRESET's text goes
+    /// — `prefix` (one box, sent before the task), `postfix` (one box,
+    /// sent after it) or `prefix & postfix` (both). The PRESET EDITOR
+    /// opens a new preset on the box(es) named here, and its Text row
+    /// changes one preset; a stored side with text always shows. Resolved
+    /// by [`Config::preset_text`]; `prefix` by default, the framing most
+    /// people reach for and one box to fill.
+    pub preset_text: String,
     /// Color theme name (see `theme::THEMES`). Unknown names fall back to
     /// the default theme.
     pub theme: String,
@@ -864,13 +978,18 @@ pub struct Config {
     /// closed browser tab can't lose the choice the way the daemon's
     /// save-on-quit UI blob would.
     pub show_workspaces: bool,
-    /// Hide the Projects panel and give its width to the terminal pane.
-    /// False by default so configs written before this key keep the current
-    /// three-panel layout.
+    /// Collapse the Projects panel to a rail and give its width to the
+    /// terminal pane. False by default so configs written before this key
+    /// keep the current three-panel layout.
     pub hide_projects: bool,
-    /// Hide the Worktrees panel and give its width to the terminal pane.
-    /// Independent from `hide_projects`; Sessions always remains visible.
+    /// Collapse the Worktrees panel to a rail and give its width to the
+    /// terminal pane. Independent from `hide_projects` and `hide_sessions`.
     pub hide_worktrees: bool,
+    /// Collapse the Sessions panel to a rail and give its width to the
+    /// terminal pane. Independent from `hide_projects` and `hide_worktrees`.
+    /// False by default so configs written before this key keep the
+    /// current three-panel layout.
+    pub hide_sessions: bool,
     /// Leave draft pull requests out of the PROJECT OPEN PRS GROUP and the
     /// `/` PALETTE's pull-request rows, so browsing what's open shows only
     /// the rows asking for a reviewer. A view filter, not a fetch filter:
@@ -881,12 +1000,24 @@ pub struct Config {
     /// the SESSIONS PANEL — those describe work you have, not work you are
     /// browsing. Off by default: a config predating the key hides nothing.
     pub hide_draft_prs: bool,
-    /// Experimental: leave the ROOT WORKTREE row out of the WORKTREES
-    /// PANEL, so nothing launched there lands in the shared checkout. (A
-    /// `p` on that panel cuts a fresh worktree with this on or off — that
-    /// is the panel's doing, not this switch's.) Off by default: the root
-    /// row is where most people start.
+    /// What every project without a `projects` entry gets for **Hide root
+    /// worktree** — the key the setting lived under while it was one
+    /// switch for every project (Settings → Experimental, through 0.27).
+    /// Still read and written back, so a file that set it keeps hiding
+    /// the root everywhere until a project's own row says otherwise, and
+    /// an older build sharing the file still sees its key; no tab edits
+    /// it any more. See [`Config::project_fallback`].
     pub hide_root_worktree: bool,
+    /// PROJECT SETTINGS: one [`ProjectSettings`] per project set up
+    /// differently from the rest, keyed by the project's repo path as the
+    /// DAEMON stores it — what the Settings → Project tab edits for the
+    /// selected project. A project with no entry reads as
+    /// [`Config::project_fallback`], and an entry that says nothing the
+    /// fallback doesn't is dropped on save ([`Config::set_project`]), so
+    /// the map names only the projects that differ. One key to the file's
+    /// rules: a value in here this build can't read costs the whole map,
+    /// not one project.
+    pub projects: BTreeMap<PathBuf, ProjectSettings>,
     /// Experimental: list each session's RECENT PROMPTS — the last few
     /// things typed into it, as the daemon captured them off the
     /// `UserPromptSubmit` hook — under its row in the SESSIONS PANEL,
@@ -905,6 +1036,25 @@ pub struct Config {
     /// overlay's text field never show. Off by default: it is a teaching
     /// aid, and a row of chrome nobody asked for otherwise.
     pub show_key_combos: bool,
+    /// Experimental: REMEMBER HARNESS — a launch walked through the NEW
+    /// SESSION PICKER, the PR SESSION picker or the QUICK PROMPT's `Tab`
+    /// picker writes its harness into `quick_prompt_kind`, and a model or
+    /// effort a submenu chose into that harness's own rows, so the next
+    /// picker starts on it and the next `p` launches it
+    /// ([`Config::remember_launch`]). Off by default: a pick is one
+    /// session's, and the AGENTS TAB is where the defaults are set.
+    pub remember_harness: bool,
+    /// Experimental: PR & ISSUE COUNTS — each PROJECTS PANEL row counts
+    /// the repo's open pull requests and issues after its name (`3 prs ·
+    /// 2 issues`), so what is waiting on a repo reads off the column
+    /// without visiting it. The pull requests are the lists the OPEN PRS
+    /// sweep already keeps warm for every project; the issues take a
+    /// sweep of their own (`issues::sweep_others`), one project per tick,
+    /// that only runs while this is on. On by default — the sweep is one
+    /// `gh issue list` per project every five minutes, well inside the
+    /// budget — and the one Experimental switch that is; off, the rows
+    /// are what they were and no project but the selected one is asked.
+    pub pr_issue_counts: bool,
     /// Default model/effort for new Claude / Codex / Cursor sessions.
     /// "default" means "don't pass the flag" (the CLI picks); any other
     /// value is passed through verbatim, so hand-edited configs can name
@@ -990,6 +1140,101 @@ pub struct Config {
     pub skipped: BTreeSet<String>,
 }
 
+/// One project's own settings — the PROJECT TAB's rows — kept under the
+/// project's repo path in [`Config::projects`]. Read through
+/// [`Config::project`], which supplies the fallback for a project with no
+/// entry; written through [`Config::set_project`].
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ProjectSettings {
+    /// The RUN COMMAND `r` starts in this project's worktrees, typed on
+    /// the Project tab. Empty — the default, shown as `.nebula.json` — is
+    /// the checkout's PROJECT FILE `run`, where the command lived before
+    /// the row existed; set, it wins over the file. The DAEMON reads it
+    /// (`nebula-daemon/src/config.rs`); the TUI only edits it. Left out
+    /// of the file while empty, so an entry written before the row reads
+    /// the same after a save.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub run_command: String,
+    /// The OPEN COMMAND `Shift+Enter` / `Shift+O` fires on this project's
+    /// worktrees, typed on the Project tab — `open http://localhost:3000`,
+    /// say. Empty (shown as `.nebula.json`) is the checkout's PROJECT FILE
+    /// `open`; set, it wins over the file. The TUI both edits and runs it
+    /// (`event_loop::open_worktree`): what it opens belongs on the machine
+    /// the user sits at, never the DAEMON's. Left out of the file while
+    /// empty, like `run_command`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub open_command: String,
+    /// Leave this project's ROOT WORKTREE row out of the WORKTREES PANEL,
+    /// so nothing launched there lands in its shared checkout. The root's
+    /// sessions keep running and the PALETTE still finds them. (A `p` on
+    /// that panel cuts a fresh worktree with this on or off — that is the
+    /// panel's doing, not this switch's.)
+    pub hide_root_worktree: bool,
+    /// Keys in the entry this build doesn't know — a newer nebula's, most
+    /// likely — carried through a save untouched, as the file's top-level
+    /// keys are. An entry holding one is never dropped as "all default".
+    #[serde(flatten)]
+    pub other: BTreeMap<String, serde_json::Value>,
+}
+
+impl ProjectSettings {
+    /// The overlay's label for a PROJECT TAB row ([`SettingKind::is_project`]);
+    /// empty for a row that is not one.
+    pub fn value_label(&self, kind: SettingKind) -> String {
+        match kind {
+            SettingKind::HideRootWorktree => on_off(self.hide_root_worktree).into(),
+            SettingKind::RunCommand => match self.run_command.trim() {
+                "" => PROJECT_FILE_CHOICE.into(),
+                command => command.to_string(),
+            },
+            SettingKind::OpenCommand => match self.open_command.trim() {
+                "" => PROJECT_FILE_CHOICE.into(),
+                command => command.to_string(),
+            },
+            _ => String::new(),
+        }
+    }
+
+    /// Activate a PROJECT TAB row. A toggle flips on ←, → and Enter alike;
+    /// a typed row ([`SettingKind::is_text`]) is left alone, since its
+    /// prompt writes it through [`ProjectSettings::set_text`]; so is a row
+    /// that is not a project row.
+    pub fn cycle(&mut self, kind: SettingKind) {
+        if kind == SettingKind::HideRootWorktree {
+            self.hide_root_worktree = !self.hide_root_worktree;
+        }
+    }
+
+    /// The stored text of a typed PROJECT TAB row as its prompt pre-fills
+    /// it — `""` for an unset row, never the `.nebula.json` the overlay
+    /// shows in its place. Empty for a row that is not typed.
+    pub fn text_value(&self, kind: SettingKind) -> String {
+        match kind {
+            SettingKind::RunCommand => self.run_command.clone(),
+            SettingKind::OpenCommand => self.open_command.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// Write a typed value into a typed PROJECT TAB row, trimmed. Empty
+    /// puts the row back on its default. False for a row that is not a
+    /// typed project row — nothing changes.
+    pub fn set_text(&mut self, kind: SettingKind, value: &str) -> bool {
+        match kind {
+            SettingKind::RunCommand => {
+                self.run_command = value.trim().to_string();
+                true
+            }
+            SettingKind::OpenCommand => {
+                self.open_command = value.trim().to_string();
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -1006,17 +1251,22 @@ impl Default for Config {
             prewarm_sessions: true,
             done_sound: "Glass".into(),
             feedback_sound: "Sosumi".into(),
+            preset_text: PresetText::DEFAULT.as_str().into(),
             theme: "default".into(),
             animations: true,
             focus_tint: true,
             show_workspaces: true,
             hide_projects: false,
             hide_worktrees: false,
+            hide_sessions: false,
             hide_draft_prs: false,
             hide_root_worktree: false,
+            projects: BTreeMap::new(),
             recent_prompts: false,
             recent_prompts_count: DEFAULT_RECENT_PROMPTS_COUNT,
             show_key_combos: false,
+            remember_harness: false,
+            pr_issue_counts: true,
             claude_model: DEFAULT_CHOICE.into(),
             claude_models: Vec::new(),
             claude_effort: DEFAULT_CHOICE.into(),
@@ -1199,9 +1449,17 @@ impl Config {
     /// the table, older than the `harnesses` map.
     fn legacy_harness_fields(&self, id: &str) -> (Option<bool>, Option<String>, Option<String>) {
         let (enabled, model, effort) = match id {
-            "claude" => (&self.claude_enabled, &self.claude_model, &self.claude_effort),
+            "claude" => (
+                &self.claude_enabled,
+                &self.claude_model,
+                &self.claude_effort,
+            ),
             "codex" => (&self.codex_enabled, &self.codex_model, &self.codex_effort),
-            "cursor" => (&self.cursor_enabled, &self.cursor_model, &self.cursor_effort),
+            "cursor" => (
+                &self.cursor_enabled,
+                &self.cursor_model,
+                &self.cursor_effort,
+            ),
             "pi" => (&self.pi_enabled, &self.pi_model, &self.pi_effort),
             "muse" => (&self.muse_enabled, &self.muse_model, &self.muse_effort),
             _ => return (None, None, None),
@@ -1233,7 +1491,10 @@ impl Config {
             AgentKind::Custom => custom.unwrap_or_default().trim(),
             _ => kind.as_str(),
         };
-        if let Some(descriptor) = self.harness_registry().into_iter().find(|entry| entry.id == id)
+        if let Some(descriptor) = self
+            .harness_registry()
+            .into_iter()
+            .find(|entry| entry.id == id)
         {
             return descriptor;
         }
@@ -1257,7 +1518,9 @@ impl Config {
         if kind == AgentKind::Custom {
             return None;
         }
-        self.builtin_descriptor(kind).default_model().map(str::to_string)
+        self.builtin_descriptor(kind)
+            .default_model()
+            .map(str::to_string)
     }
 
     /// The configured default effort for new sessions of `kind`;
@@ -1351,11 +1614,21 @@ impl Config {
             .is_some_and(|entry| entry.enabled && entry.problem().is_none())
     }
 
+    /// PRESET TEXT resolved: the side(s) of the task a new AGENT PRESET's
+    /// text goes. `prefix` for a config that never set it or a hand edit
+    /// off the list; `both` is taken for `prefix & postfix`.
+    pub fn preset_text(&self) -> PresetText {
+        PresetText::parse(&self.preset_text).unwrap_or(PresetText::DEFAULT)
+    }
+
     /// The effective descriptor for a registry id, or a placeholder under
     /// its own name when the registry no longer names it, so rows
     /// outliving their entry still render.
     pub fn effective_harness_by_id(&self, id: &str) -> HarnessDescriptor {
-        if let Some(descriptor) = self.harness_registry().into_iter().find(|entry| entry.id == id)
+        if let Some(descriptor) = self
+            .harness_registry()
+            .into_iter()
+            .find(|entry| entry.id == id)
         {
             return descriptor;
         }
@@ -1521,7 +1794,11 @@ impl Config {
             self.set_legacy_enabled(id, enabled);
             return;
         }
-        if let Some(entry) = self.custom_harnesses.iter_mut().find(|entry| entry.id == id) {
+        if let Some(entry) = self
+            .custom_harnesses
+            .iter_mut()
+            .find(|entry| entry.id == id)
+        {
             entry.enabled = enabled;
             return;
         }
@@ -1531,7 +1808,12 @@ impl Config {
     /// Write a Model default: the map where it speaks, else the legacy
     /// layer (the built-in model key, the list entry's model).
     fn set_harness_model(&mut self, id: &str, model: String) {
-        if self.harnesses.get(id).and_then(|o| o.model_default.clone()).is_some() {
+        if self
+            .harnesses
+            .get(id)
+            .and_then(|o| o.model_default.clone())
+            .is_some()
+        {
             self.harness_override_mut(id).model_default = Some(model);
             return;
         }
@@ -1539,7 +1821,11 @@ impl Config {
             self.set_legacy_model(id, model);
             return;
         }
-        if let Some(entry) = self.custom_harnesses.iter_mut().find(|entry| entry.id == id) {
+        if let Some(entry) = self
+            .custom_harnesses
+            .iter_mut()
+            .find(|entry| entry.id == id)
+        {
             entry.model = model;
             return;
         }
@@ -1551,7 +1837,11 @@ impl Config {
     /// owns theirs).
     fn set_harness_effort(&mut self, id: &str, effort: String) {
         if nebula_core::harness::builtin(id).is_some()
-            && self.harnesses.get(id).and_then(|o| o.effort_default.clone()).is_none()
+            && self
+                .harnesses
+                .get(id)
+                .and_then(|o| o.effort_default.clone())
+                .is_none()
         {
             self.set_legacy_effort(id, effort);
             return;
@@ -1560,10 +1850,7 @@ impl Config {
     }
 
     /// The `harnesses` map entry for `id`, created when absent.
-    fn harness_override_mut(
-        &mut self,
-        id: &str,
-    ) -> &mut nebula_core::harness::HarnessOverride {
+    fn harness_override_mut(&mut self, id: &str) -> &mut nebula_core::harness::HarnessOverride {
         self.harnesses.entry(id.to_string()).or_default()
     }
 
@@ -1613,6 +1900,76 @@ impl Config {
         self.enabled_kinds().first().copied().unwrap_or(configured)
     }
 
+    /// The harness the NEW SESSION PICKER (and the PR SESSION picker)
+    /// starts on: the last launch's while REMEMBER HARNESS is on — read
+    /// through [`Config::quick_prompt_kind`], so one switched off since
+    /// steps aside — and None, the first row, while it is off.
+    pub fn remembered_kind(&self) -> Option<AgentKind> {
+        self.remember_harness.then(|| self.quick_prompt_kind())
+    }
+
+    /// REMEMBER HARNESS (Settings → Experimental): make `kind` — and a
+    /// model or effort a picker chose for it, `None` for one it did not —
+    /// the defaults the next launch starts from, by writing the AGENTS
+    /// TAB's own rows: `quick_prompt_kind`, and that harness's Model /
+    /// Effort (the registry entry's, keyed by the kind name or the
+    /// custom id). An explicit `"default"` pick lands as the row's own
+    /// `default`. The QUICK PROMPT names only built-in kinds, so a custom
+    /// entry is remembered by its Model / Effort rows alone. Returns
+    /// whether anything changed, so the caller saves only then; nothing
+    /// moves while the switch is off.
+    pub fn remember_launch(
+        &mut self,
+        kind: AgentKind,
+        custom: Option<&str>,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> bool {
+        if !self.remember_harness {
+            return false;
+        }
+        let id = match (kind, custom) {
+            (AgentKind::Custom, Some(id)) => id.to_string(),
+            (AgentKind::Custom, None) => return false,
+            (kind, _) => kind.as_str().to_string(),
+        };
+        let mut changed = false;
+        if kind != AgentKind::Custom && self.quick_prompt_kind != kind.as_str() {
+            self.quick_prompt_kind = kind.as_str().into();
+            changed = true;
+        }
+        let before = self.effective_harness_by_id(&id);
+        if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+            if before.model.default != model {
+                self.set_harness_model(&id, model.into());
+                changed = true;
+            }
+        }
+        if let Some(effort) = effort.map(str::trim).filter(|e| !e.is_empty()) {
+            if before.effort.default != effort {
+                self.set_harness_effort(&id, effort.into());
+                changed = true;
+            }
+        }
+        // A composing harness (Cursor's family-suffix shape) keeps the
+        // stored effort only if the family it now names ships it, as the
+        // AGENTS TAB's own Model cycle does — never an id the CLI would
+        // refuse.
+        if changed {
+            let descriptor = self.effective_harness_by_id(&id);
+            if descriptor.compose_model_effort {
+                let family = descriptor.default_model().map(str::to_string);
+                let choices = effort_choices_in(&descriptor, family.as_deref());
+                if !fits(&descriptor.effort.default, &choices) {
+                    let fitted = fit_effort_in(&descriptor, family.as_deref(), None)
+                        .unwrap_or_else(|| DEFAULT_CHOICE.into());
+                    self.set_harness_effort(&id, fitted);
+                }
+            }
+        }
+        changed
+    }
+
     /// How many RECENT PROMPTS the SESSIONS PANEL lists under a session:
     /// zero while the feature is off, else the count clamped to what the
     /// daemon keeps (a hand-edited `0` or `50` reads as `1` or the cap,
@@ -1631,6 +1988,67 @@ impl Config {
         crate::keymap::Keymap::from_overrides(&self.keybindings)
     }
 
+    /// The settings of the project checked out at `repo_path`: its
+    /// `projects` entry, else what every project without one gets
+    /// ([`Config::project_fallback`]).
+    pub fn project(&self, repo_path: &Path) -> ProjectSettings {
+        self.projects
+            .get(repo_path)
+            .cloned()
+            .unwrap_or_else(|| self.project_fallback())
+    }
+
+    /// What a project with no entry of its own reads as: the top-level
+    /// `hide_root_worktree`, the key the setting had while it applied to
+    /// every project at once, so a file written then keeps its meaning.
+    pub fn project_fallback(&self) -> ProjectSettings {
+        ProjectSettings {
+            hide_root_worktree: self.hide_root_worktree,
+            ..Default::default()
+        }
+    }
+
+    /// Store `settings` as the entry of the project at `repo_path`. An
+    /// entry that says nothing the fallback doesn't is dropped rather than
+    /// written, so `projects` names only the projects set up differently
+    /// — and a project turned back to match the rest leaves no trace.
+    pub fn set_project(&mut self, repo_path: &Path, settings: ProjectSettings) {
+        if settings == self.project_fallback() {
+            self.projects.remove(repo_path);
+        } else {
+            self.projects.insert(repo_path.to_path_buf(), settings);
+        }
+    }
+
+    /// Activate a PROJECT TAB row for the project at `repo_path` — what
+    /// [`Config::cycle`] is for every other row.
+    pub fn cycle_project(&mut self, repo_path: &Path, kind: SettingKind) {
+        let mut settings = self.project(repo_path);
+        settings.cycle(kind);
+        self.set_project(repo_path, settings);
+    }
+
+    /// The stored text of a typed PROJECT TAB row for the project at
+    /// `repo_path` — what [`Config::text_value`] is for a top-level row.
+    pub fn project_text_value(&self, repo_path: &Path, kind: SettingKind) -> String {
+        self.project(repo_path).text_value(kind)
+    }
+
+    /// Write a typed PROJECT TAB row for the project at `repo_path` — what
+    /// [`Config::set_text`] is for a top-level row. False for a row that
+    /// is not a typed project row.
+    pub fn set_project_text(&mut self, repo_path: &Path, kind: SettingKind, value: &str) -> bool {
+        let mut settings = self.project(repo_path);
+        if !settings.set_text(kind, value) {
+            return false;
+        }
+        self.set_project(repo_path, settings);
+        true
+    }
+
+    /// The overlay's label for `kind`. A PROJECT TAB row read here shows
+    /// the fallback — the overlay reads the selected project's through
+    /// [`Config::project`] instead.
     pub fn value_label(&self, kind: SettingKind) -> String {
         match kind {
             SettingKind::PaletteEnterAttaches => on_off(self.palette_enter_attaches).into(),
@@ -1642,23 +2060,28 @@ impl Config {
             SettingKind::Editor => self.editor.clone(),
             SettingKind::CloseFinderOnOpen => on_off(self.close_finder_on_open).into(),
             SettingKind::SshSyncConfig => on_off(self.ssh_sync_config).into(),
-            SettingKind::SkipSessionNaming => on_off(self.skip_session_naming).into(),
             SettingKind::ConfirmOnArchive => on_off(self.confirm_on_archive).into(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
             SettingKind::PrewarmAgents => on_off(self.prewarm_agents).into(),
             SettingKind::PrewarmSessions => on_off(self.prewarm_sessions).into(),
             SettingKind::DoneSound => self.done_sound.clone(),
             SettingKind::FeedbackSound => self.feedback_sound.clone(),
+            SettingKind::PresetText => self.preset_text().as_str().into(),
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
             SettingKind::FocusTint => on_off(self.focus_tint).into(),
             SettingKind::ShowWorkspaces => on_off(self.show_workspaces).into(),
             SettingKind::HideProjects => shown_hidden(self.hide_projects).into(),
             SettingKind::HideWorktrees => shown_hidden(self.hide_worktrees).into(),
+            SettingKind::HideSessions => shown_hidden(self.hide_sessions).into(),
             SettingKind::HideDraftPrs => shown_hidden(self.hide_draft_prs).into(),
-            SettingKind::HideRootWorktree => on_off(self.hide_root_worktree).into(),
+            SettingKind::HideRootWorktree | SettingKind::RunCommand | SettingKind::OpenCommand => {
+                self.project_fallback().value_label(kind)
+            }
             SettingKind::RecentPrompts => on_off(self.recent_prompts).into(),
             SettingKind::ShowKeyCombos => on_off(self.show_key_combos).into(),
+            SettingKind::RememberHarness => on_off(self.remember_harness).into(),
+            SettingKind::PrIssueCounts => on_off(self.pr_issue_counts).into(),
             SettingKind::RecentPromptsCount => self
                 .recent_prompts_count
                 .clamp(1, nebula_core::RECENT_PROMPTS_KEPT)
@@ -1671,9 +2094,10 @@ impl Config {
 
     /// `delta == 0` means activate (toggle a bool, cycle a choice forward).
     /// Non-zero delta cycles a choice; bools still toggle. `index` is
-    /// tab-local — the Hotkeys tab has no cyclable values and no-ops here.
-    /// The Agents tab resolves its head rows statically and its harness
-    /// rows through the registry.
+    /// tab-local — the Hotkeys tab has no cyclable values and no-ops here,
+    /// and so does a PROJECT TAB row, which [`Config::cycle_project`]
+    /// flips for one project. The Agents tab resolves its head rows
+    /// statically and its harness rows through the registry.
     pub fn cycle(&mut self, tab: usize, index: usize, delta: i32) {
         if tab == agents_tab() {
             if let Some(spec) = AGENTS_HEAD.get(index) {
@@ -1711,9 +2135,6 @@ impl Config {
             SettingKind::SshSyncConfig => {
                 self.ssh_sync_config = !self.ssh_sync_config;
             }
-            SettingKind::SkipSessionNaming => {
-                self.skip_session_naming = !self.skip_session_naming;
-            }
             SettingKind::ConfirmOnArchive => {
                 self.confirm_on_archive = !self.confirm_on_archive;
             }
@@ -1733,6 +2154,12 @@ impl Config {
             SettingKind::FeedbackSound => {
                 self.feedback_sound = cycle_choice(&self.feedback_sound, SOUNDS, step).into();
             }
+            SettingKind::PresetText => {
+                // Cycled from the resolved side, so a hand edit off the
+                // list steps on from the default it reads as.
+                self.preset_text =
+                    cycle_choice(self.preset_text().as_str(), PRESET_TEXTS, step).into();
+            }
             SettingKind::Theme => {
                 self.theme = cycle_choice(&self.theme, crate::theme::THEMES, step).into();
             }
@@ -1751,12 +2178,14 @@ impl Config {
             SettingKind::HideWorktrees => {
                 self.hide_worktrees = !self.hide_worktrees;
             }
+            SettingKind::HideSessions => {
+                self.hide_sessions = !self.hide_sessions;
+            }
             SettingKind::HideDraftPrs => {
                 self.hide_draft_prs = !self.hide_draft_prs;
             }
-            SettingKind::HideRootWorktree => {
-                self.hide_root_worktree = !self.hide_root_worktree;
-            }
+            // One project's, not the file's: see `cycle_project`.
+            SettingKind::HideRootWorktree | SettingKind::RunCommand | SettingKind::OpenCommand => {}
             SettingKind::RecentPrompts => {
                 self.recent_prompts = !self.recent_prompts;
             }
@@ -1769,6 +2198,12 @@ impl Config {
             }
             SettingKind::ShowKeyCombos => {
                 self.show_key_combos = !self.show_key_combos;
+            }
+            SettingKind::RememberHarness => {
+                self.remember_harness = !self.remember_harness;
+            }
+            SettingKind::PrIssueCounts => {
+                self.pr_issue_counts = !self.pr_issue_counts;
             }
             SettingKind::HideUninstalledHarnesses => {
                 self.hide_uninstalled_harnesses = !self.hide_uninstalled_harnesses;
@@ -2031,6 +2466,30 @@ mod tests {
         (
             "0.27.0",
             include_str!("../../nebula-core/fixtures/config-0.27.0.json"),
+        ),
+        (
+            "0.28.0",
+            include_str!("../../nebula-core/fixtures/config-0.28.0.json"),
+        ),
+        (
+            "0.29.0",
+            include_str!("../../nebula-core/fixtures/config-0.29.0.json"),
+        ),
+        (
+            "0.30.0",
+            include_str!("../../nebula-core/fixtures/config-0.30.0.json"),
+        ),
+        (
+            "0.31.0",
+            include_str!("../../nebula-core/fixtures/config-0.31.0.json"),
+        ),
+        (
+            "0.32.0",
+            include_str!("../../nebula-core/fixtures/config-0.32.0.json"),
+        ),
+        (
+            "0.33.0",
+            include_str!("../../nebula-core/fixtures/config-0.33.0.json"),
         ),
     ];
 
@@ -2307,26 +2766,29 @@ mod tests {
         assert!(!cfg.git_init_on_create);
     }
 
+    /// `n` always launches straight from the picker now, so **Skip
+    /// starting prompt** has no row to be edited on — but the key an
+    /// earlier release wrote still loads, and is written back unchanged
+    /// for the older builds that read it.
     #[test]
-    fn skip_session_naming_defaults_off_toggles_and_persists() {
-        assert!(
-            !Config::default().skip_session_naming,
-            "naming is the default; skipping it is opt-in"
-        );
-        let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert!(!cfg.skip_session_naming);
-
-        let mut cfg = Config::default();
-        let (tab, row) = locate(SettingKind::SkipSessionNaming).unwrap();
-        assert_eq!(cfg.value_label(SettingKind::SkipSessionNaming), "off");
-        cfg.cycle(tab, row, 0);
-        assert!(cfg.skip_session_naming);
-        assert_eq!(cfg.value_label(SettingKind::SkipSessionNaming), "on");
+    fn skip_session_naming_has_no_row_and_is_written_back_for_older_builds() {
+        assert!(SETTINGS_TABS.iter().all(|tab| match &tab.body {
+            TabBody::Values(rows) | TabBody::Project(rows) => {
+                rows.iter().all(|row| row.label != "Skip starting prompt")
+            }
+            TabBody::Hotkeys | TabBody::Agents => true,
+        }));
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"skip_session_naming": true}"#).unwrap();
+        let mut cfg = load_from(&path);
+        assert!(cfg.skipped.is_empty(), "{:?}", cfg.skipped);
+        assert!(cfg.skip_session_naming);
+
+        cfg.focus_tint = false;
         cfg.save_to(&path).unwrap();
-        assert!(load_from(&path).skip_session_naming);
+        assert_eq!(read_json_file(&path)["skip_session_naming"], true);
     }
 
     #[test]
@@ -2756,32 +3218,314 @@ mod tests {
         assert!(!cfg.quick_prompt_focus);
     }
 
-    /// The Experimental tab's first row: off by default, a plain toggle,
-    /// persisted under its own key, and unknown to a config written
-    /// before it (which reads as off).
+    /// **Hide root worktree** is the PROJECT TAB's row: off for every
+    /// project by default, flipped for one project at a time through
+    /// `cycle_project`, stored under that project's repo path in
+    /// `projects` — and only while it differs from what the rest get, so
+    /// flipping it back leaves no entry behind. `Config::cycle` on the
+    /// row, which has no project to speak of, changes nothing.
     #[test]
-    fn hide_root_worktree_is_off_by_default_on_the_experimental_tab_and_persists() {
+    fn hide_root_worktree_is_a_project_setting_kept_per_repo_path() {
+        let demo = Path::new("/tmp/demo");
+        let other = Path::new("/tmp/other");
         let mut cfg = Config::default();
-        assert!(
-            !cfg.hide_root_worktree,
-            "the root row is where most people start"
-        );
-        assert_eq!(cfg.value_label(SettingKind::HideRootWorktree), "off");
+        assert!(!cfg.project(demo).hide_root_worktree, "off out of the box");
+        assert!(cfg.projects.is_empty());
 
         let (tab, row) = locate(SettingKind::HideRootWorktree).unwrap();
-        assert_eq!(SETTINGS_TABS[tab].title, "Experimental");
-        assert_eq!(tab + 1, hotkeys_tab(), "Hotkeys stays last");
+        assert_eq!(SETTINGS_TABS[tab].title, "Project");
+        assert_eq!(tab, project_tab());
+        assert!(SettingKind::HideRootWorktree.is_project());
         cfg.cycle(tab, row, 0);
-        assert!(cfg.hide_root_worktree);
-        assert_eq!(cfg.value_label(SettingKind::HideRootWorktree), "on");
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap(),
+            serde_json::to_value(Config::default()).unwrap(),
+            "no project named: nothing to flip"
+        );
+
+        cfg.cycle_project(demo, SettingKind::HideRootWorktree);
+        assert!(cfg.project(demo).hide_root_worktree);
+        assert_eq!(
+            cfg.project(demo).value_label(SettingKind::HideRootWorktree),
+            "on"
+        );
+        assert!(
+            !cfg.project(other).hide_root_worktree,
+            "one project's, not every project's"
+        );
+        assert_eq!(
+            cfg.project(other)
+                .value_label(SettingKind::HideRootWorktree),
+            "off"
+        );
+        assert!(
+            !cfg.hide_root_worktree,
+            "the old global key is not what was written"
+        );
+        assert_eq!(cfg.projects.keys().collect::<Vec<_>>(), [demo]);
+
+        // Persisted under the project's path, as its own object.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert_eq!(
+            read_json_file(&path)["projects"],
+            serde_json::json!({ "/tmp/demo": { "hide_root_worktree": true } })
+        );
+        let loaded = load_from(&path);
+        assert!(loaded.project(demo).hide_root_worktree);
+        assert!(!loaded.project(other).hide_root_worktree);
+
+        // Back to what the rest get: the entry goes, not just its value.
+        cfg.cycle_project(demo, SettingKind::HideRootWorktree);
+        assert!(!cfg.project(demo).hide_root_worktree);
+        assert!(cfg.projects.is_empty(), "an all-default entry is dropped");
+        cfg.save_to(&path).unwrap();
+        assert_eq!(read_json_file(&path)["projects"], serde_json::json!({}));
+
+        // A config predating the key has no entries.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.projects.is_empty());
+    }
+
+    /// **Run command** on the Project tab: a typed row (Enter prompts,
+    /// ←/→ and cycle change nothing) kept per repo path as `run_command`,
+    /// shown as `.nebula.json` while empty — the file decides then — and
+    /// left out of the file while empty, so an entry that only sets the
+    /// toggle is written as it always was.
+    #[test]
+    fn run_command_is_a_typed_project_row_kept_per_repo_path() {
+        let demo = Path::new("/tmp/demo");
+        let other = Path::new("/tmp/other");
+        let mut cfg = Config::default();
+        assert!(SettingKind::RunCommand.is_text());
+        assert!(SettingKind::RunCommand.is_project());
+        let (tab, row) = locate(SettingKind::RunCommand).unwrap();
+        assert_eq!(tab, project_tab());
+        assert_eq!(row, 0, "the first row of the tab");
+        assert_eq!(cfg.project(demo).run_command, "");
+        assert_eq!(
+            cfg.project(demo).value_label(SettingKind::RunCommand),
+            PROJECT_FILE_CHOICE
+        );
+        assert_eq!(cfg.value_label(SettingKind::RunCommand), ".nebula.json");
+        assert_eq!(cfg.project_text_value(demo, SettingKind::RunCommand), "");
+
+        // Neither the tab's cycle nor the project's touches a typed row.
+        for delta in [0, 1, -1] {
+            cfg.cycle(tab, row, delta);
+        }
+        cfg.cycle_project(demo, SettingKind::RunCommand);
+        assert!(cfg.projects.is_empty());
+        assert!(
+            !cfg.set_text(SettingKind::RunCommand, "npm run dev"),
+            "not a top-level row"
+        );
+        assert!(
+            !cfg.set_project_text(demo, SettingKind::HideRootWorktree, "on"),
+            "not a typed row"
+        );
+        assert!(cfg.projects.is_empty());
+
+        assert!(cfg.set_project_text(demo, SettingKind::RunCommand, "  npm run dev "));
+        assert_eq!(cfg.project(demo).run_command, "npm run dev", "trimmed");
+        assert_eq!(
+            cfg.project(demo).value_label(SettingKind::RunCommand),
+            "npm run dev"
+        );
+        assert_eq!(
+            cfg.project_text_value(demo, SettingKind::RunCommand),
+            "npm run dev"
+        );
+        assert_eq!(
+            cfg.project(other).value_label(SettingKind::RunCommand),
+            PROJECT_FILE_CHOICE,
+            "one project's, not every project's"
+        );
+        assert!(
+            !cfg.project(demo).hide_root_worktree,
+            "the toggle is untouched"
+        );
+
+        // Persisted in the project's entry beside the toggle; the toggle
+        // alone is still written without the key.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.cycle_project(other, SettingKind::HideRootWorktree);
+        cfg.save_to(&path).unwrap();
+        assert_eq!(
+            read_json_file(&path)["projects"],
+            serde_json::json!({
+                "/tmp/demo": { "hide_root_worktree": false, "run_command": "npm run dev" },
+                "/tmp/other": { "hide_root_worktree": true },
+            })
+        );
+        let loaded = load_from(&path);
+        assert_eq!(loaded.project(demo).run_command, "npm run dev");
+        assert_eq!(loaded.project(other).run_command, "");
+
+        // Empty is the way back to the file — and drops the entry.
+        assert!(cfg.set_project_text(demo, SettingKind::RunCommand, "   "));
+        assert_eq!(cfg.projects.keys().collect::<Vec<_>>(), [other]);
+        cfg.save_to(&path).unwrap();
+        assert_eq!(
+            read_json_file(&path)["projects"],
+            serde_json::json!({ "/tmp/other": { "hide_root_worktree": true } })
+        );
+    }
+
+    /// **Open command** on the Project tab: the same typed per-project row
+    /// as Run command, right under it, kept as `open_command` — what
+    /// `Shift+Enter` / `Shift+O` runs before looking at `.nebula.json`.
+    /// Its own key, so setting it leaves `run_command` alone; empty drops
+    /// it from the entry.
+    #[test]
+    fn open_command_is_a_typed_project_row_under_run_command() {
+        let demo = Path::new("/tmp/demo");
+        let mut cfg = Config::default();
+        assert!(SettingKind::OpenCommand.is_text());
+        assert!(SettingKind::OpenCommand.is_project());
+        let (tab, row) = locate(SettingKind::OpenCommand).unwrap();
+        assert_eq!(tab, project_tab());
+        assert_eq!(
+            row,
+            locate(SettingKind::RunCommand).unwrap().1 + 1,
+            "right under Run command"
+        );
+        assert_eq!(cfg.project(demo).open_command, "");
+        assert_eq!(
+            cfg.project(demo).value_label(SettingKind::OpenCommand),
+            PROJECT_FILE_CHOICE
+        );
+        assert_eq!(cfg.value_label(SettingKind::OpenCommand), ".nebula.json");
+
+        // A typed row: cycling it changes nothing, and the top-level
+        // setter is not its.
+        cfg.cycle_project(demo, SettingKind::OpenCommand);
+        assert!(cfg.projects.is_empty());
+        assert!(!cfg.set_text(SettingKind::OpenCommand, "open x"));
+
+        assert!(cfg.set_project_text(
+            demo,
+            SettingKind::OpenCommand,
+            "  open http://localhost:3000 "
+        ));
+        assert_eq!(
+            cfg.project(demo).open_command,
+            "open http://localhost:3000",
+            "trimmed"
+        );
+        assert_eq!(cfg.project(demo).run_command, "", "run's key is untouched");
+        assert_eq!(
+            cfg.project_text_value(demo, SettingKind::OpenCommand),
+            "open http://localhost:3000"
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         cfg.save_to(&path).unwrap();
-        assert!(load_from(&path).hide_root_worktree);
+        assert_eq!(
+            read_json_file(&path)["projects"],
+            serde_json::json!({
+                "/tmp/demo": { "hide_root_worktree": false, "open_command": "open http://localhost:3000" },
+            })
+        );
+        assert_eq!(
+            load_from(&path).project(demo).open_command,
+            "open http://localhost:3000"
+        );
 
-        let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert!(!cfg.hide_root_worktree);
+        // Empty is the way back to the file — and drops the entry.
+        assert!(cfg.set_project_text(demo, SettingKind::OpenCommand, " "));
+        assert!(cfg.projects.is_empty());
+    }
+
+    /// The top-level `hide_root_worktree` a 0.27 file set keeps its
+    /// meaning as the fallback: every project without an entry hides its
+    /// root, a project's own row can still say `off` (and that entry is
+    /// kept, since it differs from the fallback), and the key itself is
+    /// written back unchanged for the older builds that read it. Keys in
+    /// an entry this build doesn't know ride through a save too.
+    #[test]
+    fn the_old_global_key_is_the_fallback_every_project_without_an_entry_gets() {
+        let demo = Path::new("/tmp/demo");
+        let other = Path::new("/tmp/other");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "hide_root_worktree": true,
+              "projects": {
+                "/tmp/other": { "hide_root_worktree": false, "future_row": "x" }
+              }
+            }"#,
+        )
+        .unwrap();
+        let mut cfg = load_from(&path);
+        assert!(cfg.skipped.is_empty(), "{:?}", cfg.skipped);
+        assert!(cfg.hide_root_worktree);
+        assert!(
+            cfg.project(demo).hide_root_worktree,
+            "no entry: the fallback"
+        );
+        assert_eq!(
+            cfg.value_label(SettingKind::HideRootWorktree),
+            "on",
+            "the fallback's label"
+        );
+        assert!(!cfg.project(other).hide_root_worktree, "its own row wins");
+        assert_eq!(
+            cfg.project(other).other.get("future_row"),
+            Some(&serde_json::json!("x"))
+        );
+
+        // Turning demo off writes an entry, since off now differs from
+        // the fallback; turning other on makes it match the fallback —
+        // but its unknown key keeps the entry from being dropped.
+        cfg.cycle_project(demo, SettingKind::HideRootWorktree);
+        cfg.cycle_project(other, SettingKind::HideRootWorktree);
+        assert!(!cfg.project(demo).hide_root_worktree);
+        assert!(cfg.project(other).hide_root_worktree);
+        cfg.save_to(&path).unwrap();
+        let saved = read_json_file(&path);
+        assert_eq!(
+            saved["hide_root_worktree"], true,
+            "written back for older builds"
+        );
+        assert_eq!(
+            saved["projects"],
+            serde_json::json!({
+                "/tmp/demo": { "hide_root_worktree": false },
+                "/tmp/other": { "hide_root_worktree": true, "future_row": "x" }
+            })
+        );
+    }
+
+    /// The Project tab: one line naming the project, then its rows, every
+    /// one of them a project row — and no project row anywhere else.
+    #[test]
+    fn the_project_tab_names_the_project_then_lists_its_rows() {
+        let tab = project_tab();
+        assert_eq!(SETTINGS_TABS[tab].title, "Project");
+        assert!(tab < hotkeys_tab());
+        let rows = settings_rows(tab);
+        assert_eq!(rows[0], SettingsRow::Project);
+        assert_eq!(
+            rows[1..],
+            (0..tab_len(tab))
+                .map(SettingsRow::Setting)
+                .collect::<Vec<_>>()[..]
+        );
+        for (t, _, spec) in all_settings() {
+            assert_eq!(
+                spec.kind.is_project(),
+                t == tab,
+                "{:?} sits on {}",
+                spec.kind,
+                SETTINGS_TABS[t].title
+            );
+        }
     }
 
     /// The KEY COMBO DISPLAY: an Experimental switch, off by default, a
@@ -2811,6 +3555,233 @@ mod tests {
 
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(!cfg.show_key_combos);
+    }
+
+    /// REMEMBER HARNESS: an Experimental switch, off by default, a plain
+    /// toggle persisted under `remember_harness`, unknown to a config
+    /// written before it (which reads as off).
+    #[test]
+    fn remember_harness_is_off_by_default_on_the_experimental_tab_and_persists() {
+        let mut cfg = Config::default();
+        assert!(!cfg.remember_harness, "a pick is one session's by default");
+        assert_eq!(cfg.value_label(SettingKind::RememberHarness), "off");
+        assert_eq!(
+            cfg.remembered_kind(),
+            None,
+            "off: the picker starts on its first row"
+        );
+
+        let (tab, row) = locate(SettingKind::RememberHarness).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Experimental");
+        assert_eq!(tab + 1, hotkeys_tab(), "Hotkeys stays last");
+        let (combo_tab, combo_row) = locate(SettingKind::ShowKeyCombos).unwrap();
+        assert_eq!(
+            (combo_tab, combo_row + 1),
+            (tab, row),
+            "the newest switch sits last"
+        );
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.remember_harness);
+        assert_eq!(cfg.value_label(SettingKind::RememberHarness), "on");
+        assert_eq!(cfg.remembered_kind(), Some(AgentKind::Claude));
+        cfg.cycle(tab, row, 1);
+        assert!(!cfg.remember_harness, "either arrow toggles it back");
+        cfg.cycle(tab, row, -1);
+        assert!(cfg.remember_harness);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).remember_harness);
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.remember_harness);
+    }
+
+    /// PRESET TEXT: a Sessions row after the sounds, `prefix` by default,
+    /// cycling the three sides and persisted under `preset_text`; a hand
+    /// edit off the list reads as the default, and `both` as the long
+    /// label.
+    #[test]
+    fn preset_text_is_prefix_by_default_on_the_sessions_tab_and_cycles_the_sides() {
+        let mut cfg = Config::default();
+        assert_eq!(
+            cfg.preset_text(),
+            PresetText::Prefix,
+            "one box, before the task"
+        );
+        assert_eq!(cfg.value_label(SettingKind::PresetText), "prefix");
+        assert_eq!(
+            PRESET_TEXTS.to_vec(),
+            PresetText::ALL.map(PresetText::as_str).to_vec(),
+            "the row cycles every side, in the enum's order"
+        );
+
+        let (tab, row) = locate(SettingKind::PresetText).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Sessions");
+        let (sound_tab, sound_row) = locate(SettingKind::FeedbackSound).unwrap();
+        assert_eq!((sound_tab, sound_row + 1), (tab, row), "after the sounds");
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.preset_text(), PresetText::Postfix);
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.preset_text(), PresetText::Both);
+        assert_eq!(cfg.value_label(SettingKind::PresetText), "prefix & postfix");
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.preset_text(), PresetText::Prefix, "wraps");
+        cfg.cycle(tab, row, -1);
+        assert_eq!(cfg.preset_text(), PresetText::Both, "← steps back");
+        cfg.cycle(tab, row, 0);
+        assert_eq!(cfg.preset_text(), PresetText::Prefix, "Enter steps on");
+
+        cfg.cycle(tab, row, -1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert_eq!(load_from(&path).preset_text, "prefix & postfix");
+        assert_eq!(load_from(&path).preset_text(), PresetText::Both);
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            cfg.preset_text(),
+            PresetText::Prefix,
+            "unknown to an older file"
+        );
+        let cfg: Config = serde_json::from_str(r#"{"preset_text": "both"}"#).unwrap();
+        assert_eq!(cfg.preset_text(), PresetText::Both);
+        assert_eq!(cfg.value_label(SettingKind::PresetText), "prefix & postfix");
+        let mut cfg: Config = serde_json::from_str(r#"{"preset_text": "suffix"}"#).unwrap();
+        assert_eq!(
+            cfg.preset_text(),
+            PresetText::Prefix,
+            "an unknown value is the default"
+        );
+        cfg.cycle(tab, row, 1);
+        assert_eq!(
+            cfg.preset_text(),
+            PresetText::Postfix,
+            "and cycles on from it"
+        );
+    }
+
+    /// PR & ISSUE COUNTS: an Experimental switch, on by default — the one
+    /// on the tab that is — a plain toggle persisted under
+    /// `pr_issue_counts`, unknown to a config written before it (which
+    /// reads as on). The newest switch, so it sits last on the tab, under
+    /// REMEMBER HARNESS.
+    #[test]
+    fn pr_issue_counts_is_on_by_default_on_the_experimental_tab_and_persists() {
+        let mut cfg = Config::default();
+        assert!(cfg.pr_issue_counts, "the rows count out of the box");
+        assert_eq!(cfg.value_label(SettingKind::PrIssueCounts), "on");
+
+        let (tab, row) = locate(SettingKind::PrIssueCounts).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Experimental");
+        assert_eq!(tab + 1, hotkeys_tab(), "Hotkeys stays last");
+        let (harness_tab, harness_row) = locate(SettingKind::RememberHarness).unwrap();
+        assert_eq!(
+            (harness_tab, harness_row + 1),
+            (tab, row),
+            "the newest switch sits last"
+        );
+        cfg.cycle(tab, row, 0);
+        assert!(!cfg.pr_issue_counts);
+        assert_eq!(cfg.value_label(SettingKind::PrIssueCounts), "off");
+        cfg.cycle(tab, row, 1);
+        assert!(cfg.pr_issue_counts, "either arrow toggles it back");
+        cfg.cycle(tab, row, -1);
+        assert!(!cfg.pr_issue_counts);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(!load_from(&path).pr_issue_counts, "off survives a save");
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(
+            cfg.pr_issue_counts,
+            "a config from before the key reads as on"
+        );
+    }
+
+    /// What a remembered launch writes: the harness into the QUICK
+    /// PROMPT's `quick_prompt_kind`, a picked model or effort into that
+    /// harness's own rows — and nothing at all while the switch is off,
+    /// or when the pick already is the default.
+    #[test]
+    fn remember_launch_writes_the_agents_tab_rows_only_while_on() {
+        let mut cfg = Config::default();
+        assert!(
+            !cfg.remember_launch(AgentKind::Codex, None, Some("gpt-5.5"), Some("high")),
+            "off: nothing moves"
+        );
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Claude);
+        assert_eq!(cfg.codex_model, DEFAULT_CHOICE);
+        assert_eq!(cfg.codex_effort, DEFAULT_CHOICE);
+
+        cfg.remember_harness = true;
+        // The harness alone: the rows it did not drill into stay put.
+        assert!(cfg.remember_launch(AgentKind::Codex, None, None, None));
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Codex);
+        assert_eq!(cfg.remembered_kind(), Some(AgentKind::Codex));
+        assert_eq!(cfg.codex_model, DEFAULT_CHOICE, "no model was picked");
+        assert_eq!(cfg.codex_effort, DEFAULT_CHOICE);
+        assert!(
+            !cfg.remember_launch(AgentKind::Codex, None, None, None),
+            "the same pick again changes nothing, so nothing is saved"
+        );
+
+        // A model and effort drilled into land on that harness's rows.
+        assert!(cfg.remember_launch(AgentKind::Claude, None, Some("opus"), Some("high")));
+        assert_eq!(cfg.quick_prompt_kind(), AgentKind::Claude);
+        assert_eq!(
+            cfg.default_model(AgentKind::Claude).as_deref(),
+            Some("opus")
+        );
+        assert_eq!(
+            cfg.default_effort(AgentKind::Claude).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            cfg.codex_model, DEFAULT_CHOICE,
+            "another harness's rows are its own"
+        );
+        // The explicit "default" row is a pick too: back to no flag.
+        assert!(cfg.remember_launch(AgentKind::Claude, None, Some("default"), None));
+        assert_eq!(cfg.claude_model, DEFAULT_CHOICE);
+        assert_eq!(
+            cfg.default_effort(AgentKind::Claude).as_deref(),
+            Some("high")
+        );
+        // A blank pick is no pick.
+        assert!(!cfg.remember_launch(AgentKind::Claude, None, Some("  "), Some("")));
+
+        // Cursor: a family picked without an effort refits the stored one
+        // to what the family ships, as the AGENTS TAB's own cycle does.
+        cfg.cursor_effort = "high".into();
+        let family_without_efforts = crate::cursor_catalogue::models()
+            .iter()
+            .find(|m| {
+                !m.eq_ignore_ascii_case(DEFAULT_CHOICE)
+                    && effort_choices(AgentKind::Cursor, Some(m), None).is_empty()
+            })
+            .copied()
+            .expect("the seed catalogue ships a family with no effort variants");
+        assert!(cfg.remember_launch(AgentKind::Cursor, None, Some(family_without_efforts), None));
+        assert_eq!(cfg.cursor_model, family_without_efforts);
+        assert_eq!(
+            cfg.default_effort(AgentKind::Cursor),
+            None,
+            "refitted, never refused"
+        );
+
+        // Round trip: what was remembered is what loads.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.quick_prompt_kind(), AgentKind::Cursor);
+        assert_eq!(loaded.claude_effort, "high");
+        assert_eq!(loaded.cursor_model, family_without_efforts);
     }
 
     /// RECENT PROMPTS: an Experimental switch that is off by default and
@@ -3140,7 +4111,9 @@ mod tests {
         );
         assert_eq!(cfg.default_model(AgentKind::Claude), None);
         assert_eq!(cfg.default_model(AgentKind::Codex), None);
-        assert!(cfg.agent_hint("codex", HarnessField::Enabled).contains("broken:"));
+        assert!(cfg
+            .agent_hint("codex", HarnessField::Enabled)
+            .contains("broken:"));
         // The entry still resolves for reads (placeholder-free), while
         // launches refuse it with the reason.
         let codex = cfg.effective_harness_by_id("codex");
@@ -3166,10 +4139,7 @@ mod tests {
         .unwrap();
         let cfg = load_from(&path);
         assert_eq!(cfg.theme, "ocean");
-        assert_eq!(
-            cfg.skipped,
-            BTreeSet::from(["harnesses".to_string()])
-        );
+        assert_eq!(cfg.skipped, BTreeSet::from(["harnesses".to_string()]));
         assert!(cfg.harness_registry().iter().all(|entry| entry.enabled));
     }
 
@@ -3313,9 +4283,7 @@ mod tests {
     #[test]
     fn fit_effort_resolves_cursor_pairs() {
         let cursor = nebula_core::harness::builtin("cursor").unwrap();
-        let fit = |m: Option<&str>, e: Option<&str>| {
-            fit_effort_in(&cursor, m, e.map(String::from))
-        };
+        let fit = |m: Option<&str>, e: Option<&str>| fit_effort_in(&cursor, m, e.map(String::from));
         assert_eq!(fit(None, Some("high")), None, "no family, nothing to join");
         assert_eq!(fit(Some("default"), Some("high")), None);
         assert_eq!(
@@ -3470,7 +4438,7 @@ mod tests {
                     .filter(|row| matches!(row, SettingsRow::Header(_)))
                     .count();
                 match tab.body {
-                    TabBody::Values(settings) => {
+                    TabBody::Values(settings) | TabBody::Project(settings) => {
                         let grouped = settings.iter().any(|s| !s.group.is_empty());
                         assert_eq!(headers > 0, grouped, "{}", tab.title);
                     }
@@ -3497,11 +4465,10 @@ mod tests {
                     SettingsRow::Setting(i) => {
                         let label = match AGENTS_HEAD.get(i) {
                             Some(spec) => spec.label.to_string(),
-                            None => {
-                                cfg.agent_row(i)
-                                    .map(|(_, field)| field.label().to_string())
-                                    .expect("every Agents row resolves")
-                            }
+                            None => cfg
+                                .agent_row(i)
+                                .map(|(_, field)| field.label().to_string())
+                                .expect("every Agents row resolves"),
                         };
                         sections
                             .last_mut()
@@ -3510,7 +4477,7 @@ mod tests {
                             .push(label);
                     }
                     SettingsRow::Blank => assert!(!sections.is_empty(), "no leading blank"),
-                    SettingsRow::Hotkey(_) => unreachable!(),
+                    SettingsRow::Project | SettingsRow::Hotkey(_) => unreachable!(),
                 }
             }
             assert_eq!(
@@ -3526,23 +4493,43 @@ mod tests {
                     ),
                     (
                         "Claude".to_string(),
-                        vec!["Enabled".to_string(), "Model".to_string(), "Effort".to_string()]
+                        vec![
+                            "Enabled".to_string(),
+                            "Model".to_string(),
+                            "Effort".to_string()
+                        ]
                     ),
                     (
                         "Codex".to_string(),
-                        vec!["Enabled".to_string(), "Model".to_string(), "Effort".to_string()]
+                        vec![
+                            "Enabled".to_string(),
+                            "Model".to_string(),
+                            "Effort".to_string()
+                        ]
                     ),
                     (
                         "Cursor".to_string(),
-                        vec!["Enabled".to_string(), "Model".to_string(), "Effort".to_string()]
+                        vec![
+                            "Enabled".to_string(),
+                            "Model".to_string(),
+                            "Effort".to_string()
+                        ]
                     ),
                     (
                         "Pi".to_string(),
-                        vec!["Enabled".to_string(), "Model".to_string(), "Effort".to_string()]
+                        vec![
+                            "Enabled".to_string(),
+                            "Model".to_string(),
+                            "Effort".to_string()
+                        ]
                     ),
                     (
                         "Muse".to_string(),
-                        vec!["Enabled".to_string(), "Model".to_string(), "Effort".to_string()]
+                        vec![
+                            "Enabled".to_string(),
+                            "Model".to_string(),
+                            "Effort".to_string()
+                        ]
                     ),
                     (
                         "Grok Build".to_string(),
@@ -3594,7 +4581,16 @@ mod tests {
                     .collect();
                 assert_eq!(
                     sections,
-                    vec!["Quick prompt", "Claude", "Codex", "Cursor", "Pi", "Muse", "Grok Build", "agy"]
+                    vec![
+                        "Quick prompt",
+                        "Claude",
+                        "Codex",
+                        "Cursor",
+                        "Pi",
+                        "Muse",
+                        "Grok Build",
+                        "agy"
+                    ]
                 );
                 let (_, model_row) =
                     locate_agent("agy", HarnessField::Model).expect("the newcomer locates");
@@ -3620,10 +4616,7 @@ mod tests {
                     "an off-list hand edit steps onto the offered rows"
                 );
                 cfg.cycle(tab, effort_row, 1);
-                assert_eq!(
-                    cfg.harnesses["agy"].effort_default.as_deref(),
-                    Some("low")
-                );
+                assert_eq!(cfg.harnesses["agy"].effort_default.as_deref(), Some("low"));
             });
         });
     }

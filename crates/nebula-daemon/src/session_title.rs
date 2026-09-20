@@ -156,10 +156,8 @@ impl TitleState {
             AgentKind::Claude => true,
             AgentKind::Custom => {
                 let config = crate::config::Config::load();
-                let all = nebula_core::harness::registry(
-                    &config.harnesses,
-                    &config.custom_harnesses,
-                );
+                let all =
+                    nebula_core::harness::registry(&config.harnesses, &config.custom_harnesses);
                 nebula_core::harness::resolve(&all, self.kind, self.custom_harness.as_deref())
                     .map(|descriptor| descriptor.claude_like())
                     .unwrap_or(false)
