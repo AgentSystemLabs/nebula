@@ -71,6 +71,15 @@ pub enum HitTarget {
     Project(usize),
     Worktree(usize),
     Session(usize),
+    /// The FOLLOW-UP CHEVRON at the right end of a session card's name row
+    /// (index into `App::visible_session_rows()`); a click expands or folds
+    /// that card's FOLLOW-UP COMPOSER, same as the space key. Registered
+    /// ahead of the row it sits on, so it wins.
+    SessionFollowUp(usize),
+    /// The open FOLLOW-UP COMPOSER's box. Registered ahead of its row so a
+    /// click inside the box lands on the box — typing into it must not read
+    /// as a second click on the card, which would attach and lock the pane.
+    FollowUpBox,
     /// The ARCHIVED group header (either form); a click toggles the group
     /// open/closed, same as the A key.
     ArchivedHeader,
@@ -230,6 +239,11 @@ pub enum MenuAction {
     /// `ViewPrDiff`, carries no id: the row is the selection, and `y`
     /// reads it off the cursor the same way.
     CommentPullRequest,
+    /// Expand the selected session card into its FOLLOW-UP COMPOSER, or
+    /// fold it back up. Carries no id for the same reason `ViewPrDiff`
+    /// doesn't: the card is the selection, and Space reads it off the
+    /// cursor the same way.
+    FollowUp,
     EditLink(LinkId),
     DeleteLink(LinkId),
     DeleteWorktree(WorktreeId),
@@ -2860,6 +2874,21 @@ pub struct FeedbackAlert {
     pub place: String,
 }
 
+/// The FOLLOW-UP COMPOSER: the box a session card grows when it is
+/// expanded, and the next turn being typed into it.
+///
+/// One at a time, because it owns the keyboard while it is open: the
+/// SESSIONS PANEL's own keys (`j`, `a`, `d`…) are letters, so a card with a
+/// live box takes every key the panel would otherwise act on. It is bound
+/// to the AGENT rather than to a row index — the list re-sorts on every
+/// status change, and the box has to stay on the card it was opened on.
+pub struct FollowUp {
+    pub agent: AgentId,
+    /// Multi-line, like the QUICK PROMPT's box: Enter sends, Shift+Enter /
+    /// ⌥Enter / `^J` break the line.
+    pub input: TextInput,
+}
+
 pub struct App {
     pub tree: Tree,
     pub focus: Focus,
@@ -2875,9 +2904,12 @@ pub struct App {
     /// the selection moved (so arrows follow the cursor but the wheel
     /// doesn't fight it).
     pub sessions_scroll: usize,
-    /// `(sel_worktree, sel_session)` as of the last draw — the draw
-    /// re-anchors `sessions_scroll` only when this changes.
-    pub sessions_anchor: Option<(usize, usize)>,
+    /// `(sel_worktree, sel_session, follow-up rows)` as of the last draw —
+    /// the draw re-anchors `sessions_scroll` only when this changes. The
+    /// third member is how tall the FOLLOW-UP COMPOSER drew: expanding a
+    /// card, and every line typed into it, scrolls the column after the box
+    /// the way a moved cursor scrolls it after the selection.
+    pub sessions_anchor: Option<(usize, usize, usize)>,
     /// First visible row of the Worktrees panel, in panel rows. Same
     /// contract as `sessions_scroll`: the wheel moves it freely, the draw
     /// clamps it and re-anchors on the cursor when `worktrees_anchor` shows
@@ -2946,6 +2978,11 @@ pub struct App {
     /// drops back onto it. Projects until the bar has been entered.
     pub bar_return: Focus,
     pub overlay: Option<Overlay>,
+    /// The expanded session card's FOLLOW-UP COMPOSER, or None with every
+    /// card folded. Not an `Overlay`: it draws inside the SESSIONS PANEL
+    /// and the panels stay live around it — what it takes is the keyboard,
+    /// not the screen.
+    pub follow_up: Option<FollowUp>,
     pub show_archived: bool,
     /// The Worktrees panel's OPEN PRS group folded down to its header (a
     /// click on it). Like `show_archived`, it rides the UI-state blob so a
@@ -3376,6 +3413,7 @@ impl App {
             sel_session: 0,
             sessions_scroll: 0,
             sessions_anchor: None,
+            follow_up: None,
             worktrees_scroll: 0,
             worktrees_anchor: None,
             worktrees_view_rows: 0,
@@ -4127,6 +4165,42 @@ impl App {
             Some(SessionRow::Agent(a)) => Some(a),
             _ => None,
         }
+    }
+
+    // ---- the FOLLOW-UP COMPOSER ----
+
+    /// Can this row grow a FOLLOW-UP COMPOSER? An agent with a local PTY
+    /// behind it, and only that: an ARCHIVED row's turn is over, a CLOUD
+    /// row's agent is in a sandbox with a message queue of its own (its
+    /// menu's **Send to cloud session**), a QUICK PROMPT stand-in has no
+    /// session yet, and a TERMINAL or a PULL REQUEST row was never a
+    /// conversation to follow up on.
+    pub fn takes_follow_up(&self, row: &SessionRow) -> bool {
+        matches!(
+            row,
+            SessionRow::Agent(a)
+                if !a.archived
+                    && a.cloud_session_id.is_none()
+                    && !self.is_placeholder_agent(&a.id)
+        )
+    }
+
+    /// The row the open FOLLOW-UP COMPOSER belongs to — an index into
+    /// [`App::visible_session_rows`], found by AGENT so a re-sorted list
+    /// keeps the box on its own card. None with nothing expanded, or when
+    /// the agent it was opened on has left the list (archived, deleted, or
+    /// the panel moved to another checkout).
+    pub fn follow_up_row(&self) -> Option<usize> {
+        let id = &self.follow_up.as_ref()?.agent;
+        self.visible_session_rows()
+            .iter()
+            .position(|row| matches!(row, SessionRow::Agent(a) if &a.id == id))
+    }
+
+    /// Is the composer live — open, and on a card still in the list? What
+    /// decides whether the SESSIONS PANEL's keys are the box's.
+    pub fn follow_up_live(&self) -> bool {
+        self.follow_up_row().is_some()
     }
 
     /// Shell terminals of the selected worktree, in tree order.

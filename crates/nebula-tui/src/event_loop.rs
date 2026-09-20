@@ -2130,6 +2130,9 @@ fn dispatch_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientRequ
         // An overlay with a live text field takes the paste: ⌘V into a
         // filter or the ssh destination lands where the caret is.
         Event::Paste(text) if paste_into_overlay(app, &text) => {}
+        // Then an expanded session card's FOLLOW-UP COMPOSER, which holds
+        // the keyboard the way an overlay's field does while it is open.
+        Event::Paste(text) if paste_into_follow_up(app, &text) => {}
         Event::Paste(text) => {
             // A stand-in pane (QUICK PROMPT, checkout still being cut) has
             // no PTY to paste into.
@@ -2250,6 +2253,133 @@ fn paste_into_overlay(app: &mut App, text: &str) -> bool {
     true
 }
 
+// ---- the FOLLOW-UP COMPOSER ----
+
+/// A paste while a session card's FOLLOW-UP COMPOSER is open: it lands in
+/// the box, newlines and all. False when no card is expanded, so the paste
+/// falls through to the terminal pane.
+fn paste_into_follow_up(app: &mut App, text: &str) -> bool {
+    if app.focus != Focus::Sessions || !app.follow_up_live() {
+        return false;
+    }
+    let Some(follow_up) = &mut app.follow_up else {
+        return false;
+    };
+    follow_up.input.insert_str(text);
+    app.dirty = true;
+    true
+}
+
+/// One key while the composer is open and the SESSIONS PANEL has focus.
+/// True when the box took it — which is nearly everything: the panel's own
+/// verbs are bare letters, so a card with a live box has to swallow them or
+/// typing "attach and archive it" would do both. Enter sends, Esc folds the
+/// card, Shift+Enter / ⌥Enter / `^J` break the line, the readline chords
+/// edit; what is left over is dropped rather than handed on, so no
+/// keystroke aimed at the box ever acts on the list behind it.
+///
+/// Tab and ⇧Tab are the exception, and the way out that isn't Esc: the
+/// panel walk still works, and the box stays open on its card behind it.
+fn follow_up_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) -> bool {
+    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        return false;
+    }
+    let chord = crate::keymap::KeyChord::from_event(&key);
+    // The KEY COMBO DISPLAY never shows what is typed into a text field
+    // (see key_combo.rs), here as in every modal.
+    if !crate::key_combo::is_text_key(&chord) {
+        let does = match key.code {
+            KeyCode::Enter => Some("Send the follow-up"),
+            KeyCode::Esc => Some("Close the follow-up"),
+            _ => None,
+        };
+        crate::key_combo::note(app, &[chord], does);
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.follow_up = None;
+            app.dirty = true;
+        }
+        KeyCode::Enter
+            if !app
+                .follow_up
+                .as_ref()
+                .is_some_and(|f| f.input.takes_newline(&key)) =>
+        {
+            send_follow_up(app, out);
+        }
+        _ => {
+            if let Some(follow_up) = &mut app.follow_up {
+                if follow_up.input.handle_key(&key).consumed() {
+                    app.dirty = true;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Enter in the composer: what it holds goes to the agent as its next turn
+/// and the card folds back up.
+///
+/// The text crosses as a BRACKETED PASTE when it has line breaks — the
+/// CLI (claude, codex…) then takes it as one block instead of auto-indenting
+/// it into mush — and as plain bytes when it is the one line it usually is,
+/// which keeps it out of the "[Pasted text]" placeholder those CLIs fold a
+/// paste into. The carriage return that submits it is a second `Input` of
+/// its own, so the child's read of the prompt and its read of the Enter are
+/// two reads and it has the prompt in hand before the Enter arrives.
+///
+/// A session with no live PTY behind it — reaped by the IDLE REAPER, or
+/// cold since the daemon started — is booted first and the box kept as it
+/// is: the daemon drops `Input` for a session it has not spawned, and the
+/// CLI that boot starts is seconds from reading anything, so the prompt
+/// would be typed into a process that never saw it.
+fn send_follow_up(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let Some(follow_up) = &app.follow_up else {
+        return;
+    };
+    let text = follow_up.input.as_str().trim().to_string();
+    let id = follow_up.agent.clone();
+    if text.is_empty() {
+        return;
+    }
+    let Some(agent) = app.tree.agents.iter().find(|a| a.id == id).cloned() else {
+        // The row went away under the box (deleted, or the daemon lost it).
+        app.follow_up = None;
+        app.dirty = true;
+        return;
+    };
+    let sref = SessionRef::Agent(id);
+    if !agent.alive {
+        attach_now(app, sref, out);
+        app.flash = Some(format!(
+            "starting {} — press Enter again once it is up",
+            agent.name
+        ));
+        return;
+    }
+    // The pane goes to the session being prompted: the answer is about to
+    // land there, and the user asked for it by name.
+    attach_now(app, sref.clone(), out);
+    let data = if text.contains('\n') {
+        bracketed(&text)
+    } else {
+        text.into_bytes()
+    };
+    out.push(ClientRequest::Input {
+        session: sref.clone(),
+        data,
+    });
+    out.push(ClientRequest::Input {
+        session: sref,
+        data: b"\r".to_vec(),
+    });
+    app.follow_up = None;
+    app.flash = Some(format!("sent to {}", agent.name));
+    app.dirty = true;
+}
+
 fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     // The editor modal sits above every overlay: all keys forward to it —
     // vim needs Esc — except Ctrl+Q, the same hatch the terminal lock uses.
@@ -2365,6 +2495,15 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             Some("Back to panels"),
         );
         app.splash_preview = false;
+        return;
+    }
+
+    // A session card expanded into its FOLLOW-UP COMPOSER: the box owns
+    // every key the SESSIONS PANEL would otherwise act on — they are all
+    // letters, and `a` in a prompt must not archive the session being
+    // prompted. Only the panel walk gets through (Tab / ⇧Tab), and Esc
+    // folds the card back up.
+    if app.focus == Focus::Sessions && app.follow_up_live() && follow_up_key(app, key, out) {
         return;
     }
 
@@ -2743,6 +2882,14 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // lists the casualties).
         Action::DeleteAll => open_delete_all_confirm(app),
         Action::ContextMenu => open_context_menu_for_selection(app),
+        // Space on a session card: expand it into its FOLLOW-UP COMPOSER,
+        // or fold it back up. Sessions only — the other panels have no
+        // card to expand, and Space stays unbound there.
+        Action::FollowUp => {
+            if app.focus == Focus::Sessions {
+                activate::follow_up(app);
+            }
+        }
         // On an open-PR row (either list) `g` reads that pull request's
         // diff off GitHub instead of the checkout's — same modal, different
         // source.
@@ -4195,6 +4342,7 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
                 "Attach",
                 MenuAction::Attach(SessionRef::Agent(a.id.clone())),
             ),
+            MenuItem::new("Follow-up prompt", MenuAction::FollowUp),
             MenuItem::new("Restart", MenuAction::RestartAgent(a.id.clone())),
             MenuItem::new("Rename", MenuAction::RenameAgent(a.id.clone())),
             MenuItem::new("Archive", MenuAction::ArchiveAgent(a.id.clone())),
@@ -4784,6 +4932,13 @@ fn select_clicked_row(app: &mut App, target: &HitTarget, out: &mut Vec<ClientReq
             app.focus = Focus::Worktrees;
         }
         HitTarget::Session(i) => {
+            // A pointer moved onto another card is the one way the cursor
+            // leaves an open FOLLOW-UP COMPOSER while it holds the
+            // keyboard, so it folds: a box on one card with the cursor on
+            // another would leave `j` typing a letter instead of moving.
+            if app.follow_up_row().is_some_and(|open| open != i) {
+                app.follow_up = None;
+            }
             select_session_row(app, i, Duration::ZERO, out);
             app.focus = Focus::Sessions;
         }
@@ -6548,6 +6703,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::OpenLink(url) => open_link(app, &url, out),
         MenuAction::ViewPrDiff => request_pr_diff(app),
         MenuAction::CommentPullRequest => open_pr_comment(app),
+        MenuAction::FollowUp => activate::follow_up(app),
         MenuAction::EditLink(id) => open_prompt(app, PromptKind::EditLink { id }),
         MenuAction::DeleteLink(id) => {
             if let Some(row) = app
@@ -8893,6 +9049,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         None => {}
                     }
                 }
+                // The card's FOLLOW-UP CHEVRON: the cursor goes to the
+                // row as any click on it would, and then the card expands
+                // or folds — `activate::follow_up`, exactly what Space on
+                // it does.
+                Some(HitTarget::SessionFollowUp(i)) => {
+                    select_clicked_row(app, &HitTarget::Session(i), out);
+                    activate::follow_up(app);
+                }
+                // Inside the open box: the panel takes focus and the click
+                // stops there. It must not reach the card underneath, whose
+                // second click attaches the session and locks the pane.
+                Some(HitTarget::FollowUpBox) => app.focus = Focus::Sessions,
                 Some(HitTarget::ArchivedHeader) => {
                     app.focus = Focus::Sessions;
                     toggle_archived(app, out);
@@ -9037,6 +9205,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     over,
                     Some(
                         HitTarget::Session(_)
+                            | HitTarget::SessionFollowUp(_)
+                            | HitTarget::FollowUpBox
                             | HitTarget::ArchivedHeader
                             | HitTarget::PanelBg(Focus::Sessions)
                     )
@@ -33345,6 +33515,178 @@ diff --git a/src/c.rs b/src/c.rs
         );
     }
 
+    // ---- the FOLLOW-UP COMPOSER ----
+
+    /// One live agent under the cursor of a focused SESSIONS PANEL.
+    fn follow_up_app() -> App {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Sessions;
+        app.sel_session = 0;
+        app
+    }
+
+    /// Space expands the card, the box then owns every key the panel has —
+    /// `a` types an `a` instead of archiving the session it is being typed
+    /// at — and Enter sends the turn to the agent and folds the card.
+    #[test]
+    fn space_expands_the_card_and_the_box_takes_the_panel_keys() {
+        let mut app = follow_up_app();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            app.follow_up.as_ref().map(|f| f.agent.clone()),
+            Some(AgentId("a1".into())),
+            "the card under the cursor expanded"
+        );
+
+        for c in "add a test".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(
+            app.follow_up.as_ref().map(|f| f.input.as_str()),
+            Some("add a test"),
+            "a, d and t stayed letters"
+        );
+        assert!(
+            !app.tree.agents[0].archived,
+            "nothing the panel would have done happened"
+        );
+        out.clear();
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.follow_up.is_none(), "the card folded back up");
+        let typed: Vec<&ClientRequest> = out
+            .iter()
+            .filter(|r| matches!(r, ClientRequest::Input { .. }))
+            .collect();
+        match typed.as_slice() {
+            [ClientRequest::Input {
+                session: first,
+                data: text,
+            }, ClientRequest::Input {
+                session: second,
+                data: cr,
+            }] => {
+                assert_eq!(first, &SessionRef::Agent(AgentId("a1".into())));
+                assert_eq!(second, first);
+                assert_eq!(text, b"add a test", "one line goes as plain bytes");
+                assert_eq!(cr, b"\r", "and the Enter that submits it follows");
+            }
+            other => panic!("expected the turn then its Enter, got {other:?}"),
+        }
+        assert_eq!(app.flash.as_deref(), Some("sent to agent-1"));
+    }
+
+    /// A turn with line breaks in it crosses as a BRACKETED PASTE, so the
+    /// CLI takes it as one block instead of auto-indenting it to mush.
+    #[test]
+    fn a_multi_line_turn_goes_as_a_bracketed_paste() {
+        let mut app = follow_up_app();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+        // Shift+Enter breaks the line rather than sending.
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            app.follow_up.as_ref().map(|f| f.input.as_str()),
+            Some("a\nb")
+        );
+        out.clear();
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let sent = out
+            .iter()
+            .find_map(|r| match r {
+                ClientRequest::Input { data, .. } if data != b"\r" => Some(data.clone()),
+                _ => None,
+            })
+            .expect("the turn was sent");
+        assert_eq!(sent, bracketed("a\nb"));
+    }
+
+    /// A session with no live PTY is booted first and the box kept as it
+    /// is: the daemon drops Input for a session it has not spawned, and
+    /// the CLI that attach starts is seconds from reading anything.
+    #[test]
+    fn a_cold_session_is_booted_instead_of_typed_at() {
+        let mut app = follow_up_app();
+        app.tree.agents[0].alive = false;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE, &mut out);
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+
+        assert_eq!(
+            app.follow_up.as_ref().map(|f| f.input.as_str()),
+            Some("x"),
+            "the box and what is in it stay"
+        );
+        assert!(
+            !out.iter().any(|r| matches!(r, ClientRequest::Input { .. })),
+            "nothing was typed into a session that is not up: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { .. })),
+            "it was booted: {out:?}"
+        );
+        assert!(app.flash.as_deref().is_some_and(|f| f.contains("starting")));
+    }
+
+    /// Esc folds the card; an empty box sends nothing.
+    #[test]
+    fn esc_folds_the_card_and_an_empty_box_sends_nothing() {
+        let mut app = follow_up_app();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.follow_up.is_some(), "an empty box stays open");
+        assert!(out.is_empty(), "and sends nothing: {out:?}");
+
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.follow_up.is_none());
+
+        // Space on the folded card expands it again — and then it is a
+        // space, like any other character: a prompt is allowed to contain
+        // one, so Esc and the chevron are what fold the card, never the
+        // key that is being typed into it.
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        assert!(app.follow_up.is_some());
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        assert_eq!(app.follow_up.as_ref().map(|f| f.input.as_str()), Some(" "));
+    }
+
+    /// The box holds the keyboard, so the panel walk has to keep working:
+    /// Tab is the one key that gets through, and the card stays expanded
+    /// behind it.
+    #[test]
+    fn tab_still_walks_out_of_an_open_box() {
+        let mut app = follow_up_app();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.focus, Focus::Terminal, "the walk went through");
+        assert!(app.follow_up.is_some(), "the card is still expanded");
+    }
+
+    /// A paste lands in the box, line breaks and all, rather than in the
+    /// pane behind it.
+    #[test]
+    fn a_paste_lands_in_the_open_box() {
+        let mut app = follow_up_app();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        dispatch_terminal_event(&mut app, Event::Paste("one\ntwo".into()), &mut out);
+        assert_eq!(
+            app.follow_up.as_ref().map(|f| f.input.as_str()),
+            Some("one\ntwo")
+        );
+    }
+
     // ---- INPUT PARITY: a row chosen by the pointer is the row chosen by key ----
     //
     // `event_loop::activate` is the rule; these are its teeth. Each builds
@@ -33481,6 +33823,58 @@ diff --git a/src/c.rs b/src/c.rs
         select_worktree_row(&mut app, root, &mut out);
         app.sel_worktree = root;
         app
+    }
+
+    /// INPUT PARITY: a click on a card's FOLLOW-UP CHEVRON and Space on
+    /// the card are the same thing — `activate::follow_up` — and leave the
+    /// app in the same place, box and all.
+    #[test]
+    fn the_chevron_and_the_space_key_expand_the_same_card() {
+        with_default_config(|| {
+            let mut by_keys = parity_tree();
+            let mut keys_out = Vec::new();
+            click_target(
+                &mut by_keys,
+                HitTarget::Session(0),
+                MouseButton::Left,
+                &mut keys_out,
+            );
+            press(
+                &mut by_keys,
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+                &mut keys_out,
+            );
+
+            let mut by_mouse = parity_tree();
+            let mut mouse_out = Vec::new();
+            click_target(
+                &mut by_mouse,
+                HitTarget::SessionFollowUp(0),
+                MouseButton::Left,
+                &mut mouse_out,
+            );
+
+            assert!(by_mouse.follow_up.is_some(), "the click expanded the card");
+            assert_eq!(
+                by_mouse.follow_up.as_ref().map(|f| f.agent.clone()),
+                by_keys.follow_up.as_ref().map(|f| f.agent.clone()),
+            );
+            assert_eq!(
+                ui_digest(&by_mouse, &mouse_out),
+                ui_digest(&by_keys, &keys_out),
+            );
+
+            // And a second click on the chevron folds it, which is the one
+            // way back the key inside the box does not have.
+            click_target(
+                &mut by_mouse,
+                HitTarget::SessionFollowUp(0),
+                MouseButton::Left,
+                &mut mouse_out,
+            );
+            assert!(by_mouse.follow_up.is_none());
+        });
     }
 
     /// A right-click on a row is a left click on it followed by `m`: the

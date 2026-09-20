@@ -24,7 +24,9 @@ use super::{
     attach_now, jump_to_target, open_link, open_session, run_menu_action, Landing, SettingsCmd,
     WORKTREE_STILL_CREATING,
 };
-use crate::app::{App, ConfirmDialog, DiffView, Focus, Overlay, PendingAction};
+use crate::app::{
+    App, ConfirmDialog, DiffView, Focus, FollowUp, Overlay, PendingAction, SessionRow,
+};
 use nebula_core::{AgentId, ClientRequest, SessionRef, WorktreeId};
 
 /// A CONTEXT MENU row — Enter on the hovered row, a click on any: the menu
@@ -179,6 +181,52 @@ pub(super) fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientReques
     attach_now(app, sref, out);
     app.focus = Focus::Terminal;
     app.term_locked = true;
+}
+
+/// The FOLLOW-UP CHEVRON chosen — `Space` on the card, a click on the
+/// chevron itself, **Follow-up prompt** in the row's CONTEXT MENU: the
+/// selected session card expands into its FOLLOW-UP COMPOSER, or folds back
+/// up if it is the one already open. Expanding another card closes the
+/// first: the box owns the keyboard while it is up, and two of them would
+/// leave no saying which.
+///
+/// Carries no id, like `ViewPrDiff`: the card is the selection, and the
+/// click path moves the cursor onto the row before it gets here, so all
+/// three routes read the same row.
+pub(super) fn follow_up(app: &mut App) {
+    let Some(row) = app.selected_session_row() else {
+        return;
+    };
+    if let SessionRow::Agent(a) = &row {
+        if app.follow_up.as_ref().is_some_and(|f| f.agent == a.id) {
+            app.follow_up = None;
+            app.dirty = true;
+            return;
+        }
+    }
+    if !app.takes_follow_up(&row) {
+        app.flash = Some(match &row {
+            SessionRow::Agent(a) if a.archived => {
+                "archived sessions take no follow-up — u brings it back".into()
+            }
+            SessionRow::Agent(a) if a.cloud_session_id.is_some() => {
+                "cloud sessions take a queued message — m, then Send to cloud session".into()
+            }
+            SessionRow::Agent(_) => "the session is still starting".into(),
+            SessionRow::Terminal(_) => "terminals take typing in the pane — Enter attaches".into(),
+            SessionRow::Link(_) => "a pull request takes a comment — y".into(),
+        });
+        return;
+    }
+    let SessionRow::Agent(a) = row else {
+        return;
+    };
+    app.follow_up = Some(FollowUp {
+        agent: a.id,
+        input: crate::text_input::TextInput::multiline(),
+    });
+    app.focus = Focus::Sessions;
+    app.dirty = true;
 }
 
 /// Bring an archived agent back — `u` on its row, **Unarchive** in its

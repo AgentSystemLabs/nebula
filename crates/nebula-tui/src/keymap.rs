@@ -109,6 +109,10 @@ pub enum Action {
     AgentPresets,
     /// The QUICK PROMPT: type a task, launch an agent on it.
     QuickPrompt,
+    /// `Space`: expand the selected session card into its FOLLOW-UP
+    /// COMPOSER — the next turn typed into the card itself — or fold it
+    /// back up.
+    FollowUp,
     // files
     FindFile,
     Grep,
@@ -467,6 +471,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["p"],
+    },
+    ActionSpec {
+        action: Action::FollowUp,
+        id: "follow_up",
+        label: "Follow-up prompt",
+        hint: "Expand the selected session's card into a box for its next turn, sent to the running agent on Enter; the cards below move down, and Esc or the card's chevron folds it back",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["space"],
     },
     // ---- FILES ----
     ActionSpec {

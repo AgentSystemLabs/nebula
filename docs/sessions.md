@@ -131,6 +131,37 @@ row now; the next PR SESSION cuts the fork-named one.
 If the daemon refuses a PR SESSION — the fetch failed offline, the fork is gone — the `creating` rows
 come down and the box you sent it from comes back with your text, as any refused quick prompt does.
 
+## The FOLLOW-UP COMPOSER
+
+The next turn for a session already running, typed into its own card. Put the cursor on an agent's row
+in the SESSIONS PANEL and press `Space` — or click the `▸` at the end of its name row, or pick
+**Follow-up prompt** from its `m` menu — and the card expands in place: a small framed box opens inside
+the pill, under whatever RECENT PROMPTS the row carries, with `follow-up` on its top border and the keys
+on its bottom one. There is no modal over the screen; the panels stay exactly where they were, and every
+card below this one in the column moves down by what the box took, off the bottom of the column if it
+runs out. The column scrolls to keep the box you are typing into on screen, and goes on doing so as the
+box grows — it takes up to four lines of text before it starts scrolling under its own caret.
+
+`Enter` sends what you typed to the agent as its next turn and folds the card back up, with
+`sent to <session>` in the footer; `Shift+Enter`, `Option+Enter` and `Ctrl+J` break a line, as in Claude
+Code's own prompt, and `Esc` folds the card without sending. The text goes straight down the session's
+PTY — the same path your keystrokes take in the pane — so the CLI sees it as a prompt typed at it, and
+the pane swaps to that session so you can watch the turn land. A prompt with line breaks in it crosses
+as one bracketed paste rather than as typing, so nothing auto-indents it to mush.
+
+While the box is open it owns the keyboard: the panel's own verbs are bare letters, so `a`, `d` and `r`
+are letters in your prompt and not archive, delete and rename aimed at the session you are prompting.
+`Tab` still walks to the next panel and leaves the card expanded behind it, and clicking another card
+folds the box. The toggle on each card says which state it is in — `▸` folded, `▾` expanded — and a
+click on it does either.
+
+Only a live local agent has a card to expand. An archived session's turn is over, a Claude Cloud row's
+agent runs in a sandbox with a message queue of its own (**Send to cloud session** in its menu), a shell
+terminal takes typing in the pane, and a pull request row is not a conversation — each says so if you
+ask. A session whose CLI is not up — reaped by the IDLE REAPER, or cold since the daemon started — is
+booted first and the box left as it is with `starting <session>` in the footer: nothing is typed into a
+process that is still starting, so press `Enter` again once it is up.
+
 ## RECENT PROMPTS
 
 An experimental read on what each session was last asked to do. Turn on **Recent prompts** under
