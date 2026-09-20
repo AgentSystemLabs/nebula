@@ -58,6 +58,21 @@ pub struct Theme {
     /// never wears the same color as a terminated session, whatever the
     /// preset makes of that one.
     pub merged: Color,
+    /// The checkout a LAUNCHER CARD's session runs in, when that checkout
+    /// is the project's ROOT WORKTREE: the branch its edits land on with
+    /// nothing fenced around them. Amber in every preset, the way `merged`
+    /// is purple in every preset — which of the two scopes a card is in is
+    /// not a matter of taste, and two presets (`amber`, `sand`) carry a
+    /// warm `accent` that would leave them unable to tell one from the
+    /// other.
+    pub root: Color,
+    /// The counterpart, for a session in a worktree of its own — work
+    /// fenced off from the root branch. Far enough from `root` across the
+    /// 256-color cube to read as a different hue rather than a shade of
+    /// it: telling the pair apart at a glance is the whole job, and
+    /// `the_two_scope_colors_are_a_hue_apart_in_every_preset` holds them
+    /// to it.
+    pub worktree: Color,
     /// Selected-row fill in the focused panel (a subtle raised surface,
     /// not a reverse-video slab).
     pub sel_bg: Color,
@@ -113,7 +128,9 @@ impl Default for Theme {
             warn: Color::Yellow,
             err: Color::Red,
             special: Color::Magenta,
-            merged: Color::Indexed(135), // purple — GitHub's merged
+            merged: Color::Indexed(135),  // purple — GitHub's merged
+            root: Color::Indexed(214),    // amber — the branch itself
+            worktree: Color::Indexed(79), // aquamarine — fenced off from it
             sel_bg: Color::Indexed(237),
             sel_bg_dim: Color::Indexed(235),
             edge: Color::Indexed(238),
@@ -227,6 +244,24 @@ impl Theme {
 mod tests {
     use super::*;
 
+    /// Red, green, blue coordinates (0..=5) of a 6x6x6 cube color.
+    fn cube(c: Color) -> Option<[u8; 3]> {
+        match c {
+            Color::Indexed(n @ 16..=231) => {
+                let n = n - 16;
+                Some([n / 36, (n / 6) % 6, n % 6])
+            }
+            _ => None,
+        }
+    }
+
+    /// How far two cube colors sit apart, in steps; None when either is
+    /// not a cube color and the distance is not ours to measure.
+    fn cube_steps(a: Color, b: Color) -> Option<u8> {
+        let (a, b) = (cube(a)?, cube(b)?);
+        Some((0..3).map(|i| a[i].abs_diff(b[i])).sum())
+    }
+
     #[test]
     fn by_name_covers_all_presets_and_falls_back() {
         for name in THEMES {
@@ -262,16 +297,6 @@ mod tests {
     /// from the merge there. The violet this replaced was one.
     #[test]
     fn done_is_never_a_shade_of_merged() {
-        /// Red, green, blue coordinates (0..=5) of a 6x6x6 cube color.
-        fn cube(c: Color) -> Option<[u8; 3]> {
-            match c {
-                Color::Indexed(n @ 16..=231) => {
-                    let n = n - 16;
-                    Some([n / 36, (n / 6) % 6, n % 6])
-                }
-                _ => None,
-            }
-        }
         for name in THEMES {
             let th = Theme::by_name(name);
             assert!(
@@ -306,6 +331,40 @@ mod tests {
                     th.done_sweep.iter().all(|c| !other.contains(c)),
                     "{name}: the done sweep borrows a shade from another"
                 );
+            }
+        }
+    }
+
+    /// A LAUNCHER CARD names the checkout its session runs in in a SCOPE
+    /// COLOR — `⌂` amber on the project's root branch, `↳` aquamarine in a
+    /// worktree of its own — so a screenful of cards sorts into the two
+    /// without a word being read. That only holds while the pair keeps a
+    /// whole hue between them (the three cube steps `done` keeps from
+    /// `merged`), and while neither lands on a color the same card already
+    /// wears somewhere else: the status its dot and name take, the `done`
+    /// its ago label takes, the `merged` its pull-request row takes, or
+    /// the dim its harness takes.
+    #[test]
+    fn the_two_scope_colors_are_a_hue_apart_in_every_preset() {
+        for name in THEMES {
+            let th = Theme::by_name(name);
+            assert_ne!(th.root, th.worktree, "{name}: one scope, painted twice");
+            let steps = cube_steps(th.root, th.worktree);
+            assert!(
+                steps.is_none_or(|s| s >= 3),
+                "{name}: the scopes are {steps:?} cube steps apart: a shade, not a hue"
+            );
+            for (role, color) in [
+                ("ok", th.ok),
+                ("warn", th.warn),
+                ("err", th.err),
+                ("done", th.done),
+                ("merged", th.merged),
+                ("dim", th.dim),
+                ("muted", th.muted),
+            ] {
+                assert_ne!(th.root, color, "{name}: a root checkout reads as {role}");
+                assert_ne!(th.worktree, color, "{name}: a worktree reads as {role}");
             }
         }
     }

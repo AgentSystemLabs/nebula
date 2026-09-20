@@ -39,7 +39,9 @@ pub(crate) fn overlay_area(overlay: &Overlay) -> Rect {
         Overlay::AgentPresets(v) => v.area,
         Overlay::AgentPresetEditor(v) => v.area,
         Overlay::Issues(v) => v.area,
+        Overlay::PullRequests(v) => v.area,
         Overlay::BranchSwitch(v) => v.area,
+        Overlay::ProjectPicker(v) => v.area,
     }
 }
 
@@ -69,6 +71,13 @@ pub(crate) fn click_outside(app: &mut App, out: &mut Vec<ClientRequest>) {
         // submenu level at a time — but a picker opened from the QUICK
         // PROMPT still owes that box back.
         Some(Overlay::Menu(_)) => close_menu(app),
+        // The PROJECT PICKER owes its box back, typed text and all — Esc
+        // would only clear a typed query first.
+        Some(Overlay::ProjectPicker(picker)) => {
+            let back = picker.back.clone();
+            app.overlay = None;
+            crate::quick_prompt::reopen(app, back.launch, &back.text);
+        }
         // Nothing to unwind on the way out.
         Some(
             Overlay::Help(_)
@@ -119,11 +128,43 @@ pub(crate) fn force_close(app: &mut App) -> bool {
     let Some(overlay) = &app.overlay else {
         return false;
     };
+    // The one thing the unlock does hand back: a QUICK PROMPT's typed text,
+    // parked as a DRAFT for the next box (`quick_prompt::open_box`) — from
+    // the box itself and from a picker still holding it.
+    let parked = quick_draft(overlay);
     match overlay {
         Overlay::Settings(_) => crate::event_loop::close_settings(app),
         _ => app.overlay = None,
     }
+    if let Some(draft) = parked {
+        app.quick_draft = Some(draft);
+    }
     true
+}
+
+/// The QUICK PROMPT text `overlay` is holding, as a DRAFT: the box's own,
+/// or the box a picker opened from one still owes back — the picker menus
+/// pin it to their rows, and a nested submenu is reached through its
+/// parent.
+fn quick_draft(overlay: &Overlay) -> Option<crate::quick_prompt::QuickDraft> {
+    match overlay {
+        Overlay::Prompt(prompt) => crate::quick_prompt::draft_of(prompt),
+        Overlay::ProjectPicker(picker) => crate::quick_prompt::draft_of_return(&picker.back),
+        Overlay::AgentPresets(view) => view
+            .quick
+            .as_ref()
+            .and_then(crate::quick_prompt::draft_of_return),
+        Overlay::Menu(menu) => {
+            let mut menu = menu;
+            loop {
+                if let Some(back) = crate::event_loop::menu_quick_return(menu) {
+                    return crate::quick_prompt::draft_of_return(&back);
+                }
+                menu = menu.parent.as_ref()?;
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Close a CONTEXT MENU from any depth, handing the QUICK PROMPT its box

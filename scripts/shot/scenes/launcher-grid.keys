@@ -1,0 +1,35 @@
+# Three launches from the box, each into a fresh worktree; then the grid, one card per session —
+# the one that opened a pull request, the one that finished, the one stopped on a question — with
+# the cursor walked along the row to the first.
+Fix the login redirect loop when the session cookie has expired
+Enter
+p
+Sort the changelog entries by date, newest first
+Enter
+p
+Profile the daemon's startup and find what takes 400ms
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+h
+h
+F12
+F12
+F12
+F12

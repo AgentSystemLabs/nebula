@@ -13,8 +13,8 @@
 //! whose checkout of the PR's head branch the DAEMON finds or cuts.
 
 use super::{
-    create_agent, placeholder, remember_launch, schedule_prewarm, select_worktree_by_id, send_with,
-    AgentLaunchDraft,
+    create_agent, placeholder, remember_launch, schedule_prewarm, select_worktree_by_id,
+    send_with_follow, AgentLaunchDraft,
 };
 use crate::app::{App, PendingIntent, PlaceholderRows, PromptKind};
 use crate::quick_prompt::{QuickLaunch, QuickTarget};
@@ -41,12 +41,31 @@ pub(super) fn submit(
             launch.effort.as_deref(),
         );
     }
+    // A box re-aimed with `^P` fires into a project the screen is not
+    // showing: the session starts there and the user keeps working here,
+    // so nothing this launch does may move a cursor, the workspace or the
+    // pane. The Acks are born left behind for it, and the stand-in rows
+    // stop at going up (`placeholder::stage_agent`).
+    let background = crate::launcher::project_of(app, &launch.target)
+        .is_some_and(|project| crate::launcher::is_background(app, &project));
+    if background {
+        announce_background(app, &launch.target);
+    }
     match launch.target.clone() {
         QuickTarget::Worktree(worktree) => {
-            create_agent(app, draft(launch, worktree, text, None), out)
+            let draft = draft(launch, worktree, text, None);
+            let draft = AgentLaunchDraft {
+                follow: !background,
+                focus_pane: draft.focus_pane && !background,
+                ..draft
+            };
+            create_agent(app, draft, out)
         }
         QuickTarget::NewWorktree { project, branch } => {
             // The rows first, so the panels never wait on git.
+            // The composed task the create will carry (`draft`), asked
+            // here so the row goes up the way it will come back: working.
+            let first_prompt = !launch.compose(&text).is_empty();
             let placeholder = placeholder::stage(
                 app,
                 project.clone(),
@@ -55,13 +74,14 @@ pub(super) fn submit(
                 launch.custom.clone(),
                 launch.model.clone(),
                 launch.effort.clone(),
+                first_prompt,
                 out,
             );
 
             // `base: None` is the DAEMON's `worktree_base_branch` SETTING,
             // else its fetched `origin/HEAD` (`git::add_worktree_off_default`)
             // — never this checkout's HEAD.
-            send_with(
+            send_with_follow(
                 app,
                 out,
                 PendingIntent::LaunchInCreatedWorktree {
@@ -69,6 +89,7 @@ pub(super) fn submit(
                     text,
                     placeholder,
                 },
+                !background,
                 |req_id| ClientRequest::CreateWorktree {
                     req_id,
                     project,
@@ -78,6 +99,18 @@ pub(super) fn submit(
             );
         }
     }
+}
+
+/// The only trace a BACKGROUND LAUNCH leaves on screen: the footer names
+/// the project it went to, since nothing else here moves and Enter would
+/// otherwise look like it did nothing.
+fn announce_background(app: &mut App, target: &QuickTarget) {
+    let Some(name) = crate::launcher::project_of(app, target)
+        .and_then(|project| crate::launcher::project_name(app, &project))
+    else {
+        return;
+    };
+    app.flash = Some(format!("started a session in {name}"));
 }
 
 /// The Ack for that `CreateWorktree`: `worktree` exists now, launch there.

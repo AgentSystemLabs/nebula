@@ -1147,9 +1147,20 @@ fn parse_agent_kind(raw: &str) -> AgentKind {
 /// The `recent_prompts` column: NULL is the empty history, and a column
 /// that will not parse (a hand edit, a downgrade) reads as empty too
 /// rather than failing every row load.
+///
+/// Injected prompts are dropped on the way out as well as on the way in
+/// (`prompt_history::is_injected`): a nebula that recorded them before
+/// the filter existed left them in the column, and reading is where a row
+/// meets that history again. Every write goes through this same mapper
+/// first, so the next prompt a session takes persists the pruned list.
 fn parse_prompts(json: Option<&str>) -> Vec<PromptEntry> {
-    json.and_then(|j| serde_json::from_str(j).ok())
-        .unwrap_or_default()
+    let stored: Vec<PromptEntry> = json
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+    stored
+        .into_iter()
+        .filter(|p| !crate::prompt_history::is_injected(&p.text))
+        .collect()
 }
 
 /// `alive` is daemon state, filled in by the registry like the agent's.
@@ -2205,6 +2216,36 @@ mod tests {
         // `load_tree` reads the same column through the same mapper.
         let (_, _, agents, _) = store.load_tree().unwrap();
         assert_eq!(agents[0].recent_prompts, got);
+
+        // A history an older nebula wrote with injected prompts in it
+        // reads back without them, and the next push persists the
+        // pruning rather than carrying them along.
+        let injected = PromptEntry {
+            text: r#"<cross-session-message from="uds:/tmp/cc-socks/1.sock"> hi"#.into(),
+            submitted_at: 2_000,
+        };
+        let typed = PromptEntry {
+            text: "what broke the cards".into(),
+            submitted_at: 2_001,
+        };
+        {
+            let conn = store.conn.lock().unwrap();
+            let json = serde_json::to_string(&vec![injected, typed.clone()]).unwrap();
+            conn.execute(
+                "UPDATE agents SET recent_prompts = ?2 WHERE id = ?1",
+                params![id.as_str(), json],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store.get_agent(&id).unwrap().unwrap().recent_prompts,
+            vec![typed.clone()]
+        );
+        assert!(store.push_prompt(&id, &entry(99)).unwrap());
+        assert_eq!(
+            store.get_agent(&id).unwrap().unwrap().recent_prompts,
+            vec![typed, entry(99)]
+        );
 
         // No row, nothing recorded — and no error.
         assert!(!store

@@ -106,14 +106,25 @@ pub(super) fn enter_workspaces_bar(app: &mut App) {
 /// that acts on a row the user could not see it land on. The pane is the
 /// exception that the walk already makes: entering it is a commitment to
 /// type at the agent, so it takes the input lock the way the click and Tab
-/// both do. A splitter is the seam between two panels and the footer's
-/// nameplate is a button: neither is somewhere focus lives.
+/// both do. A splitter — the seam between two panels, or the LAUNCHER
+/// VIEW's pane edge — and the footer's nameplate is a button: neither is
+/// somewhere focus lives.
 pub(super) fn land_click_focus(app: &mut App, column: u16, row: u16, out: &mut Vec<ClientRequest>) {
     match app.hit_at(column, row) {
         Some(HitTarget::Workspace(_)) => enter_workspaces_bar(app),
         Some(HitTarget::Project(_)) => app.focus = app.first_sidebar_focus(),
-        Some(HitTarget::Worktree(_) | HitTarget::OpenPrsHeader) => app.focus = Focus::Worktrees,
-        Some(HitTarget::Session(_) | HitTarget::ArchivedHeader) => app.focus = Focus::Sessions,
+        Some(HitTarget::Worktree(_) | HitTarget::OpenPrsHeader | HitTarget::IssuesHeader) => {
+            app.focus = Focus::Worktrees
+        }
+        Some(
+            HitTarget::Session(_)
+            | HitTarget::ArchivedHeader
+            | HitTarget::LauncherRow(_)
+            | HitTarget::LauncherProjectCard(_)
+            | HitTarget::LauncherWorkspaceCard(_)
+            | HitTarget::SessionFollowUp(_)
+            | HitTarget::FollowUpBox,
+        ) => app.focus = Focus::Sessions,
         Some(HitTarget::PanelBg(focus)) => app.focus = focus,
         // The click was spent closing the modal, so a chevron or rail
         // only takes focus when its panel is open; toggling is the
@@ -126,7 +137,18 @@ pub(super) fn land_click_focus(app: &mut App, column: u16, row: u16, out: &mut V
         Some(HitTarget::TerminalPane | HitTarget::CloudSessionLink) => {
             enter_terminal_pane(app, out)
         }
-        Some(HitTarget::Splitter(_) | HitTarget::FooterWorkspace) | None => {}
+        // The crumb is a button out of a full-screen session, not
+        // somewhere focus lives: its own handler is what moves focus.
+        Some(
+            HitTarget::Splitter(_)
+            | HitTarget::LauncherPaneSplitter
+            | HitTarget::FooterWorkspace
+            | HitTarget::LauncherCrumb
+            | HitTarget::LauncherRoot
+            | HitTarget::LauncherWorkspace
+            | HitTarget::LauncherProject,
+        )
+        | None => {}
     }
 }
 

@@ -16,7 +16,7 @@
 //! text the panels wrap elsewhere.
 
 use crate::markdown::{self, Breaks};
-use crate::pull_request::{PrComment, PrDetail, Standing, STATE_OPEN};
+use crate::pull_request::{Checks, PrComment, PrDetail, Standing, Trouble, STATE_OPEN};
 use crate::theme::Theme;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -143,6 +143,33 @@ pub fn lines(detail: &PrDetail, width: usize, th: Theme) -> Vec<Line<'static>> {
             Style::default().fg(state.1).add_modifier(Modifier::BOLD),
         ),
     ];
+    // What stands between it and the merge button, right after the state
+    // and ahead of who and where, so a narrow pane cuts the branches off
+    // before it cuts this: the trouble in the row's red (`Trouble::label`,
+    // the same words the `/` PALETTE badges), and how the checks stand
+    // otherwise — passing in green, still running dim — so a pull request
+    // that is fine says so too. Only for an open one: a merged or closed
+    // pull request is past its checks.
+    if detail.is_open() {
+        if detail.health.conflicts {
+            meta.push(Span::styled(
+                format!(" · {}", Trouble::Conflicts.label()),
+                Style::default().fg(th.err).add_modifier(Modifier::BOLD),
+            ));
+        }
+        let checks = match detail.health.checks {
+            Checks::Absent => None,
+            Checks::Pending => Some(("checks pending".to_string(), dim)),
+            Checks::Passing => Some(("checks passing".to_string(), Style::default().fg(th.ok))),
+            Checks::Failing => Some((
+                Trouble::FailingChecks.label().to_string(),
+                Style::default().fg(th.err).add_modifier(Modifier::BOLD),
+            )),
+        };
+        if let Some((word, style)) = checks {
+            meta.push(Span::styled(format!(" · {word}"), style));
+        }
+    }
     if !detail.author.is_empty() {
         meta.push(Span::styled(format!(" · {}", detail.author), muted));
     }
@@ -288,6 +315,7 @@ mod tests {
             title: "Attach links".into(),
             state: "OPEN".into(),
             is_draft: false,
+            health: Default::default(),
             author: "webdevcody".into(),
             base: "main".into(),
             head: "feat/links".into(),
@@ -344,6 +372,86 @@ mod tests {
         assert!(out.contains("kate approved · 2024-04-25"), "{out}");
         assert!(out.contains("steiza · 2024-04-26"), "{out}");
         assert!(out.contains("nice"), "{out}");
+    }
+
+    /// The state line says what stands between the pull request and its
+    /// merge button — `merge conflicts`, `checks failing` in red, the
+    /// words its row and the `/` PALETTE use — and, when nothing does, how
+    /// the checks stand, so a healthy pull request reads as one. A merged
+    /// pull request is past its checks and says nothing about them.
+    #[test]
+    fn the_state_line_names_conflicts_and_how_the_checks_stand() {
+        use crate::pull_request::{Checks, Health};
+        let th = Theme::default();
+        let with = |health: Health, state: &str| {
+            let mut d = detail("", vec![]);
+            d.health = health;
+            d.state = state.into();
+            lines(&d, 120, th)
+        };
+        let state_line = |out: &[Line<'static>]| text(out).lines().nth(1).unwrap().to_string();
+        let span_color = |out: &[Line<'static>], word: &str| {
+            out[1]
+                .spans
+                .iter()
+                .find(|s| s.content.contains(word))
+                .unwrap_or_else(|| panic!("{word:?} on the state line: {}", text(out)))
+                .style
+                .fg
+        };
+
+        let out = with(
+            Health {
+                conflicts: true,
+                checks: Checks::Failing,
+            },
+            "OPEN",
+        );
+        assert_eq!(
+            state_line(&out),
+            " ready for review · merge conflicts · checks failing · webdevcody · main ← feat/links"
+        );
+        assert_eq!(span_color(&out, "merge conflicts"), Some(th.err));
+        assert_eq!(span_color(&out, "checks failing"), Some(th.err));
+
+        let out = with(
+            Health {
+                conflicts: false,
+                checks: Checks::Passing,
+            },
+            "OPEN",
+        );
+        assert!(state_line(&out).contains("ready for review · checks passing · webdevcody"));
+        assert_eq!(span_color(&out, "checks passing"), Some(th.ok));
+
+        let out = with(
+            Health {
+                conflicts: false,
+                checks: Checks::Pending,
+            },
+            "OPEN",
+        );
+        assert_eq!(span_color(&out, "checks pending"), Some(th.dim));
+
+        let out = with(Health::default(), "OPEN");
+        assert_eq!(
+            state_line(&out),
+            " ready for review · webdevcody · main ← feat/links",
+            "no checks, nothing to say"
+        );
+
+        let out = with(
+            Health {
+                conflicts: true,
+                checks: Checks::Failing,
+            },
+            "MERGED",
+        );
+        assert_eq!(
+            state_line(&out),
+            " merged · webdevcody · main ← feat/links",
+            "a merged pull request is past its checks"
+        );
     }
 
     /// An empty description says so rather than rendering a silent gap that

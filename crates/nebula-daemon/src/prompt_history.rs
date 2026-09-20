@@ -11,9 +11,12 @@
 //! the newest [`RECENT_PROMPTS_KEPT`] per session and the row's
 //! `recent_prompts` reaches every TUI as an ordinary upsert.
 //!
-//! Prompts nebula itself composes — the PR SESSION scope, the `nebula
-//! worktree` relocation notice, anything opening with `[nebula]` — are
-//! not the user's and are left out.
+//! Prompts nobody typed are left out: the ones nebula itself composes
+//! (the PR SESSION scope, the `nebula worktree` relocation notice —
+//! anything opening with `[nebula]`) and the ones a CLI injects into its
+//! own turn queue and then reports through the very same hook — a
+//! sibling session's message, a background task or subagent handing back,
+//! an idle notice the session had asked for. See [`INJECTED_PREFIXES`].
 
 use std::sync::Arc;
 
@@ -26,15 +29,35 @@ use crate::registry::Daemon;
 /// sentence.
 pub const MAX_PROMPT_CHARS: usize = 200;
 
-/// The marker every nebula-authored prompt opens with.
-const NEBULA_PREFIX: &str = "[nebula]";
+/// What a prompt nobody typed opens with. `[nebula]` marks the prompts
+/// nebula composes itself; the rest are the envelopes a CLI wraps around
+/// something it injected into its own turn queue — Claude reports those
+/// through `UserPromptSubmit` exactly as it reports a typed prompt, so
+/// the shape of the opening is all there is to tell them apart. They are
+/// traffic between agents, not a record of what the session was asked to
+/// do, and a panel showing them says `<cross-session-message from="uds:`
+/// where the user's own sentence belongs.
+const INJECTED_PREFIXES: &[&str] = &[
+    "[nebula]",
+    "[Cross-session idle notice]",
+    "<cross-session-message",
+    "<task-notification",
+    "<agent-message",
+];
+
+/// Whether a prompt was injected rather than typed — see
+/// [`INJECTED_PREFIXES`]. Takes an already condensed line, so the leading
+/// whitespace is gone and the marker is at the front if it is anywhere.
+pub fn is_injected(text: &str) -> bool {
+    INJECTED_PREFIXES.iter().any(|p| text.starts_with(p))
+}
 
 /// One line of the prompt: control characters become spaces (an escape
 /// sequence pasted into a prompt must not reach the panel — the same rule
 /// `sanitize_title` applies to the row's name), whitespace runs (newlines
 /// included) collapse to single spaces, and the result is clipped with an
 /// ellipsis past [`MAX_PROMPT_CHARS`]. `None` for a blank prompt or one
-/// nebula wrote itself.
+/// nobody typed ([`is_injected`]).
 pub fn condense(raw: &str) -> Option<String> {
     let cleaned: String = raw
         .chars()
@@ -47,7 +70,7 @@ pub fn condense(raw: &str) -> Option<String> {
         }
         text.push_str(word);
     }
-    if text.is_empty() || text.starts_with(NEBULA_PREFIX) {
+    if text.is_empty() || is_injected(&text) {
         return None;
     }
     if text.chars().count() > MAX_PROMPT_CHARS {
@@ -101,6 +124,30 @@ mod tests {
         assert_eq!(
             condense("why does [nebula] show a red dot").as_deref(),
             Some("why does [nebula] show a red dot")
+        );
+    }
+
+    /// The CLI reports what it injected into its own turn queue through
+    /// the same `UserPromptSubmit` hook a typed prompt rides, so every
+    /// envelope it opens with has to be dropped here or it lands on the
+    /// row as if the user had asked for it.
+    #[test]
+    fn condense_drops_prompts_the_cli_injected() {
+        for injected in [
+            r#"<cross-session-message from="uds:/tmp/cc-socks/20873.sock"> heads up"#,
+            "<task-notification> <task-id>bujca919a</task-id>",
+            r#"<agent-message from="abc050de25492f3a9"> [Subagent hand-back]"#,
+            r#"[Cross-session idle notice] "Some Session" is idle now"#,
+        ] {
+            assert_eq!(condense(injected), None, "{injected}");
+            // The newline the envelope really arrives with is collapsed
+            // before the marker is looked for, not after.
+            assert_eq!(condense(&format!("\n{injected}\n\nmore")), None);
+        }
+        // A user writing about one is still the user writing.
+        assert_eq!(
+            condense("why do the cards print <cross-session-message>").as_deref(),
+            Some("why do the cards print <cross-session-message>")
         );
     }
 

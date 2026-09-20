@@ -11,6 +11,7 @@
 //! key `config.local.json` holds is written back there, never into the
 //! portable file.
 
+use crate::agent_presets::PresetText;
 use nebula_core::harness::{CustomHarness, HarnessDescriptor};
 use nebula_core::AgentKind;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,14 @@ pub const DEFAULT_RECENT_PROMPTS_COUNT: usize = 3;
 /// accepts `+<line> <file>`, which is how the overlays launch it. As with
 /// models, hand-edited configs can name any command the list doesn't.
 pub const EDITORS: &[&str] = &["vim", "nvim", "nano", "emacs", "hx"];
+
+/// The **Preset text** choices (Settings → Sessions), in the order the row
+/// cycles them: the [`PresetText`] sides by label.
+pub const PRESET_TEXTS: &[&str] = &[
+    PresetText::Prefix.as_str(),
+    PresetText::Postfix.as_str(),
+    PresetText::Both.as_str(),
+];
 
 /// Values the settings overlay cycles through for `done_sound` (what rings
 /// when a turn reaches FINISHED) and `feedback_sound` (what rings when one
@@ -357,6 +366,7 @@ pub enum SettingKind {
     PrewarmSessions,
     DoneSound,
     FeedbackSound,
+    PresetText,
     Theme,
     Animations,
     FocusTint,
@@ -375,6 +385,7 @@ pub enum SettingKind {
     ShowKeyCombos,
     RememberHarness,
     PrIssueCounts,
+    LauncherView,
     HideUninstalledHarnesses,
 }
 
@@ -435,7 +446,7 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
             SettingSpec {
                 kind: SettingKind::PaletteEnterAttaches,
                 label: "Search Enter attaches",
-                hint: "Enter in / search opens the session in the terminal",
+                hint: "Enter in / search opens the session in the terminal (a red one always does)",
                 group: "",
             },
             SettingSpec {
@@ -507,6 +518,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::FeedbackSound,
                 label: "Feedback sound",
                 hint: "Ring, and notify an unfocused window, when a turn stops to ask you (off silences both)",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::PresetText,
+                label: "Preset text",
+                hint: "Where a new agent preset's text goes: a prefix before the task, a postfix after it, or both (its Text row can change one)",
                 group: "",
             },
         ]),
@@ -633,6 +650,12 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::PrIssueCounts,
                 label: "PR & issue counts",
                 hint: "Count each project's open pull requests and issues after its name, 3 prs · 2 issues",
+                group: "",
+            },
+            SettingSpec {
+                kind: SettingKind::LauncherView,
+                label: "Launcher view",
+                hint: "Open on a task box; list every session with its project, worktree and PR beside the live pane",
                 group: "",
             },
         ]),
@@ -854,8 +877,9 @@ fn grouped(
 pub struct Config {
     /// `/` palette: Enter on a session attaches and focuses the terminal.
     /// When false, Enter only lands on the session's row in the Sessions
-    /// panel (previewing it in the pane). Ctrl+O / Ctrl+F always pick
-    /// open / focus explicitly, regardless of this setting.
+    /// panel (previewing it in the pane) — except on a session that NEEDS
+    /// FEEDBACK, the red row, which always attaches. Ctrl+O / Ctrl+F
+    /// always pick open / focus explicitly, regardless of this setting.
     pub palette_enter_attaches: bool,
     /// Run `git init` after AddProject creates a missing directory.
     /// Owned by the daemon; the TUI writes it so the settings overlay can
@@ -935,6 +959,14 @@ pub struct Config {
     /// FEEDBACK SOUND and the desktop notification an unfocused terminal
     /// window gets: "off" silences the pair.
     pub feedback_sound: String,
+    /// PRESET TEXT: which side of the task a new AGENT PRESET's text goes
+    /// — `prefix` (one box, sent before the task), `postfix` (one box,
+    /// sent after it) or `prefix & postfix` (both). The PRESET EDITOR
+    /// opens a new preset on the box(es) named here, and its Text row
+    /// changes one preset; a stored side with text always shows. Resolved
+    /// by [`Config::preset_text`]; `prefix` by default, the framing most
+    /// people reach for and one box to fill.
+    pub preset_text: String,
     /// Color theme name (see `theme::THEMES`). Unknown names fall back to
     /// the default theme.
     pub theme: String,
@@ -1031,6 +1063,14 @@ pub struct Config {
     /// budget — and the one Experimental switch that is; off, the rows
     /// are what they were and no project but the selected one is asked.
     pub pr_issue_counts: bool,
+    /// Experimental: the LAUNCHER VIEW — nebula opens on the QUICK PROMPT,
+    /// focused, with the launch the AGENTS TAB defaults describe (`^P`
+    /// retargets the project with type-ahead, `^O` the model), and the
+    /// three panels give way to a grid of cards, one per session in the
+    /// open workspace — its project, worktree and pull request under its
+    /// name — with the session under the cursor live in the pane along the
+    /// bottom (`launcher.rs`). Off by default: it replaces the whole layout.
+    pub launcher_view: bool,
     /// Default model/effort for new Claude / Codex / Cursor sessions.
     /// "default" means "don't pass the flag" (the CLI picks); any other
     /// value is passed through verbatim, so hand-edited configs can name
@@ -1227,6 +1267,7 @@ impl Default for Config {
             prewarm_sessions: true,
             done_sound: "Glass".into(),
             feedback_sound: "Sosumi".into(),
+            preset_text: PresetText::DEFAULT.as_str().into(),
             theme: "default".into(),
             animations: true,
             focus_tint: true,
@@ -1242,6 +1283,7 @@ impl Default for Config {
             show_key_combos: false,
             remember_harness: false,
             pr_issue_counts: true,
+            launcher_view: false,
             claude_model: DEFAULT_CHOICE.into(),
             claude_models: Vec::new(),
             claude_effort: DEFAULT_CHOICE.into(),
@@ -1587,6 +1629,13 @@ impl Config {
             .iter()
             .find(|entry| entry.id == id)
             .is_some_and(|entry| entry.enabled && entry.problem().is_none())
+    }
+
+    /// PRESET TEXT resolved: the side(s) of the task a new AGENT PRESET's
+    /// text goes. `prefix` for a config that never set it or a hand edit
+    /// off the list; `both` is taken for `prefix & postfix`.
+    pub fn preset_text(&self) -> PresetText {
+        PresetText::parse(&self.preset_text).unwrap_or(PresetText::DEFAULT)
     }
 
     /// The effective descriptor for a registry id, or a placeholder under
@@ -2034,6 +2083,7 @@ impl Config {
             SettingKind::PrewarmSessions => on_off(self.prewarm_sessions).into(),
             SettingKind::DoneSound => self.done_sound.clone(),
             SettingKind::FeedbackSound => self.feedback_sound.clone(),
+            SettingKind::PresetText => self.preset_text().as_str().into(),
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
             SettingKind::FocusTint => on_off(self.focus_tint).into(),
@@ -2049,6 +2099,7 @@ impl Config {
             SettingKind::ShowKeyCombos => on_off(self.show_key_combos).into(),
             SettingKind::RememberHarness => on_off(self.remember_harness).into(),
             SettingKind::PrIssueCounts => on_off(self.pr_issue_counts).into(),
+            SettingKind::LauncherView => on_off(self.launcher_view).into(),
             SettingKind::RecentPromptsCount => self
                 .recent_prompts_count
                 .clamp(1, nebula_core::RECENT_PROMPTS_KEPT)
@@ -2121,6 +2172,12 @@ impl Config {
             SettingKind::FeedbackSound => {
                 self.feedback_sound = cycle_choice(&self.feedback_sound, SOUNDS, step).into();
             }
+            SettingKind::PresetText => {
+                // Cycled from the resolved side, so a hand edit off the
+                // list steps on from the default it reads as.
+                self.preset_text =
+                    cycle_choice(self.preset_text().as_str(), PRESET_TEXTS, step).into();
+            }
             SettingKind::Theme => {
                 self.theme = cycle_choice(&self.theme, crate::theme::THEMES, step).into();
             }
@@ -2165,6 +2222,9 @@ impl Config {
             }
             SettingKind::PrIssueCounts => {
                 self.pr_issue_counts = !self.pr_issue_counts;
+            }
+            SettingKind::LauncherView => {
+                self.launcher_view = !self.launcher_view;
             }
             SettingKind::HideUninstalledHarnesses => {
                 self.hide_uninstalled_harnesses = !self.hide_uninstalled_harnesses;
@@ -3553,6 +3613,104 @@ mod tests {
 
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(!cfg.remember_harness);
+    }
+
+    /// LAUNCHER VIEW: an Experimental switch, off by default — it replaces
+    /// the whole layout — the tab's last row, a plain toggle persisted
+    /// under `launcher_view`, and off in a config written before it.
+    #[test]
+    fn launcher_view_is_off_by_default_on_the_experimental_tab_and_persists() {
+        let mut cfg = Config::default();
+        assert!(!cfg.launcher_view);
+        assert_eq!(cfg.value_label(SettingKind::LauncherView), "off");
+
+        let (tab, row) = locate(SettingKind::LauncherView).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Experimental");
+        assert_eq!(
+            row + 1,
+            tab_settings(tab).len(),
+            "the newest switch sits last"
+        );
+        cfg.cycle(tab, row, 0);
+        assert!(cfg.launcher_view);
+        assert_eq!(cfg.value_label(SettingKind::LauncherView), "on");
+        cfg.cycle(tab, row, 1);
+        assert!(!cfg.launcher_view, "either arrow toggles it back");
+        cfg.cycle(tab, row, -1);
+        assert!(cfg.launcher_view);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(load_from(&path).launcher_view);
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.launcher_view);
+    }
+
+    /// PRESET TEXT: a Sessions row after the sounds, `prefix` by default,
+    /// cycling the three sides and persisted under `preset_text`; a hand
+    /// edit off the list reads as the default, and `both` as the long
+    /// label.
+    #[test]
+    fn preset_text_is_prefix_by_default_on_the_sessions_tab_and_cycles_the_sides() {
+        let mut cfg = Config::default();
+        assert_eq!(
+            cfg.preset_text(),
+            PresetText::Prefix,
+            "one box, before the task"
+        );
+        assert_eq!(cfg.value_label(SettingKind::PresetText), "prefix");
+        assert_eq!(
+            PRESET_TEXTS.to_vec(),
+            PresetText::ALL.map(PresetText::as_str).to_vec(),
+            "the row cycles every side, in the enum's order"
+        );
+
+        let (tab, row) = locate(SettingKind::PresetText).unwrap();
+        assert_eq!(SETTINGS_TABS[tab].title, "Sessions");
+        let (sound_tab, sound_row) = locate(SettingKind::FeedbackSound).unwrap();
+        assert_eq!((sound_tab, sound_row + 1), (tab, row), "after the sounds");
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.preset_text(), PresetText::Postfix);
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.preset_text(), PresetText::Both);
+        assert_eq!(cfg.value_label(SettingKind::PresetText), "prefix & postfix");
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.preset_text(), PresetText::Prefix, "wraps");
+        cfg.cycle(tab, row, -1);
+        assert_eq!(cfg.preset_text(), PresetText::Both, "← steps back");
+        cfg.cycle(tab, row, 0);
+        assert_eq!(cfg.preset_text(), PresetText::Prefix, "Enter steps on");
+
+        cfg.cycle(tab, row, -1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert_eq!(load_from(&path).preset_text, "prefix & postfix");
+        assert_eq!(load_from(&path).preset_text(), PresetText::Both);
+
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            cfg.preset_text(),
+            PresetText::Prefix,
+            "unknown to an older file"
+        );
+        let cfg: Config = serde_json::from_str(r#"{"preset_text": "both"}"#).unwrap();
+        assert_eq!(cfg.preset_text(), PresetText::Both);
+        assert_eq!(cfg.value_label(SettingKind::PresetText), "prefix & postfix");
+        let mut cfg: Config = serde_json::from_str(r#"{"preset_text": "suffix"}"#).unwrap();
+        assert_eq!(
+            cfg.preset_text(),
+            PresetText::Prefix,
+            "an unknown value is the default"
+        );
+        cfg.cycle(tab, row, 1);
+        assert_eq!(
+            cfg.preset_text(),
+            PresetText::Postfix,
+            "and cycles on from it"
+        );
     }
 
     /// PR & ISSUE COUNTS: an Experimental switch, on by default — the one

@@ -36,6 +36,14 @@
 //! modal's worth of rows kept in memory, so `i` paints the prefetched rows
 //! at once instead of an empty modal while the first answer lands, and a
 //! reopen paints the last list while the fresh one lands underneath.
+//!
+//! The same list is the PROJECT ISSUES GROUP under the Worktrees panel's
+//! pull requests (`App::worktree_rows`): one row per open issue, and the
+//! pane reads the one the cursor rests on the way it reads a pull request
+//! — [`lines`] draws the modal's pane and that one alike — with the
+//! comments asked for on the same debounce ([`schedule_detail`]). `p` and
+//! `e` on the row are the modal's `Enter` and `e` for it
+//! ([`open_prompt_for_row`], [`open_preset_for_row`]).
 
 use std::path::{Path, PathBuf};
 
@@ -52,11 +60,11 @@ use crate::app::{clamp_selection, window_start, App, Overlay};
 use crate::markdown::{self, Breaks};
 use crate::pr_preview::fit;
 use crate::quick_prompt::{QuickLaunch, QuickReturn, QuickTarget};
-use crate::text_input::TextInput;
+use crate::text_input::{TextInput, TextView};
 use crate::theme::Theme;
 use crate::ui::{
-    centered_rect_pct, empty_list_row, input_spans, multiline_input_lines, panel_block, render_row,
-    row_rect, truncate, SPLIT_MODAL_PCT, SPLIT_PANE_LAYOUT_MIN,
+    centered_rect_pct, draw_multiline_input, draw_scroll_marks, empty_list_row, input_spans,
+    panel_block, render_row, row_rect, truncate, SPLIT_MODAL_PCT, SPLIT_PANE_LAYOUT_MIN,
 };
 
 /// How long a lookup may run before we give up on it — the PR lookups'
@@ -368,7 +376,7 @@ impl IssueEditor {
             url: issue.url.clone(),
             number: issue.number,
             title: TextInput::with_text(issue.title.clone()),
-            body: TextInput::with_text(issue.body.clone()),
+            body: TextInput::multiline_with_text(issue.body.clone()),
             field: EditField::Title,
             original: IssueText {
                 title: issue.title.clone(),
@@ -402,12 +410,11 @@ impl IssueEditor {
         }
     }
 
-    /// Shift+Enter / Ctrl+J: a hard line in the description; on the title
-    /// — one line by nature — the caret steps down into the description.
-    pub fn newline(&mut self) {
+    /// The field under the caret, to read.
+    pub fn field_ref(&self) -> &TextInput {
         match self.field {
-            EditField::Body => self.body.insert_char('\n'),
-            EditField::Title => self.field = EditField::Body,
+            EditField::Title => &self.title,
+            EditField::Body => &self.body,
         }
     }
 }
@@ -853,11 +860,13 @@ fn arm_beat(app: &mut App, project: &ProjectId, found: bool) {
     );
 }
 
-/// Arm (or disarm) the debounced comments fetch for the row under the
-/// cursor. An issue already fetched, in flight, or known unanswerable arms
-/// nothing. Landing on a row rewinds the reading pane.
-fn schedule_detail(app: &mut App) {
-    let pending = selected_issue(app).and_then(|(issue, dir)| {
+/// Arm (or disarm) the debounced comments fetch for the issue in focus
+/// ([`issue_in_focus`]: the modal's row, or the PROJECT ISSUES GROUP row
+/// under the Worktrees cursor). An issue already fetched, in flight, or
+/// known unanswerable arms nothing. Landing on a row rewinds the reading
+/// pane.
+pub(crate) fn schedule_detail(app: &mut App) {
+    let pending = issue_in_focus(app).and_then(|(issue, dir)| {
         let url = issue.url.clone();
         if app.issue_detail.contains_key(&url)
             || app.issue_detail_inflight.contains(&url)
@@ -1147,6 +1156,18 @@ fn selected_issue(app: &App) -> Option<(Issue, PathBuf)> {
     Some((issue.clone(), view.dir.clone()))
 }
 
+/// The issue whose comments the pane wants: the modal's row while the
+/// modal is up, else the PROJECT ISSUES GROUP row under the Worktrees
+/// cursor, asked from the project's checkout.
+fn issue_in_focus(app: &App) -> Option<(Issue, PathBuf)> {
+    if matches!(app.overlay, Some(Overlay::Issues(_))) {
+        return selected_issue(app);
+    }
+    let issue = app.selected_worktree_issue()?.clone();
+    let dir = app.selected_project()?.repo_path.clone();
+    Some((issue, dir))
+}
+
 /// Move the cursor to `index` (clamped): the pane rewinds and the row's
 /// comments are asked for once the cursor rests.
 fn select(app: &mut App, index: i64) {
@@ -1236,21 +1257,32 @@ fn handle_editor_key(app: &mut App, key: KeyEvent) {
     let Some(editor) = &mut view.editor else {
         return;
     };
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let mut save = false;
     match key.code {
         KeyCode::Esc => view.editor = None,
         _ if editor.saving => {}
         KeyCode::Tab | KeyCode::BackTab => editor.field = editor.field.next(),
-        KeyCode::Down => editor.field = EditField::Body,
-        KeyCode::Up => editor.field = EditField::Title,
-        // A hard line in the description, as in the task editor; asked
-        // for on the title, which has no second line, it steps down into
-        // the description rather than saving under the user.
-        KeyCode::Char('j') if ctrl => editor.newline(),
-        KeyCode::Enter if shift => editor.newline(),
-        KeyCode::Enter => save = true,
+        // ↓/↑ walk the description's lines first; past its last (or
+        // first) line, and from the one-line title, they move between
+        // the two fields.
+        KeyCode::Down => {
+            if !editor.field_mut().handle_key(&key).consumed() {
+                editor.field = EditField::Body;
+            }
+        }
+        KeyCode::Up => {
+            if !editor.field_mut().handle_key(&key).consumed() {
+                editor.field = EditField::Title;
+            }
+        }
+        // A line break — Shift+Enter, Option+Enter or Ctrl+J, as in the
+        // task editor — is the description's own (the `_` arm below).
+        // Asked for on the title, which has no second line, it steps down
+        // into the description rather than saving under the user.
+        _ if editor.field == EditField::Title && TextInput::is_newline_key(&key) => {
+            editor.field = EditField::Body;
+        }
+        KeyCode::Enter if !editor.field_ref().takes_newline(&key) => save = true,
         _ => {
             if editor.field_mut().handle_key(&key).changed() {
                 editor.notice = None;
@@ -1274,10 +1306,9 @@ pub(crate) fn paste(view: &mut IssuesView, text: &str) -> bool {
         return true;
     }
     editor.notice = None;
-    match editor.field {
-        EditField::Title => editor.title.insert_str(text),
-        EditField::Body => editor.body.insert_multiline_str(text),
-    }
+    // The title is one line, the description keeps the paste's line
+    // breaks: each field knows which it is.
+    editor.field_mut().insert_str(text);
     true
 }
 
@@ -1336,7 +1367,7 @@ fn launch_for_selected(app: &mut App) -> Option<QuickLaunch> {
 /// modal; Esc from it lands on the panels, `i` reopens the list.
 fn open_prompt_for_selected(app: &mut App) {
     if let Some(launch) = launch_for_selected(app) {
-        crate::event_loop::open_prompt(app, crate::app::PromptKind::QuickPrompt(launch));
+        crate::quick_prompt::open_box(app, launch);
     }
 }
 
@@ -1350,6 +1381,43 @@ fn open_preset_for_selected(app: &mut App) {
             QuickReturn {
                 launch,
                 text: String::new(),
+                from_box: false,
+            },
+        );
+    }
+}
+
+/// The launch the PROJECT ISSUES GROUP row under the Worktrees cursor
+/// describes — the modal's for that row: the `quick_prompt_kind`
+/// SETTING's harness aimed at [`launch_target`] (an issue row has no
+/// checkout, so that is the project's root), carrying the issue.
+fn launch_for_row(app: &mut App) -> Option<QuickLaunch> {
+    let issue = app.selected_worktree_issue()?.launch_ref();
+    let project = app.selected_project()?.id.clone();
+    let Some(target) = launch_target(app, &project) else {
+        app.flash = Some("issues: the project has no worktree to launch into".into());
+        return None;
+    };
+    Some(QuickLaunch::from_config(target, &crate::config::Config::load()).with_issue(Some(issue)))
+}
+
+/// `p` on a PROJECT ISSUES GROUP row: the QUICK PROMPT for that issue —
+/// what `Enter` in the modal opens on the same row.
+pub(crate) fn open_prompt_for_row(app: &mut App) {
+    if let Some(launch) = launch_for_row(app) {
+        crate::quick_prompt::open_box(app, launch);
+    }
+}
+
+/// `e` on a PROJECT ISSUES GROUP row: an AGENT PRESET on that issue.
+pub(crate) fn open_preset_for_row(app: &mut App) {
+    if let Some(launch) = launch_for_row(app) {
+        crate::quick_prompt::open_preset_picker(
+            app,
+            QuickReturn {
+                launch,
+                text: String::new(),
+                from_box: false,
             },
         );
     }
@@ -1664,7 +1732,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
 
     // ---- right: the editor, while it is up ----
     if let Some(editor) = &view.editor {
-        let (title_area, body_area) = draw_editor(f, body_a, editor, th);
+        let (title_area, body_area, body_view) = draw_editor(f, body_a, editor, th);
         if let Some(Overlay::Issues(v)) = &mut app.overlay {
             v.area = area;
             v.list_area = list_inner;
@@ -1672,6 +1740,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
             if let Some(e) = &mut v.editor {
                 e.title_area = title_area;
                 e.body_area = body_area;
+                if let Some(view) = body_view {
+                    e.body.set_view(view);
+                }
             }
         }
         return;
@@ -1728,8 +1799,14 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
 /// The reading pane as the form: the title on the first row, the
 /// description in a box under it, the frame's foot saying what Enter will
 /// do — or why the last one did nothing, or that GitHub is being asked.
-/// Returns the title row and the description box for click-to-focus.
-fn draw_editor(f: &mut Frame, area: Rect, editor: &IssueEditor, th: Theme) -> (Rect, Rect) {
+/// Returns the title row and the description box for click-to-focus, and
+/// the view the description was drawn with while it has the caret.
+fn draw_editor(
+    f: &mut Frame,
+    area: Rect,
+    editor: &IssueEditor,
+    th: Theme,
+) -> (Rect, Rect, Option<TextView>) {
     let title = format!("Edit issue #{}", editor.number);
     let (foot, style) = match (&editor.notice, editor.saving) {
         (Some(notice), _) => (format!(" {notice} "), Style::default().fg(th.err)),
@@ -1779,6 +1856,7 @@ fn draw_editor(f: &mut Frame, area: Rect, editor: &IssueEditor, th: Theme) -> (R
         height: inner.height.saturating_sub(1),
     };
     let mut body_area = Rect::default();
+    let mut body_view = None;
     if box_area.height >= 3 && box_area.width >= 4 {
         body_area = box_area;
         let focused = editor.field == EditField::Body;
@@ -1791,13 +1869,9 @@ fn draw_editor(f: &mut Frame, area: Rect, editor: &IssueEditor, th: Theme) -> (R
         let box_inner = block.inner(box_area);
         f.render_widget(block, box_area);
         if focused {
-            let (lines, caret_row) =
-                multiline_input_lines(&editor.body, box_inner.width as usize, th.accent, th);
-            let visible = box_inner.height.max(1) as usize;
-            let max_start = lines.len().saturating_sub(visible);
-            let start = caret_row.saturating_sub(visible / 2).min(max_start);
-            let shown: Vec<Line> = lines.into_iter().skip(start).take(visible).collect();
-            f.render_widget(Paragraph::new(shown), box_inner);
+            let (view, rows) = draw_multiline_input(f, &editor.body, box_inner, th);
+            draw_scroll_marks(f, box_area, view, rows, th.dim);
+            body_view = Some(view);
         } else if editor.body.trim().is_empty() {
             f.render_widget(
                 Paragraph::new(Span::styled(
@@ -1813,7 +1887,7 @@ fn draw_editor(f: &mut Frame, area: Rect, editor: &IssueEditor, th: Theme) -> (R
             );
         }
     }
-    (title_area, body_area)
+    (title_area, body_area, body_view)
 }
 
 #[cfg(test)]
@@ -2538,10 +2612,11 @@ mod tests {
         assert_eq!(empty.flash.as_deref(), Some("no issue selected"));
     }
 
-    /// Tab and ↑/↓ move the caret between the two fields, Shift+Enter and
-    /// Ctrl+J break a line in the description — and step into it from the
-    /// title, which has no second line — and a paste keeps its lines in
-    /// the description while the title flattens them.
+    /// Tab moves the caret between the two fields and ↑/↓ do too once
+    /// they have walked the description's lines, Shift+Enter and Ctrl+J
+    /// break a line in the description — and step into it from the title,
+    /// which has no second line — and a paste keeps its lines in the
+    /// description while the title flattens them.
     #[test]
     fn the_editor_fields_take_the_form_keys() {
         let (mut app, _) = modal_with(vec![issue(15, "Fix login redirect")]);
@@ -2560,6 +2635,13 @@ mod tests {
             editor(&app).unwrap().body.as_str(),
             "Login bounces back to /.\n\n"
         );
+        // ↑ walks the description's three lines before it leaves the field.
+        handle_key(&mut app, key(KeyCode::Up, KeyModifiers::NONE));
+        let e = editor(&app).unwrap();
+        assert_eq!((e.field, e.body.cursor_chars()), (EditField::Body, 25));
+        handle_key(&mut app, key(KeyCode::Up, KeyModifiers::NONE));
+        let e = editor(&app).unwrap();
+        assert_eq!((e.field, e.body.cursor_chars()), (EditField::Body, 0));
         handle_key(&mut app, key(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(editor(&app).unwrap().field, EditField::Title);
         handle_key(&mut app, key(KeyCode::Down, KeyModifiers::NONE));
@@ -2577,7 +2659,9 @@ mod tests {
         );
         view.editor.as_mut().unwrap().field = EditField::Body;
         assert!(paste(view, "c\r\nd"));
-        assert!(view.editor.as_ref().unwrap().body.ends_with("c\nd"));
+        // The walk above left the description's caret on its first
+        // character, so the paste lands there — lines kept.
+        assert!(view.editor.as_ref().unwrap().body.starts_with("c\nd"));
         view.editor = None;
         assert!(!paste(view, "x"), "nothing typing: the paste falls through");
     }

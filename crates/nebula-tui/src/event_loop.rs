@@ -32,6 +32,7 @@ mod activate;
 mod alerts;
 mod focus_walk;
 mod host_terminal;
+mod launcher;
 mod optimistic;
 mod pacing;
 mod placeholder;
@@ -60,6 +61,16 @@ const MODAL_WHEEL_LINES: i32 = 3;
 /// offset moves, and how many arrow keys an alt-screen app that ignores
 /// the mouse is sent per notch.
 const TERM_WHEEL_LINES: usize = 1;
+
+/// The EDGE AUTO-SCROLL beat: a drag-selection whose pointer rests past
+/// the pane's top or bottom edge scrolls the history under it this often.
+const DRAG_AUTOSCROLL_TICK: Duration = Duration::from_millis(50);
+
+/// Lines per EDGE AUTO-SCROLL tick, at most. One per row the pointer is
+/// past the edge — the rule line above the pane is a gentle crawl, the
+/// footer below it a faster one — so the pointer steers the speed rather
+/// than waiting on one fixed crawl for a long copy.
+const DRAG_AUTOSCROLL_MAX_LINES: usize = 6;
 
 /// Ceiling on a panel or file-list width read back from the persisted UI
 /// state — a coarse sanity clamp; the draw re-fits it to the real screen.
@@ -256,6 +267,9 @@ async fn main_loop(
     app.startup_workspace = startup_workspace;
     let cfg = crate::config::Config::load();
     apply_config(&mut app, &cfg);
+    // The LAUNCHER VIEW opens on its box, once the first snapshot has a
+    // project to aim it at (`launcher::boot`).
+    app.launcher_boot = app.launcher;
     app.keymap = cfg.keymap();
     // Every pull request the last run knew about, painted before the
     // daemon's snapshot even lands; the lookups below refresh them all in
@@ -362,7 +376,7 @@ async fn main_loop(
         }
 
         let focus_before = app.focus;
-        let preview_before = app.previewed_pr().map(|pr| pr.url);
+        let preview_before = app.reading_url();
         // When the KEY COMBO DISPLAY's last press comes down (its arm below).
         let key_combo_deadline = app
             .key_combo
@@ -370,6 +384,10 @@ async fn main_loop(
             .map_or_else(tokio::time::Instant::now, |combo| {
                 tokio::time::Instant::from_std(combo.deadline())
             });
+        // When the EDGE AUTO-SCROLL next steps (its arm below).
+        let drag_autoscroll_deadline = app
+            .next_drag_autoscroll
+            .map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std);
         tokio::select! {
             // Pending redraw: wake at the frame boundary even if no new
             // events arrive.
@@ -461,9 +479,21 @@ async fn main_loop(
             // A host that reset itself (iTerm2's ⌘R) drops mouse reporting
             // without a word, and a dead mouse can't report that it is
             // dead — so re-ask on a beat rather than on a signal.
-            _ = tokio::time::sleep_until(next_mode_reassert) => {
+            // …but never while the left button is down. The re-ask is the
+            // one thing nebula writes to the host on a clock, and it is a
+            // mode change under a gesture in progress: a host that takes
+            // it as a fresh start drops the button, and the selection
+            // stops growing a couple of seconds into every long drag. The
+            // beat resumes on the release.
+            _ = tokio::time::sleep_until(next_mode_reassert), if !app.mouse_held() => {
                 let _ = reassert_modes(terminal.backend_mut());
                 next_mode_reassert = tokio::time::Instant::now() + MODE_REASSERT;
+            }
+            // The EDGE AUTO-SCROLL beat: a drag-selection resting past the
+            // pane's top or bottom edge scrolls the history under it, with
+            // no further mouse report to prompt it.
+            _ = tokio::time::sleep_until(drag_autoscroll_deadline), if app.next_drag_autoscroll.is_some() => {
+                drag_autoscroll_tick(&mut app, &mut out);
             }
             // The selection rested past the debounce: tell the daemon what
             // the pane has been showing since the cursor landed here.
@@ -854,8 +884,25 @@ fn sweep_pull_request(
 /// a worktree can be restored underneath us.
 fn sweep_target(app: &mut App) -> Option<(WorktreeId, std::path::PathBuf)> {
     let selected = app.selected_worktree().map(|w| w.id.clone());
-    let candidates: Vec<(WorktreeId, std::path::PathBuf)> = app
-        .visible_worktrees()
+    // The LAUNCHER VIEW names a pull request under every session it lists,
+    // so the sweep there covers every checkout of the SESSIONS level's
+    // list — the selected project's, the root aside — rather than only
+    // the one under the worktree cursor. Walk the level into another
+    // project and the sweep goes with it.
+    let listed: Vec<&nebula_core::Worktree> = if app.launcher_active() {
+        let held: std::collections::HashSet<WorktreeId> = crate::launcher::rows(app)
+            .into_iter()
+            .map(|row| row.agent.worktree_id)
+            .collect();
+        app.tree
+            .worktrees
+            .iter()
+            .filter(|w| held.contains(&w.id))
+            .collect()
+    } else {
+        app.visible_worktrees()
+    };
+    let candidates: Vec<(WorktreeId, std::path::PathBuf)> = listed
         .iter()
         .filter(|w| !w.is_main && Some(&w.id) != selected.as_ref())
         .map(|w| (w.id.clone(), w.path.clone()))
@@ -1097,6 +1144,9 @@ fn note_open_prs_answer(
     if changed {
         refresh_palette(app);
     }
+    // So does the PULL REQUESTS MODAL, whose cursor follows its pull
+    // request across the new list.
+    crate::pr_modal::list_changed(app);
 }
 
 /// Pull the lookup of every checkout whose *open* pull request is among
@@ -1205,10 +1255,14 @@ fn adopt_pr_state(app: &mut App, detail: &crate::pull_request::PrDetail) {
         if pr.url != detail.url {
             continue;
         }
-        if pr.state != detail.state || pr.is_draft != detail.is_draft {
+        if pr.state != detail.state || pr.is_draft != detail.is_draft || pr.health != detail.health
+        {
             let was_merged = pr.standing() == Standing::Merged;
             pr.state = detail.state.clone();
             pr.is_draft = detail.is_draft;
+            // The pane's answer is the newer one: a conflict resolved (or
+            // found) since the row's own lookup turns the row on the spot.
+            pr.health = detail.health;
             if !was_merged && pr.standing() == Standing::Merged {
                 landed.push(worktree.clone());
             }
@@ -1238,6 +1292,7 @@ fn drop_retired_pr(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
     }
     reconcile_open_pr_cursor(app, cursor, out);
     refresh_palette(app);
+    crate::pr_modal::list_changed(app);
     app.dirty = true;
 }
 
@@ -1268,8 +1323,15 @@ fn prune_pull_requests_to_tree(app: &mut App) {
 /// way, and re-asking would spend an API call on a row the user is only
 /// passing through. A body the cache hydrated (`pr_detail_stale`) is the
 /// one exception: the pane shows it at once, and the rest that would have
-/// fetched a missing body fetches a fresh copy over it.
+/// fetched a missing body fetches a fresh copy over it. While the PULL
+/// REQUESTS MODAL is up the slot is its cursor's (`pr_modal::schedule_detail`):
+/// a list refresh re-arming the pane behind it must not take the fetch of
+/// the row the modal is reading.
 fn schedule_pr_detail(app: &mut App) {
+    if matches!(&app.overlay, Some(Overlay::PullRequests(_))) {
+        crate::pr_modal::schedule_detail(app);
+        return;
+    }
     let pending = app.previewed_pr().and_then(|pr| {
         let url = pr.url;
         let fresh = app.pr_detail.contains_key(&url) && !app.pr_detail_stale.contains(&url);
@@ -1292,15 +1354,18 @@ fn schedule_pr_detail(app: &mut App) {
 }
 
 /// The one place "the pane is reading something else now" is noticed: the
-/// loop takes `previewed_pr()`'s URL before handling an event and hands it
-/// back here after. A different URL — the Sessions cursor stepped onto or
-/// off the PR ROW, focus left the Sessions panel for the pane, a refresh
-/// retired the row — re-arms the detail fetch and rewinds the scroll; the
-/// same URL leaves a reader exactly where they were. Keyed on URL, not the
-/// whole row, so a re-titled PR arriving on the GIT POLL is not a change.
+/// loop takes `reading_url()` — the pull request's or the issue's — before
+/// handling an event and hands it back here after. A different URL — the
+/// Sessions cursor stepped onto or off the PR ROW, focus left the Sessions
+/// panel for the pane, a refresh retired the row, the Worktrees cursor
+/// landed on an issue — re-arms the detail fetch (the pull request's, and
+/// the issue's comments) and rewinds the scroll; the same URL leaves a
+/// reader exactly where they were. Keyed on URL, not the whole row, so a
+/// re-titled PR arriving on the GIT POLL is not a change.
 fn note_preview_change(app: &mut App, before: Option<String>) {
-    if app.previewed_pr().map(|pr| pr.url) != before {
+    if app.reading_url() != before {
         schedule_pr_detail(app);
+        crate::issues::schedule_detail(app);
     }
 }
 
@@ -1379,6 +1444,7 @@ fn open_pr_comment(app: &mut App) {
             number: pr.number,
             url: pr.url,
             label: pr.label,
+            back: None,
         },
         draft,
     );
@@ -1390,8 +1456,16 @@ fn open_pr_comment(app: &mut App) {
 /// detail fetch does — and say it is on its way. The outcome lands in
 /// `land_pr_comment`. A post that cannot even start — one already running
 /// on this pull request, no checkout on disk — says why and hands the box
-/// straight back with its text.
-fn post_pr_comment(app: &mut App, number: u64, url: String, label: String, body: String) {
+/// straight back with its text. A box that stood in for the PULL REQUESTS
+/// MODAL (`back`) puts the modal back on its row as the post goes out.
+fn post_pr_comment(
+    app: &mut App,
+    number: u64,
+    url: String,
+    label: String,
+    body: String,
+    back: Option<Box<crate::pr_modal::PullRequestsView>>,
+) {
     let dir = app.selected_project().map(|p| p.repo_path.clone());
     let refused = if app.pr_comment_inflight.contains(&url) {
         Some(format!("still posting the last comment on #{number}…"))
@@ -1409,9 +1483,21 @@ fn post_pr_comment(app: &mut App, number: u64, url: String, label: String, body:
     };
     if let Some(why) = refused {
         app.flash = Some(why);
-        reopen_prompt_with(app, PromptKind::PrComment { number, url, label }, body);
+        reopen_prompt_with(
+            app,
+            PromptKind::PrComment {
+                number,
+                url,
+                label,
+                back,
+            },
+            body,
+        );
         app.dirty = true;
         return;
+    }
+    if let Some(view) = back {
+        crate::pr_modal::reopen(app, *view);
     }
     let (Some(dir), Some(tx)) = (dir, app.pr_comment_tx.clone()) else {
         return;
@@ -1436,7 +1522,8 @@ fn post_pr_comment(app: &mut App, number: u64, url: String, label: String, body:
 /// when the pane is still on it (`refetch_pr_detail`, which keeps the
 /// reader's scroll), and on the next visit otherwise (`pr_detail_stale`).
 /// Refused: say why, in `gh`'s words, and put the box back with the text
-/// — at once when nothing else is on screen, and otherwise the next `y`
+/// — at once when nothing else is on screen (or only the PULL REQUESTS
+/// MODAL, which the box stands in for again), and otherwise the next `y`
 /// on that pull request starts from it, so no refusal costs what was
 /// typed.
 fn land_pr_comment(app: &mut App, answer: PrCommentAnswer) {
@@ -1452,16 +1539,34 @@ fn land_pr_comment(app: &mut App, answer: PrCommentAnswer) {
         Ok(_) => {
             app.flash = Some(format!("comment posted on #{number}"));
             app.pr_detail_stale.insert(url.clone());
-            if app.previewed_pr().is_some_and(|pr| pr.url == url) {
+            if matches!(&app.overlay, Some(Overlay::PullRequests(_))) {
+                // The modal reads its row again, the new comment in.
+                crate::pr_modal::schedule_detail(app);
+            } else if app.previewed_pr().is_some_and(|pr| pr.url == url) {
                 refetch_pr_detail(app);
             }
         }
         Err(why) => {
             app.flash = Some(format!("couldn't post the comment on #{number}: {why}"));
-            if app.overlay.is_none() {
-                reopen_prompt_with(app, PromptKind::PrComment { number, url, label }, body);
-            } else {
-                app.pr_comment_drafts.insert(url, body);
+            let back = match &app.overlay {
+                None => Some(None),
+                Some(Overlay::PullRequests(view)) => Some(Some(Box::new(view.clone()))),
+                Some(_) => None,
+            };
+            match back {
+                Some(back) => reopen_prompt_with(
+                    app,
+                    PromptKind::PrComment {
+                        number,
+                        url,
+                        label,
+                        back,
+                    },
+                    body,
+                ),
+                None => {
+                    app.pr_comment_drafts.insert(url, body);
+                }
             }
         }
     }
@@ -1481,7 +1586,13 @@ fn request_pr_diff(app: &mut App) {
     let Some(pr) = app.previewed_pr() else {
         return;
     };
-    let (number, url, title) = (pr.number, pr.url, pr.label);
+    request_pr_diff_for(app, pr.number, pr.url, pr.label);
+}
+
+/// [`request_pr_diff`] for pull request `number` of the selected project,
+/// titled `title` — the pane's row, or the PULL REQUESTS MODAL's (`g`
+/// there), whose modal the diff's replaces.
+pub(crate) fn request_pr_diff_for(app: &mut App, number: u64, url: String, title: String) {
     if app.pr_diff_inflight == Some(number) {
         app.flash = Some(format!("still fetching the diff for #{number}…"));
         return;
@@ -1789,7 +1900,26 @@ fn send_with(
     intent: PendingIntent,
     make: impl FnOnce(u64) -> ClientRequest,
 ) {
+    send_with_follow(app, out, intent, true, make);
+}
+
+/// [`send_with`], with the Ack born LEFT BEHIND when `follow` is false:
+/// the intent still runs, but nothing it does moves a cursor, the pane or
+/// FOCUS onto what it made. That is how a BACKGROUND LAUNCH sends its
+/// first half — the checkout it cuts for a prompt fired into another
+/// project — so the screen stays where the user left it, the same way a
+/// launch the user navigated away from is treated (`App::left_behind`).
+fn send_with_follow(
+    app: &mut App,
+    out: &mut Vec<ClientRequest>,
+    intent: PendingIntent,
+    follow: bool,
+    make: impl FnOnce(u64) -> ClientRequest,
+) {
     let req_id = app.alloc_req_id(intent);
+    if !follow {
+        app.left_behind.insert(req_id);
+    }
     out.push(make(req_id));
 }
 
@@ -1809,9 +1939,11 @@ fn ui_state_json(app: &App) -> String {
         show_archived: app.show_archived,
         collapsed: app.collapsed,
         open_prs_collapsed: app.open_prs_collapsed,
+        issues_collapsed: app.issues_collapsed,
         panel_widths: Some(app.panel_widths),
         diff_files_width: Some(app.diff_files_width),
         diff_tree: app.diff_tree,
+        launcher_pane_h: app.launcher_pane_h,
     };
     serde_json::to_string(&state).unwrap_or_else(|_| "{}".into())
 }
@@ -1868,6 +2000,7 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
     };
     app.show_archived = state.show_archived;
     app.open_prs_collapsed = state.open_prs_collapsed;
+    app.issues_collapsed = state.issues_collapsed;
     if let Some(w) = state.panel_widths {
         // normalize_panel_widths re-fits to the actual screen on the next
         // draw.
@@ -1878,6 +2011,12 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
         app.diff_files_width = w.clamp(crate::app::MIN_DIFF_FILES_W, MAX_RESTORED_WIDTH);
     }
     app.diff_tree = state.diff_tree;
+    // The next draw re-fits it to the body actually on screen
+    // (`launcher::pane_height`); the cap here only keeps a nonsense blob
+    // from carrying a wild number around.
+    app.launcher_pane_h = state
+        .launcher_pane_h
+        .map(|h| h.clamp(crate::launcher::PANE_MIN_H, MAX_RESTORED_WIDTH));
     if let Some(pid) = &state.project {
         let row = app
             .project_rows()
@@ -1914,8 +2053,13 @@ fn sync_pty_size(app: &mut App, out: &mut Vec<ClientRequest>) {
     }
     if let Some(term) = &mut app.term {
         if (term.cols, term.rows) != (area.width, area.height) {
-            // The grid reflows; a screen-anchored selection would drift.
-            app.term_selection = None;
+            // The grid regrids and the program repaints into it: a
+            // finished selection is let go rather than shown over whatever
+            // lands. A drag under way keeps its history lines — rows keep
+            // their numbers through a resize — and the button ends it.
+            if !app.term_selection.is_some_and(|s| s.dragging) {
+                app.term_selection = None;
+            }
             term.cols = area.width;
             term.rows = area.height;
             term.parser.screen_mut().set_size(area.height, area.width);
@@ -2065,6 +2209,27 @@ fn dispatch_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientRequ
     if app.term_locked {
         fire_pending_attach(app, out);
     }
+    // The LAUNCHER VIEW's card under the cursor, ahead of a key or a click
+    // that may take it out of the grid (`launcher::keep_cursor`).
+    let pressed = matches!(event, Event::Key(_))
+        || matches!(
+            event,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(_),
+                ..
+            })
+        );
+    let launcher_before = (pressed && app.launcher_grid() && !app.term_locked)
+        .then(|| launcher::cursor_entry(app))
+        .flatten();
+    dispatch_input(app, event, out);
+    if let Some(before) = launcher_before {
+        launcher::keep_cursor(app, before, out);
+    }
+}
+
+/// [`dispatch_terminal_event`]'s body: the event to its handler.
+fn dispatch_input(app: &mut App, event: Event, out: &mut Vec<ClientRequest>) {
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => {
             let typing = typing_into_pane(app);
@@ -2090,6 +2255,9 @@ fn dispatch_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientRequ
         // An overlay with a live text field takes the paste: ⌘V into a
         // filter or the ssh destination lands where the caret is.
         Event::Paste(text) if paste_into_overlay(app, &text) => {}
+        // Then an expanded session card's FOLLOW-UP COMPOSER, which holds
+        // the keyboard the way an overlay's field does while it is open.
+        Event::Paste(text) if paste_into_follow_up(app, &text) => {}
         Event::Paste(text) => {
             // A stand-in pane (QUICK PROMPT, checkout still being cut) has
             // no PTY to paste into.
@@ -2155,17 +2323,19 @@ fn paste_into_overlay(app: &mut App, text: &str) -> bool {
         return false;
     };
     match overlay {
+        // A task box keeps the paste's line breaks, a one-line prompt
+        // flattens them: the field knows which it is.
         Overlay::Prompt(prompt) => {
-            if prompt.is_multiline() {
-                prompt.input.insert_multiline_str(text);
-            } else {
-                prompt.input.insert_str(text);
-            }
+            prompt.input.insert_str(text);
             prompt.refresh_dirs();
         }
         Overlay::Palette(palette) => {
             palette.query.insert_str(text);
             palette.apply_filter();
+        }
+        Overlay::ProjectPicker(picker) => {
+            picker.query.insert_str(text);
+            picker.apply_filter();
         }
         Overlay::Files(finder) => {
             finder.query.insert_str(text);
@@ -2202,21 +2372,141 @@ fn paste_into_overlay(app: &mut App, text: &str) -> bool {
         },
         // The name is one line; prefix and postfix keep their newlines.
         Overlay::AgentPresetEditor(editor) => {
-            let multiline = matches!(
-                editor.field,
-                crate::preset_overlays::PresetField::Prefix
-                    | crate::preset_overlays::PresetField::Postfix
-            );
-            match editor.text_field_mut() {
-                Some(input) if multiline => input.insert_multiline_str(text),
-                Some(input) => input.insert_str(text),
-                None => return false,
+            if !editor.paste(text) {
+                return false;
             }
         }
         _ => return false,
     }
     app.dirty = true;
     true
+}
+
+// ---- the FOLLOW-UP COMPOSER ----
+
+/// A paste while a session card's FOLLOW-UP COMPOSER is open: it lands in
+/// the box, newlines and all. False when no card is expanded, so the paste
+/// falls through to the terminal pane.
+fn paste_into_follow_up(app: &mut App, text: &str) -> bool {
+    if app.focus != Focus::Sessions || !app.follow_up_live() {
+        return false;
+    }
+    let Some(follow_up) = &mut app.follow_up else {
+        return false;
+    };
+    follow_up.input.insert_str(text);
+    app.dirty = true;
+    true
+}
+
+/// One key while the composer is open and the SESSIONS PANEL has focus.
+/// True when the box took it — which is nearly everything: the panel's own
+/// verbs are bare letters, so a card with a live box has to swallow them or
+/// typing "attach and archive it" would do both. Enter sends, Esc folds the
+/// card, Shift+Enter / ⌥Enter / `^J` break the line, the readline chords
+/// edit; what is left over is dropped rather than handed on, so no
+/// keystroke aimed at the box ever acts on the list behind it.
+///
+/// Tab and ⇧Tab are the exception, and the way out that isn't Esc: the
+/// panel walk still works, and the box stays open on its card behind it.
+fn follow_up_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) -> bool {
+    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        return false;
+    }
+    let chord = crate::keymap::KeyChord::from_event(&key);
+    // The KEY COMBO DISPLAY never shows what is typed into a text field
+    // (see key_combo.rs), here as in every modal.
+    if !crate::key_combo::is_text_key(&chord) {
+        let does = match key.code {
+            KeyCode::Enter => Some("Send the follow-up"),
+            KeyCode::Esc => Some("Close the follow-up"),
+            _ => None,
+        };
+        crate::key_combo::note(app, &[chord], does);
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.follow_up = None;
+            app.dirty = true;
+        }
+        KeyCode::Enter
+            if !app
+                .follow_up
+                .as_ref()
+                .is_some_and(|f| f.input.takes_newline(&key)) =>
+        {
+            send_follow_up(app, out);
+        }
+        _ => {
+            if let Some(follow_up) = &mut app.follow_up {
+                if follow_up.input.handle_key(&key).consumed() {
+                    app.dirty = true;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Enter in the composer: what it holds goes to the agent as its next turn
+/// and the card folds back up.
+///
+/// The text crosses as a BRACKETED PASTE when it has line breaks — the
+/// CLI (claude, codex…) then takes it as one block instead of auto-indenting
+/// it into mush — and as plain bytes when it is the one line it usually is,
+/// which keeps it out of the "[Pasted text]" placeholder those CLIs fold a
+/// paste into. The carriage return that submits it is a second `Input` of
+/// its own, so the child's read of the prompt and its read of the Enter are
+/// two reads and it has the prompt in hand before the Enter arrives.
+///
+/// A session with no live PTY behind it — reaped by the IDLE REAPER, or
+/// cold since the daemon started — is booted first and the box kept as it
+/// is: the daemon drops `Input` for a session it has not spawned, and the
+/// CLI that boot starts is seconds from reading anything, so the prompt
+/// would be typed into a process that never saw it.
+fn send_follow_up(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let Some(follow_up) = &app.follow_up else {
+        return;
+    };
+    let text = follow_up.input.as_str().trim().to_string();
+    let id = follow_up.agent.clone();
+    if text.is_empty() {
+        return;
+    }
+    let Some(agent) = app.tree.agents.iter().find(|a| a.id == id).cloned() else {
+        // The row went away under the box (deleted, or the daemon lost it).
+        app.follow_up = None;
+        app.dirty = true;
+        return;
+    };
+    let sref = SessionRef::Agent(id);
+    if !agent.alive {
+        attach_now(app, sref, out);
+        app.flash = Some(format!(
+            "starting {} — press Enter again once it is up",
+            agent.name
+        ));
+        return;
+    }
+    // The pane goes to the session being prompted: the answer is about to
+    // land there, and the user asked for it by name.
+    attach_now(app, sref.clone(), out);
+    let data = if text.contains('\n') {
+        bracketed(&text)
+    } else {
+        text.into_bytes()
+    };
+    out.push(ClientRequest::Input {
+        session: sref.clone(),
+        data,
+    });
+    out.push(ClientRequest::Input {
+        session: sref,
+        data: b"\r".to_vec(),
+    });
+    app.follow_up = None;
+    app.flash = Some(format!("sent to {}", agent.name));
+    app.dirty = true;
 }
 
 fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
@@ -2294,8 +2584,11 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         if !exited {
             if let Some(term) = &mut app.term {
                 // Typing changes the content under a persisted selection
-                // highlight — drop it.
-                app.term_selection = None;
+                // highlight — drop it. Not one still being dragged: the
+                // button is down, and only its release ends that.
+                if !app.term_selection.is_some_and(|s| s.dragging) {
+                    app.term_selection = None;
+                }
                 // Typing exits scroll mode (tmux behavior).
                 if term.scroll > 0 {
                     term.set_scroll(0);
@@ -2334,11 +2627,21 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         return;
     }
 
-    // Reading a pull request in the pane: the diff modal's scroll keys work
-    // here too. Page/Home/End only — shift+↑/↓ already move a project, and
-    // ↑/↓ have to keep walking the PR list itself. From either list that
-    // can rest on one; a focused pane keeps its keys for the PTY.
-    if app.previewed_pr().is_some() && matches!(app.focus, Focus::Worktrees | Focus::Sessions) {
+    // A session card expanded into its FOLLOW-UP COMPOSER: the box owns
+    // every key the SESSIONS PANEL would otherwise act on — they are all
+    // letters, and `a` in a prompt must not archive the session being
+    // prompted. Only the panel walk gets through (Tab / ⇧Tab), and Esc
+    // folds the card back up.
+    if app.focus == Focus::Sessions && app.follow_up_live() && follow_up_key(app, key, out) {
+        return;
+    }
+
+    // Reading a pull request or an issue in the pane: the diff modal's
+    // scroll keys work here too. Page/Home/End only — shift+↑/↓ already
+    // move a project, and ↑/↓ have to keep walking the list itself. From
+    // either list that can rest on one; a focused pane keeps its keys for
+    // the PTY.
+    if app.reading_url().is_some() && matches!(app.focus, Focus::Worktrees | Focus::Sessions) {
         let page = app.term_area.height.max(1);
         let max = app.pr_preview_max_scroll();
         let scrolled = match key.code {
@@ -2349,10 +2652,15 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             _ => None,
         };
         if let Some(to) = scrolled {
+            let does = if app.previewed_pr().is_some() {
+                "Scroll the pull request"
+            } else {
+                "Scroll the issue"
+            };
             crate::key_combo::note(
                 app,
                 &[crate::keymap::KeyChord::from_event(&key)],
-                Some("Scroll the pull request"),
+                Some(does),
             );
             app.dirty |= app.pr_preview_scroll != to;
             app.pr_preview_scroll = to;
@@ -2378,9 +2686,27 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         &[chord],
         action.and_then(crate::keymap::spec_of).map(|s| s.label),
     );
+    // Esc in the LAUNCHER VIEW walks back up the tree — a project's
+    // sessions to the projects beside it, those to the workspaces. Esc is
+    // the modal grammar's key and bound to no action, so the lookup above
+    // found nothing and the `else` below would drop it.
+    if action.is_none() && app.launcher_grid() && key.code == KeyCode::Esc {
+        crate::key_combo::note(app, &[chord], Some("Back up a level"));
+        launcher::go_up(app, out);
+        return;
+    }
     let Some(action) = action else {
         return;
     };
+    // The LAUNCHER VIEW's GRID takes the keys that walk it and open a
+    // card; the rest keep their panel meaning. Only the grid: over a
+    // full-screen session the keys are the PTY's, and the ones that get
+    // past it (an exited pane unlocks) are the pane's own. `armed` and the
+    // chord go with it: `k` on the grid's top row is a double tap out to
+    // the level above, exactly as it is on a panel's first row.
+    if app.launcher_grid() && launcher::handle_action(app, action, armed, &chord, out) {
+        return;
+    }
     use crate::keymap::Action;
     match action {
         Action::Quit => app.overlay = Some(Overlay::Confirm(confirm_quit())),
@@ -2453,6 +2779,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::AgentPresets => crate::preset_overlays::open_agent_presets(app),
         Action::QuickPrompt => crate::quick_prompt::open_quick_prompt(app),
         Action::Issues => crate::issues::open_issues(app),
+        Action::PullRequests => crate::pr_modal::open(app),
         Action::SwitchBranch => crate::branch_switch::open_branch_switch(app),
         // Ctrl+→ still reaches the terminal pane (the counterpart of the
         // Ctrl+← escape hatch).
@@ -2689,20 +3016,29 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // `]` / `[`: the palette's attention order as a ring, no modal —
         // one press lands on the next session that needs you, in whatever
         // workspace it lives, the way `/` Enter would (same setting, same
-        // landing). Like the workspace digits, live from any panel.
+        // landing, same always-attach on a red row). Like the workspace
+        // digits, live from any panel.
         Action::NextAttention => {
-            let landing = Landing::for_enter(crate::config::Config::load().palette_enter_attaches);
-            jump_attention(app, 1, landing, out);
+            let attaches = crate::config::Config::load().palette_enter_attaches;
+            jump_attention(app, 1, attaches, out);
         }
         Action::PrevAttention => {
-            let landing = Landing::for_enter(crate::config::Config::load().palette_enter_attaches);
-            jump_attention(app, -1, landing, out);
+            let attaches = crate::config::Config::load().palette_enter_attaches;
+            jump_attention(app, -1, attaches, out);
         }
         Action::Delete => open_delete_confirm(app),
         // Delete EVERY row of the focused panel (behind a confirm that
         // lists the casualties).
         Action::DeleteAll => open_delete_all_confirm(app),
         Action::ContextMenu => open_context_menu_for_selection(app),
+        // Space on a session card: expand it into its FOLLOW-UP COMPOSER,
+        // or fold it back up. Sessions only — the other panels have no
+        // card to expand, and Space stays unbound there.
+        Action::FollowUp => {
+            if app.focus == Focus::Sessions {
+                activate::follow_up(app);
+            }
+        }
         // On an open-PR row (either list) `g` reads that pull request's
         // diff off GitHub instead of the checkout's — same modal, different
         // source.
@@ -2727,10 +3063,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::NewTerminal => create_terminal_for_context(app, out),
         Action::Zoom => {
             if app.term.is_some() {
-                app.collapsed = true;
-                app.focus = Focus::Terminal;
-                app.term_locked = true;
-                fire_pending_attach(app, out);
+                zoom_pane(app, out);
             } else {
                 app.flash = Some("attach a session first".into());
             }
@@ -2765,6 +3098,7 @@ fn quick_return_of(prompt: &PromptDialog) -> Option<crate::quick_prompt::QuickRe
     Some(crate::quick_prompt::QuickReturn {
         launch: launch.clone(),
         text: prompt.input.as_str().to_string(),
+        from_box: true,
     })
 }
 
@@ -3790,7 +4124,9 @@ fn toggle_open_prs(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.open_prs_collapsed = !app.open_prs_collapsed;
     follow_checkout(app, checkout.as_ref());
     if on_pr {
-        app.sel_worktree = app.worktree_row_count().saturating_sub(1);
+        // The last checkout — not the last row, which with an ISSUES
+        // group open below would be an issue.
+        app.sel_worktree = last_checkout_row(app);
         if app.selected_worktree().is_some() {
             restore_session(app, out);
             // A fold is an explicit act, like an archive: the row the
@@ -3799,6 +4135,34 @@ fn toggle_open_prs(app: &mut App, out: &mut Vec<ClientRequest>) {
             fire_pending_attach(app, out);
         }
         schedule_pr_detail(app);
+    }
+    app.dirty = true;
+}
+
+/// The last checkout row of the Worktrees panel — where a fold lands a
+/// cursor it took the row from. The first row when the project has none.
+fn last_checkout_row(app: &App) -> usize {
+    app.worktree_rows()
+        .iter()
+        .rposition(|row| row.checkout().is_some())
+        .unwrap_or(0)
+}
+
+/// Fold/unfold the Worktrees panel's ISSUES group (header click, context
+/// menu; ↓ off the row above it unfolds it too — see `move_selection`).
+/// Folding while the cursor sits on an issue re-lands it on the row above
+/// the header — the last pull request, whose preview the loop's
+/// `note_preview_change` brings up, or the last checkout, whose session
+/// comes back the way the OPEN PRS fold brings it back.
+fn toggle_issues(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let on_issue = app.selected_worktree_issue().is_some();
+    app.issues_collapsed = !app.issues_collapsed;
+    if on_issue {
+        app.sel_worktree = app.worktree_row_count().saturating_sub(1);
+        if app.selected_worktree().is_some() {
+            restore_session(app, out);
+            fire_pending_attach(app, out);
+        }
     }
     app.dirty = true;
 }
@@ -4124,6 +4488,7 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
                 "Attach",
                 MenuAction::Attach(SessionRef::Agent(a.id.clone())),
             ),
+            MenuItem::new("Follow-up prompt", MenuAction::FollowUp),
             MenuItem::new("Restart", MenuAction::RestartAgent(a.id.clone())),
             MenuItem::new("Rename", MenuAction::RenameAgent(a.id.clone())),
             MenuItem::new("Archive", MenuAction::ArchiveAgent(a.id.clone())),
@@ -4203,6 +4568,15 @@ fn open_pr_agent_picker(app: &mut App) {
         return;
     };
     agent_picker::open_kind_picker(app, KindPicker::pr_session(worktree, &pr));
+}
+
+/// The CONTEXT MENU for a PROJECT ISSUES GROUP row: the browser. The
+/// launches are the row's keys (`p`, `e`), as the footer says.
+fn issue_row_menu_items(issue: &crate::issues::Issue) -> Vec<MenuItem> {
+    vec![MenuItem::new(
+        "Open in browser",
+        MenuAction::OpenLink(issue.url.clone()),
+    )]
 }
 
 /// The CONTEXT MENU for a PROJECT OPEN PRS GROUP row: a PR SESSION row per
@@ -4328,7 +4702,17 @@ pub(crate) fn menu_quick_return(menu: &ContextMenu) -> Option<crate::quick_promp
 /// Management verbs are keys with footer hints:
 /// n creates (and opens) a workspace, r renames the hovered one, d deletes
 /// it. The list refreshes in place as workspace deltas arrive.
+///
+/// Shut in the LAUNCHER VIEW, which puts no dialog over its grid: every
+/// way in — `w`, `⇧W`, the `1`-`9` tabs, the footer's nameplate — says so
+/// rather than opening a menu whose keys the view refuses. Workspaces are
+/// a LEVEL there instead, and the header breadcrumb's `nebula` crumb
+/// walks to it (`launcher::click_crumb`).
 fn open_workspace_picker(app: &mut App) {
+    if app.launcher_active() {
+        app.flash = Some(launcher::WORKSPACES_LEVEL.into());
+        return;
+    }
     let active = &app.tree.active_workspace;
     let items: Vec<MenuItem> = app
         .tree
@@ -4607,7 +4991,10 @@ fn context_menu_items(app: &App, focus: Focus) -> Option<Vec<MenuItem>> {
         }
         Focus::Worktrees => match app.selected_worktree_pr() {
             Some(pr) => Some(pr_row_menu_items(app, pr)),
-            None => app.selected_worktree().map(|w| worktree_menu_items(app, w)),
+            None => match app.selected_worktree_issue() {
+                Some(issue) => Some(issue_row_menu_items(issue)),
+                None => app.selected_worktree().map(|w| worktree_menu_items(app, w)),
+            },
         },
         Focus::Sessions => app.selected_session_row().map(|row| match row {
             SessionRow::Agent(a) => menu_items_for_session(&a),
@@ -4638,6 +5025,9 @@ fn panel_menu_items(app: &App, focus: Focus) -> Vec<MenuItem> {
                         "Show/hide open PRs",
                         MenuAction::ToggleOpenPrs,
                     ));
+                }
+                if !app.listed_issues().is_empty() {
+                    items.push(MenuItem::new("Show/hide issues", MenuAction::ToggleIssues));
                 }
                 // And drafts to hide — or, once hidden, a way back that
                 // doesn't need the list to still hold one.
@@ -4698,9 +5088,19 @@ fn select_clicked_row(app: &mut App, target: &HitTarget, out: &mut Vec<ClientReq
             app.focus = Focus::Worktrees;
         }
         HitTarget::Session(i) => {
+            // A pointer moved onto another card is the one way the cursor
+            // leaves an open FOLLOW-UP COMPOSER while it holds the
+            // keyboard, so it folds: a box on one card with the cursor on
+            // another would leave `j` typing a letter instead of moving.
+            if app.follow_up_row().is_some_and(|open| open != i) {
+                app.follow_up = None;
+            }
             select_session_row(app, i, Duration::ZERO, out);
             app.focus = Focus::Sessions;
         }
+        HitTarget::LauncherRow(i) => return launcher::select_row(app, i, out),
+        HitTarget::LauncherProjectCard(i) => return launcher::select_project_card(app, i),
+        HitTarget::LauncherWorkspaceCard(i) => return launcher::select_workspace_card(app, i, out),
         _ => return false,
     }
     true
@@ -4805,7 +5205,9 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
         Overlay::AgentPresets(_) => crate::preset_overlays::handle_list_key(app, key, out),
         Overlay::AgentPresetEditor(_) => crate::preset_overlays::handle_editor_key(app, key),
         Overlay::Issues(_) => crate::issues::handle_key(app, key),
+        Overlay::PullRequests(_) => crate::pr_modal::handle_key(app, key),
         Overlay::BranchSwitch(_) => crate::branch_switch::handle_key(app, key),
+        Overlay::ProjectPicker(_) => launcher::handle_picker_key(app, key),
         Overlay::Menu(menu) => match key.code {
             // `?` (and `s` where no filter eats letters) on a row that
             // starts a session jumps to that harness's Agents section,
@@ -4917,11 +5319,25 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                     PromptKind::IssueComment { view, .. } => Some(view.clone()),
                     _ => None,
                 };
+                // And the PULL REQUESTS MODAL's, the same way.
+                let back_to_prs = match &prompt.kind {
+                    PromptKind::PrComment { back, .. } => back.clone(),
+                    _ => None,
+                };
+                // Esc on a box with something typed in it is the accident
+                // that costs nothing: the box is parked as a DRAFT, and the
+                // next QUICK PROMPT opens on it.
+                let parked = crate::quick_prompt::draft_of(prompt);
                 app.overlay = None;
+                if let Some(draft) = parked {
+                    app.quick_draft = Some(draft);
+                }
                 if back_to_settings {
                     reopen_settings(app);
                 } else if let Some(view) = back_to_issues {
                     crate::issues::reopen(app, view);
+                } else if let Some(view) = back_to_prs {
+                    crate::pr_modal::reopen(app, *view);
                 } else if let Some((worktree, name)) = back_to_presets {
                     let index = crate::agent_presets::load()
                         .iter()
@@ -4930,25 +5346,31 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                     crate::preset_overlays::reopen_agent_presets(app, worktree, index);
                 }
             }
-            KeyCode::Char('j')
-                if prompt.is_multiline() && key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                prompt.input.insert_char('\n');
-            }
-            KeyCode::Enter
-                if prompt.is_multiline() && key.modifiers.contains(KeyModifiers::SHIFT) =>
-            {
-                prompt.input.insert_char('\n');
-            }
-            KeyCode::Enter => {
-                // Enter on a highlighted listing row adds that directory;
-                // on the input row it submits the typed path as before.
+            // A line break in a task box — Shift+Enter, Option+Enter or
+            // Ctrl+J, as in Claude Code's prompt — is the line editor's
+            // (the `_` arm below); the guard keeps the send off it. Enter
+            // on a highlighted listing row adds that directory; on the
+            // input row it submits the typed path as before.
+            KeyCode::Enter if !prompt.input.takes_newline(&key) => {
                 let mut prompt = prompt.clone();
                 if let Some(path) = prompt.hovered_path() {
                     prompt.input.set_text(path);
                 }
                 app.overlay = None;
                 submit_prompt(app, prompt, out);
+            }
+            // The LAUNCHER VIEW's box chords: `^P` the project, `^O` the
+            // model, and a `^N` that flips between a fresh worktree and the
+            // project the box is aimed at (not the one under the cursor).
+            KeyCode::Char('p' | 'P' | 'o' | 'O' | 'n' | 'N')
+                if app.launcher
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(prompt.kind, PromptKind::QuickPrompt(_)) =>
+            {
+                if let PromptKind::QuickPrompt(launch) = &prompt.kind {
+                    let (launch, input) = (launch.clone(), prompt.input.clone());
+                    launcher::handle_box_key(app, &key, &launch, &input);
+                }
             }
             // Tab / Shift+Tab retarget this one launch: the harness (and
             // its MODEL / EFFORT submenus) or a saved AGENT PRESET. Both
@@ -5010,10 +5432,21 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 prompt.input.set_text(c.to_string());
                 prompt.refresh_dirs();
             }
-            // Everything else is the line editor's (see text_input).
+            // Everything else is the line editor's (see text_input). ↑ on
+            // a task box's top row and ↓ on its bottom one go on to the
+            // very start and end of the text, as a text area on the web
+            // does: the field leaves them over for a form to step fields
+            // on, and this box has no other field.
             _ => {
-                if prompt.input.handle_key(&key).changed() {
+                let edit = prompt.input.handle_key(&key);
+                if edit.changed() {
                     prompt.refresh_dirs();
+                } else if !edit.consumed() && prompt.is_multiline() {
+                    match key.code {
+                        KeyCode::Up => prompt.input.cursor_to_start(),
+                        KeyCode::Down => prompt.input.cursor_to_end(),
+                        _ => {}
+                    }
                 }
             }
         },
@@ -5028,9 +5461,11 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                     _ => None,
                 };
                 let to_presets = match &confirm.action {
-                    PendingAction::DeleteAgentPreset { index, worktree } => {
-                        Some((*index, worktree.clone()))
-                    }
+                    PendingAction::DeleteAgentPreset {
+                        index,
+                        worktree,
+                        quick,
+                    } => Some((*index, worktree.clone(), quick.clone())),
                     _ => None,
                 };
                 app.overlay = None;
@@ -5038,8 +5473,13 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                     reopen_settings(app);
                 } else if let Some(hover) = to_picker {
                     reopen_workspace_picker(app, hover);
-                } else if let Some((index, worktree)) = to_presets {
-                    crate::preset_overlays::reopen_agent_presets(app, worktree, index);
+                } else if let Some((index, worktree, quick)) = to_presets {
+                    crate::preset_overlays::reopen_presets_list(
+                        app,
+                        worktree,
+                        quick.map(|back| *back),
+                        index,
+                    );
                 }
             }
             KeyCode::Enter | KeyCode::Char('y') => {
@@ -5706,6 +6146,7 @@ fn apply_config(app: &mut App, cfg: &crate::config::Config) {
     set_hide_draft_prs(app, cfg.hide_draft_prs);
     app.recent_prompts = cfg.recent_prompts_shown();
     app.pr_issue_counts = cfg.pr_issue_counts;
+    app.launcher = cfg.launcher_view;
     app.show_key_combos = cfg.show_key_combos;
     if !app.show_key_combos {
         // Switched off: whatever the display was showing comes down now
@@ -6031,8 +6472,12 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
     };
     if value.is_empty() && !empty_is_a_default {
         // An empty comment box goes back to the modal it stood in for.
-        if let PromptKind::IssueComment { view, .. } = &prompt.kind {
-            crate::issues::reopen(app, view.clone());
+        match &prompt.kind {
+            PromptKind::IssueComment { view, .. } => crate::issues::reopen(app, view.clone()),
+            PromptKind::PrComment {
+                back: Some(view), ..
+            } => crate::pr_modal::reopen(app, (**view).clone()),
+            _ => {}
         }
         app.flash = Some("cancelled: empty input".into());
         return;
@@ -6144,9 +6589,12 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             create_agent(app, draft, out);
         }
         PromptKind::QuickPrompt(launch) => quick_launch::submit(app, launch, value, out),
-        PromptKind::PrComment { number, url, label } => {
-            post_pr_comment(app, number, url, label, value)
-        }
+        PromptKind::PrComment {
+            number,
+            url,
+            label,
+            back,
+        } => post_pr_comment(app, number, url, label, value, back),
         PromptKind::CloudMessage { id } => {
             let intent = PendingIntent::ReopenPromptOnError {
                 kind: PromptKind::CloudMessage { id: id.clone() },
@@ -6277,7 +6725,11 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
                 reopen_workspace_picker(app, hover);
             }
         }
-        PendingAction::DeleteAgentPreset { index, worktree } => {
+        PendingAction::DeleteAgentPreset {
+            index,
+            worktree,
+            quick,
+        } => {
             let mut presets = crate::agent_presets::load();
             if index < presets.len() {
                 let removed = presets.remove(index);
@@ -6286,7 +6738,12 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
                     Err(err) => app.flash = Some(format!("could not save agent presets: {err}")),
                 }
             }
-            crate::preset_overlays::reopen_agent_presets(app, worktree, index);
+            crate::preset_overlays::reopen_presets_list(
+                app,
+                worktree,
+                quick.map(|back| *back),
+                index,
+            );
         }
         PendingAction::ResetSettings => reset_settings(app),
         PendingAction::Quit => app.should_quit = true,
@@ -6453,6 +6910,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::OpenLink(url) => open_link(app, &url, out),
         MenuAction::ViewPrDiff => request_pr_diff(app),
         MenuAction::CommentPullRequest => open_pr_comment(app),
+        MenuAction::FollowUp => activate::follow_up(app),
         MenuAction::EditLink(id) => open_prompt(app, PromptKind::EditLink { id }),
         MenuAction::DeleteLink(id) => {
             if let Some(row) = app
@@ -6490,6 +6948,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         }
         MenuAction::ToggleArchived => toggle_archived(app, out),
         MenuAction::ToggleOpenPrs => toggle_open_prs(app, out),
+        MenuAction::ToggleIssues => toggle_issues(app, out),
         MenuAction::ToggleDraftPrs => toggle_hide_draft_prs(app, out),
     }
 }
@@ -6588,6 +7047,16 @@ fn restore_workspace_project(app: &mut App) {
 /// After a project switch: land on the project's remembered worktree (its
 /// main checkout otherwise), then re-show that worktree's session.
 fn restore_context(app: &mut App, out: &mut Vec<ClientRequest>) {
+    restore_project_cursors(app);
+    restore_session(app, out);
+}
+
+/// Everything [`restore_context`] does except bring a session up: the new
+/// project's sweeps rescheduled and its remembered checkout under the
+/// Worktrees cursor. The LAUNCHER VIEW's PROJECT SWITCHER takes this half
+/// on its own — its grid draws no pane, so attaching the project's last
+/// session would boot a PTY nobody is looking at.
+fn restore_project_cursors(app: &mut App) {
     app.sel_worktree = 0;
     schedule_open_prs_lookup(app);
     crate::issues::schedule_prefetch(app);
@@ -6599,7 +7068,6 @@ fn restore_context(app: &mut App, out: &mut Vec<ClientRequest>) {
             }
         }
     }
-    restore_session(app, out);
 }
 
 /// After a worktree switch: select and re-attach the worktree's remembered
@@ -7015,12 +7483,29 @@ impl Landing {
     /// reading it — the setting is about attaching, and a pull request has
     /// nothing to attach — so `Ctrl+O` stays the one palette key that also
     /// hands it to the browser.
-    fn for_enter_on(target: &PaletteTarget, attaches: bool) -> Self {
+    ///
+    /// One target overrides the setting: a session that NEEDS FEEDBACK —
+    /// the red dot, a permission prompt or a question sitting unanswered —
+    /// always attaches, because the only thing to do with a jump to a
+    /// question is answer it, and the quiet landing would leave it asking.
+    /// `Ctrl+O` / `Ctrl+F` still name their own landing, so this is Enter's
+    /// rule alone.
+    fn for_enter_on(app: &App, target: &PaletteTarget, attaches: bool) -> Self {
         match target {
             PaletteTarget::PullRequest { .. } => Landing::FocusOnly,
+            PaletteTarget::Session(id) if session_needs_feedback(app, id) => Landing::Attach,
             _ => Landing::for_enter(attaches),
         }
     }
+}
+
+/// Whether `id` is a live session waiting on the user — the red row that
+/// [`Landing::for_enter_on`] attaches whatever the setting says.
+fn session_needs_feedback(app: &App, id: &AgentId) -> bool {
+    app.tree
+        .agents
+        .iter()
+        .any(|a| &a.id == id && a.status == nebula_core::AgentStatus::NeedsFeedback)
 }
 
 /// `]` / `[`: land on the next (`step` 1) or previous (`step` -1) session
@@ -7036,7 +7521,7 @@ impl Landing {
 /// selected (a terminal, a link, an archived row, an empty worktree) `]`
 /// starts at the top and `[` at the bottom, so the two stay each other's
 /// reverse.
-fn jump_attention(app: &mut App, step: i64, landing: Landing, out: &mut Vec<ClientRequest>) {
+fn jump_attention(app: &mut App, step: i64, attaches: bool, out: &mut Vec<ClientRequest>) {
     let ring = crate::palette::attention_sessions(&app.tree);
     if ring.is_empty() {
         app.flash = Some(NO_SESSIONS_TO_JUMP.into());
@@ -7052,6 +7537,7 @@ fn jump_attention(app: &mut App, step: i64, landing: Landing, out: &mut Vec<Clie
         None => len - 1,
     };
     let target = PaletteTarget::Session(ring[next as usize].clone());
+    let landing = Landing::for_enter_on(app, &target, attaches);
     jump_to_target(app, target, landing, out);
 }
 
@@ -7083,6 +7569,24 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
                     .worktree_rows()
                     .iter()
                     .position(|row| row.open_pr().is_some())
+                    .unwrap_or(checkouts);
+                select_worktree_row(app, first, out);
+                return;
+            }
+            // And off the last row above a folded ISSUES group — the last
+            // pull request, or the last checkout when there are none —
+            // into that group, the same way.
+            if delta > 0
+                && app.issues_collapsed
+                && app.sel_worktree + 1 >= checkouts
+                && !app.listed_issues().is_empty()
+            {
+                app.issues_collapsed = false;
+                app.dirty = true;
+                let first = app
+                    .worktree_rows()
+                    .iter()
+                    .position(|row| row.open_issue().is_some())
                     .unwrap_or(checkouts);
                 select_worktree_row(app, first, out);
                 return;
@@ -7129,9 +7633,9 @@ fn select_project_row(app: &mut App, i: usize, out: &mut Vec<ClientRequest>) {
 }
 
 /// Move the Worktrees cursor to a *different* row `i` and bring up its
-/// session. Stepping onto an open-PR row is not a worktree switch: it has
-/// no sessions to restore and nothing to attach, so the pane is left
-/// exactly as it was.
+/// session. Stepping onto an open-PR or issue row is not a worktree
+/// switch: it has no sessions to restore and nothing to attach, so the
+/// pane is left exactly as it was.
 fn select_worktree_row(app: &mut App, i: usize, out: &mut Vec<ClientRequest>) {
     app.select_worktree_when_seen = None;
     remember_context(app);
@@ -7140,6 +7644,7 @@ fn select_worktree_row(app: &mut App, i: usize, out: &mut Vec<ClientRequest>) {
         restore_session(app, out);
     }
     schedule_pr_detail(app);
+    crate::issues::schedule_detail(app);
 }
 
 /// Show the selected session in the terminal pane WITHOUT taking focus or
@@ -7206,8 +7711,22 @@ fn cloud_session_url_of(app: &App, sref: &SessionRef) -> Option<String> {
         .and_then(|a| a.cloud_session_url())
 }
 
+/// Full-screen whatever the pane is showing, with the input lock on:
+/// the sidebars collapse away and the keys go to the PTY. `z`
+/// (`Action::Zoom`) out of the panels, and `z` on a card out of the
+/// LAUNCHER VIEW's GRID, are the same intent and share this — Enter and a
+/// double-click there only step into the pane under the cards
+/// (`launcher::enter_pane`). [`leave_terminal_lock`] is its undo.
+pub(super) fn zoom_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
+    app.collapsed = true;
+    app.focus = Focus::Terminal;
+    app.term_locked = true;
+    fire_pending_attach(app, out);
+}
+
 /// Leave a locked pane for the Sessions panel. Also expands collapsed
-/// sidebars, so there is something on screen to land in.
+/// sidebars, so there is something on screen to land in — which is what
+/// takes a full-screen session back to the LAUNCHER VIEW's GRID.
 fn leave_terminal_lock(app: &mut App) {
     app.collapsed = false;
     app.term_locked = false;
@@ -7580,6 +8099,7 @@ fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequ
                     custom.clone(),
                     model.clone(),
                     effort.clone(),
+                    starting_prompt.is_some(),
                     out,
                 )),
             };
@@ -7791,8 +8311,9 @@ fn forward_mouse(
     }
 }
 
-/// Text under the current selection, from the screen's visible view
-/// (respects scrollback offset and wrapped rows).
+/// Text under the current selection, by HISTORY LINE: rows the selection
+/// scrolled past on the way (the EDGE AUTO-SCROLL, the wheel) read back
+/// whole whether or not they are still on screen, and wrapped rows join.
 fn selection_text(app: &App) -> Option<String> {
     let sel = app.term_selection.as_ref()?;
     if !sel.active {
@@ -7800,14 +8321,18 @@ fn selection_text(app: &App) -> Option<String> {
     }
     let screen = app.term.as_ref()?.parser.screen();
     let (rows, cols) = screen.size();
-    if rows == 0 || cols == 0 {
+    let end = screen.history_end();
+    if rows == 0 || cols == 0 || end == 0 {
         return None;
     }
-    let ((start_col, start_row), (end_col, end_row)) = sel.bounds();
-    let text = screen.contents_between(
-        start_row.min(rows - 1),
+    let ((start_col, start_line), (end_col, end_line)) = sel.bounds();
+    if start_line >= end {
+        return None;
+    }
+    let text = screen.contents_between_history(
+        start_line,
         start_col.min(cols - 1),
-        end_row.min(rows - 1),
+        end_line.min(end - 1),
         // contents_between's end column is exclusive; the selection's head
         // cell is inclusive.
         (end_col + 1).min(cols),
@@ -7820,6 +8345,7 @@ fn selection_text(app: &App) -> Option<String> {
 /// that never left its starting cell is just a click — drop it.
 fn finish_selection(app: &mut App) {
     app.dirty = true;
+    app.next_drag_autoscroll = None;
     let Some(sel) = &mut app.term_selection else {
         return;
     };
@@ -7837,6 +8363,128 @@ fn copy_selection(app: &mut App) {
         let label = format!("copied {} chars", text.chars().count());
         copy_and_flash(app, &text, &label);
     }
+}
+
+/// A drag report landed at `pointer` (host cells): the selection's head
+/// follows it. The cell is the pane's nearest — a pointer past an edge
+/// selects to that edge — and its HISTORY LINE is read at the current
+/// scroll, so the head names the text under the pointer, not the row.
+/// Past the pane's top or bottom edge the EDGE AUTO-SCROLL starts: one
+/// step now, then `drag_autoscroll_tick` on its beat until the pointer is
+/// back inside or the button comes up.
+fn drag_select_to(app: &mut App, pointer: (u16, u16), out: &mut Vec<ClientRequest>) {
+    let Some(sel) = &mut app.term_selection else {
+        return;
+    };
+    if !sel.dragging {
+        return;
+    }
+    sel.pointer = pointer;
+    place_drag_head(app);
+    match edge_overshoot(app.term_area, pointer.1) {
+        Some(_) if app.next_drag_autoscroll.is_none() => drag_autoscroll_tick(app, out),
+        Some(_) => {}
+        None => app.next_drag_autoscroll = None,
+    }
+}
+
+/// Put the dragged selection's head on the cell under its pointer, at the
+/// pane's current scroll. A head that has left the anchor cell makes the
+/// selection real (and it stays real if the head returns: a 1-cell
+/// selection is still a selection). Only a head that moved repaints — the
+/// EDGE AUTO-SCROLL calls this on every tick, scrolled or not.
+fn place_drag_head(app: &mut App) {
+    let area = app.term_area;
+    let Some(base) = app.term.as_ref().map(|t| t.parser.screen().history_base()) else {
+        return;
+    };
+    let Some(sel) = &mut app.term_selection else {
+        return;
+    };
+    let (col, row) = pane_cell(area, sel.pointer.0, sel.pointer.1);
+    let head = (col, base + u64::from(row));
+    if sel.head != head {
+        sel.head = head;
+        app.dirty = true;
+    }
+    if sel.head != sel.anchor {
+        sel.active = true;
+    }
+}
+
+/// How far past the pane's top (`true`) or bottom (`false`) edge a pointer
+/// row is, in rows — None inside the pane. The rule line above the pane
+/// is one row past it; the footer below, one or two.
+fn edge_overshoot(area: ratatui::layout::Rect, row: u16) -> Option<(bool, u16)> {
+    if row < area.y {
+        Some((true, area.y - row))
+    } else if row >= area.y + area.height {
+        Some((false, row - (area.y + area.height) + 1))
+    } else {
+        None
+    }
+}
+
+/// One EDGE AUTO-SCROLL step: scroll the history under a drag whose
+/// pointer rests past the pane's edge — a line per row past it, up to
+/// `DRAG_AUTOSCROLL_MAX_LINES` — put the head on the edge row's new text,
+/// and book the next step. The beat runs until the pointer comes back
+/// inside or the button comes up; a step with nothing left to scroll to
+/// (the top of the history, the live bottom) moves nothing and paints
+/// nothing.
+fn drag_autoscroll_tick(app: &mut App, out: &mut Vec<ClientRequest>) {
+    app.next_drag_autoscroll = None;
+    let Some(sel) = app.term_selection.filter(|s| s.dragging) else {
+        return;
+    };
+    let Some((up, distance)) = edge_overshoot(app.term_area, sel.pointer.1) else {
+        return;
+    };
+    let lines = usize::from(distance).min(DRAG_AUTOSCROLL_MAX_LINES);
+    let Some(term) = &app.term else {
+        return;
+    };
+    // Where the view is: the parser's offset — output arriving while
+    // scrolled back moves it up to keep the view still, which
+    // `AttachedTerm::scroll` does not follow — or the notch asked for
+    // past a history that is not back yet (`rehydrate_history`).
+    let current = term.parser.screen().scrollback().max(term.scroll);
+    let target = if up {
+        // A history let go while the screen sat in the cache reads as
+        // empty until the replay brings it back, and the notch past it is
+        // what asks. Otherwise stop at the top: an offset past the real
+        // history would have to be scrolled back down through before the
+        // view moved again.
+        let top = term.parser.screen().scrollback_rows();
+        let asked = current.saturating_add(lines);
+        if term.history_dropped {
+            asked
+        } else {
+            asked.min(top.max(current))
+        }
+    } else {
+        current.saturating_sub(lines)
+    };
+    if target != current {
+        scroll_pane_to(app, target, out);
+    }
+    place_drag_head(app);
+    app.next_drag_autoscroll = Some(std::time::Instant::now() + DRAG_AUTOSCROLL_TICK);
+}
+
+/// Scroll the pane's view of its history to offset `target` — the wheel's
+/// notch, the EDGE AUTO-SCROLL's step. Scrolling up into a history that
+/// was let go asks the DAEMON for it back (`rehydrate_history`).
+fn scroll_pane_to(app: &mut App, target: usize, out: &mut Vec<ClientRequest>) {
+    let Some(term) = &mut app.term else {
+        return;
+    };
+    let up = target > term.scroll;
+    term.set_scroll(target);
+    if up {
+        rehydrate_history(app, target, out);
+    }
+    app.dirty = true;
 }
 
 /// Select the maximal run of non-blank cells around `cell` on its row (a
@@ -7867,11 +8515,13 @@ fn select_word_at(app: &mut App, cell: (u16, u16)) {
     while end + 1 < cols && is_word(end + 1) {
         end += 1;
     }
+    let line = screen.history_base() + u64::from(row);
     app.term_selection = Some(TermSelection {
-        anchor: (start, row),
-        head: (end, row),
+        anchor: (start, line),
+        head: (end, line),
         dragging: false,
         active: true,
+        pointer: (0, 0),
     });
     copy_selection(app);
 }
@@ -8094,15 +8744,30 @@ fn pointer_wants_resize(app: &App, column: u16, row: u16) -> bool {
 /// don't report motion (Terminal.app) still pass through here on clicks and
 /// drags, so drag state keeps the shape honest where hover can't.
 fn update_pointer(app: &mut App, mouse: &MouseEvent) {
-    app.pointer_shape = if pointer_wants_resize(app, mouse.column, mouse.row) {
+    // One hit-test feeds both boundaries and both grips. The modals draw
+    // their own file-list edge outside the hit map, so `pointer_wants_resize`
+    // still measures that one itself.
+    let on_panels = app.vim.is_none() && app.overlay.is_none();
+    let hit = on_panels
+        .then(|| app.hit_at(mouse.column, mouse.row))
+        .flatten();
+    // The LAUNCHER VIEW's pane edge resizes the other way, so it gets the
+    // other arrows — and it is asked first, the two boundaries never
+    // sharing a cell.
+    let on_pane_edge = on_panels
+        && (app.launcher_pane_drag.is_some()
+            || matches!(&hit, Some(HitTarget::LauncherPaneSplitter)));
+    app.pointer_shape = if on_pane_edge {
+        PointerShape::RowResize
+    } else if pointer_wants_resize(app, mouse.column, mouse.row) {
         PointerShape::ColResize
     } else {
         PointerShape::Default
     };
-    let hover = if app.vim.is_none() && app.overlay.is_none() {
-        match (app.splitter_drag, app.hit_at(mouse.column, mouse.row)) {
+    let hover = if on_panels {
+        match (app.splitter_drag, &hit) {
             (Some(drag), _) => Some(drag.idx),
-            (None, Some(HitTarget::Splitter(i))) => Some(i),
+            (None, Some(HitTarget::Splitter(i))) => Some(*i),
             _ => None,
         }
     } else {
@@ -8110,6 +8775,10 @@ fn update_pointer(app: &mut App, mouse: &MouseEvent) {
     };
     if app.hover_splitter != hover {
         app.hover_splitter = hover;
+        app.dirty = true;
+    }
+    if app.hover_launcher_pane != on_pane_edge {
+        app.hover_launcher_pane = on_pane_edge;
         app.dirty = true;
     }
 }
@@ -8172,9 +8841,41 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     }
     // A prompt dialog is modal too: the wheel and clicks drive the
     // Add-project directory listing (click highlights, a second click on
-    // the highlighted row steps in); everything else is swallowed.
+    // the highlighted row steps in) or a task box's text (the wheel
+    // scrolls it, a click puts the caret where it points); everything
+    // else is swallowed.
+    // The `[ ] new worktree` toggle on the LAUNCHER VIEW box's prompt
+    // header is a button: a click on it flips the launch exactly as `^N`
+    // does. Every other box leaves the rect empty, and an empty rect
+    // contains no point.
+    if let (Some(Overlay::Prompt(prompt)), MouseEventKind::Down(MouseButton::Left)) =
+        (&app.overlay, mouse.kind)
+    {
+        if prompt.toggle_area.contains(mouse_pos) {
+            launcher::click_new_worktree(app);
+            app.dirty = true;
+            return;
+        }
+    }
     if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
+        let task_box = prompt.is_multiline();
         match mouse.kind {
+            MouseEventKind::ScrollDown if task_box => {
+                prompt.input.scroll_rows(MODAL_WHEEL_LINES as isize);
+                app.dirty = true;
+            }
+            MouseEventKind::ScrollUp if task_box => {
+                prompt.input.scroll_rows(-(MODAL_WHEEL_LINES as isize));
+                app.dirty = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) if task_box => {
+                let area = prompt.editor_area;
+                if area.contains(mouse_pos) {
+                    let (row, col) = (mouse.row - area.y, mouse.column - area.x);
+                    prompt.input.click(row, col);
+                }
+                app.dirty = true;
+            }
             MouseEventKind::ScrollDown => {
                 prompt.move_hover(1);
                 app.dirty = true;
@@ -8200,6 +8901,26 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             }
             _ => {}
         }
+        return;
+    }
+    // The PROJECT PICKER: the wheel moves its cursor, a click on a row
+    // picks it (Enter on it); everything else is swallowed.
+    if let Some(Overlay::ProjectPicker(picker)) = &mut app.overlay {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => picker.select(1),
+            MouseEventKind::ScrollUp => picker.select(-1),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let area = picker.list_area;
+                let first = picker.window_start(area.height as usize);
+                if let Some(i) =
+                    crate::list_hit::row_at(area, first, picker.matches.len(), mouse_pos)
+                {
+                    launcher::click_picker_row(app, i);
+                }
+            }
+            _ => {}
+        }
+        app.dirty = true;
         return;
     }
     // Diff modal: the wheel scrolls the diff, a click on a file-list row
@@ -8392,6 +9113,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         crate::issues::handle_mouse(app, mouse, mouse_pos);
         return;
     }
+    if matches!(&app.overlay, Some(Overlay::PullRequests(_))) {
+        crate::pr_modal::handle_mouse(app, mouse, mouse_pos);
+        return;
+    }
     if matches!(&app.overlay, Some(Overlay::BranchSwitch(_))) {
         crate::branch_switch::handle_mouse(app, mouse, mouse_pos);
         return;
@@ -8526,6 +9251,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         return;
     }
 
+    // Motion while nebula holds the left button — the press came, its
+    // release has not — is the drag going on, whatever button the host put
+    // on the report: a host that lost track of the button between two
+    // reports would otherwise end a selection the user is still making.
+    // The release is the only end of a drag.
+    let mouse = match mouse.kind {
+        MouseEventKind::Moved if app.mouse_held() => MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            ..mouse
+        },
+        _ => mouse,
+    };
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             // ⌥click on a detected URL opens it in the browser; the click is
@@ -8571,6 +9308,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             // still holding (its release never arrived) is let go the same
             // way.
             app.term_selection = None;
+            app.next_drag_autoscroll = None;
             app.term_mouse_grab = None;
             match app.hit_at(mouse.column, mouse.row) {
                 Some(HitTarget::Splitter(i)) => {
@@ -8579,6 +9317,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         idx: i,
                         grab_offset: app.splitter_x(i) as i32 - mouse.column as i32,
                     });
+                }
+                Some(HitTarget::LauncherPaneSplitter) => {
+                    // The LAUNCHER VIEW's pane edge, armed the same way and
+                    // as quietly: the offset from the grabbed row is kept
+                    // so the edge does not jump depending on which of the
+                    // two grab rows was caught. The boundary is measured by
+                    // the arithmetic the draw laid it out with.
+                    let body = app.launcher_body;
+                    let pane_h =
+                        crate::launcher::pane_height(body, app.launcher_pane_h).unwrap_or_default();
+                    let boundary = i32::from(body.y) + i32::from(body.height) - i32::from(pane_h);
+                    app.launcher_pane_drag = Some(boundary - mouse.row as i32);
                 }
                 // The footer's nameplate opens the switcher.
                 Some(HitTarget::FooterWorkspace) => open_workspace_picker(app),
@@ -8600,9 +9350,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     // double-click.
                     let key = match app.selected_worktree_pr() {
                         Some(pr) => Some(RowKey::Link(pr.url.clone())),
-                        None => app
-                            .selected_worktree()
-                            .map(|w| RowKey::Worktree(w.id.clone())),
+                        None => match app.selected_worktree_issue() {
+                            Some(issue) => Some(RowKey::Link(issue.url.clone())),
+                            None => app
+                                .selected_worktree()
+                                .map(|w| RowKey::Worktree(w.id.clone())),
+                        },
                     };
                     match key {
                         Some(key) => {
@@ -8632,6 +9385,45 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         None => {}
                     }
                 }
+                // A LAUNCHER VIEW card: the cursor lands on it; a second
+                // click is Enter, into the session full-screen.
+                Some(HitTarget::LauncherRow(i)) => launcher::click_row(app, i, out),
+                Some(HitTarget::LauncherProjectCard(i)) => {
+                    launcher::click_project_card(app, i, out)
+                }
+                Some(HitTarget::LauncherWorkspaceCard(i)) => {
+                    launcher::click_workspace_card(app, i, out)
+                }
+                // `‹ sessions` in a full-screen session's header: back to
+                // the grid, the same way `^q` goes back.
+                Some(HitTarget::LauncherCrumb) => leave_terminal_lock(app),
+                // The GRID header's breadcrumb: a crumb OPENS what its
+                // word names, the way a path segment does — `nebula` is
+                // the machine, so it opens the list of workspaces; a
+                // workspace opens its projects; a project opens its
+                // sessions. All three go through the same `go_to` Esc and
+                // `w` take, never a modal over the grid.
+                Some(HitTarget::LauncherRoot) => {
+                    launcher::click_crumb(app, crate::launcher::Level::Workspaces)
+                }
+                Some(HitTarget::LauncherWorkspace) => {
+                    launcher::click_crumb(app, crate::launcher::Level::Projects)
+                }
+                Some(HitTarget::LauncherProject) => {
+                    launcher::click_crumb(app, crate::launcher::Level::Sessions)
+                }
+                // The card's FOLLOW-UP CHEVRON: the cursor goes to the
+                // row as any click on it would, and then the card expands
+                // or folds — `activate::follow_up`, exactly what Space on
+                // it does.
+                Some(HitTarget::SessionFollowUp(i)) => {
+                    select_clicked_row(app, &HitTarget::Session(i), out);
+                    activate::follow_up(app);
+                }
+                // Inside the open box: the panel takes focus and the click
+                // stops there. It must not reach the card underneath, whose
+                // second click attaches the session and locks the pane.
+                Some(HitTarget::FollowUpBox) => app.focus = Focus::Sessions,
                 Some(HitTarget::ArchivedHeader) => {
                     app.focus = Focus::Sessions;
                     toggle_archived(app, out);
@@ -8639,6 +9431,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 Some(HitTarget::OpenPrsHeader) => {
                     app.focus = Focus::Worktrees;
                     toggle_open_prs(app, out);
+                }
+                Some(HitTarget::IssuesHeader) => {
+                    app.focus = Focus::Worktrees;
+                    toggle_issues(app, out);
                 }
                 Some(HitTarget::CollapsePanel(focus)) => {
                     // The header chevron collapses its panel and the rail
@@ -8692,11 +9488,17 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         } else {
                             // Arm a drag-selection; it becomes visible (and
                             // copyable) once the drag leaves this cell.
+                            let base = app
+                                .term
+                                .as_ref()
+                                .map_or(0, |t| t.parser.screen().history_base());
+                            let cell = (cell.0, base + u64::from(cell.1));
                             app.term_selection = Some(TermSelection {
                                 anchor: cell,
                                 head: cell,
                                 dragging: true,
                                 active: false,
+                                pointer: (mouse.column, mouse.row),
                             });
                         }
                     }
@@ -8712,6 +9514,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     mouse.column as i32 + drag.grab_offset,
                     app.body_area.width,
                 );
+                app.dirty = true;
+            } else if let Some(grab) = app.launcher_pane_drag {
+                app.set_launcher_pane(mouse.row as i32 + grab);
                 app.dirty = true;
             } else if let Some(sref) = &app.term_mouse_grab {
                 // The program holding the button gets the motion — if it
@@ -8729,20 +9534,16 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     let button = 32 | mouse_modifier_bits(mouse.modifiers);
                     forward_mouse(app, out, sgr, button, false, &mouse);
                 }
-            } else if let Some(sel) = &mut app.term_selection {
-                if sel.dragging {
-                    sel.head = pane_cell(app.term_area, mouse.column, mouse.row);
-                    // A real drag; stays active even if it returns to the
-                    // anchor cell (a 1-cell selection is still a selection).
-                    if sel.head != sel.anchor {
-                        sel.active = true;
-                    }
-                    app.dirty = true;
-                }
+            } else {
+                drag_select_to(app, (mouse.column, mouse.row), out);
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            if app.splitter_drag.take().is_some() {
+            // Both boundaries let go here. They are never armed at once,
+            // but each is taken on its own so one can't strand the other.
+            let splitter_ended = app.splitter_drag.take().is_some();
+            let pane_ended = app.launcher_pane_drag.take().is_some();
+            if splitter_ended || pane_ended {
                 app.dirty = true;
             } else if let Some(sref) = app.term_mouse_grab.take() {
                 // The release closes the program's button — except under
@@ -8765,6 +9566,25 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
             let over = app.hit_at(mouse.column, mouse.row);
+            // The LAUNCHER VIEW's grid takes no wheel. A notch over the
+            // cards used to walk the cursor, and walking it swaps the pane
+            // onto another session and reads it — far too easy to do by
+            // accident on a trackpad while reading the one you are on. The
+            // keys walk the grid; the wheel stops here rather than falling
+            // through to the panels' scrolling, which this view never draws.
+            if app.launcher_grid()
+                && matches!(
+                    over,
+                    Some(
+                        HitTarget::LauncherRow(_)
+                            | HitTarget::LauncherProjectCard(_)
+                            | HitTarget::LauncherWorkspaceCard(_)
+                            | HitTarget::PanelBg(Focus::Sessions)
+                    )
+                )
+            {
+                return;
+            }
             // The Sessions column scrolls under the wheel/trackpad — with
             // the ARCHIVED group expanded its list routinely outgrows the
             // panel. The offset moves without touching the selection; the
@@ -8774,6 +9594,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     over,
                     Some(
                         HitTarget::Session(_)
+                            | HitTarget::SessionFollowUp(_)
+                            | HitTarget::FollowUpBox
                             | HitTarget::ArchivedHeader
                             | HitTarget::PanelBg(Focus::Sessions)
                     )
@@ -8786,6 +9608,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     Some(
                         HitTarget::Worktree(_)
                             | HitTarget::OpenPrsHeader
+                            | HitTarget::IssuesHeader
                             | HitTarget::PanelBg(Focus::Worktrees)
                     )
                 );
@@ -8804,9 +9627,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     app.sessions_scroll.saturating_add(SESSIONS_WHEEL_STEP)
                 };
                 app.dirty = true;
-            } else if in_term && app.previewed_pr().is_some() {
-                // The pane is showing a pull request, not a session: the
-                // wheel reads it rather than reaching the PTY underneath.
+            } else if in_term && app.reading_url().is_some() {
+                // The pane is showing a pull request or an issue, not a
+                // session: the wheel reads it rather than reaching the
+                // PTY underneath.
                 let max = app.pr_preview_max_scroll();
                 app.pr_preview_scroll = if up {
                     app.pr_preview_scroll.saturating_sub(PR_PREVIEW_WHEEL_STEP)
@@ -8822,9 +9646,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 // (`child_mouse_mode` calls it mouseless).
                 let (mouse_mode, sgr) = app.child_mouse_mode();
                 if let Some(term) = &mut app.term {
-                    // Scrolling shifts the content under a (screen-anchored)
-                    // selection highlight — drop it.
-                    app.term_selection = None;
+                    // The wheel takes a finished selection's highlight with
+                    // it. One still being dragged rides along: its lines
+                    // are the history's, so the highlight stays on its
+                    // text as the view moves.
+                    if !app.term_selection.is_some_and(|s| s.dragging) {
+                        app.term_selection = None;
+                    }
                     let alternate = term.parser.screen().alternate_screen();
                     if mouse_mode != vt100::MouseProtocolMode::None {
                         // The child asked for the mouse (claude's alt-screen
@@ -8853,10 +9681,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         } else {
                             term.scroll.saturating_sub(TERM_WHEEL_LINES)
                         };
-                        term.set_scroll(new_scroll);
-                        if up {
-                            rehydrate_history(app, new_scroll, out);
-                        }
+                        scroll_pane_to(app, new_scroll, out);
                     }
                     app.dirty = true;
                 }
@@ -8934,10 +9759,14 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // its terminal back with it, exactly as landing on the row would.
             // No debounce: a boot restores one remembered session once, so
             // there is no cursor sweep to wait out — only the user waiting
-            // to see the screen they left.
-            if session_restored {
+            // to see the screen they left. The LAUNCHER VIEW's PANE reads
+            // the card its cursor is on, so a boot that remembered no
+            // session fills it from the grid's own cursor rather than
+            // sitting empty under a grid full of cards.
+            if session_restored || app.launcher_grid() {
                 preview_selected_now(app, out);
             }
+            launcher::boot(app);
             app.dirty = true;
         }
         ServerEvent::Scrollback {
@@ -8950,8 +9779,28 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     // A replay continuing a kept screen lands on it; any
                     // other rebuilds the screen from scratch, and a
                     // selection anchored to the old cells goes with it.
+                    let base_before = term.parser.screen().history_base();
                     if term.apply_scrollback(base_seq, &data) {
-                        app.term_selection = None;
+                        // The screen was rebuilt from scratch and its
+                        // history lines start over. A finished selection
+                        // goes; a drag under way is carried across by its
+                        // screen rows — the replay lands on the same view
+                        // — so the button, not the replay, ends it.
+                        let base_after = term.parser.screen().history_base();
+                        let rebase = |line: u64| {
+                            if line >= base_before {
+                                line - base_before + base_after
+                            } else {
+                                base_after.saturating_sub(base_before - line)
+                            }
+                        };
+                        match &mut app.term_selection {
+                            Some(sel) if sel.dragging => {
+                                sel.anchor.1 = rebase(sel.anchor.1);
+                                sel.head.1 = rebase(sel.head.1);
+                            }
+                            _ => app.term_selection = None,
+                        }
                     }
                     // A replay is history: a clipboard write in it went out
                     // when it happened (or never reached this client), and
@@ -9028,6 +9877,13 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 a.status_changed_at = changed_at;
                 a.unseen = unseen;
                 app.dirty = true;
+            }
+            // The first turn in a session we just launched: its own stamp
+            // leads the list from here, so the launch stops having to.
+            if status != nebula_core::AgentStatus::Fresh
+                && app.just_launched.as_ref() == Some(&agent)
+            {
+                app.just_launched = None;
             }
             // A turn that finished in the pane the user is looking at was
             // watched: clear it before it can count anywhere.
@@ -9257,6 +10113,9 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             }
             refresh_palette(app);
             refresh_workspace_picker(app);
+            // A first run's first project: the LAUNCHER VIEW's box was owed
+            // since boot, with nothing to aim it at until now.
+            launcher::boot(app);
             app.dirty = true;
         }
         ServerEvent::EntityRemoved { id } => {
@@ -9433,6 +10292,12 @@ fn attach_created(
 ) {
     if let (Some(stand_in), EntityId::Agent(real)) = (&placeholder, &id) {
         placeholder::resolve_agent(app, stand_in, real);
+    }
+    // The card leads the sessions lists until its first turn starts, with
+    // or without `follow`: where the cursor goes is one question, and
+    // where the newest session sorts is another.
+    if let EntityId::Agent(real) = &id {
+        app.just_launched = Some(real.clone());
     }
     let sref = match id {
         EntityId::Agent(id) => Some(SessionRef::Agent(id)),
@@ -9668,6 +10533,8 @@ struct SelectionSnapshot {
     /// launch with no box (`n`, a `skip`-task preset) then ran against a
     /// pull request nobody picked.
     pr: Option<String>,
+    /// The ISSUES row under it, the same way.
+    issue: Option<String>,
     session: Option<SessionRef>,
     /// The Sessions panel row the cursor was on, and the group that row
     /// sat in. Following onto an archived row is only right when the
@@ -9703,6 +10570,7 @@ fn selection_snapshot(app: &App) -> SelectionSnapshot {
         project: app.selected_project().map(|p| p.id.clone()),
         worktree: app.selected_worktree().map(|w| w.id.clone()),
         pr: app.selected_worktree_pr().map(|pr| pr.url.clone()),
+        issue: app.selected_worktree_issue().map(|i| i.url.clone()),
         session_index: app.sel_session,
         session_group: row.as_ref().map(session_group),
         session: row.and_then(|r| r.sref()),
@@ -9761,6 +10629,12 @@ fn reconcile_selection_inner(
         // left is followed nowhere, and the cursor stays where it landed.
         if app.selected_worktree_pr().map(|pr| &pr.url) != Some(url) {
             if let Some(i) = app.open_pr_row_of(url) {
+                app.sel_worktree = i;
+            }
+        }
+    } else if let Some(url) = &before.issue {
+        if app.selected_worktree_issue().map(|i| &i.url) != Some(url) {
+            if let Some(i) = app.issue_row_of(url) {
                 app.sel_worktree = i;
             }
         }
@@ -11604,12 +12478,38 @@ mod tests {
                         title: (*title).into(),
                         url: format!("https://github.com/o/r/pull/{number}"),
                         is_draft: false,
+                        health: Default::default(),
                         head: format!("pr-{number}-head"),
                     })
                     .collect(),
                 at: now,
                 due: now + OPEN_PRS_REFRESH,
                 step: OPEN_PRS_REFRESH,
+            },
+        );
+    }
+
+    /// Open issues on the selected project, as `gh issue list` would have
+    /// answered — the PROJECT ISSUES GROUP's rows.
+    pub(super) fn seed_issues(app: &mut App, issues: &[(u64, &str)]) {
+        let id = app.selected_project().expect("a project").id.clone();
+        app.issues.insert(
+            id,
+            crate::issues::IssueList {
+                list: issues
+                    .iter()
+                    .map(|(number, title)| crate::issues::Issue {
+                        number: *number,
+                        url: format!("https://github.com/o/r/issues/{number}"),
+                        title: (*title).into(),
+                        author: "webdevcody".into(),
+                        created_at: "2026-09-10T12:00:00Z".into(),
+                        updated_at: "2026-09-11T12:00:00Z".into(),
+                        labels: Vec::new(),
+                        body: format!("Body of issue {number}"),
+                    })
+                    .collect(),
+                at: std::time::Instant::now(),
             },
         );
     }
@@ -11665,6 +12565,7 @@ mod tests {
                     WorktreeRow::PrCheckout { worktree, pr } => {
                         format!("#{} └ {}", pr.number, worktree.branch)
                     }
+                    WorktreeRow::Issue(issue) => format!("issue #{}", issue.number),
                 })
                 .collect()
         };
@@ -11730,6 +12631,7 @@ mod tests {
             title: "Attach links".into(),
             url: pr_url(7),
             is_draft: false,
+            health: Default::default(),
             head: "pr-7-head".into(),
         }];
 
@@ -12296,6 +13198,7 @@ mod tests {
             title: "Attach links".into(),
             url: "https://github.com/o/r/pull/7".into(),
             is_draft: false,
+            health: Default::default(),
             head: "attach-links".into(),
         }];
         note_open_prs_answer(&mut app, pid.clone(), Some(found.clone()), &mut Vec::new());
@@ -12458,6 +13361,7 @@ mod tests {
                     title: "Still cooking".into(),
                     url: pr_url(9),
                     is_draft: true,
+                    health: Default::default(),
                     head: "still-cooking".into(),
                 },
                 crate::pull_request::OpenPr {
@@ -12465,6 +13369,7 @@ mod tests {
                     title: "Attach links".into(),
                     url: pr_url(7),
                     is_draft: false,
+                    health: Default::default(),
                     head: "attach-links".into(),
                 },
             ]),
@@ -12801,9 +13706,10 @@ mod tests {
         {
             let p = palette(&app);
             assert_eq!(
-                p.items[p.matches[0].item].text, "demo/#9 Number the lines",
-                "the project prefixes it, like every other row"
+                p.items[p.matches[p.selected].item].text, "demo/#9 Number the lines",
+                "the project paths it, like every other row"
             );
+            assert!(p.matches[p.selected].nested, "under its project's header");
         }
         // Enter lands on the row whether or not "Enter attaches" is on: the
         // setting is about attaching sessions, and a pull request has
@@ -12902,6 +13808,7 @@ mod tests {
                     title: title.into(),
                     url: pr_url(number),
                     is_draft,
+                    health: Default::default(),
                     head: format!("pr-{number}-head"),
                 })
                 .collect();
@@ -12913,30 +13820,34 @@ mod tests {
         );
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        // The overview is projects and sessions; `#` reaches the pull
+        // requests, nested under their project like every other row.
+        press(&mut app, KeyCode::Char('#'), KeyModifiers::NONE, &mut out);
 
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(
-            text.contains("↗ demo/#7 Attach links ready for review"),
+            text.contains("↗ #7 Attach links ready for review"),
             "a finished pull request says so after its title:\n{text}"
         );
         assert!(
-            text.contains("↗ demo/#9 Number the lines draft"),
+            text.contains("↗ #9 Number the lines draft"),
             "a draft says so after its title:\n{text}"
         );
         // The colors are the sidebar's: accent arrow and plain title for
         // the ready one, dim arrow and dim title for the draft — the same
         // `pr_row::look` both panels paint from.
         let buffer = terminal.backend().buffer();
-        let (x, y) = find_cell(&terminal, "↗ demo/#7");
+        let (x, y) = find_cell(&terminal, "↗ #7");
         assert_eq!(buffer[(x, y)].fg, th.accent, "ready: the accent arrow");
-        let title_x = x + "↗ demo/".chars().count() as u16;
+        // Past the `#` the query lit: the title proper.
+        let title_x = x + "↗ #7 ".chars().count() as u16;
         assert_eq!(buffer[(title_x, y)].fg, th.text, "ready: the title reads");
-        let (x, y) = find_cell(&terminal, "↗ demo/#9");
+        let (x, y) = find_cell(&terminal, "↗ #9");
         assert_eq!(buffer[(x, y)].fg, th.dim, "draft: the dim arrow");
         assert_eq!(buffer[(title_x, y)].fg, th.dim, "draft: dimmed end to end");
-        let badge_x = x + "↗ demo/#9 Number the lines ".chars().count() as u16;
+        let badge_x = x + "↗ #9 Number the lines ".chars().count() as u16;
         assert_eq!(buffer[(badge_x, y)].fg, th.dim, "draft: the badge is dim");
 
         // Park the cursor on the draft, then let a refresh say it was
@@ -12970,7 +13881,7 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(
-            text.contains("↗ demo/#9 Number the lines ready for review"),
+            text.contains("↗ #9 Number the lines ready for review"),
             "the refresh flips the word:\n{text}"
         );
         assert!(
@@ -12986,7 +13897,7 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(
-            text.contains("↗ demo/#9 Number the lines draft"),
+            text.contains("↗ #9 Number the lines draft"),
             "back to a draft:\n{text}"
         );
     }
@@ -13031,12 +13942,16 @@ mod tests {
         }
         let p = palette(&app);
         assert_eq!(p.query, "demo #7", "the space reaches the query");
-        let texts: Vec<&str> = p
+        // The one hit, under the header of the project it names.
+        let texts: Vec<(&str, bool)> = p
             .matches
             .iter()
-            .map(|m| p.items[m.item].text.as_str())
+            .map(|m| (p.items[m.item].text.as_str(), m.context))
             .collect();
-        assert_eq!(texts, vec!["demo/#7 Attach links to worktrees"]);
+        assert_eq!(
+            texts,
+            vec![("demo", true), ("demo/#7 Attach links to worktrees", false)]
+        );
     }
 
     /// A pull request merged or closed on GitHub simply stops coming back
@@ -13058,6 +13973,7 @@ mod tests {
                     title: format!("pull {number}"),
                     url: format!("https://github.com/o/r/pull/{number}"),
                     is_draft,
+                    health: Default::default(),
                     head: format!("pr-{number}-head"),
                 })
                 .collect();
@@ -13117,6 +14033,7 @@ mod tests {
                 title: "Brand new".into(),
                 url: pr_url(11),
                 is_draft: false,
+                health: Default::default(),
                 head: "brand-new".into(),
             },
             crate::pull_request::OpenPr {
@@ -13124,6 +14041,7 @@ mod tests {
                 title: "Number lines".into(),
                 url: pr_url(9),
                 is_draft: false,
+                health: Default::default(),
                 head: "number-lines".into(),
             },
             crate::pull_request::OpenPr {
@@ -13131,6 +14049,7 @@ mod tests {
                 title: "Attach links".into(),
                 url: pr_url(7),
                 is_draft: false,
+                health: Default::default(),
                 head: "attach-links".into(),
             },
         ];
@@ -13243,6 +14162,7 @@ mod tests {
             title: title.into(),
             url: pr_url(number),
             is_draft,
+            health: Default::default(),
             head: format!("pr-{number}-head"),
         }
     }
@@ -13262,6 +14182,7 @@ mod tests {
             title: "Attach links".into(),
             state: "OPEN".into(),
             is_draft: false,
+            health: Default::default(),
             author: "webdevcody".into(),
             base: "main".into(),
             head: "feat/links".into(),
@@ -13404,6 +14325,7 @@ mod tests {
                 title: title.into(),
                 state: crate::pull_request::STATE_OPEN.into(),
                 is_draft: false,
+                health: Default::default(),
                 activity: Vec::new(),
             }),
         );
@@ -14147,6 +15069,7 @@ diff --git a/docs/keys.md b/docs/keys.md
             title: format!("PR {number}"),
             state: crate::pull_request::STATE_OPEN.into(),
             is_draft: false,
+            health: Default::default(),
             activity: Vec::new(),
         }
     }
@@ -14157,6 +15080,7 @@ diff --git a/docs/keys.md b/docs/keys.md
             title: format!("PR {number}"),
             url: pr_url(number),
             is_draft: false,
+            health: Default::default(),
             head: format!("head-{number}"),
         }
     }
@@ -14657,6 +15581,7 @@ diff --git a/src/c.rs b/src/c.rs
                 title: "Attach links".into(),
                 state: crate::pull_request::STATE_OPEN.into(),
                 is_draft: false,
+                health: Default::default(),
                 activity: Vec::new(),
             }),
         );
@@ -14791,6 +15716,7 @@ diff --git a/src/c.rs b/src/c.rs
                 title: "Attach links".into(),
                 state: crate::pull_request::STATE_OPEN.into(),
                 is_draft: false,
+                health: Default::default(),
                 activity: Vec::new(),
             }),
         );
@@ -15052,6 +15978,7 @@ diff --git a/src/c.rs b/src/c.rs
                 title: "done".into(),
                 state: crate::pull_request::STATE_OPEN.into(),
                 is_draft: false,
+                health: Default::default(),
                 activity: Vec::new(),
             }),
         );
@@ -15081,6 +16008,7 @@ diff --git a/src/c.rs b/src/c.rs
                 title: "done".into(),
                 state: crate::pull_request::STATE_OPEN.into(),
                 is_draft: false,
+                health: Default::default(),
                 activity: vec!["2024-04-25T19:55:42Z".into()],
             }),
         );
@@ -15123,6 +16051,7 @@ diff --git a/src/c.rs b/src/c.rs
             title: "Attach links".into(),
             state: crate::pull_request::STATE_OPEN.into(),
             is_draft: false,
+            health: Default::default(),
             activity,
         };
 
@@ -15872,6 +16801,67 @@ diff --git a/src/c.rs b/src/c.rs
                 "cold-45m", "agent-1",
             ],
             "the cold row jumped to the top, behind only the live turn it ties with"
+        );
+    }
+
+    /// Every session mid-turn counts as interacting *now*, so the raw
+    /// stamp breaks that tie: the newest turn leads. This is what puts the
+    /// session just launched — created `running`, stamped as it was created
+    /// — at the top of the list instead of under the sessions that have
+    /// been working for an hour, in the checkout's row and the project's too.
+    #[test]
+    fn a_session_created_running_leads_the_working_ones() {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app); // agent-1: fresh, never run
+        let now = crate::app::now_ms();
+        let mk = |id: &str, status: AgentStatus, at: i64, sort: i64| ServerEvent::EntityUpserted {
+            entity: Entity::Agent(Agent {
+                id: AgentId(id.into()),
+                worktree_id: WorktreeId("w1".into()),
+                name: id.into(),
+                status,
+                archived: false,
+                archived_at: 0,
+                unseen: false,
+                kind: nebula_core::AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                session_id: None,
+                cloud_session_id: None,
+                sort_order: sort,
+                status_changed_at: at,
+                alive: true,
+                recent_prompts: Vec::new(),
+            }),
+        };
+        hse(
+            &mut app,
+            mk("working-1h", AgentStatus::Running, now - 3_600_000, 1),
+        );
+        hse(
+            &mut app,
+            mk(
+                "blocked-20m",
+                AgentStatus::NeedsFeedback,
+                now - 1_200_000,
+                2,
+            ),
+        );
+        // The create the user just fired: the DAEMON stamps it as it makes
+        // the row, and says `running` because the launch carried a task.
+        hse(&mut app, mk("just-launched", AgentStatus::Running, now, 3));
+
+        let names: Vec<String> = app
+            .visible_sessions()
+            .iter()
+            .map(|a| a.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["just-launched", "blocked-20m", "working-1h", "agent-1"],
+            "the newest turn first, the oldest working row last"
         );
     }
 
@@ -18073,6 +19063,7 @@ diff --git a/src/c.rs b/src/c.rs
                 title: "Attach links".into(),
                 state: crate::pull_request::STATE_OPEN.into(),
                 is_draft: false,
+                health: Default::default(),
                 activity: Vec::new(),
             }),
         );
@@ -18114,6 +19105,7 @@ diff --git a/src/c.rs b/src/c.rs
                 title: "Attach links".into(),
                 state: crate::pull_request::STATE_MERGED.into(),
                 is_draft: false,
+                health: Default::default(),
                 activity: Vec::new(),
             }),
         );
@@ -19454,6 +20446,211 @@ diff --git a/src/c.rs b/src/c.rs
         assert!(app.open_prs_collapsed);
     }
 
+    /// The open issues take the rows after the pull requests: a cursor on
+    /// one has no worktree and no pull request, only the issue, and the
+    /// pane reads it. Folded, the rows are gone and the header still
+    /// counts them; the pull requests fold on their own.
+    #[test]
+    fn issues_take_the_rows_after_the_pull_requests() {
+        use crate::app::WorktreeRow;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        seed_issues(&mut app, &[(15, "Panel flickers"), (12, "Add themes")]);
+        let rows = |app: &App| -> Vec<String> {
+            app.worktree_rows()
+                .iter()
+                .map(|r| match r {
+                    WorktreeRow::Checkout(w) => w.branch.clone(),
+                    WorktreeRow::Pr(pr) => format!("#{}", pr.number),
+                    WorktreeRow::PrCheckout { worktree, pr } => {
+                        format!("#{} └ {}", pr.number, worktree.branch)
+                    }
+                    WorktreeRow::Issue(issue) => format!("issue #{}", issue.number),
+                })
+                .collect()
+        };
+        assert_eq!(rows(&app), ["main", "#7", "issue #15", "issue #12"]);
+
+        app.sel_worktree = 2;
+        assert_eq!(app.selected_worktree_issue().map(|i| i.number), Some(15));
+        assert!(app.selected_worktree().is_none(), "an issue row");
+        assert!(app.selected_worktree_pr().is_none());
+        assert_eq!(
+            app.reading_url().as_deref(),
+            Some("https://github.com/o/r/issues/15")
+        );
+        assert!(app.sessions_collapsed(), "nothing to list beside an issue");
+        assert_eq!(
+            app.issue_row_of("https://github.com/o/r/issues/12"),
+            Some(3)
+        );
+
+        app.issues_collapsed = true;
+        assert_eq!(rows(&app), ["main", "#7"]);
+        assert_eq!(app.listed_issues().len(), 2, "the header still counts them");
+        app.issues_collapsed = false;
+        app.open_prs_collapsed = true;
+        assert_eq!(rows(&app), ["main", "issue #15", "issue #12"]);
+    }
+
+    /// A click on the ISSUES header folds the group like the OPEN PRS one;
+    /// folding away the row the cursor is on lands it on the row above
+    /// the header — the last pull request here, the last checkout (its
+    /// session back in the pane) when there are none — and a second click
+    /// opens it back up.
+    #[test]
+    fn clicking_the_issues_header_folds_the_group() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        seed_issues(&mut app, &[(15, "Panel flickers"), (12, "Add themes")]);
+        let mut out = Vec::new();
+        app.sel_worktree = 3;
+        assert_eq!(app.selected_worktree_issue().map(|i| i.number), Some(12));
+
+        app.hits.push((
+            ratatui::layout::Rect::new(0, 5, 20, 1),
+            HitTarget::IssuesHeader,
+        ));
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 1, 5),
+            &mut out,
+        );
+        assert!(app.issues_collapsed, "click on the header folds");
+        assert_eq!(app.focus, Focus::Worktrees);
+        assert_eq!(app.worktree_row_count(), 2, "the issue rows are gone");
+        assert_eq!(
+            app.sel_worktree, 1,
+            "the cursor lands on the last pull request"
+        );
+        assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+        assert!(
+            !app.open_prs_collapsed,
+            "the pull requests fold on their own"
+        );
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 1, 5),
+            &mut out,
+        );
+        assert!(!app.issues_collapsed, "second click opens it back up");
+        assert_eq!(app.worktree_row_count(), 4);
+        assert_eq!(app.sel_worktree, 1, "unfolding leaves the cursor be");
+
+        app.open_prs.clear();
+        app.sel_worktree = 2;
+        assert_eq!(app.selected_worktree_issue().map(|i| i.number), Some(12));
+        toggle_issues(&mut app, &mut out);
+        assert!(app.issues_collapsed);
+        assert_eq!(app.sel_worktree, 0, "no pull requests: the last checkout");
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == a1)),
+            "the checkout's session comes back: {out:?}"
+        );
+    }
+
+    /// ↓ off the last row above a folded ISSUES group opens it onto its
+    /// first issue — past a folded OPEN PRS group first, which ↓ opens on
+    /// its own step. ↑ back out leaves it open, and an empty folded group
+    /// is no stop at all.
+    #[test]
+    fn stepping_down_into_a_folded_issues_group_unfolds_it() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        seed_issues(&mut app, &[(15, "Panel flickers")]);
+        app.focus = Focus::Worktrees;
+        app.open_prs_collapsed = true;
+        app.issues_collapsed = true;
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert!(!app.open_prs_collapsed, "the pull requests open first");
+        assert!(app.issues_collapsed, "…and the issues wait their turn");
+        assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert!(!app.issues_collapsed, "the next step opens the issues");
+        assert_eq!(app.sel_worktree, 2, "…and lands on the first one");
+        assert_eq!(app.selected_worktree_issue().map(|i| i.number), Some(15));
+
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.sel_worktree, 1);
+        assert!(!app.issues_collapsed, "walking back out leaves it open");
+
+        app.issues.clear();
+        app.issues_collapsed = true;
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.sel_worktree, 1, "an empty folded group is no stop");
+        assert!(app.issues_collapsed);
+    }
+
+    /// Folded, the ISSUES group is one dim line under the pull requests;
+    /// open, its rows are the issues, and the cursor on one reads it in
+    /// the pane — the description at once, the comments asked for once
+    /// the cursor rests.
+    #[test]
+    fn an_issue_row_reads_in_the_pane_and_the_group_folds_to_its_header() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        seed_issues(&mut app, &[(15, "Panel flickers"), (12, "Add themes")]);
+        app.issues_collapsed = true;
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("▸ ISSUES · 2"), "folded header:\n{text}");
+        assert!(!text.contains("Panel flickers"), "no issue rows:\n{text}");
+        assert!(
+            text.contains("#7 Attach links"),
+            "the pull requests stay:\n{text}"
+        );
+        assert!(
+            app.hits.iter().any(|(_, h)| *h == HitTarget::IssuesHeader),
+            "the folded header is a click target"
+        );
+
+        app.issues_collapsed = false;
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        let before = app.reading_url();
+        select_worktree_row(&mut app, 2, &mut out);
+        note_preview_change(&mut app, before);
+        assert_eq!(app.selected_worktree_issue().map(|i| i.number), Some(15));
+        let (pending, _) = app
+            .pending_issue_detail
+            .clone()
+            .expect("the comments are asked for");
+        assert_eq!(pending.url, "https://github.com/o/r/issues/15");
+        assert_eq!(pending.dir, std::path::PathBuf::from("/tmp/demo"));
+
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("▾ ISSUES · 2"), "open header:\n{text}");
+        assert!(text.contains("#15 Panel flickers"), "issue rows:\n{text}");
+        assert!(
+            text.contains("ISSUE · #15"),
+            "the pane is titled for it:\n{text}"
+        );
+        assert!(
+            text.contains("Body of issue 15"),
+            "…and reads its description:\n{text}"
+        );
+        assert!(
+            text.contains("reading the comments…"),
+            "…with the comments on their way:\n{text}"
+        );
+        assert!(
+            app.hits.iter().any(|(_, h)| *h == HitTarget::IssuesHeader),
+            "the open header is a click target too"
+        );
+    }
+
     /// Folded, the group is one dim line whose triangle and count say what
     /// a click would open — the rows leave the column and the checkouts
     /// have it to themselves. Open, the triangle turns down.
@@ -19597,6 +20794,445 @@ diff --git a/src/c.rs b/src/c.rs
             "a click that never dragged is not a selection"
         );
         assert!(app.flash.is_none(), "nothing was copied");
+    }
+
+    /// Twenty numbered lines into a five-row pane whose top row is host
+    /// row `y`: lines 0–14 in the scrollback, 15–19 on screen, and history
+    /// line `n` reads `line n`. The PTY cursor is hidden so its cell never
+    /// reads as a highlight.
+    fn twenty_line_pane(app: &mut App, y: u16) {
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        let mut term = AttachedTerm::new(sref, 80, 5);
+        let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        term.parser.process(b"\x1b[?25l");
+        term.parser.process(lines.join("\r\n").as_bytes());
+        app.term = Some(term);
+        app.term_area = ratatui::layout::Rect::new(0, y, 80, 5);
+        app.hits.push((app.term_area, HitTarget::TerminalPane));
+    }
+
+    /// `line from` through `line to`, one per row, as a copy reads back.
+    fn lines_text(from: usize, to: usize) -> String {
+        (from..=to)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn history_base(app: &App) -> u64 {
+        app.term.as_ref().unwrap().parser.screen().history_base()
+    }
+
+    fn bounds(app: &App) -> ((u16, u64), (u16, u64)) {
+        app.term_selection.expect("a selection").bounds()
+    }
+
+    /// A drag under way is anchored to the text, not to screen rows: the
+    /// agent printing on and the wheel both move rows under the pointer,
+    /// and the selection stays on the rows it started on, reading back
+    /// whole at release. A finished selection still goes with the wheel.
+    #[test]
+    fn a_drag_is_pinned_to_its_text_through_new_output_and_the_wheel() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        twenty_line_pane(&mut app, 1);
+        assert_eq!(history_base(&app), 15);
+
+        // Press on `line 17` (host row 3), drag to the end of `line 18`.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 0, 3),
+            &mut out,
+        );
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 6, 4),
+            &mut out,
+        );
+        assert_eq!(bounds(&app), ((0, 17), (6, 18)));
+        assert_eq!(
+            selection_text(&app).as_deref(),
+            Some(lines_text(17, 18).as_str())
+        );
+
+        // Two more lines arrive mid-drag and push everything up two rows:
+        // the selection still names lines 17–18, and the next drag report
+        // — same host row — reads the text now under the pointer.
+        app.term
+            .as_mut()
+            .unwrap()
+            .parser
+            .process(b"\r\nline 20\r\nline 21");
+        assert_eq!(history_base(&app), 17);
+        assert_eq!(bounds(&app), ((0, 17), (6, 18)));
+        assert_eq!(
+            selection_text(&app).as_deref(),
+            Some(lines_text(17, 18).as_str())
+        );
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 6, 4),
+            &mut out,
+        );
+        assert_eq!(bounds(&app), ((0, 17), (6, 20)));
+
+        // The wheel mid-drag scrolls the view; the selection rides along.
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollUp, 40, 3), &mut out);
+        assert_eq!(app.term.as_ref().unwrap().scroll, 1);
+        assert_eq!(
+            bounds(&app),
+            ((0, 17), (6, 20)),
+            "the wheel keeps a drag on its text"
+        );
+
+        // The release copies every row the drag crossed, on screen or not.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Up(MouseButton::Left), 6, 4),
+            &mut out,
+        );
+        assert_eq!(
+            selection_text(&app).as_deref(),
+            Some(lines_text(17, 20).as_str())
+        );
+        assert!(app
+            .flash
+            .as_deref()
+            .is_some_and(|f| f.starts_with("copied")));
+
+        // A finished selection goes with the wheel, as it always has.
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollUp, 40, 3), &mut out);
+        assert!(app.term_selection.is_none());
+    }
+
+    /// Dragging past the pane's top edge — onto the rule above it — scrolls
+    /// the history under the pointer: one step at once, then a step per
+    /// EDGE AUTO-SCROLL tick, faster the further past the edge the pointer
+    /// rests, with the head on the edge row's new text each time. Back
+    /// inside, the beat stops; at the top of the history, it moves nothing.
+    #[test]
+    fn dragging_past_the_top_edge_scrolls_the_history_under_the_pointer() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        // Pane at host rows 3–7: rows 0–2 are past its top edge.
+        twenty_line_pane(&mut app, 3);
+        let scroll = |app: &App| app.term.as_ref().unwrap().scroll;
+
+        // Press at the end of `line 17`, drag to the pane's top row:
+        // inside, so no beat.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 79, 5),
+            &mut out,
+        );
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 0, 3),
+            &mut out,
+        );
+        assert_eq!(bounds(&app), ((0, 15), (79, 17)));
+        assert!(
+            app.next_drag_autoscroll.is_none(),
+            "the top row is inside the pane"
+        );
+        assert_eq!(scroll(&app), 0);
+
+        // One row past the edge: a step now — one line — and the beat is on.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 0, 2),
+            &mut out,
+        );
+        assert_eq!(scroll(&app), 1);
+        assert_eq!(
+            bounds(&app),
+            ((0, 14), (79, 17)),
+            "the head is on the edge row's new text"
+        );
+        assert!(app.next_drag_autoscroll.is_some());
+
+        // A tick: another line, with no mouse report in between.
+        drag_autoscroll_tick(&mut app, &mut out);
+        assert_eq!(scroll(&app), 2);
+        assert_eq!(bounds(&app), ((0, 13), (79, 17)));
+        assert!(app.next_drag_autoscroll.is_some());
+
+        // Three rows past the edge: three lines a tick.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 0, 0),
+            &mut out,
+        );
+        assert_eq!(
+            scroll(&app),
+            2,
+            "a report while the beat runs is not a step of its own"
+        );
+        drag_autoscroll_tick(&mut app, &mut out);
+        assert_eq!(scroll(&app), 5);
+        assert_eq!(bounds(&app), ((0, 10), (79, 17)));
+
+        // The top of the history: ticks move nothing and the beat goes on
+        // waiting for the pointer, not the history.
+        for _ in 0..20 {
+            drag_autoscroll_tick(&mut app, &mut out);
+        }
+        assert_eq!(scroll(&app), 15, "stops at the oldest row");
+        assert_eq!(bounds(&app), ((0, 0), (79, 17)));
+        assert!(app.next_drag_autoscroll.is_some());
+
+        // Back inside: the beat stops and the head is under the pointer.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 0, 4),
+            &mut out,
+        );
+        assert!(app.next_drag_autoscroll.is_none());
+        assert_eq!(bounds(&app), ((0, 1), (79, 17)));
+
+        // The release copies the whole run — 17 rows into a 5-row pane.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Up(MouseButton::Left), 0, 4),
+            &mut out,
+        );
+        assert!(app.next_drag_autoscroll.is_none());
+        assert_eq!(
+            selection_text(&app).as_deref(),
+            Some(lines_text(1, 17).as_str())
+        );
+    }
+
+    /// …and past the bottom edge the view scrolls back down toward the
+    /// live tail, two lines a tick from the footer's second row, stopping
+    /// at the tail.
+    #[test]
+    fn dragging_past_the_bottom_edge_scrolls_back_toward_the_tail() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        // Pane at host rows 1–5, scrolled to the top of its history: rows
+        // 6 and up are past its bottom edge.
+        twenty_line_pane(&mut app, 1);
+        app.term.as_mut().unwrap().set_scroll(15);
+        let scroll = |app: &App| app.term.as_ref().unwrap().scroll;
+
+        // Press on `line 2` (host row 3), drag two rows past the bottom.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 0, 3),
+            &mut out,
+        );
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 79, 7),
+            &mut out,
+        );
+        assert_eq!(scroll(&app), 13);
+        assert_eq!(bounds(&app), ((0, 2), (79, 6)));
+        drag_autoscroll_tick(&mut app, &mut out);
+        assert_eq!(scroll(&app), 11);
+        assert_eq!(bounds(&app), ((0, 2), (79, 8)));
+
+        for _ in 0..20 {
+            drag_autoscroll_tick(&mut app, &mut out);
+        }
+        assert_eq!(scroll(&app), 0, "stops at the live tail");
+        assert_eq!(bounds(&app), ((0, 2), (79, 19)));
+        assert!(app.next_drag_autoscroll.is_some());
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Up(MouseButton::Left), 79, 7),
+            &mut out,
+        );
+        assert_eq!(
+            selection_text(&app).as_deref(),
+            Some(lines_text(2, 19).as_str())
+        );
+    }
+
+    /// Motion reported with no button while nebula holds the left button
+    /// is the drag going on — a host that lost track of the button between
+    /// two reports must not end a selection the user is still making, nor
+    /// a splitter drag. Once the button is up, motion is motion.
+    #[test]
+    fn motion_without_a_button_keeps_a_held_drag_going() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        twenty_line_pane(&mut app, 1);
+        assert!(!app.mouse_held());
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 0, 3),
+            &mut out,
+        );
+        assert!(app.mouse_held(), "the press is nebula's until the release");
+        handle_mouse(&mut app, mev(MouseEventKind::Moved, 6, 4), &mut out);
+        assert_eq!(
+            bounds(&app),
+            ((0, 17), (6, 18)),
+            "motion under a held button extends the selection"
+        );
+        assert!(app.term_selection.is_some_and(|s| s.active));
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Up(MouseButton::Left), 6, 4),
+            &mut out,
+        );
+        assert!(!app.mouse_held());
+        handle_mouse(&mut app, mev(MouseEventKind::Moved, 20, 5), &mut out);
+        assert_eq!(
+            bounds(&app),
+            ((0, 17), (6, 18)),
+            "after the release, motion is just motion"
+        );
+
+        // The same for a splitter grab.
+        let mut app = App::new();
+        seed_splitters(&mut app);
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 20, 5),
+            &mut out,
+        );
+        assert!(app.mouse_held());
+        handle_mouse(&mut app, mev(MouseEventKind::Moved, 30, 5), &mut out);
+        assert_eq!(app.panel_widths[0], 30, "motion moves the held boundary");
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Up(MouseButton::Left), 30, 5),
+            &mut out,
+        );
+        assert!(!app.mouse_held());
+    }
+
+    /// A replay that rebuilds the screen from scratch (a ring that wrapped,
+    /// a new process under the session) starts its history lines over. A
+    /// finished selection is dropped, as ever; a drag under way is carried
+    /// across by its screen rows, so the button ends it and not the replay.
+    #[test]
+    fn a_rebuilding_replay_carries_a_drag_across_and_drops_a_finished_selection() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        twenty_line_pane(&mut app, 1);
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 0, 3),
+            &mut out,
+        );
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 6, 4),
+            &mut out,
+        );
+        assert_eq!(bounds(&app), ((0, 17), (6, 18)));
+
+        // A replay from a seq this parser never saw: 22 lines, rebuilt —
+        // the same two screen rows are now lines 19–20.
+        let lines: Vec<String> = (0..22).map(|i| format!("line {i}")).collect();
+        let replay = lines.join("\r\n").into_bytes();
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: sref.clone(),
+                base_seq: 5_000,
+                data: replay.clone(),
+            },
+        );
+        assert_eq!(history_base(&app), 17);
+        let sel = app.term_selection.expect("the drag survives the replay");
+        assert!(sel.dragging);
+        assert_eq!(sel.bounds(), ((0, 19), (6, 20)));
+        assert_eq!(
+            selection_text(&app).as_deref(),
+            Some(lines_text(19, 20).as_str())
+        );
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Up(MouseButton::Left), 6, 4),
+            &mut out,
+        );
+        assert!(app.term_selection.is_some_and(|s| !s.dragging));
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: sref,
+                base_seq: 9_000,
+                data: replay,
+            },
+        );
+        assert!(
+            app.term_selection.is_none(),
+            "a rebuild drops a finished highlight"
+        );
+    }
+
+    /// The parser's ring holds 10,000 rows; past that the oldest go, and
+    /// history lines keep counting from where they were, so a selection
+    /// stays on its text as the ring turns under it. A row that has gone
+    /// off the ring reads as nothing.
+    #[test]
+    fn a_selection_keeps_its_text_as_the_scrollback_ring_turns() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        let sref = SessionRef::Agent(AgentId("a1".into()));
+        let mut term = AttachedTerm::new(sref, 80, 5);
+        let lines: Vec<String> = (0..10_010).map(|i| format!("l{i}")).collect();
+        term.parser.process(lines.join("\r\n").as_bytes());
+        app.term = Some(term);
+        app.term_area = ratatui::layout::Rect::new(0, 1, 80, 5);
+        app.hits.push((app.term_area, HitTarget::TerminalPane));
+        assert_eq!(
+            app.term.as_ref().unwrap().parser.screen().scrollback_rows(),
+            10_000
+        );
+        assert_eq!(
+            history_base(&app),
+            10_005,
+            "five rows have gone off the ring"
+        );
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 0, 1),
+            &mut out,
+        );
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 5, 1),
+            &mut out,
+        );
+        assert_eq!(bounds(&app), ((0, 10_005), (5, 10_005)));
+        assert_eq!(selection_text(&app).as_deref(), Some("l10005"));
+
+        // Three more lines: three more rows off the ring, the selected row
+        // into the scrollback.
+        app.term
+            .as_mut()
+            .unwrap()
+            .parser
+            .process(b"\r\nl10010\r\nl10011\r\nl10012");
+        assert_eq!(history_base(&app), 10_008);
+        assert_eq!(selection_text(&app).as_deref(), Some("l10005"));
+
+        app.term_selection = Some(TermSelection {
+            anchor: (0, 2),
+            head: (5, 2),
+            dragging: false,
+            active: true,
+            pointer: (0, 0),
+        });
+        assert_eq!(selection_text(&app), None, "line 2 fell off the ring");
     }
 
     #[test]
@@ -20408,6 +22044,13 @@ diff --git a/src/c.rs b/src/c.rs
         restore_ui_state(&mut restored, &json);
         assert_eq!(restored.panel_widths, [33, 44, 55]);
 
+        // The LAUNCHER VIEW's dragged pane height rides the same blob.
+        let mut app = App::new();
+        app.launcher_pane_h = Some(18);
+        let mut restored = App::new();
+        restore_ui_state(&mut restored, &ui_state_json(&app));
+        assert_eq!(restored.launcher_pane_h, Some(18));
+
         // Old blobs without the field keep the defaults — including ones
         // still carrying the retired `workspaces_w` of the column era,
         // which deserializes as an ignored extra key.
@@ -20417,6 +22060,120 @@ diff --git a/src/c.rs b/src/c.rs
             r#"{"project":null,"worktree":null,"session_agent":null,"show_archived":false,"collapsed":false,"workspaces_w":26}"#,
         );
         assert_eq!(legacy.panel_widths, crate::app::DEFAULT_PANEL_WIDTHS);
+        assert_eq!(
+            legacy.launcher_pane_h, None,
+            "a blob from before the drag opens the pane on its default share"
+        );
+    }
+
+    /// The LAUNCHER VIEW's pane edge drags like a panel boundary: hovering
+    /// it lights the grip and asks for the resize arrows, the grab keeps
+    /// its offset from the edge, motion trades rows between the cards and
+    /// the pane, both ends stop against their minimums, and mouse-up ends
+    /// it.
+    #[test]
+    fn launcher_pane_edge_drags_the_pane_taller_and_shorter() {
+        use crate::launcher::{pane_height, CARD_H, HEAD_H, PANE_MIN_H};
+        let mut app = App::new();
+        // Tall enough that the default share, and a drag either side of
+        // it, sit clear of both stops — the stops get their own drags below.
+        let body = ratatui::layout::Rect::new(0, 0, 120, 60);
+        app.launcher_body = body;
+        let boundary = body.height - pane_height(body, None).expect("60 rows fits a pane");
+        app.hits.push((
+            ratatui::layout::Rect::new(0, boundary - 1, 120, 2),
+            HitTarget::LauncherPaneSplitter,
+        ));
+        let mut out = Vec::new();
+
+        // Hover the edge: the other arrows, and the grip lit.
+        app.dirty = false;
+        handle_mouse(&mut app, mev(MouseEventKind::Moved, 60, boundary), &mut out);
+        assert_eq!(app.pointer_shape, PointerShape::RowResize);
+        assert!(app.hover_launcher_pane);
+        assert!(app.dirty, "hover change repaints the grip");
+
+        // Off it: back to default, grip resting.
+        app.dirty = false;
+        handle_mouse(&mut app, mev(MouseEventKind::Moved, 60, 2), &mut out);
+        assert_eq!(app.pointer_shape, PointerShape::Default);
+        assert!(!app.hover_launcher_pane);
+        assert!(app.dirty);
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), 60, boundary),
+            &mut out,
+        );
+        assert_eq!(
+            app.launcher_pane_drag,
+            Some(0),
+            "grabbed on the edge itself"
+        );
+        assert!(
+            app.term_selection.is_none(),
+            "a pane-edge grab must not arm a terminal selection"
+        );
+
+        // Up five rows: the pane takes them off the cards.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 60, boundary - 5),
+            &mut out,
+        );
+        assert_eq!(app.launcher_pane_h, Some(body.height - boundary + 5));
+
+        // Down again: the cards get them back.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 60, boundary + 3),
+            &mut out,
+        );
+        assert_eq!(app.launcher_pane_h, Some(body.height - boundary - 3));
+
+        // Past the top: the header and a row of cards are kept.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 60, 0),
+            &mut out,
+        );
+        assert_eq!(app.launcher_pane_h, Some(body.height - (HEAD_H + CARD_H)));
+
+        // Past the bottom: the pane keeps its own minimum.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Drag(MouseButton::Left), 60, body.height),
+            &mut out,
+        );
+        assert_eq!(app.launcher_pane_h, Some(PANE_MIN_H));
+
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Up(MouseButton::Left), 60, body.height),
+            &mut out,
+        );
+        assert!(app.launcher_pane_drag.is_none(), "mouse-up ends the drag");
+    }
+
+    /// The ISSUES fold rides the UI-state blob like the OPEN PRS one, and
+    /// a blob from before it existed leaves the group open.
+    #[test]
+    fn ui_state_roundtrip_includes_the_issues_fold() {
+        let mut app = App::new();
+        app.issues_collapsed = true;
+        let json = ui_state_json(&app);
+        assert!(json.contains(r#""issues_collapsed":true"#), "{json}");
+
+        let mut restored = App::new();
+        restore_ui_state(&mut restored, &json);
+        assert!(restored.issues_collapsed);
+
+        let mut legacy = App::new();
+        restore_ui_state(
+            &mut legacy,
+            r#"{"project":null,"worktree":null,"session_agent":null,"show_archived":false,"collapsed":false}"#,
+        );
+        assert!(!legacy.issues_collapsed, "old blobs keep the group open");
     }
 
     /// The fold is remembered like the ARCHIVED toggle: it rides the
@@ -22598,8 +24355,23 @@ diff --git a/src/c.rs b/src/c.rs
             ],
             "grouped build order, archived hidden by default"
         );
-        // The empty query shows everything.
-        assert_eq!(palette(&app).matches.len(), texts.len());
+        // The empty query is the RECENT OVERVIEW: each project with its
+        // sessions nested under it; the worktrees wait for a query.
+        let p = palette(&app);
+        let shown: Vec<(&str, bool)> = p
+            .matches
+            .iter()
+            .map(|m| (p.items[m.item].text.as_str(), m.nested))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("demo", false),
+                ("demo/main/agent-1", true),
+                ("nebula", false),
+                ("nebula/feat-x/codex-1", true),
+            ]
+        );
         assert!(out.is_empty(), "opening the palette sends nothing");
     }
 
@@ -22633,7 +24405,7 @@ diff --git a/src/c.rs b/src/c.rs
         {
             let p = palette(&app);
             assert_eq!(p.query, "main");
-            let top = &p.items[p.matches[0].item];
+            let top = &p.items[p.matches[p.selected].item];
             // Same boundary match; the attention order breaks the tie, and
             // for two never-run rows that is build order — the worktree
             // before its session.
@@ -22641,6 +24413,7 @@ diff --git a/src/c.rs b/src/c.rs
             assert!(p
                 .matches
                 .iter()
+                .filter(|m| !m.context)
                 .all(|m| p.items[m.item].text.contains("main")));
         }
         // First Esc clears the query, second closes.
@@ -22706,6 +24479,73 @@ diff --git a/src/c.rs b/src/c.rs
                     if *session == SessionRef::Agent(AgentId("a2".into())))),
             "the pane still previews the picked session: {out:?}"
         );
+    }
+
+    /// A session waiting on you — the red dot — is the one row the setting
+    /// does not get a say over: the whole point of jumping to a question is
+    /// to answer it, so Enter attaches and takes the input lock even with
+    /// auto-attach off.
+    #[test]
+    fn palette_enter_attaches_a_red_session_with_auto_attach_off() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        let mut out = Vec::new();
+        hse(
+            &mut app,
+            ServerEvent::StatusChanged {
+                agent: AgentId("a2".into()),
+                status: nebula_core::AgentStatus::NeedsFeedback,
+                changed_at: crate::app::now_ms(),
+                unseen: false,
+            },
+        );
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        set_enter_attaches(&mut app, false);
+        for c in "codex".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+
+        assert!(app.overlay.is_none());
+        assert_eq!(app.selected_session().unwrap().name, "codex-1");
+        assert_eq!(app.focus, Focus::Terminal, "a red row attaches anyway");
+        assert!(app.term_locked, "and takes the input lock, ready to answer");
+    }
+
+    /// The override is Enter's alone: `Ctrl+F` asked for the quiet landing
+    /// by name, so a red session still only lands on its row.
+    #[test]
+    fn palette_ctrl_f_still_only_focuses_a_red_session() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        let mut out = Vec::new();
+        hse(
+            &mut app,
+            ServerEvent::StatusChanged {
+                agent: AgentId("a2".into()),
+                status: nebula_core::AgentStatus::NeedsFeedback,
+                changed_at: crate::app::now_ms(),
+                unseen: false,
+            },
+        );
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        set_enter_attaches(&mut app, true);
+        for c in "codex".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(
+            &mut app,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+
+        assert!(app.overlay.is_none());
+        assert_eq!(app.selected_session().unwrap().name, "codex-1");
+        assert_eq!(app.focus, Focus::Sessions, "the chord named the landing");
+        assert!(!app.term_locked);
     }
 
     #[test]
@@ -22800,12 +24640,13 @@ diff --git a/src/c.rs b/src/c.rs
     }
 
     /// The session names `step` visits from the cursor's current row,
-    /// `n` presses in a row, landing without attaching.
+    /// `n` presses in a row, with auto-attach off — so every row but a
+    /// red one only lands.
     fn walk_attention(app: &mut App, step: i64, n: usize) -> Vec<String> {
         let mut out = Vec::new();
         (0..n)
             .map(|_| {
-                jump_attention(app, step, Landing::FocusOnly, &mut out);
+                jump_attention(app, step, false, &mut out);
                 app.selected_session().expect("landed on a session").name
             })
             .collect()
@@ -22953,6 +24794,34 @@ diff --git a/src/c.rs b/src/c.rs
         );
     }
 
+    /// `]` carries the palette's rule with it: with auto-attach off the
+    /// never-run row only lands, and the next press — onto the session
+    /// waiting on you — attaches anyway.
+    #[test]
+    fn bracket_keys_attach_a_red_session_with_auto_attach_off() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_second_project(&mut app);
+        seed_attention_ring(&mut app);
+        app.focus = Focus::Sessions;
+        app.sel_session = row_of(&app, "a1");
+        let mut out = Vec::new();
+
+        with_config_json(r#"{"palette_enter_attaches": false}"#, || {
+            press(&mut app, KeyCode::Char(']'), KeyModifiers::NONE, &mut out);
+        });
+        assert_eq!(app.selected_session().unwrap().name, "codex-1");
+        assert_eq!(app.focus, Focus::Sessions, "a never-run row only lands");
+        assert!(!app.term_locked);
+
+        with_config_json(r#"{"palette_enter_attaches": false}"#, || {
+            press(&mut app, KeyCode::Char(']'), KeyModifiers::NONE, &mut out);
+        });
+        assert_eq!(app.selected_session().unwrap().name, "ask");
+        assert_eq!(app.focus, Focus::Terminal, "the red row attaches anyway");
+        assert!(app.term_locked);
+    }
+
     /// The ring spans every workspace: a RUNNING session in a workspace
     /// that isn't open outranks the never-run one under the cursor, so `]`
     /// switches there — project, worktree and session row all selected, the
@@ -22969,7 +24838,7 @@ diff --git a/src/c.rs b/src/c.rs
         app.sel_session = row_of(&app, "a1");
         let mut out = Vec::new();
 
-        jump_attention(&mut app, 1, Landing::FocusOnly, &mut out);
+        jump_attention(&mut app, 1, false, &mut out);
         assert_eq!(app.tree.active_workspace, WorkspaceId("ws2".into()));
         assert_eq!(app.selected_project().unwrap().name, "secret");
         assert_eq!(app.selected_worktree().unwrap().branch, "main");
@@ -22988,7 +24857,7 @@ diff --git a/src/c.rs b/src/c.rs
         );
 
         out.clear();
-        jump_attention(&mut app, 1, Landing::FocusOnly, &mut out);
+        jump_attention(&mut app, 1, false, &mut out);
         assert_eq!(app.tree.active_workspace, WorkspaceId::default());
         assert_eq!(app.selected_project().unwrap().name, "demo");
         assert_eq!(app.selected_session().unwrap().name, "agent-1");
@@ -23023,7 +24892,7 @@ diff --git a/src/c.rs b/src/c.rs
         assert_eq!(app.worktree_unseen(&w1), 1, "one terminal to go read");
 
         let mut out = Vec::new();
-        jump_attention(&mut app, 1, Landing::FocusOnly, &mut out);
+        jump_attention(&mut app, 1, false, &mut out);
         assert_eq!(app.selected_session().unwrap().name, "agent-2");
         assert_eq!(app.worktree_unseen(&w1), 0, "landing on the row reads it");
         assert_eq!(app.project_unseen(&p1), 0);
@@ -23193,7 +25062,8 @@ diff --git a/src/c.rs b/src/c.rs
         seed_tree(&mut app);
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        // Tall enough that the sidebar's headers show past the modal.
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("Jump to"), "palette title rendered:\n{text}");
@@ -23205,14 +25075,22 @@ diff --git a/src/c.rs b/src/c.rs
         assert!(text.contains("PROJECTS"), "{text}");
         assert!(text.contains("WORKTREES"), "{text}");
         assert!(text.contains("SESSIONS"), "{text}");
-        // Palette rows carry per-kind glyphs: ▪ project, ▸ worktree,
-        // ● session.
+        // Palette rows carry per-kind glyphs, NESTED: ▪ the project, ●
+        // its session stepped in under it, by title alone — no
+        // `project/branch/` path in front of it.
         assert!(text.contains("▪ demo"), "project glyph row:\n{text}");
-        assert!(text.contains("▸ demo/main"), "worktree glyph row:\n{text}");
         assert!(
-            text.contains("● demo/main/agent-1"),
-            "session row rendered in the palette:\n{text}"
+            text.contains("  ● agent-1"),
+            "session row nested under its project:\n{text}"
         );
+        assert!(!text.contains("demo/main"), "no path on a row:\n{text}");
+        // A query reaches the worktree, ▸, nested under its project too.
+        for c in "main".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("  ▸ main"), "worktree glyph row:\n{text}");
         // Rects for mouse hit-testing were written back during the draw.
         assert!(palette(&app).list_area.width > 0);
     }
@@ -23255,8 +25133,9 @@ diff --git a/src/c.rs b/src/c.rs
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
 
-        // The one running agent lights its own row and both rollups.
-        for row in ["▪ demo", "▸ demo/main", "● demo/main/agent-1"] {
+        // The one running agent lights its own row and its project's
+        // rollup…
+        for row in ["▪ demo", "● agent-1"] {
             let (x, y) = find_cell(&terminal, row);
             assert_eq!(
                 terminal.backend().buffer()[(x, y)].fg,
@@ -23264,19 +25143,28 @@ diff --git a/src/c.rs b/src/c.rs
                 "{row:?} glyph reads running"
             );
         }
-        // ...and the leaf segment rides the running sweep, not plain text.
-        let (x, y) = find_cell(&terminal, "● demo/main/agent-1");
+        // ...and its title rides the running sweep, not plain text.
+        let (x, y) = find_cell(&terminal, "● agent-1");
         let buffer = terminal.backend().buffer();
-        let leaf_x = x + "● demo/main/".chars().count() as u16;
+        let title_x = x + "● ".chars().count() as u16;
         for i in 0.."agent-1".chars().count() as u16 {
-            let fg = buffer[(leaf_x + i, y)].fg;
+            let fg = buffer[(title_x + i, y)].fg;
             assert!(
                 th.warn_sweep.contains(&fg),
-                "leaf cell {i} is on the sweep ramp, got {fg:?}"
+                "title cell {i} is on the sweep ramp, got {fg:?}"
             );
         }
-        // The dim parent path stays out of the sweep.
-        assert_eq!(buffer[(x + 2, y)].fg, th.dim, "parent path stays quiet");
+        // …and so does its worktree's, once a query reaches that row.
+        for c in "main".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let (x, y) = find_cell(&terminal, "▸ main");
+        assert_eq!(
+            terminal.backend().buffer()[(x, y)].fg,
+            th.warn,
+            "the worktree glyph reads running"
+        );
     }
 
     /// Nothing live under a row: the glyph goes hollow and dim, mirroring
@@ -23289,17 +25177,18 @@ diff --git a/src/c.rs b/src/c.rs
         app.tree.agents.clear();
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &mut out);
+        for c in "main".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("▫ demo"), "hollow project glyph:\n{text}");
-        assert!(
-            text.contains("▹ demo/main"),
-            "hollow worktree glyph:\n{text}"
-        );
-        // Row 0 sits under the selection fill, which lifts dim to muted;
-        // read the unselected worktree row for the resting shade.
-        let (x, y) = find_cell(&terminal, "▹ demo/main");
+        assert!(text.contains("▹ main"), "hollow worktree glyph:\n{text}");
+        // The cursor sits on the worktree the query matched, under the
+        // selection fill that lifts dim to muted; read the project header
+        // above it for the resting shade.
+        let (x, y) = find_cell(&terminal, "▫ demo");
         assert_eq!(terminal.backend().buffer()[(x, y)].fg, th.dim);
     }
 
@@ -26154,6 +28043,7 @@ diff --git a/src/c.rs b/src/c.rs
                     title: "Hush the logs".into(),
                     url: "https://github.com/o/secret/pull/3".into(),
                     is_draft: false,
+                    health: Default::default(),
                     head: "hush".into(),
                 }],
                 at: now,
@@ -26170,7 +28060,7 @@ diff --git a/src/c.rs b/src/c.rs
         {
             let p = palette(&app);
             assert_eq!(
-                p.items[p.matches[0].item].text, "client/secret/#3 Hush the logs",
+                p.items[p.matches[p.selected].item].text, "client/secret/#3 Hush the logs",
                 "pathed under its workspace like every other row"
             );
         }
@@ -28696,7 +30586,7 @@ diff --git a/src/c.rs b/src/c.rs
 
             press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
             for _ in 0..skip_row {
-                press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
             }
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(
@@ -28789,6 +30679,64 @@ diff --git a/src/c.rs b/src/c.rs
                 assert_eq!(back.launch.pr.as_ref().map(|pr| pr.number), Some(7));
                 assert!(out.is_empty(), "{out:?}");
             }
+        });
+    }
+
+    /// Esc in the picker `e` opens on a pull request closes it: no box was
+    /// up when it opened, so there is none to put back — it used to open
+    /// an empty QUICK PROMPT for the PR, a box nobody asked for. The box's
+    /// own `Shift+Tab` picker is still a round trip: Esc hands the box
+    /// back, text and all.
+    #[test]
+    fn esc_in_the_pr_preset_picker_closes_it_without_opening_a_box() {
+        with_seeded_presets(|| {
+            let on_pr = || {
+                let mut app = App::new();
+                seed_tree(&mut app);
+                seed_open_prs(&mut app, &[(7, "Attach links")]);
+                app.focus = Focus::Worktrees;
+                app.sel_worktree = 1;
+                assert_eq!(app.selected_worktree_pr().map(|p| p.number), Some(7));
+                app
+            };
+
+            let mut app = on_pr();
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresets(view)) = &app.overlay else {
+                panic!("e opens the picker, got {:?}", app.overlay);
+            };
+            assert!(view.is_picker());
+            assert!(view.box_behind().is_none(), "no box to go back to");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(
+                app.overlay.is_none(),
+                "Esc closes the picker and opens no box, got {:?}",
+                app.overlay
+            );
+            assert_eq!(app.flash, None);
+            assert!(out.is_empty(), "{out:?}");
+
+            // From the box itself, Esc is the way back to it.
+            let mut app = on_pr();
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(paste_into_overlay(&mut app, "Review it"));
+            press(&mut app, KeyCode::BackTab, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresets(view)) = &app.overlay else {
+                panic!("⇧Tab opens the picker over the box, got {:?}", app.overlay);
+            };
+            assert!(view.box_behind().is_some(), "the box waits behind it");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("Esc hands the box back, got {:?}", app.overlay);
+            };
+            assert_eq!(prompt.input.as_str(), "Review it");
+            assert!(
+                prompt.title.starts_with("Quick prompt · PR #7"),
+                "{}",
+                prompt.title
+            );
+            assert!(out.is_empty(), "{out:?}");
         });
     }
 
@@ -28954,6 +30902,120 @@ diff --git a/src/c.rs b/src/c.rs
         });
     }
 
+    /// The presets list `e` opens on a PROJECT OPEN PRS GROUP row manages
+    /// presets as the one on a checkout's row does: `a` adds, `e` edits,
+    /// `d` deletes. Every way back — the editor's save and its Esc, the
+    /// delete confirm's either answer — lands in the PR picker with the
+    /// pull request still riding it, so the next Enter is still a PR
+    /// SESSION.
+    #[test]
+    fn the_pr_preset_picker_adds_edits_and_deletes_presets() {
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            seed_open_prs(&mut app, &[(7, "Attach links")]);
+            app.focus = Focus::Worktrees;
+            app.sel_worktree = 1;
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+            // The row names, and the cursor, of the PR picker on screen.
+            fn pr_picker(app: &App) -> (Vec<String>, usize) {
+                let Some(Overlay::AgentPresets(view)) = &app.overlay else {
+                    panic!("back in the PR picker, got {:?}", app.overlay);
+                };
+                let back = view.quick.as_ref().expect("the picker, not the manager");
+                assert_eq!(back.launch.pr.as_ref().map(|pr| pr.number), Some(7));
+                let names = view.presets.iter().map(|p| p.name.clone()).collect();
+                (names, view.selected)
+            }
+            let (seeded, _) = pr_picker(&app);
+            assert_eq!(seeded, ["reviewer", "scratch"]);
+
+            // a: a new preset, saved, the cursor on it.
+            press(
+                &mut app,
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert!(
+                matches!(&app.overlay, Some(Overlay::AgentPresetEditor(_))),
+                "a opens the editor: {:?}",
+                app.overlay
+            );
+            type_text(&mut app, "triage", &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let (names, cursor) = pr_picker(&app);
+            assert_eq!(names, ["reviewer", "scratch", "triage"]);
+            assert_eq!(cursor, 2, "the cursor lands on the new row");
+
+            // e: edited in place.
+            press(
+                &mut app,
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert!(
+                matches!(&app.overlay, Some(Overlay::AgentPresetEditor(e)) if e.editing == Some(2)),
+                "e edits the row under the cursor: {:?}",
+                app.overlay
+            );
+            type_text(&mut app, " pr", &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert_eq!(pr_picker(&app).0[2], "triage pr");
+
+            // Esc backs out of the editor unsaved, to the picker too.
+            press(
+                &mut app,
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            type_text(&mut app, "abandoned", &mut out);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert_eq!(pr_picker(&app).0.len(), 3);
+
+            // d: `n` keeps the preset, `y` drops it — the picker either way.
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Confirm(_))),
+                "d asks first: {:?}",
+                app.overlay
+            );
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            assert_eq!(pr_picker(&app).0.len(), 3);
+            press(
+                &mut app,
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+            assert_eq!(pr_picker(&app).0, seeded);
+            assert_eq!(crate::agent_presets::load().len(), 2, "the store agrees");
+
+            // And a pick from it is still for the pull request.
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("the pick hands the box back, got {:?}", app.overlay);
+            };
+            assert_eq!(
+                prompt.title,
+                "Quick prompt · PR #7 · reviewer (claude · opus · high)"
+            );
+            assert!(out.is_empty(), "managing presets sends nothing: {out:?}");
+        });
+    }
+
     /// `e` on a PROJECT OPEN PRS GROUP row is the preset picker for a PR
     /// SESSION: the pick hands the QUICK PROMPT back titled for the PR,
     /// `Ctrl+N` in it is refused (the DAEMON picks the checkout), and
@@ -28981,10 +31043,7 @@ diff --git a/src/c.rs b/src/c.rs
                     app.overlay
                 );
             };
-            assert!(
-                view.is_picker(),
-                "pick-only: presets are managed in Sessions"
-            );
+            assert!(view.is_picker(), "a picker for the PR, not the manager");
             let back = view.quick.as_ref().expect("is_picker");
             assert_eq!(back.launch.pr.as_ref().map(|pr| pr.number), Some(7));
             assert_eq!(
@@ -29134,8 +31193,8 @@ diff --git a/src/c.rs b/src/c.rs
             });
             crate::agent_presets::save(&presets).unwrap();
             press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(
                 app.overlay.is_none(),
@@ -29260,7 +31319,7 @@ diff --git a/src/c.rs b/src/c.rs
                 "bare preset:\n{text}"
             );
             assert!(
-                text.contains("Enter: launch  a: new  e: edit  d: delete"),
+                text.contains("Enter: launch  ^a: new  ^e: edit  ^d: delete"),
                 "modal hint:\n{text}"
             );
 
@@ -29353,7 +31412,12 @@ diff --git a/src/c.rs b/src/c.rs
             let mut app = App::new();
             let mut out = Vec::new();
             open_presets(&mut app, &mut out);
-            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
             let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
                 panic!("a should open the editor, got {:?}", app.overlay);
             };
@@ -29369,11 +31433,55 @@ diff --git a/src/c.rs b/src/c.rs
             press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            // Effort, then the Text row: a new preset starts on `prefix`
+            // alone — one box, and no Postfix row for Tab to land on.
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                panic!("editor should stay open, got {:?}", app.overlay);
+            };
+            assert_eq!(editor.field, PresetField::Text);
+            assert_eq!(editor.text, crate::agent_presets::PresetText::Prefix);
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("Text  ◂ prefix ▸"), "text row:\n{text}");
+            assert!(text.contains("Prefix (optional)"), "one box:\n{text}");
+            assert!(
+                !text.contains("Postfix (optional)"),
+                "no postfix box on `prefix`:\n{text}"
+            );
+            // → → : postfix, then both sides — and the Postfix row is back.
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
             assert!(paste_into_overlay(&mut app, "Line one"));
             press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
             assert!(paste_into_overlay(&mut app, "Line two"));
-            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            // Option+Enter — the ESC CR a mapped Shift+Enter sends — and
+            // Ctrl+J break lines too, as in Claude Code's own prompt; none
+            // of the three is the save.
+            press(&mut app, KeyCode::Enter, KeyModifiers::ALT, &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('j'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert!(paste_into_overlay(&mut app, "Line four"));
+            // ↑ walks the box's lines rather than leaving the field …
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                panic!("editor should stay open, got {:?}", app.overlay);
+            };
+            assert_eq!(editor.field, PresetField::Prefix);
+            assert_eq!(
+                editor.prefix.cursor_chars(),
+                "Line one\nLine two\n".len(),
+                "↑ from the end of line four lands on the empty third line"
+            );
+            // … and ↓ past the last line steps to the next field, as Tab does.
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
             type_text(&mut app, "END", &mut out);
             let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
                 panic!("editor should stay open, got {:?}", app.overlay);
@@ -29382,7 +31490,7 @@ diff --git a/src/c.rs b/src/c.rs
             assert_eq!(editor.kind, AgentKind::Codex);
             assert_eq!(editor.model, "gpt-5.6-sol", "→ steps off the default");
             assert_eq!(editor.effort, "minimal");
-            assert_eq!(editor.prefix.as_str(), "Line one\nLine two");
+            assert_eq!(editor.prefix.as_str(), "Line one\nLine two\n\nLine four");
             assert_eq!(editor.field, PresetField::Postfix);
 
             let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -29407,7 +31515,7 @@ diff --git a/src/c.rs b/src/c.rs
             assert_eq!(saved.kind, AgentKind::Codex);
             assert_eq!(saved.model.as_deref(), Some("gpt-5.6-sol"));
             assert_eq!(saved.effort.as_deref(), Some("minimal"));
-            assert_eq!(saved.prefix, "Line one\nLine two");
+            assert_eq!(saved.prefix, "Line one\nLine two\n\nLine four");
             assert_eq!(saved.postfix, "END");
             assert!(
                 out.is_empty(),
@@ -29416,28 +31524,130 @@ diff --git a/src/c.rs b/src/c.rs
         });
     }
 
+    /// Enter on a form that can't save keeps the form and says why on a
+    /// banner at the top of it — in the error color, with the Name label
+    /// and caret painted to match — and brings the caret back to the Name
+    /// row from wherever it was, so the next keystroke is the fix. That
+    /// keystroke takes the banner down; the next Enter judges the new
+    /// text afresh. Nothing goes to the FOOTER, which is nowhere near the
+    /// form.
     #[test]
     fn presets_editor_refuses_blank_and_duplicate_names() {
+        use crate::preset_overlays::{FormError, PresetField};
+        use ratatui::style::Modifier;
         with_seeded_presets(|| {
             let mut app = App::new();
             let mut out = Vec::new();
             open_presets(&mut app, &mut out);
-            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(matches!(&app.overlay, Some(Overlay::AgentPresetEditor(_))));
-            assert_eq!(app.flash.as_deref(), Some("the preset needs a name"));
-
-            type_text(&mut app, "Reviewer", &mut out);
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(matches!(&app.overlay, Some(Overlay::AgentPresetEditor(_))));
-            assert!(
-                app.flash
-                    .as_deref()
-                    .unwrap_or("")
-                    .contains("already exists"),
-                "case-insensitive duplicate: {:?}",
-                app.flash
+            press(
+                &mut app,
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                &mut out,
             );
+            // Enter from the far end of the form.
+            press(&mut app, KeyCode::BackTab, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                panic!("a should open the editor, got {:?}", app.overlay);
+            };
+            assert_eq!(editor.field, PresetField::Task);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                panic!("a refused save keeps the form, got {:?}", app.overlay);
+            };
+            assert_eq!(
+                editor.error,
+                Some(FormError {
+                    field: PresetField::Name,
+                    message: "the preset needs a name".into(),
+                })
+            );
+            assert_eq!(
+                editor.field,
+                PresetField::Name,
+                "the caret comes back to the field to fix"
+            );
+            assert_eq!(app.flash, None, "the reason is in the form, not the footer");
+
+            let th = app.theme;
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            let (bx, by) = find_cell(&terminal, "✗ the preset needs a name");
+            let (nx, ny) = find_cell(&terminal, "Name  ");
+            assert_eq!(
+                ny,
+                by + 1,
+                "the banner sits right above the Name row:\n{text}"
+            );
+            let buffer = terminal.backend().buffer();
+            let banner = &buffer[(bx, by)];
+            assert_eq!(banner.fg, th.err, "the banner in the error color:\n{text}");
+            assert!(
+                banner.modifier.contains(Modifier::BOLD),
+                "and bold:\n{text}"
+            );
+            assert_eq!(
+                buffer[(nx, ny)].fg,
+                th.err,
+                "the Name label with it:\n{text}"
+            );
+            // The caret block sits right after the two-space gap.
+            let caret = &buffer[(nx + 6, ny)];
+            assert_eq!(caret.bg, th.err, "and the caret:\n{text}");
+
+            // The first keystroke into the name is the fix: the banner
+            // goes, the label is back in the focus color, the form keeps
+            // its place.
+            type_text(&mut app, "R", &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                panic!("typing keeps the form, got {:?}", app.overlay);
+            };
+            assert_eq!(editor.error, None);
+            assert_eq!(editor.name.as_str(), "R");
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                !text.contains("✗ the preset"),
+                "the banner is gone:\n{text}"
+            );
+            let (nx, ny) = find_cell(&terminal, "Name  ");
+            assert_eq!(
+                terminal.backend().buffer()[(nx, ny)].fg,
+                th.accent,
+                "{text}"
+            );
+
+            type_text(&mut app, "eviewer", &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                panic!("a duplicate keeps the form, got {:?}", app.overlay);
+            };
+            let error = editor.error.clone().expect("case-insensitive duplicate");
+            assert_eq!(error.field, PresetField::Name);
+            assert!(error.message.contains("already exists"), "{error:?}");
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("✗ a preset named 'Reviewer' already exists"),
+                "{text}"
+            );
+
+            // Tabbing away leaves the banner up — the name is still the
+            // problem; the first change to it takes the banner down.
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                panic!("Tab keeps the form, got {:?}", app.overlay);
+            };
+            assert_eq!(editor.field, PresetField::Kind);
+            assert_eq!(editor.error.as_ref(), Some(&error));
+            press(&mut app, KeyCode::BackTab, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
+                panic!("Backspace keeps the form, got {:?}", app.overlay);
+            };
+            assert_eq!(editor.error, None);
+            assert_eq!(editor.name.as_str(), "Reviewe");
 
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
             let Some(Overlay::AgentPresets(view)) = &app.overlay else {
@@ -29448,14 +31658,132 @@ diff --git a/src/c.rs b/src/c.rs
         });
     }
 
+    /// Letters in the AGENT PRESETS list type ahead over the names, as in
+    /// the MODEL / EFFORT submenus: the rows narrow to the fuzzy matches,
+    /// the cursor on the best, the query in the title. The old verb
+    /// letters type too — `e` and `q` are no edit and no close — and a
+    /// letter nothing matches is refused, so the list never empties. Esc
+    /// clears the letters before it closes, leaving the found row
+    /// selected; Enter, a click and the Ctrl verbs all act on the row the
+    /// filter left.
+    #[test]
+    fn presets_list_types_ahead_to_find_a_preset_by_name() {
+        with_seeded_presets(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            open_presets(&mut app, &mut out);
+            fn list(app: &App) -> crate::preset_overlays::AgentPresetsView {
+                match &app.overlay {
+                    Some(Overlay::AgentPresets(view)) => view.clone(),
+                    other => panic!("expected the presets list, got {other:?}"),
+                }
+            }
+            let rows = |app: &App| {
+                let view = list(app);
+                view.visible()
+                    .iter()
+                    .map(|(i, _)| view.presets[*i].name.clone())
+                    .collect::<Vec<_>>()
+            };
+
+            // `e` — the old edit verb — narrows to "reviewer" instead.
+            type_text(&mut app, "e", &mut out);
+            assert_eq!(rows(&app), ["reviewer"]);
+            assert_eq!(list(&app).filter, "e");
+
+            // `q` matches nothing: refused, the list still up.
+            type_text(&mut app, "q", &mut out);
+            assert_eq!(list(&app).filter, "e", "a dead letter is refused");
+            assert_eq!(app.flash.as_deref(), Some("no preset matches 'eq'"));
+
+            // Backspace widens; "scr" finds the second row and the cursor
+            // follows it.
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
+            assert_eq!(rows(&app), ["reviewer", "scratch"]);
+            type_text(&mut app, "scr", &mut out);
+            assert_eq!(rows(&app), ["scratch"]);
+            assert_eq!(list(&app).selected, 1, "the cursor is on the match");
+
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("Agent presets ⌕ scr"),
+                "query in the title:\n{text}"
+            );
+            assert!(!text.contains("reviewer"), "filtered out:\n{text}");
+            assert!(text.contains("Esc: clear"), "Esc clears first:\n{text}");
+
+            // The first Esc clears the letters and keeps the found row …
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert_eq!(list(&app).filter, "");
+            assert_eq!(rows(&app), ["reviewer", "scratch"]);
+            assert_eq!(list(&app).selected, 1, "still on the preset found");
+            // … the second closes.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none());
+
+            // Ctrl+e edits the row the filter left, not the stored first.
+            open_presets(&mut app, &mut out);
+            type_text(&mut app, "scr", &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert!(
+                matches!(&app.overlay, Some(Overlay::AgentPresetEditor(e)) if e.editing == Some(1)),
+                "{:?}",
+                app.overlay
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+            // Enter launches the filtered row: "scratch" asks for its task.
+            type_text(&mut app, "scr", &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(p))
+                        if matches!(&p.kind, PromptKind::AgentPresetTask { preset, .. } if preset.name == "scratch")
+                ),
+                "{:?}",
+                app.overlay
+            );
+
+            // A click on the filtered list's first row is that same row.
+            app.overlay = None;
+            open_presets(&mut app, &mut out);
+            type_text(&mut app, "scr", &mut out);
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let area = list(&app).list_area;
+            click(&mut app, area.x + 1, area.y, &mut out);
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(p))
+                        if matches!(&p.kind, PromptKind::AgentPresetTask { preset, .. } if preset.name == "scratch")
+                ),
+                "{:?}",
+                app.overlay
+            );
+        });
+    }
+
     #[test]
     fn presets_e_edits_in_place() {
         with_seeded_presets(|| {
             let mut app = App::new();
             let mut out = Vec::new();
             open_presets(&mut app, &mut out);
-            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
             let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
                 panic!("e should open the editor on the row, got {:?}", app.overlay);
             };
@@ -29494,7 +31822,12 @@ diff --git a/src/c.rs b/src/c.rs
             let mut app = App::new();
             let mut out = Vec::new();
             open_presets(&mut app, &mut out);
-            press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
             match &app.overlay {
                 Some(Overlay::Confirm(c)) => {
                     assert!(c.message.contains("'reviewer'"), "{}", c.message);
@@ -29511,7 +31844,12 @@ diff --git a/src/c.rs b/src/c.rs
                 Some(Overlay::AgentPresets(view)) => assert_eq!(view.presets.len(), 2),
                 other => panic!("cancel should reopen the list, got {other:?}"),
             }
-            press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
             press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
             match &app.overlay {
                 Some(Overlay::AgentPresets(view)) => {
@@ -29613,7 +31951,7 @@ diff --git a/src/c.rs b/src/c.rs
             let mut out = Vec::new();
             open_presets(&mut app, &mut out);
             let worktree = app.selected_worktree().unwrap().id.clone();
-            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             let Some(Overlay::Prompt(prompt)) = &app.overlay else {
                 panic!("Enter should ask for the task, got {:?}", app.overlay);
@@ -29690,7 +32028,12 @@ diff --git a/src/c.rs b/src/c.rs
 
             // `e` on "reviewer"; Task is the last field, so ⇧Tab from Name
             // wraps onto it.
-            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
             press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
             let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
                 panic!("e should open the editor, got {:?}", app.overlay);
@@ -30626,6 +32969,91 @@ diff --git a/src/c.rs b/src/c.rs
         });
     }
 
+    /// Closing the box is not throwing the prompt away: Esc, a click
+    /// outside and the HARDWIRED UNLOCK park what was typed, and the next
+    /// QUICK PROMPT takes it back — whole, harness pick and all, when it
+    /// is aimed at the same checkout, and text-only into a box aimed
+    /// somewhere else. Clearing the box and closing it is how a draft is
+    /// thrown away; an empty box parks nothing.
+    #[test]
+    fn a_closed_quick_prompt_is_parked_and_the_next_box_takes_it_back() {
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            seed_feat_worktree(&mut app, "w2", "feat");
+            app.focus = Focus::Sessions;
+            assert_eq!(
+                app.selected_worktree().map(|w| w.branch.as_str()),
+                Some("main")
+            );
+
+            // A box with a harness picked in it and a prompt typed.
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(paste_into_overlay(&mut app, "Fix auth"));
+            assert!(matches!(&app.overlay, Some(Overlay::Prompt(p))
+                if p.title == "Quick prompt (codex)"));
+
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "Esc closes the box");
+            assert!(app.quick_draft.is_some(), "and parks what was typed");
+
+            // The same place: the box comes back whole, and the slot is
+            // empty again.
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("p should open the box, got {:?}", app.overlay);
+            };
+            assert_eq!(prompt.input.as_str(), "Fix auth");
+            assert_eq!(prompt.title, "Quick prompt (codex)", "the pick too");
+            assert!(app.quick_draft.is_none(), "taken back, not copied");
+
+            // The HARDWIRED UNLOCK parks it the same way.
+            press(
+                &mut app,
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert!(app.overlay.is_none(), "^q closes the box");
+            assert!(app.quick_draft.is_some(), "and parks it");
+
+            // A box aimed at another checkout keeps its own aim and spec;
+            // the text is the user's, so it still comes back.
+            app.sel_worktree = 1;
+            assert_eq!(
+                app.selected_worktree().map(|w| w.branch.as_str()),
+                Some("feat")
+            );
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("p should open the box, got {:?}", app.overlay);
+            };
+            assert_eq!(prompt.input.as_str(), "Fix auth");
+            assert_eq!(
+                prompt.title, "Quick prompt (claude)",
+                "another checkout's box is the settings' harness again"
+            );
+            assert!(matches!(&prompt.kind, PromptKind::QuickPrompt(launch)
+                if launch.target == crate::quick_prompt::QuickTarget::Worktree(
+                    nebula_core::WorktreeId("w2".into()))));
+
+            // Cleared and closed: nothing is parked, and the next box is
+            // the empty one it should be.
+            if let Some(Overlay::Prompt(prompt)) = &mut app.overlay {
+                prompt.input.clear();
+            }
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            assert!(app.quick_draft.is_none(), "an empty box parks nothing");
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            assert!(matches!(&app.overlay, Some(Overlay::Prompt(p)) if p.input.is_empty()));
+            assert!(out.is_empty(), "none of this launches anything: {out:?}");
+        });
+    }
+
     /// `Shift+Tab` picks a saved AGENT PRESET for this launch: its harness,
     /// its MODEL / EFFORT, and its prefix/postfix around what was typed.
     #[test]
@@ -30645,16 +33073,28 @@ diff --git a/src/c.rs b/src/c.rs
             assert!(view.is_picker(), "opened to pick, not to manage");
             assert_eq!(view.presets[0].name, "reviewer");
 
-            // The management verbs belong to the Sessions panel's list.
-            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+            // The manage verbs answer here as in the Sessions panel's list,
+            // and come back to the picker: `a` then Esc leaves the box and
+            // its text waiting behind it.
+            press(
+                &mut app,
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
             assert!(
-                matches!(&app.overlay, Some(Overlay::AgentPresets(_))),
-                "a stays put in picker mode: {:?}",
+                matches!(&app.overlay, Some(Overlay::AgentPresetEditor(e)) if e.quick.is_some()),
+                "a opens the editor from the picker: {:?}",
                 app.overlay
             );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::AgentPresets(view)) = &app.overlay else {
+                panic!("Esc goes back to the picker, got {:?}", app.overlay);
+            };
+            assert!(view.is_picker(), "still the picker, not the manager");
             assert_eq!(
-                app.flash.as_deref(),
-                Some("presets are added and edited with e in the Sessions panel")
+                view.quick.as_ref().map(|back| back.text.as_str()),
+                Some("Fix auth")
             );
 
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
@@ -30755,10 +33195,12 @@ diff --git a/src/c.rs b/src/c.rs
         });
     }
 
-    /// With no presets saved there is nothing to pick — say so and leave
-    /// the box up rather than opening an empty list.
+    /// With no presets saved the picker still opens — empty, on the
+    /// manager's `a` hint — so the first one is made right there: saving it
+    /// lands back in the picker on it, and Enter hands the box back, text
+    /// intact, under that preset.
     #[test]
-    fn shift_tab_without_presets_leaves_the_box_alone() {
+    fn shift_tab_without_presets_opens_a_picker_that_adds_one() {
         with_default_config(|| {
             let dir = tempfile::tempdir().unwrap();
             crate::agent_presets::with_presets_path(dir.path().join("agent_presets.json"), || {
@@ -30769,14 +33211,40 @@ diff --git a/src/c.rs b/src/c.rs
                 press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
                 assert!(paste_into_overlay(&mut app, "Fix auth"));
                 press(&mut app, KeyCode::BackTab, KeyModifiers::NONE, &mut out);
+                let Some(Overlay::AgentPresets(view)) = &app.overlay else {
+                    panic!("an empty picker, got {:?}", app.overlay);
+                };
+                assert!(view.is_picker() && view.presets.is_empty(), "{view:?}");
+                let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+                terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+                let text = buffer_text(&terminal);
+                assert!(
+                    text.contains("no presets yet — Ctrl+a creates one"),
+                    "{text}"
+                );
+
+                press(
+                    &mut app,
+                    KeyCode::Char('a'),
+                    KeyModifiers::CONTROL,
+                    &mut out,
+                );
+                type_text(&mut app, "tidy", &mut out);
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+                let Some(Overlay::AgentPresets(view)) = &app.overlay else {
+                    panic!("the save lands back in the picker, got {:?}", app.overlay);
+                };
+                assert!(view.is_picker(), "still the picker, not the manager");
+                assert_eq!(view.presets.len(), 1);
+                assert_eq!(view.presets[view.selected].name, "tidy");
+
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
                 let Some(Overlay::Prompt(prompt)) = &app.overlay else {
-                    panic!("the box should stay up, got {:?}", app.overlay);
+                    panic!("the pick hands the box back, got {:?}", app.overlay);
                 };
                 assert_eq!(prompt.input.as_str(), "Fix auth");
-                assert_eq!(
-                    app.flash.as_deref(),
-                    Some("no agent presets yet — press e in the Sessions panel to add one")
-                );
+                assert!(prompt.title.contains("tidy"), "{}", prompt.title);
+                assert!(out.is_empty(), "{out:?}");
             });
         });
     }
@@ -30819,8 +33287,12 @@ diff --git a/src/c.rs b/src/c.rs
                 "the head scrolled off rather than the tail: {text}"
             );
             assert!(
-                text.contains("^J newline") && text.contains("Esc"),
+                text.contains("⇧Enter newline") && text.contains("Esc"),
                 "the newline and cancel keys are on the border: {text}"
+            );
+            assert!(
+                !text.contains("^J"),
+                "the line break is advertised as Shift+Enter, not ^J: {text}"
             );
             assert!(
                 text.contains("Tab agent")
@@ -30828,6 +33300,112 @@ diff --git a/src/c.rs b/src/c.rs
                     && text.contains("^N worktree"),
                 "and so are the two pickers and the worktree toggle: {text}"
             );
+        });
+    }
+
+    /// A long prompt typed without one Shift+Enter is ONE line wrapped over
+    /// many rows, and used to be a dead end for ↑/↓ and ⌥↑. Now ↑/↓ walk
+    /// the rows as drawn, ⌥↑/⌥↓ jump to the paragraph's start or end, ↑ on
+    /// the top row goes to the text's start and ↓ on the bottom row to its
+    /// end, the box scrolls only as the caret leaves it (with `↑ N more`
+    /// on its border), the wheel scrolls it, and a click puts the caret
+    /// where it points.
+    #[test]
+    fn the_quick_prompt_walks_a_long_wrapped_prompt() {
+        fn input(app: &App) -> &TextInput {
+            let Some(Overlay::Prompt(prompt)) = &app.overlay else {
+                panic!("the quick prompt should be up, got {:?}", app.overlay);
+            };
+            &prompt.input
+        }
+        fn row_of(input: &TextInput) -> usize {
+            input.caret_row(&input.rows(input.view().width.into()))
+        }
+        with_default_config(|| {
+            let mut app = App::new();
+            let mut out = Vec::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
+            let words: Vec<String> = (0..300).map(|i| format!("w{i:03}")).collect();
+            let long = words.join(" ");
+            assert!(paste_into_overlay(&mut app, &long));
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            let mut draw = |app: &mut App| {
+                terminal.draw(|f| ui::draw(f, app)).unwrap();
+                buffer_text(&terminal)
+            };
+
+            let text = draw(&mut app);
+            let view = input(&app).view();
+            let width = usize::from(view.width);
+            let (top, height) = (usize::from(view.top), usize::from(view.height));
+            let rows = input(&app).rows(width).len();
+            assert!(width > 0 && rows > height, "{view:?}, {rows} rows");
+            assert_eq!(row_of(input(&app)), rows - 1, "caret at the end");
+            assert_eq!(top, rows - height, "the tail in sight");
+            assert!(text.contains("↑ ") && text.contains(" more"), "{text}");
+
+            // ↑ is a row up the wrapped paragraph, and the box stays put.
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+            assert_eq!(row_of(input(&app)), rows - 2);
+            draw(&mut app);
+            assert_eq!(input(&app).view().top, view.top, "no scroll inside the box");
+
+            // ⌥↑ — what the user reached for — is the paragraph's start.
+            press(&mut app, KeyCode::Up, KeyModifiers::ALT, &mut out);
+            assert_eq!(input(&app).cursor_chars(), 0);
+            let text = draw(&mut app);
+            assert_eq!(input(&app).view().top, 0);
+            assert!(text.contains("w000") && text.contains("↓ "), "{text}");
+
+            // ↓ then ↑ walk the rows keeping the column; ↑ on the top row
+            // is the very start.
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            assert_eq!(row_of(input(&app)), 1);
+            let second = input(&app).rows(width)[1].0;
+            assert_eq!(input(&app).cursor_chars(), second + 2);
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+            assert_eq!(input(&app).cursor_chars(), 2);
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+            assert_eq!(input(&app).cursor_chars(), 0, "top row ↑: the start");
+
+            // ⌥↓ is the end again, and ↓ on the bottom row too.
+            press(&mut app, KeyCode::Down, KeyModifiers::ALT, &mut out);
+            assert_eq!(input(&app).cursor_chars(), long.len());
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+            assert_eq!(input(&app).cursor_chars(), long.len(), "bottom row ↓");
+            draw(&mut app);
+
+            // The wheel scrolls the box, dragging the caret into sight.
+            let editor = match &app.overlay {
+                Some(Overlay::Prompt(prompt)) => prompt.editor_area,
+                _ => unreachable!(),
+            };
+            let bottom_top = usize::from(input(&app).view().top);
+            handle_mouse(
+                &mut app,
+                mev(MouseEventKind::ScrollUp, editor.x + 1, editor.y + 1),
+                &mut out,
+            );
+            let top = usize::from(input(&app).view().top);
+            assert_eq!(top, bottom_top - MODAL_WHEEL_LINES as usize);
+            assert!(row_of(input(&app)) < top + height);
+            draw(&mut app);
+
+            // A click lands the caret where it points.
+            click(&mut app, editor.x + 3, editor.y + 1, &mut out);
+            let rows_now = input(&app).rows(width);
+            let top = usize::from(input(&app).view().top);
+            assert_eq!(input(&app).cursor_chars(), rows_now[top + 1].0 + 3);
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Prompt(p)) if p.input.as_str() == long),
+                "nothing typed, nothing lost"
+            );
+            assert!(out.is_empty(), "{out:?}");
         });
     }
 
@@ -30921,6 +33499,17 @@ diff --git a/src/c.rs b/src/c.rs
             };
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(app.overlay.is_none(), "launching closes the box");
+            // Both stand-in rows are up before git has run — and the
+            // session's is up *working*, because the create it stands for
+            // carries the typed prompt: the CLI submits it as it boots, so
+            // the row goes up the way it will come back.
+            assert_eq!(
+                app.visible_sessions()
+                    .first()
+                    .map(|a| a.status)
+                    .expect("the stand-in session row is up"),
+                nebula_core::AgentStatus::Running
+            );
             let req_id = match out.as_slice() {
                 [ClientRequest::CreateWorktree {
                     req_id,
@@ -31003,10 +33592,16 @@ diff --git a/src/c.rs b/src/c.rs
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
 
             // The root hidden and no other checkout: nothing to flip to.
+            // The box Esc just closed was parked, so the next one opens on
+            // its text — nothing to type in again.
             hide_root(&mut app, true);
             assert!(app.selected_worktree().is_none());
             press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &mut out);
-            assert!(paste_into_overlay(&mut app, "Fix auth"));
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Prompt(p)) if p.input.as_str() == "Fix auth"),
+                "the draft comes back: {:?}",
+                app.overlay
+            );
             press(
                 &mut app,
                 KeyCode::Char('n'),
@@ -31152,7 +33747,12 @@ diff --git a/src/c.rs b/src/c.rs
             let mut app = App::new();
             let mut out = Vec::new();
             open_presets(&mut app, &mut out);
-            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
             type_text(&mut app, "cur", &mut out);
             press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
@@ -31173,11 +33773,7 @@ diff --git a/src/c.rs b/src/c.rs
             let Some(Overlay::AgentPresetEditor(editor)) = &app.overlay else {
                 unreachable!()
             };
-            assert_eq!(
-                editor.field,
-                PresetField::Prefix,
-                "Tab skips the n/a effort"
-            );
+            assert_eq!(editor.field, PresetField::Text, "Tab skips the n/a effort");
             press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
 
             // → → : default → auto → claude-fable-5, whose efforts exist.
@@ -31357,7 +33953,12 @@ diff --git a/src/c.rs b/src/c.rs
             let mut app = App::new();
             let mut out = Vec::new();
             open_presets(&mut app, &mut out);
-            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+            press(
+                &mut app,
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
             type_text(&mut app, "typed", &mut out);
             press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
             // Harness: "cu" jumps to cursor; h/l no longer cycle.
@@ -31507,9 +34108,9 @@ diff --git a/src/c.rs b/src/c.rs
     /// click used to launch the row straight into it: a `skip`-task preset
     /// clicked on an OPEN PRS row started a plain session in the main
     /// checkout, no pull request, no checkout cut, nothing nested. The
-    /// delete keys are manage verbs too, and a picker only picks: they
-    /// used to reach the delete confirm, whose exits reopened the list in
-    /// manage mode against the root.
+    /// delete keys reach the delete confirm, as in the manager — whose
+    /// exits once reopened the list in manage mode against the root, and
+    /// now come back to the picker, the pull request still on it.
     #[test]
     fn a_click_in_the_pr_preset_picker_launches_the_pr_session_not_a_root_session() {
         with_seeded_presets(|| {
@@ -31535,18 +34136,31 @@ diff --git a/src/c.rs b/src/c.rs
             let mut out = Vec::new();
             press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
 
-            // The delete keys only say where presets are managed.
-            for key in [KeyCode::Char('x'), KeyCode::Backspace, KeyCode::Delete] {
-                app.flash = None;
-                press(&mut app, key, KeyModifiers::NONE, &mut out);
+            // The delete keys ask first, and backing out of the confirm
+            // lands in the PR picker again.
+            for (key, mods) in [
+                (KeyCode::Char('d'), KeyModifiers::CONTROL),
+                (KeyCode::Delete, KeyModifiers::NONE),
+            ] {
+                press(&mut app, key, mods, &mut out);
                 assert!(
-                    matches!(&app.overlay, Some(Overlay::AgentPresets(view)) if view.is_picker()),
-                    "{key:?} leaves the picker up: {:?}",
+                    matches!(
+                        &app.overlay,
+                        Some(Overlay::Confirm(c))
+                            if matches!(&c.action, PendingAction::DeleteAgentPreset { quick: Some(_), .. })
+                    ),
+                    "{key:?} asks before deleting: {:?}",
                     app.overlay
                 );
-                assert_eq!(
-                    app.flash.as_deref(),
-                    Some("presets are added and edited with e in the Sessions panel")
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+                assert!(
+                    matches!(
+                        &app.overlay,
+                        Some(Overlay::AgentPresets(view))
+                            if view.quick.as_ref().is_some_and(|back| back.launch.pr.is_some())
+                    ),
+                    "{key:?}'s confirm backs out to the PR picker: {:?}",
+                    app.overlay
                 );
             }
 
@@ -31656,15 +34270,23 @@ diff --git a/src/c.rs b/src/c.rs
                 let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
                 terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
                 let text = buffer_text(&terminal);
-                assert!(text.contains("no presets yet — a creates one"), "{text}");
-                // Enter and e on nothing only nudge toward `a`.
+                assert!(
+                    text.contains("no presets yet — Ctrl+a creates one"),
+                    "{text}"
+                );
+                // Enter and Ctrl+e on nothing only nudge toward Ctrl+a.
                 press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
                 assert!(matches!(&app.overlay, Some(Overlay::AgentPresets(_))));
                 assert_eq!(
                     app.flash.as_deref(),
-                    Some("no preset selected — a creates one")
+                    Some("no preset selected — Ctrl+a creates one")
                 );
-                press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
+                press(
+                    &mut app,
+                    KeyCode::Char('e'),
+                    KeyModifiers::CONTROL,
+                    &mut out,
+                );
                 assert!(matches!(&app.overlay, Some(Overlay::AgentPresets(_))));
             })
         });
@@ -31816,6 +34438,178 @@ diff --git a/src/c.rs b/src/c.rs
         );
     }
 
+    // ---- the FOLLOW-UP COMPOSER ----
+
+    /// One live agent under the cursor of a focused SESSIONS PANEL.
+    fn follow_up_app() -> App {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Sessions;
+        app.sel_session = 0;
+        app
+    }
+
+    /// Space expands the card, the box then owns every key the panel has —
+    /// `a` types an `a` instead of archiving the session it is being typed
+    /// at — and Enter sends the turn to the agent and folds the card.
+    #[test]
+    fn space_expands_the_card_and_the_box_takes_the_panel_keys() {
+        let mut app = follow_up_app();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            app.follow_up.as_ref().map(|f| f.agent.clone()),
+            Some(AgentId("a1".into())),
+            "the card under the cursor expanded"
+        );
+
+        for c in "add a test".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(
+            app.follow_up.as_ref().map(|f| f.input.as_str()),
+            Some("add a test"),
+            "a, d and t stayed letters"
+        );
+        assert!(
+            !app.tree.agents[0].archived,
+            "nothing the panel would have done happened"
+        );
+        out.clear();
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.follow_up.is_none(), "the card folded back up");
+        let typed: Vec<&ClientRequest> = out
+            .iter()
+            .filter(|r| matches!(r, ClientRequest::Input { .. }))
+            .collect();
+        match typed.as_slice() {
+            [ClientRequest::Input {
+                session: first,
+                data: text,
+            }, ClientRequest::Input {
+                session: second,
+                data: cr,
+            }] => {
+                assert_eq!(first, &SessionRef::Agent(AgentId("a1".into())));
+                assert_eq!(second, first);
+                assert_eq!(text, b"add a test", "one line goes as plain bytes");
+                assert_eq!(cr, b"\r", "and the Enter that submits it follows");
+            }
+            other => panic!("expected the turn then its Enter, got {other:?}"),
+        }
+        assert_eq!(app.flash.as_deref(), Some("sent to agent-1"));
+    }
+
+    /// A turn with line breaks in it crosses as a BRACKETED PASTE, so the
+    /// CLI takes it as one block instead of auto-indenting it to mush.
+    #[test]
+    fn a_multi_line_turn_goes_as_a_bracketed_paste() {
+        let mut app = follow_up_app();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+        // Shift+Enter breaks the line rather than sending.
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, &mut out);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            app.follow_up.as_ref().map(|f| f.input.as_str()),
+            Some("a\nb")
+        );
+        out.clear();
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let sent = out
+            .iter()
+            .find_map(|r| match r {
+                ClientRequest::Input { data, .. } if data != b"\r" => Some(data.clone()),
+                _ => None,
+            })
+            .expect("the turn was sent");
+        assert_eq!(sent, bracketed("a\nb"));
+    }
+
+    /// A session with no live PTY is booted first and the box kept as it
+    /// is: the daemon drops Input for a session it has not spawned, and
+    /// the CLI that attach starts is seconds from reading anything.
+    #[test]
+    fn a_cold_session_is_booted_instead_of_typed_at() {
+        let mut app = follow_up_app();
+        app.tree.agents[0].alive = false;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE, &mut out);
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+
+        assert_eq!(
+            app.follow_up.as_ref().map(|f| f.input.as_str()),
+            Some("x"),
+            "the box and what is in it stay"
+        );
+        assert!(
+            !out.iter().any(|r| matches!(r, ClientRequest::Input { .. })),
+            "nothing was typed into a session that is not up: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { .. })),
+            "it was booted: {out:?}"
+        );
+        assert!(app.flash.as_deref().is_some_and(|f| f.contains("starting")));
+    }
+
+    /// Esc folds the card; an empty box sends nothing.
+    #[test]
+    fn esc_folds_the_card_and_an_empty_box_sends_nothing() {
+        let mut app = follow_up_app();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.follow_up.is_some(), "an empty box stays open");
+        assert!(out.is_empty(), "and sends nothing: {out:?}");
+
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.follow_up.is_none());
+
+        // Space on the folded card expands it again — and then it is a
+        // space, like any other character: a prompt is allowed to contain
+        // one, so Esc and the chevron are what fold the card, never the
+        // key that is being typed into it.
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        assert!(app.follow_up.is_some());
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        assert_eq!(app.follow_up.as_ref().map(|f| f.input.as_str()), Some(" "));
+    }
+
+    /// The box holds the keyboard, so the panel walk has to keep working:
+    /// Tab is the one key that gets through, and the card stays expanded
+    /// behind it.
+    #[test]
+    fn tab_still_walks_out_of_an_open_box() {
+        let mut app = follow_up_app();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.focus, Focus::Terminal, "the walk went through");
+        assert!(app.follow_up.is_some(), "the card is still expanded");
+    }
+
+    /// A paste lands in the box, line breaks and all, rather than in the
+    /// pane behind it.
+    #[test]
+    fn a_paste_lands_in_the_open_box() {
+        let mut app = follow_up_app();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        dispatch_terminal_event(&mut app, Event::Paste("one\ntwo".into()), &mut out);
+        assert_eq!(
+            app.follow_up.as_ref().map(|f| f.input.as_str()),
+            Some("one\ntwo")
+        );
+    }
+
     // ---- INPUT PARITY: a row chosen by the pointer is the row chosen by key ----
     //
     // `event_loop::activate` is the rule; these are its teeth. Each builds
@@ -31952,6 +34746,58 @@ diff --git a/src/c.rs b/src/c.rs
         select_worktree_row(&mut app, root, &mut out);
         app.sel_worktree = root;
         app
+    }
+
+    /// INPUT PARITY: a click on a card's FOLLOW-UP CHEVRON and Space on
+    /// the card are the same thing — `activate::follow_up` — and leave the
+    /// app in the same place, box and all.
+    #[test]
+    fn the_chevron_and_the_space_key_expand_the_same_card() {
+        with_default_config(|| {
+            let mut by_keys = parity_tree();
+            let mut keys_out = Vec::new();
+            click_target(
+                &mut by_keys,
+                HitTarget::Session(0),
+                MouseButton::Left,
+                &mut keys_out,
+            );
+            press(
+                &mut by_keys,
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+                &mut keys_out,
+            );
+
+            let mut by_mouse = parity_tree();
+            let mut mouse_out = Vec::new();
+            click_target(
+                &mut by_mouse,
+                HitTarget::SessionFollowUp(0),
+                MouseButton::Left,
+                &mut mouse_out,
+            );
+
+            assert!(by_mouse.follow_up.is_some(), "the click expanded the card");
+            assert_eq!(
+                by_mouse.follow_up.as_ref().map(|f| f.agent.clone()),
+                by_keys.follow_up.as_ref().map(|f| f.agent.clone()),
+            );
+            assert_eq!(
+                ui_digest(&by_mouse, &mouse_out),
+                ui_digest(&by_keys, &keys_out),
+            );
+
+            // And a second click on the chevron folds it, which is the one
+            // way back the key inside the box does not have.
+            click_target(
+                &mut by_mouse,
+                HitTarget::SessionFollowUp(0),
+                MouseButton::Left,
+                &mut mouse_out,
+            );
+            assert!(by_mouse.follow_up.is_none());
+        });
     }
 
     /// A right-click on a row is a left click on it followed by `m`: the
@@ -32236,11 +35082,21 @@ diff --git a/src/c.rs b/src/c.rs
                     // Drawn, as the clicked one is: the pane's size rides
                     // every Attach.
                     drawn_list_area(&mut by_keys);
-                    let down = if name == "palette" {
+                    // Letters type ahead in the palette and the preset
+                    // lists, so ↓ moves there.
+                    let down = if name == "palette" || name.ends_with("presets") {
                         KeyCode::Down
                     } else {
                         KeyCode::Char('j')
                     };
+                    // The palette opens with its cursor on the top
+                    // session, under the project header drawn above it:
+                    // walk up to the first row before counting down.
+                    if let Some(Overlay::Palette(p)) = &by_keys.overlay {
+                        for _ in 0..p.selected {
+                            press(&mut by_keys, KeyCode::Up, KeyModifiers::NONE, &mut keys_out);
+                        }
+                    }
                     for _ in 0..row {
                         press(&mut by_keys, down, KeyModifiers::NONE, &mut keys_out);
                     }
@@ -32745,6 +35601,14 @@ diff --git a/src/c.rs b/src/c.rs
                 None,
             ),
             (
+                "PullRequests",
+                |app| {
+                    seed_tree(app);
+                    press(app, KeyCode::Char('v'), KeyModifiers::NONE, &mut Vec::new());
+                },
+                None,
+            ),
+            (
                 "BranchSwitch",
                 |app| {
                     seed_tree(app);
@@ -32785,9 +35649,27 @@ diff --git a/src/c.rs b/src/c.rs
                         app,
                         nebula_core::WorktreeId("w1".into()),
                         None,
+                        None,
                     );
                 },
                 Some("AgentPresets"),
+            ),
+            (
+                // Owes the LAUNCHER VIEW's box back, as a picker opened from
+                // the QUICK PROMPT does.
+                "ProjectPicker",
+                |app| {
+                    seed_tree(app);
+                    app.launcher = true;
+                    press(app, KeyCode::Char('p'), KeyModifiers::NONE, &mut Vec::new());
+                    press(
+                        app,
+                        KeyCode::Char('p'),
+                        KeyModifiers::CONTROL,
+                        &mut Vec::new(),
+                    );
+                },
+                Some("Prompt"),
             ),
         ]
     }
@@ -32923,7 +35805,9 @@ diff --git a/src/c.rs b/src/c.rs
             Overlay::AgentPresets(_) => "AgentPresets",
             Overlay::AgentPresetEditor(_) => "AgentPresetEditor",
             Overlay::Issues(_) => "Issues",
+            Overlay::PullRequests(_) => "PullRequests",
             Overlay::BranchSwitch(_) => "BranchSwitch",
+            Overlay::ProjectPicker(_) => "ProjectPicker",
         }
     }
 
@@ -32952,7 +35836,7 @@ diff --git a/src/c.rs b/src/c.rs
             let mut unique = seen.clone();
             unique.dedup();
             assert_eq!(unique, seen, "two rows for the same variant");
-            assert_eq!(seen.len(), 17, "a variant came or went: {seen:?}");
+            assert_eq!(seen.len(), 19, "a variant came or went: {seen:?}");
         });
     }
 
@@ -33066,7 +35950,7 @@ diff --git a/src/c.rs b/src/c.rs
                 seed_tree(app);
                 app.focus = Focus::Sessions;
                 press(app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
-                press(app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+                press(app, KeyCode::Char('a'), KeyModifiers::CONTROL, &mut out);
                 assert!(
                     matches!(app.overlay, Some(Overlay::AgentPresetEditor(_))),
                     "{:?}",

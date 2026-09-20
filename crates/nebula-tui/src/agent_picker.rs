@@ -212,13 +212,23 @@ pub(crate) fn pr_session_menu_rows(worktree: WorktreeId, pr: &OpenPr) -> Vec<Men
 
 /// The harness badge a session row wears: the built-in name, or the
 /// custom entry's label (the id when the entry is gone, the kind name
-/// when the row somehow names none).
+/// when the row somehow names none). Only a CUSTOM harness reads
+/// CONFIG.JSON — a caller drawing a screenful of rows at once should hold
+/// the file open across them ([`session_harness_badge_in`]) rather than
+/// reload it per row.
 pub(crate) fn session_harness_badge(agent: &Agent) -> String {
     match (agent.kind, agent.custom_harness.as_deref()) {
-        (AgentKind::Custom, Some(id)) => Config::load()
-            .effective_harness_by_id(id)
-            .display_label()
-            .to_string(),
+        (AgentKind::Custom, Some(_)) => session_harness_badge_in(agent, &Config::load()),
+        _ => agent.kind.as_str().to_string(),
+    }
+}
+
+/// The same badge against a config already in hand.
+pub(crate) fn session_harness_badge_in(agent: &Agent, cfg: &Config) -> String {
+    match (agent.kind, agent.custom_harness.as_deref()) {
+        (AgentKind::Custom, Some(id)) => {
+            cfg.effective_harness_by_id(id).display_label().to_string()
+        }
         _ => agent.kind.as_str().to_string(),
     }
 }
@@ -260,6 +270,7 @@ mod tests {
             title: "Attach links".into(),
             url: PR_URL.into(),
             is_draft: false,
+            health: Default::default(),
             head: PR_HEAD.into(),
         }
     }
@@ -441,6 +452,7 @@ mod tests {
                     pr: None,
                 },
                 text: "typed so far".into(),
+                from_box: true,
             };
             open_kind_picker(&mut app, KindPicker::quick_prompt(worktree.clone(), back));
             let Some(Overlay::Menu(menu)) = &app.overlay else {
@@ -512,6 +524,7 @@ mod tests {
                         pr: None,
                     },
                     text: String::new(),
+                    from_box: true,
                 };
                 open_kind_picker(&mut app, KindPicker::quick_prompt(worktree.clone(), back));
                 assert_eq!(

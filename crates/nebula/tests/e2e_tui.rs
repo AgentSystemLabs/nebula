@@ -1064,3 +1064,144 @@ fn tui_branch_switcher_moves_the_root_checkout() {
         String::from_utf8_lossy(&stashes.stdout)
     );
 }
+
+/// An SGR mouse report as the terminal would send it: `button` (0 = left,
+/// 32 = left held while moving) at 0-based `col`,`row`.
+fn sgr_mouse(button: u16, col: u16, row: u16, release: bool) -> Vec<u8> {
+    format!(
+        "\x1b[<{button};{};{}{}",
+        col + 1,
+        row + 1,
+        if release { 'm' } else { 'M' }
+    )
+    .into_bytes()
+}
+
+/// Where `needle` first appears on screen: (row, col), in cells.
+fn find_text(screen: &vt100::Screen, needle: &str) -> Option<(u16, u16)> {
+    screen_to_text(screen)
+        .lines()
+        .enumerate()
+        .find_map(|(row, line)| {
+            let at = line.find(needle)?;
+            Some((row as u16, line[..at].chars().count() as u16))
+        })
+}
+
+/// How far back the pane says it is scrolled — the `scroll N` tag in the
+/// TERMINAL header — or 0 at the live tail.
+fn scrolled(screen: &vt100::Screen) -> usize {
+    let text = screen_to_text(screen);
+    text.match_indices("scroll ")
+        .filter_map(|(at, _)| {
+            let digits: String = text[at + 7..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// A drag-select past the pane's top edge scrolls the history under the
+/// pointer on the event loop's own beat — with no further mouse report —
+/// and the release copies rows that were never on screen together. A stub
+/// clipboard tool on PATH catches the copy.
+#[test]
+fn tui_drag_past_the_pane_top_autoscrolls_and_copies_the_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let stub_bin = tempfile::tempdir().unwrap();
+    let copied = stub_bin.path().join("copied");
+    // Whichever tool this platform's copy reaches for.
+    for tool in ["pbcopy", "xclip", "xsel", "wl-copy"] {
+        let stub = stub_bin.path().join(tool);
+        std::fs::write(&stub, format!("#!/bin/sh\ncat > {}\n", copied.display())).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        stub_bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut tui = TuiHarness::spawn_with_env(&[("PATH", path)]);
+    let repo = tui.make_repo("drag-proj");
+
+    tui.wait_for_text("create your first project");
+    add_project(&mut tui, &repo, "drag-proj");
+    tui.send(ENTER); // Projects → Worktrees
+    tui.wait_for_text(FOOTER_WORKTREES);
+    tui.send(ENTER); // Worktrees → Sessions
+    tui.wait_for_text(FOOTER_SESSIONS);
+    tui.send(b"n");
+    tui.wait_for_text("New session");
+    tui.send(ENTER);
+    tui.wait_for_gone("New session");
+    tui.wait_for_text("agent-1");
+    tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
+
+    // Sixty numbered rows out of the stand-in shell: twice the pane's height.
+    tui.type_str("i=1; while [ $i -le 60 ]; do echo \"row $i\"; i=$((i+1)); done");
+    tui.send(ENTER);
+    tui.wait_for_text("row 60");
+
+    // The pane's first content row is two below its TERMINAL header;
+    // `row 58` sits near the bottom of the pane.
+    let (header_row, content_top, row58, col58) = {
+        let parser = tui.parser.lock().unwrap();
+        let screen = parser.screen();
+        let (header_row, _) = find_text(screen, "TERMINAL").expect("the pane header");
+        let (row58, col58) = find_text(screen, "row 58").expect("row 58 on screen");
+        (header_row, header_row + 2, row58, col58)
+    };
+    assert!(
+        row58 > content_top + 5,
+        "row 58 is well inside the pane (header {header_row})"
+    );
+    // Rows on screen above `row 58` at the press; the top one is
+    // `row {58 - visible_above}`.
+    let visible_above = usize::from(row58 - content_top);
+    let off_screen_row = format!("row {}", 58 - visible_above - 3);
+    assert!(!tui.screen_text().contains(&off_screen_row));
+
+    // Press on the last character of `row 58`, drag up onto the pane's
+    // top row, then one row further — onto the rule above it — and rest.
+    tui.send(&sgr_mouse(0, col58 + 5, row58, false));
+    tui.send(&sgr_mouse(32, col58, content_top, false));
+    tui.send(&sgr_mouse(32, col58, content_top - 1, false));
+    // The loop's beat scrolls the history under the resting pointer; the
+    // header counts the lines.
+    tui.wait_for("the pane to scroll back under the held drag", |s| {
+        scrolled(s) >= 5
+    });
+    tui.wait_for_text(&off_screen_row);
+
+    // Release there: the copy runs from rows above anything that was on
+    // screen at the press down to `row 58`.
+    tui.send(&sgr_mouse(0, col58, content_top - 1, true));
+    tui.wait_for_text("copied");
+    let deadline = Instant::now() + WAIT;
+    while !std::fs::read_to_string(&copied).is_ok_and(|t| t.ends_with("row 58")) {
+        assert!(
+            Instant::now() < deadline,
+            "the copy never reached the stub clipboard"
+        );
+        std::thread::sleep(POLL_STEP);
+    }
+    let text = std::fs::read_to_string(&copied).unwrap();
+    let rows: Vec<&str> = text.lines().collect();
+    assert!(
+        rows.len() >= visible_above + 6,
+        "rows above the screen at the press are in the copy: {} rows, {visible_above} visible above row 58\n{text}",
+        rows.len()
+    );
+    assert!(text.contains(&off_screen_row), "{text}");
+    // Every row is one the shell printed, in order.
+    let first: usize = rows[0]
+        .strip_prefix("row ")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("a numbered row first: {:?}", rows[0]));
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(*row, format!("row {}", first + i), "{text}");
+    }
+}

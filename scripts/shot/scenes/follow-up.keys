@@ -1,0 +1,14 @@
+# The FOLLOW-UP COMPOSER: into the root checkout's SESSIONS column, two quick prompts so the column has
+# cards, then Space on the card the second launch left the cursor on and the next turn typed into it —
+# captured before Enter, so the box, the flipped `▾` toggle and the card pushed down below it are all in
+# the frame.
+Tab
+Tab
+p
+Fix the login redirect
+Enter
+p
+Sort the changelog by date
+Enter
+Space
+also add a regression test

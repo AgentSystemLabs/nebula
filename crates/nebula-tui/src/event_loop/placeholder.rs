@@ -84,6 +84,7 @@ pub(super) fn stage_worktree(
 /// PROMPT launch keeps it), its one session row — a `kind` CLI at
 /// `model` / `effort`, named as the create will name it — selected, the
 /// pane showing "starting…" for it. Returns the ids the intents carry.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn stage(
     app: &mut App,
     project: ProjectId,
@@ -92,11 +93,21 @@ pub(super) fn stage(
     custom: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    first_prompt: bool,
     out: &mut Vec<ClientRequest>,
 ) -> PlaceholderRows {
     let focus = app.focus;
     let worktree = stage_worktree(app, project, branch, out);
-    let agent = stage_agent(app, &worktree, kind, custom, model, effort, out);
+    let agent = stage_agent(
+        app,
+        &worktree,
+        kind,
+        custom,
+        model,
+        effort,
+        first_prompt,
+        out,
+    );
     app.focus = focus;
     PlaceholderRows { worktree, agent }
 }
@@ -106,6 +117,16 @@ pub(super) fn stage(
 /// showing "starting…" for it; FOCUS stays where it is. `stage`'s second
 /// half, and on its own the row of a launch waiting on the NEW WORKTREE
 /// modal's checkout (`defer_launch`). Returns the id the intent carries.
+///
+/// A BACKGROUND LAUNCH puts the row up and stops there: nothing is
+/// selected and the pane is not taken, because the launch landed in a
+/// project the user is not looking at.
+///
+/// `first_prompt` is a launch carrying a task (a QUICK PROMPT's, an AGENT
+/// PRESET's): the CLI submits it the moment it boots, so the row is staged
+/// `running` exactly as the DAEMON will create it — the same optimism, one
+/// checkout earlier.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn stage_agent(
     app: &mut App,
     worktree: &WorktreeId,
@@ -113,6 +134,7 @@ pub(super) fn stage_agent(
     custom: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    first_prompt: bool,
     out: &mut Vec<ClientRequest>,
 ) -> AgentId {
     // The name the DAEMON will give the real row: `default_session_name`
@@ -127,12 +149,28 @@ pub(super) fn stage_agent(
     // id across the push — left alone, the cursor would highlight
     // whichever project slid into the vacated row, and `worktree_row_of`
     // below would look for the stand-in among that project's checkouts.
+    //
+    // A BACKGROUND LAUNCH (`launcher::is_background` — a box aimed at
+    // another project with `^P`) is the one that holds nothing: its rows
+    // go up in that project's list and the screen stays where the user
+    // is, cursor and pane included. See the early return below.
     let project = app.selected_project().map(|p| p.id.clone());
+    let background = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|w| &w.id == worktree)
+        .map(|w| w.project_id.clone())
+        .is_some_and(|landed| crate::launcher::is_background(app, &landed));
     app.tree.agents.push(Agent {
         id: agent.clone(),
         worktree_id: worktree.clone(),
         name,
-        status: AgentStatus::Fresh,
+        status: if first_prompt {
+            AgentStatus::Running
+        } else {
+            AgentStatus::Fresh
+        },
         archived: false,
         archived_at: 0,
         unseen: false,
@@ -156,6 +194,16 @@ pub(super) fn stage_agent(
             .position(|i| app.tree.projects[*i].id == id)
     }) {
         app.sel_project = i;
+    }
+    // A prompt fired into another project is not a place to go: the row
+    // is in the tree for that project's list, the cursor above only held
+    // its ground through the re-sort, and nothing else here runs — the
+    // grid, the worktree cursor and the pane stay on the work in front
+    // of the user. The create's Ack is left behind for the same reason
+    // (`quick_launch::submit`).
+    if background {
+        app.dirty = true;
+        return agent;
     }
     // That stamp just moved the row to the top — or, for a PR SESSION's
     // stand-in, under its pull request's row: re-seat the cursor on it.
@@ -417,6 +465,7 @@ pub(super) fn defer_launch(
         draft.custom.clone(),
         draft.model.clone(),
         draft.effort.clone(),
+        draft.starting_prompt.is_some(),
         out,
     );
     draft.placeholder = Some(agent);

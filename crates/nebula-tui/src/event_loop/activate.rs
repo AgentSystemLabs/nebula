@@ -24,7 +24,9 @@ use super::{
     attach_now, jump_to_target, open_link, open_session, run_menu_action, Landing, SettingsCmd,
     WORKTREE_STILL_CREATING,
 };
-use crate::app::{App, ConfirmDialog, DiffView, Focus, Overlay, PendingAction};
+use crate::app::{
+    App, ConfirmDialog, DiffView, Focus, FollowUp, Overlay, PendingAction, SessionRow,
+};
 use nebula_core::{AgentId, ClientRequest, SessionRef, WorktreeId};
 
 /// A CONTEXT MENU row — Enter on the hovered row, a click on any: the menu
@@ -43,9 +45,9 @@ pub(super) fn menu_row(app: &mut App, index: usize, out: &mut Vec<ClientRequest>
 
 /// The PALETTE's selected row — Enter, a click, `Ctrl+O`, `Ctrl+F`: the
 /// palette goes and the panels land on the row's target. `landing` is how:
-/// None is Enter's own rule (the `palette_enter_attaches` SETTING, or the
-/// browser for a pull request), which a click follows too; the two chords
-/// name theirs.
+/// None is Enter's own rule (the `palette_enter_attaches` SETTING, the
+/// browser for a pull request, an attach for a session waiting on you),
+/// which a click follows too; the two chords name theirs.
 pub(super) fn palette_row(app: &mut App, landing: Option<Landing>, out: &mut Vec<ClientRequest>) {
     let Some(Overlay::Palette(palette)) = &app.overlay else {
         return;
@@ -53,7 +55,8 @@ pub(super) fn palette_row(app: &mut App, landing: Option<Landing>, out: &mut Vec
     let Some(target) = palette.selected_target().cloned() else {
         return;
     };
-    let landing = landing.unwrap_or_else(|| Landing::for_enter_on(&target, palette.enter_attaches));
+    let attaches = palette.enter_attaches;
+    let landing = landing.unwrap_or_else(|| Landing::for_enter_on(app, &target, attaches));
     app.overlay = None;
     jump_to_target(app, target, landing, out);
 }
@@ -147,11 +150,15 @@ pub(super) fn settings_row_cmd(hotkeys: bool, selected: usize) -> SettingsCmd {
 }
 
 /// Enter on the WORKTREES PANEL's row — and a double-click on it: a pull
-/// request leads out of nebula, so it is handed to the browser and the
-/// cursor stays put; a checkout hands FOCUS one column right, to its
-/// sessions.
+/// request or an issue leads out of nebula, so it is handed to the browser
+/// and the cursor stays put; a checkout hands FOCUS one column right, to
+/// its sessions.
 pub(super) fn worktrees_row(app: &mut App, out: &mut Vec<ClientRequest>) {
-    match app.selected_worktree_pr().map(|pr| pr.url.clone()) {
+    let link = app
+        .selected_worktree_pr()
+        .map(|pr| pr.url.clone())
+        .or_else(|| app.selected_worktree_issue().map(|i| i.url.clone()));
+    match link {
         Some(url) => open_link(app, &url, out),
         None => app.focus = Focus::Sessions,
     }
@@ -175,6 +182,52 @@ pub(super) fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientReques
     attach_now(app, sref, out);
     app.focus = Focus::Terminal;
     app.term_locked = true;
+}
+
+/// The FOLLOW-UP CHEVRON chosen — `Space` on the card, a click on the
+/// chevron itself, **Follow-up prompt** in the row's CONTEXT MENU: the
+/// selected session card expands into its FOLLOW-UP COMPOSER, or folds back
+/// up if it is the one already open. Expanding another card closes the
+/// first: the box owns the keyboard while it is up, and two of them would
+/// leave no saying which.
+///
+/// Carries no id, like `ViewPrDiff`: the card is the selection, and the
+/// click path moves the cursor onto the row before it gets here, so all
+/// three routes read the same row.
+pub(super) fn follow_up(app: &mut App) {
+    let Some(row) = app.selected_session_row() else {
+        return;
+    };
+    if let SessionRow::Agent(a) = &row {
+        if app.follow_up.as_ref().is_some_and(|f| f.agent == a.id) {
+            app.follow_up = None;
+            app.dirty = true;
+            return;
+        }
+    }
+    if !app.takes_follow_up(&row) {
+        app.flash = Some(match &row {
+            SessionRow::Agent(a) if a.archived => {
+                "archived sessions take no follow-up — u brings it back".into()
+            }
+            SessionRow::Agent(a) if a.cloud_session_id.is_some() => {
+                "cloud sessions take a queued message — m, then Send to cloud session".into()
+            }
+            SessionRow::Agent(_) => "the session is still starting".into(),
+            SessionRow::Terminal(_) => "terminals take typing in the pane — Enter attaches".into(),
+            SessionRow::Link(_) => "a pull request takes a comment — y".into(),
+        });
+        return;
+    }
+    let SessionRow::Agent(a) = row else {
+        return;
+    };
+    app.follow_up = Some(FollowUp {
+        agent: a.id,
+        input: crate::text_input::TextInput::multiline(),
+    });
+    app.focus = Focus::Sessions;
+    app.dirty = true;
 }
 
 /// Bring an archived agent back — `u` on its row, **Unarchive** in its

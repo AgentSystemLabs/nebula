@@ -241,6 +241,13 @@ pub struct AgentStatusMachine {
     /// the turn ended around the dialog. A `permission_prompt` notification
     /// inside `LATE_PROMPT_NOTIFICATION_GRACE` of it is a late echo.
     feedback_left_at: Option<Instant>,
+    /// Set for a session the CREATE stamped `running` before its CLI had
+    /// said anything — a launch handed a first prompt (see
+    /// [`AgentStatusMachine::launching`]). The one `9;4;0` such a CLI
+    /// prints as it draws its input box is the boot, not that turn ending,
+    /// so it is swallowed once. Any other event is real news and spends
+    /// the reprieve.
+    launch_idle_pending: bool,
 }
 
 impl AgentStatusMachine {
@@ -257,6 +264,21 @@ impl AgentStatusMachine {
             waiting_on: None,
             question_open: false,
             feedback_left_at: None,
+            launch_idle_pending: false,
+        }
+    }
+
+    /// The machine for a row created `running` before its CLI booted: a
+    /// launch that hands the harness its first prompt (`claude "<task>"`)
+    /// is working from the moment it spawns, and the CREATE says so rather
+    /// than leaving the row gray until the first hook lands seconds later
+    /// (`Daemon::create_agent`). Nothing is emitted — the persisted row is
+    /// already `running`; what the machine carries is the reprieve for the
+    /// startup progress-clear that arrives before the turn begins.
+    pub fn launching() -> Self {
+        Self {
+            launch_idle_pending: true,
+            ..Self::new(AgentStatus::Running, None)
         }
     }
 
@@ -307,6 +329,12 @@ impl AgentStatusMachine {
                 effects.push(Effect::SaveSessionId(sid.to_string()));
             }
         }
+
+        // Every event but the swallowed startup progress-clear below is
+        // news from the CLI, so an optimistic launch's reprieve lasts
+        // exactly until the first of them (foreign traffic returned above
+        // without spending it).
+        let launch_idle_pending = std::mem::take(&mut self.launch_idle_pending);
 
         let was_waiting = self.status == AgentStatus::NeedsFeedback;
         match event {
@@ -418,6 +446,13 @@ impl AgentStatusMachine {
                         self.finished_at = None;
                         self.set_status(AgentStatus::Running, &mut effects);
                     }
+                } else if launch_idle_pending && self.status == AgentStatus::Running {
+                    // The startup `9;4;0` of a CLI the CREATE stamped
+                    // `running` for the prompt it was launched with: it is
+                    // parking at its input box on the way to that prompt,
+                    // and the turn has not started, let alone ended.
+                    // Swallowed once — the reprieve is spent now, so the
+                    // `0` that really ends the turn lands below.
                 } else if matches!(
                     self.status,
                     AgentStatus::Running | AgentStatus::NeedsFeedback
@@ -1312,6 +1347,75 @@ mod tests {
 
     fn progress(m: &mut AgentStatusMachine, busy: bool, now: Instant) -> Vec<Effect> {
         m.handle(HookEvent::Progress { busy }, None, now)
+    }
+
+    /// A row the CREATE stamped `running` for the prompt its CLI was
+    /// launched with: the `9;4;0` that CLI prints as it draws its input box
+    /// arrives *before* the turn starts, and reading it as the turn's end
+    /// would flash the row green a second after it went yellow.
+    #[test]
+    fn an_optimistic_launch_survives_the_clis_startup_progress_clear() {
+        let mut m = AgentStatusMachine::launching();
+        let now = t0();
+        assert_eq!(m.status(), AgentStatus::Running);
+
+        let fx = progress(&mut m, false, now);
+        assert!(fx.is_empty(), "the startup clear is swallowed: {fx:?}");
+        assert_eq!(m.status(), AgentStatus::Running);
+
+        // The turn it was launched with, then its real end.
+        let fx = progress(&mut m, true, now + Duration::from_secs(1));
+        assert!(fx.is_empty(), "already running: {fx:?}");
+        let fx = progress(&mut m, false, now + Duration::from_secs(9));
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    /// The reprieve is one event wide: any news from the CLI spends it, so
+    /// the progress clear that ends the launched turn still finishes it even
+    /// when no `0` came at startup.
+    #[test]
+    fn the_launch_reprieve_is_spent_by_the_first_news() {
+        let mut m = AgentStatusMachine::launching();
+        let now = t0();
+        let fx = m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        assert_eq!(
+            status_of(&fx),
+            None,
+            "the CREATE already said running, so the status does not move: {fx:?}"
+        );
+        let fx = progress(&mut m, false, now + Duration::from_secs(4));
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    /// A hook from another Claude session in the same checkout is dropped
+    /// before it can spend the reprieve.
+    #[test]
+    fn a_foreign_hook_does_not_spend_the_launch_reprieve() {
+        let mut m = AgentStatusMachine::launching();
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("mine"), now);
+        m.handle(
+            HookEvent::PreToolUse {
+                tool_name: Some("Bash".into()),
+                subagent_id: None,
+            },
+            Some("theirs"),
+            now,
+        );
+        let mut m2 = AgentStatusMachine::launching();
+        m2.handle(
+            HookEvent::PreToolUse {
+                tool_name: Some("Bash".into()),
+                subagent_id: None,
+            },
+            Some("theirs"),
+            now,
+        );
+        // m2 never adopted a session id, so nothing was foreign there —
+        // what this pins is the first machine: its own prompt hook set the
+        // id, and the stranger's tool call after it changed nothing.
+        assert_eq!(m.status(), AgentStatus::Running);
+        assert_eq!(m2.status(), AgentStatus::Running);
     }
 
     #[test]

@@ -1130,6 +1130,16 @@ impl Daemon {
         // way at boot.
         let harness = resolve_harness(kind, custom_harness.as_deref())?;
         let program = harness.program.trim().to_string();
+        // A launch that hands the CLI a first prompt is working from the
+        // moment it spawns, so the row says so now instead of staying gray
+        // until the CLI has booted and its first hook has landed — seconds
+        // in which the session the user just started looked idle and sorted
+        // under every session mid-turn.
+        let optimistic_run = Self::launch_submits_first_prompt(
+            &harness,
+            starting_prompt.as_deref(),
+            pr_url.is_some() || issue_url.is_some(),
+        ) && cloud_prompt.is_none();
         let worktree = self
             .store
             .get_worktree(&worktree_id)?
@@ -1163,7 +1173,11 @@ impl Daemon {
             } else {
                 name.trim().to_string()
             },
-            status: AgentStatus::Fresh,
+            status: if optimistic_run {
+                AgentStatus::Running
+            } else {
+                AgentStatus::Fresh
+            },
             archived: false,
             archived_at: 0,
             unseen: false,
@@ -1188,6 +1202,16 @@ impl Daemon {
             pr_url.as_deref(),
             issue_url.as_deref(),
         )?;
+        if optimistic_run {
+            // Seeded by hand, ahead of the spawn, so the CLI's own startup
+            // progress-clear cannot green the row out before its turn has
+            // begun — and so nothing seeds a plain `running` machine from
+            // the row first.
+            self.status_machines
+                .lock()
+                .unwrap()
+                .insert(agent.id.clone(), AgentStatusMachine::launching());
+        }
         if adopted.is_none() {
             // Cold path: boot the CLI right away.
             let spawned = self.spawn_agent_session_with(
@@ -1215,10 +1239,38 @@ impl Daemon {
         Ok(EntityId::Agent(agent.id))
     }
 
+    /// Does a cold spawn of this launch hand the CLI a first prompt — the
+    /// turn that makes a created row `running` before a single hook has
+    /// fired? Asked of the two places that decide it, so it cannot drift
+    /// from them: [`crate::pr_scope::launch_prompts`], which folds a launch
+    /// rule (a PR SESSION's, an ISSUE SESSION's) into the first prompt on a
+    /// harness with no system-prompt flag, and the argv builder's prepend
+    /// shape, which puts nebula's guidance there
+    /// ([`agent_spawn_command_with`]). The rule's text is built per spawn
+    /// from the checkout; only whether there *is* one matters here, so a
+    /// stand-in stands in for it.
+    fn launch_submits_first_prompt(
+        harness: &nebula_core::harness::HarnessDescriptor,
+        starting_prompt: Option<&str>,
+        rule: bool,
+    ) -> bool {
+        harness.system.prepend_to_first_prompt
+            || crate::pr_scope::launch_prompts(
+                harness.system.append_flag.is_some(),
+                // A row being created has no session to resume.
+                false,
+                rule.then_some("<rule>"),
+                starting_prompt,
+            )
+            .initial
+            .is_some()
+    }
+
     fn rollback_agent_on_spawn_error<T>(&self, id: &AgentId, result: Result<T>) -> Result<T> {
         match result {
             Ok(value) => Ok(value),
             Err(spawn_error) => {
+                self.status_machines.lock().unwrap().remove(id);
                 if let Err(rollback_error) = self.store.delete_agent(id) {
                     return Err(spawn_error.context(format!(
                         "agent spawn failed and its database rollback also failed: {rollback_error:#}"
@@ -5042,6 +5094,127 @@ mod tests {
             daemon.prewarmed.lock().unwrap().contains_key(&key),
             "a starting-prompt create must not adopt the warm spare"
         );
+    }
+
+    /// Which launches boot straight into a turn — the question the
+    /// optimistic `running` hangs on. Claude and Pi take a launch rule on
+    /// their system-prompt flag, so only a task makes them work at once;
+    /// Codex, Cursor and Muse have no such flag, so the rule itself opens
+    /// their first prompt.
+    #[test]
+    fn a_launch_submits_a_first_prompt_when_it_carries_a_task_or_an_unflagged_rule() {
+        for kind in AgentKind::ALL {
+            if kind == AgentKind::Custom {
+                continue; // no descriptor without a registry entry
+            }
+            let harness = resolve_harness(kind, None).unwrap();
+            let flagged = harness.system.append_flag.is_some();
+            assert!(
+                Daemon::launch_submits_first_prompt(&harness, Some("Fix auth"), false),
+                "{kind:?}: a task is always the first prompt"
+            );
+            assert!(
+                Daemon::launch_submits_first_prompt(&harness, Some("Fix auth"), true),
+                "{kind:?}: a task beside a rule too"
+            );
+            assert_eq!(
+                Daemon::launch_submits_first_prompt(&harness, None, true),
+                !flagged,
+                "{kind:?}: a bare rule opens the first prompt only without the flag"
+            );
+            assert!(
+                !Daemon::launch_submits_first_prompt(&harness, None, false),
+                "{kind:?}: a bare launch parks at the CLI's own input"
+            );
+        }
+    }
+
+    /// The row the clients are told about is already `running` when the
+    /// launch carries a task: the CLI submits it as it boots, and the
+    /// session must not sit gray — and sort under everything mid-turn —
+    /// for the seconds until its first hook lands.
+    #[tokio::test]
+    async fn a_create_with_a_task_broadcasts_a_running_row() {
+        let daemon = test_daemon();
+        let (dir, worktree) = run_worktree(&daemon);
+        // `/bin/cat` stands in for the CLI: spawned verbatim, it blocks on
+        // the PTY instead of running anything.
+        let _cmd = EnvGuard::set(env::AGENT_CMD, "/bin/cat");
+        let spec = |name: &str, task: Option<&str>| CreateAgentSpec {
+            worktree: worktree.id.clone(),
+            name: name.into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: task.map(String::from),
+            pr_url: None,
+            issue_url: None,
+        };
+
+        let created = |mut events: broadcast::Receiver<ServerEvent>| {
+            std::iter::from_fn(|| events.try_recv().ok())
+                .find_map(|e| match e {
+                    ServerEvent::EntityUpserted {
+                        entity: Entity::Agent(a),
+                    } => Some(a),
+                    _ => None,
+                })
+                .expect("the create broadcasts its row")
+        };
+
+        let events = daemon.events.subscribe();
+        let EntityId::Agent(with_task) = daemon
+            .create_agent(spec("task", Some("Fix auth")))
+            .await
+            .unwrap()
+        else {
+            panic!("a create makes an agent");
+        };
+        assert_eq!(created(events).status, AgentStatus::Running);
+        assert_eq!(
+            daemon.store.get_agent(&with_task).unwrap().unwrap().status,
+            AgentStatus::Running,
+            "and that is what a restart reads back"
+        );
+        // Seeded with its reprieve, so the CLI's startup progress-clear
+        // cannot green it out before the turn begins.
+        daemon.apply_hook_event(&with_task, HookEvent::Progress { busy: false }, None);
+        assert_eq!(
+            daemon.store.get_agent(&with_task).unwrap().unwrap().status,
+            AgentStatus::Running
+        );
+
+        // A launch with nothing to do still parks at the CLI's input box.
+        let events = daemon.events.subscribe();
+        daemon.create_agent(spec("bare", None)).await.unwrap();
+        assert_eq!(created(events).status, AgentStatus::Fresh);
+        drop(dir);
+    }
+
+    /// Save/restore around a process-wide env var a test has to set.
+    struct EnvGuard {
+        key: &'static str,
+        was: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let was = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, was }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.was.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 
     #[test]

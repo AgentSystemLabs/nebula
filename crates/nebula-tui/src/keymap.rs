@@ -83,6 +83,9 @@ pub enum Action {
     /// place, commented on, with a QUICK PROMPT or an AGENT PRESET launched
     /// on one.
     Issues,
+    /// `v`: the PULL REQUESTS MODAL — the project's open pull requests,
+    /// read in place, commented on, with a PR SESSION launched on one.
+    PullRequests,
     /// `c`: the BRANCH SWITCHER — move the project's ROOT WORKTREE onto
     /// another branch, asking what to do with uncommitted changes.
     SwitchBranch,
@@ -109,6 +112,10 @@ pub enum Action {
     AgentPresets,
     /// The QUICK PROMPT: type a task, launch an agent on it.
     QuickPrompt,
+    /// `Space`: expand the selected session card into its FOLLOW-UP
+    /// COMPOSER — the next turn typed into the card itself — or fold it
+    /// back up.
+    FollowUp,
     // files
     FindFile,
     Grep,
@@ -360,6 +367,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         defaults: &["i"],
     },
     ActionSpec {
+        action: Action::PullRequests,
+        id: "pull_requests",
+        label: "GitHub pull requests",
+        hint: "List the project's open pull requests; Enter prompts a PR session on one, e launches a preset on it, n picks a harness",
+        group: "PROJECTS & WORKTREES",
+        scope: Scope::Global,
+        defaults: &["v"],
+    },
+    ActionSpec {
         action: Action::SwitchBranch,
         id: "switch_branch",
         label: "Switch root branch",
@@ -467,6 +483,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["p"],
+    },
+    ActionSpec {
+        action: Action::FollowUp,
+        id: "follow_up",
+        label: "Follow-up prompt",
+        hint: "Expand the selected session's card into a box for its next turn, sent to the running agent on Enter; the cards below move down, and Esc or the card's chevron folds it back",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["space"],
     },
     // ---- FILES ----
     ActionSpec {
