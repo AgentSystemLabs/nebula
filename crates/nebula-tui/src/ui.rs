@@ -4126,23 +4126,64 @@ enum SessionEntry {
     /// The ARCHIVED group header, in whichever form the toggle is in.
     ArchivedHeader(String),
     /// Index into `visible_session_rows()`, plus how many RECENT PROMPTS
-    /// lines hang under its pill (see [`session_prompt_lines`]).
+    /// lines hang under its pill (see [`session_prompt_lines`]) and how
+    /// many rows its FOLLOW-UP COMPOSER takes under those (see
+    /// [`follow_up_rows`]) — 0 on every folded card.
     Row {
         index: usize,
         prompts: usize,
+        follow_up: usize,
     },
 }
 
 impl SessionEntry {
     /// Rows the entry occupies: a header one, a pill its 3-row cell (they
     /// stack on a `PILL_H` stride, so neighboring pads overlap) plus any
-    /// prompt lines inside it.
+    /// prompt lines and FOLLOW-UP COMPOSER inside it.
     fn height(&self) -> usize {
         match self {
-            SessionEntry::Row { prompts, .. } => PILL_H as usize + 1 + prompts,
+            SessionEntry::Row {
+                prompts, follow_up, ..
+            } => PILL_H as usize + 1 + prompts + follow_up,
             _ => 1,
         }
     }
+}
+
+/// The most text rows the FOLLOW-UP COMPOSER grows to before it scrolls
+/// under its own caret. Four is a paragraph of instruction in a 30-column
+/// panel; past that the box would own the column and push every card below
+/// it off the bottom for a prompt nobody reads back in full anyway.
+const FOLLOW_UP_MAX_LINES: usize = 4;
+
+/// Rows the FOLLOW-UP COMPOSER takes inside its card: the framed box —
+/// title row, text, hint row — or 0 for every card but the expanded one.
+/// The layout and the draw both ask, so the height they agree on is
+/// computed once here from the text as it wraps at this width.
+fn follow_up_rows(app: &App, index: usize, width: u16) -> usize {
+    if app.follow_up_row() != Some(index) {
+        return 0;
+    }
+    let Some(follow_up) = &app.follow_up else {
+        return 0;
+    };
+    let lines = multiline_input_lines(
+        &follow_up.input,
+        follow_up_text_width(width),
+        app.theme.accent,
+        app.theme,
+    )
+    .0
+    .len();
+    2 + lines.clamp(1, FOLLOW_UP_MAX_LINES)
+}
+
+/// Columns of typing inside the composer's frame, at a panel `width`: the
+/// pill's rail column, the box's two borders and a space either side of
+/// the text come off it first. Never 0 — a column dragged down to
+/// [`crate::app::MIN_PANEL_W`] still has to wrap somewhere.
+fn follow_up_text_width(width: u16) -> usize {
+    (width as usize).saturating_sub(5).max(1)
 }
 
 /// How many RECENT PROMPTS lines a row carries under its pill: the
@@ -4294,13 +4335,25 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
             let end = (start + len).min(rows.len());
             for (i, row) in rows.iter().enumerate().take(end).skip(start) {
                 let prompts = session_prompt_lines(app, row);
-                layout.push((*vrow, SessionEntry::Row { index: i, prompts }));
+                // The expanded card's FOLLOW-UP COMPOSER is laid out like
+                // its prompt lines — inside the pill, billed to this entry
+                // — so opening it pushes every card below it down the
+                // column and off the bottom, and the scroll follows.
+                let follow_up = follow_up_rows(app, i, inner.width);
+                layout.push((
+                    *vrow,
+                    SessionEntry::Row {
+                        index: i,
+                        prompts,
+                        follow_up,
+                    },
+                ));
                 // Pills stack on a `PILL_H` stride, sharing their pads;
-                // one with prompt lines inside it grows by them and keeps
-                // its bottom pad, so the next pill starts below that.
+                // one with rows of its own inside it grows by them and
+                // keeps its bottom pad, so the next pill starts below that.
                 *vrow += PILL_H as usize;
-                if prompts > 0 {
-                    *vrow += 1 + prompts;
+                if prompts + follow_up > 0 {
+                    *vrow += 1 + prompts + follow_up;
                 }
             }
         };
@@ -4355,12 +4408,28 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     let content_h = layout.last().map_or(0, |(top, e)| top + e.height());
     // The cursor pulls the viewport, but only on the frames where it
     // actually moved — otherwise a wheel scroll would snap straight back.
-    let anchor = (app.sel_worktree, app.sel_session);
+    // Expanding a card, and every line typed into it, counts as a move:
+    // the box is what the user is looking at, and it has to stay on
+    // screen as it grows.
+    let composer = layout
+        .iter()
+        .find_map(|(_, e)| match e {
+            SessionEntry::Row { follow_up, .. } if *follow_up > 0 => Some(*follow_up),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let anchor = (app.sel_worktree, app.sel_session, composer);
     if app.sessions_anchor != Some(anchor) {
         app.sessions_anchor = Some(anchor);
-        if let Some(pos) = layout.iter().position(
-            |(_, e)| matches!(e, SessionEntry::Row { index, .. } if *index == app.sel_session),
-        ) {
+        // The expanded card pulls the viewport ahead of the cursor's own
+        // row: the box is where the keyboard is pointed, and a cursor
+        // parked elsewhere (a click that moved it, a re-sort that did)
+        // must not scroll the box being typed into off the screen.
+        let wanted = app.follow_up_row().unwrap_or(app.sel_session);
+        if let Some(pos) = layout
+            .iter()
+            .position(|(_, e)| matches!(e, SessionEntry::Row { index, .. } if *index == wanted))
+        {
             let (top, entry) = &layout[pos];
             // Scrolling up to the first row of a group brings that group's
             // header along, so the cursor never sits under a bare edge.
@@ -4402,8 +4471,12 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
                     app.hits.push((r, HitTarget::ArchivedHeader));
                 }
             }
-            SessionEntry::Row { index, prompts } => {
-                let hit_h = row_hit_height(*top, next_top, *prompts);
+            SessionEntry::Row {
+                index,
+                prompts,
+                follow_up,
+            } => {
+                let hit_h = row_hit_height(*top, next_top, *prompts + *follow_up);
                 draw_session_row(
                     f,
                     app,
@@ -4412,6 +4485,7 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
                     hit_h,
                     *index,
                     *prompts,
+                    *follow_up,
                     &rows[*index],
                     focused,
                 )
@@ -4424,7 +4498,9 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// `hit_h` is the row's click target height (see [`row_hit_height`]);
-/// `prompts` how many RECENT PROMPTS lines to hang under the pill.
+/// `prompts` how many RECENT PROMPTS lines to hang under the pill, and
+/// `follow_up` how many rows the FOLLOW-UP COMPOSER takes under those (see
+/// [`follow_up_rows`]) — 0 on every card but the expanded one.
 #[allow(clippy::too_many_arguments)]
 fn draw_session_row(
     f: &mut Frame,
@@ -4434,11 +4510,24 @@ fn draw_session_row(
     hit_h: u16,
     index: usize,
     prompts: usize,
+    follow_up: usize,
     row: &SessionRow,
     focused: bool,
 ) {
     let th = app.theme;
     let width = inner.width;
+    // The FOLLOW-UP CHEVRON: the card's own toggle, two columns at the end
+    // of the name row, taken out of the name's budget before anything else
+    // is measured. Only on a card that can grow a box (`takes_follow_up`)
+    // — the rest of the column keeps its full width.
+    let chevron = if !app.takes_follow_up(row) {
+        None
+    } else if follow_up > 0 {
+        Some((" ▾", th.accent))
+    } else {
+        Some((" ▸", th.dim))
+    };
+    let chevron_w = chevron.map_or(0, |(glyph, _)| glyph.chars().count());
     // Each arm yields its spans and the rail color: the STATUS DOT's on an
     // agent row, the accent on the rows that have no dot.
     let (spans, mark) = match row {
@@ -4510,8 +4599,10 @@ fn draw_session_row(
                 ago_badge(a.status_changed_at)
             };
             // 3 = the pill's selection marker plus the status dot, both of
-            // which render ahead of the name.
-            let free = (width.saturating_sub(3) as usize).saturating_sub(badge.chars().count());
+            // which render ahead of the name; the FOLLOW-UP CHEVRON, when
+            // the card has one, renders after the badge.
+            let free = (width.saturating_sub(3) as usize)
+                .saturating_sub(badge.chars().count() + chevron_w);
             let (ago, name_max) = fit_ago(ago, free);
             // Archived rows stay quiet even if their last status was live.
             let ramp = if a.archived || pending || cold {
@@ -4600,20 +4691,158 @@ fn draw_session_row(
         }
     };
     let selected = index == app.sel_session;
-    render_pill_body(f, inner, top, spans, selected, focused, th, mark, prompts);
+    let mut spans = spans;
+    if let Some((glyph, color)) = chevron {
+        spans.push(Span::styled(glyph, Style::default().fg(color)));
+    }
+    render_pill_body(
+        f,
+        inner,
+        top,
+        spans,
+        selected,
+        focused,
+        th,
+        mark,
+        prompts + follow_up,
+    );
+    let bar = selected.then(|| pill_bar(focused, mark, th));
     if prompts > 0 {
         if let SessionRow::Agent(a) = row {
             // Inside the pill, straight under the name: its bottom pad
             // closes under the last line, so a selected row's history
             // sits on the row's own fill and reads as part of the session
             // the cursor is on, not as rows of its own beneath it.
-            let bar = selected.then(|| pill_bar(focused, mark, th));
             let first_row = top + PILL_H as isize;
             draw_prompt_lines(f, inner, first_row, &a.recent_prompts, prompts, bar, th);
         }
     }
+    if follow_up > 0 {
+        // Under the history, still inside the pill: the card grows a box
+        // rather than putting one over the screen, which is the whole
+        // point of it — the session, what it was last asked, and what it
+        // is about to be asked read as one card.
+        let first_row = top + PILL_H as isize + prompts as isize;
+        draw_follow_up_box(f, app, inner, first_row, follow_up, bar, th);
+        // Ahead of the row's target: a click inside the box is a click on
+        // the box, not a second click on the card — which would attach the
+        // session and lock the pane out from under the typing.
+        if let Some(r) = rows_rect_at(inner, first_row, follow_up as u16) {
+            app.hits.push((r, HitTarget::FollowUpBox));
+        }
+    }
+    // The chevron's own target, ahead of the row's so a click on it
+    // toggles the card instead of selecting it twice.
+    if chevron.is_some() {
+        if let Some(r) = row_rect_at(inner, top + 1) {
+            let cell = Rect {
+                x: r.x + r.width.saturating_sub(chevron_w as u16),
+                width: (chevron_w as u16).min(r.width),
+                ..r
+            };
+            app.hits.push((cell, HitTarget::SessionFollowUp(index)));
+        }
+    }
     if let Some(hit) = rows_rect_at(inner, top, hit_h) {
         app.hits.push((hit, HitTarget::Session(index)));
+    }
+}
+
+/// The FOLLOW-UP COMPOSER, `rows` tall from `first_row` inside its card: a
+/// framed box with `follow-up` on its top border, the turn being typed
+/// inside it, and the keys that send it on the bottom one — the task box's
+/// shape, drawn a row at a time so a card straddling the top of the column
+/// loses only the rows that scrolled off.
+///
+/// `bar` is the pill's `(fill, rail)` when the card is the selected one, as
+/// [`draw_prompt_lines`] takes it: the box then sits on the row's own fill
+/// and carries the rail down its first column, so card and box are one
+/// slab. The frame is the accent — this is where the keyboard is pointed.
+fn draw_follow_up_box(
+    f: &mut Frame,
+    app: &App,
+    inner: Rect,
+    first_row: isize,
+    rows: usize,
+    bar: Option<(Color, Color)>,
+    th: Theme,
+) {
+    let Some(follow_up) = &app.follow_up else {
+        return;
+    };
+    let base = bar.map_or_else(Style::default, |(fill, _)| Style::default().bg(fill));
+    let marker = match bar {
+        Some((_, rail)) => Span::styled(PILL_RAIL, Style::default().fg(rail)),
+        None => Span::raw(" "),
+    };
+    let frame = Style::default().fg(th.accent);
+    // Everything but the rail column belongs to the box.
+    let box_w = (inner.width as usize).saturating_sub(1).max(2);
+    let text_w = follow_up_text_width(inner.width);
+    let put = |f: &mut Frame, row: isize, mut spans: Vec<Span<'static>>| {
+        if let Some(r) = row_rect_at(inner, row) {
+            spans.insert(0, marker.clone());
+            f.render_widget(Paragraph::new(Line::from(spans)).style(base), r);
+        }
+    };
+
+    // Top border: ╭─ follow-up ──────╮
+    let title = truncate(" follow-up ", box_w.saturating_sub(3));
+    let fill = box_w.saturating_sub(3 + title.chars().count());
+    put(
+        f,
+        first_row,
+        vec![Span::styled(
+            format!("╭─{title}{}╮", "─".repeat(fill)),
+            frame,
+        )],
+    );
+
+    // The text, windowed on the caret the way every other box windows it.
+    let visible = rows.saturating_sub(2).max(1);
+    let (lines, caret_row) = multiline_input_lines(&follow_up.input, text_w, th.accent, th);
+    let max_start = lines.len().saturating_sub(visible);
+    let start = caret_row.saturating_sub(visible / 2).min(max_start);
+    for i in 0..visible {
+        let mut spans = vec![Span::styled("│ ", frame)];
+        let mut used = 0usize;
+        if let Some(line) = lines.get(start + i) {
+            for span in &line.spans {
+                used += span.content.chars().count();
+                spans.push(Span::styled(span.content.to_string(), span.style));
+            }
+        }
+        spans.push(Span::raw(" ".repeat(text_w.saturating_sub(used))));
+        spans.push(Span::styled(" │", frame));
+        put(f, first_row + 1 + i as isize, spans);
+    }
+
+    // Bottom border, carrying the keys: ╰─ ↵ send · ^J nl · Esc ─╯
+    let hint = follow_up_hint(box_w);
+    let fill = box_w.saturating_sub(3 + hint.chars().count());
+    put(
+        f,
+        first_row + rows as isize - 1,
+        vec![Span::styled(
+            format!("╰─{hint}{}╯", "─".repeat(fill)),
+            frame,
+        )],
+    );
+}
+
+/// The keys on the composer's bottom border, widest that fits `width` (the
+/// box's own, borders included). The column is narrow and a hint wider
+/// than its border is silently chopped, so this steps down the way
+/// [`task_prompt_hint`] does.
+fn follow_up_hint(width: usize) -> &'static str {
+    if width >= 32 {
+        " ↵ send · ⇧↵ newline · Esc close "
+    } else if width >= 24 {
+        " ↵ send · ^J nl · Esc "
+    } else if width >= 14 {
+        " ↵ · ^J · Esc "
+    } else {
+        ""
     }
 }
 
@@ -7364,6 +7593,204 @@ mod tests {
             .unwrap();
         assert_eq!(app.worktrees_view_rows, 1, "three title rows, one pill");
         assert_eq!(app.worktrees_half_page(), 1, "never less than a row");
+    }
+
+    /// A card expanded into its FOLLOW-UP COMPOSER grows a framed box
+    /// inside the pill, and everything under it in the column moves down
+    /// by exactly what the box took — off the bottom if the column runs
+    /// out, which is what the scroll is for.
+    #[test]
+    fn the_expanded_card_grows_a_box_and_pushes_the_cards_below_it_down() {
+        let mut app = hit_test_app(&["main"], &["alpha", "beta", "gamma"], &[]);
+        let area = Rect::new(0, 0, 34, 20);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 20)).unwrap();
+        let rows_of = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| -> Vec<String> {
+            let buf = terminal.backend().buffer().clone();
+            (0..20)
+                .map(|y| {
+                    (0..34)
+                        .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                        .collect()
+                })
+                .collect()
+        };
+        let row_at = |lines: &[String], needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} on screen:\n{}", lines.join("\n")))
+        };
+
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        let folded = rows_of(&terminal);
+        let (alpha, beta, gamma) = (
+            row_at(&folded, "alpha"),
+            row_at(&folded, "beta"),
+            row_at(&folded, "gamma"),
+        );
+        assert!(
+            folded[alpha].contains('▸'),
+            "every card wears its toggle: {:?}",
+            folded[alpha]
+        );
+        assert!(!folded.iter().any(|l| l.contains("follow-up")));
+
+        app.follow_up = Some(crate::app::FollowUp {
+            agent: nebula_core::AgentId("a0".into()),
+            input: crate::text_input::TextInput::multiline(),
+        });
+        app.hits.clear();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        let open = rows_of(&terminal);
+
+        assert_eq!(row_at(&open, "alpha"), alpha, "the card itself stays put");
+        assert!(
+            open[alpha].contains('▾'),
+            "its toggle flipped: {:?}",
+            open[alpha]
+        );
+        let title = row_at(&open, "follow-up");
+        assert_eq!(title, alpha + 1, "the box opens straight under the name");
+        assert!(open[title].contains("╭─ follow-up"), "{:?}", open[title]);
+        assert!(
+            open[title + 2].contains('╰') && open[title + 2].contains("Esc"),
+            "the keys ride the bottom border: {:?}",
+            open[title + 2]
+        );
+
+        // An empty box is three rows — border, one line of typing, border
+        // — and the card also gives up the bottom pad it was sharing with
+        // the next one, exactly as a card with RECENT PROMPTS does.
+        let grew = 4;
+        assert_eq!(row_at(&open, "beta"), beta + grew);
+        assert_eq!(row_at(&open, "gamma"), gamma + grew);
+    }
+
+    /// The box grows with what is typed into it, up to its cap, and the
+    /// cards below keep moving down with it.
+    #[test]
+    fn the_box_grows_by_the_lines_typed_into_it() {
+        let mut app = hit_test_app(&["main"], &["alpha", "beta"], &[]);
+        let area = Rect::new(0, 0, 34, 24);
+        let width = 32; // draw_column's inner width at 34
+
+        let mut input = crate::text_input::TextInput::multiline();
+        assert_eq!(follow_up_rows(&app, 0, width), 0, "nothing expanded yet");
+        app.follow_up = Some(crate::app::FollowUp {
+            agent: nebula_core::AgentId("a0".into()),
+            input: input.clone(),
+        });
+        assert_eq!(follow_up_rows(&app, 0, width), 3, "empty: one line of room");
+        assert_eq!(follow_up_rows(&app, 1, width), 0, "only the expanded card");
+
+        input.insert_str("one\ntwo\nthree");
+        app.follow_up.as_mut().unwrap().input = input.clone();
+        assert_eq!(follow_up_rows(&app, 0, width), 5);
+
+        input.insert_str("\nfour\nfive\nsix");
+        app.follow_up.as_mut().unwrap().input = input;
+        assert_eq!(
+            follow_up_rows(&app, 0, width),
+            2 + FOLLOW_UP_MAX_LINES,
+            "past the cap the box scrolls under its own caret instead"
+        );
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 24)).unwrap();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let lines: Vec<String> = (0..24)
+            .map(|y| {
+                (0..34)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        let beta = lines
+            .iter()
+            .position(|l| l.contains("beta"))
+            .expect("beta still listed");
+        let alpha = lines
+            .iter()
+            .position(|l| l.contains("alpha"))
+            .expect("alpha listed");
+        assert_eq!(
+            beta - alpha,
+            PILL_H as usize + 1 + 2 + FOLLOW_UP_MAX_LINES,
+            "the pill, its bottom pad, and a box at its cap"
+        );
+    }
+
+    /// The chevron is its own click target, ahead of the card's, and the
+    /// open box is another: a click inside what you are typing into must
+    /// not read as a second click on the card, which attaches the session
+    /// and locks the pane.
+    #[test]
+    fn the_chevron_and_the_open_box_are_their_own_click_targets() {
+        let mut app = hit_test_app(&["main"], &["alpha", "beta"], &[]);
+        let area = Rect::new(0, 0, 34, 20);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 20)).unwrap();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+
+        // draw_column hands the list rows from y=3, so the first card's
+        // name row is y=4 and its chevron the last two columns of it (the
+        // panel's inner width is 32 inside a 34-column area).
+        assert_eq!(app.hit_at(1, 4), Some(HitTarget::Session(0)));
+        assert_eq!(app.hit_at(30, 4), Some(HitTarget::SessionFollowUp(0)));
+        assert_eq!(app.hit_at(31, 4), Some(HitTarget::SessionFollowUp(0)));
+
+        app.follow_up = Some(crate::app::FollowUp {
+            agent: nebula_core::AgentId("a0".into()),
+            input: crate::text_input::TextInput::multiline(),
+        });
+        app.hits.clear();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        for y in 5..=7 {
+            assert_eq!(app.hit_at(4, y), Some(HitTarget::FollowUpBox), "y={y}");
+        }
+        assert_eq!(
+            app.hit_at(4, 9),
+            Some(HitTarget::Session(1)),
+            "the card below starts under the box"
+        );
+    }
+
+    /// A terminal row, a pull request row and an archived agent have no
+    /// follow-up to make, so they wear no toggle and keep their full
+    /// width for the name.
+    #[test]
+    fn only_a_live_agent_card_wears_the_toggle() {
+        let mut app = hit_test_app(&["main"], &["alpha"], &["shell"]);
+        app.tree.agents.push(nebula_core::Agent {
+            archived: true,
+            id: nebula_core::AgentId("a1".into()),
+            name: "old".into(),
+            ..app.tree.agents[0].clone()
+        });
+        app.show_archived = true;
+        let area = Rect::new(0, 0, 34, 20);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 20)).unwrap();
+        terminal.draw(|f| draw_sessions(f, &mut app, area)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let lines: Vec<String> = (0..20)
+            .map(|y| {
+                (0..34)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        let line_with = |needle: &str| {
+            lines
+                .iter()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} on screen:\n{}", lines.join("\n")))
+        };
+        assert!(line_with("alpha").contains('▸'));
+        assert!(!line_with("shell").contains('▸'), "a terminal takes none");
+        assert!(!line_with("old").contains('▸'), "nor an archived session");
     }
 
     /// The Sessions column writes its page size back the same way, on
