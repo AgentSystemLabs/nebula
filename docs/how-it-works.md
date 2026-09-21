@@ -222,6 +222,15 @@
   same `UserPromptSubmit` hook reply, as `hookSpecificOutput.sessionTitle`. Whichever side changed
   last wins; a name you set in nebula is never undone by re-reading Claude's older one. Claude only —
   Codex and Cursor have no session name of their own.
+- **A Claude session's card names the model it is on.** Switch with `/model` inside Claude Code and
+  the card follows within a second (`claude opus` → `claude fable`, `[1m]` kept for the 1M context
+  window). Claude fires no hook for that either; it writes `Set model to …` into the transcript at
+  once, and a `model` line naming the exact id with each session's first prompt. The DAEMON checks the
+  size of every live session's transcript each second and reads only what was appended since. The
+  new model is what the row stores, so a restart or resume comes back on it and `nebula spawn`
+  inherits it. A session launched on the default model gets its model named after the first prompt.
+  Built-in Claude only; a row on an exact id (a Bedrock id from `claude_models`) keeps it while
+  Claude stays in that family.
 - **Rows can list what they were last asked.** With **Recent prompts** on (Settings → Experimental),
   the `prompt` field of the `UserPromptSubmit` payload — which every harness sends — is condensed to
   one line in the hook receiver, kept on the AGENT row (the newest ten, in SQLite) and drawn under its

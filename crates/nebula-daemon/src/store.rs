@@ -807,6 +807,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_agent_model(&self, id: &AgentId, model: Option<&str>) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE agents SET model = ?2 WHERE id = ?1",
+            params![id.as_str(), model],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_agent(&self, id: &AgentId) -> Result<()> {
         self.delete_by_id("agents", id.as_str())
     }

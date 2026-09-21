@@ -35,7 +35,8 @@ use crate::registry::{sanitize_title, Daemon};
 pub const SIDECAR: &str = "custom-title.json";
 /// How much of the transcript's tail to search when no sidecar exists
 /// (older Claude versions): the title line is re-appended around every
-/// prompt, so it is never far from the end for long.
+/// prompt, so it is never far from the end for long. The model sweep
+/// (`session_model`) reads the same window.
 const TAIL_BYTES: u64 = 64 * 1024;
 /// When the window title changes, when to (re)read the persisted title.
 /// The PTY bytes and the sidecar write are not ordered, so the first read
@@ -97,16 +98,24 @@ fn read_sidecar(path: &Path) -> Option<String> {
     custom_title(&serde_json::from_str(&text).ok()?)
 }
 
-/// The last `{"type":"custom-title"}` line within the transcript's tail.
-fn read_transcript_tail(path: &Path) -> Option<String> {
+/// The transcript's last `TAIL_BYTES`. Its first line is usually cut
+/// short (and a character split there is replaced), so a reader matches
+/// whole lines and lets a partial one fail to parse.
+pub(crate) fn transcript_tail(path: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))
         .ok()?;
-    let mut tail = String::new();
-    file.read_to_string(&mut tail).ok()?;
-    tail.lines()
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    Some(String::from_utf8_lossy(&tail).into_owned())
+}
+
+/// The last `{"type":"custom-title"}` line within the transcript's tail.
+fn read_transcript_tail(path: &Path) -> Option<String> {
+    transcript_tail(path)?
+        .lines()
         .rev()
         .filter(|line| line.contains(r#""type":"custom-title""#))
         .find_map(|line| {
