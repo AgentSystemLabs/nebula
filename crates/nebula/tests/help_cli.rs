@@ -10,7 +10,7 @@
 
 use std::process::Command;
 
-/// Every command `nebula --help` lists, plus the `workspace` subcommands.
+/// Every command `nebula --help` lists.
 /// Hidden ones (`_raw-attach`, `_stale-daemon-note`) are deliberately absent.
 const VISIBLE: &[&[&str]] = &[
     &["add"],
@@ -20,12 +20,6 @@ const VISIBLE: &[&[&str]] = &[
     &["worktree"],
     &["spawn"],
     &["open"],
-    &["workspace"],
-    &["workspace", "add"],
-    &["workspace", "open"],
-    &["workspace", "list"],
-    &["workspace", "delete"],
-    &["workspace", "rename"],
     &["config"],
     &["config", "path"],
     &["config", "export"],
@@ -124,8 +118,8 @@ fn the_root_help_lists_one_line_per_command() {
     }
     assert_eq!(
         commands.lines().count(),
-        14,
-        "thirteen commands plus `help`:\n{commands}"
+        13,
+        "twelve commands plus `help`:\n{commands}"
     );
 }
 

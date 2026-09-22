@@ -45,9 +45,9 @@ pub(super) fn menu_row(app: &mut App, index: usize, out: &mut Vec<ClientRequest>
 
 /// The PALETTE's selected row — Enter, a click, `Ctrl+O`, `Ctrl+F`: the
 /// palette goes and the panels land on the row's target. `landing` is how:
-/// None is Enter's own rule (the `palette_enter_attaches` SETTING, or the
-/// browser for a pull request), which a click follows too; the two chords
-/// name theirs.
+/// None is Enter's own rule (the `palette_enter_attaches` SETTING, the
+/// browser for a pull request, an attach for a session waiting on you),
+/// which a click follows too; the two chords name theirs.
 pub(super) fn palette_row(app: &mut App, landing: Option<Landing>, out: &mut Vec<ClientRequest>) {
     let Some(Overlay::Palette(palette)) = &app.overlay else {
         return;
@@ -55,7 +55,8 @@ pub(super) fn palette_row(app: &mut App, landing: Option<Landing>, out: &mut Vec
     let Some(target) = palette.selected_target().cloned() else {
         return;
     };
-    let landing = landing.unwrap_or_else(|| Landing::for_enter_on(&target, palette.enter_attaches));
+    let attaches = palette.enter_attaches;
+    let landing = landing.unwrap_or_else(|| Landing::for_enter_on(app, &target, attaches));
     app.overlay = None;
     jump_to_target(app, target, landing, out);
 }
@@ -204,18 +205,8 @@ pub(super) fn follow_up(app: &mut App) {
             return;
         }
     }
-    if !app.takes_follow_up(&row) {
-        app.flash = Some(match &row {
-            SessionRow::Agent(a) if a.archived => {
-                "archived sessions take no follow-up — u brings it back".into()
-            }
-            SessionRow::Agent(a) if a.cloud_session_id.is_some() => {
-                "cloud sessions take a queued message — m, then Send to cloud session".into()
-            }
-            SessionRow::Agent(_) => "the session is still starting".into(),
-            SessionRow::Terminal(_) => "terminals take typing in the pane — Enter attaches".into(),
-            SessionRow::Link(_) => "a pull request takes a comment — y".into(),
-        });
+    if let Some(why) = no_follow_up(app, &row) {
+        app.flash = Some(why);
         return;
     }
     let SessionRow::Agent(a) = row else {
@@ -227,6 +218,27 @@ pub(super) fn follow_up(app: &mut App) {
     });
     app.focus = Focus::Sessions;
     app.dirty = true;
+}
+
+/// Why `row` takes no follow-up, or None when it does. Both composers
+/// ask — the SESSIONS PANEL's box in the card ([`follow_up`]) and the
+/// LAUNCHER VIEW's modal (`event_loop::launcher::follow_up`) — so what a
+/// row refuses, and the word it refuses with, is written once.
+pub(super) fn no_follow_up(app: &App, row: &SessionRow) -> Option<String> {
+    if app.takes_follow_up(row) {
+        return None;
+    }
+    Some(match row {
+        SessionRow::Agent(a) if a.archived => {
+            "archived sessions take no follow-up — u brings it back".into()
+        }
+        SessionRow::Agent(a) if a.cloud_session_id.is_some() => {
+            "cloud sessions take a queued message — m, then Send to cloud session".into()
+        }
+        SessionRow::Agent(_) => "the session is still starting".into(),
+        SessionRow::Terminal(_) => "terminals take typing in the pane — Enter attaches".into(),
+        SessionRow::Link(_) => "a pull request takes a comment — y".into(),
+    })
 }
 
 /// Bring an archived agent back — `u` on its row, **Unarchive** in its

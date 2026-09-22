@@ -22,8 +22,8 @@ use crate::app::{
 use crate::text_input::TextInput;
 use crate::theme::Theme;
 use crate::ui::{
-    centered_rect, empty_list_row, fuzzy_highlight_spans, input_spans, modal_block,
-    multiline_input_lines, render_row, row_rect, truncate, visible_positions,
+    centered_rect, draw_multiline_input, draw_scroll_marks, empty_list_row, fuzzy_highlight_spans,
+    input_spans, modal_block, render_row, row_rect, truncate, visible_positions,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use nebula_core::{AgentKind, ClientRequest, WorktreeId};
@@ -869,7 +869,8 @@ fn apply_preset_to_quick_prompt(
     let launch_now = preset.skip_task && back.text.trim().is_empty();
     let launch = crate::quick_prompt::QuickLaunch::of_preset(back.launch.target, preset, &cfg)
         .with_issue(back.launch.issue)
-        .with_pr(back.launch.pr);
+        .with_pr(back.launch.pr)
+        .with_under(back.launch.under);
     if launch_now {
         crate::event_loop::submit_prompt_now(app, PromptKind::QuickPrompt(launch), out);
     } else {
@@ -1380,6 +1381,7 @@ pub(crate) fn draw_editor(f: &mut Frame, app: &mut App, editor: &AgentPresetEdit
         .filter(|(field, ..)| field.available(editor))
         .collect();
     let each = if shown.len() > 1 { box_h } else { 2 * box_h };
+    let mut focused_view = None;
     for (n, (field, input, title, placeholder)) in shown.into_iter().enumerate() {
         let y = inner.y.saturating_add(banner + 6 + n as u16 * each);
         if y + each > inner.y + inner.height {
@@ -1408,13 +1410,9 @@ pub(crate) fn draw_editor(f: &mut Frame, app: &mut App, editor: &AgentPresetEdit
         let box_inner = block.inner(box_area);
         f.render_widget(block, box_area);
         if focused {
-            let (lines, caret_row) =
-                multiline_input_lines(input, box_inner.width as usize, th.accent, th);
-            let visible = box_inner.height.max(1) as usize;
-            let max_start = lines.len().saturating_sub(visible);
-            let start = caret_row.saturating_sub(visible / 2).min(max_start);
-            let shown: Vec<Line> = lines.into_iter().skip(start).take(visible).collect();
-            f.render_widget(Paragraph::new(shown), box_inner);
+            let (view, rows) = draw_multiline_input(f, input, box_inner, th);
+            draw_scroll_marks(f, box_area, view, rows, th.dim);
+            focused_view = Some(view);
         } else if input.trim().is_empty() {
             f.render_widget(
                 Paragraph::new(Span::styled(*placeholder, Style::default().fg(th.dim))),
@@ -1430,9 +1428,12 @@ pub(crate) fn draw_editor(f: &mut Frame, app: &mut App, editor: &AgentPresetEdit
     }
 
     // Write-back (draw works on a clone): the rect a click outside
-    // of backs out from.
+    // of backs out from, and the view the focused box's rows walk by.
     if let Some(Overlay::AgentPresetEditor(e)) = &mut app.overlay {
         e.area = area;
+        if let (Some(view), Some(input)) = (focused_view, e.text_field_mut()) {
+            input.set_view(view);
+        }
     }
 }
 

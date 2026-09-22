@@ -117,15 +117,25 @@ pub(crate) fn kind_rows(
 ) -> Vec<MenuItem> {
     rows.iter()
         .map(|row| {
+            // A QUICK PROMPT picker opens on the box as it stands: a box
+            // already set to CLAUDE CLOUD shows its Claude row toggled.
+            let cloud = row.kind == AgentKind::Claude
+                && row.custom.is_none()
+                && quick.is_some_and(|back| back.launch.cloud);
+            let label = label(row.kind, row.custom.as_deref());
             MenuItem::new(
-                label(row.kind, row.custom.as_deref()),
+                if cloud {
+                    format!("{label} · cloud")
+                } else {
+                    label
+                },
                 MenuAction::NewAgentOfKind {
                     worktree: worktree.clone(),
                     kind: row.kind,
                     custom: row.custom.clone(),
                     model: None,
                     effort: None,
-                    cloud: false,
+                    cloud,
                     pr: pr.cloned(),
                     quick: quick.map(|back| Box::new(back.clone())),
                 },
@@ -210,15 +220,12 @@ pub(crate) fn pr_session_menu_rows(worktree: WorktreeId, pr: &OpenPr) -> Vec<Men
     )
 }
 
-/// The harness badge a session row wears: the built-in name, or the
-/// custom entry's label (the id when the entry is gone, the kind name
-/// when the row somehow names none).
-pub(crate) fn session_harness_badge(agent: &Agent) -> String {
+/// The same badge against a config already in hand.
+pub(crate) fn session_harness_badge_in(agent: &Agent, cfg: &Config) -> String {
     match (agent.kind, agent.custom_harness.as_deref()) {
-        (AgentKind::Custom, Some(id)) => Config::load()
-            .effective_harness_by_id(id)
-            .display_label()
-            .to_string(),
+        (AgentKind::Custom, Some(id)) => {
+            cfg.effective_harness_by_id(id).display_label().to_string()
+        }
         _ => agent.kind.as_str().to_string(),
     }
 }
@@ -441,6 +448,8 @@ mod tests {
                     preset: None,
                     issue: None,
                     pr: None,
+                    under: None,
+                    cloud: false,
                 },
                 text: "typed so far".into(),
                 from_box: true,
@@ -465,6 +474,53 @@ mod tests {
                 .map(|label| format!("New {label} session"))
                 .collect();
             assert_eq!(names, expected);
+        });
+    }
+
+    /// The QUICK PROMPT's picker offers the NEW SESSION PICKER's cloud
+    /// toggle on its Claude row, and opens with it on for a box already set
+    /// to cloud — but not for a box the DAEMON would refuse a cloud task
+    /// for, one carrying a pull request or an issue.
+    #[test]
+    fn the_quick_prompt_picker_toggles_cloud_where_the_box_can_go() {
+        pinned("{}", || {
+            let worktree = WorktreeId("w1".into());
+            let claude = QuickLaunch::of_kind(
+                crate::quick_prompt::QuickTarget::Worktree(worktree.clone()),
+                AgentKind::Claude,
+                None,
+                None,
+                None,
+                &Config::load(),
+            );
+            let open = |app: &mut App, launch: QuickLaunch| -> ContextMenu {
+                let back = QuickReturn {
+                    launch,
+                    text: "typed so far".into(),
+                    from_box: true,
+                };
+                open_kind_picker(app, KindPicker::quick_prompt(worktree.clone(), back));
+                match &app.overlay {
+                    Some(Overlay::Menu(menu)) => menu.clone(),
+                    other => panic!("{other:?}"),
+                }
+            };
+            let mut app = App::new();
+
+            let mut menu = open(&mut app, claude.clone());
+            assert_eq!(menu.items[menu.hover].label, "Claude");
+            assert_eq!(menu.hovered_claude_cloud(), Some(false));
+            assert!(menu.toggle_hovered_claude_cloud());
+            assert_eq!(menu.items[menu.hover].label, "Claude · cloud");
+
+            let menu = open(&mut app, claude.clone().with_cloud(true));
+            assert_eq!(menu.items[menu.hover].label, "Claude · cloud");
+            assert_eq!(menu.hovered_claude_cloud(), Some(true));
+
+            let mut menu = open(&mut app, claude.with_pr(Some(PrLaunch::of(&open_pr()))));
+            assert_eq!(menu.hovered_claude_cloud(), None, "no cloud for a PR");
+            assert!(!menu.toggle_hovered_claude_cloud());
+            assert_eq!(menu.items[menu.hover].label, "Claude");
         });
     }
 
@@ -513,6 +569,8 @@ mod tests {
                         preset: None,
                         issue: None,
                         pr: None,
+                        under: None,
+                        cloud: false,
                     },
                     text: String::new(),
                     from_box: true,
@@ -534,7 +592,10 @@ mod tests {
                 let Some(Overlay::Menu(menu)) = &app.overlay else {
                     panic!("{:?}", app.overlay);
                 };
-                assert_eq!(labels(menu), ["Claude", "Codex", "Pi", "Muse", "Grok Build"]);
+                assert_eq!(
+                    labels(menu),
+                    ["Claude", "Codex", "Pi", "Muse", "Grok Build"]
+                );
                 assert_eq!(
                     menu.hover, 0,
                     "a remembered harness switched off steps to the first enabled"

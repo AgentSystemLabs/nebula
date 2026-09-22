@@ -12,12 +12,14 @@
 //! takes them the way Claude Code's own prompt does: Shift+Enter,
 //! Option+Enter — the `ESC` `CR` a terminal without the kitty protocol
 //! sends for a mapped Shift+Enter, which is Alt+Enter to us — and Ctrl+J
-//! all break the line; ↑/↓ walk the lines and fall through to the caller
-//! past the first or last, so a form can step to its next field; Home/End
-//! and the readline chords work on the line under the caret; a paste keeps
-//! its newlines. A one-line field flattens a paste and leaves the break
-//! keys to the caller, so Enter — always the caller's — stays the only
-//! way out of it.
+//! all break the line; ↑/↓ walk the rows as drawn — a long paragraph's
+//! wrapped rows too, keeping the column through a short one — and fall
+//! through to the caller past the first or last, so a form can step to its
+//! next field; ⌥↑/⌥↓ jump by paragraph, Cmd+↑/↓ (Ctrl+Home/End) to either
+//! end, PageUp/PageDown a screenful; Home/End and the readline chords work
+//! on the line under the caret; a paste keeps its newlines. A one-line
+//! field flattens a paste and leaves the break keys to the caller, so
+//! Enter — always the caller's — stays the only way out of it.
 //!
 //! On macOS the option-arrow combos are what actually reaches us as
 //! `Alt+b` / `Alt+f`: both Terminal.app (its bundled keyMappings.plist maps
@@ -58,7 +60,7 @@ impl Edit {
 }
 
 /// Editable text plus a cursor into it: one line, or many.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct TextInput {
     text: String,
     /// Byte offset into `text`; always on a char boundary, always ≤ len.
@@ -66,13 +68,55 @@ pub struct TextInput {
     /// Hard line breaks allowed: the break keys insert one and a paste
     /// keeps its own. Off, the field is one line whatever comes in.
     multiline: bool,
+    /// The column a run of ↑/↓ aims for, so passing through a short or
+    /// empty row doesn't drag the caret to its end for good. Any other
+    /// key lets it go.
+    goal: Option<u16>,
+    /// Where a multi-row field was last drawn (see [`TextView`]).
+    view: TextView,
 }
+
+/// Where a multi-row field was last drawn: the columns its rows wrap at,
+/// how many rows show, and the first one shown. The renderer hands it back
+/// (draws work on a clone) so ↑/↓ walk the rows the user SEES — a long
+/// paragraph wrapped over five rows is five rows, not one — PageUp/PageDown
+/// move a screenful, and a click lands where it points. All zero before
+/// the first draw, where the rows are the hard lines. In cells, as a
+/// ratatui `Rect` counts them — every field carries one, so it stays small.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TextView {
+    pub width: u16,
+    pub height: u16,
+    pub top: u16,
+}
+
+/// A row or column count as a [`TextView`] keeps it, saturating.
+fn cells(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
+/// A field's value is its text, caret and shape; the column a run of ↑/↓
+/// aims for and where it was last drawn are not part of it.
+impl PartialEq for TextInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text && self.cursor == other.cursor && self.multiline == other.multiline
+    }
+}
+
+impl Eq for TextInput {}
 
 /// Word characters for ⌥-arrow / Ctrl+W motion: a run of these is one word,
 /// everything else (spaces, `/`, `-`, `.`) separates. Matches what readline
 /// does in a shell, which is where the muscle memory comes from.
 fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// Does row `i` of a [`TextInput::rows`] layout end at a soft wrap — the
+/// next row picking up at the very char it stopped before — rather than
+/// at a line break or the end of the text?
+fn is_soft(rows: &[(usize, usize)], i: usize) -> bool {
+    rows.get(i + 1).is_some_and(|next| next.0 == rows[i].1)
 }
 
 impl TextInput {
@@ -88,7 +132,7 @@ impl TextInput {
         Self {
             text,
             cursor,
-            multiline: false,
+            ..Self::default()
         }
     }
 
@@ -153,15 +197,162 @@ impl TextInput {
         self.text[..self.cursor].chars().count()
     }
 
+    /// Park the caret `at` chars in, clamped to the end of the text.
+    fn set_cursor_chars(&mut self, at: usize) {
+        self.cursor = self
+            .text
+            .char_indices()
+            .nth(at)
+            .map_or(self.text.len(), |(i, _)| i);
+    }
+
+    /// Caret to the very start of the text — ↑ on a task box's top row.
+    pub fn cursor_to_start(&mut self) {
+        self.goal = None;
+        self.cursor = 0;
+    }
+
+    /// Caret to the very end of the text — ↓ on a task box's bottom row.
+    pub fn cursor_to_end(&mut self) {
+        self.goal = None;
+        self.cursor = self.text.len();
+    }
+
     /// Replace the whole value, cursor to the end.
     pub fn set_text(&mut self, text: impl Into<String>) {
         self.text = text.into();
         self.cursor = self.text.len();
+        self.goal = None;
     }
 
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
+        self.goal = None;
+    }
+
+    /// The text as the rows a `width`-column box shows it in, as char
+    /// ranges. A hard line break always ends a row (an empty line is an
+    /// empty row); a line wider than the box breaks after the last space
+    /// that fits — mid-word only for a word wider than the row — and the
+    /// row keeps that space. The one layout the renderer draws and ↑/↓,
+    /// PageUp/PageDown, the wheel and a click walk. Width 0 wraps nothing:
+    /// the rows are the hard lines.
+    pub fn rows(&self, width: usize) -> Vec<(usize, usize)> {
+        let chars: Vec<char> = self.text.chars().collect();
+        let width = if width == 0 { usize::MAX } else { width };
+        let mut rows = Vec::new();
+        let mut line_start = 0;
+        loop {
+            let line_end = chars[line_start..]
+                .iter()
+                .position(|c| *c == '\n')
+                .map_or(chars.len(), |i| line_start + i);
+            if line_start == line_end {
+                rows.push((line_start, line_end));
+            }
+            let mut start = line_start;
+            while start < line_end {
+                let hard_end = start.saturating_add(width).min(line_end);
+                let end = if hard_end < line_end {
+                    chars[start..hard_end]
+                        .iter()
+                        .rposition(|c| c.is_whitespace())
+                        .map_or(hard_end, |i| start + i + 1)
+                } else {
+                    hard_end
+                };
+                rows.push((start, end));
+                start = end;
+            }
+            if line_end == chars.len() {
+                return rows;
+            }
+            line_start = line_end + 1;
+        }
+    }
+
+    /// Which of `rows` the caret is drawn on. At a soft break it starts
+    /// the next row; at a hard break, or the end of the text, it closes
+    /// its own.
+    pub fn caret_row(&self, rows: &[(usize, usize)]) -> usize {
+        let caret = self.cursor_chars();
+        rows.iter()
+            .enumerate()
+            .position(|(i, &(start, end))| {
+                start <= caret && (caret < end || (caret == end && !is_soft(rows, i)))
+            })
+            .unwrap_or(rows.len().saturating_sub(1))
+    }
+
+    /// Where the field was last drawn.
+    pub fn view(&self) -> TextView {
+        self.view
+    }
+
+    /// Record where the field was drawn — what [`view_for`](Self::view_for)
+    /// returned — on the live field, the draw having worked on a clone.
+    pub fn set_view(&mut self, view: TextView) {
+        self.view = view;
+    }
+
+    /// The view to draw a `width` × `height` box with: the last draw's
+    /// first row, moved only as far as brings the caret into sight, and
+    /// never so far down that rows go unused below the text. So ↑/↓ inside
+    /// the box leave it still, and the text doesn't jump about as it is
+    /// typed.
+    pub fn view_for(&self, width: u16, height: u16) -> TextView {
+        let rows = self.rows(width.into());
+        let caret = self.caret_row(&rows);
+        let height = height.max(1);
+        let shown = usize::from(height);
+        let top = usize::from(self.view.top)
+            .min(rows.len().saturating_sub(shown))
+            .clamp(caret.saturating_sub(shown - 1), caret);
+        TextView {
+            width,
+            height,
+            top: cells(top),
+        }
+    }
+
+    /// The wheel over the box: scroll it `delta` rows, bringing the caret
+    /// along only when it would leave the rows in sight. [`Edit::Ignored`]
+    /// with nowhere further to scroll.
+    pub fn scroll_rows(&mut self, delta: isize) -> Edit {
+        let rows = self.rows(self.view.width.into());
+        let height = usize::from(self.view.height.max(1));
+        let old = usize::from(self.view.top);
+        let top = old
+            .saturating_add_signed(delta)
+            .min(rows.len().saturating_sub(height));
+        if top == old {
+            return Edit::Ignored;
+        }
+        self.view.top = cells(top);
+        let row = self.caret_row(&rows);
+        let into = row.clamp(top, top + height - 1);
+        if into != row {
+            let col = self
+                .goal
+                .map_or(self.cursor_chars() - rows[row].0, usize::from);
+            self.land(&rows, into, col);
+            self.goal = Some(cells(col));
+        }
+        Edit::Moved
+    }
+
+    /// A click `row` rows down and `col` columns into the box as last
+    /// drawn: the caret to that spot — or the end of that row, clicked
+    /// past it, and the end of the text, clicked below the last row.
+    pub fn click(&mut self, row: u16, col: u16) {
+        self.goal = None;
+        let rows = self.rows(self.view.width.into());
+        let row = usize::from(self.view.top) + usize::from(row);
+        match rows.get(row) {
+            Some(_) => self.land(&rows, row, col.into()),
+            None => self.cursor = self.text.len(),
+        }
     }
 
     pub fn insert_char(&mut self, c: char) {
@@ -181,6 +372,7 @@ impl TextInput {
         };
         self.text.insert_str(self.cursor, &run);
         self.cursor += run.len();
+        self.goal = None;
     }
 
     /// Apply one key press. Returns [`Edit::Ignored`] for anything that
@@ -192,6 +384,9 @@ impl TextInput {
         let cmd = key
             .modifiers
             .intersects(KeyModifiers::SUPER | KeyModifiers::META | KeyModifiers::HYPER);
+        // A run of ↑/↓ (PageUp/PageDown) keeps aiming for the column it
+        // set out from; any other key starts afresh.
+        let goal = self.goal.take();
 
         match key.code {
             // ---- line breaks (multi-row fields only) ----
@@ -209,14 +404,31 @@ impl TextInput {
             KeyCode::Right if cmd => self.move_to(self.line_end(self.cursor)),
             KeyCode::Right if alt || ctrl => self.move_to(self.word_right(self.cursor)),
             KeyCode::Right => self.move_to(self.next_boundary(self.cursor)),
+            KeyCode::Home if ctrl || cmd => self.move_to(0),
+            KeyCode::End if ctrl || cmd => self.move_to(self.text.len()),
             KeyCode::Home => self.move_to(self.line_start(self.cursor)),
             KeyCode::End => self.move_to(self.line_end(self.cursor)),
-            // ↑/↓ walk a multi-row field's lines, keeping the column where
-            // the line has it; past the first or last line they are the
-            // caller's (a form steps to its next field), and a one-line
-            // field never has a second line to walk to.
-            KeyCode::Up => self.line_up(),
-            KeyCode::Down => self.line_down(),
+            // ↑/↓ walk a multi-row field's rows as drawn — a paragraph
+            // wrapped over five rows is five rows — keeping the column;
+            // past the first or last row they are the caller's (a form
+            // steps to its next field). ⌥↑/⌥↓ jump to the start or end of
+            // the paragraph, then the one before or after, as a macOS text
+            // view does; Cmd+↑/↓ (Ctrl+Home/End) to the text's very start
+            // or end; PageUp/PageDown a screenful. A one-line field has no
+            // second row: all of these stay the caller's there.
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+                if !self.multiline =>
+            {
+                Edit::Ignored
+            }
+            KeyCode::Up if cmd => self.move_to(0),
+            KeyCode::Down if cmd => self.move_to(self.text.len()),
+            KeyCode::Up if alt => self.paragraph_up(),
+            KeyCode::Down if alt => self.paragraph_down(),
+            KeyCode::Up => self.move_rows(-1, goal),
+            KeyCode::Down => self.move_rows(1, goal),
+            KeyCode::PageUp => self.page(-1, goal),
+            KeyCode::PageDown => self.page(1, goal),
 
             // ---- deletion ----
             // Cmd+⌫ kills the line, ⌥⌫ / Ctrl+⌫ the previous word.
@@ -323,43 +535,79 @@ impl TextInput {
             .map_or(self.text.len(), |i| at + i)
     }
 
-    /// The caret's column on its line, in characters — what ↑/↓ keep.
-    fn column(&self) -> usize {
-        self.text[self.line_start(self.cursor)..self.cursor]
-            .chars()
-            .count()
+    /// The caret `col` chars into `row` — or as far as that row lets it
+    /// stand: a soft-wrapped row's last spot is its final char (one step
+    /// on is the next row's start), a hard line's is its end.
+    fn land(&mut self, rows: &[(usize, usize)], row: usize, col: usize) {
+        let (start, end) = rows[row];
+        let last = if is_soft(rows, row) { end - 1 } else { end };
+        self.set_cursor_chars((start + col).min(last));
     }
 
-    /// `col` characters into the line starting at `start`, or that line's
-    /// end when it is shorter.
-    fn at_column(&self, start: usize, col: usize) -> usize {
-        let end = self.line_end(start);
-        self.text[start..end]
-            .char_indices()
-            .nth(col)
-            .map_or(end, |(i, _)| start + i)
+    /// The caret `delta` rows up (−) or down, as last drawn, at the goal
+    /// column — clamped to the first and last rows, and [`Edit::Ignored`]
+    /// when it already stands there, so the caller can act on the key.
+    fn move_rows(&mut self, delta: isize, goal: Option<u16>) -> Edit {
+        let rows = self.rows(self.view.width.into());
+        let row = self.caret_row(&rows);
+        let target = row.saturating_add_signed(delta).min(rows.len() - 1);
+        if target == row {
+            self.goal = goal;
+            return Edit::Ignored;
+        }
+        let col = goal.map_or(self.cursor_chars() - rows[row].0, usize::from);
+        self.land(&rows, target, col);
+        self.goal = Some(cells(col));
+        Edit::Moved
     }
 
-    /// ↑: the same column one line up, or [`Edit::Ignored`] on the first
-    /// line so the caller can act on the key.
-    fn line_up(&mut self) -> Edit {
+    /// PageUp/PageDown: a screenful of rows at the goal column, keeping
+    /// one row of the old screen in sight, the box scrolling with the
+    /// caret; from the first or last row, the very start or end of the
+    /// text.
+    fn page(&mut self, dir: isize, goal: Option<u16>) -> Edit {
+        let rows = self.rows(self.view.width.into());
+        let before = self.caret_row(&rows) as isize;
+        let step = self.view.height.saturating_sub(1).max(1) as isize;
+        match self.move_rows(dir * step, goal) {
+            Edit::Ignored => {
+                self.goal = None;
+                self.move_to(if dir < 0 { 0 } else { self.text.len() })
+            }
+            moved => {
+                let after = self.caret_row(&rows) as isize;
+                let top = usize::from(self.view.top).saturating_add_signed(after - before);
+                self.view.top = cells(top);
+                moved
+            }
+        }
+    }
+
+    /// ⌥↑: to the start of the paragraph — the hard line — the caret is
+    /// in, or from its start to the previous paragraph's. [`Edit::Ignored`]
+    /// at the very start.
+    fn paragraph_up(&mut self) -> Edit {
+        if self.cursor == 0 {
+            return Edit::Ignored;
+        }
         let start = self.line_start(self.cursor);
-        if start == 0 {
-            return Edit::Ignored;
+        if start < self.cursor {
+            return self.move_to(start);
         }
-        let col = self.column();
-        let above = self.line_start(start - 1);
-        self.move_to(self.at_column(above, col))
+        self.move_to(self.line_start(start - 1))
     }
 
-    /// ↓: the same column one line down, or [`Edit::Ignored`] on the last.
-    fn line_down(&mut self) -> Edit {
-        let end = self.line_end(self.cursor);
-        if end == self.text.len() {
+    /// ⌥↓: to the end of the paragraph the caret is in, or from its end
+    /// to the next paragraph's. [`Edit::Ignored`] at the very end.
+    fn paragraph_down(&mut self) -> Edit {
+        if self.cursor == self.text.len() {
             return Edit::Ignored;
         }
-        let col = self.column();
-        self.move_to(self.at_column(end + 1, col))
+        let end = self.line_end(self.cursor);
+        if end > self.cursor {
+            return self.move_to(end);
+        }
+        self.move_to(self.line_end(end + 1))
     }
 
     /// Start of the word at or before `at`: skip back over separators, then
@@ -682,9 +930,9 @@ mod tests {
         )));
     }
 
-    /// ↑/↓ walk the lines keeping the column (clamped to a shorter line),
-    /// and past the first or last line they are Ignored, so a form can
-    /// step to its next field on the very same key.
+    /// ↑/↓ walk the lines keeping the column — clamped on a shorter line,
+    /// and back to it past one — and past the first or last line they are
+    /// Ignored, so a form can step to its next field on the very same key.
     #[test]
     fn arrows_walk_the_lines_and_fall_through_at_the_ends() {
         let mut input = TextInput::multiline_with_text("first line\nhi\nthird");
@@ -694,26 +942,35 @@ mod tests {
             Edit::Moved
         );
         assert_eq!(input.cursor_chars(), "first line\nhi".len());
-        // Column 2 now, onto the first line.
+        // Still aiming for column 5 on the first line, not hi's 2.
         assert_eq!(
             press(&mut input, KeyCode::Up, KeyModifiers::NONE),
             Edit::Moved
         );
-        assert_eq!(input.cursor_chars(), 2);
+        assert_eq!(input.cursor_chars(), "first".len());
         assert_eq!(
             press(&mut input, KeyCode::Up, KeyModifiers::NONE),
             Edit::Ignored,
             "no line above the first"
         );
-        assert_eq!(input.cursor_chars(), 2, "the caret stays put");
+        assert_eq!(input.cursor_chars(), "first".len(), "the caret stays put");
         press(&mut input, KeyCode::Down, KeyModifiers::NONE);
         press(&mut input, KeyCode::Down, KeyModifiers::NONE);
-        assert_eq!(input.cursor_chars(), "first line\nhi\nth".len());
+        assert_eq!(input.cursor_chars(), "first line\nhi\nthird".len());
         assert_eq!(
             press(&mut input, KeyCode::Down, KeyModifiers::NONE),
             Edit::Ignored,
             "no line below the last"
         );
+        // Any other key lets the column go: from "fi|rst", ↓ lands at 2.
+        press(&mut input, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut input, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut input, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut input, KeyCode::Right, KeyModifiers::NONE);
+        press(&mut input, KeyCode::Right, KeyModifiers::NONE);
+        press(&mut input, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut input, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(input.cursor_chars(), "first line\nhi\nth".len());
         // A one-line field never walks: still the caller's keys.
         let mut one = typed("solo");
         assert_eq!(
@@ -753,6 +1010,205 @@ mod tests {
         assert_eq!(input.cursor_chars(), 4);
         press(&mut input, KeyCode::Backspace, KeyModifiers::NONE);
         assert_eq!(input.as_str(), "one", "⌫ at a line's start joins it");
+    }
+
+    /// A multi-row field as a `width` × `height` box last drew it, caret
+    /// at the end.
+    fn drawn(text: &str, width: u16, height: u16) -> TextInput {
+        let mut input = TextInput::multiline_with_text(text);
+        let view = input.view_for(width, height);
+        input.set_view(view);
+        input
+    }
+
+    /// The row the caret is drawn on, in the layout the box last used.
+    fn row_of(input: &TextInput) -> usize {
+        input.caret_row(&input.rows(input.view().width.into()))
+    }
+
+    const FOX: &str = "the quick brown fox jumps over the lazy dog";
+
+    /// Ten columns wide the fox wraps into `the quick |brown fox |jumps
+    /// |over the |lazy dog`.
+    #[test]
+    fn rows_wrap_after_the_last_space_that_fits() {
+        let input = TextInput::multiline_with_text(FOX);
+        assert_eq!(
+            input.rows(10),
+            vec![(0, 10), (10, 20), (20, 26), (26, 35), (35, 43)]
+        );
+        assert_eq!(input.rows(0), vec![(0, 43)], "width 0 wraps nothing");
+        let hard = TextInput::multiline_with_text("one\n\nabcdefghij");
+        assert_eq!(
+            hard.rows(4),
+            vec![(0, 3), (4, 4), (5, 9), (9, 13), (13, 15)],
+            "a word wider than the row breaks mid-word"
+        );
+    }
+
+    /// The prompt nobody pressed Shift+Enter in is ONE line: ↑/↓ must walk
+    /// the rows it wraps into as drawn, keeping the column, or there is no
+    /// way up it but ←.
+    #[test]
+    fn arrows_walk_the_rows_a_long_paragraph_wraps_into() {
+        let mut input = drawn(FOX, 10, 5);
+        assert_eq!(row_of(&input), 4);
+        // Column 8 all the way up; "jumps " stops at its space.
+        let ups = [34, 25, 18, 8];
+        for want in ups {
+            assert_eq!(
+                press(&mut input, KeyCode::Up, KeyModifiers::NONE),
+                Edit::Moved
+            );
+            assert_eq!(input.cursor_chars(), want);
+        }
+        assert_eq!(
+            press(&mut input, KeyCode::Up, KeyModifiers::NONE),
+            Edit::Ignored,
+            "the top row is the caller's"
+        );
+        for want in [18, 25, 34, 43] {
+            press(&mut input, KeyCode::Down, KeyModifiers::NONE);
+            assert_eq!(input.cursor_chars(), want);
+        }
+        // Never drawn, the paragraph is one row, as it always was.
+        let mut undrawn = TextInput::multiline_with_text(FOX);
+        assert_eq!(
+            press(&mut undrawn, KeyCode::Up, KeyModifiers::NONE),
+            Edit::Ignored
+        );
+    }
+
+    /// ⌥↑/⌥↓ — what the user reached for — jump by paragraph as a macOS
+    /// text view does: its start (end), then the one before (after).
+    #[test]
+    fn option_arrows_jump_by_paragraph() {
+        let text = "alpha beta\ngamma\n\ndelta";
+        let mut input = drawn(text, 80, 5);
+        for want in [18, 17, 11, 0] {
+            assert_eq!(
+                press(&mut input, KeyCode::Up, KeyModifiers::ALT),
+                Edit::Moved
+            );
+            assert_eq!(input.cursor_chars(), want);
+        }
+        assert_eq!(
+            press(&mut input, KeyCode::Up, KeyModifiers::ALT),
+            Edit::Ignored
+        );
+        for want in [10, 16, 17, 23] {
+            press(&mut input, KeyCode::Down, KeyModifiers::ALT);
+            assert_eq!(input.cursor_chars(), want);
+        }
+        assert_eq!(
+            press(&mut input, KeyCode::Down, KeyModifiers::ALT),
+            Edit::Ignored
+        );
+        let mut one = typed("solo");
+        assert_eq!(
+            press(&mut one, KeyCode::Up, KeyModifiers::ALT),
+            Edit::Ignored,
+            "a one-line field leaves it to the caller"
+        );
+    }
+
+    #[test]
+    fn cmd_arrows_and_ctrl_home_end_reach_the_ends_of_the_text() {
+        let mut input = drawn("one\ntwo\nthree", 80, 5);
+        press(&mut input, KeyCode::Home, KeyModifiers::CONTROL);
+        assert_eq!(input.cursor_chars(), 0);
+        press(&mut input, KeyCode::End, KeyModifiers::CONTROL);
+        assert_eq!(input.cursor_chars(), 13);
+        press(&mut input, KeyCode::Up, KeyModifiers::SUPER);
+        assert_eq!(input.cursor_chars(), 0);
+        press(&mut input, KeyCode::Down, KeyModifiers::SUPER);
+        assert_eq!(input.cursor_chars(), 13);
+    }
+
+    fn twenty_lines() -> String {
+        (0..20)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// PageUp/PageDown move a screenful less one row, the box going with
+    /// the caret, and from the first or last row to the text's very end.
+    #[test]
+    fn page_keys_move_a_screenful() {
+        let mut input = drawn(&twenty_lines(), 20, 5);
+        assert_eq!((row_of(&input), input.view().top), (19, 15));
+        for (row, top) in [(15, 11), (11, 7), (7, 3), (3, 0), (0, 0)] {
+            assert_eq!(
+                press(&mut input, KeyCode::PageUp, KeyModifiers::NONE),
+                Edit::Moved
+            );
+            let view = input.view_for(20, 5);
+            input.set_view(view);
+            assert_eq!((row_of(&input), view.top), (row, top));
+        }
+        assert_eq!(input.cursor_chars(), 2, "column 3 clamped on l0");
+        press(&mut input, KeyCode::PageUp, KeyModifiers::NONE);
+        assert_eq!(input.cursor_chars(), 0, "the first row's page is the start");
+        press(&mut input, KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(
+            input.cursor_chars(),
+            "l0\nl1\nl2\nl3\n".len(),
+            "l4, column 0"
+        );
+    }
+
+    /// The box scrolls only when the caret would leave it — ↑/↓ inside it
+    /// leave it still, rather than recentring on every press.
+    #[test]
+    fn the_view_moves_only_to_keep_the_caret_in_sight() {
+        let mut input = drawn(&twenty_lines(), 20, 5);
+        for _ in 0..4 {
+            press(&mut input, KeyCode::Up, KeyModifiers::NONE);
+            let view = input.view_for(20, 5);
+            assert_eq!(view.top, 15, "caret on row {}", row_of(&input));
+            input.set_view(view);
+        }
+        press(&mut input, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(input.view_for(20, 5).top, 14);
+        // A box taller than the text shows it all, from the top.
+        assert_eq!(input.view_for(20, 30).top, 0);
+    }
+
+    /// The wheel scrolls the box, pulling the caret along only when it
+    /// would drop out of sight.
+    #[test]
+    fn the_wheel_scrolls_and_drags_the_caret_into_view() {
+        let mut input = drawn(&twenty_lines(), 20, 5);
+        assert_eq!(input.scroll_rows(-3), Edit::Moved);
+        assert_eq!((input.view().top, row_of(&input)), (12, 16));
+        assert_eq!(input.scroll_rows(1), Edit::Moved);
+        assert_eq!(
+            (input.view().top, row_of(&input)),
+            (13, 16),
+            "still in sight: the caret stays"
+        );
+        input.scroll_rows(-100);
+        assert_eq!((input.view().top, row_of(&input)), (0, 4));
+        assert_eq!(input.scroll_rows(-1), Edit::Ignored);
+    }
+
+    /// A click puts the caret where it points in the rows as drawn — past
+    /// a row's end at that end, below the last row at the text's end.
+    #[test]
+    fn a_click_lands_the_caret_where_it_points() {
+        let mut input = drawn(FOX, 10, 3);
+        assert_eq!(input.view().top, 2, "rows 2-4 in sight");
+        input.click(0, 2);
+        assert_eq!(input.cursor_chars(), 22, "ju|mps");
+        input.click(0, 9);
+        assert_eq!(input.cursor_chars(), 25, "the end of `jumps `");
+        input.click(9, 0);
+        assert_eq!(input.cursor_chars(), 43);
+        let mut top = drawn(FOX, 10, 5);
+        top.click(1, 0);
+        assert_eq!(top.cursor_chars(), 10);
+        assert_eq!(row_of(&top), 1, "a soft break's caret starts the next row");
     }
 
     #[test]

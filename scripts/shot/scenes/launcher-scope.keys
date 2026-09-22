@@ -1,0 +1,34 @@
+# The two SCOPE COLORS on the grid: one session launched straight into the project's root checkout
+# (^N turns the box's new-worktree toggle off, and the boot selection is the root), then one into a
+# worktree of its own. The cards name the checkout each runs in — `⌂ main` amber against
+# `↳ branch` aquamarine — so which is which reads before a word of either card does.
+C-n
+Profile the daemon's startup and find what takes 400ms
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+p
+C-n
+Sort the changelog entries by date, newest first
+Enter
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+F12
+h
+F12
+F12

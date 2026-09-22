@@ -142,6 +142,135 @@ pub fn parse_status_z(bytes: &[u8]) -> Vec<DiffFile> {
     files
 }
 
+/// Lines added and removed across a checkout's uncommitted changes, as the
+/// DIFF VIEWER shows them: tracked files against HEAD, staged or not, and
+/// every line of an untracked file as added. What the LAUNCHER VIEW's cards
+/// print after their changed-file count while CARD LINE COUNTS
+/// (`card_line_changes`) is on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LineChanges {
+    pub added: u64,
+    pub removed: u64,
+}
+
+impl LineChanges {
+    pub fn is_empty(self) -> bool {
+        self.added == 0 && self.removed == 0
+    }
+}
+
+/// The biggest untracked file read to count its lines; a bigger one — a
+/// build artifact, a dump — counts nothing rather than stall the read.
+const UNTRACKED_FILE_CAP: u64 = 1 << 20;
+/// The most untracked bytes one count reads, so a checkout full of new
+/// files costs a bounded amount per poll; files past it count nothing.
+const UNTRACKED_READ_BUDGET: u64 = 16 << 20;
+
+/// Count the changed lines behind `files`, the list `changed_files` just
+/// read there: one `git diff --numstat` for the tracked ones — against
+/// HEAD, or git's empty tree on a checkout with no commit yet — and a read
+/// from disk for each untracked one. None when git couldn't say.
+pub fn line_changes(root: &Path, files: &[DiffFile]) -> Option<LineChanges> {
+    let mut total = LineChanges::default();
+    if files.iter().any(|f| !f.is_untracked()) {
+        total = match tracked_line_changes(root, "HEAD") {
+            Some(lines) => lines,
+            // No commit yet: every tracked line is new.
+            None if !has_head(root) => tracked_line_changes(root, &empty_tree(root)?)?,
+            None => return None,
+        };
+    }
+    total.added += untracked_lines(root, files);
+    Some(total)
+}
+
+/// `git diff <base> --numstat`, summed.
+fn tracked_line_changes(root: &Path, base: &str) -> Option<LineChanges> {
+    let output = run_git(
+        root,
+        &[
+            "diff",
+            base,
+            "--numstat",
+            "-z",
+            "--no-color",
+            "--no-ext-diff",
+            "--",
+        ],
+    )
+    .ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_numstat_z(&output.stdout))
+}
+
+/// Git's empty tree in this repo's hash, for an unborn HEAD to diff from.
+fn empty_tree(root: &Path) -> Option<String> {
+    let output = run_git(root, &["hash-object", "-t", "tree", "/dev/null"]).ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Sum `git diff --numstat -z`: `added\tremoved\tpath\0` per file, and for
+/// a rename or copy `added\tremoved\t\0old\0new\0`. A binary file reads
+/// `-\t-` and adds nothing.
+pub fn parse_numstat_z(bytes: &[u8]) -> LineChanges {
+    let mut total = LineChanges::default();
+    let mut fields = bytes.split(|b| *b == 0);
+    while let Some(field) = fields.next() {
+        let field = String::from_utf8_lossy(field);
+        let mut parts = field.splitn(3, '\t');
+        let (Some(added), Some(removed), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        total.added += added.parse::<u64>().unwrap_or(0);
+        total.removed += removed.parse::<u64>().unwrap_or(0);
+        if path.is_empty() {
+            // A rename: its two paths are the next two fields.
+            fields.next();
+            fields.next();
+        }
+    }
+    total
+}
+
+/// Every line of the untracked `files`, read from disk within the caps
+/// above; a directory (a nested repo), a symlink or a binary file counts
+/// nothing, as it adds no text lines to the diff.
+fn untracked_lines(root: &Path, files: &[DiffFile]) -> u64 {
+    let mut budget = UNTRACKED_READ_BUDGET;
+    let mut lines = 0;
+    for file in files.iter().filter(|f| f.is_untracked()) {
+        let path = root.join(&file.path);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() > UNTRACKED_FILE_CAP || meta.len() > budget {
+            continue;
+        }
+        budget -= meta.len();
+        if let Ok(bytes) = std::fs::read(&path) {
+            lines += count_lines(&bytes);
+        }
+    }
+    lines
+}
+
+/// A file's lines as `git diff --numstat` counts them: every newline, plus
+/// a last line without one; none for a binary file (a NUL in its first
+/// 8000 bytes, git's own test).
+fn count_lines(bytes: &[u8]) -> u64 {
+    if bytes.iter().take(8000).any(|b| *b == 0) {
+        return 0;
+    }
+    let newlines = bytes.iter().filter(|b| **b == b'\n').count() as u64;
+    newlines + u64::from(bytes.last().is_some_and(|b| *b != b'\n'))
+}
+
 /// Every file in the checkout (tracked + untracked, gitignore respected) in
 /// git listing order, for the fuzzy file finder. `Err` is a user-facing
 /// flash message.
@@ -776,6 +905,74 @@ mod tests {
             before,
             "a plain status left the index alone, so this test proves nothing"
         );
+    }
+
+    /// Numstat records sum across files; a rename's two path fields are
+    /// skipped rather than read as records, and a binary file's `-` adds
+    /// nothing.
+    #[test]
+    fn parse_numstat_z_sums_files_renames_and_binaries() {
+        let raw =
+            b"3\t1\tsrc/a.rs\x00-\t-\tlogo.png\x0010\t2\t\x00old.rs\x00new.rs\x000\t4\tgone.rs\x00";
+        assert_eq!(
+            parse_numstat_z(raw),
+            LineChanges {
+                added: 13,
+                removed: 7
+            }
+        );
+        assert!(parse_numstat_z(b"").is_empty());
+    }
+
+    #[test]
+    fn count_lines_counts_like_numstat() {
+        assert_eq!(count_lines(b""), 0);
+        assert_eq!(count_lines(b"one\n"), 1);
+        assert_eq!(count_lines(b"one\ntwo"), 2);
+        assert_eq!(count_lines(b"a\x00b\n"), 0, "binary");
+    }
+
+    /// Against a real checkout: a staged edit, an unstaged one and an
+    /// untracked file all count, the way the DIFF VIEWER would show them,
+    /// and an unborn HEAD counts its tracked files from nothing.
+    #[test]
+    fn line_changes_counts_staged_unstaged_and_untracked() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let out = run_git(repo, args).unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "1\n2\n3\n").unwrap();
+        git(&["add", "a.txt"]);
+        let unborn = changed_files(repo).unwrap();
+        assert_eq!(
+            line_changes(repo, &unborn),
+            Some(LineChanges {
+                added: 3,
+                removed: 0
+            }),
+            "no commit yet: every tracked line is new"
+        );
+        git(&["commit", "-qm", "init"]);
+
+        std::fs::write(repo.join("a.txt"), "1\nTWO\n3\n4\n").unwrap();
+        git(&["add", "a.txt"]);
+        std::fs::write(repo.join("a.txt"), "1\nTWO\n4\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "x\ny").unwrap();
+        let files = changed_files(repo).unwrap();
+        assert_eq!(
+            line_changes(repo, &files),
+            Some(LineChanges {
+                added: 4,
+                removed: 2
+            }),
+            "HEAD 1 2 3 -> 1 TWO 4 is +2 -2, and new.txt's two lines add"
+        );
+        assert_eq!(line_changes(repo, &[]), Some(LineChanges::default()));
     }
 
     #[test]

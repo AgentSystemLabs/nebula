@@ -6,7 +6,7 @@ mod upgrade;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Command, ConfigCommand, WorkspaceCommand};
+use cli::{Cli, Command, ConfigCommand};
 use std::path::Path;
 
 fn main() -> Result<()> {
@@ -24,19 +24,6 @@ fn main() -> Result<()> {
             )
         }
         Some(Command::Add { path }) => nebula_tui::run_add_project(path),
-        Some(Command::Workspace { command }) => {
-            use nebula_tui::WorkspaceOp;
-            let op = match command {
-                WorkspaceCommand::Add { name } => WorkspaceOp::Add { name },
-                WorkspaceCommand::Open { name } => WorkspaceOp::Open { name },
-                WorkspaceCommand::List => WorkspaceOp::List,
-                WorkspaceCommand::Delete { name } => WorkspaceOp::Delete { name },
-                WorkspaceCommand::Rename { name, new_name } => {
-                    WorkspaceOp::Rename { name, new_name }
-                }
-            };
-            nebula_tui::run_workspace(op)
-        }
         Some(Command::Config { command }) => nebula_tui::run_config(match command {
             ConfigCommand::Path => nebula_tui::ConfigOp::Path,
             ConfigCommand::Export { path } => nebula_tui::ConfigOp::Export { path },
@@ -108,10 +95,8 @@ fn main() -> Result<()> {
             Some(dir) => nebula_tui::run_add_project(dir),
             None => {
                 init_tui_logging()?;
-                let handoff = log_fatal(
-                    nebula_tui::run_tui(cli.workspace),
-                    &nebula_core::paths::tui_log_path(),
-                )?;
+                let handoff =
+                    log_fatal(nebula_tui::run_tui(), &nebula_core::paths::tui_log_path())?;
                 match handoff {
                     // Hosts-picker handoff: the TUI quit and restored the
                     // terminal so a fresh `nebula ssh` can exec over us (the

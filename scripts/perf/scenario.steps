@@ -65,8 +65,6 @@ settings: down	j
 settings: close	Escape
 open help	?
 help: close	Escape
-open workspace picker	w
-workspace picker: close	Escape
 open issues	i
 issues: down	j
 issues: close	Escape
@@ -85,8 +83,6 @@ context menu	m
 context menu: close	Escape
 toggle projects panel	P
 toggle projects panel back	P
-toggle workspaces bar	W
-toggle workspaces bar back	W
 fullscreen pane	z
 leave fullscreen	C-q
 next attention	]
@@ -118,10 +114,6 @@ project down	j
 project up	k
 add project prompt	o
 add project: cancel	Escape
-workspace picker	w
-workspace picker: new	n
-workspace picker: name	text:second
-workspace picker: create	Enter
-back to workspace 1	1
-to workspace 2	2
-back to workspace 1 (2)	1
+project tab 1	1
+next project tab	.
+prev project tab	,

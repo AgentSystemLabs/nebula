@@ -1,14 +1,13 @@
 use crate::entities::{
-    Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Project, TerminalTab, Workspace,
-    Worktree,
+    Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Project, TerminalTab, Worktree,
 };
-use crate::ids::{AgentId, LinkId, ProjectId, TerminalId, WorkspaceId, WorktreeId};
+use crate::ids::{AgentId, LinkId, ProjectId, TerminalId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 40;
+pub const PROTOCOL_VERSION: u32 = 41;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -55,34 +54,8 @@ pub enum ClientRequest {
     },
 
     // -- entity CRUD (RPC-style; answered by Ack/Error with matching req_id) --
-    /// Create a workspace. Does not open it — that stays a separate step.
-    AddWorkspace {
-        req_id: u64,
-        name: String,
-    },
-    /// Delete a workspace. Refused while it still holds projects, or when it
-    /// is the last workspace. Clients still scoped to it fall back to a
-    /// surviving one when its EntityRemoved lands.
-    RemoveWorkspace {
-        req_id: u64,
-        id: WorkspaceId,
-    },
-    RenameWorkspace {
-        req_id: u64,
-        id: WorkspaceId,
-        name: String,
-    },
-    /// Scope THIS connection to `id`, and remember it as the workspace a
-    /// fresh client opens into. Deliberately not broadcast: two nebula
-    /// instances are two views, and switching in one must not drag the
-    /// other along with it.
-    OpenWorkspace {
-        req_id: u64,
-        id: WorkspaceId,
-    },
-    /// Add a project to the workspace this connection is scoped to (see
-    /// OpenWorkspace) — the remembered default for a connection that never
-    /// scoped itself, which is every one-shot `nebula add`.
+    /// Register a repo as a project. Refused when `path` resolves to a
+    /// repo this machine already knows — one repo is one project.
     AddProject {
         req_id: u64,
         path: PathBuf,
@@ -467,11 +440,6 @@ pub enum ServerEvent {
         daemon_protocol_version: u32,
     },
     Snapshot {
-        workspaces: Vec<Workspace>,
-        /// The workspace to scope this client's project lists to: the
-        /// last one opened anywhere, which is only ever a starting point —
-        /// each client owns its scope from here (see OpenWorkspace).
-        active_workspace: WorkspaceId,
         projects: Vec<Project>,
         worktrees: Vec<Worktree>,
         agents: Vec<Agent>,

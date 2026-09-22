@@ -1117,8 +1117,8 @@ impl BranchSwitchView {
 
 /// The hotkey. From a WORKTREES PANEL or SESSIONS PANEL row (and the pane)
 /// it acts on the selected checkout, which must be the root; from the
-/// PROJECTS PANEL, the WORKSPACES BAR, or with no checkout under the
-/// cursor (an OPEN PRS row), on the project's root.
+/// PROJECTS PANEL, or with no checkout under the cursor (an OPEN PRS
+/// row), on the project's root.
 pub(crate) fn open_branch_switch(app: &mut App) {
     let Some(project) = app.selected_project().map(|p| p.id.clone()) else {
         app.flash = Some("switch branch: select a project first".into());
@@ -1387,6 +1387,8 @@ fn land_switch(app: &mut App, worktree: WorktreeId, request: u64, outcome: Outco
             {
                 app.git_changes = None;
             }
+            app.worktree_changes.remove(&worktree);
+            app.worktree_lines.remove(&worktree);
             app.pull_requests.remove(&worktree);
             app.pr_recheck.remove(&worktree);
             if view_for(app, &worktree).is_some() {
@@ -2842,7 +2844,6 @@ mod tests {
     fn app_on(path: &Path) -> App {
         let mut app = App::new();
         app.tree.projects.push(Project {
-            workspace_id: Default::default(),
             id: ProjectId("p1".into()),
             name: "demo".into(),
             repo_path: path.to_path_buf(),

@@ -1,4 +1,4 @@
-use crate::ids::{AgentId, LinkId, ProjectId, TerminalId, WorkspaceId, WorktreeId};
+use crate::ids::{AgentId, LinkId, ProjectId, TerminalId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -131,24 +131,10 @@ impl AgentKind {
     }
 }
 
-/// A named group of projects. Each nebula instance has exactly one
-/// workspace open and shows only that workspace's projects; the daemon
-/// remembers the last one opened as the workspace a fresh instance boots
-/// into, not as a scope every client shares.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Workspace {
-    pub id: WorkspaceId,
-    pub name: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: ProjectId,
     pub name: String,
-    /// The workspace this project lives in. Defaults to the built-in
-    /// `default` workspace for rows that predate workspaces.
-    #[serde(default)]
-    pub workspace_id: WorkspaceId,
     pub repo_path: PathBuf,
     pub sort_order: i64,
 }
@@ -304,7 +290,6 @@ pub struct Link {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Entity {
-    Workspace(Workspace),
     Project(Project),
     Worktree(Worktree),
     Agent(Agent),
@@ -314,7 +299,6 @@ pub enum Entity {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EntityId {
-    Workspace(WorkspaceId),
     Project(ProjectId),
     Worktree(WorktreeId),
     Agent(AgentId),

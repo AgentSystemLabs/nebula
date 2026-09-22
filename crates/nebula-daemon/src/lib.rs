@@ -11,6 +11,7 @@ pub mod prompt_history;
 pub mod pty;
 pub mod registry;
 pub mod server;
+pub mod session_model;
 pub mod session_title;
 pub mod sibling;
 pub mod status;
@@ -221,6 +222,23 @@ async fn serve() -> Result<()> {
                             project = %project.name, error = %e, "worktree sync failed"
                         ),
                     }
+                }
+            }
+        });
+    }
+
+    // Claude's `/model` rides no hook either, but the switch lands in the
+    // transcript at once: a size probe over the transcripts the hooks named
+    // gates reading what each one appended (see `session_model`).
+    {
+        let daemon = daemon.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut offsets = session_model::TranscriptOffsets::new();
+            loop {
+                tokio::select! {
+                    _ = daemon.shutdown.cancelled() => break,
+                    _ = interval.tick() => daemon.sweep_claude_models(&mut offsets),
                 }
             }
         });

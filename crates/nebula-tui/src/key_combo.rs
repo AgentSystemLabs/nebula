@@ -1,7 +1,7 @@
 //! The KEY COMBO DISPLAY (Settings → Experimental, `show_key_combos`):
 //! each key pressed in the panels, spelled at the bottom left of the
 //! screen with what it did — `j - Move down`, `^d - Half page down`,
-//! `h h - Workspaces` — so someone watching over a shoulder or a screen
+//! `l l - Enter pane` — so someone watching over a shoulder or a screen
 //! share can pick the shortcuts up as they are used. Modelled on vim's
 //! `showcmd`: the keys show as they land and clear on their own a moment
 //! later ([`LINGER`]), with nothing to dismiss.
@@ -149,13 +149,13 @@ mod tests {
             at: Instant::now(),
         };
         assert_eq!(combo.text(), "x", "no dash with nothing after it");
-        let h = chord(KeyCode::Char('h'), KeyModifiers::NONE);
+        let l = chord(KeyCode::Char('l'), KeyModifiers::NONE);
         let combo = KeyCombo {
-            keys: vec![h, h],
-            does: Some("Workspaces".into()),
+            keys: vec![l, l],
+            does: Some("Enter pane".into()),
             at: Instant::now(),
         };
-        assert_eq!(combo.text(), "h h - Workspaces");
+        assert_eq!(combo.text(), "l l - Enter pane");
     }
 
     #[test]

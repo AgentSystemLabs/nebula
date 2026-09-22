@@ -1,0 +1,89 @@
+{
+  "animations": false,
+  "claude_effort": "high",
+  "claude_enabled": false,
+  "claude_model": "opus",
+  "claude_models": [
+    "claude-sonnet-5",
+    "us.anthropic.claude-opus-5-v1:0"
+  ],
+  "close_finder_on_open": false,
+  "codex_effort": "xhigh",
+  "codex_enabled": false,
+  "codex_model": "gpt-5.5",
+  "confirm_on_archive": true,
+  "cursor_effort": "high",
+  "cursor_enabled": false,
+  "cursor_model": "claude-opus-5-thinking",
+  "custom_harnesses": [
+    {
+      "id": "agy",
+      "label": "Agy",
+      "program": "/usr/local/bin/agy",
+      "enabled": false,
+      "model": "agy-large",
+      "model_flag": "-m",
+      "hooks": "claude"
+    }
+  ],
+  "done_sound": "Ping",
+  "editor": "nvim",
+  "feedback_sound": "off",
+  "preset_text": "postfix",
+  "focus_tint": false,
+  "black_background": false,
+  "session_pane": "right",
+  "git_init_on_create": false,
+  "harnesses": {
+    "claude": {
+      "enabled": false,
+      "label": "Claude Code"
+    },
+    "grok": {
+      "label": "Grok",
+      "program": "/usr/local/bin/grok",
+      "model_flag": "--model"
+    }
+  },
+  "hide_draft_prs": true,
+  "card_line_changes": true,
+  "hide_projects": true,
+  "hide_root_worktree": true,
+  "hide_sessions": true,
+  "hide_uninstalled_harnesses": true,
+  "hide_worktrees": true,
+  "keybindings": {
+    "git_diff": "ctrl+g, g",
+    "quit": ""
+  },
+  "muse_effort": "high",
+  "muse_enabled": false,
+  "muse_model": "muse-1",
+  "palette_enter_attaches": false,
+  "pi_effort": "medium",
+  "pi_enabled": false,
+  "pi_model": "anthropic/claude-sonnet-5",
+  "pr_issue_counts": false,
+  "prewarm_agents": false,
+  "prewarm_sessions": false,
+  "projects": {
+    "/Users/me/src/app": {
+      "run_command": "npm run dev",
+      "open_command": "open http://localhost:3000",
+      "hide_root_worktree": false
+    }
+  },
+  "quick_prompt_focus": true,
+  "quick_prompt_new_worktree": true,
+  "quick_prompt_kind": "codex",
+  "recent_prompts": true,
+  "recent_prompts_count": 5,
+  "remember_harness": true,
+  "session_idle_timeout": "30m",
+  "show_key_combos": true,
+  "show_workspaces": false,
+  "skip_session_naming": true,
+  "ssh_sync_config": false,
+  "theme": "ocean",
+  "worktree_base_branch": "develop"
+}

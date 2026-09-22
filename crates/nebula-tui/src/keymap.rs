@@ -61,15 +61,29 @@ pub enum Action {
     HalfPageUp,
     Activate,
     Palette,
-    /// `]`: the next session in the PALETTE's attention order, no modal.
+    /// `.`: the next session in the PALETTE's attention order, no modal.
     NextAttention,
-    /// `[`: the same walk backwards.
+    /// `,`: the same walk backwards.
     PrevAttention,
+    /// `]`: the LAUNCHER VIEW's next PROJECT TAB to the right — that
+    /// project's sessions. The last tab goes no further.
+    NextProjectTab,
+    /// `[`: the tab to the left. The first tab goes no further.
+    PrevProjectTab,
+    /// `x`: close the PROJECT TAB the grid is on, landing on the tab that
+    /// slides into its place.
+    CloseProjectTab,
+    /// `⌘P` / `+`: the PROJECT DROPDOWN, the list the `+` after the PROJECT
+    /// TABS drops — type to narrow it, Enter or a click opens the project.
+    ProjectDropdown,
     // projects & worktrees
     AddProject,
     New,
     GitDiff,
     OpenRepo,
+    /// `Shift+P`: the pull request of the session card under the cursor,
+    /// in the browser — the `#42 title` line on the card.
+    OpenPullRequest,
     /// `Shift+C`: a new Ghostty tab in the selected worktree's directory —
     /// a silent no-op on a machine without Ghostty.
     OpenGhosttyTab,
@@ -83,6 +97,9 @@ pub enum Action {
     /// place, commented on, with a QUICK PROMPT or an AGENT PRESET launched
     /// on one.
     Issues,
+    /// `v`: the PULL REQUESTS MODAL — the project's open pull requests,
+    /// read in place, commented on, with a PR SESSION launched on one.
+    PullRequests,
     /// `c`: the BRANCH SWITCHER — move the project's ROOT WORKTREE onto
     /// another branch, asking what to do with uncommitted changes.
     SwitchBranch,
@@ -121,16 +138,21 @@ pub enum Action {
     Zoom,
     UnlockTerminal,
     // general
-    Workspaces,
-    ToggleWorkspaces,
-    ToggleProjects,
-    ToggleWorktrees,
-    ToggleSessions,
-    /// Collapse every sidebar panel to its rail, or expand them all:
-    /// the one-keystroke way to give the terminal the full width.
+    /// `^~`: fold the LAUNCHER VIEW's PANE away and give the cards the
+    /// whole body, or bring it back. Folding it also unselects the card
+    /// under the cursor, so nothing is selected and nothing is read.
+    ToggleLauncherPane,
+    /// `` ` ``: walk the LAUNCHER PANE's TAB STRIP — the session the
+    /// cursor is on, then each TERMINAL open in that checkout, then back
+    /// to the session. What the pane READS, where `^~` is whether it is
+    /// drawn at all.
+    PaneTabs,
+    /// Fold the LAUNCHER PANE away and give the cards the whole body,
+    /// or bring it back — the same thing [`Action::ToggleLauncherPane`]
+    /// does, on the chord the panels' "collapse everything" used to own.
     ToggleSidebars,
-    /// Open the Nth workspace tab (1-based) straight from the top bar.
-    SelectWorkspace(u8),
+    /// Open the Nth PROJECT TAB (1-based) in the LAUNCHER VIEW's header.
+    SelectProjectTab(u8),
     Hosts,
     Settings,
     Metrics,
@@ -152,19 +174,19 @@ pub struct ActionSpec {
     pub defaults: &'static [&'static str],
 }
 
-/// One positional workspace shortcut. `⌘N` is what the tab bar advertises
-/// and what a Mac user reaches for — but it is [`Reach::Blocked`] in
-/// Terminal.app and most other emulators, which never encode ⌘ into pty
-/// bytes at all. The bare digit is bound alongside it and is the chord that
-/// actually fires there; digits are otherwise unbound in the panels.
-macro_rules! workspace_slot {
+/// One positional PROJECT TAB shortcut. `⌘N` is what a browser user
+/// reaches for — but it is [`Reach::Blocked`] in Terminal.app and most
+/// other emulators, which never encode ⌘ into pty bytes at all. The bare
+/// digit is bound alongside it and is the chord that actually fires there;
+/// digits are otherwise unbound on the grid.
+macro_rules! project_tab_slot {
     ($n:literal, $id:literal, $label:literal, $cmd:literal, $digit:literal) => {
         ActionSpec {
-            action: Action::SelectWorkspace($n),
+            action: Action::SelectProjectTab($n),
             id: $id,
             label: $label,
-            hint: "Open that workspace tab from anywhere (⌘N only in emulators that send ⌘)",
-            group: "GENERAL",
+            hint: "Launcher view: open the project on that tab of the header, counting from the left (⌘N only in emulators that send ⌘)",
+            group: "NAVIGATE",
             scope: Scope::Global,
             defaults: &[$cmd, $digit],
         }
@@ -186,7 +208,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::FocusPrev,
         id: "focus_prev",
         label: "Previous panel",
-        hint: "Walk focus back through visible panels, stopping at the workspaces bar or first visible sidebar (^⇧H needs the kitty protocol)",
+        hint: "Walk focus back through visible panels, stopping at the first visible sidebar (^⇧H needs the kitty protocol)",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["shift+tab", "ctrl+shift+h"],
@@ -195,7 +217,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::FocusLeft,
         id: "focus_left",
         label: "Focus left",
-        hint: "Move focus one visible panel left; a double tap at the first sidebar jumps to the workspaces bar, like ⇧Tab",
+        hint: "Move focus one visible panel left, stopping at the first visible sidebar",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["h", "left"],
@@ -222,7 +244,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::MoveDown,
         id: "move_down",
         label: "Move down",
-        hint: "Move the selection down in the focused panel; in the workspaces bar a double tap drops back onto the panel you came up from",
+        hint: "Move the selection down in the focused panel; twice from the project tabs, into the one under their cursor",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["j", "down"],
@@ -231,7 +253,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::MoveUp,
         id: "move_up",
         label: "Move up",
-        hint: "Move the selection up in the focused panel, stopping at the first row; a double tap there jumps up into the workspaces bar, like ⇧Tab",
+        hint: "Move the selection up in the focused panel, stopping at the first row; twice there, up to the project tabs",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["k", "up"],
@@ -267,7 +289,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::Palette,
         id: "palette",
         label: "Fuzzy jump",
-        hint: "Search every workspace, project, worktree and session at once",
+        hint: "Search every project, worktree and session at once",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["/"],
@@ -276,10 +298,10 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::NextAttention,
         id: "next_attention",
         label: "Next session needing you",
-        hint: "Jump to the next session in the palette's attention order (needs feedback, running, unseen, then recency) in any workspace, wrapping",
+        hint: "Jump to the next session in the palette's attention order (needs feedback, running, unseen, then recency) in any project, wrapping",
         group: "NAVIGATE",
         scope: Scope::Global,
-        defaults: &["]"],
+        defaults: &["."],
     },
     ActionSpec {
         action: Action::PrevAttention,
@@ -288,7 +310,55 @@ pub const ACTIONS: &[ActionSpec] = &[
         hint: "The same walk backwards: the session before this one in the palette's attention order, wrapping at the top",
         group: "NAVIGATE",
         scope: Scope::Global,
+        defaults: &[","],
+    },
+    ActionSpec {
+        action: Action::NextProjectTab,
+        id: "next_project_tab",
+        label: "Next project tab",
+        hint: "Launcher view: open the project on the tab to the right of this one in the header, stopping at the last",
+        group: "NAVIGATE",
+        scope: Scope::Global,
+        defaults: &["]"],
+    },
+    ActionSpec {
+        action: Action::PrevProjectTab,
+        id: "prev_project_tab",
+        label: "Prev project tab",
+        hint: "Launcher view: open the project on the tab to the left, stopping at the first",
+        group: "NAVIGATE",
+        scope: Scope::Global,
         defaults: &["["],
+    },
+    project_tab_slot!(1, "project_tab_1", "Project tab 1", "cmd+1", "1"),
+    project_tab_slot!(2, "project_tab_2", "Project tab 2", "cmd+2", "2"),
+    project_tab_slot!(3, "project_tab_3", "Project tab 3", "cmd+3", "3"),
+    project_tab_slot!(4, "project_tab_4", "Project tab 4", "cmd+4", "4"),
+    project_tab_slot!(5, "project_tab_5", "Project tab 5", "cmd+5", "5"),
+    project_tab_slot!(6, "project_tab_6", "Project tab 6", "cmd+6", "6"),
+    project_tab_slot!(7, "project_tab_7", "Project tab 7", "cmd+7", "7"),
+    project_tab_slot!(8, "project_tab_8", "Project tab 8", "cmd+8", "8"),
+    project_tab_slot!(9, "project_tab_9", "Project tab 9", "cmd+9", "9"),
+    ActionSpec {
+        action: Action::CloseProjectTab,
+        id: "close_project_tab",
+        label: "Close project tab",
+        hint: "Launcher view: drop this project's tab from the header and open the tab beside it. Nothing is deleted — + opens it again",
+        group: "NAVIGATE",
+        scope: Scope::Global,
+        defaults: &["x"],
+    },
+    ActionSpec {
+        action: Action::ProjectDropdown,
+        id: "project_dropdown",
+        label: "Switch project",
+        hint: "Launcher view: drop the list of every project under the + in the header — type to narrow it, Enter or a click opens one. ⌘P works from inside the pane too and puts the list away again, but needs the kitty protocol (Ghostty/kitty send it, Terminal.app never does); the bare + is the header's own button and arrives everywhere",
+        group: "NAVIGATE",
+        scope: Scope::Global,
+        // `⌘P` is the chord to reach for; `+`, the header button's own
+        // glyph, is bound beside it for the terminals that never encode ⌘
+        // — as the bare digits are beside `⌘1`–`⌘9`.
+        defaults: &["cmd+p", "+"],
     },
     // ---- PROJECTS & WORKTREES ----
     ActionSpec {
@@ -328,6 +398,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         defaults: &["shift+g"],
     },
     ActionSpec {
+        action: Action::OpenPullRequest,
+        id: "open_pull_request",
+        label: "Open pull request in browser",
+        hint: "Send the pull request of the session card under the cursor — its checkout's branch — to your browser",
+        group: "PROJECTS & WORKTREES",
+        scope: Scope::Global,
+        defaults: &["shift+p"],
+    },
+    ActionSpec {
         action: Action::OpenGhosttyTab,
         id: "open_ghostty_tab",
         label: "Open in Ghostty tab",
@@ -362,6 +441,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["i"],
+    },
+    ActionSpec {
+        action: Action::PullRequests,
+        id: "pull_requests",
+        label: "GitHub pull requests",
+        hint: "List the project's open pull requests; Enter prompts a PR session on one, e launches a preset on it, n picks a harness",
+        group: "PROJECTS & WORKTREES",
+        scope: Scope::Global,
+        defaults: &["v"],
     },
     ActionSpec {
         action: Action::SwitchBranch,
@@ -530,68 +618,39 @@ pub const ACTIONS: &[ActionSpec] = &[
     },
     // ---- GENERAL ----
     ActionSpec {
-        action: Action::Workspaces,
-        id: "workspaces",
-        label: "Workspaces",
-        hint: "Switch workspace (n / r / d manage them)",
+        action: Action::ToggleLauncherPane,
+        id: "toggle_launcher_pane",
+        label: "Launcher session pane",
+        hint: "Launcher view: fold the pane under the cards away — which also unselects the card it was reading — or bring it back. From inside the pane the ctrl chords take two presses: the first hands the keys back to the card, the second folds the pane. ^` and ^~ need the kitty protocol; ~ is bound alongside them, the shift of the ` that walks the pane's tabs",
         group: "GENERAL",
         scope: Scope::Global,
-        defaults: &["w"],
+        // `^`` is the chord to reach for — out of the pane, then the pane
+        // away — and `^~` the same key for the terminals that report it
+        // shifted with ctrl held. Only the kitty protocol carries either:
+        // a stock terminal has no encoding for ctrl and this key, and
+        // sends the same NUL it sends for ^Space. So the bare `~` is bound
+        // beside them — the shift of the `` ` `` that walks the pane's
+        // tabs, which is the key everything else about the pane is on.
+        defaults: &["ctrl+`", "ctrl+~", "~"],
     },
     ActionSpec {
-        action: Action::ToggleWorkspaces,
-        id: "toggle_workspaces",
-        label: "Workspaces bar",
-        hint: "Show or hide the Workspaces tab bar across the top",
+        action: Action::PaneTabs,
+        id: "pane_tabs",
+        label: "Terminals in the pane",
+        hint: "Launcher view: swap the pane under the cards between the session the cursor is on and the terminals open in that checkout — the tabs across the pane's header, which a click walks too",
         group: "GENERAL",
         scope: Scope::Global,
-        defaults: &["shift+w"],
-    },
-    ActionSpec {
-        action: Action::ToggleProjects,
-        id: "toggle_projects",
-        label: "Projects panel",
-        hint: "Collapse or expand the Projects panel and give its width to the terminal",
-        group: "GENERAL",
-        scope: Scope::Global,
-        defaults: &["shift+p"],
-    },
-    ActionSpec {
-        action: Action::ToggleWorktrees,
-        id: "toggle_worktrees",
-        label: "Worktrees panel",
-        hint: "Collapse or expand the Worktrees panel and give its width to the terminal",
-        group: "GENERAL",
-        scope: Scope::Global,
-        defaults: &["shift+b"],
-    },
-    ActionSpec {
-        action: Action::ToggleSessions,
-        id: "toggle_sessions",
-        label: "Sessions panel",
-        hint: "Collapse or expand the Sessions panel and give its width to the terminal",
-        group: "GENERAL",
-        scope: Scope::Global,
-        defaults: &["shift+s"],
+        defaults: &["`"],
     },
     ActionSpec {
         action: Action::ToggleSidebars,
         id: "toggle_sidebars",
-        label: "All sidebars",
-        hint: "Collapse every panel and the workspaces bar, or bring them all back",
+        label: "Full-width cards",
+        hint: "Fold the pane under the cards away and give the grid the whole body, or bring it back",
         group: "GENERAL",
         scope: Scope::Global,
         defaults: &["ctrl+b", "cmd+b", "shift+z"],
     },
-    workspace_slot!(1, "select_workspace_1", "Open workspace 1", "cmd+1", "1"),
-    workspace_slot!(2, "select_workspace_2", "Open workspace 2", "cmd+2", "2"),
-    workspace_slot!(3, "select_workspace_3", "Open workspace 3", "cmd+3", "3"),
-    workspace_slot!(4, "select_workspace_4", "Open workspace 4", "cmd+4", "4"),
-    workspace_slot!(5, "select_workspace_5", "Open workspace 5", "cmd+5", "5"),
-    workspace_slot!(6, "select_workspace_6", "Open workspace 6", "cmd+6", "6"),
-    workspace_slot!(7, "select_workspace_7", "Open workspace 7", "cmd+7", "7"),
-    workspace_slot!(8, "select_workspace_8", "Open workspace 8", "cmd+8", "8"),
-    workspace_slot!(9, "select_workspace_9", "Open workspace 9", "cmd+9", "9"),
     ActionSpec {
         action: Action::Hosts,
         id: "hosts",

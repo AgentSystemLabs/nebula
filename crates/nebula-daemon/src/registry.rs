@@ -13,8 +13,8 @@ use nebula_core::env;
 use nebula_core::project_file::{self, ProjectCommand};
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, EnterOutcome, Entity, EntityId, Link, LinkId,
-    PrewarmInfo, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Workspace,
-    WorkspaceId, Worktree, WorktreeId, MAX_CLOUD_PROMPT_BYTES,
+    PrewarmInfo, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Worktree,
+    WorktreeId, MAX_CLOUD_PROMPT_BYTES,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -176,8 +176,8 @@ pub struct Daemon {
     /// would both miss the registry and fork two CLIs, orphaning one.
     spawn_gate: Mutex<()>,
     /// The worktree prewarm sweep currently running, so a newer one can
-    /// cancel it. Stepping through the Workspaces column fires a sweep per
-    /// row, and only the row the cursor rests on is worth warming.
+    /// cancel it. Walking the project tabs fires a sweep per step, and
+    /// only the project the cursor rests on is worth warming.
     prewarm_sweep: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Resumed agent spawns, by agent, until their PTY exits: a resume that
     /// dies inside [`RESUME_FAIL_WINDOW`] could not find its session, and
@@ -549,8 +549,6 @@ impl Daemon {
             }
         }
         Ok(ServerEvent::Snapshot {
-            workspaces: self.store.load_workspaces()?,
-            active_workspace: self.store.active_workspace_id()?,
             projects,
             worktrees,
             agents,
@@ -591,113 +589,16 @@ impl Daemon {
         Ok(term)
     }
 
-    // ---- workspaces ----
-
-    /// Validated, trimmed workspace name, checked for collisions (excluding
-    /// `except` on renames).
-    fn checked_workspace_name(&self, name: &str, except: Option<&WorkspaceId>) -> Result<String> {
-        let name = name.trim();
-        if name.is_empty() {
-            bail!("workspace name is empty");
-        }
-        if let Some(existing) = self.store.workspace_by_name(name)? {
-            if Some(&existing) != except {
-                bail!("a workspace named '{name}' already exists");
-            }
-        }
-        Ok(name.to_string())
-    }
-
-    /// Create a workspace. Does not open it — `workspace open` stays a
-    /// separate, explicit step.
-    pub fn add_workspace(self: &Arc<Self>, name: &str) -> Result<EntityId> {
-        let name = self.checked_workspace_name(name, None)?;
-        let workspace = Workspace {
-            id: WorkspaceId::generate(),
-            name,
-        };
-        self.store.insert_workspace(&workspace)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Workspace(workspace.clone()),
-        });
-        Ok(EntityId::Workspace(workspace.id))
-    }
-
-    pub fn rename_workspace(self: &Arc<Self>, id: &WorkspaceId, name: &str) -> Result<()> {
-        let mut workspace = self
-            .store
-            .get_workspace(id)?
-            .context("workspace not found")?;
-        workspace.name = self.checked_workspace_name(name, Some(id))?;
-        self.store.rename_workspace(id, &workspace.name)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Workspace(workspace),
-        });
-        Ok(())
-    }
-
-    /// Delete a workspace. Only empty ones go — its projects are the user's
-    /// to move or remove first — and never the last one. Deleting the
-    /// remembered default moves that default to a survivor; clients still
-    /// scoped to it re-scope themselves off the EntityRemoved.
-    pub fn remove_workspace(self: &Arc<Self>, id: &WorkspaceId) -> Result<()> {
-        self.store
-            .get_workspace(id)?
-            .context("workspace not found")?;
-        let projects = self.store.count_workspace_projects(id)?;
-        if projects > 0 {
-            bail!(
-                "workspace still has {projects} project{} — remove them first",
-                if projects == 1 { "" } else { "s" }
-            );
-        }
-        if self.store.count_workspaces()? <= 1 {
-            bail!("cannot delete the last workspace");
-        }
-        if self.store.active_workspace_id()? == *id {
-            let fallback = self
-                .store
-                .load_workspaces()?
-                .into_iter()
-                .find(|w| &w.id != id)
-                .context("no workspace left to open")?;
-            self.store.set_active_workspace(&fallback.id)?;
-        }
-        self.store.delete_workspace(id)?;
-        self.broadcast(ServerEvent::EntityRemoved {
-            id: EntityId::Workspace(id.clone()),
-        });
-        Ok(())
-    }
-
-    /// Remember `id` as the workspace a fresh client opens into. Which
-    /// workspace a *live* client is looking at is that client's own state —
-    /// see `ClientRequest::OpenWorkspace` — so this deliberately notifies
-    /// nobody: one instance switching must leave the others where they are.
-    pub fn set_default_workspace(self: &Arc<Self>, id: &WorkspaceId) -> Result<()> {
-        self.store
-            .get_workspace(id)?
-            .context("workspace not found")?;
-        if self.store.active_workspace_id()? == *id {
-            return Ok(()); // already the default
-        }
-        self.store.set_active_workspace(id)?;
-        Ok(())
-    }
-
     // ---- projects ----
 
-    /// Register a repo as a project. `workspace` is the caller's own scope
-    /// (a TUI that switched with OpenWorkspace); `None` — a one-shot
-    /// `nebula add`, or a client still on whatever it booted into — means
-    /// the remembered default. A scope naming a workspace that has since
-    /// been deleted falls back the same way rather than failing the add.
+    /// Register a repo as a project. One repo is one project: a path that
+    /// resolves to a repo already registered — its root or any checkout of
+    /// it — is refused.
     pub async fn add_project(
         self: &Arc<Self>,
         path: &Path,
         name: Option<String>,
         create_missing: bool,
-        workspace: Option<WorkspaceId>,
     ) -> Result<EntityId> {
         if create_missing && !path.exists() {
             tokio::fs::create_dir_all(path)
@@ -733,27 +634,13 @@ impl Daemon {
             // project with no rows, which is how a project loses its root row.
             None => bail!("git listed no checkout for {}", toplevel.display()),
         };
-        // New projects land in the caller's own workspace; the same repo
-        // may be added to any number of workspaces, just not twice to one.
-        let workspace_id = match workspace {
-            Some(id) if self.store.get_workspace(&id)?.is_some() => id,
-            _ => self.store.active_workspace_id()?,
-        };
-        if self
-            .store
-            .project_in_workspace(&repo_path, &workspace_id)?
-            .is_some()
-        {
-            bail!(
-                "project already added to this workspace: {}",
-                repo_path.display()
-            );
+        if self.store.project_by_path(&repo_path)?.is_some() {
+            bail!("project already added: {}", repo_path.display());
         }
         let name = name.unwrap_or_else(|| Project::folder_name(&repo_path));
         let project = Project {
             id: ProjectId::generate(),
             name,
-            workspace_id,
             repo_path: repo_path.clone(),
             sort_order: self.store.next_project_sort_order()?,
         };
@@ -1130,6 +1017,16 @@ impl Daemon {
         // way at boot.
         let harness = resolve_harness(kind, custom_harness.as_deref())?;
         let program = harness.program.trim().to_string();
+        // A launch that hands the CLI a first prompt is working from the
+        // moment it spawns, so the row says so now instead of staying gray
+        // until the CLI has booted and its first hook has landed — seconds
+        // in which the session the user just started looked idle and sorted
+        // under every session mid-turn.
+        let optimistic_run = Self::launch_submits_first_prompt(
+            &harness,
+            starting_prompt.as_deref(),
+            pr_url.is_some() || issue_url.is_some(),
+        ) && cloud_prompt.is_none();
         let worktree = self
             .store
             .get_worktree(&worktree_id)?
@@ -1163,7 +1060,11 @@ impl Daemon {
             } else {
                 name.trim().to_string()
             },
-            status: AgentStatus::Fresh,
+            status: if optimistic_run {
+                AgentStatus::Running
+            } else {
+                AgentStatus::Fresh
+            },
             archived: false,
             archived_at: 0,
             unseen: false,
@@ -1188,6 +1089,16 @@ impl Daemon {
             pr_url.as_deref(),
             issue_url.as_deref(),
         )?;
+        if optimistic_run {
+            // Seeded by hand, ahead of the spawn, so the CLI's own startup
+            // progress-clear cannot green the row out before its turn has
+            // begun — and so nothing seeds a plain `running` machine from
+            // the row first.
+            self.status_machines
+                .lock()
+                .unwrap()
+                .insert(agent.id.clone(), AgentStatusMachine::launching());
+        }
         if adopted.is_none() {
             // Cold path: boot the CLI right away.
             let spawned = self.spawn_agent_session_with(
@@ -1215,10 +1126,38 @@ impl Daemon {
         Ok(EntityId::Agent(agent.id))
     }
 
+    /// Does a cold spawn of this launch hand the CLI a first prompt — the
+    /// turn that makes a created row `running` before a single hook has
+    /// fired? Asked of the two places that decide it, so it cannot drift
+    /// from them: [`crate::pr_scope::launch_prompts`], which folds a launch
+    /// rule (a PR SESSION's, an ISSUE SESSION's) into the first prompt on a
+    /// harness with no system-prompt flag, and the argv builder's prepend
+    /// shape, which puts nebula's guidance there
+    /// ([`agent_spawn_command_with`]). The rule's text is built per spawn
+    /// from the checkout; only whether there *is* one matters here, so a
+    /// stand-in stands in for it.
+    fn launch_submits_first_prompt(
+        harness: &nebula_core::harness::HarnessDescriptor,
+        starting_prompt: Option<&str>,
+        rule: bool,
+    ) -> bool {
+        harness.system.prepend_to_first_prompt
+            || crate::pr_scope::launch_prompts(
+                harness.system.append_flag.is_some(),
+                // A row being created has no session to resume.
+                false,
+                rule.then_some("<rule>"),
+                starting_prompt,
+            )
+            .initial
+            .is_some()
+    }
+
     fn rollback_agent_on_spawn_error<T>(&self, id: &AgentId, result: Result<T>) -> Result<T> {
         match result {
             Ok(value) => Ok(value),
             Err(spawn_error) => {
+                self.status_machines.lock().unwrap().remove(id);
                 if let Err(rollback_error) = self.store.delete_agent(id) {
                     return Err(spawn_error.context(format!(
                         "agent spawn failed and its database rollback also failed: {rollback_error:#}"
@@ -4564,7 +4503,6 @@ mod tests {
     fn run_worktree(daemon: &Daemon) -> (tempfile::TempDir, Worktree) {
         let dir = tempfile::tempdir().unwrap();
         let project = Project {
-            workspace_id: Default::default(),
             id: ProjectId::generate(),
             name: "demo".into(),
             repo_path: dir.path().to_path_buf(),
@@ -4875,8 +4813,7 @@ mod tests {
         git_in(&repo, &["branch", "-D", "feat-x"]);
 
         let daemon = test_daemon();
-        let EntityId::Project(project) =
-            daemon.add_project(&repo, None, false, None).await.unwrap()
+        let EntityId::Project(project) = daemon.add_project(&repo, None, false).await.unwrap()
         else {
             panic!("expected a project id");
         };
@@ -5082,6 +5019,127 @@ mod tests {
         );
     }
 
+    /// Which launches boot straight into a turn — the question the
+    /// optimistic `running` hangs on. Claude and Pi take a launch rule on
+    /// their system-prompt flag, so only a task makes them work at once;
+    /// Codex, Cursor and Muse have no such flag, so the rule itself opens
+    /// their first prompt.
+    #[test]
+    fn a_launch_submits_a_first_prompt_when_it_carries_a_task_or_an_unflagged_rule() {
+        for kind in AgentKind::ALL {
+            if kind == AgentKind::Custom {
+                continue; // no descriptor without a registry entry
+            }
+            let harness = resolve_harness(kind, None).unwrap();
+            let flagged = harness.system.append_flag.is_some();
+            assert!(
+                Daemon::launch_submits_first_prompt(&harness, Some("Fix auth"), false),
+                "{kind:?}: a task is always the first prompt"
+            );
+            assert!(
+                Daemon::launch_submits_first_prompt(&harness, Some("Fix auth"), true),
+                "{kind:?}: a task beside a rule too"
+            );
+            assert_eq!(
+                Daemon::launch_submits_first_prompt(&harness, None, true),
+                !flagged,
+                "{kind:?}: a bare rule opens the first prompt only without the flag"
+            );
+            assert!(
+                !Daemon::launch_submits_first_prompt(&harness, None, false),
+                "{kind:?}: a bare launch parks at the CLI's own input"
+            );
+        }
+    }
+
+    /// The row the clients are told about is already `running` when the
+    /// launch carries a task: the CLI submits it as it boots, and the
+    /// session must not sit gray — and sort under everything mid-turn —
+    /// for the seconds until its first hook lands.
+    #[tokio::test]
+    async fn a_create_with_a_task_broadcasts_a_running_row() {
+        let daemon = test_daemon();
+        let (dir, worktree) = run_worktree(&daemon);
+        // `/bin/cat` stands in for the CLI: spawned verbatim, it blocks on
+        // the PTY instead of running anything.
+        let _cmd = EnvGuard::set(env::AGENT_CMD, "/bin/cat");
+        let spec = |name: &str, task: Option<&str>| CreateAgentSpec {
+            worktree: worktree.id.clone(),
+            name: name.into(),
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            auto_title: false,
+            cloud_prompt: None,
+            starting_prompt: task.map(String::from),
+            pr_url: None,
+            issue_url: None,
+        };
+
+        let created = |mut events: broadcast::Receiver<ServerEvent>| {
+            std::iter::from_fn(|| events.try_recv().ok())
+                .find_map(|e| match e {
+                    ServerEvent::EntityUpserted {
+                        entity: Entity::Agent(a),
+                    } => Some(a),
+                    _ => None,
+                })
+                .expect("the create broadcasts its row")
+        };
+
+        let events = daemon.events.subscribe();
+        let EntityId::Agent(with_task) = daemon
+            .create_agent(spec("task", Some("Fix auth")))
+            .await
+            .unwrap()
+        else {
+            panic!("a create makes an agent");
+        };
+        assert_eq!(created(events).status, AgentStatus::Running);
+        assert_eq!(
+            daemon.store.get_agent(&with_task).unwrap().unwrap().status,
+            AgentStatus::Running,
+            "and that is what a restart reads back"
+        );
+        // Seeded with its reprieve, so the CLI's startup progress-clear
+        // cannot green it out before the turn begins.
+        daemon.apply_hook_event(&with_task, HookEvent::Progress { busy: false }, None);
+        assert_eq!(
+            daemon.store.get_agent(&with_task).unwrap().unwrap().status,
+            AgentStatus::Running
+        );
+
+        // A launch with nothing to do still parks at the CLI's input box.
+        let events = daemon.events.subscribe();
+        daemon.create_agent(spec("bare", None)).await.unwrap();
+        assert_eq!(created(events).status, AgentStatus::Fresh);
+        drop(dir);
+    }
+
+    /// Save/restore around a process-wide env var a test has to set.
+    struct EnvGuard {
+        key: &'static str,
+        was: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let was = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, was }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.was.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn failed_agent_spawn_rolls_back_the_persisted_row() {
         let daemon = test_daemon();
@@ -5103,7 +5161,6 @@ mod tests {
             daemon
                 .store
                 .insert_project(&Project {
-                    workspace_id: Default::default(),
                     id: ProjectId((*name).into()),
                     name: (*name).into(),
                     repo_path: format!("/tmp/{name}").into(),
@@ -5283,7 +5340,6 @@ mod tests {
         daemon
             .store
             .insert_project(&Project {
-                workspace_id: Default::default(),
                 id: ProjectId("p".into()),
                 name: "p".into(),
                 repo_path: repo.clone(),
@@ -5468,7 +5524,6 @@ mod tests {
 
         let daemon = test_daemon();
         let project = Project {
-            workspace_id: Default::default(),
             id: ProjectId("p".into()),
             name: "p".into(),
             repo_path: repo.clone(),
@@ -5574,7 +5629,7 @@ mod tests {
         git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
 
         let daemon = test_daemon();
-        let id = match daemon.add_project(&repo, None, false, None).await.unwrap() {
+        let id = match daemon.add_project(&repo, None, false).await.unwrap() {
             EntityId::Project(id) => id,
             other => panic!("expected a project id, got {other:?}"),
         };
@@ -5624,7 +5679,7 @@ mod tests {
         );
 
         let daemon = test_daemon();
-        daemon.add_project(&feat, None, false, None).await.unwrap();
+        daemon.add_project(&feat, None, false).await.unwrap();
 
         let (projects, worktrees, _, _) = daemon.store.load_tree().unwrap();
         let project = projects.first().expect("project added");
@@ -5646,7 +5701,7 @@ mod tests {
         assert_eq!(linked.branch, "gentle-narwhal-files");
     }
 
-    /// Adding the repo from a worktree of one already in the workspace is the
+    /// Adding the repo from a worktree of one already registered is the
     /// same repo, so it collides instead of arriving as a second project.
     #[tokio::test]
     async fn adding_a_worktree_of_a_known_repo_is_a_duplicate() {
@@ -5663,11 +5718,8 @@ mod tests {
         );
 
         let daemon = test_daemon();
-        daemon.add_project(&repo, None, false, None).await.unwrap();
-        let err = daemon
-            .add_project(&feat, None, false, None)
-            .await
-            .unwrap_err();
+        daemon.add_project(&repo, None, false).await.unwrap();
+        let err = daemon.add_project(&feat, None, false).await.unwrap_err();
         assert!(
             err.to_string().contains("already added"),
             "expected a duplicate error, got: {err}"
@@ -5694,7 +5746,6 @@ mod tests {
 
         let daemon = test_daemon();
         let project = Project {
-            workspace_id: Default::default(),
             id: ProjectId("p".into()),
             name: "p".into(),
             repo_path: repo.clone(),
@@ -5730,7 +5781,6 @@ mod tests {
 
         let daemon = test_daemon();
         let project = Project {
-            workspace_id: Default::default(),
             id: ProjectId("p".into()),
             name: "p".into(),
             repo_path: repo.clone(),
@@ -5777,7 +5827,6 @@ mod tests {
 
     fn project_at(daemon: &Daemon, repo: &Path) -> Project {
         let project = Project {
-            workspace_id: Default::default(),
             id: ProjectId("p".into()),
             name: "p".into(),
             repo_path: repo.to_path_buf(),
@@ -6271,72 +6320,6 @@ mod tests {
 
         daemon.reparent_agent_by_cwd(&AgentId("a1".into()), "/nebula-test/p-feat", None, false);
         assert_eq!(agent_worktree(&daemon, "a1"), "root");
-    }
-
-    // ---- workspaces ----
-
-    #[test]
-    fn workspace_lifecycle_add_open_rename_delete() {
-        let daemon = test_daemon();
-        let EntityId::Workspace(id) = daemon.add_workspace(" client ").unwrap() else {
-            panic!("add returns the workspace id");
-        };
-        // Name is trimmed; duplicates (trimmed) and blanks are refused.
-        assert_eq!(
-            daemon.store.get_workspace(&id).unwrap().unwrap().name,
-            "client"
-        );
-        assert!(daemon.add_workspace("client").is_err());
-        assert!(daemon.add_workspace("   ").is_err());
-
-        // Adding never opens; opening one moves the remembered default
-        // (and re-opening is a quiet no-op).
-        assert_eq!(
-            daemon.store.active_workspace_id().unwrap().as_str(),
-            "default"
-        );
-        daemon.set_default_workspace(&id).unwrap();
-        assert_eq!(daemon.store.active_workspace_id().unwrap(), id);
-        daemon.set_default_workspace(&id).unwrap();
-        assert!(daemon
-            .set_default_workspace(&WorkspaceId("ghost".into()))
-            .is_err());
-
-        // Rename keeps names unique (a rename to itself is fine).
-        daemon.rename_workspace(&id, "acme").unwrap();
-        daemon.rename_workspace(&id, "acme").unwrap();
-        assert!(daemon.rename_workspace(&id, "default").is_err());
-
-        // Deleting the default workspace moves the default to a survivor.
-        daemon.remove_workspace(&id).unwrap();
-        assert_eq!(
-            daemon.store.active_workspace_id().unwrap().as_str(),
-            "default"
-        );
-        assert!(daemon.store.get_workspace(&id).unwrap().is_none());
-
-        // The last workspace can't go.
-        assert!(daemon
-            .remove_workspace(&WorkspaceId("default".into()))
-            .is_err());
-    }
-
-    #[test]
-    fn workspace_with_projects_refuses_deletion() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["p"]); // lands in 'default'
-        let EntityId::Workspace(empty) = daemon.add_workspace("empty").unwrap() else {
-            panic!("add returns the workspace id");
-        };
-        let err = daemon
-            .remove_workspace(&WorkspaceId("default".into()))
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("1 project"),
-            "helpful refusal: {err}"
-        );
-        // An empty, closed workspace deletes cleanly.
-        daemon.remove_workspace(&empty).unwrap();
     }
 
     /// The status broadcast carries the flag it persisted: a live turn

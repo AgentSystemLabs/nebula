@@ -20,11 +20,16 @@
 //! PROJECT OPEN PRS GROUP row (`e` there, through the preset picker) is
 //! the same box for a PR SESSION: it carries the pull request
 //! ([`QuickLaunch::pr`]) and ends in a `CreatePrAgent` instead.
+//!
+//! A box closed without launching does not take what was typed with it:
+//! Esc, a click outside and the HARDWIRED UNLOCK park it as a
+//! [`QuickDraft`] (`App::quick_draft`), and the next box opened takes it
+//! back ([`open_box`]).
 
 use crate::agent_presets::AgentPreset;
-use crate::app::{App, Focus, Overlay, PromptKind};
+use crate::app::{App, Focus, Overlay, PromptDialog, PromptKind};
 use crate::config::{fit_effort, Config};
-use crate::pull_request::PrLaunch;
+use crate::pull_request::{OpenPr, PrLaunch};
 use crate::text_input::TextInput;
 use nebula_core::{AgentKind, ProjectId, WorktreeId};
 
@@ -73,6 +78,96 @@ pub struct QuickLaunch {
     /// ROOT WORKTREE). Kept across the box's pickers, as the issue is;
     /// `Ctrl+N` is refused, the checkout being the DAEMON's to pick.
     pub pr: Option<PrLaunch>,
+    /// A CLAUDE CLOUD launch: `Tab` on the Claude row of the box's own
+    /// `Tab` picker toggles it, as it does in the NEW SESSION PICKER, and
+    /// Enter sends the typed text as the cloud task (`claude --cloud
+    /// <task>`) rather than as a STARTING PROMPT. Only ever on a plain
+    /// Claude launch ([`QuickLaunch::with_cloud`]): the DAEMON refuses a
+    /// cloud task beside a preset, an issue or a pull request.
+    pub cloud: bool,
+    /// The modal the box was opened over — `Enter` / `p` in the ISSUES
+    /// MODAL or the PULL REQUESTS MODAL — which it stands on rather than
+    /// takes away: drawn under the box, and put back when the box goes
+    /// without launching. A launch closes it, the new session's card being
+    /// what there is to see. Kept across the box's pickers, as the issue is.
+    pub under: Option<ModalUnder>,
+}
+
+/// A modal a QUICK PROMPT box stands on ([`QuickLaunch::under`]), as it
+/// stood when the box went up: its cursor, and the rects it was drawn in.
+/// The rows are the [`App`]'s, so it is drawn fresh under the box.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModalUnder {
+    Issues(Box<crate::issues::IssuesView>),
+    PullRequests(Box<crate::pr_modal::PullRequestsView>),
+}
+
+impl ModalUnder {
+    /// The modal `overlay` is, when it is one a box can stand on.
+    pub fn of(overlay: Option<&Overlay>) -> Option<Self> {
+        match overlay? {
+            Overlay::Issues(view) => Some(Self::Issues(Box::new(view.clone()))),
+            Overlay::PullRequests(view) => Some(Self::PullRequests(Box::new(view.clone()))),
+            _ => None,
+        }
+    }
+
+    /// Put the modal back up, on the row it was left on.
+    pub fn reopen(self, app: &mut App) {
+        match self {
+            Self::Issues(view) => crate::issues::reopen(app, *view),
+            Self::PullRequests(view) => crate::pr_modal::reopen(app, *view),
+        }
+    }
+}
+
+/// The modal under `overlay`: the box's own, or the one under the box a
+/// picker opened from it is drawn over — `Tab`'s harness list, `^P`'s
+/// PROJECT PICKER, `Shift+Tab`'s AGENT PRESETS — so the layers stay put
+/// while the box's spec is rewritten.
+pub(crate) fn modal_under(overlay: &Overlay) -> Option<ModalUnder> {
+    match overlay {
+        Overlay::Prompt(prompt) => match &prompt.kind {
+            PromptKind::QuickPrompt(launch) => launch.under.clone(),
+            _ => None,
+        },
+        other => {
+            held_return(other)
+                .filter(|back| back.from_box)?
+                .launch
+                .under
+        }
+    }
+}
+
+/// The box a picker `overlay` owes back, when it is one opened for a QUICK
+/// PROMPT launch — the menus pin it to their root rows, so a nested
+/// submenu is reached through its parent.
+pub(crate) fn held_return(overlay: &Overlay) -> Option<QuickReturn> {
+    match overlay {
+        Overlay::ProjectPicker(picker) => Some(picker.back.clone()),
+        Overlay::AgentPresets(view) => view.quick.clone(),
+        Overlay::Menu(menu) => {
+            let mut menu = menu;
+            loop {
+                if let Some(back) = crate::event_loop::menu_quick_return(menu) {
+                    return Some(back);
+                }
+                menu = menu.parent.as_ref()?;
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A refused launch's box coming back (`event_loop::reopen_prompt_with`)
+/// stands on the modal it was opened over only while one is still up —
+/// that one, its cursor where it is now. Once the modal has closed, the
+/// box comes back on its own rather than raising it again.
+pub(crate) fn restack(app: &App, launch: &mut QuickLaunch) {
+    if launch.under.is_some() {
+        launch.under = ModalUnder::of(app.overlay.as_ref());
+    }
 }
 
 /// What a picker for a QUICK PROMPT launch carries, so the trip loses
@@ -88,6 +183,78 @@ pub struct QuickReturn {
     /// manager does: it used to put up an empty box nobody asked for. A
     /// pick opens the box either way.
     pub from_box: bool,
+}
+
+/// A QUICK PROMPT box abandoned with something typed in it: the launch as
+/// it stood and the field itself — text, caret and scroll. Nothing typed
+/// into the box is lost to the press that closes it; the draft waits in
+/// `App::quick_draft` for the next box ([`open_box`]).
+///
+/// One slot, in memory only: the last box abandoned is the one that comes
+/// back, and none of it outlives the process. The next box empties the
+/// slot whether or not it was aimed the same way, so a draft is restored
+/// once — cleared out of the box it lands in and sent on Enter, or
+/// abandoned again and parked again.
+#[derive(Debug, Clone)]
+pub struct QuickDraft {
+    pub launch: QuickLaunch,
+    pub input: TextInput,
+}
+
+/// The DRAFT a box on its way out leaves behind: a QUICK PROMPT with
+/// something other than whitespace in it. Every other prompt leaves
+/// nothing, and so does an empty box — closing one is a change of mind,
+/// and parking it would drop the draft the slot already holds.
+pub(crate) fn draft_of(prompt: &PromptDialog) -> Option<QuickDraft> {
+    let PromptKind::QuickPrompt(launch) = &prompt.kind else {
+        return None;
+    };
+    (!prompt.input.trim().is_empty()).then(|| QuickDraft {
+        launch: launch.clone(),
+        input: prompt.input.clone(),
+    })
+}
+
+/// The DRAFT a picker closed from under the box leaves behind: the box it
+/// owed back, with the text that was in it. The HARDWIRED UNLOCK is the
+/// only way out of a picker that does not hand the box back itself.
+pub(crate) fn draft_of_return(back: &QuickReturn) -> Option<QuickDraft> {
+    (!back.text.trim().is_empty()).then(|| QuickDraft {
+        launch: back.launch.clone(),
+        input: TextInput::multiline_with_text(back.text.clone()),
+    })
+}
+
+/// Open a fresh QUICK PROMPT box on `launch`, taking back the DRAFT the
+/// last abandoned box left — every way into the box but the ones that
+/// carry their own text (a picker's return trip, `Ctrl+N`, a refused
+/// create) comes through here.
+///
+/// The text always comes back: it is the user's, not the target's. The
+/// spec comes back with it only when the parked box was aimed at the same
+/// place ([`QuickLaunch::aimed_like`]) — coming back to the same box is
+/// coming back to the harness or AGENT PRESET picked in it, while a box
+/// aimed somewhere else keeps the aim and spec it was opened with. Either
+/// way the slot is emptied: the draft is in this box now, and clearing it
+/// here and pressing Esc is how it is thrown away.
+pub(crate) fn open_box(app: &mut App, launch: QuickLaunch) {
+    let (launch, restored) = match app.quick_draft.take() {
+        // What the box stands on is where it is opened now, never where
+        // the parked one was.
+        Some(draft) if draft.launch.aimed_like(&launch) => (
+            QuickLaunch {
+                under: launch.under,
+                ..draft.launch
+            },
+            Some(draft.input),
+        ),
+        Some(draft) => (launch, Some(draft.input)),
+        None => (launch, None),
+    };
+    crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch));
+    if let (Some(input), Some(Overlay::Prompt(prompt))) = (restored, &mut app.overlay) {
+        prompt.input = input;
+    }
 }
 
 impl QuickLaunch {
@@ -138,7 +305,17 @@ impl QuickLaunch {
             preset: None,
             issue: None,
             pr: None,
+            under: None,
+            cloud: false,
         }
+    }
+
+    /// The same launch, standing on the modal `under` (or on none). What
+    /// every picker's return trip does to the launch it rebuilt, so the box
+    /// comes back over the modal it was opened over.
+    pub fn with_under(mut self, under: Option<ModalUnder>) -> Self {
+        self.under = under;
+        self
     }
 
     /// The same launch, for the pull request `pr` (or for none). What
@@ -155,6 +332,27 @@ impl QuickLaunch {
     pub fn with_issue(mut self, issue: Option<crate::issues::IssueRef>) -> Self {
         self.issue = issue;
         self
+    }
+
+    /// The same launch, sent to Claude Cloud when `cloud` — and when the
+    /// launch can go there at all: plain Claude, no preset, no issue, no
+    /// pull request. What the `Tab` picker's pick does last, after the
+    /// issue and the PR are back on the launch it rebuilt.
+    pub fn with_cloud(mut self, cloud: bool) -> Self {
+        self.cloud = cloud
+            && self.kind == AgentKind::Claude
+            && self.custom.is_none()
+            && self.preset.is_none()
+            && self.takes_cloud();
+        self
+    }
+
+    /// Could this box launch in Claude Cloud once its harness is Claude?
+    /// Not one for an issue or a pull request — the DAEMON refuses either
+    /// context beside a cloud task — so their `Tab` picker offers no
+    /// toggle. (A preset does not count: the `Tab` pick clears it.)
+    pub fn takes_cloud(&self) -> bool {
+        self.issue.is_none() && self.pr.is_none()
     }
 
     /// The task Enter sends when the box is empty: an ISSUE SESSION's box
@@ -217,10 +415,12 @@ impl QuickLaunch {
     /// `Quick prompt · reviewer (claude · opus · high)`,
     /// `Quick prompt · new worktree yellow-fox-jumps (claude)`,
     /// `Quick prompt · issue #15 · reviewer (claude · opus)`,
-    /// `Quick prompt · PR #42 · reviewer (claude · opus)`.
+    /// `Quick prompt · PR #42 · reviewer (claude · opus)`,
+    /// `Quick prompt (claude · cloud · opus)`.
     pub fn title(&self) -> String {
         let harness = self.custom.as_deref().unwrap_or_else(|| self.kind.as_str());
         let opts: Vec<&str> = std::iter::once(harness)
+            .chain(self.cloud.then_some("cloud"))
             .chain(self.model.as_deref())
             .chain(self.effort.as_deref())
             .collect();
@@ -258,9 +458,29 @@ impl QuickLaunch {
             ),
             (None, None) => match &self.pr {
                 Some(pr) => format!("what should the agent do about PR #{}?", pr.number),
+                None if self.cloud => "what should Claude do in the cloud?".into(),
                 None => "what should the agent do?".into(),
             },
         }
+    }
+
+    /// Are two launches aimed at the same place — the same checkout, or a
+    /// fresh one in the same PROJECT, for the same issue and the same pull
+    /// request? The branch a fresh worktree gets is minted when the box
+    /// opens, so two boxes aimed at a new checkout in one project are aimed
+    /// alike however their names differ. What a parked [`QuickDraft`] is
+    /// matched on: the same aim is the same box reopened, so the whole of
+    /// it comes back.
+    pub fn aimed_like(&self, other: &Self) -> bool {
+        let same_place = match (&self.target, &other.target) {
+            (QuickTarget::Worktree(a), QuickTarget::Worktree(b)) => a == b,
+            (
+                QuickTarget::NewWorktree { project: a, .. },
+                QuickTarget::NewWorktree { project: b, .. },
+            ) => a == b,
+            _ => false,
+        };
+        same_place && self.issue == other.issue && self.pr == other.pr
     }
 
     /// Does Enter cut a fresh worktree before it launches? The box's frame
@@ -332,7 +552,7 @@ pub(crate) fn open_quick_prompt(app: &mut App) {
 /// the title can name what Enter is about to start.
 pub(crate) fn open_for(app: &mut App, target: QuickTarget) {
     let launch = QuickLaunch::from_config(target, &Config::load());
-    crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch));
+    open_box(app, launch);
 }
 
 /// `p` with the Worktrees cursor on an OPEN PRS row: the box for a PR
@@ -345,9 +565,16 @@ pub(crate) fn open_for(app: &mut App, target: QuickTarget) {
 /// open when the project has no ROOT WORKTREE to address it to; the
 /// footer says so.
 fn open_for_pr(app: &mut App) {
-    let Some(launch) = pr_launch(app) else {
-        return;
-    };
+    if let Some(launch) = pr_launch(app) {
+        open_pr_box(app, launch);
+    }
+}
+
+/// Put up the box for a PR SESSION `launch` — the PROJECT OPEN PRS GROUP
+/// row's `p` and the PULL REQUESTS MODAL's `Enter` alike — starting from
+/// the text of a launch on the same pull request the DAEMON refused while
+/// another modal was up, when there is one.
+pub(crate) fn open_pr_box(app: &mut App, launch: QuickLaunch) {
     // The text of a launch the DAEMON refused while another modal was up
     // (`App::parked_pr_prompt`): this box is where it was headed.
     let url = launch.pr.as_ref().map(|pr| pr.url.clone());
@@ -360,7 +587,7 @@ fn open_for_pr(app: &mut App) {
     };
     match parked {
         Some(text) => reopen(app, launch, &text),
-        None => crate::event_loop::open_prompt(app, PromptKind::QuickPrompt(launch)),
+        None => open_box(app, launch),
     }
 }
 
@@ -372,19 +599,34 @@ fn open_for_pr(app: &mut App) {
 /// checkout, the PR head branch's own. None off a pull request row, and,
 /// with a flash, when the project has no root to address it to.
 fn pr_launch(app: &mut App) -> Option<QuickLaunch> {
-    let pr = app.selected_worktree_pr().map(PrLaunch::of)?;
-    let root = app.selected_project().and_then(|project| {
-        app.tree
-            .worktrees
-            .iter()
-            .find(|w| w.project_id == project.id && w.is_main)
-            .map(|w| w.id.clone())
-    });
+    let pr = app.selected_worktree_pr().cloned()?;
+    let project = app.selected_project()?.id.clone();
+    pr_launch_for(app, &project, &pr)
+}
+
+/// The PR SESSION launch for `pr` on `project` — what [`pr_launch`] builds
+/// for the Worktrees cursor's row, for any open pull request: the PULL
+/// REQUESTS MODAL's rows launch through it too. None, with a flash, when
+/// the project has no ROOT WORKTREE to address the create to.
+pub(crate) fn pr_launch_for(
+    app: &mut App,
+    project: &ProjectId,
+    pr: &OpenPr,
+) -> Option<QuickLaunch> {
+    let root = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|w| &w.project_id == project && w.is_main)
+        .map(|w| w.id.clone());
     let Some(root) = root else {
         app.flash = Some("the project has no ROOT WORKTREE for this PR session".into());
         return None;
     };
-    Some(QuickLaunch::from_config(QuickTarget::Worktree(root), &Config::load()).with_pr(Some(pr)))
+    Some(
+        QuickLaunch::from_config(QuickTarget::Worktree(root), &Config::load())
+            .with_pr(Some(PrLaunch::of(pr))),
+    )
 }
 
 /// The checkout a picker opened from the box is built against — the
@@ -393,7 +635,7 @@ fn pr_launch(app: &mut App) -> Option<QuickLaunch> {
 /// project has whether the panel shows it or not: in quick mode neither
 /// picker launches into it, they hand the pick back and the launch keeps
 /// its own `target`. None only if the project vanished meanwhile.
-fn picker_context(app: &App, launch: &QuickLaunch) -> Option<WorktreeId> {
+pub(crate) fn picker_context(app: &App, launch: &QuickLaunch) -> Option<WorktreeId> {
     match &launch.target {
         QuickTarget::Worktree(id) => Some(id.clone()),
         QuickTarget::NewWorktree { project, .. } => app
@@ -413,6 +655,21 @@ pub(crate) fn reopen(app: &mut App, launch: QuickLaunch, text: &str) {
     if let Some(crate::app::Overlay::Prompt(prompt)) = &mut app.overlay {
         prompt.input.insert_str(text);
     }
+}
+
+/// The box a picker draws under itself: the launch as it stood with the
+/// text that was typed into it, built to be drawn and never opened as an
+/// overlay. `^P` layers the PROJECT PICKER over this rather than taking
+/// the box off the screen, so the task is still in front of you while you
+/// pick where it lands; [`reopen`] is what actually hands the box back.
+pub(crate) fn backdrop_box(back: &QuickReturn) -> PromptDialog {
+    let launch = back.launch.clone();
+    PromptDialog::new(
+        launch.title(),
+        launch.label(),
+        back.text.clone(),
+        PromptKind::QuickPrompt(launch),
+    )
 }
 
 /// `Ctrl+N` in the box: flip this one launch between the selected
@@ -674,6 +931,51 @@ mod tests {
         );
     }
 
+    /// A parked DRAFT comes back whole only into the box it left: the
+    /// same checkout, issue and pull request. The branch a fresh worktree
+    /// would get is minted per box, so it never decides the match.
+    #[test]
+    fn a_draft_matches_the_box_it_was_typed_in() {
+        let cfg = Config::default();
+        let here = QuickLaunch::from_config(worktree(), &cfg);
+        assert!(here.aimed_like(&QuickLaunch::of_preset(
+            worktree(),
+            preset("reviewer", AgentKind::Codex),
+            &cfg
+        )));
+        assert!(!here.aimed_like(&QuickLaunch::from_config(
+            QuickTarget::Worktree(WorktreeId::from("wt-2".to_string())),
+            &cfg
+        )));
+        assert!(!here.aimed_like(&QuickLaunch::from_config(new_worktree("a"), &cfg)));
+
+        // Two boxes aimed at a fresh checkout in one project are the same
+        // box, however the random branch came out.
+        let fresh = QuickLaunch::from_config(new_worktree("blue-fox-runs"), &cfg);
+        assert!(fresh.aimed_like(&QuickLaunch::from_config(
+            new_worktree("red-owl-digs"),
+            &cfg
+        )));
+
+        // The issue and the pull request are part of the aim: a box for
+        // one is not the box for another, nor for none.
+        let issue = |number| crate::issues::IssueRef {
+            url: format!("https://github.com/o/r/issues/{number}"),
+            number,
+            title: "Fix login".into(),
+        };
+        let for_15 = here.clone().with_issue(Some(issue(15)));
+        assert!(for_15.aimed_like(&here.clone().with_issue(Some(issue(15)))));
+        assert!(!for_15.aimed_like(&here.clone().with_issue(Some(issue(16)))));
+        assert!(!for_15.aimed_like(&here));
+        let for_pr = here.clone().with_pr(Some(PrLaunch {
+            url: "https://github.com/o/r/pull/42".into(),
+            head: "feat".into(),
+            number: 42,
+        }));
+        assert!(!for_pr.aimed_like(&here));
+    }
+
     #[test]
     fn the_title_and_label_name_the_launch() {
         let cfg = Config::default();
@@ -847,5 +1149,33 @@ mod tests {
             ..wrapped
         };
         assert!(flipped_wrapped.launches_empty());
+    }
+
+    /// Cloud is a plain Claude launch's alone: another harness, a preset,
+    /// an issue or a pull request keeps it off whatever the picker said,
+    /// and a cloud box names it in the title and asks for the task.
+    #[test]
+    fn only_a_plain_claude_launch_goes_to_the_cloud() {
+        let cfg = Config::default();
+        let claude = QuickLaunch::of_kind(worktree(), AgentKind::Claude, None, None, None, &cfg);
+        let cloud = claude.clone().with_cloud(true);
+        assert!(cloud.cloud);
+        assert_eq!(cloud.title(), "Quick prompt (claude · cloud)");
+        assert_eq!(cloud.label(), "what should Claude do in the cloud?");
+        assert!(!cloud.launches_empty(), "a cloud launch needs its task");
+        assert!(!cloud.clone().with_cloud(false).cloud);
+
+        let codex = QuickLaunch::of_kind(worktree(), AgentKind::Codex, None, None, None, &cfg);
+        assert!(!codex.with_cloud(true).cloud);
+        let wrapped =
+            QuickLaunch::of_preset(worktree(), preset("reviewer", AgentKind::Claude), &cfg);
+        assert!(!wrapped.with_cloud(true).cloud);
+        let issue = claude.clone().with_issue(Some(crate::issues::IssueRef {
+            number: 15,
+            title: "Login fails".into(),
+            url: "https://github.com/o/r/issues/15".into(),
+        }));
+        assert!(!issue.takes_cloud());
+        assert!(!issue.with_cloud(true).cloud);
     }
 }

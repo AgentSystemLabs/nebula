@@ -281,6 +281,11 @@ fn is_path_char(c: char) -> bool {
 
 /// Length of the URL scheme starting at `at`, if any (case-insensitive).
 fn scheme_at(line: &[(char, (u16, u16))], at: usize) -> Option<usize> {
+    // Asked of every cell on screen, every frame: turn away the ones that
+    // cannot start either scheme before walking both.
+    if !matches!(line.get(at), Some(('h' | 'H', _))) {
+        return None;
+    }
     for scheme in ["https://", "http://"] {
         let len = scheme.len();
         if line.len() >= at + len

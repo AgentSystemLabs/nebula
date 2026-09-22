@@ -456,7 +456,6 @@ mod tests {
         let store = Arc::new(Store::open_in_memory().unwrap());
         store
             .insert_project(&Project {
-                workspace_id: Default::default(),
                 id: ProjectId("p1".into()),
                 name: "p".into(),
                 repo_path: "/tmp/p".into(),

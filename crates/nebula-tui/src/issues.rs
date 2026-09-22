@@ -59,12 +59,12 @@ use serde::{Deserialize, Serialize};
 use crate::app::{clamp_selection, window_start, App, Overlay};
 use crate::markdown::{self, Breaks};
 use crate::pr_preview::fit;
-use crate::quick_prompt::{QuickLaunch, QuickReturn, QuickTarget};
-use crate::text_input::TextInput;
+use crate::quick_prompt::{ModalUnder, QuickLaunch, QuickReturn, QuickTarget};
+use crate::text_input::{TextInput, TextView};
 use crate::theme::Theme;
 use crate::ui::{
-    centered_rect_pct, empty_list_row, input_spans, multiline_input_lines, panel_block, render_row,
-    row_rect, truncate, SPLIT_MODAL_PCT, SPLIT_PANE_LAYOUT_MIN,
+    centered_rect_pct, draw_multiline_input, draw_scroll_marks, empty_list_row, input_spans,
+    panel_block, render_row, row_rect, truncate, SPLIT_MODAL_PCT, SPLIT_PANE_LAYOUT_MIN,
 };
 
 /// How long a lookup may run before we give up on it — the PR lookups'
@@ -665,8 +665,8 @@ fn day(stamp: &str) -> &str {
 // ---- opening, fetching, landing ----
 
 /// The hotkey: the ISSUES MODAL for the selected PROJECT. Every panel has
-/// one selected, so this works from any row; only an empty workspace has
-/// nothing to list.
+/// one selected, so this works from any row; only a machine with no
+/// project has nothing to list.
 pub(crate) fn open_issues(app: &mut App) {
     let Some(project) = app.selected_project().cloned() else {
         app.flash = Some("issues: select a project first".into());
@@ -790,8 +790,8 @@ pub(crate) fn sweep_others(app: &mut App) {
     request_list(app, project, dir);
 }
 
-/// The project the sweep should spend this tick on, if any: the first of
-/// the workspace's projects, in row order, that isn't selected, isn't in
+/// The project the sweep should spend this tick on, if any: the first
+/// project, in row order, that isn't selected, isn't in
 /// flight, and was never asked, or whose list is older than
 /// [`SWEEP_REFRESH`] — or whose own beat has run out, when that backoff is
 /// the longer wait (a repo with nothing open, or no `gh`, keeps its
@@ -1324,16 +1324,19 @@ pub(crate) fn footer_hint(view: &IssuesView) -> &'static str {
 
 // ---- launching ----
 
-/// Where a launch from the modal lands: the selected WORKTREE when it is
-/// one of this project's real checkouts (not a stand-in git is still
-/// cutting, not an OPEN PRS row), else the project's ROOT WORKTREE — which
-/// every project has whether the panel shows it or not. `Ctrl+N` in the box
-/// flips to a fresh worktree named after the issue.
-fn launch_target(app: &App, project: &ProjectId) -> Option<QuickTarget> {
-    if let Some(w) = app.selected_worktree() {
-        if &w.project_id == project && !app.is_placeholder_worktree(&w.id) {
-            return Some(QuickTarget::Worktree(w.id.clone()));
-        }
+/// Where a launch from the modal lands: the project's ROOT WORKTREE —
+/// which every project has whether the panel shows it or not — as every
+/// new session's box does, never the checkout of the card under the
+/// cursor; or, with the `quick_prompt_new_worktree` SETTING on, a fresh
+/// worktree named after the issue. `Ctrl+N` in the box flips between the
+/// two.
+fn launch_target(app: &App, project: &ProjectId, issue: &IssueRef) -> Option<QuickTarget> {
+    if crate::config::Config::load().quick_prompt_new_worktree {
+        let taken = app.project_branches(project);
+        return Some(QuickTarget::NewWorktree {
+            project: project.clone(),
+            branch: crate::branch_name::issue_name(issue.number, &issue.title, &taken),
+        });
     }
     app.tree
         .worktrees
@@ -1353,21 +1356,22 @@ fn launch_for_selected(app: &mut App) -> Option<QuickLaunch> {
         app.flash = Some("no issue selected".into());
         return None;
     };
-    let Some(target) = launch_target(app, &project) else {
+    let issue = issue.launch_ref();
+    let Some(target) = launch_target(app, &project, &issue) else {
         app.flash = Some("issues: the project has no worktree to launch into".into());
         return None;
     };
-    Some(
-        QuickLaunch::from_config(target, &crate::config::Config::load())
-            .with_issue(Some(issue.launch_ref())),
-    )
+    Some(QuickLaunch::from_config(target, &crate::config::Config::load()).with_issue(Some(issue)))
 }
 
-/// `Enter` / `p`: the QUICK PROMPT for the issue. The box replaces the
-/// modal; Esc from it lands on the panels, `i` reopens the list.
+/// `Enter` / `p`: the QUICK PROMPT for the issue. The box goes up over the
+/// modal, which stays on screen under it: Esc puts the modal back on the
+/// row (`QuickLaunch::under`), and the launch closes it onto the new
+/// session's card.
 fn open_prompt_for_selected(app: &mut App) {
+    let under = ModalUnder::of(app.overlay.as_ref());
     if let Some(launch) = launch_for_selected(app) {
-        crate::event_loop::open_prompt(app, crate::app::PromptKind::QuickPrompt(launch));
+        crate::quick_prompt::open_box(app, launch.with_under(under));
     }
 }
 
@@ -1389,12 +1393,11 @@ fn open_preset_for_selected(app: &mut App) {
 
 /// The launch the PROJECT ISSUES GROUP row under the Worktrees cursor
 /// describes — the modal's for that row: the `quick_prompt_kind`
-/// SETTING's harness aimed at [`launch_target`] (an issue row has no
-/// checkout, so that is the project's root), carrying the issue.
+/// SETTING's harness aimed at [`launch_target`], carrying the issue.
 fn launch_for_row(app: &mut App) -> Option<QuickLaunch> {
     let issue = app.selected_worktree_issue()?.launch_ref();
     let project = app.selected_project()?.id.clone();
-    let Some(target) = launch_target(app, &project) else {
+    let Some(target) = launch_target(app, &project, &issue) else {
         app.flash = Some("issues: the project has no worktree to launch into".into());
         return None;
     };
@@ -1405,7 +1408,7 @@ fn launch_for_row(app: &mut App) -> Option<QuickLaunch> {
 /// what `Enter` in the modal opens on the same row.
 pub(crate) fn open_prompt_for_row(app: &mut App) {
     if let Some(launch) = launch_for_row(app) {
-        crate::event_loop::open_prompt(app, crate::app::PromptKind::QuickPrompt(launch));
+        crate::quick_prompt::open_box(app, launch);
     }
 }
 
@@ -1655,7 +1658,12 @@ pub fn lines(
 }
 
 /// The ISSUES MODAL: the list down the left, the reading pane on the right.
-pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
+/// `backdrop` draws it as the layer under a QUICK PROMPT box opened from it
+/// (`QuickLaunch::under`): dim frames and an unfocused cursor row, the box
+/// in front having the eye.
+pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme, backdrop: bool) {
+    // The list holds the keys unless the editor or a box over the modal does.
+    let list_focused = view.editor.is_none() && !backdrop;
     let area = centered_rect_pct(f.area(), SPLIT_MODAL_PCT.0, SPLIT_MODAL_PCT.1);
     f.render_widget(Clear, area);
     let list_w = (area.width * LIST_PCT / 100)
@@ -1683,7 +1691,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
         rows.len(),
         if inflight { ", refreshing…" } else { "" }
     );
-    let block = panel_block(&title, view.editor.is_none(), th).title_bottom(
+    let block = panel_block(&title, list_focused, th).title_bottom(
         Line::from(Span::styled(
             " Enter/p: prompt  e: preset  E: edit  c: comment  o: browser  r: refresh ",
             Style::default().fg(th.dim),
@@ -1727,12 +1735,12 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
             spans.push(Span::raw(" ".repeat(budget - used - opened_w)));
             spans.push(Span::styled(opened, Style::default().fg(th.dim)));
         }
-        render_row(f, row_area, spans, i == selected, view.editor.is_none(), th);
+        render_row(f, row_area, spans, i == selected, list_focused, th);
     }
 
     // ---- right: the editor, while it is up ----
     if let Some(editor) = &view.editor {
-        let (title_area, body_area) = draw_editor(f, body_a, editor, th);
+        let (title_area, body_area, body_view) = draw_editor(f, body_a, editor, th);
         if let Some(Overlay::Issues(v)) = &mut app.overlay {
             v.area = area;
             v.list_area = list_inner;
@@ -1740,6 +1748,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
             if let Some(e) = &mut v.editor {
                 e.title_area = title_area;
                 e.body_area = body_area;
+                if let Some(view) = body_view {
+                    e.body.set_view(view);
+                }
             }
         }
         return;
@@ -1796,8 +1807,14 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App, view: &IssuesView, th: Theme) {
 /// The reading pane as the form: the title on the first row, the
 /// description in a box under it, the frame's foot saying what Enter will
 /// do — or why the last one did nothing, or that GitHub is being asked.
-/// Returns the title row and the description box for click-to-focus.
-fn draw_editor(f: &mut Frame, area: Rect, editor: &IssueEditor, th: Theme) -> (Rect, Rect) {
+/// Returns the title row and the description box for click-to-focus, and
+/// the view the description was drawn with while it has the caret.
+fn draw_editor(
+    f: &mut Frame,
+    area: Rect,
+    editor: &IssueEditor,
+    th: Theme,
+) -> (Rect, Rect, Option<TextView>) {
     let title = format!("Edit issue #{}", editor.number);
     let (foot, style) = match (&editor.notice, editor.saving) {
         (Some(notice), _) => (format!(" {notice} "), Style::default().fg(th.err)),
@@ -1847,6 +1864,7 @@ fn draw_editor(f: &mut Frame, area: Rect, editor: &IssueEditor, th: Theme) -> (R
         height: inner.height.saturating_sub(1),
     };
     let mut body_area = Rect::default();
+    let mut body_view = None;
     if box_area.height >= 3 && box_area.width >= 4 {
         body_area = box_area;
         let focused = editor.field == EditField::Body;
@@ -1859,13 +1877,9 @@ fn draw_editor(f: &mut Frame, area: Rect, editor: &IssueEditor, th: Theme) -> (R
         let box_inner = block.inner(box_area);
         f.render_widget(block, box_area);
         if focused {
-            let (lines, caret_row) =
-                multiline_input_lines(&editor.body, box_inner.width as usize, th.accent, th);
-            let visible = box_inner.height.max(1) as usize;
-            let max_start = lines.len().saturating_sub(visible);
-            let start = caret_row.saturating_sub(visible / 2).min(max_start);
-            let shown: Vec<Line> = lines.into_iter().skip(start).take(visible).collect();
-            f.render_widget(Paragraph::new(shown), box_inner);
+            let (view, rows) = draw_multiline_input(f, &editor.body, box_inner, th);
+            draw_scroll_marks(f, box_area, view, rows, th.dim);
+            body_view = Some(view);
         } else if editor.body.trim().is_empty() {
             f.render_widget(
                 Paragraph::new(Span::styled(
@@ -1881,7 +1895,7 @@ fn draw_editor(f: &mut Frame, area: Rect, editor: &IssueEditor, th: Theme) -> (R
             );
         }
     }
-    (title_area, body_area)
+    (title_area, body_area, body_view)
 }
 
 #[cfg(test)]
@@ -2324,7 +2338,6 @@ mod tests {
         app.tree.projects.push(nebula_core::Project {
             id: project.clone(),
             name: id.into(),
-            workspace_id: Default::default(),
             repo_path: dir.into(),
             sort_order: 0,
         });
@@ -2438,7 +2451,7 @@ mod tests {
         app.issues_failed.clear();
         refresh_selected(&mut app);
         assert!(app.issues_failed.is_empty());
-        // An empty workspace arms nothing.
+        // No project at all arms nothing.
         let mut empty = App::new();
         schedule_prefetch(&mut empty);
         assert!(empty.pending_issues_prefetch.is_none());
@@ -2823,7 +2836,7 @@ mod tests {
             let Some(Overlay::Issues(v)) = app.overlay.clone() else {
                 panic!("no issues modal");
             };
-            draw(f, app, &v, app.theme);
+            draw(f, app, &v, app.theme, false);
         })
         .unwrap();
         let buf = term.backend().buffer().clone();

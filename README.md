@@ -1,5 +1,7 @@
 <div align="center">
 
+*"Whatever you do, work heartily, as for the Lord and not for men."* — Colossians 3:23 (ESV)
+
 # nebula
 
 **Mission control for your coding agents.**
@@ -51,8 +53,9 @@ dot on a collapsed PROJECT tells you exactly where to look without opening anyth
 | **Agents that drive nebula back** | Tell a Claude SESSION *"do this in a worktree"* and it runs `nebula worktree`, then restarts itself resumed inside the new checkout. Say *"show me the file"* and `nebula open` puts it in front of you in a tabbed modal. Say *"start a new nebula session that…"* and `nebula spawn` has a second agent working beside it before you look. |
 | **Every open pull request, in place** | nebula asks `gh` what's still open on the repo. Rest on a PR ROW and the PR PREVIEW reads it to you — description, stats, the whole conversation. A row goes red, badged `conflicts` or `failing`, when GitHub says the branch no longer merges or a check failed. `g` for its diff, `y` to comment on it without leaving the keyboard, `Enter` for the browser, `n` for a SESSION on any harness, scoped to that PR. |
 | **Every open issue, one key from an agent** | `i` lists the project's open GitHub issues, newest first, and reads the one under the cursor — description, labels, comments. `Enter` opens a QUICK PROMPT for it, `e` launches one of your AGENT PRESETS on it, `E` edits its title and description in place; the issue's URL travels with the session as context on every spawn, so the harness knows what it is fixing. |
+| **Every open pull request, one key from a review** | `v` lists the project's open pull requests and reads the one under the cursor — description, checks, conversation — from the list nebula already keeps warm. `Enter` opens a QUICK PROMPT for a PR SESSION on it, `e` launches one of your AGENT PRESETS on it, `n` picks a harness; the session runs in a checkout of the PR's branch with its URL as context. |
 | **Diff, find, grep, browse** | `g` opens the DIFF VIEWER with REVIEWED MARKS, `f` the FILE FINDER, `F` a `git grep`, `b` the TREE BROWSER — all scoped to the selected WORKTREE, all one key from anywhere. Markdown previews are rendered pages, not raw `#` and `*`. |
-| **`/` finds anything, anywhere** | The PALETTE spans every WORKSPACE, not just the open one. Before you type it sorts by attention: NEEDS FEEDBACK first, then RUNNING, then UNSEEN — so `/` `Enter` is the fastest way back to whatever needs you, and `]` / `[` cycle that same attention order with no modal at all, one session per press, workspaces included. Open pull requests are rows too: `Enter` on one lands on its PR ROW with the PR PREVIEW reading it, `Ctrl+o` hands it to the browser. |
+| **`/` finds anything, anywhere** | The PALETTE spans every PROJECT on the machine, each session listed by title with its project in front of it. Before you type it is that overview, sorted by attention: NEEDS FEEDBACK first, then RUNNING, then UNSEEN — so `/` `Enter` is the fastest way back to whatever needs you, and `.` / `,` cycle that same attention order with no modal at all, one session per press, every project included. Open pull requests are rows too: `Enter` on one lands on its PR ROW with the PR PREVIEW reading it, `Ctrl+o` hands it to the browser. |
 | **It follows you to other machines** | `nebula ssh <host>` opens nebula there, installing it if missing. `nebula tunnel <host>` puts that machine's TUI in a browser tab over a single ssh tunnel. Your settings and agent presets go along, and `nebula config export` / `import` back them up. |
 
 ## Supported harnesses
@@ -110,7 +113,8 @@ nebula
 ```
 
 `Tab` / `Shift+Tab` (or `h` / `l`) move FOCUS between PANELS, `j` / `k` move the selection inside one, and
-`Enter` drills in. With no PROJECTS yet you get the SPLASH — press `n` to add one without leaving the TUI.
+`Enter` drills in. With no PROJECTS yet you get the SPLASH: launched from inside a repo, `Enter` opens it as
+your first PROJECT, so step 1 is optional — anywhere else, `o` browses for one without leaving the TUI.
 
 **3. Pick where the agent runs.** Every PROJECT starts with one WORKTREE: the checkout itself. Press `n`
 in the WORKTREES PANEL to branch off into a real `git worktree`. That's the whole point of the column —
@@ -164,7 +168,7 @@ just changed; a row at rest is at rest (`animations` off stills all of it). The 
 a turn finishes in a pane that isn't on screen, its WORKTREE and PROJECT rows grow a blue `n done`
 DONE BADGE — the number of terminals you have left to go read — and the SESSION row says `done` where its
 HARNESS BADGE normally sits. Walking the cursor onto a SESSION previews it, which reads it: the badges
-count down as you go and disappear at zero — `]` walks you onto the next one owed a look without hunting
+count down as you go and disappear at zero — `.` walks you onto the next one owed a look without hunting
 for it. The flag lives in the DAEMON, so it survives closing the TUI
 and is shared by every client; a turn that finishes in the pane you're already looking at never counts.
 
@@ -230,8 +234,8 @@ never travel with it: each machine runs only the programs its own files name. Fu
 | | |
 |---|---|
 | [**Keys**](docs/keys.md) | Every default binding, the WORKTREE views (`g` `f` `F` `b`), and the mouse. All of it rebindable. |
-| [**Commands**](docs/commands.md) | The `nebula` CLI: `add`, `rename`, `worktree`, `spawn`, `workspace`, `config`, `ssh`, `tunnel`, `browser`, `daemon`, `kill`, `upgrade`. |
-| [**Sessions**](docs/sessions.md) | The NEW SESSION PICKER, MODEL / EFFORT, Claude Cloud and the CLOUD SESSION PANEL, AGENT PRESETS, the PROJECT OPEN PRS group, the ISSUES MODAL. |
+| [**Commands**](docs/commands.md) | The `nebula` CLI: `add`, `rename`, `worktree`, `spawn`, `config`, `ssh`, `tunnel`, `browser`, `daemon`, `kill`, `upgrade`. |
+| [**Sessions**](docs/sessions.md) | The NEW SESSION PICKER, MODEL / EFFORT, Claude Cloud and the CLOUD SESSION PANEL, AGENT PRESETS, the PROJECT OPEN PRS group, the ISSUES MODAL, the PULL REQUESTS MODAL. |
 | [**Configuration**](docs/configuration.md) | `config.json` and `config.local.json`, backup and restore, the SETTINGS OVERLAY, the HOTKEYS TAB, the `.nebula.json` PROJECT FILE (`r` runs a worktree, `Shift+Enter` opens it), compatibility rules, logs and environment overrides. |
 | [**How it works**](docs/how-it-works.md) | The DAEMON, the hook dialects, AUTO-TITLE, WORKTREE RELOCATION, prewarm and reaping, persistence. |
 | [**Architecture**](ARCHITECTURE.md) | Process model, the IPC CODEC and the crate layout. |
