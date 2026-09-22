@@ -3201,6 +3201,10 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::GitDiff => open_diff_view(app),
         Action::CommentPullRequest => open_pr_comment(app),
         Action::OpenRepo => open_repo_in_browser(app),
+        // The grid takes this itself (`launcher::handle_action`); it
+        // reaches here over a full-screen session the keys got past, which
+        // is still the selected session's card.
+        Action::OpenPullRequest => launcher::open_pull_request(app, out),
         Action::OpenGhosttyTab => open_ghostty_tab(app),
         // Shift+Enter / Shift+O: the selected worktree's OPEN COMMAND, from
         // any panel — the cursor's worktree is the context wherever the
@@ -4732,7 +4736,16 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
 /// menu is where they go.
 fn menu_items_for_session_in(app: &App, a: &nebula_core::Agent) -> Vec<MenuItem> {
     let mut items = menu_items_for_session(a);
+    // The card's pull request, what `⇧P` opens (`launcher::open_pull_request`):
+    // ahead of the trailing Delete on an archived card, which keeps no
+    // checkout verbs, and after the checkout's Open on a live one.
+    let pr = crate::launcher::row(app, &a.id)
+        .and_then(|row| row.pr)
+        .map(|pr| MenuItem::new("Open pull request", MenuAction::OpenLink(pr.url)));
     if a.archived {
+        if let Some(pr) = pr {
+            items.insert(items.len().saturating_sub(1), pr);
+        }
         return items;
     }
     let Some(w) = app
@@ -4756,6 +4769,7 @@ fn menu_items_for_session_in(app: &App, a: &nebula_core::Agent) -> Vec<MenuItem>
         "Open",
         MenuAction::OpenWorktree(w.id.clone()),
     ));
+    items.extend(pr);
     if w.is_main {
         items.push(MenuItem::new(
             "Switch branch…",

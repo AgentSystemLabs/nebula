@@ -81,6 +81,9 @@ pub enum Action {
     New,
     GitDiff,
     OpenRepo,
+    /// `Shift+P`: the pull request of the session card under the cursor,
+    /// in the browser — the `#42 title` line on the card.
+    OpenPullRequest,
     /// `Shift+C`: a new Ghostty tab in the selected worktree's directory —
     /// a silent no-op on a machine without Ghostty.
     OpenGhosttyTab,
@@ -393,6 +396,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["shift+g"],
+    },
+    ActionSpec {
+        action: Action::OpenPullRequest,
+        id: "open_pull_request",
+        label: "Open pull request in browser",
+        hint: "Send the pull request of the session card under the cursor — its checkout's branch — to your browser",
+        group: "PROJECTS & WORKTREES",
+        scope: Scope::Global,
+        defaults: &["shift+p"],
     },
     ActionSpec {
         action: Action::OpenGhosttyTab,

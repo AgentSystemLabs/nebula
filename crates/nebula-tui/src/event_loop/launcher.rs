@@ -400,6 +400,9 @@ pub(super) fn handle_action(
         // the card itself has no room to grow one, and the pane stays
         // exactly as it is.
         Action::FollowUp => follow_up(app),
+        // `⇧P` on a card: the pull request its `#42 title` line names, in
+        // the browser.
+        Action::OpenPullRequest => open_pull_request(app, out),
         // `m` with no card selected — the aim let go of, or a project with
         // no sessions yet — is the PROJECT's menu: there is no session
         // under the cursor for it to be the menu of.
@@ -453,6 +456,40 @@ pub(super) fn follow_up(app: &mut App) {
         return;
     };
     super::open_follow_up(app, agent.id, String::new());
+}
+
+/// What `⇧P` says with no card under the cursor to read a pull request
+/// off — the aim let go of, or a grid with no sessions in it.
+const NO_CARD_FOR_PR: &str = "no card selected — j/k onto one, then ⇧P opens its pull request";
+
+/// `⇧P` on a card, and **Open pull request** in its menu: the pull request
+/// of the checkout the card's session runs in — the `#42 title` line on
+/// the card (`view::RowPr`) — in the browser, without stepping into the
+/// session or opening the PULL REQUESTS MODAL to find it. The opening is
+/// `event_loop::open_link`'s, so the pull request is marked read on the
+/// way out, as it is from every other place a PR opens.
+///
+/// INPUT PARITY: the menu row's `MenuAction::OpenLink` carries the URL
+/// this reads, and ends in the same `open_link`.
+pub(super) fn open_pull_request(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let aimed = !(app.launcher_grid() && app.launcher_unaimed);
+    let Some(agent) = app.selected_session().filter(|_| aimed) else {
+        app.flash = Some(NO_CARD_FOR_PR.into());
+        return;
+    };
+    let Some(row) = view::row(app, &agent.id) else {
+        app.flash = Some(NO_CARD_FOR_PR.into());
+        return;
+    };
+    match row.pr {
+        Some(pr) => super::open_link(app, &pr.url, out),
+        None => {
+            app.flash = Some(format!(
+                "no pull request on {} yet — ⇧R asks GitHub again",
+                row.branch
+            ))
+        }
+    }
 }
 
 /// The PROJECT's own menu — `m` with no card selected, and a right-click
@@ -5472,6 +5509,118 @@ mod tests {
             );
             assert!(text.contains("#42 Polish the nav"), "{text}");
             assert!(text.contains("⌂ main · claude"), "{text}");
+        });
+    }
+
+    const PR_42: &str = "https://github.com/o/demo/pull/42";
+
+    /// [`two_sessions`], drawn, with the checkout of the card under the
+    /// cursor on pull request #42.
+    fn card_on_a_pull_request() -> App {
+        let mut app = two_sessions();
+        draw(&mut app);
+        let worktree = app
+            .selected_session()
+            .map(|a| a.worktree_id.clone())
+            .expect("a card under the cursor");
+        app.pull_requests.insert(
+            worktree,
+            Some(crate::pull_request::PullRequest {
+                number: 42,
+                url: PR_42.into(),
+                title: "Polish the nav".into(),
+                state: crate::pull_request::STATE_OPEN.into(),
+                is_draft: false,
+                health: Default::default(),
+                activity: Vec::new(),
+            }),
+        );
+        draw(&mut app);
+        app
+    }
+
+    /// Where **Open pull request** sits on the card's `m` menu, if it is
+    /// there at all.
+    fn pr_menu_row(app: &mut App) -> Option<usize> {
+        key(app, KeyCode::Char('m'), KeyModifiers::NONE);
+        match &app.overlay {
+            Some(Overlay::Menu(menu)) => menu
+                .items
+                .iter()
+                .position(|i| i.label == "Open pull request"),
+            other => panic!("expected the card's menu, got {other:?}"),
+        }
+    }
+
+    /// `⇧P` on a card opens the pull request its `#42 title` line names,
+    /// marking it read on the way out as every other door to a PR does —
+    /// and, INPUT PARITY, the card menu's **Open pull request** ends in
+    /// the same state.
+    #[test]
+    fn shift_p_opens_the_cards_pull_request_as_its_menu_row_does() {
+        with_default_config(|| {
+            let mut by_key = card_on_a_pull_request();
+            let sent = key(&mut by_key, KeyCode::Char('P'), KeyModifiers::SHIFT);
+            assert!(by_key.overlay.is_none(), "{:?}", by_key.overlay);
+            assert_eq!(
+                by_key.flash.as_deref(),
+                Some("opened github.com/o/demo/pull/42")
+            );
+            assert!(
+                sent.iter()
+                    .any(|r| matches!(r, ClientRequest::MarkPrSeen { url, .. } if url == PR_42)),
+                "the pull request is marked read: {sent:?}"
+            );
+
+            let mut by_menu = card_on_a_pull_request();
+            let at = pr_menu_row(&mut by_menu).expect("the row is on the card's menu");
+            for _ in 0..at {
+                key(&mut by_menu, KeyCode::Down, KeyModifiers::NONE);
+            }
+            let sent_by_menu = key(&mut by_menu, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(by_menu.overlay.is_none(), "{:?}", by_menu.overlay);
+            assert_eq!(by_menu.flash, by_key.flash);
+            assert_eq!(format!("{sent_by_menu:?}"), format!("{sent:?}"));
+            assert_eq!(by_menu.pr_seen, by_key.pr_seen);
+        });
+    }
+
+    /// A card whose checkout has no pull request yet says so, naming the
+    /// branch, and its menu carries no row for one.
+    #[test]
+    fn shift_p_on_a_card_with_no_pull_request_says_so() {
+        with_default_config(|| {
+            let mut app = two_sessions();
+            draw(&mut app);
+            let branch = app
+                .selected_session()
+                .and_then(|a| crate::launcher::row(&app, &a.id))
+                .map(|row| row.branch)
+                .expect("a card under the cursor");
+            let sent = key(&mut app, KeyCode::Char('P'), KeyModifiers::SHIFT);
+            assert!(sent.is_empty(), "{sent:?}");
+            assert_eq!(
+                app.flash,
+                Some(format!(
+                    "no pull request on {branch} yet — ⇧R asks GitHub again"
+                ))
+            );
+            assert_eq!(pr_menu_row(&mut app), None);
+        });
+    }
+
+    /// With the aim let go of (Esc), no card wears the cursor, so `⇧P`
+    /// has none to read a pull request off — even though the session the
+    /// cursor last rested on has one.
+    #[test]
+    fn shift_p_with_no_card_selected_opens_nothing() {
+        with_default_config(|| {
+            let mut app = card_on_a_pull_request();
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.launcher_unaimed);
+            let sent = key(&mut app, KeyCode::Char('P'), KeyModifiers::SHIFT);
+            assert!(sent.is_empty(), "{sent:?}");
+            assert_eq!(app.flash.as_deref(), Some(super::NO_CARD_FOR_PR));
         });
     }
 
